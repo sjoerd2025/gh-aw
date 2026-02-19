@@ -104,9 +104,11 @@ export default function App() {
               <EditorView />
             </div>
           )}
+          <div className="app-error-panel">
+            <ErrorPanel />
+          </div>
         </div>
         {isVisualMode && <YamlPreview />}
-        <ErrorPanel />
         {!hasSeenOnboarding && <WelcomeModal />}
         <Toaster position="bottom-right" />
       </BaseStyles>

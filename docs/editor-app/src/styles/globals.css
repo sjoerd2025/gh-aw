@@ -40,7 +40,7 @@ html, body, #root {
 /* Three-panel layout */
 .app-layout {
   display: grid;
-  grid-template-rows: 56px 1fr;
+  grid-template-rows: 56px 1fr auto;
   grid-template-columns: 240px 1fr 0;
   height: 100vh;
   width: 100vw;
@@ -333,29 +333,30 @@ code, pre, .monospace {
 
 
 /* ============================================================
-   Error / Warning / Compiling Panel (bottom of viewport)
+   Error / Warning / Compiling Panel (grid row at bottom of layout)
    ============================================================ */
 
-@keyframes errorPanelSlideUp {
+/* Grid placement for error panel row */
+.app-error-panel {
+  grid-column: 1 / -1;
+  grid-row: 3;
+}
+
+@keyframes errorPanelReveal {
   from {
-    transform: translateY(100%);
+    max-height: 0;
     opacity: 0;
   }
   to {
-    transform: translateY(0);
+    max-height: 180px;
     opacity: 1;
   }
 }
 
 .error-panel {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  z-index: 200;
-  max-height: 200px;
+  max-height: 180px;
   overflow-y: auto;
-  animation: errorPanelSlideUp 0.2s ease-out;
+  animation: errorPanelReveal 0.2s ease-out;
   font-size: 13px;
   padding: 8px 16px;
 /* ---------- Variant: Error ---------- */
