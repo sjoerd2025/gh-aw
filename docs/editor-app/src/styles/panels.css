@@ -1,7 +1,12 @@
 /* Property panel styles */
 
+/* Outer wrapper from PropertiesPanel — positions close button, no extra padding */
+.panel-wrapper {
+  position: relative;
+}
+
 .panel {
-  padding: 16px;
+  padding: 20px;
 }
 
 .panel__header {
@@ -20,34 +25,39 @@
 }
 
 .panel__title {
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--fgColor-default, #1f2328);
 }
 
 .panel__description {
   font-size: 12px;
+  line-height: 1.5;
   color: var(--fgColor-muted, #656d76);
-  margin-bottom: 16px;
-}
-
-.panel__section {
   margin-bottom: 20px;
 }
 
+.panel__section {
+  margin-bottom: 24px;
+}
+
+.panel__section:last-child {
+  margin-bottom: 8px;
+}
+
 .panel__section-title {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   color: var(--fgColor-muted, #656d76);
   text-transform: uppercase;
   letter-spacing: 0.5px;
-  margin-bottom: 8px;
-  padding-bottom: 4px;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
   border-bottom: 1px solid var(--borderColor-muted, #d8dee4);
 }
 
 .panel__field {
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
 
 .panel__label {
@@ -57,23 +67,25 @@
   font-size: 12px;
   font-weight: 600;
   color: var(--fgColor-default, #1f2328);
-  margin-bottom: 4px;
+  margin-bottom: 6px;
 }
 
 .panel__help {
   font-size: 12px;
+  line-height: 1.5;
   color: var(--fgColor-muted, #656d76);
-  margin-top: 4px;
+  margin-top: 6px;
 }
 
 .panel__info {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 8px 12px;
+  padding: 10px 14px;
   background: var(--bgColor-accent-muted, #ddf4ff);
   border-radius: 6px;
   font-size: 12px;
+  line-height: 1.5;
   color: var(--fgColor-default, #1f2328);
   margin-top: 16px;
 }
@@ -83,12 +95,16 @@
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  padding: 10px 12px;
+  padding: 12px 14px;
   border: 1px solid var(--borderColor-default, #d1d9e0);
   border-radius: 8px;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
   cursor: pointer;
   transition: background 150ms ease, border-color 150ms ease;
+}
+
+.tool-card:last-child {
+  margin-bottom: 0;
 }
 
 .tool-card:hover {
@@ -113,5 +129,6 @@
 .tool-card__description {
   font-size: 12px;
   color: var(--fgColor-muted, #656d76);
-  margin-top: 2px;
+  margin-top: 3px;
+  line-height: 1.4;
 }

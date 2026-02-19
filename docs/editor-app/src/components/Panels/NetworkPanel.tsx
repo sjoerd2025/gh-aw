@@ -65,8 +65,8 @@ function DomainList({
   return (
     <div className="panel__section">
       <div className="panel__label">{label}</div>
-      <div className="panel__help" style={{ marginBottom: '8px' }}>{description}</div>
-      <div style={{ display: 'flex', gap: '6px', marginBottom: '8px' }}>
+      <div className="panel__help" style={{ marginBottom: '10px', marginTop: '0' }}>{description}</div>
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
         <input
           type="text"
           value={input}
@@ -77,7 +77,7 @@ function DomainList({
         />
         <button onClick={handleAdd} style={addButtonStyle}>Add</button>
       </div>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
         {domains.map((d) => (
           <span key={d} style={chipStyle}>
             {d}
@@ -102,7 +102,7 @@ function DomainList({
 
 const inputStyle: React.CSSProperties = {
   flex: 1,
-  padding: '6px 10px',
+  padding: '8px 12px',
   fontSize: '13px',
   border: '1px solid #d0d7de',
   borderRadius: '6px',
@@ -110,7 +110,7 @@ const inputStyle: React.CSSProperties = {
 };
 
 const addButtonStyle: React.CSSProperties = {
-  padding: '6px 14px',
+  padding: '8px 14px',
   fontSize: '13px',
   border: '1px solid #d0d7de',
   borderRadius: '6px',
@@ -123,8 +123,8 @@ const addButtonStyle: React.CSSProperties = {
 const chipStyle: React.CSSProperties = {
   display: 'inline-flex',
   alignItems: 'center',
-  gap: '4px',
-  padding: '3px 8px',
+  gap: '6px',
+  padding: '5px 10px',
   fontSize: '12px',
   background: '#ddf4ff',
   border: '1px solid #54aeff',

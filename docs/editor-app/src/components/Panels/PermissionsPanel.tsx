@@ -120,9 +120,9 @@ const tableStyle: React.CSSProperties = {
 const headerRowStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
-  padding: '6px 0',
+  padding: '8px 0',
   borderBottom: '2px solid #d0d7de',
-  fontSize: '12px',
+  fontSize: '11px',
   fontWeight: 600,
   color: '#656d76',
   textTransform: 'uppercase',
@@ -138,9 +138,9 @@ const headerCellStyle: React.CSSProperties = {
 const rowStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'center',
-  padding: '8px 0',
+  padding: '10px 0',
   borderBottom: '1px solid #f0f0f0',
-  gap: '8px',
+  gap: '10px',
 };
 
 const segmentedControlStyle: React.CSSProperties = {
@@ -149,7 +149,7 @@ const segmentedControlStyle: React.CSSProperties = {
 };
 
 const segmentButtonStyle: React.CSSProperties = {
-  padding: '3px 8px',
+  padding: '4px 10px',
   fontSize: '11px',
   fontWeight: 500,
   border: '1px solid #d0d7de',

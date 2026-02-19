@@ -27,7 +27,7 @@ export function EnginePanel() {
       {/* Engine selector */}
       <div className="panel__section">
         <div className="panel__section-title">AI Engine</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
           {engineOptions.map((opt) => {
             const fd = opt.type === 'custom'
               ? { label: 'Custom Engine', description: 'Use a custom or self-hosted AI engine.' }
@@ -55,7 +55,7 @@ export function EnginePanel() {
                   <div style={{ fontSize: '13px', fontWeight: 600, color: '#1f2328' }}>
                     {fd.label}
                   </div>
-                  <div style={{ fontSize: '12px', color: '#656d76', marginTop: '2px' }}>
+                  <div style={{ fontSize: '12px', color: '#656d76', marginTop: '4px', lineHeight: '1.4' }}>
                     {fd.description}
                   </div>
                 </div>
@@ -133,8 +133,8 @@ function getModelPlaceholder(type: EngineType): string {
 const engineCardStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'flex-start',
-  gap: '10px',
-  padding: '12px',
+  gap: '12px',
+  padding: '14px',
   border: '1px solid #d0d7de',
   borderRadius: '8px',
   cursor: 'pointer',
@@ -145,7 +145,7 @@ const engineCardStyle: React.CSSProperties = {
 
 const inputStyle: React.CSSProperties = {
   width: '100%',
-  padding: '6px 10px',
+  padding: '8px 12px',
   fontSize: '13px',
   border: '1px solid #d0d7de',
   borderRadius: '6px',

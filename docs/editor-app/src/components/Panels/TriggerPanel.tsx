@@ -66,7 +66,7 @@ export function TriggerPanel() {
                 <div style={{ fontSize: '13px', fontWeight: 600, color: '#1f2328' }}>
                   {fd.label}
                 </div>
-                <div style={{ fontSize: '11px', color: '#656d76', marginTop: '2px' }}>
+                <div style={{ fontSize: '11px', color: '#656d76', marginTop: '4px', lineHeight: '1.4' }}>
                   {fd.description}
                 </div>
               </button>
@@ -79,11 +79,11 @@ export function TriggerPanel() {
       {availableActivityTypes.length > 0 && (
         <div className="panel__section">
           <div className="panel__section-title">Activity Types</div>
-          <div className="panel__help" style={{ marginBottom: '8px' }}>
+          <div className="panel__help" style={{ marginBottom: '10px', marginTop: '0' }}>
             Select which specific activities should trigger the workflow.
             Leave all unchecked to trigger on any activity.
           </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
             {availableActivityTypes.map((at) => {
               const active = trigger.activityTypes.includes(at);
               return (
@@ -118,7 +118,7 @@ export function TriggerPanel() {
             placeholder="e.g. 0 0 * * *"
             style={inputStyle}
           />
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '8px' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '10px' }}>
             {schedulePresets.map((p) => (
               <button
                 key={p.label}
@@ -168,13 +168,13 @@ export function TriggerPanel() {
               <div style={{ fontSize: '13px', fontWeight: 500 }}>
                 {getFieldDescription('trigger.skipBots').label}
               </div>
-              <div style={{ fontSize: '12px', color: '#656d76' }}>
+              <div style={{ fontSize: '12px', color: '#656d76', marginTop: '2px', lineHeight: '1.4' }}>
                 {getFieldDescription('trigger.skipBots').description}
               </div>
             </div>
           </label>
 
-          <div className="panel__field" style={{ marginTop: '8px' }}>
+          <div className="panel__field" style={{ marginTop: '12px' }}>
             <div className="panel__label">
               {getFieldDescription('trigger.skipRoles').label}
             </div>
@@ -200,11 +200,11 @@ export function TriggerPanel() {
 const gridStyle: React.CSSProperties = {
   display: 'grid',
   gridTemplateColumns: 'repeat(2, 1fr)',
-  gap: '8px',
+  gap: '10px',
 };
 
 const eventCardStyle: React.CSSProperties = {
-  padding: '10px',
+  padding: '12px',
   border: '1px solid #d0d7de',
   borderRadius: '8px',
   cursor: 'pointer',
@@ -215,7 +215,7 @@ const eventCardStyle: React.CSSProperties = {
 
 const activityChipStyle = (active: boolean): React.CSSProperties => ({
   display: 'inline-block',
-  padding: '4px 10px',
+  padding: '5px 12px',
   fontSize: '12px',
   borderRadius: '16px',
   border: `1px solid ${active ? '#0969da' : '#d0d7de'}`,
@@ -227,7 +227,7 @@ const activityChipStyle = (active: boolean): React.CSSProperties => ({
 
 const inputStyle: React.CSSProperties = {
   width: '100%',
-  padding: '6px 10px',
+  padding: '8px 12px',
   fontSize: '13px',
   border: '1px solid #d0d7de',
   borderRadius: '6px',
@@ -235,7 +235,7 @@ const inputStyle: React.CSSProperties = {
 };
 
 const presetButtonStyle: React.CSSProperties = {
-  padding: '4px 10px',
+  padding: '5px 12px',
   fontSize: '12px',
   border: '1px solid #d0d7de',
   borderRadius: '16px',
@@ -247,7 +247,7 @@ const presetButtonStyle: React.CSSProperties = {
 const filterRowStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'flex-start',
-  gap: '8px',
-  padding: '8px 0',
+  gap: '10px',
+  padding: '10px 0',
   cursor: 'pointer',
 };

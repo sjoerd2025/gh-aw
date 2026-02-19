@@ -66,7 +66,7 @@ export function StepsPanel() {
 
 const textareaStyle: React.CSSProperties = {
   width: '100%',
-  padding: '10px 12px',
+  padding: '10px 14px',
   fontSize: '12px',
   fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
   lineHeight: '1.5',

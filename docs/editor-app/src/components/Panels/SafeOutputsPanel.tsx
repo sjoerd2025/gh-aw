@@ -109,7 +109,7 @@ export function SafeOutputsPanel() {
                   <div style={{ fontSize: '13px', fontWeight: 500, color: '#1f2328' }}>
                     {fd.label}
                   </div>
-                  <div style={{ fontSize: '12px', color: '#656d76' }}>
+                  <div style={{ fontSize: '12px', color: '#656d76', marginTop: '2px', lineHeight: '1.4' }}>
                     {fd.description}
                   </div>
                 </div>
@@ -125,8 +125,8 @@ export function SafeOutputsPanel() {
 const summaryStyle: React.CSSProperties = {
   fontSize: '12px',
   color: '#656d76',
-  marginBottom: '12px',
-  padding: '6px 10px',
+  marginBottom: '16px',
+  padding: '8px 12px',
   background: '#f6f8fa',
   borderRadius: '6px',
 };
@@ -134,7 +134,8 @@ const summaryStyle: React.CSSProperties = {
 const checkboxRowStyle: React.CSSProperties = {
   display: 'flex',
   alignItems: 'flex-start',
-  padding: '8px 0',
+  padding: '10px 0',
   cursor: 'pointer',
   borderBottom: '1px solid #f0f0f0',
+  gap: '4px',
 };

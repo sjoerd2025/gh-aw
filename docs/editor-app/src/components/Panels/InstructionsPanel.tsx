@@ -32,7 +32,7 @@ export function InstructionsPanel() {
 
       <div className="panel__section">
         <div className="panel__section-title">Quick Snippets</div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
           {snippets.map((s) => (
             <button
               key={s.label}
@@ -72,7 +72,7 @@ const counterStyle: React.CSSProperties = {
 };
 
 const snippetButtonStyle: React.CSSProperties = {
-  padding: '4px 10px',
+  padding: '5px 12px',
   fontSize: '12px',
   border: '1px solid #d0d7de',
   borderRadius: '16px',

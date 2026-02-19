@@ -47,14 +47,15 @@ export function PropertiesPanel() {
   }
 
   return (
-    <div className="panel">
+    <div className="panel-wrapper">
       <button
         className="panel__close-btn"
         onClick={() => selectNode(null)}
         title="Close panel"
         style={{
-          position: 'absolute', top: 8, right: 8, background: 'none', border: 'none',
+          position: 'absolute', top: 12, right: 12, background: 'none', border: 'none',
           cursor: 'pointer', padding: 4, borderRadius: 4, color: 'var(--fgColor-muted, #656d76)',
+          zIndex: 1,
         }}
       >
         <X size={16} />
