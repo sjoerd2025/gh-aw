@@ -112,13 +112,30 @@ func getEnabledSafeOutputToolNamesReflection(safeOutputs *SafeOutputsConfig) []s
 	return tools
 }
 
-// formatSafeOutputsRunsOn formats the runs-on value from SafeOutputsConfig for job output
-func (c *Compiler) formatSafeOutputsRunsOn(safeOutputs *SafeOutputsConfig) string {
-	if safeOutputs == nil || safeOutputs.RunsOn == "" {
-		return "runs-on: " + constants.DefaultActivationJobRunnerImage
+// formatSafeOutputsRunsOn formats the runs-on value for support jobs (activation,
+// pre-activation, safe-outputs, detection, cache-memory, repo-memory, etc.).
+//
+// Resolution order:
+//  1. safe-outputs.runs-on (explicit per-workflow override for support jobs)
+//  2. top-level runs-on (inherited when safe-outputs.runs-on is not set)
+//  3. DefaultActivationJobRunnerImage ("ubuntu-slim") as the final default
+//
+// This allows a single top-level runs-on entry to configure all jobs at once,
+// while still providing a fine-grained override via safe-outputs.runs-on when
+// the agent job and support jobs need different runners.
+func (c *Compiler) formatSafeOutputsRunsOn(data *WorkflowData) string {
+	// 1. Explicit safe-outputs.runs-on takes priority
+	if data.SafeOutputs != nil && data.SafeOutputs.RunsOn != "" {
+		return "runs-on: " + data.SafeOutputs.RunsOn
 	}
 
-	return "runs-on: " + safeOutputs.RunsOn
+	// 2. Inherit from top-level runs-on when explicitly set by the user
+	if data.RunsOnExplicit && data.RunsOn != "" {
+		return c.indentYAMLLines(data.RunsOn, "    ")
+	}
+
+	// 3. Fall back to the lightweight default runner for support jobs
+	return "runs-on: " + constants.DefaultActivationJobRunnerImage
 }
 
 // builtinSafeOutputFields contains the struct field names for the built-in safe output types

@@ -199,7 +199,7 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 				}
 			}
 		} else {
-			job.RunsOn = "runs-on: ubuntu-latest" // Default
+			job.RunsOn = c.formatSafeOutputsRunsOn(data) // Default inherits from safe-outputs.runs-on or top-level runs-on
 		}
 
 		// Set if condition - combine safe output type check with user-provided condition

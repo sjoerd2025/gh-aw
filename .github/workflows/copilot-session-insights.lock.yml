@@ -1125,7 +1125,7 @@ jobs:
   detection:
     needs: agent
     if: needs.agent.outputs.output_types != '' || needs.agent.outputs.has_patch == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: read
     concurrency:
@@ -1248,7 +1248,7 @@ jobs:
       - agent
       - detection
     if: always() && needs.detection.outputs.success == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: write
     outputs:
@@ -1380,7 +1380,7 @@ jobs:
       - agent
       - detection
     if: always() && needs.detection.outputs.success == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     permissions:
       contents: read
     env:

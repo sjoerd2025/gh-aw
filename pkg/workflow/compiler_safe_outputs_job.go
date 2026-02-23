@@ -333,7 +333,7 @@ func (c *Compiler) buildConsolidatedSafeOutputsJob(data *WorkflowData, mainJobNa
 	job := &Job{
 		Name:           "safe_outputs",
 		If:             jobCondition.Render(),
-		RunsOn:         c.formatSafeOutputsRunsOn(data.SafeOutputs),
+		RunsOn:         c.formatSafeOutputsRunsOn(data),
 		Permissions:    permissions.RenderToYAML(),
 		TimeoutMinutes: 15, // Slightly longer timeout for consolidated job with multiple steps
 		Env:            jobEnv,

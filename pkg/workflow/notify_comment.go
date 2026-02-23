@@ -385,7 +385,7 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 	job := &Job{
 		Name:        "conclusion",
 		If:          condition.Render(),
-		RunsOn:      c.formatSafeOutputsRunsOn(data.SafeOutputs),
+		RunsOn:      c.formatSafeOutputsRunsOn(data),
 		Permissions: permissions.RenderToYAML(),
 		Steps:       steps,
 		Needs:       needs,

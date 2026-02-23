@@ -1840,7 +1840,7 @@
       }
     },
     "runs-on": {
-      "description": "Runner type for workflow execution (GitHub Actions standard field). Supports multiple forms: simple string for single runner label (e.g., 'ubuntu-latest'), array for runner selection with fallbacks, or object for GitHub-hosted runner groups with specific labels. For agentic workflows, runner selection matters when AI workloads require specific compute resources or when using self-hosted runners with specialized capabilities. Typically configured at the job level instead. See https://docs.github.com/en/actions/using-jobs/choosing-the-runner-for-a-job",
+      "description": "Runner type for all workflow jobs. When set, this value is used for the agent job AND all support jobs (activation, pre-activation, safe-outputs, detection, cache-memory, repo-memory). This is the single entry point for routing every generated job to self-hosted runners. Use safe-outputs.runs-on to override support jobs independently. Supports multiple forms: simple string (e.g., 'self-hosted'), array for runner selection with fallbacks, or object for GitHub-hosted runner groups. See https://docs.github.com/en/actions/using-jobs/choosing-the-runner-for-a-job",
       "oneOf": [
         {
           "type": "string",
@@ -6922,7 +6922,7 @@
         },
         "runs-on": {
           "type": "string",
-          "description": "Runner specification for all safe-outputs jobs (activation, create-issue, add-comment, etc.). Single runner label (e.g., 'ubuntu-slim', 'ubuntu-latest', 'windows-latest', 'self-hosted'). Defaults to 'ubuntu-slim'. See https://github.blog/changelog/2025-10-28-1-vcpu-linux-runner-now-available-in-github-actions-in-public-preview/"
+          "description": "Runner override for support jobs (activation, pre-activation, safe-outputs, detection, cache-memory, repo-memory). Takes precedence over the top-level runs-on for these jobs. Single runner label (e.g., 'ubuntu-slim', 'ubuntu-latest', 'windows-latest', 'self-hosted'). When not set, inherits from the top-level runs-on; when top-level is also not set, defaults to 'ubuntu-slim'. See https://github.blog/changelog/2025-10-28-1-vcpu-linux-runner-now-available-in-github-actions-in-public-preview/"
         }
       },
       "additionalProperties": false

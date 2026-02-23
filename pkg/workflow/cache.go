@@ -839,7 +839,7 @@ func (c *Compiler) buildUpdateCacheMemoryJob(data *WorkflowData, threatDetection
 	job := &Job{
 		Name:        "update_cache_memory",
 		DisplayName: "", // No display name - job ID is sufficient
-		RunsOn:      "runs-on: ubuntu-latest",
+		RunsOn:      c.formatSafeOutputsRunsOn(data),
 		If:          jobCondition,
 		Permissions: permissions,
 		Needs:       []string{"agent", "detection"},

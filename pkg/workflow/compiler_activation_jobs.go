@@ -348,7 +348,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 	job := &Job{
 		Name:        string(constants.PreActivationJobName),
 		If:          jobIfCondition,
-		RunsOn:      c.formatSafeOutputsRunsOn(data.SafeOutputs),
+		RunsOn:      c.formatSafeOutputsRunsOn(data),
 		Permissions: permissions,
 		Steps:       steps,
 		Outputs:     outputs,
@@ -728,7 +728,7 @@ func (c *Compiler) buildActivationJob(data *WorkflowData, preActivationJobCreate
 		Name:                       string(constants.ActivationJobName),
 		If:                         activationCondition,
 		HasWorkflowRunSafetyChecks: workflowRunRepoSafety != "", // Mark job as having workflow_run safety checks
-		RunsOn:                     c.formatSafeOutputsRunsOn(data.SafeOutputs),
+		RunsOn:                     c.formatSafeOutputsRunsOn(data),
 		Permissions:                permissions,
 		Environment:                environment,
 		Steps:                      steps,

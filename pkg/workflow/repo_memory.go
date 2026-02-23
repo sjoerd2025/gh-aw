@@ -730,7 +730,7 @@ func (c *Compiler) buildPushRepoMemoryJob(data *WorkflowData, threatDetectionEna
 	job := &Job{
 		Name:        "push_repo_memory",
 		DisplayName: "", // No display name - job ID is sufficient
-		RunsOn:      "runs-on: ubuntu-latest",
+		RunsOn:      c.formatSafeOutputsRunsOn(data),
 		If:          jobCondition,
 		Permissions: "permissions:\n      contents: write",
 		Needs:       []string{"agent"}, // Detection dependency added by caller if needed

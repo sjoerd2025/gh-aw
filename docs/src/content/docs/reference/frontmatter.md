@@ -465,8 +465,20 @@ Standard GitHub Actions properties:
 
 ```yaml wrap
 run-name: "Custom workflow run name"  # Defaults to workflow name
-runs-on: ubuntu-latest               # Defaults to ubuntu-latest (main job only)
+runs-on: ubuntu-latest               # Applies to ALL jobs (agent + all support jobs)
 timeout-minutes: 30                  # Defaults to 20 minutes
+```
+
+When `runs-on` is set, it applies to **every generated job** – the agent job and all support jobs
+(activation, pre-activation, safe-outputs, detection, cache-memory, repo-memory).
+This is the single entry point for routing all jobs to self-hosted runners.
+
+To use different runners for the agent job and support jobs, combine `runs-on` with `safe-outputs.runs-on`:
+
+```yaml wrap
+runs-on: [self-hosted, heavy]        # Agent job uses powerful self-hosted runner
+safe-outputs:
+  runs-on: ubuntu-slim               # Support jobs use the lightweight hosted runner
 ```
 
 **Supported runners for `runs-on:`**
@@ -476,6 +488,7 @@ timeout-minutes: 30                  # Defaults to 20 minutes
 | `ubuntu-latest` | ✅ Default. Recommended for most workflows. |
 | `ubuntu-24.04` / `ubuntu-22.04` | ✅ Supported. |
 | `ubuntu-24.04-arm` | ✅ Supported. Linux ARM64 runner. |
+| `self-hosted` / `[self-hosted, linux]` | ✅ Supported. Applies to all jobs. See [self-hosted runners guide](/gh-aw/guides/self-hosted-runners/). |
 | `macos-*` | ❌ Not supported. Docker is unavailable on macOS runners (no nested virtualization). See [FAQ](/gh-aw/reference/faq/). |
 | `windows-*` | ❌ Not supported. AWF requires Linux. |
 

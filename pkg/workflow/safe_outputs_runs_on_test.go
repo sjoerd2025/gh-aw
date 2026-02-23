@@ -153,31 +153,115 @@ This is a test workflow.`
 	}
 }
 
+// TestTopLevelRunsOnInheritedByAllJobs verifies that setting a top-level runs-on
+// causes all support jobs (activation, pre_activation, safe_outputs, detection,
+// cache-memory, repo-memory) to use the same runner as the agent job.
+func TestTopLevelRunsOnInheritedByAllJobs(t *testing.T) {
+	frontmatter := `---
+on: push
+runs-on: self-hosted
+safe-outputs:
+  create-issue:
+    title-prefix: "[ai] "
+---
+
+# Test Workflow
+
+This is a test workflow.`
+
+	tmpDir := testutil.TempDir(t, "workflow-top-runs-on-test")
+	testFile := filepath.Join(tmpDir, "test.md")
+	if err := os.WriteFile(testFile, []byte(frontmatter), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "test.lock.yml")
+	yamlContent, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	yamlStr := string(yamlContent)
+	expectedRunsOn := "runs-on: self-hosted"
+	defaultRunsOn := "runs-on: " + constants.DefaultActivationJobRunnerImage
+
+	// All jobs (agent + all support) should use self-hosted
+	if strings.Contains(yamlStr, defaultRunsOn) {
+		t.Errorf("Expected no jobs to use default %q when top-level runs-on is set to self-hosted.\nYAML:\n%s", defaultRunsOn, yamlStr)
+	}
+
+	// At minimum, verify activation and safe_outputs jobs use self-hosted
+	for _, jobName := range []string{"pre_activation:", "activation:", "safe_outputs:"} {
+		jobPattern := "\n  " + jobName
+		jobStart := strings.Index(yamlStr, jobPattern)
+		if jobStart == -1 {
+			continue // job may not be present (optional)
+		}
+		end := min(jobStart+600, len(yamlStr))
+		jobSection := yamlStr[jobStart:end]
+		if !strings.Contains(jobSection, expectedRunsOn) {
+			t.Errorf("Job %q does not use expected %q when top-level runs-on is self-hosted.\nJob section:\n%s", jobName, expectedRunsOn, jobSection)
+		}
+	}
+}
+
 func TestFormatSafeOutputsRunsOnEdgeCases(t *testing.T) {
 	compiler := NewCompiler()
 
 	tests := []struct {
 		name           string
-		safeOutputs    *SafeOutputsConfig
+		data           *WorkflowData
 		expectedRunsOn string
 	}{
 		{
 			name:           "nil safe outputs config",
-			safeOutputs:    nil,
+			data:           &WorkflowData{SafeOutputs: nil},
 			expectedRunsOn: "runs-on: " + constants.DefaultActivationJobRunnerImage,
 		},
 		{
-			name: "safe outputs config with nil runs-on",
-			safeOutputs: &SafeOutputsConfig{
-				RunsOn: "",
+			name: "safe outputs config with empty runs-on",
+			data: &WorkflowData{
+				SafeOutputs: &SafeOutputsConfig{RunsOn: ""},
 			},
 			expectedRunsOn: "runs-on: " + constants.DefaultActivationJobRunnerImage,
+		},
+		{
+			name: "inherits from top-level runs-on when safe-outputs.runs-on is unset",
+			data: &WorkflowData{
+				RunsOn:         "runs-on: self-hosted",
+				RunsOnExplicit: true,
+				SafeOutputs:    nil,
+			},
+			expectedRunsOn: "runs-on: self-hosted",
+		},
+		{
+			name: "does not inherit top-level runs-on when it is just the default",
+			data: &WorkflowData{
+				RunsOn:         "runs-on: ubuntu-latest",
+				RunsOnExplicit: false, // not explicitly set by user
+				SafeOutputs:    nil,
+			},
+			expectedRunsOn: "runs-on: " + constants.DefaultActivationJobRunnerImage,
+		},
+		{
+			name: "safe-outputs.runs-on overrides top-level runs-on",
+			data: &WorkflowData{
+				RunsOn:         "runs-on: ubuntu-latest",
+				RunsOnExplicit: true,
+				SafeOutputs:    &SafeOutputsConfig{RunsOn: "ubuntu-slim"},
+			},
+			expectedRunsOn: "runs-on: ubuntu-slim",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			runsOn := compiler.formatSafeOutputsRunsOn(tt.safeOutputs)
+			runsOn := compiler.formatSafeOutputsRunsOn(tt.data)
 			if runsOn != tt.expectedRunsOn {
 				t.Errorf("Expected runs-on to be %q, got %q", tt.expectedRunsOn, runsOn)
 			}

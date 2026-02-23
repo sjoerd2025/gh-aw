@@ -412,6 +412,7 @@ type WorkflowData struct {
 	CustomSteps           string
 	PostSteps             string // steps to run after AI execution
 	RunsOn                string
+	RunsOnExplicit        bool   // true when runs-on was explicitly set in frontmatter (not just defaulted)
 	Environment           string // environment setting for the main job
 	Container             string // container setting for the main job
 	Services              string // services setting for the main job

@@ -1289,7 +1289,14 @@ safe-outputs:
 
 ### Custom Runner Image
 
-Specify custom runner for safe output jobs (default: `ubuntu-slim`): `runs-on: ubuntu-22.04`
+Specify a custom runner for all support jobs (default: inherits from top-level `runs-on`, otherwise `ubuntu-slim`):
+
+```yaml
+safe-outputs:
+  runs-on: ubuntu-22.04
+```
+
+This overrides the top-level `runs-on` for support jobs only. To route **all** jobs (agent + support) to self-hosted runners, set `runs-on` at the top level instead. See the [Self-Hosted Runners Guide](/gh-aw/guides/self-hosted-runners/) for details.
 
 ### Custom Messages (`messages:`)
 

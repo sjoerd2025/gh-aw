@@ -705,39 +705,44 @@ func TestFormatSafeOutputsRunsOn(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		safeOutputs    *SafeOutputsConfig
+		data           *WorkflowData
 		expectedRunsOn string
 	}{
 		{
 			name:           "nil safe outputs returns default",
-			safeOutputs:    nil,
+			data:           &WorkflowData{SafeOutputs: nil},
 			expectedRunsOn: "runs-on: " + constants.DefaultActivationJobRunnerImage,
 		},
 		{
 			name:           "empty runs-on returns default",
-			safeOutputs:    &SafeOutputsConfig{RunsOn: ""},
+			data:           &WorkflowData{SafeOutputs: &SafeOutputsConfig{RunsOn: ""}},
 			expectedRunsOn: "runs-on: " + constants.DefaultActivationJobRunnerImage,
 		},
 		{
-			name:           "custom runs-on",
-			safeOutputs:    &SafeOutputsConfig{RunsOn: "ubuntu-latest"},
+			name:           "custom safe-outputs.runs-on",
+			data:           &WorkflowData{SafeOutputs: &SafeOutputsConfig{RunsOn: "ubuntu-latest"}},
 			expectedRunsOn: "runs-on: ubuntu-latest",
 		},
 		{
-			name:           "self-hosted runs-on",
-			safeOutputs:    &SafeOutputsConfig{RunsOn: "self-hosted"},
+			name:           "self-hosted safe-outputs.runs-on",
+			data:           &WorkflowData{SafeOutputs: &SafeOutputsConfig{RunsOn: "self-hosted"}},
 			expectedRunsOn: "runs-on: self-hosted",
 		},
 		{
-			name:           "windows-latest runs-on",
-			safeOutputs:    &SafeOutputsConfig{RunsOn: "windows-latest"},
+			name:           "windows-latest safe-outputs.runs-on",
+			data:           &WorkflowData{SafeOutputs: &SafeOutputsConfig{RunsOn: "windows-latest"}},
 			expectedRunsOn: "runs-on: windows-latest",
+		},
+		{
+			name:           "inherits top-level runs-on when safe-outputs.runs-on unset",
+			data:           &WorkflowData{RunsOn: "runs-on: self-hosted", RunsOnExplicit: true, SafeOutputs: nil},
+			expectedRunsOn: "runs-on: self-hosted",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := compiler.formatSafeOutputsRunsOn(tt.safeOutputs)
+			result := compiler.formatSafeOutputsRunsOn(tt.data)
 			if result != tt.expectedRunsOn {
 				t.Errorf("formatSafeOutputsRunsOn() = %q, want %q", result, tt.expectedRunsOn)
 			}

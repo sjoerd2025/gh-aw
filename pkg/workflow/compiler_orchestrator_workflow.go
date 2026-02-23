@@ -209,6 +209,7 @@ func (c *Compiler) extractYAMLSections(frontmatter map[string]any, workflowData 
 	workflowData.TimeoutMinutes = c.extractTopLevelYAMLSection(frontmatter, "timeout-minutes")
 
 	workflowData.RunsOn = c.extractTopLevelYAMLSection(frontmatter, "runs-on")
+	workflowData.RunsOnExplicit = workflowData.RunsOn != ""
 	workflowData.Environment = c.extractTopLevelYAMLSection(frontmatter, "environment")
 	workflowData.Container = c.extractTopLevelYAMLSection(frontmatter, "container")
 	workflowData.Cache = c.extractTopLevelYAMLSection(frontmatter, "cache")
