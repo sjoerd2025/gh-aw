@@ -222,6 +222,10 @@ func checkMissingPermissions(permissions *Permissions, required map[PermissionSc
 		if !granted {
 			missing = true
 		} else if requiredLevel == PermissionWrite && grantedLevel != PermissionWrite {
+			// Need write but have read or none
+			missing = true
+		} else if requiredLevel == PermissionRead && grantedLevel == PermissionNone {
+			// Need at least read but explicitly set to none
 			missing = true
 		}
 

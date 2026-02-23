@@ -73,6 +73,22 @@ func TestCollectRequiredPermissions(t *testing.T) {
 			},
 		},
 		{
+			name:     "Dependabot toolset requires security-events read",
+			toolsets: []string{"dependabot"},
+			readOnly: false,
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionRead,
+			},
+		},
+		{
+			name:     "Dependabot toolset in read-only mode requires security-events read",
+			toolsets: []string{"dependabot"},
+			readOnly: true,
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionRead,
+			},
+		},
+		{
 			name:     "Code security toolset",
 			toolsets: []string{"code_security"},
 			readOnly: false,
@@ -211,6 +227,54 @@ func TestValidatePermissions_MissingPermissions(t *testing.T) {
 			},
 			expectMissingCount: 0,
 			expectHasIssues:    false,
+		},
+		{
+			name:        "Dependabot toolset with no permissions",
+			permissions: NewPermissions(),
+			githubToolConfig: &GitHubToolConfig{
+				Toolset: GitHubToolsets{"dependabot"},
+			},
+			expectMissing: map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionRead,
+			},
+			expectMissingCount: 1,
+			expectHasIssues:    true,
+		},
+		{
+			name: "Dependabot toolset with security-events: read",
+			permissions: NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionRead,
+			}),
+			githubToolConfig: &GitHubToolConfig{
+				Toolset: GitHubToolsets{"dependabot"},
+			},
+			expectMissingCount: 0,
+			expectHasIssues:    false,
+		},
+		{
+			name: "Dependabot toolset with security-events: write",
+			permissions: NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionWrite,
+			}),
+			githubToolConfig: &GitHubToolConfig{
+				Toolset: GitHubToolsets{"dependabot"},
+			},
+			expectMissingCount: 0,
+			expectHasIssues:    false,
+		},
+		{
+			name: "Dependabot toolset with security-events: none should warn",
+			permissions: NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionNone,
+			}),
+			githubToolConfig: &GitHubToolConfig{
+				Toolset: GitHubToolsets{"dependabot"},
+			},
+			expectMissing: map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionRead,
+			},
+			expectMissingCount: 1,
+			expectHasIssues:    true,
 		},
 	}
 
