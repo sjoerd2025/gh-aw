@@ -141,7 +141,7 @@ func (c *Compiler) buildThreatDetectionJob(data *WorkflowData, mainJobName strin
 	job := &Job{
 		Name:           string(constants.DetectionJobName),
 		If:             condition.Render(),
-		RunsOn:         c.formatSafeOutputsRunsOn(data),
+		RunsOn:         "runs-on: ubuntu-latest",
 		Permissions:    permissions,
 		Concurrency:    c.indentYAMLLines(agentConcurrency, "    "),
 		TimeoutMinutes: 10,

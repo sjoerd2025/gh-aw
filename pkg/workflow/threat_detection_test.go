@@ -222,8 +222,8 @@ func TestBuildThreatDetectionJob(t *testing.T) {
 				if job.Name != string(constants.DetectionJobName) {
 					t.Errorf("Expected job name 'detection', got %q", job.Name)
 				}
-				if job.RunsOn != "runs-on: "+constants.DefaultActivationJobRunnerImage {
-					t.Errorf("Expected %s runner, got %q", constants.DefaultActivationJobRunnerImage, job.RunsOn)
+				if job.RunsOn != "runs-on: ubuntu-latest" {
+					t.Errorf("Expected ubuntu-latest runner, got %q", job.RunsOn)
 				}
 				// In dev mode (default), detection job should have contents: read permission for checkout
 				// In release mode, it should have empty permissions
