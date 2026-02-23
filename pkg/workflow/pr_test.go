@@ -45,8 +45,8 @@ func TestShouldGeneratePRCheckoutStep(t *testing.T) {
 			expected:    false,
 		},
 		{
-			name:        "with all: read",
-			permissions: `all: read`,
+			name:        "with read-all shorthand (replaces deprecated all: read)",
+			permissions: "read-all",
 			expected:    true,
 		},
 		{

@@ -549,32 +549,12 @@ func (c *Compiler) addZizmorIgnoreForWorkflowRun(yamlStr string) string {
 
 // extractPermissions extracts permissions from frontmatter using the permission parser
 func (c *Compiler) extractPermissions(frontmatter map[string]any) string {
-	permissionsValue, exists := frontmatter["permissions"]
+	_, exists := frontmatter["permissions"]
 	if !exists {
 		return ""
 	}
 
-	// Check if this is an "all: read" case by using the parser
-	parser := NewPermissionsParserFromValue(permissionsValue)
-
-	// If it's "all: read", use the parser to expand it
-	if parser.hasAll && parser.allLevel == "read" {
-		frontmatterLog.Print("Expanding 'all: read' permissions to individual scopes")
-		permissions := parser.ToPermissions()
-		yaml := permissions.RenderToYAML()
-
-		// Adjust indentation from 6 spaces to 2 spaces for workflow-level permissions
-		// RenderToYAML uses 6 spaces for job-level rendering
-		lines := strings.Split(yaml, "\n")
-		for i := 1; i < len(lines); i++ {
-			if strings.HasPrefix(lines[i], "      ") {
-				lines[i] = "  " + lines[i][6:]
-			}
-		}
-		return strings.Join(lines, "\n")
-	}
-
-	// For all other cases, use standard extraction
+	// Use standard extraction for all permissions formats
 	return c.extractTopLevelYAMLSection(frontmatter, "permissions")
 }
 

@@ -3,7 +3,6 @@
 package workflow
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -298,61 +297,18 @@ func TestPermissionsEdgeCases(t *testing.T) {
 	}
 }
 
-// TestPermissionsAllKeyValidation tests the special 'all' key validation
-func TestPermissionsAllKeyValidation(t *testing.T) {
-	tests := []struct {
-		name        string
-		permissions string
-		expectValid bool
-		description string
-	}{
-		{
-			name:        "all: read is valid",
-			permissions: "permissions:\n  all: read",
-			expectValid: true,
-			description: "all: read grants read access to all scopes",
-		},
-		{
-			name:        "all: write is invalid",
-			permissions: "permissions:\n  all: write",
-			expectValid: false,
-			description: "all: write is not allowed for security reasons",
-		},
-		{
-			name:        "all: read with other read permissions",
-			permissions: "permissions:\n  all: read\n  contents: read",
-			expectValid: true,
-			description: "all: read can be combined with other read permissions",
-		},
-		{
-			name:        "all: read with none permission is invalid",
-			permissions: "permissions:\n  all: read\n  contents: none",
-			expectValid: false,
-			description: "all: read cannot be combined with : none",
-		},
+// TestPermissionsAllKeyRemoved tests that the deprecated 'all' key in permissions is no longer supported
+func TestPermissionsAllKeyRemoved(t *testing.T) {
+	// 'all: read' is no longer supported - the parser should treat it as an unknown scope
+	parser := NewPermissionsParser("permissions:\n  all: read")
+
+	// 'all' should be treated as unknown scope and ignored (no special handling)
+	if parser.isShorthand {
+		t.Error("parser should not be shorthand for 'all: read'")
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			parser := NewPermissionsParser(tt.permissions)
-
-			if tt.expectValid {
-				// For valid cases, check that parser processed them correctly
-				if parser.hasAll && parser.allLevel != "read" {
-					t.Errorf("%s: expected hasAll with level 'read', got level %q", tt.description, parser.allLevel)
-				}
-			} else {
-				// For invalid cases, the parser should not set hasAll for 'all: write'
-				// or should have empty parsedPerms for 'all: read' + ': none' combination
-				if parser.hasAll && len(parser.parsedPerms) == 0 {
-					// This might indicate the combination was rejected
-					return
-				}
-				if strings.Contains(tt.permissions, "all: write") && parser.hasAll {
-					t.Errorf("%s: 'all: write' should not be accepted", tt.description)
-				}
-			}
-		})
+	// The 'all' key should be in parsedPerms but not grant special permissions
+	if parser.HasContentsReadAccess() {
+		t.Error("'all: read' should no longer grant contents read access")
 	}
 }
 

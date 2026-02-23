@@ -15,8 +15,6 @@ type PermissionsParser struct {
 	parsedPerms    map[string]string
 	isShorthand    bool
 	shorthandValue string
-	hasAll         bool
-	allLevel       string
 }
 
 // NewPermissionsParser creates a new PermissionsParser instance
@@ -115,32 +113,6 @@ func (p *PermissionsParser) parse() {
 	if err := yaml.Unmarshal([]byte(yamlContent), &perms); err == nil {
 		permissionsParserLog.Printf("Successfully parsed permissions map with %d keys", len(perms))
 
-		// Handle 'all' key specially
-		if allValue, exists := perms["all"]; exists {
-			if strValue, ok := allValue.(string); ok {
-				permissionsParserLog.Printf("Found 'all' permission with value: %s", strValue)
-				if strValue == "write" {
-					permissionsParserLog.Print("Invalid 'all: write' not allowed, ignoring permissions")
-					// all: write is not allowed - don't set any permissions
-					return
-				}
-				if strValue == "read" {
-					// Check that no other permissions are set to 'none' when all: read is used
-					for key, value := range perms {
-						if key != "all" {
-							if permValue, ok := value.(string); ok && permValue == "none" {
-								permissionsParserLog.Printf("Invalid combination: all: read with %s: none", key)
-								// all: read cannot be combined with : none - don't set any permissions
-								return
-							}
-						}
-					}
-					p.hasAll = true
-					p.allLevel = strValue
-					permissionsParserLog.Print("Set hasAll=true with level=read")
-				}
-			}
-		}
 		// Convert any values to strings
 		for key, value := range perms {
 			if strValue, ok := value.(string); ok {
@@ -168,15 +140,6 @@ func (p *PermissionsParser) HasContentsReadAccess() bool {
 			return false
 		}
 		return false
-	}
-
-	// Handle all: read case
-	if p.hasAll && p.allLevel == "read" {
-		// all: read grants contents access unless explicitly overridden
-		if contentsLevel, exists := p.parsedPerms["contents"]; exists {
-			return contentsLevel == "read" || contentsLevel == "write"
-		}
-		return true
 	}
 
 	// Handle explicit permissions map
@@ -207,24 +170,6 @@ func (p *PermissionsParser) IsAllowed(scope, level string) bool {
 		default:
 			return false
 		}
-	}
-
-	// Handle all: read case
-	if p.hasAll && p.allLevel == "read" {
-		// Check if there's an explicit permission for this scope
-		if permLevel, exists := p.parsedPerms[scope]; exists {
-			if level == "read" {
-				// Read access is allowed if permission is "read" or "write"
-				return permLevel == "read" || permLevel == "write"
-			}
-			return permLevel == level
-		}
-		// No explicit permission, use the "all" default
-		// Special case: id-token doesn't support read level
-		if scope == "id-token" && level == "read" {
-			return false
-		}
-		return level == "read"
 	}
 
 	// Handle explicit permissions map
@@ -259,29 +204,6 @@ func NewPermissionsParserFromValue(permissionsValue any) *PermissionsParser {
 
 	// Handle map format
 	if mapValue, ok := permissionsValue.(map[string]any); ok {
-		// Handle 'all' key specially
-		if allValue, exists := mapValue["all"]; exists {
-			if strValue, ok := allValue.(string); ok {
-				if strValue == "write" {
-					// all: write is not allowed, return empty parser
-					return parser
-				}
-				if strValue == "read" {
-					// Check that no other permissions are set to 'none' when all: read is used
-					for key, value := range mapValue {
-						if key != "all" {
-							if permValue, ok := value.(string); ok && permValue == "none" {
-								// all: read cannot be combined with : none, return empty parser
-								return parser
-							}
-						}
-					}
-					parser.hasAll = true
-					parser.allLevel = strValue
-				}
-			}
-		}
-
 		for key, value := range mapValue {
 			if strValue, ok := value.(string); ok {
 				parser.parsedPerms[key] = strValue
@@ -312,30 +234,9 @@ func (p *PermissionsParser) ToPermissions() *Permissions {
 		}
 	}
 
-	// Handle all: read case
-	if p.hasAll && p.allLevel == "read" {
-		perms := NewPermissionsAllRead()
-
-		// Apply explicit overrides from parsedPerms
-		for key, value := range p.parsedPerms {
-			if key == "all" {
-				continue // Skip the "all" key itself
-			}
-			scope := convertStringToPermissionScope(key)
-			if scope != "" {
-				perms.Set(scope, PermissionLevel(value))
-			}
-		}
-
-		return perms
-	}
-
 	// Handle explicit permissions map
 	permsMap := make(map[PermissionScope]PermissionLevel)
 	for key, value := range p.parsedPerms {
-		if key == "all" {
-			continue // Skip the "all" key
-		}
 		scope := convertStringToPermissionScope(key)
 		if scope != "" {
 			permsMap[scope] = PermissionLevel(value)

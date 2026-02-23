@@ -56,12 +56,10 @@ func NewPermissionsFromMap(perms map[PermissionScope]PermissionLevel) *Permissio
 	return p
 }
 
-// NewPermissionsAllRead creates a Permissions with all: read
+// NewPermissionsAllRead creates Permissions equivalent to read-all shorthand.
+// Deprecated: Use NewPermissionsReadAll() instead. This function exists for backward compatibility.
 func NewPermissionsAllRead() *Permissions {
-	return &Permissions{
-		hasAll:   true,
-		allLevel: PermissionRead,
-	}
+	return NewPermissionsReadAll()
 }
 
 // Helper functions for common permission patterns

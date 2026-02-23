@@ -7,6 +7,92 @@ import (
 	"github.com/github/gh-aw/pkg/logger"
 )
 
+var permissionsAllCodemodLog = logger.New("cli:codemod_permissions_all")
+
+// getPermissionsAllCodemod creates a codemod for converting the deprecated "all: read" syntax
+// to the "read-all" shorthand
+func getPermissionsAllCodemod() Codemod {
+	return Codemod{
+		ID:           "permissions-all-to-read-all",
+		Name:         "Convert permissions all: read to read-all",
+		Description:  "Converts 'permissions:\\n  all: read' to 'permissions: read-all' as the 'all' key is no longer supported",
+		IntroducedIn: "0.6.0",
+		Apply: func(content string, frontmatter map[string]any) (string, bool, error) {
+			permissionsValue, hasPermissions := frontmatter["permissions"]
+			if !hasPermissions {
+				return content, false, nil
+			}
+
+			// Check if permissions uses "all: read" map syntax
+			mapValue, isMap := permissionsValue.(map[string]any)
+			if !isMap {
+				return content, false, nil
+			}
+
+			allValue, hasAll := mapValue["all"]
+			if !hasAll {
+				return content, false, nil
+			}
+
+			allStr, ok := allValue.(string)
+			if !ok || allStr != "read" {
+				return content, false, nil
+			}
+
+			// Parse frontmatter to get raw lines
+			frontmatterLines, markdown, err := parseFrontmatterLines(content)
+			if err != nil {
+				return content, false, err
+			}
+
+			// Find the permissions block and replace it
+			var modified bool
+			var inPermissionsBlock bool
+			var permissionsIndent string
+			var permissionsLineIdx int
+			result := make([]string, 0, len(frontmatterLines))
+
+			for i, line := range frontmatterLines {
+				trimmedLine := strings.TrimSpace(line)
+
+				if strings.HasPrefix(trimmedLine, "permissions:") {
+					inPermissionsBlock = true
+					permissionsIndent = getIndentation(line)
+					permissionsLineIdx = i
+					// Replace the permissions: block header with the shorthand
+					result = append(result, permissionsIndent+"permissions: read-all")
+					modified = true
+					permissionsAllCodemodLog.Printf("Replaced permissions block start on line %d", i+1)
+					continue
+				}
+
+				// Check if we've exited the permissions block
+				if inPermissionsBlock && len(trimmedLine) > 0 && !strings.HasPrefix(trimmedLine, "#") {
+					if hasExitedBlock(line, permissionsIndent) {
+						inPermissionsBlock = false
+					}
+				}
+
+				// Skip lines inside the permissions block (they are replaced by the shorthand)
+				if inPermissionsBlock && permissionsLineIdx >= 0 {
+					permissionsAllCodemodLog.Printf("Skipping permissions block line %d: %s", i+1, trimmedLine)
+					continue
+				}
+
+				result = append(result, line)
+			}
+
+			if !modified {
+				return content, false, nil
+			}
+
+			newContent := reconstructContent(result, markdown)
+			permissionsAllCodemodLog.Print("Applied permissions all: read to read-all migration")
+			return newContent, true, nil
+		},
+	}
+}
+
 var permissionsReadCodemodLog = logger.New("cli:codemod_permissions_read")
 
 // getPermissionsReadCodemod creates a codemod for converting invalid "read" and "write" shorthands

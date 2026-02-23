@@ -44,14 +44,11 @@ func convertStringToPermissionScope(key string) PermissionScope {
 			return PermissionSecurityEvents
 		case "statuses":
 			return PermissionStatuses
-		case "all":
-			// "all" is a meta-key handled at the parser level; it is not a real scope
-			return ""
 		default:
 			return ""
 		}
 	}()
-	if scope == "" && key != "all" {
+	if scope == "" {
 		permissionsLog.Printf("Unknown permission scope key: %s", key)
 	}
 	return scope
@@ -113,12 +110,9 @@ func GetAllPermissionScopes() []PermissionScope {
 }
 
 // Permissions represents GitHub Actions permissions
-// It can be a shorthand (read-all, write-all, read, write, none) or a map of scopes to levels
-// It can also have an "all" permission that expands to all scopes
+// It can be a shorthand (read-all, write-all, none) or a map of scopes to levels
 type Permissions struct {
 	shorthand     string
 	permissions   map[PermissionScope]PermissionLevel
-	hasAll        bool
-	allLevel      PermissionLevel
 	explicitEmpty bool // When true, renders "permissions: {}" even if no permissions are set
 }
