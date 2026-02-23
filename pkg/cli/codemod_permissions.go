@@ -45,7 +45,6 @@ func getPermissionsAllCodemod() Codemod {
 			}
 
 			// Find the permissions block and replace it
-			var modified bool
 			var inPermissionsBlock bool
 			var permissionsIndent string
 			var permissionsLineIdx int
@@ -81,12 +80,7 @@ func getPermissionsAllCodemod() Codemod {
 			result = append(result, frontmatterLines[:permissionsLineIdx]...)
 			result = append(result, permissionsIndent+"permissions: read-all")
 			result = append(result, frontmatterLines[blockEndIdx+1:]...)
-			modified = true
 			permissionsAllCodemodLog.Printf("Replaced 'permissions: all: read' with 'permissions: read-all'")
-
-			if !modified {
-				return content, false, nil
-			}
 
 			newContent := reconstructContent(result, markdown)
 			return newContent, true, nil
