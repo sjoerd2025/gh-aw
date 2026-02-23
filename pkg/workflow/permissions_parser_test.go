@@ -482,113 +482,6 @@ pull-requests: read`,
 	}
 }
 
-func TestPermissionsParser_AllRead(t *testing.T) {
-	tests := []struct {
-		name        string
-		permissions string
-		expected    bool
-		scope       string
-		level       string
-	}{
-		{
-			name: "all: read grants contents read access",
-			permissions: `permissions:
-  all: read
-  contents: write`,
-			expected: true,
-			scope:    "contents",
-			level:    "read",
-		},
-		{
-			name: "all: read grants contents write access when overridden",
-			permissions: `permissions:
-  all: read
-  contents: write`,
-			expected: true,
-			scope:    "contents",
-			level:    "write",
-		},
-		{
-			name: "all: read grants issues read access",
-			permissions: `permissions:
-  all: read
-  contents: write`,
-			expected: true,
-			scope:    "issues",
-			level:    "read",
-		},
-		{
-			name: "all: read denies issues write access by default",
-			permissions: `permissions:
-  all: read`,
-			expected: false,
-			scope:    "issues",
-			level:    "write",
-		},
-		{
-			name: "all: read with explicit write override",
-			permissions: `permissions:
-  all: read
-  issues: write`,
-			expected: true,
-			scope:    "issues",
-			level:    "write",
-		},
-		{
-			name: "all: write is not allowed - should fail parsing",
-			permissions: `permissions:
-  all: write`,
-			expected: false,
-			scope:    "contents",
-			level:    "read",
-		},
-		{
-			name: "all: read with none is not allowed - should fail parsing",
-			permissions: `permissions:
-  all: read
-  contents: none`,
-			expected: false,
-			scope:    "contents",
-			level:    "read",
-		},
-		{
-			name: "all: read grants id-token write access when overridden",
-			permissions: `permissions:
-  all: read
-  id-token: write`,
-			expected: true,
-			scope:    "id-token",
-			level:    "write",
-		},
-		{
-			name: "all: read does not grant id-token read access (not supported)",
-			permissions: `permissions:
-  all: read`,
-			expected: false,
-			scope:    "id-token",
-			level:    "read",
-		},
-		{
-			name: "all: read denies id-token write access by default (not included in expansion)",
-			permissions: `permissions:
-  all: read`,
-			expected: false,
-			scope:    "id-token",
-			level:    "write",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			parser := NewPermissionsParser(tt.permissions)
-			result := parser.IsAllowed(tt.scope, tt.level)
-			if result != tt.expected {
-				t.Errorf("IsAllowed(%s, %s) = %v, want %v", tt.scope, tt.level, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestPermissionsParser_ToPermissions(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -608,74 +501,12 @@ func TestPermissionsParser_ToPermissions(t *testing.T) {
 			wantYAML: "permissions: write-all",
 		},
 		{
-			name: "all: read without overrides",
-			input: map[string]any{
-				"all": "read",
-			},
-			contains: []string{
-				"permissions:",
-				"      actions: read",
-				"      contents: read",
-				"      issues: read",
-			},
-			notContains: []string{
-				"      id-token: read", // id-token doesn't support read
-			},
-		},
-		{
-			name: "all: read with contents: write override",
-			input: map[string]any{
-				"all":      "read",
-				"contents": "write",
-			},
-			contains: []string{
-				"permissions:",
-				"      actions: read",
-				"      contents: write", // Override
-				"      issues: read",
-			},
-			notContains: []string{
-				"      contents: read",
-			},
-		},
-		{
-			name: "all: read with id-token: write override",
-			input: map[string]any{
-				"all":      "read",
-				"id-token": "write",
-			},
-			contains: []string{
-				"permissions:",
-				"      actions: read",
-				"      contents: read",
-				"      id-token: write", // Explicitly set
-			},
-			notContains: []string{
-				"      id-token: read",
-			},
-		},
-		{
 			name: "explicit permissions without all",
 			input: map[string]any{
 				"contents": "read",
 				"issues":   "write",
 			},
 			wantYAML: "permissions:\n      contents: read\n      issues: write",
-		},
-		{
-			name: "all: write is not allowed",
-			input: map[string]any{
-				"all": "write",
-			},
-			wantYAML: "",
-		},
-		{
-			name: "all: read with none is not allowed",
-			input: map[string]any{
-				"all":      "read",
-				"contents": "none",
-			},
-			wantYAML: "",
 		},
 	}
 

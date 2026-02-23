@@ -56,14 +56,6 @@ func NewPermissionsFromMap(perms map[PermissionScope]PermissionLevel) *Permissio
 	return p
 }
 
-// NewPermissionsAllRead creates a Permissions with all: read
-func NewPermissionsAllRead() *Permissions {
-	return &Permissions{
-		hasAll:   true,
-		allLevel: PermissionRead,
-	}
-}
-
 // Helper functions for common permission patterns
 
 // NewPermissionsContentsRead creates permissions with contents: read

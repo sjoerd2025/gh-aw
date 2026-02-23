@@ -1501,9 +1501,6 @@
         {
           "contents": "read",
           "actions": "read"
-        },
-        {
-          "all": "read"
         }
       ],
       "oneOf": [
@@ -1601,11 +1598,6 @@
               "type": "string",
               "enum": ["read", "write", "none"],
               "description": "Permission level for commit statuses (read/write/none). Controls access to create and update commit status checks."
-            },
-            "all": {
-              "type": "string",
-              "enum": ["read"],
-              "description": "Permission shorthand that applies read access to all permission scopes. Can be combined with specific write permissions to override individual scopes. 'write' is not allowed for all."
             }
           }
         }

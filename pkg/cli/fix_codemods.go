@@ -23,6 +23,7 @@ func GetAllCodemods() []Codemod {
 		getCommandToSlashCommandCodemod(),
 		getSafeInputsModeCodemod(),
 		getUploadAssetsCodemod(),
+		getPermissionsAllToReadAllCodemod(), // Convert permissions: {all: read} -> permissions: read-all
 		getWritePermissionsCodemod(),
 		getPermissionsReadCodemod(), // Fix permissions: read -> permissions: read-all
 		getAgentTaskToAgentSessionCodemod(),

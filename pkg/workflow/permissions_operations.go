@@ -29,21 +29,6 @@ func (p *Permissions) Set(scope PermissionScope, level PermissionLevel) {
 			p.permissions = make(map[PermissionScope]PermissionLevel)
 		}
 	}
-	if p.hasAll {
-		// Convert from all to explicit map
-		permissionsOpsLog.Printf("Converting from all:%s to explicit map", p.allLevel)
-		if p.permissions == nil {
-			p.permissions = make(map[PermissionScope]PermissionLevel)
-		}
-		// Expand all permissions to explicit permissions first
-		for _, s := range GetAllPermissionScopes() {
-			if _, exists := p.permissions[s]; !exists {
-				p.permissions[s] = p.allLevel
-			}
-		}
-		p.hasAll = false
-		p.allLevel = ""
-	}
 	p.permissions[scope] = level
 }
 
@@ -62,18 +47,9 @@ func (p *Permissions) Get(scope PermissionScope) (PermissionLevel, bool) {
 		return "", false
 	}
 
-	// Check explicit permission first
+	// Check explicit permission
 	if level, exists := p.permissions[scope]; exists {
 		return level, true
-	}
-
-	// If we have all: read, return that as default for any scope not explicitly set
-	if p.hasAll {
-		// Special case: id-token doesn't support read level
-		if scope == PermissionIdToken && p.allLevel == PermissionRead {
-			return "", false
-		}
-		return p.allLevel, true
 	}
 
 	return "", false
@@ -109,45 +85,6 @@ func (p *Permissions) Merge(other *Permissions) {
 
 	if permissionsOpsLog.Enabled() {
 		permissionsOpsLog.Printf("Merging permissions: current_perms_count=%d, other_perms_count=%d", len(p.permissions), len(other.permissions))
-	}
-
-	// Handle all permissions - convert to explicit first if needed
-	if p.hasAll || other.hasAll {
-		// Convert both to explicit maps
-		if p.hasAll {
-			if p.permissions == nil {
-				p.permissions = make(map[PermissionScope]PermissionLevel)
-			}
-			for _, scope := range GetAllPermissionScopes() {
-				if _, exists := p.permissions[scope]; !exists {
-					// Skip id-token when level is read since it doesn't support read
-					if scope == PermissionIdToken && p.allLevel == PermissionRead {
-						continue
-					}
-					p.permissions[scope] = p.allLevel
-				}
-			}
-			p.hasAll = false
-			p.allLevel = ""
-		}
-		if other.hasAll {
-			if other.permissions == nil {
-				// Create a temporary map for merging
-				tempPerms := make(map[PermissionScope]PermissionLevel)
-				for _, scope := range GetAllPermissionScopes() {
-					// Skip id-token when level is read since it doesn't support read
-					if scope == PermissionIdToken && other.allLevel == PermissionRead {
-						continue
-					}
-					tempPerms[scope] = other.allLevel
-				}
-				// Merge the temporary map
-				p.mergePermissionMaps(tempPerms)
-				// Also merge explicit permissions from other if any
-				p.mergePermissionMaps(other.permissions)
-				return
-			}
-		}
 	}
 
 	// If other has shorthand, we need to handle it specially
@@ -212,28 +149,6 @@ func (p *Permissions) RenderToYAML() string {
 
 	// Collect all permissions to render
 	allPerms := make(map[PermissionScope]PermissionLevel)
-
-	if p.hasAll {
-		// Expand all: read/write to individual permissions
-		for _, scope := range GetAllPermissionScopes() {
-			// Skip id-token when expanding all: read since id-token doesn't support read level
-			if scope == PermissionIdToken && p.allLevel == PermissionRead {
-				continue
-			}
-			// Skip discussions when expanding all: read unless explicitly set
-			// This prevents issues in GitHub Enterprise where discussions might not be available
-			// Discussions permission should be added explicitly or via safe-outputs that need it
-			if scope == PermissionDiscussions && p.allLevel == PermissionRead {
-				// Only include if explicitly set in permissions map
-				if _, explicitlySet := p.permissions[PermissionDiscussions]; !explicitlySet {
-					continue
-				}
-			}
-			allPerms[scope] = p.allLevel
-		}
-	}
-
-	// Override with explicit permissions
 	maps.Copy(allPerms, p.permissions)
 
 	if len(allPerms) == 0 {

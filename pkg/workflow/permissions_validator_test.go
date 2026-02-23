@@ -358,8 +358,8 @@ func TestValidatePermissions_ComplexScenarios(t *testing.T) {
 			},
 		},
 		{
-			name:        "All: read with discussions toolset",
-			permissions: NewPermissionsAllRead(),
+			name:        "read-all with discussions toolset",
+			permissions: NewPermissionsReadAll(),
 			githubToolConfig: &GitHubToolConfig{
 				Toolset:  GitHubToolsets{"discussions"},
 				ReadOnly: false,
