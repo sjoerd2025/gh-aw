@@ -7,6 +7,93 @@ import (
 	"github.com/github/gh-aw/pkg/logger"
 )
 
+var permissionsAllCodemodLog = logger.New("cli:codemod_permissions_all")
+
+// getPermissionsAllCodemod creates a codemod for converting "permissions:\n  all: read" to "permissions: read-all"
+func getPermissionsAllCodemod() Codemod {
+	return Codemod{
+		ID:           "permissions-all-to-read-all",
+		Name:         "Convert permissions all: read to read-all shorthand",
+		Description:  "Converts 'permissions:\\n  all: read' map syntax to 'permissions: read-all' shorthand as the map syntax is no longer supported",
+		IntroducedIn: "0.6.0",
+		Apply: func(content string, frontmatter map[string]any) (string, bool, error) {
+			// Check if permissions exist and is a map with an "all" key
+			permissionsValue, hasPermissions := frontmatter["permissions"]
+			if !hasPermissions {
+				return content, false, nil
+			}
+
+			mapValue, isMap := permissionsValue.(map[string]any)
+			if !isMap {
+				return content, false, nil
+			}
+
+			allValue, hasAll := mapValue["all"]
+			if !hasAll {
+				return content, false, nil
+			}
+
+			allStr, ok := allValue.(string)
+			if !ok || allStr != "read" {
+				return content, false, nil
+			}
+
+			// Parse frontmatter to get raw lines
+			frontmatterLines, markdown, err := parseFrontmatterLines(content)
+			if err != nil {
+				return content, false, err
+			}
+
+			// Find the permissions block and replace it
+			var modified bool
+			var inPermissionsBlock bool
+			var permissionsIndent string
+			var permissionsLineIdx int
+			var blockEndIdx int
+
+			for i, line := range frontmatterLines {
+				trimmedLine := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmedLine, "permissions:") {
+					inPermissionsBlock = true
+					permissionsIndent = getIndentation(line)
+					permissionsLineIdx = i
+					blockEndIdx = i
+					continue
+				}
+				if inPermissionsBlock {
+					if trimmedLine == "" || strings.HasPrefix(trimmedLine, "#") {
+						blockEndIdx = i
+						continue
+					}
+					if hasExitedBlock(line, permissionsIndent) {
+						break
+					}
+					blockEndIdx = i
+				}
+			}
+
+			if !inPermissionsBlock {
+				return content, false, nil
+			}
+
+			// Replace the entire permissions block with "permissions: read-all"
+			result := make([]string, 0, len(frontmatterLines))
+			result = append(result, frontmatterLines[:permissionsLineIdx]...)
+			result = append(result, permissionsIndent+"permissions: read-all")
+			result = append(result, frontmatterLines[blockEndIdx+1:]...)
+			modified = true
+			permissionsAllCodemodLog.Printf("Replaced 'permissions: all: read' with 'permissions: read-all'")
+
+			if !modified {
+				return content, false, nil
+			}
+
+			newContent := reconstructContent(result, markdown)
+			return newContent, true, nil
+		},
+	}
+}
+
 var permissionsReadCodemodLog = logger.New("cli:codemod_permissions_read")
 
 // getPermissionsReadCodemod creates a codemod for converting invalid "read" and "write" shorthands

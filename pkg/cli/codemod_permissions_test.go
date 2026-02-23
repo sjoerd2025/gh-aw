@@ -428,3 +428,139 @@ This workflow needs permissions.`
 	assert.Contains(t, result, "# Test Workflow")
 	assert.Contains(t, result, "This workflow needs permissions.")
 }
+
+func TestGetPermissionsAllCodemod(t *testing.T) {
+	codemod := getPermissionsAllCodemod()
+
+	assert.Equal(t, "permissions-all-to-read-all", codemod.ID)
+	assert.Equal(t, "Convert permissions all: read to read-all shorthand", codemod.Name)
+	assert.NotEmpty(t, codemod.Description)
+	assert.Equal(t, "0.6.0", codemod.IntroducedIn)
+	require.NotNil(t, codemod.Apply)
+}
+
+func TestPermissionsAllCodemod_SimpleAllRead(t *testing.T) {
+	codemod := getPermissionsAllCodemod()
+
+	content := `---
+on: workflow_dispatch
+permissions:
+  all: read
+---
+
+# Test`
+
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"permissions": map[string]any{
+			"all": "read",
+		},
+	}
+
+	result, applied, err := codemod.Apply(content, frontmatter)
+
+	require.NoError(t, err)
+	assert.True(t, applied)
+	assert.Contains(t, result, "permissions: read-all")
+	assert.NotContains(t, result, "all: read")
+}
+
+func TestPermissionsAllCodemod_NoChange_NoPermissions(t *testing.T) {
+	codemod := getPermissionsAllCodemod()
+
+	content := `---
+on: workflow_dispatch
+timeout-minutes: 30
+---
+
+# Test`
+
+	frontmatter := map[string]any{
+		"on":              "workflow_dispatch",
+		"timeout-minutes": 30,
+	}
+
+	result, applied, err := codemod.Apply(content, frontmatter)
+
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Equal(t, content, result)
+}
+
+func TestPermissionsAllCodemod_NoChange_ShorthandReadAll(t *testing.T) {
+	codemod := getPermissionsAllCodemod()
+
+	content := `---
+on: workflow_dispatch
+permissions: read-all
+---
+
+# Test`
+
+	frontmatter := map[string]any{
+		"on":          "workflow_dispatch",
+		"permissions": "read-all",
+	}
+
+	result, applied, err := codemod.Apply(content, frontmatter)
+
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Equal(t, content, result)
+}
+
+func TestPermissionsAllCodemod_NoChange_MapFormat(t *testing.T) {
+	codemod := getPermissionsAllCodemod()
+
+	content := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+  issues: read
+---
+
+# Test`
+
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"permissions": map[string]any{
+			"contents": "read",
+			"issues":   "read",
+		},
+	}
+
+	result, applied, err := codemod.Apply(content, frontmatter)
+
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Equal(t, content, result)
+}
+
+func TestPermissionsAllCodemod_PreservesMarkdown(t *testing.T) {
+	codemod := getPermissionsAllCodemod()
+
+	content := `---
+on: workflow_dispatch
+permissions:
+  all: read
+---
+
+# Test Workflow
+
+This workflow needs permissions.`
+
+	frontmatter := map[string]any{
+		"on": "workflow_dispatch",
+		"permissions": map[string]any{
+			"all": "read",
+		},
+	}
+
+	result, applied, err := codemod.Apply(content, frontmatter)
+
+	require.NoError(t, err)
+	assert.True(t, applied)
+	assert.Contains(t, result, "permissions: read-all")
+	assert.Contains(t, result, "# Test Workflow")
+	assert.Contains(t, result, "This workflow needs permissions.")
+}

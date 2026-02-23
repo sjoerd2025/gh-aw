@@ -491,16 +491,15 @@ func TestPermissionsParser_AllRead(t *testing.T) {
 		level       string
 	}{
 		{
-			name: "all: read grants contents read access",
+			name: "all: read no longer grants contents read access (all key is deprecated/ignored)",
 			permissions: `permissions:
-  all: read
-  contents: write`,
-			expected: true,
+  all: read`,
+			expected: false,
 			scope:    "contents",
 			level:    "read",
 		},
 		{
-			name: "all: read grants contents write access when overridden",
+			name: "explicit contents: write still grants write access even when combined with all: read",
 			permissions: `permissions:
   all: read
   contents: write`,
@@ -509,16 +508,16 @@ func TestPermissionsParser_AllRead(t *testing.T) {
 			level:    "write",
 		},
 		{
-			name: "all: read grants issues read access",
+			name: "all: read no longer grants issues read access (all key is deprecated/ignored)",
 			permissions: `permissions:
   all: read
   contents: write`,
-			expected: true,
+			expected: false,
 			scope:    "issues",
 			level:    "read",
 		},
 		{
-			name: "all: read denies issues write access by default",
+			name: "all: read with no overrides denies issues write access",
 			permissions: `permissions:
   all: read`,
 			expected: false,
@@ -526,16 +525,15 @@ func TestPermissionsParser_AllRead(t *testing.T) {
 			level:    "write",
 		},
 		{
-			name: "all: read with explicit write override",
+			name: "explicit issues: write still grants write access",
 			permissions: `permissions:
-  all: read
   issues: write`,
 			expected: true,
 			scope:    "issues",
 			level:    "write",
 		},
 		{
-			name: "all: write is not allowed - should fail parsing",
+			name: "all: write is ignored - no contents read",
 			permissions: `permissions:
   all: write`,
 			expected: false,
@@ -543,7 +541,7 @@ func TestPermissionsParser_AllRead(t *testing.T) {
 			level:    "read",
 		},
 		{
-			name: "all: read with none is not allowed - should fail parsing",
+			name: "all: read with contents: none - contents read is denied (explicit override)",
 			permissions: `permissions:
   all: read
   contents: none`,
@@ -552,16 +550,15 @@ func TestPermissionsParser_AllRead(t *testing.T) {
 			level:    "read",
 		},
 		{
-			name: "all: read grants id-token write access when overridden",
+			name: "explicit id-token: write grants write access",
 			permissions: `permissions:
-  all: read
   id-token: write`,
 			expected: true,
 			scope:    "id-token",
 			level:    "write",
 		},
 		{
-			name: "all: read does not grant id-token read access (not supported)",
+			name: "all: read alone does not grant id-token read access (all key is deprecated/ignored)",
 			permissions: `permissions:
   all: read`,
 			expected: false,
@@ -569,7 +566,7 @@ func TestPermissionsParser_AllRead(t *testing.T) {
 			level:    "read",
 		},
 		{
-			name: "all: read denies id-token write access by default (not included in expansion)",
+			name: "all: read alone denies id-token write access",
 			permissions: `permissions:
   all: read`,
 			expected: false,
@@ -591,11 +588,12 @@ func TestPermissionsParser_AllRead(t *testing.T) {
 
 func TestPermissionsParser_ToPermissions(t *testing.T) {
 	tests := []struct {
-		name        string
-		input       any
-		wantYAML    string
-		contains    []string
-		notContains []string
+		name          string
+		input         any
+		wantYAML      string
+		wantEmptyYAML bool
+		contains      []string
+		notContains   []string
 	}{
 		{
 			name:     "shorthand read-all",
@@ -608,53 +606,6 @@ func TestPermissionsParser_ToPermissions(t *testing.T) {
 			wantYAML: "permissions: write-all",
 		},
 		{
-			name: "all: read without overrides",
-			input: map[string]any{
-				"all": "read",
-			},
-			contains: []string{
-				"permissions:",
-				"      actions: read",
-				"      contents: read",
-				"      issues: read",
-			},
-			notContains: []string{
-				"      id-token: read", // id-token doesn't support read
-			},
-		},
-		{
-			name: "all: read with contents: write override",
-			input: map[string]any{
-				"all":      "read",
-				"contents": "write",
-			},
-			contains: []string{
-				"permissions:",
-				"      actions: read",
-				"      contents: write", // Override
-				"      issues: read",
-			},
-			notContains: []string{
-				"      contents: read",
-			},
-		},
-		{
-			name: "all: read with id-token: write override",
-			input: map[string]any{
-				"all":      "read",
-				"id-token": "write",
-			},
-			contains: []string{
-				"permissions:",
-				"      actions: read",
-				"      contents: read",
-				"      id-token: write", // Explicitly set
-			},
-			notContains: []string{
-				"      id-token: read",
-			},
-		},
-		{
 			name: "explicit permissions without all",
 			input: map[string]any{
 				"contents": "read",
@@ -663,19 +614,12 @@ func TestPermissionsParser_ToPermissions(t *testing.T) {
 			wantYAML: "permissions:\n      contents: read\n      issues: write",
 		},
 		{
-			name: "all: write is not allowed",
+			name: "all: read map key is no longer supported (treated as unknown key)",
 			input: map[string]any{
-				"all": "write",
+				"all": "read",
 			},
-			wantYAML: "",
-		},
-		{
-			name: "all: read with none is not allowed",
-			input: map[string]any{
-				"all":      "read",
-				"contents": "none",
-			},
-			wantYAML: "",
+			wantYAML:      "",
+			wantEmptyYAML: true,
 		},
 	}
 
@@ -684,6 +628,13 @@ func TestPermissionsParser_ToPermissions(t *testing.T) {
 			parser := NewPermissionsParserFromValue(tt.input)
 			permissions := parser.ToPermissions()
 			yaml := permissions.RenderToYAML()
+
+			if tt.wantEmptyYAML {
+				if yaml != "" {
+					t.Errorf("ToPermissions().RenderToYAML() = %q, want empty string", yaml)
+				}
+				return
+			}
 
 			if tt.wantYAML != "" && yaml != tt.wantYAML {
 				t.Errorf("ToPermissions().RenderToYAML() = %q, want %q", yaml, tt.wantYAML)

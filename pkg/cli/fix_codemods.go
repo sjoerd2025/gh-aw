@@ -25,6 +25,7 @@ func GetAllCodemods() []Codemod {
 		getUploadAssetsCodemod(),
 		getWritePermissionsCodemod(),
 		getPermissionsReadCodemod(), // Fix permissions: read -> permissions: read-all
+		getPermissionsAllCodemod(),  // Fix permissions: all: read -> permissions: read-all
 		getAgentTaskToAgentSessionCodemod(),
 		getSandboxFalseToAgentFalseCodemod(), // Convert sandbox: false to sandbox.agent: false
 		getScheduleAtToAroundCodemod(),
