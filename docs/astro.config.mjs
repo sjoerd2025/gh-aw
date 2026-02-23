@@ -231,6 +231,7 @@ export default defineConfig({
 						{ label: 'Network Access', link: '/reference/network/' },
 						{ label: 'Permissions', link: '/reference/permissions/' },
 						{ label: 'Rate Limiting Controls', link: '/reference/rate-limiting-controls/' },
+					{ label: 'Runners', link: '/reference/runners/' },
 						{ label: 'Repo Memory', link: '/reference/repo-memory/' },
 						{ label: 'Safe Inputs', link: '/reference/safe-inputs/' },
 						{ label: 'Safe Inputs (Spec)', link: '/reference/safe-inputs-specification/' },
