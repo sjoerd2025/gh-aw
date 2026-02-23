@@ -174,9 +174,18 @@ Use this when you need different permission levels for MCP server operations ver
 
 **When to use**:
 
-- You need different permission levels for MCP server vs. other operations.
-- You want to isolate MCP server authentication from general workflow authentication.
-- You are using remote GitHub MCP mode and need a token with specific scopes.
+The default `GITHUB_TOKEN` provided by GitHub Actions is scoped to the current repository and cannot access certain GitHub APIs. Use `GH_AW_GITHUB_MCP_SERVER_TOKEN` in these specific cases:
+
+- **GitHub Projects operations**: The default `GITHUB_TOKEN` cannot access the GitHub Projects v2 API. When using the `projects` toolset to read or update project boards, you need a PAT with `project` scope (classic) or `projects: read/write` organization permission (fine-grained). See [`GH_AW_PROJECT_GITHUB_TOKEN`](#gh_aw_project_github_token) for a Projects-dedicated alternative.
+
+- **Cross-repository search in an organization**: The default `GITHUB_TOKEN` is scoped to the current repository and cannot search private repositories elsewhere in the organization. When using the `search` toolset to find issues, code, or repositories across an org's private repos, you need a PAT with `repo` scope or an org-scoped fine-grained PAT.
+
+- **Remote GitHub MCP server features requiring a personal token**: When using `mode: remote`, certain hosted GitHub MCP server features require a PAT rather than a `GITHUB_TOKEN`:
+  - **Semantic issue search** (`experiments` toolset): Natural-language search across issues requires a PAT.
+  - **Organization-level operations** (`orgs` toolset): Reading or writing org-level data requires a PAT with `read:org` scope.
+  - **User notifications** (`notifications` toolset): Accessing notifications is user-scoped and cannot be performed with a repository-scoped `GITHUB_TOKEN`.
+  - **Gists** (`gists` toolset): Reading or creating gists requires a PAT with `gist` scope.
+  - **Discussions** (`discussions` toolset): Some discussion operations may require a PAT when working with private repositories outside the workflow's repository.
 
 **Setup**:
 
