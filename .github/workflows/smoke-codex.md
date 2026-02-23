@@ -12,6 +12,7 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  security-events: read
 name: Smoke Codex
 engine: codex
 strict: true
@@ -26,6 +27,7 @@ network:
 tools:
   cache-memory: true
   github:
+    toolsets: [default, dependabot]
   playwright:
   edit:
   bash:
@@ -83,6 +85,7 @@ timeout-minutes: 15
 5. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-codex-${{ github.run_id }}.txt` with content "Smoke test passed for Codex at $(date)" (create the directory if it doesn't exist)
 6. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)
 7. **Build gh-aw**: Run `GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod make build` to verify the agent can successfully build the gh-aw project (both caches must be set to /tmp because the default cache locations are not writable). If the command fails, mark this test as ❌ and report the failure.
+8. **Dependabot Testing**: Use the GitHub MCP `list_dependabot_alerts` tool to list up to 1 Dependabot alert from ${{ github.repository }}. An empty result is acceptable — just record whether any alerts were returned.
 
 ## Output
 

@@ -28,7 +28,7 @@
 #     - shared/gh.md
 #     - shared/reporting.md
 #
-# gh-aw-metadata: {"schema_version":"v1","frontmatter_hash":"fbb9ed29477ed621b1c3827b01a8f7bf0052063618b2900bb1e739453a3aa770"}
+# gh-aw-metadata: {"schema_version":"v1","frontmatter_hash":"59dfabec6f64b9a1721960f5ae83afe09d32dfeed26e685bd773fbd0ad9f7512"}
 
 name: "Smoke Codex"
 "on":
@@ -274,6 +274,7 @@ jobs:
       contents: read
       issues: read
       pull-requests: read
+      security-events: read
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       GH_AW_ASSETS_ALLOWED_EXTS: ""
@@ -1045,7 +1046,7 @@ jobs:
           startup_timeout_sec = 120
           tool_timeout_sec = 60
           container = "ghcr.io/github/github-mcp-server:v0.31.0"
-          env = { "GITHUB_PERSONAL_ACCESS_TOKEN" = "$GH_AW_GITHUB_TOKEN", "GITHUB_READ_ONLY" = "1", "GITHUB_TOOLSETS" = "context,repos,issues,pull_requests" }
+          env = { "GITHUB_PERSONAL_ACCESS_TOKEN" = "$GH_AW_GITHUB_TOKEN", "GITHUB_READ_ONLY" = "1", "GITHUB_TOOLSETS" = "context,repos,issues,pull_requests,dependabot" }
           env_vars = ["GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_READ_ONLY", "GITHUB_TOOLSETS"]
           
           [mcp_servers.playwright]
@@ -1106,7 +1107,7 @@ jobs:
                   "GITHUB_LOCKDOWN_MODE": "$GITHUB_MCP_LOCKDOWN",
                   "GITHUB_PERSONAL_ACCESS_TOKEN": "$GITHUB_MCP_SERVER_TOKEN",
                   "GITHUB_READ_ONLY": "1",
-                  "GITHUB_TOOLSETS": "context,repos,issues,pull_requests"
+                  "GITHUB_TOOLSETS": "context,repos,issues,pull_requests,dependabot"
                 }
               },
               "playwright": {
