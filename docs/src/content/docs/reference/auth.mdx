@@ -22,6 +22,7 @@ You will need one of the following GitHub Actions secrets configured in your rep
 - **Copilot** – Add [`COPILOT_GITHUB_TOKEN`](#copilot_github_token)
 - **Claude by Anthropic** – Add [`ANTHROPIC_API_KEY`](#anthropic_api_key)
 - **Codex by OpenAI** – Add [`OPENAI_API_KEY`](#openai_api_key)
+- **Gemini by Google** – Add [`GEMINI_API_KEY`](#gemini_api_key)
 
 Depending on what your workflow needs to do, you may need additional GitHub tokens added as repository secrets:
 
@@ -49,8 +50,7 @@ You can also check existing secrets with:
 gh aw secrets bootstrap
 ```
 
-> [!NOTE]
-> The `gh aw secrets set` command does not work in GitHub Codespaces. If you're working in Codespaces, use the GitHub UI method below to add secrets.
+If you're working in Codespaces, use the GitHub UI method below to add secrets.
 
 ### Adding secrets using the GitHub UI
 
@@ -69,23 +69,23 @@ A reference for all GitHub Actions secrets and tokens used by GitHub Agentic Wor
 
 ### `COPILOT_GITHUB_TOKEN`
 
-If using Copilot as your AI engine, you need a GitHub Actions Secret set to a GitHub Personal Access Token (PAT) with the `copilot-requests` scope to authenticate Copilot CLI.
+If using Copilot as your AI engine, you need a GitHub Actions Secret set to a GitHub Personal Access Token (PAT) to authenticate Copilot CLI.
 
 **Setup**:
 
 Create a [fine-grained PAT](https://github.com/settings/personal-access-tokens/new):
 
-1. Select your user account, not an organization.
-2. Choose **"Public repositories"** access, even if adding a workflow to a private repo.
-3. Enable "Copilot Requests" permissions.
+1. Select your **user account**, not an organization.
+2. Choose **Public repositories**, even if you will be using it with private repositories. This is required for the "Copilot Requests" permission to be available.
+3. Click **Add permissions** and choose **Copilot Requests**.
+4. Click **Generate token** and copy the token value.
+5. Add the PAT to your GitHub Actions repository secrets as `COPILOT_GITHUB_TOKEN`, either by CLI or GitHub UI (see video).
 
-You **must have "Public repositories" selected**; otherwise, the Copilot Requests permission option will not appear.
+   ```bash wrap
+   gh aw secrets set COPILOT_GITHUB_TOKEN --value "<your-github-pat>"
+   ```
 
-Then add the PAT to your GitHub Actions repository secrets as `COPILOT_GITHUB_TOKEN`, either by CLI or GitHub UI (see video).
-
-```bash wrap
-gh aw secrets set COPILOT_GITHUB_TOKEN --value "<your-github-pat>"
-```
+**Troubleshooting**:
 
 If your workflow fails at the Copilot inference step even with the token set, verify that the token owner's account has an active Copilot license. See [Copilot License or Inference Access Issues](/gh-aw/troubleshooting/common-issues/#copilot-license-or-inference-access-issues) for a local diagnostic step.
 
@@ -131,6 +131,24 @@ If using the Codex by OpenAI engine, you need to set a GitHub Actions secret `OP
    ```
 
 See also (/gh-aw/reference/engines/#using-openai-codex) for additional configuration needed when using Codex with GitHub MCP.
+
+---
+
+### `GEMINI_API_KEY`
+
+If using the Gemini by Google engine, you need to set a GitHub Actions secret `GEMINI_API_KEY` with an API key from Google AI Studio.
+
+**Setup**:
+
+1. Create an API key at https://aistudio.google.com/api-keys
+
+2. Add it to your repository secrets:
+
+   ```bash wrap
+   gh aw secrets set GEMINI_API_KEY --value "YOUR_GEMINI_API_KEY"
+   ```
+
+See also (/gh-aw/reference/engines/#using-google-gemini-cli) for additional configuration needed when using Gemini with GitHub MCP.
 
 ---
 
@@ -196,7 +214,7 @@ gh aw secrets set GH_AW_GITHUB_MCP_SERVER_TOKEN --value "YOUR_MCP_PAT"
 
 ### `GH_AW_CI_TRIGGER_TOKEN`
 
-Pull requests and pushes made with `GITHUB_TOKEN` do not trigger `pull_request`, `push`, or `pull_request_target` events. This is a [GitHub Actions security feature](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow) to prevent recursive workflows.
+Pull requests and pushes made with `GITHUB_TOKEN` do not trigger `pull_request`, `push`, or `pull_request_target` events. This is a GitHub Actions feature to prevent event cascades.
 
 See [Triggering CI](/gh-aw/reference/triggering-ci/) for how to configure CI triggers on PRs created by workflows using `
 

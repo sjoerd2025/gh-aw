@@ -50,8 +50,8 @@ func convertStringToPermissionScope(key string) PermissionScope {
 	}()
 	if scope == "" {
 		permissionsLog.Printf("Unknown permission scope key: %s", key)
+		return ""
 	}
-	return scope
 }
 
 // PermissionLevel represents the level of access (read, write, none)
