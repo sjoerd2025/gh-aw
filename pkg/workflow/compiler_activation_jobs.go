@@ -952,6 +952,19 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		}
 	}
 
+	// Add security-events: read when the dependabot toolset is configured.
+	// The dependabot toolset requires security-events: read to access Dependabot alerts.
+	if data.ParsedTools != nil && data.ParsedTools.GitHub != nil {
+		enabledToolsets := ParseGitHubToolsets(data.ParsedTools.GitHub.GetToolsets())
+		if slices.Contains(enabledToolsets, "dependabot") {
+			perms := NewPermissionsParser(permissions).ToPermissions()
+			if level, exists := perms.Get(PermissionSecurityEvents); !exists || level == PermissionNone {
+				perms.Set(PermissionSecurityEvents, PermissionRead)
+				permissions = perms.RenderToYAML()
+			}
+		}
+	}
+
 	job := &Job{
 		Name:        string(constants.AgentJobName),
 		If:          jobCondition,

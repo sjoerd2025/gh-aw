@@ -304,3 +304,112 @@ This is a test workflow with network permissions and codex engine.
 		}
 	})
 }
+
+func TestDependabotToolsetAddsSecurityEventsPermission(t *testing.T) {
+	compiler := NewCompiler()
+	tmpDir := testutil.TempDir(t, "dependabot-toolset-test")
+
+	t.Run("dependabot toolset adds security-events: read to agent job", func(t *testing.T) {
+		testContent := `---
+on: push
+strict: false
+tools:
+  github:
+    toolsets: [dependabot]
+---
+
+# Dependabot Workflow
+
+Check Dependabot alerts.
+`
+		testFile := filepath.Join(tmpDir, "dependabot-workflow.md")
+		if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		err := compiler.CompileWorkflow(testFile)
+		if err != nil {
+			t.Fatalf("Unexpected compilation error: %v", err)
+		}
+
+		lockFile := filepath.Join(tmpDir, "dependabot-workflow.lock.yml")
+		lockContent, err := os.ReadFile(lockFile)
+		if err != nil {
+			t.Fatalf("Failed to read lock file: %v", err)
+		}
+
+		if !strings.Contains(string(lockContent), "security-events: read") {
+			t.Errorf("Expected agent job permissions to contain 'security-events: read' when dependabot toolset is used.\nFull content:\n%s", lockContent)
+		}
+	})
+
+	t.Run("dependabot toolset preserves existing security-events: read", func(t *testing.T) {
+		testContent := `---
+on: push
+strict: false
+permissions:
+  security-events: read
+tools:
+  github:
+    toolsets: [dependabot]
+---
+
+# Dependabot Workflow With Explicit Read Permission
+
+Check Dependabot alerts with explicitly declared read access.
+`
+		testFile := filepath.Join(tmpDir, "dependabot-read-workflow.md")
+		if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		err := compiler.CompileWorkflow(testFile)
+		if err != nil {
+			t.Fatalf("Unexpected compilation error: %v", err)
+		}
+
+		lockFile := filepath.Join(tmpDir, "dependabot-read-workflow.lock.yml")
+		lockContent, err := os.ReadFile(lockFile)
+		if err != nil {
+			t.Fatalf("Failed to read lock file: %v", err)
+		}
+
+		if !strings.Contains(string(lockContent), "security-events: read") {
+			t.Errorf("Expected agent job to keep 'security-events: read' when user explicitly set it.\nFull content:\n%s", lockContent)
+		}
+	})
+
+	t.Run("no dependabot toolset does not add security-events permission", func(t *testing.T) {
+		testContent := `---
+on: push
+strict: false
+tools:
+  github:
+    toolsets: [repos, issues]
+---
+
+# Non-Dependabot Workflow
+
+No Dependabot toolset configured.
+`
+		testFile := filepath.Join(tmpDir, "no-dependabot-workflow.md")
+		if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		err := compiler.CompileWorkflow(testFile)
+		if err != nil {
+			t.Fatalf("Unexpected compilation error: %v", err)
+		}
+
+		lockFile := filepath.Join(tmpDir, "no-dependabot-workflow.lock.yml")
+		lockContent, err := os.ReadFile(lockFile)
+		if err != nil {
+			t.Fatalf("Failed to read lock file: %v", err)
+		}
+
+		if strings.Contains(string(lockContent), "security-events") {
+			t.Errorf("Expected agent job NOT to contain 'security-events' when dependabot toolset is not used.\nFull content:\n%s", lockContent)
+		}
+	})
+}
