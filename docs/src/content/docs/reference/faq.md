@@ -322,19 +322,10 @@ See [Triggering CI on Created Pull Requests](/gh-aw/reference/safe-outputs/#trig
 Configure your [`create-pull-request` safe output](/gh-aw/reference/safe-outputs/#pull-request-creation-create-pull-request) to use a PAT or a GitHub App for all operations. This allows PR creation to trigger CI workflows, but changes the authorization for the entire PR creation process. The user or app associated with the token will be the author of the PR.
 
 ```yaml wrap
-
-**Option 3: Use workflow_run trigger**
-
-Configure your CI workflows to run on `workflow_run` events, which allows them to react to completed workflows:
-
-```yaml wrap
-on:
-  workflow_run:
-    workflows: ["Create Pull Request Workflow"]
-    types: [completed]
+safe-outputs:
+  create-pull-request:
+    github-token: ${{ secrets.CI_USER_PAT }}
 ```
-
-This approach maintains security while allowing CI to run after PR creation. See [GitHub Actions workflow_run documentation](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_run) for details.
 
 ## Workflow Design
 
