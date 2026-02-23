@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -181,7 +182,53 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 		}
 		data.Permissions = strings.Join(lines, "\n")
 	}
+
+	// Inject security-events: read when the dependabot toolset is configured but
+	// the permission has not been declared. This ensures the workflow automatically
+	// receives the minimum permission needed to access Dependabot APIs.
+	injectDependabotPermission(data)
+
 	return nil
+}
+
+// isDependabotToolsetEnabled returns true when the dependabot toolset is effectively
+// configured for the workflow (including when it is implied by the "all" alias).
+func isDependabotToolsetEnabled(data *WorkflowData) bool {
+	if data.ParsedTools == nil || data.ParsedTools.GitHub == nil {
+		return false
+	}
+	toolsets := ParseGitHubToolsets(data.ParsedTools.GitHub.GetToolsets())
+	return slices.Contains(toolsets, "dependabot")
+}
+
+// injectDependabotPermission adds security-events: read to data.Permissions when the
+// dependabot toolset is enabled and the permission has not already been declared.
+// It respects any explicitly set level (read, write, or none) and does not override it.
+func injectDependabotPermission(data *WorkflowData) {
+	if !isDependabotToolsetEnabled(data) {
+		return
+	}
+
+	// Parse current permissions and check if security-events is already declared.
+	parser := NewPermissionsParser(data.Permissions)
+	perms := parser.ToPermissions()
+	if _, exists := perms.Get(PermissionSecurityEvents); exists {
+		// User has explicitly set security-events (read, write, or none) – respect it.
+		return
+	}
+
+	// Inject security-events: read.
+	perms.Set(PermissionSecurityEvents, PermissionRead)
+	rendered := perms.RenderToYAML()
+
+	// RenderToYAML uses 6-space indentation; data.Permissions uses 2-space.
+	lines := strings.Split(rendered, "\n")
+	for i := 1; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "      ") {
+			lines[i] = "  " + lines[i][6:]
+		}
+	}
+	data.Permissions = strings.Join(lines, "\n")
 }
 
 // mergeToolsAndMCPServers merges tools, mcp-servers, and included tools

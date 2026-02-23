@@ -73,6 +73,22 @@ func TestCollectRequiredPermissions(t *testing.T) {
 			},
 		},
 		{
+			name:     "Dependabot toolset requires security-events read",
+			toolsets: []string{"dependabot"},
+			readOnly: false,
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionRead,
+			},
+		},
+		{
+			name:     "Dependabot toolset in read-only mode requires security-events read",
+			toolsets: []string{"dependabot"},
+			readOnly: true,
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionSecurityEvents: PermissionRead,
+			},
+		},
+		{
 			name:     "Code security toolset",
 			toolsets: []string{"code_security"},
 			readOnly: false,
@@ -379,6 +395,108 @@ func TestValidatePermissions_ComplexScenarios(t *testing.T) {
 			for _, expected := range tt.expectMsg {
 				if !strings.Contains(message, expected) {
 					t.Errorf("Expected message to contain %q, got:\n%s", expected, message)
+				}
+			}
+		})
+	}
+}
+
+func TestInjectDependabotPermission(t *testing.T) {
+	tests := []struct {
+		name               string
+		initialPermissions string
+		toolsets           GitHubToolsets
+		expectSecEvents    PermissionLevel
+		expectInjected     bool
+	}{
+		{
+			name:               "Injects security-events: read when dependabot toolset configured and no permissions set",
+			initialPermissions: "",
+			toolsets:           GitHubToolsets{"dependabot"},
+			expectSecEvents:    PermissionRead,
+			expectInjected:     true,
+		},
+		{
+			name:               "Injects security-events: read when dependabot is among multiple toolsets",
+			initialPermissions: "permissions:\n  contents: read",
+			toolsets:           GitHubToolsets{"default", "dependabot"},
+			expectSecEvents:    PermissionRead,
+			expectInjected:     true,
+		},
+		{
+			name:               "Does not inject when security-events already set to read",
+			initialPermissions: "permissions:\n  security-events: read",
+			toolsets:           GitHubToolsets{"dependabot"},
+			expectSecEvents:    PermissionRead,
+			expectInjected:     false,
+		},
+		{
+			name:               "Does not inject when security-events already set to write",
+			initialPermissions: "permissions:\n  security-events: write",
+			toolsets:           GitHubToolsets{"dependabot"},
+			expectSecEvents:    PermissionWrite,
+			expectInjected:     false,
+		},
+		{
+			name:               "Does not inject when security-events explicitly set to none",
+			initialPermissions: "permissions:\n  security-events: none",
+			toolsets:           GitHubToolsets{"dependabot"},
+			expectSecEvents:    PermissionNone,
+			expectInjected:     false,
+		},
+		{
+			name:               "Does not inject when dependabot toolset is not configured",
+			initialPermissions: "permissions:\n  contents: read",
+			toolsets:           GitHubToolsets{"repos"},
+			expectSecEvents:    "",
+			expectInjected:     false,
+		},
+		{
+			name:               "Does not inject when no GitHub tool is configured",
+			initialPermissions: "permissions:\n  contents: read",
+			toolsets:           nil,
+			expectSecEvents:    "",
+			expectInjected:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &WorkflowData{
+				Permissions: tt.initialPermissions,
+			}
+			if tt.toolsets != nil {
+				data.ParsedTools = &Tools{
+					GitHub: &GitHubToolConfig{
+						Toolset: tt.toolsets,
+					},
+				}
+			}
+
+			injectDependabotPermission(data)
+
+			perms := NewPermissionsParser(data.Permissions).ToPermissions()
+			level, exists := perms.Get(PermissionSecurityEvents)
+
+			if tt.expectInjected {
+				if !exists {
+					t.Errorf("Expected security-events permission to be injected, but not found in: %q", data.Permissions)
+					return
+				}
+				if level != tt.expectSecEvents {
+					t.Errorf("Expected security-events: %s, got: %s", tt.expectSecEvents, level)
+				}
+			} else if tt.expectSecEvents == "" {
+				if exists {
+					t.Errorf("Expected security-events NOT to be present, but found: %s", level)
+				}
+			} else {
+				if !exists {
+					t.Errorf("Expected security-events: %s to be preserved, but permission not found", tt.expectSecEvents)
+					return
+				}
+				if level != tt.expectSecEvents {
+					t.Errorf("Expected security-events: %s to be preserved, got: %s", tt.expectSecEvents, level)
 				}
 			}
 		})

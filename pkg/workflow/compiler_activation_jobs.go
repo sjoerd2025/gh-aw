@@ -937,17 +937,34 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	// Agent job ALWAYS needs contents: read to access .github and .actions folders
 	permissions := data.Permissions
 	if permissions == "" {
-		// No permissions specified, just add contents: read
+		// No permissions specified, start with contents: read
 		perms := NewPermissionsContentsRead()
+		// Add security-events: read if the dependabot toolset is configured
+		if isDependabotToolsetEnabled(data) {
+			perms.Set(PermissionSecurityEvents, PermissionRead)
+		}
 		permissions = perms.RenderToYAML()
 	} else {
-		// Parse existing permissions and add contents: read
+		// Parse existing permissions and ensure required scopes are present
 		parser := NewPermissionsParser(permissions)
 		perms := parser.ToPermissions()
+		modified := false
 
 		// Only add contents: read if not already present
 		if level, exists := perms.Get(PermissionContents); !exists || level == PermissionNone {
 			perms.Set(PermissionContents, PermissionRead)
+			modified = true
+		}
+
+		// Add security-events: read if the dependabot toolset is configured and not already set
+		if isDependabotToolsetEnabled(data) {
+			if _, exists := perms.Get(PermissionSecurityEvents); !exists {
+				perms.Set(PermissionSecurityEvents, PermissionRead)
+				modified = true
+			}
+		}
+
+		if modified {
 			permissions = perms.RenderToYAML()
 		}
 	}
