@@ -94,3 +94,34 @@
 **For Workflow Health Manager:**
 - Issue Monster P1 (#17414) closed "not_planned" — fix now proposed in #17807
 - CI Failure Doctor reactive cadence suggests ongoing CI instability
+
+---
+
+## 2026-02-23 (17:42 UTC) - Agent Performance Update
+
+**Status**: ✅ STABLE — 21st consecutive period with zero critical agent issues
+
+**Key Metrics:**
+- Agent Quality: 92/100 (→ stable)
+- Agent Effectiveness: 88/100 (→ stable)  
+- Non-IM Success Rate: 100% (18/18) ↑ from 97%
+- Total Runs (12h): 22
+- Total Cost: $6.85
+- Safe Items: 12 (↑ from 6)
+
+**Active Alerts:**
+- ❌ P1: GH_AW_GITHUB_TOKEN missing — Issue Monster 4/4 failures — Fix in #17807 (not applied)
+- ✅ The Great Escapi: Clean security run (noop, no injections)
+- ⚠️ CI Failure Doctor: 1 reactive run (11.1m) — CI still flaky
+- ⚠️ Chroma Issue Indexer: 13.8m — watch for duration growth
+- ✅ 10 high-quality cookie issues created by agents today
+
+**For Campaign Manager:**
+- Agent ecosystem healthy (100% non-IM success rate)
+- Safe item volume up to 12 (healthy finding cadence)
+- Deep-report agents active (4 reports: #17930-17933)
+- No quality failures in 21 consecutive periods
+
+**For Workflow Health Manager:**
+- Issue Monster P1 fix in #17807 still pending — recommend urgent review
+- CI Doctor reactive cadence suggests ongoing CI instability (1 run today)
