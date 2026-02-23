@@ -305,21 +305,23 @@ GitHub Actions prevents the `GITHUB_TOKEN` from triggering new workflow runs to 
 
 If you need CI checks to run on PRs created by agentic workflows, you have several options:
 
-**Option 1: Use `github-ci-trigger-token` (Recommended)**
+**Option 1: Use `github-token-for-extra-empty-commit` (Recommended)**
 
-Add a `github-ci-trigger-token` to your `create-pull-request` or `push-to-pull-request-branch` safe output. This pushes an empty commit using a different token after PR creation/push, which triggers CI events without changing the overall PR authorization.
+Add a `github-token-for-extra-empty-commit` to your `create-pull-request` or `push-to-pull-request-branch` safe output. This pushes an empty commit using a different token after PR creation/push, which triggers CI events without changing the overall PR authorization.
 
 ```yaml wrap
 safe-outputs:
   create-pull-request:
-    github-ci-trigger-token: ${{ secrets.CI_TRIGGER_PAT }}
+    github-token-for-extra-empty-commit: ${{ secrets.CI_TRIGGER_PAT }}
 ```
 
-You can also use `app` to use a GitHub App token, or set the `GH_AW_CI_TRIGGER_TOKEN` repository secret for a global default. See [Triggering CI on Created Pull Requests](/gh-aw/reference/safe-outputs/#triggering-ci-on-created-pull-requests) for details.
+See [Triggering CI on Created Pull Requests](/gh-aw/reference/safe-outputs/#triggering-ci-on-created-pull-requests) for details.
 
 **Option 2: Use different authorization for the entire safe output**
 
-Configure your [`create-pull-request` safe output](/gh-aw/reference/safe-outputs/#pull-request-creation-create-pull-request) to use a PAT or a GitHub App for all operations. This allows PR creation to trigger CI workflows, but changes the authorization for the entire PR creation process.
+Configure your [`create-pull-request` safe output](/gh-aw/reference/safe-outputs/#pull-request-creation-create-pull-request) to use a PAT or a GitHub App for all operations. This allows PR creation to trigger CI workflows, but changes the authorization for the entire PR creation process. The user or app associated with the token will be the author of the PR.
+
+```yaml wrap
 
 **Option 3: Use workflow_run trigger**
 

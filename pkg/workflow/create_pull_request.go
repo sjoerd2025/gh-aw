@@ -20,22 +20,22 @@ func getFallbackAsIssue(config *CreatePullRequestsConfig) bool {
 
 // CreatePullRequestsConfig holds configuration for creating GitHub pull requests from agent output
 type CreatePullRequestsConfig struct {
-	BaseSafeOutputConfig `yaml:",inline"`
-	TitlePrefix          string   `yaml:"title-prefix,omitempty"`
-	Labels               []string `yaml:"labels,omitempty"`
-	AllowedLabels        []string `yaml:"allowed-labels,omitempty"`          // Optional list of allowed labels. If omitted, any labels are allowed (including creating new ones).
-	Reviewers            []string `yaml:"reviewers,omitempty"`               // List of users/bots to assign as reviewers to the pull request
-	Draft                *string  `yaml:"draft,omitempty"`                   // Pointer to distinguish between unset (nil), literal bool, and expression values
-	IfNoChanges          string   `yaml:"if-no-changes,omitempty"`           // Behavior when no changes to push: "warn" (default), "error", or "ignore"
-	AllowEmpty           *string  `yaml:"allow-empty,omitempty"`             // Allow creating PR without patch file or with empty patch (useful for preparing feature branches)
-	TargetRepoSlug       string   `yaml:"target-repo,omitempty"`             // Target repository in format "owner/repo" for cross-repository pull requests
-	AllowedRepos         []string `yaml:"allowed-repos,omitempty"`           // List of additional repositories that pull requests can be created in (additionally to the target-repo)
-	Expires              int      `yaml:"expires,omitempty"`                 // Hours until the pull request expires and should be automatically closed (only for same-repo PRs)
-	AutoMerge            *string  `yaml:"auto-merge,omitempty"`              // Enable auto-merge for the pull request when all required checks pass
-	BaseBranch           string   `yaml:"base-branch,omitempty"`             // Base branch for the pull request (defaults to github.ref_name if not specified)
-	Footer               *string  `yaml:"footer,omitempty"`                  // Controls whether AI-generated footer is added. When false, visible footer is omitted but XML markers are kept.
-	FallbackAsIssue      *bool    `yaml:"fallback-as-issue,omitempty"`       // When true (default), creates an issue if PR creation fails. When false, no fallback occurs and issues: write permission is not requested.
-	GithubCITriggerToken string   `yaml:"github-ci-trigger-token,omitempty"` // Token used to push an empty commit to trigger CI events. Use a PAT, "app" for GitHub App auth, or set GH_AW_CI_TRIGGER_TOKEN secret.
+	BaseSafeOutputConfig           `yaml:",inline"`
+	TitlePrefix                    string   `yaml:"title-prefix,omitempty"`
+	Labels                         []string `yaml:"labels,omitempty"`
+	AllowedLabels                  []string `yaml:"allowed-labels,omitempty"`                      // Optional list of allowed labels. If omitted, any labels are allowed (including creating new ones).
+	Reviewers                      []string `yaml:"reviewers,omitempty"`                           // List of users/bots to assign as reviewers to the pull request
+	Draft                          *string  `yaml:"draft,omitempty"`                               // Pointer to distinguish between unset (nil), literal bool, and expression values
+	IfNoChanges                    string   `yaml:"if-no-changes,omitempty"`                       // Behavior when no changes to push: "warn" (default), "error", or "ignore"
+	AllowEmpty                     *string  `yaml:"allow-empty,omitempty"`                         // Allow creating PR without patch file or with empty patch (useful for preparing feature branches)
+	TargetRepoSlug                 string   `yaml:"target-repo,omitempty"`                         // Target repository in format "owner/repo" for cross-repository pull requests
+	AllowedRepos                   []string `yaml:"allowed-repos,omitempty"`                       // List of additional repositories that pull requests can be created in (additionally to the target-repo)
+	Expires                        int      `yaml:"expires,omitempty"`                             // Hours until the pull request expires and should be automatically closed (only for same-repo PRs)
+	AutoMerge                      *string  `yaml:"auto-merge,omitempty"`                          // Enable auto-merge for the pull request when all required checks pass
+	BaseBranch                     string   `yaml:"base-branch,omitempty"`                         // Base branch for the pull request (defaults to github.ref_name if not specified)
+	Footer                         *string  `yaml:"footer,omitempty"`                              // Controls whether AI-generated footer is added. When false, visible footer is omitted but XML markers are kept.
+	FallbackAsIssue                *bool    `yaml:"fallback-as-issue,omitempty"`                   // When true (default), creates an issue if PR creation fails. When false, no fallback occurs and issues: write permission is not requested.
+	GithubTokenForExtraEmptyCommit string   `yaml:"github-token-for-extra-empty-commit,omitempty"` // Token used to push an empty commit to trigger CI events. Use a PAT or "app" for GitHub App auth.
 }
 
 // buildCreateOutputPullRequestJob creates the create_pull_request job
@@ -165,19 +165,16 @@ func (c *Compiler) buildCreateOutputPullRequestJob(data *WorkflowData, mainJobNa
 		createPRLog.Print("Footer disabled - XML markers will be included but visible footer content will be omitted")
 	}
 
-	// Add CI trigger token if configured (for pushing an empty commit to trigger CI)
-	ciTriggerToken := data.SafeOutputs.CreatePullRequests.GithubCITriggerToken
-	if ciTriggerToken != "" {
-		if ciTriggerToken == "app" {
-			customEnvVars = append(customEnvVars, "          GH_AW_CI_TRIGGER_TOKEN: ${{ steps.safe-outputs-app-token.outputs.token || '' }}\n")
-			createPRLog.Print("CI trigger using GitHub App token")
+	// Add extra empty commit token if configured (for pushing an empty commit to trigger CI)
+	extraEmptyCommitToken := data.SafeOutputs.CreatePullRequests.GithubTokenForExtraEmptyCommit
+	if extraEmptyCommitToken != "" {
+		if extraEmptyCommitToken == "app" {
+			customEnvVars = append(customEnvVars, "          GH_AW_EXTRA_EMPTY_COMMIT_TOKEN: ${{ steps.safe-outputs-app-token.outputs.token || '' }}\n")
+			createPRLog.Print("Extra empty commit using GitHub App token")
 		} else {
-			customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_CI_TRIGGER_TOKEN: %s\n", ciTriggerToken))
-			createPRLog.Printf("CI trigger using explicit token")
+			customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_EXTRA_EMPTY_COMMIT_TOKEN: %s\n", extraEmptyCommitToken))
+			createPRLog.Printf("Extra empty commit using explicit token")
 		}
-	} else {
-		// Fall back to GH_AW_CI_TRIGGER_TOKEN secret if set
-		customEnvVars = append(customEnvVars, "          GH_AW_CI_TRIGGER_TOKEN: ${{ secrets.GH_AW_CI_TRIGGER_TOKEN || '' }}\n")
 	}
 
 	// Add standard environment variables (metadata + staged/target repo)

@@ -405,27 +405,23 @@ func (c *Compiler) buildJobLevelSafeOutputEnvVars(data *WorkflowData, workflowID
 		}
 	}
 
-	// Add CI trigger token if configured on create-pull-request or push-to-pull-request-branch.
+	// Add extra empty commit token if configured on create-pull-request or push-to-pull-request-branch.
 	// This token is used to push an empty commit after code changes to trigger CI events,
 	// working around the GITHUB_TOKEN limitation where events don't trigger other workflows.
-	// Precedence: per-safe-output github-ci-trigger-token > GH_AW_CI_TRIGGER_TOKEN secret
 	if data.SafeOutputs != nil {
-		var ciTriggerToken string
-		if data.SafeOutputs.CreatePullRequests != nil && data.SafeOutputs.CreatePullRequests.GithubCITriggerToken != "" {
-			ciTriggerToken = data.SafeOutputs.CreatePullRequests.GithubCITriggerToken
-		} else if data.SafeOutputs.PushToPullRequestBranch != nil && data.SafeOutputs.PushToPullRequestBranch.GithubCITriggerToken != "" {
-			ciTriggerToken = data.SafeOutputs.PushToPullRequestBranch.GithubCITriggerToken
+		var extraEmptyCommitToken string
+		if data.SafeOutputs.CreatePullRequests != nil && data.SafeOutputs.CreatePullRequests.GithubTokenForExtraEmptyCommit != "" {
+			extraEmptyCommitToken = data.SafeOutputs.CreatePullRequests.GithubTokenForExtraEmptyCommit
+		} else if data.SafeOutputs.PushToPullRequestBranch != nil && data.SafeOutputs.PushToPullRequestBranch.GithubTokenForExtraEmptyCommit != "" {
+			extraEmptyCommitToken = data.SafeOutputs.PushToPullRequestBranch.GithubTokenForExtraEmptyCommit
 		}
 
-		if ciTriggerToken == "app" {
-			envVars["GH_AW_CI_TRIGGER_TOKEN"] = "${{ steps.safe-outputs-app-token.outputs.token || '' }}"
-			consolidatedSafeOutputsJobLog.Print("CI trigger using GitHub App token")
-		} else if ciTriggerToken != "" {
-			envVars["GH_AW_CI_TRIGGER_TOKEN"] = ciTriggerToken
-			consolidatedSafeOutputsJobLog.Print("CI trigger using explicit token")
-		} else if data.SafeOutputs.CreatePullRequests != nil || data.SafeOutputs.PushToPullRequestBranch != nil {
-			// Fall back to GH_AW_CI_TRIGGER_TOKEN secret if set (implicit mode)
-			envVars["GH_AW_CI_TRIGGER_TOKEN"] = "${{ secrets.GH_AW_CI_TRIGGER_TOKEN || '' }}"
+		if extraEmptyCommitToken == "app" {
+			envVars["GH_AW_EXTRA_EMPTY_COMMIT_TOKEN"] = "${{ steps.safe-outputs-app-token.outputs.token || '' }}"
+			consolidatedSafeOutputsJobLog.Print("Extra empty commit using GitHub App token")
+		} else if extraEmptyCommitToken != "" {
+			envVars["GH_AW_EXTRA_EMPTY_COMMIT_TOKEN"] = extraEmptyCommitToken
+			consolidatedSafeOutputsJobLog.Print("Extra empty commit using explicit token")
 		}
 	}
 

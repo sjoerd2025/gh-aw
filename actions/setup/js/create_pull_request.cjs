@@ -18,7 +18,7 @@ const { generateWorkflowIdMarker } = require("./generate_footer.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { generateFooterWithMessages } = require("./messages_footer.cjs");
 const { normalizeBranchName } = require("./normalize_branch_name.cjs");
-const { pushCITriggerCommit } = require("./ci_trigger_commit.cjs");
+const { pushExtraEmptyCommit } = require("./extra_empty_commit.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -840,15 +840,15 @@ ${patchPreview}`;
         )
         .write();
 
-      // Push an empty CI trigger commit if a CI trigger token is configured.
+      // Push an extra empty commit if a token is configured.
       // This works around the GITHUB_TOKEN limitation where pushes don't trigger CI events.
-      const ciTriggerResult = await pushCITriggerCommit({
+      const ciTriggerResult = await pushExtraEmptyCommit({
         branchName,
         repoOwner: repoParts.owner,
         repoName: repoParts.repo,
       });
       if (ciTriggerResult.success && !ciTriggerResult.skipped) {
-        core.info("CI trigger commit pushed - CI checks should start shortly");
+        core.info("Extra empty commit pushed - CI checks should start shortly");
       }
 
       // Return success with PR details

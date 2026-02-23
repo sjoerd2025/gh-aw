@@ -26,7 +26,7 @@ You will need one of the following GitHub Actions secrets configured in your rep
 Depending on what your workflow needs to do, you may need additional GitHub tokens added as repository secrets:
 
 - **Lockdown mode, cross-repo access, or remote GitHub tools** – Add [`GH_AW_GITHUB_TOKEN`](#gh_aw_github_token)
-- **Trigger CI on PRs created by workflows** – Add [`GH_AW_CI_TRIGGER_TOKEN`](#gh_aw_ci_trigger_token)
+- **Trigger CI on PRs created by workflows** – Use [`github-token-for-extra-empty-commit`](/gh-aw/reference/safe-outputs/#triggering-ci-on-created-pull-requests)
 - **GitHub Projects v2 operations** – Add [`GH_AW_PROJECT_GITHUB_TOKEN`](#gh_aw_project_github_token)
 - **Assign Copilot coding agent to issues/PRs** – Add [`GH_AW_AGENT_TOKEN`](#gh_aw_agent_token)
 - **MCP server with special permissions** – Add [`GH_AW_GITHUB_MCP_SERVER_TOKEN`](#gh_aw_github_mcp_server_token)
@@ -194,61 +194,28 @@ gh aw secrets set GH_AW_GITHUB_MCP_SERVER_TOKEN --value "YOUR_MCP_PAT"
 
 ---
 
-### `GH_AW_CI_TRIGGER_TOKEN`
+### Triggering CI on Created Pull Requests
 
-A Personal Access Token (PAT) or GitHub App token used to push an empty commit after PR creation or branch push, triggering CI events that the default `GITHUB_TOKEN` cannot trigger.
+Pull requests and pushes made with `GITHUB_TOKEN` do not trigger `pull_request`, `push`, or `pull_request_target` events. This is a [GitHub Actions security feature](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow) to prevent recursive workflows.
 
-Pull requests and pushes made with `GITHUB_TOKEN` do not trigger `pull_request`, `push`, or `pull_request_target` events. This is a [GitHub Actions security feature](https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow) to prevent recursive workflows. The `GH_AW_CI_TRIGGER_TOKEN` provides a minimal workaround: after the safe output creates the PR or pushes, an additional empty commit is pushed using this token, which triggers CI.
+To trigger CI, add `github-token-for-extra-empty-commit` to your `create-pull-request` or `push-to-pull-request-branch` safe output configuration. This pushes an additional empty commit using the specified token, which triggers CI events.
 
-**When to use**:
-
-- You need CI checks to run on PRs created by `create-pull-request` safe outputs.
-- You need CI checks to run after `push-to-pull-request-branch` pushes.
-- You want a global default CI trigger token for all safe outputs without configuring each one individually.
-
-**Setup**:
-
-Create a [fine-grained PAT](https://github.com/settings/personal-access-tokens/new) with:
-
-- **Repository access**: Select specific repos that run agentic workflows
-- **Repository permissions**:
-  - Contents: Read & Write (required to push commits)
-
-Then add to repository secrets:
-
-```bash wrap
-gh aw secrets set GH_AW_CI_TRIGGER_TOKEN --value "YOUR_CI_TRIGGER_PAT"
-```
-
-**Per-safe-output override**:
-
-You can also configure the token per safe output using `github-ci-trigger-token` in the workflow frontmatter, which takes precedence over the `GH_AW_CI_TRIGGER_TOKEN` secret:
-
-```yaml wrap
-safe-outputs:
-  create-pull-request:
-    github-ci-trigger-token: ${{ secrets.MY_CUSTOM_CI_TOKEN }}
-```
-
-Or use `app` to use a GitHub App installation token:
-
-```yaml wrap
-safe-outputs:
-  create-pull-request:
-    github-ci-trigger-token: app
-```
-
-**Token precedence**: per-safe-output `github-ci-trigger-token` → `GH_AW_CI_TRIGGER_TOKEN` secret.
-
-**Three ways to configure CI triggering:**
+**Two ways to configure:**
 
 | Method | Configuration | Description |
 |--------|--------------|-------------|
-| **Explicit token** | `github-ci-trigger-token: ${{ secrets.CI_TOKEN }}` | Use a specific PAT or token per safe output |
-| **GitHub App** | `github-ci-trigger-token: app` | Use the configured GitHub App installation token |
-| **Implicit secret** | Set `GH_AW_CI_TRIGGER_TOKEN` repository secret | No workflow config needed — checked automatically |
+| **Explicit token** | `github-token-for-extra-empty-commit: ${{ secrets.CI_TOKEN }}` | Use a specific PAT or token per safe output |
+| **GitHub App** | `github-token-for-extra-empty-commit: app` | Use the configured GitHub App installation token |
 
-The implicit `GH_AW_CI_TRIGGER_TOKEN` secret is checked automatically when `create-pull-request` or `push-to-pull-request-branch` is configured, even without explicit `github-ci-trigger-token` in the workflow. Just add the secret to your repository.
+**Example:**
+
+```yaml wrap
+safe-outputs:
+  create-pull-request:
+    github-token-for-extra-empty-commit: ${{ secrets.CI_TOKEN }}
+```
+
+**Required permissions**: Create a [fine-grained PAT](https://github.com/settings/personal-access-tokens/new) with `Contents: Read & Write` scoped to the relevant repositories.
 
 > [!TIP]
 > Use a fine-grained PAT with `contents: write` permission scoped to your repository. This is the minimum permission needed to push commits.

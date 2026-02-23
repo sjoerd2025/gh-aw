@@ -687,7 +687,7 @@ safe-outputs:
     base-branch: "vnext"          # target branch for PR (default: github.base_ref || github.ref_name)
     fallback-as-issue: false      # disable issue fallback (default: true)
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
-    github-ci-trigger-token: ${{ secrets.CI_TOKEN }} # optional token to push empty commit triggering CI
+    github-token-for-extra-empty-commit: ${{ secrets.CI_TOKEN }} # optional token to push empty commit triggering CI
 ```
 
 The `base-branch` field specifies which branch the pull request should target. This is particularly useful for cross-repository PRs where you need to target non-default branches (e.g., `vnext`, `release/v1.0`, `staging`). When not specified, defaults to `github.base_ref` (the PR's target branch) with a fallback to `github.ref_name` (the workflow's branch) for push events.
@@ -715,12 +715,12 @@ By default, pull requests created using `GITHUB_TOKEN` **do not trigger CI workf
 ```yaml wrap
 safe-outputs:
   create-pull-request:
-    github-ci-trigger-token: ${{ secrets.CI_TOKEN }}  # PAT or token to trigger CI
+    github-token-for-extra-empty-commit: ${{ secrets.CI_TOKEN }}  # PAT or token to trigger CI
 ```
 
 When configured, an empty commit is pushed to the PR branch using the specified token after PR creation. Since this push comes from a different authentication context, it triggers `push` and `pull_request` events normally.
 
-See [`GH_AW_CI_TRIGGER_TOKEN`](/gh-aw/reference/auth/#gh_aw_ci_trigger_token) for token setup, configuration methods (explicit token, GitHub App, or implicit secret), and required permissions.
+Use a secret expression (e.g. `${{ secrets.CI_TOKEN }}`) or `app` for GitHub App auth. See the [Authentication reference](/gh-aw/reference/auth/) for token setup and required permissions.
 
 ### Close Pull Request (`close-pull-request:`)
 
@@ -848,12 +848,12 @@ safe-outputs:
     max: 3                      # max pushes per run (default: 1)
     if-no-changes: "warn"       # "warn" (default), "error", or "ignore"
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
-    github-ci-trigger-token: ${{ secrets.CI_TOKEN }} # optional token to push empty commit triggering CI
+    github-token-for-extra-empty-commit: ${{ secrets.CI_TOKEN }} # optional token to push empty commit triggering CI
 ```
 
 When `push-to-pull-request-branch` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
 
-Like `create-pull-request`, pushes made with `GITHUB_TOKEN` do not trigger CI events. Use `github-ci-trigger-token` or the [`GH_AW_CI_TRIGGER_TOKEN`](/gh-aw/reference/auth/#gh_aw_ci_trigger_token) secret to trigger CI after pushing. See [Triggering CI on Created Pull Requests](#triggering-ci-on-created-pull-requests) for details.
+Like `create-pull-request`, pushes made with `GITHUB_TOKEN` do not trigger CI events. Use `github-token-for-extra-empty-commit` to trigger CI after pushing. See [Triggering CI on Created Pull Requests](#triggering-ci-on-created-pull-requests) for details.
 
 #### Fail-Fast on Code Push Failure
 
