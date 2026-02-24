@@ -12,10 +12,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-const fs = require("fs");
-const path = require("path");
-const { spawnSync } = require("child_process");
-const os = require("os");
+import fs from "fs";
+import path from "path";
+import { spawnSync } from "child_process";
+import os from "os";
+import { generateGitPatch } from "./generate_git_patch.cjs";
 
 /**
  * Execute git command safely with args array
@@ -546,8 +547,6 @@ describe("git patch integration tests", () => {
       execGit(["update-ref", "-d", "refs/remotes/origin/feature-branch"], { cwd: workingRepo });
 
       // Generate patch in incremental mode
-      const { generateGitPatch } = require("./generate_git_patch.cjs");
-
       // Set environment
       const origWorkspace = process.env.GITHUB_WORKSPACE;
       const origDefaultBranch = process.env.DEFAULT_BRANCH;
@@ -593,8 +592,6 @@ describe("git patch integration tests", () => {
 
       // Don't push - origin/local-only-branch doesn't exist
 
-      const { generateGitPatch } = require("./generate_git_patch.cjs");
-
       const origWorkspace = process.env.GITHUB_WORKSPACE;
       const origDefaultBranch = process.env.DEFAULT_BRANCH;
       process.env.GITHUB_WORKSPACE = workingRepo;
@@ -633,8 +630,6 @@ describe("git patch integration tests", () => {
 
       // Fetch origin/main so merge-base can work
       execGit(["fetch", "origin", "main"], { cwd: workingRepo });
-
-      const { generateGitPatch } = require("./generate_git_patch.cjs");
 
       const origWorkspace = process.env.GITHUB_WORKSPACE;
       const origDefaultBranch = process.env.DEFAULT_BRANCH;
