@@ -16,7 +16,6 @@ type FirewallConfig struct {
 	Enabled       bool     `yaml:"enabled,omitempty"`        // Enable/disable AWF (default: true for copilot when network restrictions present)
 	Version       string   `yaml:"version,omitempty"`        // AWF version (empty = latest)
 	Args          []string `yaml:"args,omitempty"`           // Additional arguments to pass to AWF
-	LogLevel      string   `yaml:"log_level,omitempty"`      // AWF log level (default: "info")
 	CleanupScript string   `yaml:"cleanup_script,omitempty"` // Cleanup script path (default: "./scripts/ci/cleanup.sh")
 	SSLBump       bool     `yaml:"ssl_bump,omitempty"`       // AWF-only: Enable SSL Bump for HTTPS content inspection (allows URL path filtering)
 	AllowURLs     []string `yaml:"allow_urls,omitempty"`     // AWF-only: URL patterns to allow for HTTPS (requires SSLBump), e.g., "https://github.com/githubnext/*"
@@ -70,8 +69,8 @@ func getFirewallConfig(workflowData *WorkflowData) *FirewallConfig {
 	if workflowData.NetworkPermissions != nil && workflowData.NetworkPermissions.Firewall != nil {
 		config := workflowData.NetworkPermissions.Firewall
 		if firewallLog.Enabled() {
-			firewallLog.Printf("Retrieved firewall config: enabled=%v, version=%s, logLevel=%s",
-				config.Enabled, config.Version, config.LogLevel)
+			firewallLog.Printf("Retrieved firewall config: enabled=%v, version=%s",
+				config.Enabled, config.Version)
 		}
 		return config
 	}

@@ -525,12 +525,6 @@
               "desc": "AWF version to use (empty = latest release).",
               "leaf": true
             },
-            "log-level": {
-              "type": "string",
-              "desc": "AWF log level (default: info).",
-              "enum": ["debug", "info", "warn", "error"],
-              "leaf": true
-            },
             "ssl-bump": {
               "type": "boolean",
               "desc": "Enable SSL Bump for HTTPS content inspection.",

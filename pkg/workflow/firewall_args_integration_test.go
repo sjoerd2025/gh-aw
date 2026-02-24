@@ -174,7 +174,6 @@ network:
     allow-urls:
       - "https://github.com/githubnext/*"
       - "https://api.github.com/repos/*"
-    log-level: debug
 ---
 
 # Test SSL Bump Workflow
@@ -229,8 +228,8 @@ Test workflow with SSL bump and allow-urls configuration.
 			t.Error("Compiled workflow should still contain '--env-all' flag")
 		}
 
-		if !strings.Contains(lockYAML, "--log-level debug") {
-			t.Error("Compiled workflow should contain '--log-level debug'")
+		if !strings.Contains(lockYAML, "--log-level info") {
+			t.Error("Compiled workflow should contain '--log-level info'")
 		}
 	})
 }
