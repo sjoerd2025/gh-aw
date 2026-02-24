@@ -7438,7 +7438,7 @@
               "oneOf": [
                 {
                   "type": "string",
-                  "description": "Simple concurrency group name. Gets converted to GitHub Actions concurrency format with the specified group."
+                  "description": "Simple concurrency group name, or 'none' to disable the default job-level concurrency. Use 'none' when the workflow-level concurrency already provides the desired isolation (e.g., per-issue dispatch workflows). Gets converted to GitHub Actions concurrency format with the specified group."
                 },
                 {
                   "type": "object",
@@ -7457,7 +7457,7 @@
                   "additionalProperties": false
                 }
               ],
-              "description": "Agent job concurrency configuration. Defaults to single job per engine across all workflows (group: 'gh-aw-{engine-id}'). Supports full GitHub Actions concurrency syntax."
+              "description": "Agent job concurrency configuration. Defaults to single job per engine across all workflows (group: 'gh-aw-{engine-id}'). Set to 'none' to disable the default job-level concurrency and rely solely on workflow-level concurrency. Supports full GitHub Actions concurrency syntax."
             },
             "user-agent": {
               "type": "string",

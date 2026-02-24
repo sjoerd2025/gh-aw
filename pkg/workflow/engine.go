@@ -119,8 +119,13 @@ func (c *Compiler) ExtractEngineConfig(frontmatter map[string]any) (string, *Eng
 			// Extract optional 'concurrency' field (string or object format)
 			if concurrency, hasConcurrency := engineObj["concurrency"]; hasConcurrency {
 				if concurrencyStr, ok := concurrency.(string); ok {
-					// Simple string format (group name)
-					config.Concurrency = fmt.Sprintf("concurrency:\n  group: \"%s\"", concurrencyStr)
+					if concurrencyStr == "none" {
+						// Special value to opt out of default job-level concurrency
+						config.Concurrency = "none"
+					} else {
+						// Simple string format (group name)
+						config.Concurrency = fmt.Sprintf("concurrency:\n  group: \"%s\"", concurrencyStr)
+					}
 				} else if concurrencyObj, ok := concurrency.(map[string]any); ok {
 					// Object format with group and optional cancel-in-progress
 					var parts []string

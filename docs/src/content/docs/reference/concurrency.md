@@ -53,6 +53,28 @@ tools:
 ---
 ```
 
+## Disabling Job-Level Concurrency
+
+Set `engine.concurrency: none` to opt out of the default per-engine job-level concurrency. This is useful when the workflow-level `concurrency` already provides the required isolation (for example, a `workflow_dispatch` workflow that processes individual issues and includes the issue number in its concurrency group):
+
+```yaml wrap
+---
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        required: true
+concurrency:
+  group: issue-triage-${{ github.event.inputs.issue_number }}
+  cancel-in-progress: true
+engine:
+  id: copilot
+  concurrency: none  # Disable default job-level concurrency; rely on workflow-level group above
+---
+```
+
+Without `engine.concurrency: none`, the compiled agent job would use `gh-aw-copilot-${{ github.workflow }}` as its concurrency group, which serializes all runs of the workflow regardless of the issue number. Setting it to `none` allows different issues to be processed in parallel while still cancelling duplicate runs for the same issue.
+
 ## Related Documentation
 
 - [AI Engines](/gh-aw/reference/engines/) - Engine configuration and capabilities

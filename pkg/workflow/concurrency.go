@@ -44,6 +44,11 @@ func GenerateJobConcurrencyConfig(workflowData *WorkflowData) string {
 
 	// If concurrency is explicitly configured in engine, use it
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Concurrency != "" {
+		// "none" is a special value to opt out of default job-level concurrency
+		if workflowData.EngineConfig.Concurrency == "none" {
+			concurrencyLog.Print("Engine concurrency set to none, skipping default job concurrency")
+			return ""
+		}
 		concurrencyLog.Print("Using engine-configured concurrency")
 		return workflowData.EngineConfig.Concurrency
 	}

@@ -391,6 +391,15 @@ func TestGenerateJobConcurrencyConfig(t *testing.T) {
   group: "gh-aw-codex-${{ github.workflow }}"`,
 			description: "Codex with schedule should get default concurrency",
 		},
+		{
+			name: "No concurrency when engine.concurrency is set to none",
+			workflowData: &WorkflowData{
+				On:           "on:\n  workflow_dispatch:",
+				EngineConfig: &EngineConfig{ID: "copilot", Concurrency: "none"},
+			},
+			expected:    "",
+			description: "engine.concurrency: none should disable default job-level concurrency",
+		},
 	}
 
 	for _, tt := range tests {
