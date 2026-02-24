@@ -14,8 +14,8 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestClassifyCheckState_NoChecks(t *testing.T) {
-	state := classifyCheckState([]PRCheckRun{}, []PRCommitStatus{})
-	assert.Equal(t, CheckStateNoChecks, state, "empty check runs and statuses should yield no_checks")
+	state := classifyCheckState([]PRCheckRun{})
+	assert.Equal(t, CheckStateNoChecks, state, "empty check runs should return no_checks")
 }
 
 func TestClassifyCheckState_AllSuccess(t *testing.T) {
@@ -23,7 +23,7 @@ func TestClassifyCheckState_AllSuccess(t *testing.T) {
 		{Name: "build", Status: "completed", Conclusion: "success"},
 		{Name: "lint", Status: "completed", Conclusion: "success"},
 	}
-	state := classifyCheckState(runs, nil)
+	state := classifyCheckState(runs)
 	assert.Equal(t, CheckStateSuccess, state, "all successful check runs should yield success")
 }
 
@@ -32,7 +32,7 @@ func TestClassifyCheckState_Failed(t *testing.T) {
 		{Name: "build", Status: "completed", Conclusion: "success"},
 		{Name: "test", Status: "completed", Conclusion: "failure"},
 	}
-	state := classifyCheckState(runs, nil)
+	state := classifyCheckState(runs)
 	assert.Equal(t, CheckStateFailed, state, "at least one failed check run should yield failed")
 }
 
@@ -41,7 +41,7 @@ func TestClassifyCheckState_Pending(t *testing.T) {
 		{Name: "build", Status: "completed", Conclusion: "success"},
 		{Name: "test", Status: "in_progress", Conclusion: ""},
 	}
-	state := classifyCheckState(runs, nil)
+	state := classifyCheckState(runs)
 	assert.Equal(t, CheckStatePending, state, "in-progress check run should yield pending")
 }
 
@@ -49,7 +49,7 @@ func TestClassifyCheckState_Queued(t *testing.T) {
 	runs := []PRCheckRun{
 		{Name: "build", Status: "queued", Conclusion: ""},
 	}
-	state := classifyCheckState(runs, nil)
+	state := classifyCheckState(runs)
 	assert.Equal(t, CheckStatePending, state, "queued check run should yield pending")
 }
 
@@ -57,7 +57,7 @@ func TestClassifyCheckState_PolicyBlocked(t *testing.T) {
 	runs := []PRCheckRun{
 		{Name: "Branch protection rule check", Status: "completed", Conclusion: "failure"},
 	}
-	state := classifyCheckState(runs, nil)
+	state := classifyCheckState(runs)
 	assert.Equal(t, CheckStatePolicyBlocked, state, "branch protection rule failure should yield policy_blocked")
 }
 
@@ -66,7 +66,7 @@ func TestClassifyCheckState_PolicyBlockedActionRequired(t *testing.T) {
 		{Name: "build", Status: "completed", Conclusion: "success"},
 		{Name: "required status check", Status: "completed", Conclusion: "action_required"},
 	}
-	state := classifyCheckState(runs, nil)
+	state := classifyCheckState(runs)
 	assert.Equal(t, CheckStatePolicyBlocked, state, "action_required on policy check should yield policy_blocked")
 }
 
@@ -76,63 +76,15 @@ func TestClassifyCheckState_PolicyBlockedWithFailures(t *testing.T) {
 		{Name: "required status check", Status: "completed", Conclusion: "failure"},
 		{Name: "test suite", Status: "completed", Conclusion: "failure"},
 	}
-	state := classifyCheckState(runs, nil)
+	state := classifyCheckState(runs)
 	assert.Equal(t, CheckStateFailed, state, "real failure alongside policy check should yield failed, not policy_blocked")
-}
-
-func TestClassifyCheckState_CommitStatusNoChecks(t *testing.T) {
-	state := classifyCheckState(nil, []PRCommitStatus{})
-	assert.Equal(t, CheckStateNoChecks, state, "empty commit statuses should yield no_checks")
-}
-
-func TestClassifyCheckState_CommitStatusPending(t *testing.T) {
-	statuses := []PRCommitStatus{
-		{Context: "ci/circleci", State: "pending"},
-	}
-	state := classifyCheckState(nil, statuses)
-	assert.Equal(t, CheckStatePending, state, "pending commit status should yield pending")
-}
-
-func TestClassifyCheckState_CommitStatusFailed(t *testing.T) {
-	statuses := []PRCommitStatus{
-		{Context: "ci/circleci", State: "failure"},
-	}
-	state := classifyCheckState(nil, statuses)
-	assert.Equal(t, CheckStateFailed, state, "failure commit status should yield failed")
-}
-
-func TestClassifyCheckState_CommitStatusError(t *testing.T) {
-	statuses := []PRCommitStatus{
-		{Context: "ci/circleci", State: "error"},
-	}
-	state := classifyCheckState(nil, statuses)
-	assert.Equal(t, CheckStateFailed, state, "error commit status should yield failed")
-}
-
-func TestClassifyCheckState_CommitStatusSuccess(t *testing.T) {
-	statuses := []PRCommitStatus{
-		{Context: "ci/circleci", State: "success"},
-	}
-	state := classifyCheckState(nil, statuses)
-	assert.Equal(t, CheckStateSuccess, state, "success commit status should yield success")
-}
-
-func TestClassifyCheckState_MixedRunsAndStatuses(t *testing.T) {
-	runs := []PRCheckRun{
-		{Name: "build", Status: "completed", Conclusion: "success"},
-	}
-	statuses := []PRCommitStatus{
-		{Context: "ci/circleci", State: "pending"},
-	}
-	state := classifyCheckState(runs, statuses)
-	assert.Equal(t, CheckStatePending, state, "pending status with successful run should yield pending")
 }
 
 func TestClassifyCheckState_TimedOut(t *testing.T) {
 	runs := []PRCheckRun{
 		{Name: "slow-test", Status: "completed", Conclusion: "timed_out"},
 	}
-	state := classifyCheckState(runs, nil)
+	state := classifyCheckState(runs)
 	assert.Equal(t, CheckStateFailed, state, "timed_out should yield failed")
 }
 
@@ -240,7 +192,6 @@ func TestChecksResultJSONShape(t *testing.T) {
 		CheckRuns: []PRCheckRun{
 			{Name: "build", Status: "completed", Conclusion: "failure", HTMLURL: "https://example.com"},
 		},
-		Statuses:   []PRCommitStatus{},
 		TotalCount: 1,
 	}
 

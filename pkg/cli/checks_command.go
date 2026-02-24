@@ -48,22 +48,13 @@ type PRCheckRun struct {
 	HTMLURL    string `json:"html_url"`
 }
 
-// PRCommitStatus represents a single commit status from the GitHub API.
-type PRCommitStatus struct {
-	State       string `json:"state"`
-	Description string `json:"description"`
-	Context     string `json:"context"`
-	TargetURL   string `json:"target_url"`
-}
-
 // ChecksResult is the normalized output for the checks command.
 type ChecksResult struct {
-	State      CheckState       `json:"state"`
-	PRNumber   string           `json:"pr_number"`
-	HeadSHA    string           `json:"head_sha"`
-	CheckRuns  []PRCheckRun     `json:"check_runs"`
-	Statuses   []PRCommitStatus `json:"statuses"`
-	TotalCount int              `json:"total_count"`
+	State      CheckState   `json:"state"`
+	PRNumber   string       `json:"pr_number"`
+	HeadSHA    string       `json:"head_sha"`
+	CheckRuns  []PRCheckRun `json:"check_runs"`
+	TotalCount int          `json:"total_count"`
 }
 
 // NewChecksCommand creates the checks command.
@@ -80,7 +71,7 @@ Maps PR check rollups to one of the following normalized states:
   no_checks      - no checks configured or triggered
   policy_blocked - policy or account gates are blocking the PR
 
-` + "Raw check run and commit status signals are included in JSON output." + `
+` + "Raw check run signals are included in JSON output." + `
 
 Examples:
   ` + string(constants.CLIExtensionPrefix) + ` checks 42                    # Classify checks for PR #42
@@ -123,7 +114,7 @@ func RunChecks(config ChecksConfig) error {
 	return printChecksText(result)
 }
 
-// FetchChecksResult fetches check runs and statuses for a PR and returns a classified result.
+// FetchChecksResult fetches check runs for a PR and returns a classified result.
 // This function is exported for use in tests and other packages.
 func FetchChecksResult(repoOverride string, prNumber string) (*ChecksResult, error) {
 	checksLog.Printf("Fetching checks result: repo=%s, pr=%s", repoOverride, prNumber)
@@ -143,23 +134,14 @@ func FetchChecksResult(repoOverride string, prNumber string) (*ChecksResult, err
 		checkRuns = []PRCheckRun{}
 	}
 
-	// Step 3: Fetch commit statuses
-	statuses, err := fetchCommitStatuses(repoOverride, headSHA)
-	if err != nil {
-		// Non-fatal: continue with empty statuses
-		checksLog.Printf("Failed to fetch commit statuses: %v", err)
-		statuses = []PRCommitStatus{}
-	}
-
-	state := classifyCheckState(checkRuns, statuses)
+	state := classifyCheckState(checkRuns)
 
 	return &ChecksResult{
 		State:      state,
 		PRNumber:   prNumber,
 		HeadSHA:    headSHA,
 		CheckRuns:  checkRuns,
-		Statuses:   statuses,
-		TotalCount: len(checkRuns) + len(statuses),
+		TotalCount: len(checkRuns),
 	}, nil
 }
 
@@ -262,38 +244,6 @@ func fetchCheckRuns(repoOverride string, sha string) ([]PRCheckRun, error) {
 	return resp.CheckRuns, nil
 }
 
-// commitStatusAPIResponse is the envelope returned by the statuses endpoint.
-type commitStatusAPIResponse struct {
-	State    string           `json:"state"`
-	Statuses []PRCommitStatus `json:"statuses"`
-}
-
-// fetchCommitStatuses fetches commit statuses (legacy Status API) for a commit SHA.
-func fetchCommitStatuses(repoOverride string, sha string) ([]PRCommitStatus, error) {
-	args := []string{"api", "repos/{owner}/{repo}/commits/" + sha + "/status"}
-	if repoOverride != "" {
-		args = append(args, "--repo", repoOverride)
-	}
-
-	cmd := workflow.ExecGH(args...)
-	output, err := cmd.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			stderr := strings.TrimSpace(string(exitErr.Stderr))
-			return nil, classifyGHAPIError(exitErr.ExitCode(), stderr, sha, repoOverride)
-		}
-		return nil, fmt.Errorf("gh api call failed: %w", err)
-	}
-
-	var resp commitStatusAPIResponse
-	if err := json.Unmarshal(output, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse commit status response: %w", err)
-	}
-
-	return resp.Statuses, nil
-}
-
 // policyCheckPatterns are patterns that indicate a policy/account-gate check rather than a
 // product failure. These names come from GitHub's branch-protection rule enforcement.
 var policyCheckPatterns = []string{
@@ -316,9 +266,9 @@ func isPolicyCheck(name string) bool {
 	return false
 }
 
-// classifyCheckState derives a normalized CheckState from raw check runs and commit statuses.
-func classifyCheckState(checkRuns []PRCheckRun, statuses []PRCommitStatus) CheckState {
-	if len(checkRuns) == 0 && len(statuses) == 0 {
+// classifyCheckState derives a normalized CheckState from raw check runs.
+func classifyCheckState(checkRuns []PRCheckRun) CheckState {
+	if len(checkRuns) == 0 {
 		return CheckStateNoChecks
 	}
 
@@ -340,19 +290,6 @@ func classifyCheckState(checkRuns []PRCheckRun, statuses []PRCommitStatus) Check
 				}
 			case "action_required":
 				hasPolicyBlocked = true
-			}
-		}
-	}
-
-	for _, s := range statuses {
-		switch s.State {
-		case "pending":
-			hasPending = true
-		case "failure", "error":
-			if isPolicyCheck(s.Context) {
-				hasPolicyBlocked = true
-			} else {
-				hasFailed = true
 			}
 		}
 	}
