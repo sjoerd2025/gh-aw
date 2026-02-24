@@ -158,8 +158,14 @@ describe("push_to_pull_request_branch.cjs", () => {
   });
 
   afterEach(() => {
-    // Restore environment
-    process.env = originalEnv;
+    // Restore environment by mutating process.env in place
+    // (replacing process.env with a plain object breaks Node's special env handling)
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
 
     // Clean up temp directory
     if (tempDir && fs.existsSync(tempDir)) {

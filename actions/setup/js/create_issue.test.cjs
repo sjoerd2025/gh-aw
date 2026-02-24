@@ -81,8 +81,13 @@ describe("create_issue", () => {
   });
 
   afterEach(() => {
-    // Restore original environment
-    process.env = originalEnv;
+    // Restore environment by mutating process.env in place
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    Object.assign(process.env, originalEnv);
     vi.clearAllMocks();
   });
 
