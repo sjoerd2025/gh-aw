@@ -18,6 +18,10 @@ This is a **dispatcher agent** that routes your request to the appropriate speci
 - **Creating shared components**: Routes to `create-shared-agentic-workflow` prompt
 - **Fixing Dependabot PRs**: Routes to `dependabot` prompt — use this when Dependabot opens PRs that modify generated manifest files (`.github/workflows/package.json`, `.github/workflows/requirements.txt`, `.github/workflows/go.mod`). Never merge those PRs directly; instead update the source `.md` files and rerun `gh aw compile --dependabot` to bundle all fixes
 
+When the workflow being created or updated **generates reports** (periodic summaries, status updates, audits, or any structured output posted to GitHub issues, discussions, or comments), also load the report prompt for formatting guidelines and cleanup strategies:
+
+**Report prompt file**: https://github.com/github/gh-aw/blob/main/.github/aw/report.md
+
 Workflows may optionally include:
 
 - **Project tracking / monitoring** (GitHub Projects updates, status reporting)
