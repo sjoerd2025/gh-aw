@@ -215,3 +215,85 @@ func TestCodexEngineHasSecretValidation(t *testing.T) {
 		t.Error("Should pass both CODEX_API_KEY and OPENAI_API_KEY to the script")
 	}
 }
+
+// Tests verifying that the secret validation step is skipped when engine.env is set
+
+func TestCopilotEngineSkipsSecretValidationWithCustomEnv(t *testing.T) {
+	engine := NewCopilotEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Env: map[string]string{
+				"COPILOT_GITHUB_TOKEN": "${{ secrets.ORG_GITHUB_COPILOT_TOKEN }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+
+	for _, step := range steps {
+		stepContent := strings.Join(step, "\n")
+		if strings.Contains(stepContent, "id: validate-secret") {
+			t.Error("Secret validation step should be skipped when engine.env is provided")
+		}
+	}
+}
+
+func TestClaudeEngineSkipsSecretValidationWithCustomEnv(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Env: map[string]string{
+				"ANTHROPIC_API_KEY": "${{ secrets.ORG_ANTHROPIC_API_KEY }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+
+	for _, step := range steps {
+		stepContent := strings.Join(step, "\n")
+		if strings.Contains(stepContent, "id: validate-secret") {
+			t.Error("Secret validation step should be skipped when engine.env is provided")
+		}
+	}
+}
+
+func TestCodexEngineSkipsSecretValidationWithCustomEnv(t *testing.T) {
+	engine := NewCodexEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Env: map[string]string{
+				"CODEX_API_KEY": "${{ secrets.ORG_CODEX_API_KEY }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+
+	for _, step := range steps {
+		stepContent := strings.Join(step, "\n")
+		if strings.Contains(stepContent, "id: validate-secret") {
+			t.Error("Secret validation step should be skipped when engine.env is provided")
+		}
+	}
+}
+
+func TestGeminiEngineSkipsSecretValidationWithCustomEnv(t *testing.T) {
+	engine := NewGeminiEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Env: map[string]string{
+				"GEMINI_API_KEY": "${{ secrets.ORG_GEMINI_API_KEY }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+
+	for _, step := range steps {
+		stepContent := strings.Join(step, "\n")
+		if strings.Contains(stepContent, "id: validate-secret") {
+			t.Error("Secret validation step should be skipped when engine.env is provided")
+		}
+	}
+}
