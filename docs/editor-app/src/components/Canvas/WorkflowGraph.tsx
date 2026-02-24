@@ -14,13 +14,14 @@ import {
 import '@xyflow/react/dist/style.css';
 import dagre from '@dagrejs/dagre';
 
+import { useUIStore } from '../../stores/uiStore';
 import { TriggerNode } from '../Nodes/TriggerNode';
-import { PermissionsNode } from '../Nodes/PermissionsNode';
 import { EngineNode } from '../Nodes/EngineNode';
 import { ToolsNode } from '../Nodes/ToolsNode';
 import { InstructionsNode } from '../Nodes/InstructionsNode';
 import { SafeOutputsNode } from '../Nodes/SafeOutputsNode';
 import { NetworkNode } from '../Nodes/NetworkNode';
+import { SettingsNode } from '../Nodes/SettingsNode';
 import { StepsNode } from '../Nodes/StepsNode';
 import { EmptyState } from './EmptyState';
 import { useWorkflowStore } from '../../stores/workflowStore';
@@ -29,12 +30,12 @@ import '../../styles/nodes.css';
 
 const nodeTypes: NodeTypes = {
   trigger: TriggerNode,
-  permissions: PermissionsNode,
   engine: EngineNode,
   tools: ToolsNode,
   instructions: InstructionsNode,
   safeOutputs: SafeOutputsNode,
   network: NetworkNode,
+  settings: SettingsNode,
   steps: StepsNode,
 };
 
@@ -58,14 +59,6 @@ const ALL_NODES: NodeDef[] = [
     description: 'Choose what starts this workflow',
     isRequired: true,
     isConfigured: (s) => s.trigger.event !== '',
-  },
-  {
-    id: 'permissions',
-    type: 'permissions',
-    label: 'Permissions',
-    description: 'Set access permissions',
-    isRequired: false,
-    isConfigured: (s) => Object.keys(s.permissions).length > 0,
   },
   {
     id: 'engine',
@@ -109,6 +102,19 @@ const ALL_NODES: NodeDef[] = [
       s.network.allowed.length > 0 || s.network.blocked.length > 0,
   },
   {
+    id: 'settings',
+    type: 'settings',
+    label: 'Settings',
+    description: 'Concurrency, rate limits, platform',
+    isRequired: false,
+    isConfigured: (s) =>
+      s.platform !== '' ||
+      (s.concurrency?.group ?? '') !== '' ||
+      (s.concurrency?.cancelInProgress ?? false) ||
+      (s.rateLimit?.max ?? '') !== '' ||
+      (s.rateLimit?.window ?? '') !== '',
+  },
+  {
     id: 'steps',
     type: 'steps',
     label: 'Custom Steps',
@@ -150,6 +156,11 @@ function getLayoutedElements(nodes: Node[], edges: Edge[]) {
 export function WorkflowGraph() {
   const state = useWorkflowStore();
   const selectNode = useWorkflowStore((s) => s.selectNode);
+  const theme = useUIStore((s) => s.theme);
+
+  // Resolve effective color mode (auto → system preference)
+  const isDark = theme === 'dark' || (theme === 'auto' && typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const colorMode = isDark ? 'dark' : 'light';
 
   // Determine which nodes to show: required nodes + configured optional nodes
   const visibleNodeDefs = useMemo(() => {
@@ -220,18 +231,25 @@ export function WorkflowGraph() {
       onNodeClick={onNodeClick}
       onPaneClick={onPaneClick}
       nodeTypes={nodeTypes}
+      colorMode={colorMode}
       fitView
       fitViewOptions={{ padding: 0.2 }}
       minZoom={0.3}
       maxZoom={1.5}
       proOptions={{ hideAttribution: true }}
     >
-      <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
+      <Background
+        variant={BackgroundVariant.Dots}
+        gap={16}
+        size={1}
+        color={isDark ? '#30363d' : undefined}
+      />
       <Controls position="bottom-left" />
       <MiniMap
         position="bottom-left"
         style={{ marginBottom: 50 }}
         nodeStrokeWidth={3}
+        maskColor={isDark ? 'rgba(0, 0, 0, 0.6)' : undefined}
         pannable
         zoomable
       />

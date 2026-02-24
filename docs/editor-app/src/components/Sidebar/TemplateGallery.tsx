@@ -1,12 +1,21 @@
 import { useState } from 'react';
 import {
-  GitPullRequest,
-  Tag,
+  Inbox,
+  Wrench,
   Book,
-  ShieldCheck,
-  Clock,
+  Activity,
   Terminal,
+  TestTube,
   Plus,
+  Shield,
+  ClipboardCheck,
+  Zap,
+  BarChart,
+  MessageCircle,
+  ListChecks,
+  GraduationCap,
+  BookOpen,
+  Scissors,
   type LucideIcon,
 } from 'lucide-react';
 import { toast } from '../../utils/lazyToast';
@@ -15,15 +24,22 @@ import { templates, templateCategories } from '../../utils/templates';
 import type { WorkflowTemplate } from '../../types/workflow';
 
 const ICON_MAP: Record<string, LucideIcon> = {
-  'code-review': GitPullRequest,
-  'git-pull-request': GitPullRequest,
-  inbox: Tag,
-  tag: Tag,
+  inbox: Inbox,
+  wrench: Wrench,
   book: Book,
-  'shield-check': ShieldCheck,
-  clock: Clock,
+  activity: Activity,
   terminal: Terminal,
+  'test-tube': TestTube,
   plus: Plus,
+  shield: Shield,
+  'clipboard-check': ClipboardCheck,
+  zap: Zap,
+  'bar-chart': BarChart,
+  'message-circle': MessageCircle,
+  'list-checks': ListChecks,
+  'graduation-cap': GraduationCap,
+  'book-open': BookOpen,
+  scissors: Scissors,
 };
 
 export function TemplateGallery() {

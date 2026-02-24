@@ -1,20 +1,28 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useMemo } from 'react';
 import { Highlight, themes } from 'prism-react-renderer';
 import { useWorkflowStore } from '../../stores/workflowStore';
 import { MarkdownSource } from './MarkdownSource';
+import { DiffView } from './DiffView';
+import { computeDiff, countChanges } from '../../utils/diffView';
 
-type TabId = 'yaml' | 'markdown';
+type TabId = 'yaml' | 'markdown' | 'diff';
 
 export function YamlPreview() {
   const [activeTab, setActiveTab] = useState<TabId>('yaml');
   const [copied, setCopied] = useState(false);
   const compiledYaml = useWorkflowStore((s) => s.compiledYaml);
   const compiledMarkdown = useWorkflowStore((s) => s.compiledMarkdown);
+  const previousYaml = useWorkflowStore((s) => s.previousYaml);
   const error = useWorkflowStore((s) => s.error);
   const warnings = useWorkflowStore((s) => s.warnings);
   const isCompiling = useWorkflowStore((s) => s.isCompiling);
 
-  const currentContent = activeTab === 'yaml' ? compiledYaml : compiledMarkdown;
+  const diffChangeCount = useMemo(() => {
+    if (!previousYaml && !compiledYaml) return 0;
+    return countChanges(computeDiff(previousYaml, compiledYaml));
+  }, [previousYaml, compiledYaml]);
+
+  const currentContent = activeTab === 'yaml' ? compiledYaml : activeTab === 'markdown' ? compiledMarkdown : '';
 
   const handleCopy = useCallback(async () => {
     if (!currentContent) return;
@@ -67,6 +75,15 @@ export function YamlPreview() {
           >
             Markdown Source
           </TabButton>
+          <TabButton
+            active={activeTab === 'diff'}
+            onClick={() => setActiveTab('diff')}
+          >
+            Diff
+            {diffChangeCount > 0 && (
+              <span style={diffBadgeStyle}>{diffChangeCount}</span>
+            )}
+          </TabButton>
         </div>
         <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
           {isCompiling && (
@@ -93,7 +110,7 @@ export function YamlPreview() {
       {/* Error banner */}
       {error && (
         <div style={errorBannerStyle}>
-          <strong>Compilation Error:</strong> {error}
+          <strong>Compilation Error:</strong> {error.message}
         </div>
       )}
 
@@ -101,8 +118,10 @@ export function YamlPreview() {
       <div style={contentAreaStyle}>
         {activeTab === 'yaml' ? (
           <YamlHighlighted code={compiledYaml} />
-        ) : (
+        ) : activeTab === 'markdown' ? (
           <MarkdownSource code={compiledMarkdown} />
+        ) : (
+          <DiffView oldText={previousYaml} newText={compiledYaml} />
         )}
       </div>
     </div>
@@ -260,4 +279,19 @@ const errorBannerStyle: React.CSSProperties = {
   backgroundColor: '#ffebe9',
   borderBottom: '1px solid #d1242f',
   color: '#d1242f',
+};
+
+const diffBadgeStyle: React.CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  marginLeft: 4,
+  minWidth: 18,
+  height: 18,
+  padding: '0 5px',
+  fontSize: 10,
+  fontWeight: 600,
+  borderRadius: 9,
+  background: 'var(--color-accent-fg, #0969da)',
+  color: '#ffffff',
 };

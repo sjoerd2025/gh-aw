@@ -1,12 +1,12 @@
 import { useState } from 'react';
 import {
   Bell,
-  Shield,
   Bot,
   Wrench,
   FileText,
   Send,
   Globe,
+  Settings,
   List,
   type LucideIcon,
 } from 'lucide-react';
@@ -24,20 +24,19 @@ interface PaletteItem {
 
 const PALETTE_ITEMS: PaletteItem[] = [
   { type: 'trigger', label: 'Trigger', description: 'When to run this workflow', icon: Bell, color: '#2da44e', category: 'Triggers' },
-  { type: 'permissions', label: 'Permissions', description: 'Access control for the agent', icon: Shield, color: '#d4a72c', category: 'Configuration' },
   { type: 'engine', label: 'AI Assistant', description: 'Choose which AI to use', icon: Bot, color: '#0969da', category: 'Agent' },
   { type: 'tools', label: 'Tools', description: 'Capabilities for the agent', icon: Wrench, color: '#8250df', category: 'Agent' },
   { type: 'instructions', label: 'Instructions', description: 'Tell the agent what to do', icon: FileText, color: '#57606a', category: 'Agent' },
   { type: 'safeOutputs', label: 'Safe Outputs', description: 'Actions the agent can take', icon: Send, color: '#1a7f37', category: 'Outputs' },
   { type: 'network', label: 'Network', description: 'Internet access control', icon: Globe, color: '#cf222e', category: 'Advanced' },
+  { type: 'settings', label: 'Settings', description: 'Concurrency, rate limits, platform', icon: Settings, color: '#57606a', category: 'Advanced' },
   { type: 'steps', label: 'Custom Steps', description: 'Pre/post agent steps', icon: List, color: '#0550ae', category: 'Advanced' },
 ];
 
-const CATEGORIES = ['Triggers', 'Configuration', 'Agent', 'Outputs', 'Advanced'];
+const CATEGORIES = ['Triggers', 'Agent', 'Outputs', 'Advanced'];
 
 const CATEGORY_COLORS: Record<string, string> = {
   Triggers: '#2da44e',
-  Configuration: '#d4a72c',
   Agent: '#8250df',
   Outputs: '#1a7f37',
   Advanced: '#57606a',

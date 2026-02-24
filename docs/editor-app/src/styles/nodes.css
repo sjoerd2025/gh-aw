@@ -222,6 +222,36 @@
 [data-color-mode="dark"] .node-network { --node-accent: #f85149; }
 [data-color-mode="dark"] .node-steps { --node-accent: #79c0ff; }
 
+/* Node error state */
+.workflow-node.has-error {
+  border-color: #cf222e;
+  border-left-color: #cf222e;
+  box-shadow: 0 0 0 2px rgba(207, 34, 46, 0.25),
+              0 2px 8px rgba(207, 34, 46, 0.1);
+  animation: error-pulse 2s ease-in-out infinite;
+}
+
+[data-color-mode="dark"] .workflow-node.has-error {
+  border-color: #f85149;
+  border-left-color: #f85149;
+  box-shadow: 0 0 0 2px rgba(248, 81, 73, 0.3),
+              0 2px 8px rgba(248, 81, 73, 0.15);
+}
+
+@keyframes error-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(207, 34, 46, 0.25), 0 2px 8px rgba(207, 34, 46, 0.1); }
+  50% { box-shadow: 0 0 0 4px rgba(207, 34, 46, 0.15), 0 2px 12px rgba(207, 34, 46, 0.2); }
+}
+
+[data-color-mode="dark"] .workflow-node.has-error {
+  animation-name: error-pulse-dark;
+}
+
+@keyframes error-pulse-dark {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(248, 81, 73, 0.3), 0 2px 8px rgba(248, 81, 73, 0.15); }
+  50% { box-shadow: 0 0 0 4px rgba(248, 81, 73, 0.2), 0 2px 12px rgba(248, 81, 73, 0.25); }
+}
+
 /* Node dimming when another node is selected */
 .workflow-node.dimmed {
   opacity: 0.7;

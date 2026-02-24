@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
-import { Rocket, LayoutTemplate, X } from 'lucide-react';
+import { Rocket, LayoutTemplate, Compass, X } from 'lucide-react';
 import { useUIStore } from '../../stores/uiStore';
 
 export function WelcomeModal() {
@@ -8,6 +8,7 @@ export function WelcomeModal() {
   const setSidebarTab = useUIStore((s) => s.setSidebarTab);
   const sidebarOpen = useUIStore((s) => s.sidebarOpen);
   const toggleSidebar = useUIStore((s) => s.toggleSidebar);
+  const setGuidedTourStep = useUIStore((s) => s.setGuidedTourStep);
 
   const handleStartScratch = () => {
     setHasSeenOnboarding(true);
@@ -19,6 +20,11 @@ export function WelcomeModal() {
       toggleSidebar();
     }
     setHasSeenOnboarding(true);
+  };
+
+  const handleTakeTour = () => {
+    setHasSeenOnboarding(true);
+    setGuidedTourStep(0);
   };
 
   return (
@@ -79,7 +85,7 @@ export function WelcomeModal() {
             Create AI-powered GitHub workflows visually -- no coding required.
           </Dialog.Description>
 
-          <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
+          <div style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
             <OptionCard
               icon={<Rocket size={24} />}
               title="Start from scratch"
@@ -93,6 +99,30 @@ export function WelcomeModal() {
               onClick={handleBrowseTemplates}
             />
           </div>
+          <button
+            onClick={handleTakeTour}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 6,
+              width: '100%',
+              padding: '10px 0',
+              fontSize: 13,
+              fontWeight: 500,
+              color: 'var(--color-accent-fg, #0969da)',
+              background: 'none',
+              border: 'none',
+              cursor: 'pointer',
+              borderRadius: 8,
+              transition: 'background 0.15s ease',
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--color-bg-subtle, #f6f8fa)')}
+            onMouseLeave={(e) => (e.currentTarget.style.background = 'none')}
+          >
+            <Compass size={16} />
+            Take a guided tour
+          </button>
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>

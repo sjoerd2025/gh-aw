@@ -2,21 +2,22 @@ import { useWorkflowStore } from '../../stores/workflowStore';
 import { TriggerPanel } from './TriggerPanel';
 import { EnginePanel } from './EnginePanel';
 import { ToolsPanel } from './ToolsPanel';
-import { PermissionsPanel } from './PermissionsPanel';
 import { InstructionsPanel } from './InstructionsPanel';
 import { SafeOutputsPanel } from './SafeOutputsPanel';
 import { NetworkPanel } from './NetworkPanel';
+import { SettingsPanel } from './SettingsPanel';
 import { StepsPanel } from './StepsPanel';
+import { ErrorBoundary } from '../shared/ErrorBoundary';
 import { X, MousePointer2 } from 'lucide-react';
 
 const panelMap: Record<string, React.FC> = {
   trigger: TriggerPanel,
-  permissions: PermissionsPanel,
   engine: EnginePanel,
   tools: ToolsPanel,
   instructions: InstructionsPanel,
   safeOutputs: SafeOutputsPanel,
   network: NetworkPanel,
+  settings: SettingsPanel,
   steps: StepsPanel,
 };
 
@@ -75,7 +76,9 @@ export function PropertiesPanel() {
       >
         <X size={16} />
       </button>
-      <PanelComponent />
+      <ErrorBoundary>
+        <PanelComponent />
+      </ErrorBoundary>
     </div>
   );
 }

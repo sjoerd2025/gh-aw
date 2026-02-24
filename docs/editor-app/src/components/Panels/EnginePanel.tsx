@@ -1,6 +1,9 @@
 import { useWorkflowStore } from '../../stores/workflowStore';
 import { PanelContainer } from './PanelContainer';
 import { getFieldDescription } from '../../utils/fieldDescriptions';
+import { AdvancedSection } from '../shared/AdvancedSection';
+import { FieldError } from '../shared/FieldError';
+import { getErrorsForField } from '../../utils/validation';
 import type { EngineType } from '../../types/workflow';
 
 interface EngineOption {
@@ -20,12 +23,15 @@ const engineOptions: EngineOption[] = [
 export function EnginePanel() {
   const engine = useWorkflowStore((s) => s.engine);
   const setEngine = useWorkflowStore((s) => s.setEngine);
+  const validationErrors = useWorkflowStore((s) => s.validationErrors) ?? [];
   const desc = getFieldDescription('engine');
+
+  const engineTypeErrors = getErrorsForField(validationErrors, 'engine.type');
 
   return (
     <PanelContainer title={desc.label} description={desc.description}>
       {/* Engine selector */}
-      <div className="panel__section">
+      <div className="panel__section" data-field-path="engine.type">
         <div className="panel__section-title">AI Engine</div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
           {engineOptions.map((opt) => {
@@ -39,8 +45,8 @@ export function EnginePanel() {
                 onClick={() => setEngine({ type: opt.type })}
                 style={{
                   ...engineCardStyle,
-                  borderColor: active ? opt.color : '#d0d7de',
-                  backgroundColor: active ? opt.bgColor : '#ffffff',
+                  borderColor: active ? opt.color : 'var(--color-border-default, #d0d7de)',
+                  backgroundColor: active ? `color-mix(in srgb, ${opt.color} 12%, transparent)` : 'var(--color-bg-default, #ffffff)',
                 }}
               >
                 <div style={{
@@ -52,10 +58,10 @@ export function EnginePanel() {
                   marginTop: '3px',
                 }} />
                 <div>
-                  <div style={{ fontSize: '13px', fontWeight: 600, color: '#1f2328' }}>
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-fg-default, #1f2328)' }}>
                     {fd.label}
                   </div>
-                  <div style={{ fontSize: '12px', color: '#656d76', marginTop: '4px', lineHeight: '1.4' }}>
+                  <div style={{ fontSize: '12px', color: 'var(--color-fg-muted, #656d76)', marginTop: '4px', lineHeight: '1.4' }}>
                     {fd.description}
                   </div>
                 </div>
@@ -63,11 +69,12 @@ export function EnginePanel() {
             );
           })}
         </div>
+        <FieldError errors={engineTypeErrors} />
       </div>
 
       {/* Model input */}
       {engine.type && (
-        <div className="panel__section">
+        <div className="panel__section" data-field-path="engine.model">
           <div className="panel__label">
             {getFieldDescription('engine.model').label}
           </div>
@@ -84,38 +91,54 @@ export function EnginePanel() {
         </div>
       )}
 
-      {/* Max turns */}
+      {/* Advanced: max turns, version */}
       {engine.type && (
-        <div className="panel__section">
-          <div className="panel__label">
-            {getFieldDescription('engine.maxTurns').label}
+        <AdvancedSection configuredCount={(engine.maxTurns ? 1 : 0) + (engine.version ? 1 : 0)}>
+          <div className="panel__section">
+            <div className="panel__label">
+              {getFieldDescription('engine.maxTurns').label}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <input
+                type="range"
+                min={1}
+                max={100}
+                value={engine.maxTurns || 10}
+                onChange={(e) => setEngine({ maxTurns: parseInt(e.target.value, 10) })}
+                style={{ flex: 1 }}
+              />
+              <input
+                type="number"
+                min={1}
+                max={200}
+                value={engine.maxTurns || ''}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setEngine({ maxTurns: v ? parseInt(v, 10) : '' });
+                }}
+                placeholder="10"
+                style={{ ...inputStyle, width: '60px', textAlign: 'center' }}
+              />
+            </div>
+            <div className="panel__help">
+              {getFieldDescription('engine.maxTurns').description}
+            </div>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+
+          <div className="panel__section">
+            <div className="panel__label">Version</div>
             <input
-              type="range"
-              min={1}
-              max={100}
-              value={engine.maxTurns || 10}
-              onChange={(e) => setEngine({ maxTurns: parseInt(e.target.value, 10) })}
-              style={{ flex: 1 }}
+              type="text"
+              value={engine.version}
+              onChange={(e) => setEngine({ version: e.target.value })}
+              placeholder="Leave blank for latest"
+              style={inputStyle}
             />
-            <input
-              type="number"
-              min={1}
-              max={200}
-              value={engine.maxTurns || ''}
-              onChange={(e) => {
-                const v = e.target.value;
-                setEngine({ maxTurns: v ? parseInt(v, 10) : '' });
-              }}
-              placeholder="10"
-              style={{ ...inputStyle, width: '60px', textAlign: 'center' }}
-            />
+            <div className="panel__help">
+              Pin a specific engine version. Leave blank to use the latest.
+            </div>
           </div>
-          <div className="panel__help">
-            {getFieldDescription('engine.maxTurns').description}
-          </div>
-        </div>
+        </AdvancedSection>
       )}
     </PanelContainer>
   );
@@ -135,11 +158,11 @@ const engineCardStyle: React.CSSProperties = {
   alignItems: 'flex-start',
   gap: '12px',
   padding: '14px',
-  border: '1px solid #d0d7de',
+  border: '1px solid var(--color-border-default, #d0d7de)',
   borderRadius: '8px',
   cursor: 'pointer',
   textAlign: 'left',
-  background: '#ffffff',
+  background: 'var(--color-bg-default, #ffffff)',
   transition: 'border-color 150ms ease, background 150ms ease',
 };
 
@@ -147,7 +170,9 @@ const inputStyle: React.CSSProperties = {
   width: '100%',
   padding: '8px 12px',
   fontSize: '13px',
-  border: '1px solid #d0d7de',
+  border: '1px solid var(--color-border-default, #d0d7de)',
   borderRadius: '6px',
   outline: 'none',
+  backgroundColor: 'var(--color-bg-default, #ffffff)',
+  color: 'var(--color-fg-default, #1f2328)',
 };

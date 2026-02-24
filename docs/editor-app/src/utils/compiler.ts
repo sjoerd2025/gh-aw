@@ -1,5 +1,5 @@
 import type { CompileResult } from '../types/workflow';
-import type { WorkerCompiler } from '../types/compiler';
+import type { WorkerCompiler, ValidationResult } from '../types/compiler';
 
 // Declare the module for the external JS loader
 declare function createWorkerCompiler(options?: {
@@ -36,18 +36,31 @@ export async function initCompiler(wasmBasePath: string): Promise<void> {
 
 /**
  * Compile a markdown workflow string to GitHub Actions YAML.
+ * Optionally pass a files map for import resolution.
  */
-export async function compile(markdown: string): Promise<CompileResult> {
+export async function compile(markdown: string, files?: Record<string, string>): Promise<CompileResult> {
   if (!compiler) {
     throw new Error('Compiler not initialized. Call initCompiler() first.');
   }
 
-  const result = await compiler.compile(markdown);
+  const result = await compiler.compile(markdown, files);
   return {
     yaml: result.yaml,
     warnings: result.warnings,
     error: result.error,
   };
+}
+
+/**
+ * Validate a markdown workflow string using the WASM compiler with schema validation enabled.
+ * Returns structured errors rather than compiled output.
+ */
+export async function validate(markdown: string): Promise<ValidationResult> {
+  if (!compiler) {
+    throw new Error('Compiler not initialized. Call initCompiler() first.');
+  }
+
+  return compiler.validate(markdown);
 }
 
 /**

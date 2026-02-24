@@ -19,7 +19,7 @@ export function useCompiler() {
       .then(() => setIsReady(true))
       .catch((err) => {
         console.error('Failed to initialize compiler:', err);
-        setError(`Compiler failed to load: ${err.message}`);
+        setError({ message: `Compiler failed to load: ${err.message}`, severity: 'error' });
       });
   }, [setIsReady, setError]);
 
@@ -36,7 +36,7 @@ export function useCompiler() {
         setWarnings(result.warnings);
         setError(result.error);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Compilation failed');
+        setError({ message: err instanceof Error ? err.message : 'Compilation failed', severity: 'error' });
       } finally {
         setIsCompiling(false);
       }

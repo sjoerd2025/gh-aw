@@ -67,6 +67,23 @@ function buildFrontmatter(state: WorkflowState): string {
     lines.push(...networkLines);
   }
 
+  // concurrency
+  const concurrencyLines = buildConcurrency(state);
+  if (concurrencyLines.length > 0) {
+    lines.push(...concurrencyLines);
+  }
+
+  // rate-limit
+  const rateLimitLines = buildRateLimit(state);
+  if (rateLimitLines.length > 0) {
+    lines.push(...rateLimitLines);
+  }
+
+  // platform
+  if (state.platform) {
+    lines.push(`platform: ${yamlString(state.platform)}`);
+  }
+
   // timeout-minutes
   if (state.timeoutMinutes && state.timeoutMinutes !== 15) {
     lines.push(`timeout-minutes: ${state.timeoutMinutes}`);
@@ -93,6 +110,11 @@ function buildFrontmatter(state: WorkflowState): string {
     lines.push('strict: true');
   }
 
+  // cache
+  if (state.cache) {
+    lines.push('cache: true');
+  }
+
   return lines.join('\n');
 }
 
@@ -102,6 +124,11 @@ function buildTrigger(state: WorkflowState): string[] {
 
   const lines: string[] = [];
 
+  // Check if any modifiers will be applied (determines output form)
+  const hasModifiers = !!(trigger.reaction || trigger.statusComment || trigger.skipBots ||
+    trigger.skipRoles.length > 0 || trigger.roles.length > 0 ||
+    trigger.bots.length > 0 || trigger.manualApproval);
+
   // Simple trigger events that don't need sub-configuration
   const simpleEvents = new Set([
     'create', 'delete', 'fork', 'page_build', 'public',
@@ -110,7 +137,7 @@ function buildTrigger(state: WorkflowState): string[] {
 
   if (trigger.event === 'schedule') {
     lines.push('on:');
-    lines.push(`  schedule: ${yamlString(trigger.schedule || 'daily')}`);
+    lines.push(`  schedule: ${yamlString(resolveFuzzySchedule(trigger.schedule || '0 0 * * *'))}`);
   } else if (trigger.event === 'workflow_dispatch') {
     lines.push('on:');
     lines.push('  workflow_dispatch:');
@@ -122,17 +149,20 @@ function buildTrigger(state: WorkflowState): string[] {
       lines.push('  slash_command:');
     }
   } else if (simpleEvents.has(trigger.event)) {
-    lines.push(`on: ${trigger.event}`);
+    if (hasModifiers) {
+      // Need mapping form for modifier siblings
+      lines.push('on:');
+      lines.push(`  ${trigger.event}:`);
+    } else {
+      lines.push(`on: ${trigger.event}`);
+    }
   } else {
     // Events with types/branches/paths configuration
     const hasActivityTypes = trigger.activityTypes.length > 0;
     const hasBranches = trigger.branches.length > 0;
     const hasPaths = trigger.paths.length > 0;
 
-    if (!hasActivityTypes && !hasBranches && !hasPaths) {
-      lines.push('on:');
-      lines.push(`  ${trigger.event}:`);
-    } else {
+    if (hasActivityTypes || hasBranches || hasPaths) {
       lines.push('on:');
       lines.push(`  ${trigger.event}:`);
       if (hasActivityTypes) {
@@ -144,39 +174,28 @@ function buildTrigger(state: WorkflowState): string[] {
       if (hasPaths) {
         lines.push(`    paths: [${trigger.paths.join(', ')}]`);
       }
+    } else if (hasModifiers) {
+      // No event config but has modifiers — need mapping form
+      lines.push('on:');
+      lines.push(`  ${trigger.event}:`);
+    } else {
+      // No config, no modifiers — use simple string form.
+      // This avoids producing 'event_name:' (null) which fails
+      // validation for events like workflow_run.
+      lines.push(`on: ${trigger.event}`);
     }
   }
 
-  // Trigger modifiers (added under 'on:' level)
+  // Trigger modifiers — always in mapping form at this point
   if (trigger.reaction) {
-    // Ensure we have the 'on:' structure
-    if (lines.length > 0 && !lines[0].startsWith('on:')) {
-      // Wrap simple trigger
-      const simple = lines[0];
-      lines.length = 0;
-      lines.push('on:');
-      lines.push(`  ${simple.replace('on: ', '')}:`);
-    }
     lines.push(`  reaction: ${trigger.reaction}`);
   }
 
   if (trigger.statusComment) {
-    if (lines.length > 0 && !lines[0].startsWith('on:')) {
-      const simple = lines[0];
-      lines.length = 0;
-      lines.push('on:');
-      lines.push(`  ${simple.replace('on: ', '')}:`);
-    }
     lines.push('  status-comment: true');
   }
 
   if (trigger.skipBots) {
-    if (lines.length > 0 && !lines[0].startsWith('on:')) {
-      const simple = lines[0];
-      lines.length = 0;
-      lines.push('on:');
-      lines.push(`  ${simple.replace('on: ', '')}:`);
-    }
     lines.push('  skip-bots: true');
   }
 
@@ -203,7 +222,8 @@ function buildEngine(state: WorkflowState): string[] {
   const { engine } = state;
   if (!engine.type) return [];
 
-  const hasExtraConfig = engine.model || engine.maxTurns || engine.version;
+  const hasEngineConfig = engine.config && Object.keys(engine.config).length > 0;
+  const hasExtraConfig = engine.model || engine.maxTurns || engine.version || hasEngineConfig;
 
   if (!hasExtraConfig) {
     return [`engine: ${engine.type}`];
@@ -219,6 +239,11 @@ function buildEngine(state: WorkflowState): string[] {
   }
   if (engine.version) {
     lines.push(`  version: ${yamlString(engine.version)}`);
+  }
+  if (hasEngineConfig) {
+    for (const [key, value] of Object.entries(engine.config)) {
+      lines.push(`  ${key}: ${yamlValue(value)}`);
+    }
   }
 
   return lines;
@@ -242,7 +267,25 @@ function buildTools(state: WorkflowState): string[] {
 
   const lines = ['tools:'];
   for (const tool of state.tools) {
-    lines.push(`  ${tool}:`);
+    const config = state.toolConfigs?.[tool];
+    if (tool === 'bash') {
+      // bash requires an explicit value: true, false, or ["cmd1","cmd2"]
+      // The anonymous syntax 'bash:' (null) is not supported by the compiler.
+      const cmds = config?.['allowed-commands'];
+      if (typeof cmds === 'string' && cmds.trim()) {
+        const cmdArray = cmds.split(',').map((c: string) => c.trim()).filter(Boolean);
+        lines.push(`  bash: [${cmdArray.map((c: string) => yamlString(c)).join(', ')}]`);
+      } else {
+        lines.push('  bash: true');
+      }
+    } else if (config && Object.keys(config).length > 0) {
+      lines.push(`  ${tool}:`);
+      for (const [key, value] of Object.entries(config)) {
+        lines.push(`    ${key}: ${yamlValue(value)}`);
+      }
+    } else {
+      lines.push(`  ${tool}:`);
+    }
   }
   return lines;
 }
@@ -293,6 +336,48 @@ function buildNetwork(state: WorkflowState): string[] {
     }
   }
   return lines;
+}
+
+function buildConcurrency(state: WorkflowState): string[] {
+  const { concurrency } = state;
+  if (!concurrency.group && !concurrency.cancelInProgress) return [];
+
+  const lines = ['concurrency:'];
+  if (concurrency.group) {
+    lines.push(`  group: ${yamlString(concurrency.group)}`);
+  }
+  if (concurrency.cancelInProgress) {
+    lines.push('  cancel-in-progress: true');
+  }
+  return lines;
+}
+
+function buildRateLimit(state: WorkflowState): string[] {
+  const { rateLimit } = state;
+  if (!rateLimit.max && !rateLimit.window) return [];
+
+  const lines = ['rate-limit:'];
+  if (rateLimit.max) {
+    lines.push(`  max: ${rateLimit.max}`);
+  }
+  if (rateLimit.window) {
+    lines.push(`  window: ${yamlString(rateLimit.window)}`);
+  }
+  return lines;
+}
+
+/**
+ * Convert common fuzzy schedule keywords to proper cron expressions.
+ * The WASM compiler does not support fuzzy cron scattering.
+ */
+function resolveFuzzySchedule(schedule: string): string {
+  const fuzzyMap: Record<string, string> = {
+    'hourly': '0 * * * *',
+    'daily': '0 0 * * *',
+    'weekly': '0 0 * * MON',
+    'monthly': '0 0 1 * *',
+  };
+  return fuzzyMap[schedule.toLowerCase()] ?? schedule;
 }
 
 /**

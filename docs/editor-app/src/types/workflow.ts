@@ -154,10 +154,45 @@ export interface SafeOutputConfig {
   config: Record<string, unknown>;
 }
 
+export interface ConcurrencyConfig {
+  group: string;
+  cancelInProgress: boolean;
+}
+
+export interface RateLimitConfig {
+  max: number | '';
+  window: string;
+}
+
+export interface ValidationError {
+  field: string;
+  nodeId: string;
+  message: string;
+  severity: 'error' | 'warning';
+}
+
+export interface LintResult {
+  ruleId: string;
+  severity: 'warning' | 'info';
+  message: string;
+  nodeId: string;
+  suggestion?: string;
+}
+
+export interface CompilerError {
+  message: string;
+  field?: string | null;
+  line?: number | null;
+  column?: number | null;
+  severity?: 'error' | 'warning';
+  suggestion?: string | null;
+  docsUrl?: string | null;
+}
+
 export interface CompileResult {
   yaml: string;
   warnings: string[];
-  error: string | null;
+  error: CompilerError | null;
 }
 
 export interface WorkflowTemplate {
@@ -185,12 +220,14 @@ export interface WorkflowState {
 
   // Permissions
   permissions: Partial<Record<PermissionScope, PermissionLevel>>;
+  autoSetPermissions: string[]; // scopes that were auto-set by smart defaults
 
   // Engine
   engine: EngineConfig;
 
   // Tools
   tools: string[];
+  toolConfigs: Record<string, Record<string, unknown>>;
 
   // Instructions (markdown body)
   instructions: string;
@@ -208,13 +245,27 @@ export interface WorkflowState {
   cache: boolean;
   strict: boolean;
 
+  // Settings
+  concurrency: ConcurrencyConfig;
+  rateLimit: RateLimitConfig;
+  platform: string;
+
+  // Validation
+  validationErrors: ValidationError[];
+  lintResults: LintResult[];
+
+  // Error-to-node mapping
+  errorNodeIds: string[];
+
   // UI state
   selectedNodeId: string | null;
+  highlightFieldPath: string | null;
   viewMode: 'visual' | 'markdown' | 'yaml';
   compiledYaml: string;
   compiledMarkdown: string;
+  previousYaml: string;
   warnings: string[];
-  error: string | null;
+  error: CompilerError | null;
   isCompiling: boolean;
   isReady: boolean;
 }
@@ -224,8 +275,10 @@ export interface WorkflowActions {
   setDescription: (description: string) => void;
   setTrigger: (trigger: Partial<TriggerConfig>) => void;
   setPermissions: (perms: Partial<Record<PermissionScope, PermissionLevel>>) => void;
+  setAutoSetPermissions: (scopes: string[]) => void;
   setEngine: (engine: Partial<EngineConfig>) => void;
   toggleTool: (tool: string) => void;
+  setToolConfig: (tool: string, config: Record<string, unknown>) => void;
   setInstructions: (text: string) => void;
   toggleSafeOutput: (key: string) => void;
   setSafeOutputConfig: (key: string, config: Record<string, unknown>) => void;
@@ -234,15 +287,25 @@ export interface WorkflowActions {
   removeAllowedDomain: (domain: string) => void;
   addBlockedDomain: (domain: string) => void;
   removeBlockedDomain: (domain: string) => void;
+  setConcurrency: (concurrency: Partial<ConcurrencyConfig>) => void;
+  setRateLimit: (rateLimit: Partial<RateLimitConfig>) => void;
+  addImport: (path: string) => void;
+  removeImport: (path: string) => void;
+  setPlatform: (platform: string) => void;
   selectNode: (id: string | null) => void;
+  setHighlightFieldPath: (path: string | null) => void;
   setViewMode: (mode: 'visual' | 'markdown' | 'yaml') => void;
   setCompiledYaml: (yaml: string) => void;
   setCompiledMarkdown: (markdown: string) => void;
   setWarnings: (warnings: string[]) => void;
-  setError: (error: string | null) => void;
+  setError: (error: CompilerError | null) => void;
+  setValidationErrors: (errors: ValidationError[]) => void;
+  setLintResults: (results: LintResult[]) => void;
+  setErrorNodeIds: (ids: string[]) => void;
   setIsCompiling: (isCompiling: boolean) => void;
   setIsReady: (isReady: boolean) => void;
   loadTemplate: (template: WorkflowTemplate) => void;
+  loadState: (state: Partial<WorkflowState>) => void;
   reset: () => void;
 }
 

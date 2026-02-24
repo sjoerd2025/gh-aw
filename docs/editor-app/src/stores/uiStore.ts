@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-export type SidebarTab = 'palette' | 'templates';
+export type SidebarTab = 'palette' | 'templates' | 'components';
+export type MobilePane = 'canvas' | 'properties' | 'sidebar' | 'export';
 
 export interface UIState {
   // Panel visibility
@@ -24,6 +25,12 @@ export interface UIState {
 
   // Auto-compile toggle
   autoCompile: boolean;
+
+  // Shortcuts help overlay
+  showShortcutsHelp: boolean;
+
+  // Mobile layout
+  mobilePane: MobilePane;
 }
 
 export interface UIActions {
@@ -36,6 +43,8 @@ export interface UIActions {
   setHasSeenOnboarding: (seen: boolean) => void;
   setGuidedTourStep: (step: number | null) => void;
   setAutoCompile: (enabled: boolean) => void;
+  setShowShortcutsHelp: (show: boolean) => void;
+  setMobilePane: (pane: MobilePane) => void;
 }
 
 export type UIStore = UIState & UIActions;
@@ -52,6 +61,8 @@ export const useUIStore = create<UIStore>()(
       hasSeenOnboarding: false,
       guidedTourStep: null,
       autoCompile: true,
+      showShortcutsHelp: false,
+      mobilePane: 'canvas' as MobilePane,
 
       toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
       togglePropertiesPanel: () => set((s) => ({ propertiesPanelOpen: !s.propertiesPanelOpen })),
@@ -62,6 +73,8 @@ export const useUIStore = create<UIStore>()(
       setHasSeenOnboarding: (hasSeenOnboarding) => set({ hasSeenOnboarding }),
       setGuidedTourStep: (guidedTourStep) => set({ guidedTourStep }),
       setAutoCompile: (autoCompile) => set({ autoCompile }),
+      setShowShortcutsHelp: (showShortcutsHelp) => set({ showShortcutsHelp }),
+      setMobilePane: (mobilePane) => set({ mobilePane }),
     }),
     {
       name: 'workflow-editor-ui',

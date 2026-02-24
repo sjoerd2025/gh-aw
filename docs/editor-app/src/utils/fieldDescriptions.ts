@@ -64,6 +64,37 @@ export const fieldDescriptions: Record<string, FieldDescription> = {
     description: 'What happens if this workflow is triggered again while already running.',
     tooltip: 'What happens if this workflow triggers again while it\'s already running.',
   },
+  'concurrency.group': {
+    label: 'Concurrency Group',
+    description: 'An expression that groups workflow runs. Only one run per group can be active.',
+    tooltip: 'Runs with the same group key are queued. Common pattern: use the workflow name + branch.',
+  },
+  'concurrency.cancelInProgress': {
+    label: 'Cancel In-Progress',
+    description: 'Cancel any running workflow in the same group when a new one starts.',
+  },
+  'rateLimit': {
+    label: 'Rate Limit',
+    description: 'Limit how often this workflow can run.',
+    tooltip: 'Prevents the workflow from running too frequently within a time window.',
+  },
+  'rateLimit.max': {
+    label: 'Maximum Runs',
+    description: 'Maximum number of runs allowed in the time window.',
+  },
+  'rateLimit.window': {
+    label: 'Time Window',
+    description: 'Duration of the rate limit window (e.g. 1h, 24h, 7d).',
+  },
+  platform: {
+    label: 'Runner Platform',
+    description: 'Which GitHub Actions runner to use for this workflow.',
+    tooltip: 'The operating system and version for the runner machine.',
+  },
+  settings: {
+    label: 'Settings',
+    description: 'Configure advanced workflow behavior like concurrency, rate limits, and platform.',
+  },
   imports: {
     label: 'Include Shared Instructions',
     description: 'Pull in reusable instruction snippets from shared files.',
@@ -399,6 +430,102 @@ export const fieldDescriptions: Record<string, FieldDescription> = {
   'safeOutput.threat-detection': {
     label: 'Report Threats',
     description: 'The agent can flag security threats or suspicious patterns.',
+  },
+
+  // Tool configurations — GitHub
+  'toolConfig.github.read-only': {
+    label: 'Read-only',
+    description: 'Restrict the GitHub tool to read operations only (no writes).',
+  },
+  'toolConfig.github.lockdown': {
+    label: 'Lockdown',
+    description: 'Only allow explicitly listed functions. Blocks all others.',
+  },
+  'toolConfig.github.toolsets': {
+    label: 'Toolsets',
+    description: 'Comma-separated groups of related functions to enable (e.g. code-review, issue-triage).',
+  },
+  'toolConfig.github.allowed': {
+    label: 'Allowed Functions',
+    description: 'Comma-separated list of specific GitHub MCP functions the agent can call.',
+  },
+
+  // Tool configurations — Playwright
+  'toolConfig.playwright.version': {
+    label: 'Version',
+    description: 'Pin a specific Playwright version.',
+  },
+  'toolConfig.playwright.allowed_domains': {
+    label: 'Allowed Domains',
+    description: 'Restrict which domains the browser can visit. Leave empty for no restriction.',
+  },
+
+  // Tool configurations — Cache Memory
+  'toolConfig.cache-memory.key': {
+    label: 'Cache Key',
+    description: 'Unique identifier for this cache. Different keys store separate data.',
+  },
+  'toolConfig.cache-memory.scope': {
+    label: 'Scope',
+    description: 'Whether the cache is shared across the whole repo or just this workflow.',
+  },
+  'toolConfig.cache-memory.retention-days': {
+    label: 'Retention (days)',
+    description: 'How many days to keep cached data (1-90).',
+  },
+  'toolConfig.cache-memory.description': {
+    label: 'Description',
+    description: 'A note describing what this cache stores.',
+  },
+  'toolConfig.cache-memory.restore-only': {
+    label: 'Restore Only',
+    description: 'Only read from cache, never write new data.',
+  },
+
+  // Tool configurations — Repo Memory
+  'toolConfig.repo-memory.branch-prefix': {
+    label: 'Branch Prefix',
+    description: 'Prefix for the git branch used to store memory files.',
+  },
+  'toolConfig.repo-memory.target-repo': {
+    label: 'Target Repository',
+    description: 'Store memory in a different repo (owner/repo format).',
+  },
+  'toolConfig.repo-memory.branch-name': {
+    label: 'Branch Name',
+    description: 'Explicit branch name. Auto-generated if left blank.',
+  },
+  'toolConfig.repo-memory.description': {
+    label: 'Description',
+    description: 'A note describing what this memory branch stores.',
+  },
+  'toolConfig.repo-memory.file-glob': {
+    label: 'File Patterns',
+    description: 'Comma-separated glob patterns for files to include.',
+  },
+  'toolConfig.repo-memory.max-file-size': {
+    label: 'Max File Size',
+    description: 'Maximum file size in bytes for stored memory files.',
+  },
+
+  // Tool configurations — Serena
+  'toolConfig.serena.version': {
+    label: 'Version',
+    description: 'Pin a specific Serena version.',
+  },
+  'toolConfig.serena.mode': {
+    label: 'Mode',
+    description: 'Run Serena in a Docker container or locally on the runner.',
+  },
+  'toolConfig.serena.languages': {
+    label: 'Languages',
+    description: 'Which programming languages to enable code intelligence for.',
+  },
+
+  // Tool configurations — Bash
+  'toolConfig.bash.allowed-commands': {
+    label: 'Allowed Commands',
+    description: 'Comma-separated list of specific commands to allow (e.g. npm test, make build, gh issue comment).',
   },
 
   // Network

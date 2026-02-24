@@ -57,26 +57,28 @@ const textareaStyle: React.CSSProperties = {
   fontSize: '13px',
   fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
   lineHeight: '1.5',
-  border: '1px solid #d0d7de',
+  border: '1px solid var(--color-border-default, #d0d7de)',
   borderRadius: '6px',
   resize: 'vertical',
   minHeight: '200px',
   outline: 'none',
+  backgroundColor: 'var(--color-bg-default, #ffffff)',
+  color: 'var(--color-fg-default, #1f2328)',
 };
 
 const counterStyle: React.CSSProperties = {
   textAlign: 'right',
   fontSize: '12px',
-  color: '#656d76',
+  color: 'var(--color-fg-muted, #656d76)',
   marginTop: '4px',
 };
 
 const snippetButtonStyle: React.CSSProperties = {
   padding: '5px 12px',
   fontSize: '12px',
-  border: '1px solid #d0d7de',
+  border: '1px solid var(--color-border-default, #d0d7de)',
   borderRadius: '16px',
-  background: '#f6f8fa',
-  color: '#1f2328',
+  background: 'var(--color-bg-subtle, #f6f8fa)',
+  color: 'var(--color-fg-default, #1f2328)',
   cursor: 'pointer',
 };

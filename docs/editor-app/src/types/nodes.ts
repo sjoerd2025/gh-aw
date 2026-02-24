@@ -8,6 +8,7 @@ export type WorkflowNodeType =
   | 'instructions'
   | 'safeOutputs'
   | 'network'
+  | 'settings'
   | 'steps';
 
 export interface WorkflowNodeData extends Record<string, unknown> {

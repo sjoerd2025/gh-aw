@@ -1,8 +1,12 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Highlight, themes } from 'prism-react-renderer';
+import { AlertTriangle } from 'lucide-react';
 import { useWorkflowStore } from '../../stores/workflowStore';
+import { useUIStore } from '../../stores/uiStore';
 import { generateMarkdown } from '../../utils/markdownGenerator';
 import { compile, isCompilerReady } from '../../utils/compiler';
+import { DocsPanel } from './DocsPanel';
+import { getRefEntry } from '../../utils/referenceData';
 
 /* ── Markdown tokenizer ──
  * Parses markdown text into spans with type annotations for syntax highlighting.
@@ -189,8 +193,8 @@ function tokenizeMarkdown(source: string): MdToken[][] {
   return result;
 }
 
-/** Map token types to CSS colors (GitHub-like palette). */
-const tokenColors: Record<TokenType, string> = {
+/** Map token types to CSS colors — light theme (GitHub-like palette). */
+const lightTokenColors: Record<TokenType, string> = {
   'plain':                 '#1f2328',
   'frontmatter-delimiter': '#cf222e',
   'frontmatter-key':       '#0550ae',
@@ -210,6 +214,27 @@ const tokenColors: Record<TokenType, string> = {
   'link-url':              '#0550ae',
 };
 
+/** Map token types to CSS colors — dark theme (GitHub dark palette). */
+const darkTokenColors: Record<TokenType, string> = {
+  'plain':                 '#e6edf3',
+  'frontmatter-delimiter': '#f85149',
+  'frontmatter-key':       '#79c0ff',
+  'frontmatter-colon':     '#e6edf3',
+  'frontmatter-value':     '#a5d6ff',
+  'heading-marker':        '#f85149',
+  'heading-text':          '#e6edf3',
+  'list-marker':           '#f85149',
+  'bold':                  '#e6edf3',
+  'italic':                '#e6edf3',
+  'inline-code':           '#79c0ff',
+  'code-fence':            '#8b949e',
+  'comment':               '#8b949e',
+  'link-bracket':          '#e6edf3',
+  'link-text':             '#58a6ff',
+  'link-paren':            '#e6edf3',
+  'link-url':              '#79c0ff',
+};
+
 const tokenFontWeight: Partial<Record<TokenType, number>> = {
   'heading-marker': 700,
   'heading-text':   700,
@@ -222,20 +247,48 @@ const tokenFontStyle: Partial<Record<TokenType, string>> = {
   'comment': 'italic',
 };
 
-const tokenBg: Partial<Record<TokenType, string>> = {
+const lightTokenBg: Partial<Record<TokenType, string>> = {
   'inline-code': 'rgba(175,184,193,0.2)',
 };
+
+const darkTokenBg: Partial<Record<TokenType, string>> = {
+  'inline-code': 'rgba(110,118,129,0.4)',
+};
+
+/** Helper hook: resolve whether dark mode is active from the UI store. */
+function useIsDark(): boolean {
+  const theme = useUIStore((s) => s.theme);
+  const [systemDark, setSystemDark] = useState(() =>
+    typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
+
+  useEffect(() => {
+    if (theme !== 'auto') return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const handler = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, [theme]);
+
+  return theme === 'dark' || (theme === 'auto' && systemDark);
+}
 
 /**
  * Side-by-side editor view: editable markdown on the left, compiled YAML on the right.
  * The markdown is compiled via WASM on a 500ms debounce.
  */
+export type RightPaneTab = 'yaml' | 'reference';
+
 export function EditorView() {
+  const isDark = useIsDark();
   const [markdown, setMarkdown] = useState('');
   const [yaml, setYaml] = useState('');
-  const [compileError, setCompileError] = useState<string | null>(null);
+  const [lastValidYaml, setLastValidYaml] = useState('');
+  const [compileError, setCompileError] = useState<import('../../types/workflow').CompilerError | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [isCompiling, setIsCompiling] = useState(false);
+  const [rightPaneTab, setRightPaneTab] = useState<RightPaneTab>('yaml');
+  const [activeDocKey, setActiveDocKey] = useState<string | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const markdownRef = useRef('');
 
@@ -248,16 +301,24 @@ export function EditorView() {
     setIsCompiling(true);
     try {
       const result = await compile(md);
-      setYaml(result.yaml);
       setCompileError(result.error);
       setWarnings(result.warnings);
+      if (!result.error && result.yaml) {
+        // Success: update both yaml and lastValidYaml
+        setYaml(result.yaml);
+        setLastValidYaml(result.yaml);
+      } else if (result.error) {
+        // Error: clear current yaml but keep lastValidYaml for stale display
+        setYaml('');
+      }
       const s = useWorkflowStore.getState();
       s.setCompiledYaml(result.yaml);
       s.setCompiledMarkdown(md);
       s.setWarnings(result.warnings);
       s.setError(result.error);
     } catch (err) {
-      setCompileError(err instanceof Error ? err.message : String(err));
+      setCompileError({ message: err instanceof Error ? err.message : String(err), severity: 'error' });
+      setYaml('');
     } finally {
       setIsCompiling(false);
     }
@@ -269,6 +330,7 @@ export function EditorView() {
     const md = generateMarkdown(state);
     setMarkdown(md);
     setYaml(state.compiledYaml || '');
+    if (state.compiledYaml) setLastValidYaml(state.compiledYaml);
     setCompileError(state.error);
     setWarnings(state.warnings || []);
     // If we have markdown but no compiled YAML (e.g. after page reload), compile immediately
@@ -311,6 +373,12 @@ export function EditorView() {
     };
   }, []);
 
+  // Navigate to a frontmatter key's docs
+  const handleKeyClick = useCallback((key: string) => {
+    setRightPaneTab('reference');
+    setActiveDocKey(key);
+  }, []);
+
   return (
     <div className="editor-view">
       {/* Left pane: editable markdown with syntax highlighting */}
@@ -324,51 +392,76 @@ export function EditorView() {
         <MarkdownEditor
           value={markdown}
           onChange={handleMarkdownChange}
+          onKeyClick={handleKeyClick}
+          isDark={isDark}
         />
       </div>
 
       {/* Divider */}
       <div className="editor-divider" />
 
-      {/* Right pane: compiled YAML */}
+      {/* Right pane: tabbed YAML / Reference */}
       <div className="editor-pane editor-pane-right">
         <div className="editor-pane-header">
-          <span className="editor-pane-title">Compiled YAML</span>
-          {warnings.length > 0 && (
+          <div className="editor-tab-bar">
+            <button
+              className={`editor-tab-btn ${rightPaneTab === 'yaml' ? 'editor-tab-btn--active' : ''}`}
+              onClick={() => setRightPaneTab('yaml')}
+            >
+              YAML
+            </button>
+            <button
+              className={`editor-tab-btn ${rightPaneTab === 'reference' ? 'editor-tab-btn--active' : ''}`}
+              onClick={() => setRightPaneTab('reference')}
+            >
+              Reference
+            </button>
+          </div>
+          {rightPaneTab === 'yaml' && warnings.length > 0 && (
             <span className="editor-warning-count">
               {warnings.length} warning{warnings.length > 1 ? 's' : ''}
             </span>
           )}
         </div>
 
-        {/* Warnings */}
-        {warnings.length > 0 && (
-          <div className="editor-warnings">
-            {warnings.map((w, i) => (
-              <div key={i} className="editor-warning-line">{w}</div>
-            ))}
-          </div>
-        )}
+        {rightPaneTab === 'yaml' ? (
+          <>
+            {/* Compact inline error banner */}
+            {compileError && (
+              <div className="editor-inline-error">
+                <AlertTriangle size={12} />
+                <span>{compileError.message}</span>
+              </div>
+            )}
 
-        {/* Error */}
-        {compileError && (
-          <div className="editor-error">
-            <strong>Error:</strong> {compileError}
-          </div>
-        )}
+            {/* Warnings */}
+            {warnings.length > 0 && (
+              <div className="editor-warnings">
+                {warnings.map((w, i) => (
+                  <div key={i} className="editor-warning-line">{w}</div>
+                ))}
+              </div>
+            )}
 
-        {/* YAML output */}
-        <div className="yaml-output">
-          {yaml ? (
-            <YamlHighlighted code={yaml} />
-          ) : (
-            <div className="yaml-empty-state">
-              {compileError
-                ? 'Fix the errors above to see compiled output.'
-                : 'Edit the markdown on the left to see compiled YAML here.'}
+            {/* YAML output: show last valid YAML dimmed when there's an error */}
+            <div className={`yaml-output${!yaml && compileError && lastValidYaml ? ' yaml-output--stale' : ''}`}>
+              {yaml ? (
+                <YamlHighlighted code={yaml} isDark={isDark} />
+              ) : lastValidYaml && compileError ? (
+                <YamlHighlighted code={lastValidYaml} isDark={isDark} />
+              ) : (
+                <div className="yaml-empty-state">
+                  Edit the markdown on the left to see compiled YAML here.
+                </div>
+              )}
             </div>
-          )}
-        </div>
+          </>
+        ) : (
+          <DocsPanel
+            activeDocKey={activeDocKey}
+            onScrollComplete={() => setActiveDocKey(null)}
+          />
+        )}
       </div>
     </div>
   );
@@ -380,15 +473,67 @@ export function EditorView() {
  *  - A <textarea> sits on top with transparent text so the caret is visible
  *  - Both share identical font metrics so text lines up exactly
  */
+/** Given text content and a character offset, return the frontmatter key at that position (or null). */
+function getFrontmatterKeyAtPos(text: string, pos: number): string | null {
+  const lines = text.split('\n');
+  let offset = 0;
+  let inFrontmatter = false;
+  let fmCount = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineLen = lines[i].length;
+    const trimmed = lines[i].trimEnd();
+
+    if (/^---\s*$/.test(trimmed)) {
+      if (!inFrontmatter && fmCount === 0) { inFrontmatter = true; fmCount = 1; }
+      else if (inFrontmatter && fmCount === 1) { inFrontmatter = false; fmCount = 2; }
+    }
+
+    if (offset + lineLen >= pos) {
+      if (inFrontmatter) {
+        const col = pos - offset;
+        const keyMatch = lines[i].match(/^(\s*)([\w][\w.-]*)(\s*:)/);
+        if (keyMatch) {
+          const keyStart = keyMatch[1].length;
+          const keyEnd = keyStart + keyMatch[2].length;
+          if (col >= keyStart && col < keyEnd) {
+            return keyMatch[2];
+          }
+        }
+      }
+      return null;
+    }
+    offset += lineLen + 1;
+  }
+  return null;
+}
+
+interface TooltipState {
+  key: string;
+  description: string;
+  x: number;
+  y: number;
+}
+
 function MarkdownEditor({
   value,
   onChange,
+  onKeyClick,
+  isDark,
 }: {
   value: string;
   onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
+  onKeyClick?: (key: string) => void;
+  isDark: boolean;
 }) {
+  const tokenColors = isDark ? darkTokenColors : lightTokenColors;
+  const tokenBg = isDark ? darkTokenBg : lightTokenBg;
+
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const preRef = useRef<HTMLPreElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [tooltip, setTooltip] = useState<TooltipState | null>(null);
+  const tooltipTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Synchronize scroll between textarea and highlighted pre
   const handleScroll = useCallback(() => {
@@ -396,13 +541,101 @@ function MarkdownEditor({
       preRef.current.scrollTop = textareaRef.current.scrollTop;
       preRef.current.scrollLeft = textareaRef.current.scrollLeft;
     }
+    // Hide tooltip on scroll
+    setTooltip(null);
   }, []);
 
   // Tokenize the markdown for highlighting
   const highlightedLines = useMemo(() => tokenizeMarkdown(value), [value]);
 
+  // Detect clicks on frontmatter keys
+  const handleTextareaClick = useCallback(() => {
+    if (!onKeyClick || !textareaRef.current) return;
+    const key = getFrontmatterKeyAtPos(textareaRef.current.value, textareaRef.current.selectionStart);
+    if (key) onKeyClick(key);
+  }, [onKeyClick]);
+
+  // Hover tooltip: detect frontmatter key under mouse position
+  const handleMouseMove = useCallback((e: React.MouseEvent<HTMLTextAreaElement>) => {
+    const textarea = textareaRef.current;
+    if (!textarea || !containerRef.current) return;
+
+    // Map mouse Y to line number, then check if mouse X falls on a key
+    const containerRect = containerRef.current.getBoundingClientRect();
+    const lineHeight = 20.8; // matches .md-editor-line min-height
+    const paddingTop = 12;
+    const scrollTop = textarea.scrollTop;
+    const relY = e.clientY - containerRect.top - paddingTop + scrollTop;
+    const lineIndex = Math.floor(relY / lineHeight);
+
+    const lines = textarea.value.split('\n');
+    if (lineIndex < 0 || lineIndex >= lines.length) {
+      if (tooltipTimerRef.current) { clearTimeout(tooltipTimerRef.current); tooltipTimerRef.current = null; }
+      setTooltip(null);
+      return;
+    }
+
+    // Check if the line is inside frontmatter
+    let inFrontmatter = false;
+    let fmCount = 0;
+    for (let i = 0; i <= lineIndex; i++) {
+      if (/^---\s*$/.test(lines[i].trimEnd())) {
+        if (!inFrontmatter && fmCount === 0) { inFrontmatter = true; fmCount = 1; }
+        else if (inFrontmatter && fmCount === 1) { inFrontmatter = false; fmCount = 2; }
+      }
+    }
+
+    if (inFrontmatter) {
+      const keyMatch = lines[lineIndex].match(/^(\s*)([\w][\w.-]*)(\s*:)/);
+      if (keyMatch) {
+        const keyName = keyMatch[2];
+        // Approximate character width: ~7.8px for 13px monospace
+        const charWidth = 7.8;
+        const lineNumberWidth = 40;
+        const scrollLeft = textarea.scrollLeft;
+        const relX = e.clientX - containerRect.left - lineNumberWidth + scrollLeft;
+        const colStart = keyMatch[1].length;
+        const colEnd = colStart + keyMatch[2].length;
+        const xStart = colStart * charWidth;
+        const xEnd = colEnd * charWidth;
+
+        if (relX >= xStart && relX < xEnd) {
+          const ref = getRefEntry(keyName);
+          if (ref) {
+            if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
+            tooltipTimerRef.current = setTimeout(() => {
+              setTooltip({
+                key: keyName,
+                description: ref.description,
+                x: e.clientX - containerRect.left,
+                y: e.clientY - containerRect.top - 8,
+              });
+            }, 400);
+            return;
+          }
+        }
+      }
+    }
+
+    // Not on a key — clear tooltip
+    if (tooltipTimerRef.current) { clearTimeout(tooltipTimerRef.current); tooltipTimerRef.current = null; }
+    setTooltip(null);
+  }, []);
+
+  const handleMouseLeave = useCallback(() => {
+    if (tooltipTimerRef.current) { clearTimeout(tooltipTimerRef.current); tooltipTimerRef.current = null; }
+    setTooltip(null);
+  }, []);
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
+    };
+  }, []);
+
   return (
-    <div className="md-editor-container">
+    <div className="md-editor-container" ref={containerRef}>
       {/* Highlighted layer (underneath) */}
       <pre
         ref={preRef}
@@ -414,12 +647,12 @@ function MarkdownEditor({
             <span className="editor-line-number">{i + 1}</span>
             <span className="md-editor-line-content">
               {lineTokens.length === 0 ? (
-                // Empty line: render a newline-preserving space
                 '\n'
               ) : (
                 lineTokens.map((tok, j) => (
                   <span
                     key={j}
+                    className={tok.type === 'frontmatter-key' ? 'md-frontmatter-key-token' : undefined}
                     style={{
                       color: tokenColors[tok.type],
                       fontWeight: tokenFontWeight[tok.type],
@@ -436,7 +669,6 @@ function MarkdownEditor({
             </span>
           </div>
         ))}
-        {/* Trailing newline keeps scroll height in sync */}
         <div className="md-editor-line">&nbsp;</div>
       </pre>
 
@@ -446,18 +678,105 @@ function MarkdownEditor({
         className="md-editor-textarea"
         value={value}
         onChange={onChange}
+        onClick={handleTextareaClick}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
         onScroll={handleScroll}
         spellCheck={false}
         placeholder="Write your workflow markdown here..."
       />
+
+      {/* Hover tooltip — clamped to stay within viewport */}
+      {tooltip && (
+        <TooltipClamped
+          tooltip={tooltip}
+          containerRef={containerRef}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Tooltip that clamps itself to stay fully visible within the viewport.
+ * Positioned above the cursor by default, shifts right/left/below as needed.
+ */
+function TooltipClamped({
+  tooltip,
+  containerRef,
+}: {
+  tooltip: TooltipState;
+  containerRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const tipRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ left: tooltip.x, top: tooltip.y, transform: 'translate(-50%, -100%)' });
+
+  useEffect(() => {
+    const el = tipRef.current;
+    const container = containerRef.current;
+    if (!el || !container) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const tipRect = el.getBoundingClientRect();
+    const tipW = tipRect.width;
+    const tipH = tipRect.height;
+    const margin = 8;
+
+    // Desired position: centered above cursor in container coordinates
+    let left = tooltip.x;
+    let top = tooltip.y;
+    let transform = 'translate(-50%, -100%)';
+
+    // Convert to viewport coordinates to check bounds
+    const vpLeft = containerRect.left + left - tipW / 2;
+    const vpRight = vpLeft + tipW;
+    const vpTop = containerRect.top + top - tipH;
+
+    // If tooltip goes off the left edge of viewport
+    if (vpLeft < margin) {
+      left = tipW / 2 + margin - containerRect.left;
+      if (left < margin) left = margin;
+    }
+
+    // If tooltip goes off the right edge of viewport
+    if (vpRight > window.innerWidth - margin) {
+      const shift = vpRight - (window.innerWidth - margin);
+      left = left - shift;
+    }
+
+    // If tooltip goes above the viewport, show below cursor instead
+    if (vpTop < margin) {
+      top = tooltip.y + 24;
+      transform = 'translate(-50%, 0)';
+    }
+
+    // Ensure left stays non-negative in container
+    if (left < margin) left = margin;
+
+    setPos({ left, top, transform });
+  }, [tooltip.x, tooltip.y, containerRef]);
+
+  return (
+    <div
+      ref={tipRef}
+      className="md-key-tooltip"
+      style={{
+        left: pos.left,
+        top: pos.top,
+        transform: pos.transform,
+      }}
+    >
+      <strong>{tooltip.key}</strong>
+      <span>{tooltip.description}</span>
     </div>
   );
 }
 
 /* ── YAML Highlighted output ── */
-function YamlHighlighted({ code }: { code: string }) {
+function YamlHighlighted({ code, isDark }: { code: string; isDark: boolean }) {
+  const yamlTheme = isDark ? themes.nightOwl : themes.github;
   return (
-    <Highlight theme={themes.github} code={code} language="yaml">
+    <Highlight theme={yamlTheme} code={code} language="yaml">
       {({ style, tokens, getLineProps, getTokenProps }) => (
         <pre style={{ ...style, ...yamlPreStyle }}>
           {tokens.map((line, i) => {
