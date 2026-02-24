@@ -207,8 +207,8 @@ jobs:
     needs: activation
     runs-on: ubuntu-latest
     permissions:
-          contents: read
-          issues: read
+      contents: read
+      issues: read
     concurrency:
       group: "gh-aw-copilot-${{ github.workflow }}"
     env:

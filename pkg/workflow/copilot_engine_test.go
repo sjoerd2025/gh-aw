@@ -1505,3 +1505,151 @@ func TestGenerateCopilotSessionFileCopyStep(t *testing.T) {
 		t.Error("Step should be marked continue-on-error")
 	}
 }
+
+// TestCopilotRequestsFeature tests the copilot-requests feature flag behavior.
+func TestCopilotRequestsFeature(t *testing.T) {
+	engine := NewCopilotEngine()
+
+	t.Run("validation step skipped when feature enabled", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Features: map[string]any{
+				"copilot-requests": true,
+			},
+		}
+		steps := engine.GetInstallationSteps(workflowData)
+		// Should have only 1 step: install (no secret validation)
+		if len(steps) != 1 {
+			t.Errorf("Expected 1 installation step (install only, no secret validation), got %d", len(steps))
+		}
+		// The install step should not contain validate-secret
+		for _, step := range steps {
+			content := strings.Join([]string(step), "\n")
+			if strings.Contains(content, "validate-secret") || strings.Contains(content, "Validate") {
+				t.Errorf("Expected no secret validation step when copilot-requests feature is enabled, but found one:\n%s", content)
+			}
+		}
+	})
+
+	t.Run("validation step present when feature disabled", func(t *testing.T) {
+		workflowData := &WorkflowData{}
+		steps := engine.GetInstallationSteps(workflowData)
+		// Should have 2 steps: secret validation + install
+		if len(steps) != 2 {
+			t.Errorf("Expected 2 installation steps (secret validation + install), got %d", len(steps))
+		}
+		// First step should contain validate-secret
+		firstStepContent := strings.Join([]string(steps[0]), "\n")
+		if !strings.Contains(firstStepContent, "validate-secret") {
+			t.Errorf("Expected secret validation step when copilot-requests feature is disabled:\n%s", firstStepContent)
+		}
+	})
+
+	t.Run("github token used when feature enabled", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+			Features: map[string]any{
+				"copilot-requests": true,
+			},
+		}
+		steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+		if len(steps) != 1 {
+			t.Fatalf("Expected 1 execution step, got %d", len(steps))
+		}
+		stepContent := strings.Join([]string(steps[0]), "\n")
+		// Should use github.token, not the secret
+		if !strings.Contains(stepContent, "COPILOT_GITHUB_TOKEN: ${{ github.token }}") {
+			t.Errorf("Expected COPILOT_GITHUB_TOKEN to use github.token when copilot-requests feature is enabled:\n%s", stepContent)
+		}
+		if strings.Contains(stepContent, "secrets.COPILOT_GITHUB_TOKEN") {
+			t.Errorf("Expected COPILOT_GITHUB_TOKEN to NOT use secrets.COPILOT_GITHUB_TOKEN when copilot-requests feature is enabled:\n%s", stepContent)
+		}
+	})
+
+	t.Run("secrets token used when feature disabled", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+		}
+		steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
+		if len(steps) != 1 {
+			t.Fatalf("Expected 1 execution step, got %d", len(steps))
+		}
+		stepContent := strings.Join([]string(steps[0]), "\n")
+		// Should use the secret
+		if !strings.Contains(stepContent, "COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}") {
+			t.Errorf("Expected COPILOT_GITHUB_TOKEN to use secrets.COPILOT_GITHUB_TOKEN when copilot-requests feature is disabled:\n%s", stepContent)
+		}
+	})
+
+	t.Run("COPILOT_GITHUB_TOKEN not in required secrets when feature enabled", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Features: map[string]any{
+				"copilot-requests": true,
+			},
+		}
+		secrets := engine.GetRequiredSecretNames(workflowData)
+		for _, s := range secrets {
+			if s == "COPILOT_GITHUB_TOKEN" {
+				t.Error("Expected COPILOT_GITHUB_TOKEN to NOT be in required secrets when copilot-requests feature is enabled")
+			}
+		}
+	})
+}
+
+// TestCopilotRequestsFeatureCompilation tests the full compilation behavior for the
+// copilot-requests feature.
+func TestCopilotRequestsFeatureCompilation(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "copilot-requests-feature-test")
+
+	testContent := `---
+on:
+  issues:
+    types: [opened]
+engine: copilot
+features:
+  copilot-requests: true
+---
+
+# Test copilot-requests feature
+
+This workflow tests the copilot-requests feature flag.
+`
+	testFile := filepath.Join(tmpDir, "test-copilot-requests.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow with copilot-requests feature: %v", err)
+	}
+
+	lockFile := stringutil.MarkdownToLockFile(testFile)
+	lockContent, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read generated lock file: %v", err)
+	}
+
+	lockStr := string(lockContent)
+
+	// Verify copilot-requests: write permission is generated in the agent job
+	if !strings.Contains(lockStr, "copilot-requests: write") {
+		t.Error("Expected 'copilot-requests: write' permission in generated workflow")
+	}
+
+	// Verify github.token is used instead of secrets.COPILOT_GITHUB_TOKEN
+	if !strings.Contains(lockStr, "COPILOT_GITHUB_TOKEN: ${{ github.token }}") {
+		t.Error("Expected 'COPILOT_GITHUB_TOKEN: ${{ github.token }}' in generated workflow")
+	}
+
+	// Verify secrets.COPILOT_GITHUB_TOKEN is NOT used
+	if strings.Contains(lockStr, "secrets.COPILOT_GITHUB_TOKEN") {
+		t.Error("Expected 'secrets.COPILOT_GITHUB_TOKEN' to NOT appear in generated workflow when copilot-requests feature is enabled")
+	}
+
+	// Verify the secret validation step is NOT generated
+	if strings.Contains(lockStr, "Validate COPILOT_GITHUB_TOKEN") {
+		t.Error("Expected no 'Validate COPILOT_GITHUB_TOKEN' step when copilot-requests feature is enabled")
+	}
+
+	t.Log("Successfully verified copilot-requests feature compilation")
+}

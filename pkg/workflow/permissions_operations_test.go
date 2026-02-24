@@ -354,6 +354,7 @@ func TestPermissionsMerge(t *testing.T) {
 				PermissionActions:          PermissionRead,  // added
 				PermissionAttestations:     PermissionRead,
 				PermissionChecks:           PermissionRead,
+				PermissionCopilotRequests:  PermissionRead,
 				PermissionDeployments:      PermissionRead,
 				PermissionDiscussions:      PermissionRead,
 				PermissionIssues:           PermissionRead,
@@ -378,6 +379,7 @@ func TestPermissionsMerge(t *testing.T) {
 				PermissionActions:          PermissionWrite,
 				PermissionAttestations:     PermissionWrite,
 				PermissionChecks:           PermissionWrite,
+				PermissionCopilotRequests:  PermissionWrite,
 				PermissionDeployments:      PermissionWrite,
 				PermissionDiscussions:      PermissionWrite,
 				PermissionIdToken:          PermissionWrite, // id-token supports write
@@ -402,6 +404,7 @@ func TestPermissionsMerge(t *testing.T) {
 				PermissionActions:          PermissionRead,
 				PermissionAttestations:     PermissionRead,
 				PermissionChecks:           PermissionRead,
+				PermissionCopilotRequests:  PermissionRead,
 				PermissionDeployments:      PermissionRead,
 				PermissionDiscussions:      PermissionRead,
 				PermissionIssues:           PermissionRead,
@@ -427,6 +430,7 @@ func TestPermissionsMerge(t *testing.T) {
 				PermissionAttestations:     PermissionWrite,
 				PermissionChecks:           PermissionWrite,
 				PermissionContents:         PermissionWrite,
+				PermissionCopilotRequests:  PermissionWrite,
 				PermissionDeployments:      PermissionWrite,
 				PermissionDiscussions:      PermissionWrite,
 				PermissionIdToken:          PermissionWrite, // id-token supports write

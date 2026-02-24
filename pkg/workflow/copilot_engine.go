@@ -70,7 +70,12 @@ func (e *CopilotEngine) SupportsLLMGateway() int {
 // This includes COPILOT_GITHUB_TOKEN and optionally MCP_GATEWAY_API_KEY
 func (e *CopilotEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
 	copilotLog.Print("Collecting required secrets for Copilot engine")
-	secrets := []string{"COPILOT_GITHUB_TOKEN"}
+	var secrets []string
+
+	// When copilot-requests feature is enabled, GITHUB_TOKEN is used directly (not a secret)
+	if !isFeatureEnabled(constants.CopilotRequestsFeatureFlag, workflowData) {
+		secrets = append(secrets, "COPILOT_GITHUB_TOKEN")
+	}
 
 	// Add MCP gateway API key if MCP servers are present (gateway is always started with MCP servers)
 	if HasMCPServers(workflowData) {

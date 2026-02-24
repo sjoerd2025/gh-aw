@@ -9,6 +9,8 @@ var permissionsLog = logger.New("workflow:permissions")
 // convertStringToPermissionScope converts a string key to a PermissionScope
 func convertStringToPermissionScope(key string) PermissionScope {
 	switch key {
+	case "copilot-requests":
+		return PermissionCopilotRequests
 	case "actions":
 		return PermissionActions
 	case "attestations":
@@ -65,6 +67,7 @@ const (
 type PermissionScope string
 
 const (
+	PermissionCopilotRequests  PermissionScope = "copilot-requests"
 	PermissionActions          PermissionScope = "actions"
 	PermissionAttestations     PermissionScope = "attestations"
 	PermissionChecks           PermissionScope = "checks"
@@ -91,6 +94,7 @@ func GetAllPermissionScopes() []PermissionScope {
 		PermissionAttestations,
 		PermissionChecks,
 		PermissionContents,
+		PermissionCopilotRequests,
 		PermissionDeployments,
 		PermissionDiscussions,
 		PermissionIdToken,

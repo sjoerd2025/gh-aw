@@ -936,19 +936,44 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	// Set up permissions for the agent job
 	// Agent job ALWAYS needs contents: read to access .github and .actions folders
 	permissions := data.Permissions
+	copilotRequestsEnabled := isFeatureEnabled(constants.CopilotRequestsFeatureFlag, data)
 	if permissions == "" {
 		// No permissions specified, just add contents: read
 		perms := NewPermissionsContentsRead()
+		// Add copilot-requests: write when copilot-requests feature is enabled
+		if copilotRequestsEnabled {
+			perms.Set(PermissionCopilotRequests, PermissionWrite)
+		}
 		permissions = perms.RenderToYAML()
 	} else {
 		// Parse existing permissions and add contents: read
 		parser := NewPermissionsParser(permissions)
 		perms := parser.ToPermissions()
 
+		needsRerender := false
+
 		// Only add contents: read if not already present
 		if level, exists := perms.Get(PermissionContents); !exists || level == PermissionNone {
 			perms.Set(PermissionContents, PermissionRead)
-			permissions = perms.RenderToYAML()
+			needsRerender = true
+		}
+		// Add copilot-requests: write when copilot-requests feature is enabled
+		if copilotRequestsEnabled {
+			perms.Set(PermissionCopilotRequests, PermissionWrite)
+			needsRerender = true
+		}
+
+		if needsRerender {
+			// Re-render, converting from RenderToYAML's 6-space indent to 2-space
+			// so that indentYAMLLines("    ") produces the expected 6-space output
+			yamlOut := perms.RenderToYAML()
+			lines := strings.Split(yamlOut, "\n")
+			for i := 1; i < len(lines); i++ {
+				if strings.HasPrefix(lines[i], "      ") {
+					lines[i] = "  " + lines[i][6:]
+				}
+			}
+			permissions = strings.Join(lines, "\n")
 		}
 	}
 

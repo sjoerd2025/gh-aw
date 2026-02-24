@@ -166,7 +166,7 @@ func TestFindWritePermissions(t *testing.T) {
 		{
 			name:               "write-all shorthand",
 			permissions:        NewPermissionsWriteAll(),
-			expectedWriteCount: 15,  // All permission scopes except id-token (which is excluded)
+			expectedWriteCount: 16,  // All permission scopes except id-token (which is excluded)
 			expectedScopes:     nil, // Don't check specific scopes for shorthand
 		},
 		{

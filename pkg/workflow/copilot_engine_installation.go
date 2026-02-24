@@ -44,27 +44,19 @@ func (e *CopilotEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHu
 
 	var steps []GitHubActionStep
 
-	// Define engine configuration for shared validation
-	config := EngineInstallConfig{
-		Secrets:         []string{"COPILOT_GITHUB_TOKEN"},
-		DocsURL:         "https://github.github.com/gh-aw/reference/engines/#github-copilot-default",
-		NpmPackage:      "@github/copilot",
-		Version:         string(constants.DefaultCopilotVersion),
-		Name:            "GitHub Copilot CLI",
-		CliName:         "copilot",
-		InstallStepName: "Install GitHub Copilot CLI",
+	// Add secret validation step (skip when copilot-requests feature is enabled,
+	// as GITHUB_TOKEN is used directly and does not require validation)
+	if !isFeatureEnabled(constants.CopilotRequestsFeatureFlag, workflowData) {
+		secretValidation := GenerateMultiSecretValidationStep(
+			[]string{"COPILOT_GITHUB_TOKEN"},
+			"GitHub Copilot CLI",
+			"https://github.github.com/gh-aw/reference/engines/#github-copilot-default",
+		)
+		steps = append(steps, secretValidation)
 	}
 
-	// Add secret validation step
-	secretValidation := GenerateMultiSecretValidationStep(
-		config.Secrets,
-		config.Name,
-		config.DocsURL,
-	)
-	steps = append(steps, secretValidation)
-
 	// Determine Copilot version
-	copilotVersion := config.Version
+	copilotVersion := string(constants.DefaultCopilotVersion)
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Version != "" {
 		copilotVersion = workflowData.EngineConfig.Version
 	}
@@ -78,7 +70,7 @@ func (e *CopilotEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHu
 	if installGlobally {
 		// Use the new installer script for global installation
 		copilotInstallLog.Print("Using new installer script for Copilot installation")
-		npmSteps = GenerateCopilotInstallerSteps(copilotVersion, config.InstallStepName)
+		npmSteps = GenerateCopilotInstallerSteps(copilotVersion, "Install GitHub Copilot CLI")
 	}
 
 	// Add Node.js setup step first (before sandbox installation)
