@@ -45,7 +45,6 @@ func TestExtractFirewallConfig(t *testing.T) {
 		firewallObj := map[string]any{
 			"args":       []any{"--custom-arg", "value"},
 			"version":    "v1.0.0",
-			"log-level":  "debug",
 			"ssl-bump":   true,
 			"allow-urls": []any{"https://example.com/*"},
 		}
@@ -55,7 +54,6 @@ func TestExtractFirewallConfig(t *testing.T) {
 		assert.True(t, config.Enabled, "Should be enabled")
 		assert.Len(t, config.Args, 2, "Should have 2 args")
 		assert.Equal(t, "v1.0.0", config.Version, "Should extract version")
-		assert.Equal(t, "debug", config.LogLevel, "Should extract log-level")
 		assert.True(t, config.SSLBump, "Should have ssl-bump enabled")
 		assert.Len(t, config.AllowURLs, 1, "Should have 1 allow-url")
 		assert.Equal(t, "https://example.com/*", config.AllowURLs[0], "Should extract allow-url")

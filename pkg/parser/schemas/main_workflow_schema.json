@@ -2198,8 +2198,7 @@
         {
           "allowed": ["api.openai.com", "*.github.com"],
           "firewall": {
-            "version": "v1.0.0",
-            "log-level": "debug"
+            "version": "v1.0.0"
           }
         }
       ],
@@ -2264,11 +2263,6 @@
                       "type": ["string", "number"],
                       "description": "AWF version to use (empty = latest release). Can be a string (e.g., 'v1.0.0', 'latest') or number (e.g., 20, 3.11). Numeric values are automatically converted to strings at runtime.",
                       "examples": ["v1.0.0", "latest", 20, 3.11]
-                    },
-                    "log-level": {
-                      "type": "string",
-                      "description": "AWF log level (default: info). Valid values: debug, info, warn, error",
-                      "enum": ["debug", "info", "warn", "error"]
                     },
                     "ssl-bump": {
                       "type": "boolean",
