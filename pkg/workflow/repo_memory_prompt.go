@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -53,7 +54,7 @@ func buildRepoMemoryPromptSection(config *RepoMemoryConfig) *PromptSection {
 				fmt.Fprintf(&constraints, "- **Max File Count**: %d files per commit\n", memory.MaxFileCount)
 			}
 			if memory.MaxPatchSize > 0 {
-				fmt.Fprintf(&constraints, "- **Max Patch Size**: %d bytes (%d KB) total per push (max: %d KB)\n", memory.MaxPatchSize, memory.MaxPatchSize/1024, maxRepoMemoryPatchSize/1024)
+				fmt.Fprintf(&constraints, "- **Max Patch Size**: %d bytes (%d KB) total per push (max: %d KB)\n", memory.MaxPatchSize, memory.MaxPatchSize/1024, constants.MaxRepoMemoryPatchSize/1024)
 			}
 			constraintsText = constraints.String()
 		}

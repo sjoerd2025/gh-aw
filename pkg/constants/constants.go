@@ -1016,3 +1016,6 @@ const MaxSymlinkDepth = 5
 // DefaultAllowedMemoryExtensions is the default list of allowed file extensions for cache-memory and repo-memory storage.
 // An empty slice means all file extensions are allowed. When this is empty, the validation step is not emitted.
 var DefaultAllowedMemoryExtensions = []string{}
+
+// MaxRepoMemoryPatchSize is the absolute maximum allowed value for the repo-memory max-patch-size option (20KB).
+const MaxRepoMemoryPatchSize = 20480
