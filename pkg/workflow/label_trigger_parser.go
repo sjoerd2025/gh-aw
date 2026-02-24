@@ -80,8 +80,9 @@ func parseLabelTriggerShorthand(input string) (entityType string, labelNames []s
 
 // expandLabelTriggerShorthand takes an entity type and label names and returns a map that represents
 // the expanded label trigger + workflow_dispatch configuration with item_number input.
-// Note: GitHub Actions doesn't support native label filtering for any event type,
-// so all labels are filtered via job conditions using the internal `names` field.
+// For issues and pull_request, the names field will later be converted to native GitHub Actions
+// labels: filter by convertNamesToNativeLabelFilter, preventing unnecessary workflow triggers.
+// For discussion, names is used for job-level condition filtering (native labels: not supported).
 func expandLabelTriggerShorthand(entityType string, labelNames []string) map[string]any {
 	labelTriggerParserLog.Printf("Expanding label trigger shorthand: entity=%s, labels=%v", entityType, labelNames)
 
@@ -100,16 +101,15 @@ func expandLabelTriggerShorthand(entityType string, labelNames []string) map[str
 	}
 
 	// Build the trigger configuration
-	// GitHub Actions doesn't support native label filtering for any event type,
-	// so we use the `names` field (internal representation) for job condition filtering
+	// For issues and pull_request: convertNamesToNativeLabelFilter will later convert names: to labels:
+	// For discussion: names: is used for job-level condition filtering (native labels: not supported)
 	triggerConfig := map[string]any{
 		"types": []any{"labeled"},
 	}
 
 	// Add label names for filtering
-	// All event types use `names` field for job condition filtering
-	// The `names` field is an internal representation for job condition generation
-	// and won't be rendered in the final GitHub Actions YAML for these event types
+	// For issues and pull_request: convertNamesToNativeLabelFilter will later convert names: to labels:
+	// The names field is an internal representation that gets converted before YAML generation
 	triggerConfig["names"] = labelNames
 
 	// Create workflow_dispatch with item_number input

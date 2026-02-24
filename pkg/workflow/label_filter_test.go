@@ -20,10 +20,10 @@ func TestLabelFilter(t *testing.T) {
 	compiler := NewCompiler()
 
 	tests := []struct {
-		name         string
-		frontmatter  string
-		expectedIf   string // Expected if condition in the generated lock file
-		shouldHaveIf bool   // Whether an if condition should be present
+		name              string
+		frontmatter       string
+		expectedLabels    []string // Expected labels in the on: section (native filter)
+		shouldHaveJobCond bool     // Whether an activation job if: condition for label.name should be present
 	}{
 		{
 			name: "issues with labeled and single label name",
@@ -45,8 +45,8 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "github.event.label.name == 'bug'",
-			shouldHaveIf: true,
+			expectedLabels:    []string{"bug"},
+			shouldHaveJobCond: false,
 		},
 		{
 			name: "issues with labeled and multiple label names",
@@ -68,8 +68,8 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "github.event.label.name == 'bug'",
-			shouldHaveIf: true,
+			expectedLabels:    []string{"bug", "enhancement", "feature"},
+			shouldHaveJobCond: false,
 		},
 		{
 			name: "issues with unlabeled and label names",
@@ -91,8 +91,8 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "github.event.label.name == 'wontfix'",
-			shouldHaveIf: true,
+			expectedLabels:    []string{"wontfix", "duplicate"},
+			shouldHaveJobCond: false,
 		},
 		{
 			name: "issues with both labeled and unlabeled",
@@ -114,8 +114,8 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "github.event.label.name == 'priority'",
-			shouldHaveIf: true,
+			expectedLabels:    []string{"priority", "urgent"},
+			shouldHaveJobCond: false,
 		},
 		{
 			name: "pull_request with labeled and label names",
@@ -137,8 +137,8 @@ tools:
   github:
     allowed: [get_pull_request]
 ---`,
-			expectedIf:   "github.event.label.name == 'ready-for-review'",
-			shouldHaveIf: true,
+			expectedLabels:    []string{"ready-for-review"},
+			shouldHaveJobCond: false,
 		},
 		{
 			name: "issues without labeled/unlabeled types",
@@ -160,8 +160,8 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "",
-			shouldHaveIf: false,
+			expectedLabels:    nil,
+			shouldHaveJobCond: false,
 		},
 		{
 			name: "issues with labeled but no names field",
@@ -182,8 +182,8 @@ tools:
   github:
     allowed: [issue_read]
 ---`,
-			expectedIf:   "",
-			shouldHaveIf: false,
+			expectedLabels:    nil,
+			shouldHaveJobCond: false,
 		},
 	}
 
@@ -210,15 +210,22 @@ tools:
 			}
 			lockContent := string(lockBytes)
 
-			// Check if the condition is present
-			if tt.shouldHaveIf {
-				if !strings.Contains(lockContent, "if:") {
-					t.Errorf("Expected 'if:' condition to be present in generated workflow")
+			// Check that native labels: appear in the on: section
+			for _, label := range tt.expectedLabels {
+				if !strings.Contains(lockContent, "- "+label) {
+					t.Errorf("Expected label '%s' to appear under labels: in generated workflow, got:\n%s", label, lockContent)
 				}
+			}
 
-				// Check if the expected condition fragment is present
-				if tt.expectedIf != "" && !strings.Contains(lockContent, tt.expectedIf) {
-					t.Errorf("Expected condition to contain '%s', got:\n%s", tt.expectedIf, lockContent)
+			// Check that no label.name job condition is generated for native-filtered events
+			if tt.shouldHaveJobCond {
+				if !strings.Contains(lockContent, "github.event.label.name") {
+					t.Errorf("Expected 'github.event.label.name' condition to be present in generated workflow")
+				}
+			} else if len(tt.expectedLabels) > 0 {
+				// When using native filtering, label.name should NOT appear in job conditions
+				if strings.Contains(lockContent, "github.event.label.name") {
+					t.Errorf("Expected no 'github.event.label.name' job condition when native label filtering is used, got:\n%s", lockContent)
 				}
 			}
 
@@ -229,9 +236,10 @@ tools:
 	}
 }
 
-// TestLabelFilterCommentedOut tests that the names field is commented out in the final YAML
-func TestLabelFilterCommentedOut(t *testing.T) {
-	tmpDir := testutil.TempDir(t, "label-filter-comment-test")
+// TestLabelFilterNative tests that the names field is converted to labels: in the on: section
+// for issues/pull_request with labeled/unlabeled types (native GitHub Actions label filtering)
+func TestLabelFilterNative(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "label-filter-native-test")
 
 	compiler := NewCompiler()
 
@@ -254,8 +262,8 @@ tools:
     allowed: [issue_read]
 ---`
 
-	testFile := tmpDir + "/test-comment.md"
-	content := frontmatter + "\n\n# Test Workflow\n\nTest comment."
+	testFile := tmpDir + "/test-native.md"
+	content := frontmatter + "\n\n# Test Workflow\n\nTest native label filter."
 	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -271,13 +279,23 @@ tools:
 	}
 	lockContent := string(lockBytes)
 
-	// Check that the names field is commented out
-	if !strings.Contains(lockContent, "# names:") || !strings.Contains(lockContent, "Label filtering applied") {
-		t.Error("Expected 'names:' field to be commented out with 'Label filtering applied' note")
+	// Check that labels: field is present (native GitHub Actions filter)
+	if !strings.Contains(lockContent, "labels:") {
+		t.Error("Expected 'labels:' field to be present in generated workflow on: section")
 	}
 
-	// Check that the names array items are commented out
-	if !strings.Contains(lockContent, "# - bug") || !strings.Contains(lockContent, "# - enhancement") {
-		t.Error("Expected names array items to be commented out")
+	// Check that label names appear as list items
+	if !strings.Contains(lockContent, "- bug") || !strings.Contains(lockContent, "- enhancement") {
+		t.Error("Expected label names to appear as list items under labels:")
+	}
+
+	// Check that names: is NOT commented out (it's been replaced by labels:)
+	if strings.Contains(lockContent, "# names:") {
+		t.Error("Expected 'names:' to be replaced by 'labels:', not commented out")
+	}
+
+	// Check that no job condition for label.name is generated (native filter handles it)
+	if strings.Contains(lockContent, "github.event.label.name") {
+		t.Error("Expected no 'github.event.label.name' job condition when native label filtering is used")
 	}
 }
