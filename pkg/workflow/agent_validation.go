@@ -113,7 +113,7 @@ func (c *Compiler) validateMaxTurnsSupport(frontmatter map[string]any, engine Co
 
 	// max-turns is specified, check if the engine supports it
 	if !engine.SupportsMaxTurns() {
-		return fmt.Errorf("max-turns not supported: engine '%s' does not support the max-turns feature.\nRemove max-turns from your configuration, or switch to an engine that supports it (e.g., claude). Example:\nengine:\n  id: claude\n  max-turns: 5", engine.GetID())
+		return fmt.Errorf("max-turns not supported: engine '%s' does not support the max-turns feature", engine.GetID())
 	}
 
 	// Engine supports max-turns - additional validation could be added here if needed
