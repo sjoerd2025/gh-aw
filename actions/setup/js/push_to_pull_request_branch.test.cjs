@@ -158,8 +158,17 @@ describe("push_to_pull_request_branch.cjs", () => {
   });
 
   afterEach(() => {
-    // Restore environment
-    process.env = originalEnv;
+    // Restore environment without replacing process.env object
+    // Remove any keys that were added during the test
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) {
+        delete process.env[key];
+      }
+    }
+    // Restore original keys and values
+    for (const [key, value] of Object.entries(originalEnv)) {
+      process.env[key] = value;
+    }
 
     // Clean up temp directory
     if (tempDir && fs.existsSync(tempDir)) {
