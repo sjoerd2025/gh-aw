@@ -207,6 +207,9 @@
         },
         "statuses": {
           "$ref": "#/definitions/permissions-level"
+        },
+        "copilot-requests": {
+          "$ref": "#/definitions/permissions-level"
         }
       }
     },
