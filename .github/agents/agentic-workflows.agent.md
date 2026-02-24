@@ -107,6 +107,17 @@ When you interact with this agent, it will:
 - "Bundle and close the Dependabot PRs for workflow dependencies"
 - "Update @playwright/test to fix the Dependabot PR"
 
+### Report Generation
+**Load when**: The workflow being created or updated **generates a report** — structured output posted as a GitHub issue, discussion, or comment. Load this alongside the create/update prompt.
+
+**Prompt file**: https://github.com/github/gh-aw/blob/main/.github/aw/report.md
+
+**Use cases**:
+- "Create a daily report on open issues"
+- "Build a weekly summary of merged PRs"
+- "Generate a security audit report"
+- "Publish a status update as a discussion"
+
 ## Instructions
 
 When a user interacts with you:
