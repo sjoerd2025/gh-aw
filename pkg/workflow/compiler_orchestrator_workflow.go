@@ -145,7 +145,7 @@ func (c *Compiler) buildInitialWorkflowData(
 		agentImportSpec = ""
 	}
 
-	return &WorkflowData{
+	wd := &WorkflowData{
 		Name:                  toolsResult.workflowName,
 		FrontmatterName:       toolsResult.frontmatterName,
 		FrontmatterYAML:       strings.Join(result.FrontmatterLines, "\n"),
@@ -183,6 +183,11 @@ func (c *Compiler) buildInitialWorkflowData(
 		ActionMode:            c.actionMode,
 		InlinedImports:        inlinedImports,
 	}
+	// Propagate user-configured checkout entries from parsed frontmatter
+	if toolsResult.parsedFrontmatter != nil {
+		wd.CheckoutConfigs = toolsResult.parsedFrontmatter.CheckoutConfigs
+	}
+	return wd
 }
 
 // resolveInlinedImports returns true if inlined-imports is enabled.
