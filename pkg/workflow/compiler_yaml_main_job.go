@@ -11,42 +11,24 @@ import (
 func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowData) error {
 	compilerYamlLog.Printf("Generating main job steps for workflow: %s", data.Name)
 
-	// Determine if we need to add a checkout step
-	needsCheckout := c.shouldAddCheckoutStep(data)
-	compilerYamlLog.Printf("Checkout step needed: %t", needsCheckout)
-
-	// Add checkout step first if needed
-	if needsCheckout {
-		yaml.WriteString("      - name: Checkout repository\n")
-		fmt.Fprintf(yaml, "        uses: %s\n", GetActionPin("actions/checkout"))
-		// Always add with section for persist-credentials
-		yaml.WriteString("        with:\n")
-		yaml.WriteString("          persist-credentials: false\n")
-		// In trial mode without cloning, checkout the logical repo if specified
-		if c.trialMode {
-			if c.trialLogicalRepoSlug != "" {
-				fmt.Fprintf(yaml, "          repository: %s\n", c.trialLogicalRepoSlug)
-				// trialTargetRepoName := strings.Split(c.trialLogicalRepoSlug, "/")
-				// if len(trialTargetRepoName) == 2 {
-				// 	yaml.WriteString(fmt.Sprintf("          path: %s\n", trialTargetRepoName[1]))
-				// }
-			}
-			effectiveToken := getEffectiveGitHubToken("")
-			fmt.Fprintf(yaml, "          token: %s\n", effectiveToken)
-		}
-
-		// Add CLI build steps in dev mode (after automatic checkout, before other steps)
-		// This builds the gh-aw CLI and Docker image for use by the agentic-workflows MCP server
-		// Only generate build steps if agentic-workflows tool is enabled
-		if c.actionMode.IsDev() {
-			if _, hasAgenticWorkflows := data.Tools["agentic-workflows"]; hasAgenticWorkflows {
-				compilerYamlLog.Printf("Generating CLI build steps for dev mode (agentic-workflows tool enabled)")
-				c.generateDevModeCLIBuildSteps(yaml)
-			} else {
-				compilerYamlLog.Printf("Skipping CLI build steps in dev mode (agentic-workflows tool not enabled)")
-			}
-		}
+	// Build the CheckoutManager from the workflow's checkout configuration.
+	// When the user specified checkout entries (or checkout: false) we honour them;
+	// otherwise the manager defaults to a single workspace-root checkout.
+	//
+	// Exception: if custom steps already contain an actions/checkout step we skip
+	// the automatic checkout to avoid duplicates (preserves existing behaviour).
+	checkoutDisabled := data.CheckoutDisabled
+	if !checkoutDisabled && data.CustomSteps != "" && ContainsCheckout(data.CustomSteps) {
+		compilerYamlLog.Print("Skipping automatic checkout: custom steps already contain checkout")
+		checkoutDisabled = true
 	}
+
+	checkoutMgr := NewCheckoutManager(checkoutDisabled, data.CheckoutEntries)
+	needsCheckout := checkoutMgr.HasCheckout()
+	compilerYamlLog.Printf("Checkout step(s) needed: %t (%d entries)", needsCheckout, len(checkoutMgr.Entries()))
+
+	// Emit all checkout steps (including dev-mode build steps after the first).
+	checkoutMgr.GenerateCheckoutSteps(yaml, c, data)
 
 	// Add checkout steps for repository imports
 	// Each repository import needs to be checked out into a temporary folder

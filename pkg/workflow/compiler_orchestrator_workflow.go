@@ -182,7 +182,27 @@ func (c *Compiler) buildInitialWorkflowData(
 		HasExplicitGitHubTool: toolsResult.hasExplicitGitHubTool,
 		ActionMode:            c.actionMode,
 		InlinedImports:        inlinedImports,
+		CheckoutEntries:       resolveCheckoutEntries(toolsResult.parsedFrontmatter),
+		CheckoutDisabled:      resolveCheckoutDisabled(toolsResult.parsedFrontmatter),
 	}
+}
+
+// resolveCheckoutEntries extracts the checkout entries from the parsed frontmatter.
+// Returns nil when parsedFrontmatter is nil (fallback to default behaviour).
+func resolveCheckoutEntries(pf *FrontmatterConfig) []*CheckoutConfig {
+	if pf == nil {
+		return nil
+	}
+	return pf.CheckoutEntries
+}
+
+// resolveCheckoutDisabled returns whether the checkout step should be skipped.
+// Returns false when parsedFrontmatter is nil (fallback to default behaviour).
+func resolveCheckoutDisabled(pf *FrontmatterConfig) bool {
+	if pf == nil {
+		return false
+	}
+	return pf.CheckoutDisabled
 }
 
 // resolveInlinedImports returns true if inlined-imports is enabled.

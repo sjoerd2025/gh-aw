@@ -7040,6 +7040,29 @@
         }
       ]
     },
+    "checkout": {
+      "description": "Controls the actions/checkout step(s) emitted in the agent job. Use false to skip checkout entirely, an object to configure the default workspace-root checkout, or an array of objects for multiple checkouts. The persist-credentials option is always set to false and cannot be overridden.",
+      "oneOf": [
+        {
+          "type": "boolean",
+          "enum": [false],
+          "description": "Set to false to skip all automatic checkout steps."
+        },
+        {
+          "$ref": "#/$defs/checkoutEntry",
+          "description": "Configure the default workspace-root checkout."
+        },
+        {
+          "type": "array",
+          "description": "Configure multiple checkout steps. The first entry with no checkout-dir is the workspace-root checkout.",
+          "items": {
+            "$ref": "#/$defs/checkoutEntry"
+          },
+          "minItems": 1
+        }
+      ],
+      "examples": [false, { "fetch-depth": 0 }, { "repository": "owner/other-repo", "checkout-dir": "other-repo" }, [{ "fetch-depth": 0 }, { "repository": "owner/other-repo", "checkout-dir": "other-repo" }]]
+    },
     "strict": {
       "type": "boolean",
       "default": true,
@@ -7349,6 +7372,60 @@
     }
   ],
   "$defs": {
+    "checkoutEntry": {
+      "type": "object",
+      "description": "Configuration for a single actions/checkout step. persist-credentials is always false.",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "description": "Repository to check out in 'owner/repo' format. Defaults to the repository that triggered the workflow.",
+          "examples": ["owner/my-repo", "org/shared-lib"]
+        },
+        "ref": {
+          "type": "string",
+          "description": "Git ref (branch, tag, or SHA) to check out. Defaults to the triggering ref.",
+          "examples": ["main", "v1.0.0", "refs/pull/123/head"]
+        },
+        "checkout-dir": {
+          "type": "string",
+          "description": "Relative path under GITHUB_WORKSPACE where the repository is placed. Defaults to the workspace root.",
+          "examples": ["my-lib", "vendor/other-repo"]
+        },
+        "fetch-depth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of commits to fetch. 0 fetches full history. Defaults to 1 (shallow clone).",
+          "examples": [0, 1, 50]
+        },
+        "github-token": {
+          "type": "string",
+          "description": "GitHub token to use for authentication. Defaults to the workflow GITHUB_TOKEN.",
+          "examples": ["${{ secrets.MY_PAT }}"]
+        },
+        "submodules": {
+          "type": "string",
+          "enum": ["false", "true", "recursive"],
+          "description": "Whether to check out submodules. 'recursive' fetches submodules recursively.",
+          "examples": ["true", "recursive"]
+        },
+        "sparse-checkout": {
+          "type": "string",
+          "description": "Newline-separated list of path patterns for a sparse checkout.",
+          "examples": ["src/\ndocs/"]
+        },
+        "sparse-checkout-cone-mode": {
+          "type": "boolean",
+          "description": "Enable cone-mode optimization for sparse checkout. Defaults to true.",
+          "examples": [true, false]
+        },
+        "lfs": {
+          "type": "boolean",
+          "description": "Whether to download Git-LFS files. Defaults to false.",
+          "examples": [true]
+        }
+      },
+      "additionalProperties": false
+    },
     "templatable_boolean": {
       "description": "A boolean value that may also be specified as a GitHub Actions expression string that resolves to a boolean at runtime (e.g. '${{ inputs.my-flag }}').",
       "oneOf": [
