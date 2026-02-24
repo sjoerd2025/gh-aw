@@ -3,7 +3,6 @@
 package workflow
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -67,11 +66,13 @@ func TestGenerateSecretValidationStep(t *testing.T) {
 
 func TestGenerateMultiSecretValidationStep(t *testing.T) {
 	tests := []struct {
-		name        string
-		secretNames []string
-		engineName  string
-		docsURL     string
-		wantStrings []string
+		name              string
+		secretNames       []string
+		secretExpressions map[string]string
+		engineName        string
+		docsURL           string
+		wantStrings       []string
+		wantAbsentStrings []string
 	}{
 		{
 			name:        "Codex dual secret validation",
@@ -107,16 +108,58 @@ func TestGenerateMultiSecretValidationStep(t *testing.T) {
 				"ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}",
 			},
 		},
+		{
+			name:        "Copilot with overridden token expression",
+			secretNames: []string{"COPILOT_GITHUB_TOKEN"},
+			secretExpressions: map[string]string{
+				"COPILOT_GITHUB_TOKEN": "${{ secrets.MY_SECRET }}",
+			},
+			engineName: "GitHub Copilot CLI",
+			docsURL:    "https://github.github.com/gh-aw/reference/engines/#github-copilot-default",
+			wantStrings: []string{
+				"Validate COPILOT_GITHUB_TOKEN secret",
+				// Script args still reference the env var name, not the secret name
+				"run: /opt/gh-aw/actions/validate_multi_secret.sh COPILOT_GITHUB_TOKEN 'GitHub Copilot CLI'",
+				// Env section uses the overridden secret expression
+				"COPILOT_GITHUB_TOKEN: ${{ secrets.MY_SECRET }}",
+			},
+			wantAbsentStrings: []string{
+				// Default expression must NOT appear when an override is provided
+				"COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}",
+			},
+		},
+		{
+			name:        "Claude with overridden API key expression",
+			secretNames: []string{"ANTHROPIC_API_KEY"},
+			secretExpressions: map[string]string{
+				"ANTHROPIC_API_KEY": "${{ secrets.ORG_ANTHROPIC_KEY }}",
+			},
+			engineName: "Claude Code",
+			docsURL:    "https://github.github.com/gh-aw/reference/engines/#anthropic-claude-code",
+			wantStrings: []string{
+				"Validate ANTHROPIC_API_KEY secret",
+				"ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_KEY }}",
+			},
+			wantAbsentStrings: []string{
+				"ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}",
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			step := GenerateMultiSecretValidationStep(tt.secretNames, tt.engineName, tt.docsURL)
+			step := GenerateMultiSecretValidationStep(tt.secretNames, tt.secretExpressions, tt.engineName, tt.docsURL)
 			stepContent := strings.Join(step, "\n")
 
 			for _, want := range tt.wantStrings {
 				if !strings.Contains(stepContent, want) {
 					t.Errorf("GenerateMultiSecretValidationStep() missing expected string:\nwant: %s\ngot: %s", want, stepContent)
+				}
+			}
+
+			for _, absent := range tt.wantAbsentStrings {
+				if strings.Contains(stepContent, absent) {
+					t.Errorf("GenerateMultiSecretValidationStep() should not contain:\nunwanted: %s\ngot: %s", absent, stepContent)
 				}
 			}
 
@@ -130,11 +173,10 @@ func TestGenerateMultiSecretValidationStep(t *testing.T) {
 				t.Error("Expected step to have 'env:' section")
 			}
 
-			// Verify all secrets are passed as environment variables
+			// Verify all secrets are passed as environment variable keys (with any expression)
 			for _, secretName := range tt.secretNames {
-				expectedEnvVar := fmt.Sprintf("%s: ${{ secrets.%s }}", secretName, secretName)
-				if !strings.Contains(stepContent, expectedEnvVar) {
-					t.Errorf("Expected step to have environment variable: %s", expectedEnvVar)
+				if !strings.Contains(stepContent, secretName+":") {
+					t.Errorf("Expected step to have environment variable key: %s", secretName)
 				}
 			}
 
@@ -213,5 +255,124 @@ func TestCodexEngineHasSecretValidation(t *testing.T) {
 	}
 	if !strings.Contains(firstStep, "CODEX_API_KEY OPENAI_API_KEY") {
 		t.Error("Should pass both CODEX_API_KEY and OPENAI_API_KEY to the script")
+	}
+}
+
+// TestResolveEngineSecretExpression verifies that the helper returns the overridden expression
+// when engine.env provides one, and falls back to the default otherwise.
+func TestResolveEngineSecretExpression(t *testing.T) {
+	tests := []struct {
+		name      string
+		secretKey string
+		engineEnv map[string]string
+		want      string
+	}{
+		{
+			name:      "returns default when no engineEnv",
+			secretKey: "COPILOT_GITHUB_TOKEN",
+			engineEnv: nil,
+			want:      "${{ secrets.COPILOT_GITHUB_TOKEN }}",
+		},
+		{
+			name:      "returns default when engineEnv is empty",
+			secretKey: "COPILOT_GITHUB_TOKEN",
+			engineEnv: map[string]string{},
+			want:      "${{ secrets.COPILOT_GITHUB_TOKEN }}",
+		},
+		{
+			name:      "returns default when key not in engineEnv",
+			secretKey: "COPILOT_GITHUB_TOKEN",
+			engineEnv: map[string]string{"OTHER_VAR": "value"},
+			want:      "${{ secrets.COPILOT_GITHUB_TOKEN }}",
+		},
+		{
+			name:      "returns default when engineEnv value is not a secrets expression",
+			secretKey: "COPILOT_GITHUB_TOKEN",
+			engineEnv: map[string]string{"COPILOT_GITHUB_TOKEN": "plain-value"},
+			want:      "${{ secrets.COPILOT_GITHUB_TOKEN }}",
+		},
+		{
+			name:      "returns overridden expression when engineEnv provides secrets expression",
+			secretKey: "COPILOT_GITHUB_TOKEN",
+			engineEnv: map[string]string{"COPILOT_GITHUB_TOKEN": "${{ secrets.MY_SECRET }}"},
+			want:      "${{ secrets.MY_SECRET }}",
+		},
+		{
+			name:      "returns overridden expression for ANTHROPIC_API_KEY",
+			secretKey: "ANTHROPIC_API_KEY",
+			engineEnv: map[string]string{"ANTHROPIC_API_KEY": "${{ secrets.ORG_ANTHROPIC_KEY }}"},
+			want:      "${{ secrets.ORG_ANTHROPIC_KEY }}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveEngineSecretExpression(tt.secretKey, tt.engineEnv)
+			if got != tt.want {
+				t.Errorf("resolveEngineSecretExpression(%q, %v) = %q, want %q", tt.secretKey, tt.engineEnv, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCopilotEngineSecretValidationWithEnvOverride verifies that when engine.env overrides
+// COPILOT_GITHUB_TOKEN, the validation step uses the overridden secret expression.
+func TestCopilotEngineSecretValidationWithEnvOverride(t *testing.T) {
+	engine := NewCopilotEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+			Env: map[string]string{
+				"COPILOT_GITHUB_TOKEN": "${{ secrets.MY_SECRET }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+	if len(steps) < 1 {
+		t.Fatal("Expected at least one installation step")
+	}
+
+	firstStep := strings.Join(steps[0], "\n")
+
+	// Env section should use the overridden secret expression
+	if !strings.Contains(firstStep, "COPILOT_GITHUB_TOKEN: ${{ secrets.MY_SECRET }}") {
+		t.Error("Validation step should use the overridden secret expression MY_SECRET")
+	}
+	// Default expression should NOT appear
+	if strings.Contains(firstStep, "COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}") {
+		t.Error("Validation step should NOT use the default COPILOT_GITHUB_TOKEN expression when overridden")
+	}
+	// Script args should still reference the env var name (not the secret name)
+	if !strings.Contains(firstStep, "validate_multi_secret.sh COPILOT_GITHUB_TOKEN") {
+		t.Error("Script args should still reference the env var name COPILOT_GITHUB_TOKEN")
+	}
+}
+
+// TestClaudeEngineSecretValidationWithEnvOverride verifies that when engine.env overrides
+// ANTHROPIC_API_KEY, the validation step uses the overridden secret expression.
+func TestClaudeEngineSecretValidationWithEnvOverride(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			ID: "claude",
+			Env: map[string]string{
+				"ANTHROPIC_API_KEY": "${{ secrets.ORG_CLAUDE_KEY }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+	if len(steps) < 1 {
+		t.Fatal("Expected at least one installation step")
+	}
+
+	firstStep := strings.Join(steps[0], "\n")
+
+	if !strings.Contains(firstStep, "ANTHROPIC_API_KEY: ${{ secrets.ORG_CLAUDE_KEY }}") {
+		t.Error("Validation step should use the overridden secret expression ORG_CLAUDE_KEY")
+	}
+	if strings.Contains(firstStep, "ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}") {
+		t.Error("Validation step should NOT use the default ANTHROPIC_API_KEY expression when overridden")
 	}
 }

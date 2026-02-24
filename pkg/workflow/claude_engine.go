@@ -89,9 +89,19 @@ func (e *ClaudeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		InstallStepName: "Install Claude Code CLI",
 	}
 
+	// Build secret expressions, respecting any engine.env overrides
+	var engineEnv map[string]string
+	if workflowData.EngineConfig != nil {
+		engineEnv = workflowData.EngineConfig.Env
+	}
+	secretExpressions := map[string]string{
+		"ANTHROPIC_API_KEY": resolveEngineSecretExpression("ANTHROPIC_API_KEY", engineEnv),
+	}
+
 	// Add secret validation step
 	secretValidation := GenerateMultiSecretValidationStep(
 		config.Secrets,
+		secretExpressions,
 		config.Name,
 		config.DocsURL,
 	)

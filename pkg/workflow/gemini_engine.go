@@ -106,9 +106,19 @@ func (e *GeminiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		InstallStepName: "Install Gemini CLI",
 	}
 
+	// Build secret expressions, respecting any engine.env overrides
+	var engineEnv map[string]string
+	if workflowData.EngineConfig != nil {
+		engineEnv = workflowData.EngineConfig.Env
+	}
+	secretExpressions := map[string]string{
+		"GEMINI_API_KEY": resolveEngineSecretExpression("GEMINI_API_KEY", engineEnv),
+	}
+
 	// Add secret validation step
 	secretValidation := GenerateMultiSecretValidationStep(
 		config.Secrets,
+		secretExpressions,
 		config.Name,
 		config.DocsURL,
 	)

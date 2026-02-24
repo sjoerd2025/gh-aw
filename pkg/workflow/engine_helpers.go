@@ -61,6 +61,18 @@ type EngineInstallConfig struct {
 	InstallStepName string
 }
 
+// resolveEngineSecretExpression returns the effective secret expression for a given engine env var key.
+// If the engine config provides an override via engine.env (e.g., COPILOT_GITHUB_TOKEN: ${{ secrets.MY_SECRET }}),
+// that expression is returned. Otherwise the default expression ${{ secrets.<key> }} is returned.
+func resolveEngineSecretExpression(secretKey string, engineEnv map[string]string) string {
+	if engineEnv != nil {
+		if expr, ok := engineEnv[secretKey]; ok && strings.Contains(expr, "${{ secrets.") {
+			return expr
+		}
+	}
+	return fmt.Sprintf("${{ secrets.%s }}", secretKey)
+}
+
 // GetBaseInstallationSteps returns the common installation steps for an engine.
 // This includes secret validation and npm package installation steps that are
 // shared across all engines.
@@ -76,9 +88,20 @@ func GetBaseInstallationSteps(config EngineInstallConfig, workflowData *Workflow
 
 	var steps []GitHubActionStep
 
+	// Build secret expressions, respecting any engine.env overrides
+	var engineEnv map[string]string
+	if workflowData.EngineConfig != nil {
+		engineEnv = workflowData.EngineConfig.Env
+	}
+	secretExpressions := make(map[string]string)
+	for _, secretName := range config.Secrets {
+		secretExpressions[secretName] = resolveEngineSecretExpression(secretName, engineEnv)
+	}
+
 	// Add secret validation step
 	secretValidation := GenerateMultiSecretValidationStep(
 		config.Secrets,
+		secretExpressions,
 		config.Name,
 		config.DocsURL,
 	)

@@ -437,9 +437,13 @@ func GenerateSecretValidationStep(secretName, engineName, docsURL string) GitHub
 
 // GenerateMultiSecretValidationStep creates a GitHub Actions step that validates at least one of multiple secrets is available
 // secretNames: slice of secret names to validate (e.g., []string{"CODEX_API_KEY", "OPENAI_API_KEY"})
+// secretExpressions: optional map of secret name -> expression override (e.g., {"COPILOT_GITHUB_TOKEN": "${{ secrets.MY_SECRET }}"})
+//
+//	when nil or a name is absent, the default expression ${{ secrets.<name> }} is used
+//
 // engineName: the display name of the engine (e.g., "Codex")
 // docsURL: URL to the documentation page for setting up the secret
-func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL string) GitHubActionStep {
+func GenerateMultiSecretValidationStep(secretNames []string, secretExpressions map[string]string, engineName, docsURL string) GitHubActionStep {
 	if len(secretNames) == 0 {
 		// This is a programming error - engine configurations should always provide secrets
 		// Log the error and return empty step to avoid breaking compilation
@@ -463,9 +467,15 @@ func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL
 		"        env:",
 	}
 
-	// Add env section with all secrets
+	// Add env section with all secrets, using overridden expressions where provided
 	for _, secretName := range secretNames {
-		stepLines = append(stepLines, fmt.Sprintf("          %s: ${{ secrets.%s }}", secretName, secretName))
+		expression := fmt.Sprintf("${{ secrets.%s }}", secretName)
+		if secretExpressions != nil {
+			if override, ok := secretExpressions[secretName]; ok {
+				expression = override
+			}
+		}
+		stepLines = append(stepLines, fmt.Sprintf("          %s: %s", secretName, expression))
 	}
 
 	return GitHubActionStep(stepLines)
