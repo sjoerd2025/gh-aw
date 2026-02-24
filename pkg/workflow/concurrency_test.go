@@ -316,24 +316,22 @@ func TestGenerateJobConcurrencyConfig(t *testing.T) {
 		description  string
 	}{
 		{
-			name: "Default concurrency for workflow_dispatch with copilot engine",
+			name: "No default concurrency for workflow_dispatch with copilot engine",
 			workflowData: &WorkflowData{
 				On:           "on:\n  workflow_dispatch:",
 				EngineConfig: &EngineConfig{ID: "copilot"},
 			},
-			expected: `concurrency:
-  group: "gh-aw-copilot-${{ github.workflow }}"`,
-			description: "Copilot with workflow_dispatch should get default concurrency",
+			expected:    "",
+			description: "Copilot with workflow_dispatch should NOT get default job-level concurrency",
 		},
 		{
-			name: "Default concurrency for workflow_dispatch with claude engine",
+			name: "No default concurrency for workflow_dispatch with claude engine",
 			workflowData: &WorkflowData{
 				On:           "on:\n  workflow_dispatch:",
 				EngineConfig: &EngineConfig{ID: "claude"},
 			},
-			expected: `concurrency:
-  group: "gh-aw-claude-${{ github.workflow }}"`,
-			description: "Claude with workflow_dispatch should get default concurrency",
+			expected:    "",
+			description: "Claude with workflow_dispatch should NOT get default job-level concurrency",
 		},
 		{
 			name: "No default concurrency for push workflows",
@@ -382,14 +380,13 @@ func TestGenerateJobConcurrencyConfig(t *testing.T) {
 			description: "Should preserve cancel-in-progress when specified",
 		},
 		{
-			name: "Default concurrency for schedule with codex engine",
+			name: "No default concurrency for schedule with codex engine",
 			workflowData: &WorkflowData{
 				On:           "on:\n  schedule:\n    - cron: '0 0 * * *'",
 				EngineConfig: &EngineConfig{ID: "codex"},
 			},
-			expected: `concurrency:
-  group: "gh-aw-codex-${{ github.workflow }}"`,
-			description: "Codex with schedule should get default concurrency",
+			expected:    "",
+			description: "Codex with schedule should NOT get default job-level concurrency",
 		},
 		{
 			name: "No concurrency when engine.concurrency is set to none",

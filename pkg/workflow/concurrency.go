@@ -38,76 +38,26 @@ func GenerateConcurrencyConfig(workflowData *WorkflowData, isCommandTrigger bool
 }
 
 // GenerateJobConcurrencyConfig generates the agent concurrency configuration
-// for the agent job based on engine.concurrency field
+// for the agent job based on engine.concurrency field.
+// By default, no job-level concurrency is applied (equivalent to engine.concurrency: none).
+// Set engine.concurrency to a group name or object to opt in to job-level concurrency.
 func GenerateJobConcurrencyConfig(workflowData *WorkflowData) string {
 	concurrencyLog.Print("Generating job-level concurrency config")
 
 	// If concurrency is explicitly configured in engine, use it
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Concurrency != "" {
-		// "none" is a special value to opt out of default job-level concurrency
+		// "none" is a special value to opt out of job-level concurrency (also the default)
 		if workflowData.EngineConfig.Concurrency == "none" {
-			concurrencyLog.Print("Engine concurrency set to none, skipping default job concurrency")
+			concurrencyLog.Print("Engine concurrency set to none, skipping job concurrency")
 			return ""
 		}
 		concurrencyLog.Print("Using engine-configured concurrency")
 		return workflowData.EngineConfig.Concurrency
 	}
 
-	// Check if this workflow has special trigger handling (issues, PRs, discussions, push, command)
-	// For these cases, no default concurrency should be applied at agent level
-	if hasSpecialTriggers(workflowData) {
-		concurrencyLog.Print("Workflow has special triggers, skipping default job concurrency")
-		return ""
-	}
-
-	// For generic triggers like workflow_dispatch, apply default concurrency
-	// Pattern: gh-aw-{engine-id}-${{ github.workflow }}
-	engineID := ""
-	if workflowData.EngineConfig != nil && workflowData.EngineConfig.ID != "" {
-		engineID = workflowData.EngineConfig.ID
-	}
-
-	if engineID == "" {
-		// If no engine ID is available, skip default concurrency
-		return ""
-	}
-
-	// Build the default concurrency configuration
-	groupValue := fmt.Sprintf("gh-aw-%s-${{ github.workflow }}", engineID)
-	concurrencyConfig := fmt.Sprintf("concurrency:\n  group: \"%s\"", groupValue)
-
-	return concurrencyConfig
-}
-
-// hasSpecialTriggers checks if the workflow has special trigger types that require
-// workflow-level concurrency handling (issues, PRs, discussions, push, command)
-func hasSpecialTriggers(workflowData *WorkflowData) bool {
-	// Check for specific trigger types that have special concurrency handling
-	on := workflowData.On
-
-	// Check for issue-related triggers
-	if isIssueWorkflow(on) {
-		return true
-	}
-
-	// Check for pull request triggers
-	if isPullRequestWorkflow(on) {
-		return true
-	}
-
-	// Check for discussion triggers
-	if isDiscussionWorkflow(on) {
-		return true
-	}
-
-	// Check for push triggers
-	if isPushWorkflow(on) {
-		return true
-	}
-
-	// If none of the special triggers are detected, return false
-	// This means workflow_dispatch and other generic triggers will get default concurrency
-	return false
+	// Default: no job-level concurrency
+	concurrencyLog.Print("No engine concurrency configured, skipping job concurrency (default)")
+	return ""
 }
 
 // isPullRequestWorkflow checks if a workflow's "on" section contains pull_request triggers

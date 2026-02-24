@@ -24,13 +24,17 @@ This ensures workflows on different issues, PRs, or branches run concurrently wi
 
 ## Per-Engine Concurrency
 
-The default per-engine pattern `gh-aw-{engine-id}` ensures only one agent job runs per engine across all workflows, preventing AI resource exhaustion. The group includes only the engine ID and `gh-aw-` prefix - workflow name, issue/PR numbers, and branches are excluded.
+By default, no job-level concurrency is applied to agent jobs (`engine.concurrency: none` is the default). This allows multiple agent jobs — even across different workflows — to execute in parallel without any engine-level serialization.
+
+To opt in to job-level concurrency and limit how many agent jobs run simultaneously, set `engine.concurrency` explicitly:
 
 ```yaml wrap
-jobs:
-  agent:
-    concurrency:
-      group: "gh-aw-{engine-id}"
+---
+engine:
+  id: copilot
+  concurrency:  # Limit to one agent job per engine across all workflows
+    group: "gh-aw-copilot-${{ github.workflow }}"
+---
 ```
 
 ## Custom Concurrency
@@ -55,7 +59,7 @@ tools:
 
 ## Disabling Job-Level Concurrency
 
-Set `engine.concurrency: none` to opt out of the default per-engine job-level concurrency. This is useful when the workflow-level `concurrency` already provides the required isolation (for example, a `workflow_dispatch` workflow that processes individual issues and includes the issue number in its concurrency group):
+Since `engine.concurrency: none` is the default, no action is required to run workflow dispatches in parallel. The workflow-level `concurrency` block is sufficient for per-issue isolation:
 
 ```yaml wrap
 ---
@@ -69,11 +73,17 @@ concurrency:
   cancel-in-progress: true
 engine:
   id: copilot
-  concurrency: none  # Disable default job-level concurrency; rely on workflow-level group above
+  # No engine.concurrency needed - none is the default
 ---
 ```
 
-Without `engine.concurrency: none`, the compiled agent job would use `gh-aw-copilot-${{ github.workflow }}` as its concurrency group, which serializes all runs of the workflow regardless of the issue number. Setting it to `none` allows different issues to be processed in parallel while still cancelling duplicate runs for the same issue.
+You can also be explicit by setting `engine.concurrency: none`:
+
+```yaml wrap
+engine:
+  id: copilot
+  concurrency: none  # Explicit opt-out of job-level concurrency
+```
 
 ## Related Documentation
 
