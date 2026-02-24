@@ -113,8 +113,7 @@ func RunChecks(config ChecksConfig) error {
 
 	result, err := FetchChecksResult(config.Repo, config.PRNumber)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, console.FormatErrorMessage(err.Error()))
-		return fmt.Errorf("failed to fetch check state for PR %s: %w", config.PRNumber, err)
+		return err
 	}
 
 	if config.JSONOutput {
@@ -176,16 +175,59 @@ func fetchPRHeadSHA(repoOverride string, prNumber string) (string, error) {
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return "", fmt.Errorf("gh api call failed (exit %d): %s", exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+			stderr := strings.TrimSpace(string(exitErr.Stderr))
+			return "", classifyGHAPIError(exitErr.ExitCode(), stderr, prNumber, repoOverride)
 		}
 		return "", fmt.Errorf("gh api call failed: %w", err)
 	}
 
 	sha := strings.TrimSpace(string(output))
 	if sha == "" {
-		return "", fmt.Errorf("empty SHA returned for PR %s", prNumber)
+		return "", errors.New(console.FormatErrorWithSuggestions(
+			"PR #"+prNumber+" returned an empty SHA",
+			[]string{
+				"Verify that PR #" + prNumber + " exists and is accessible",
+				"Check that the --repo flag points to the correct repository",
+			},
+		))
 	}
 	return sha, nil
+}
+
+// classifyGHAPIError converts a gh API exit error into a user-friendly, pre-formatted error.
+func classifyGHAPIError(exitCode int, stderr string, prNumber string, repo string) error {
+	checksLog.Printf("API error: exitCode=%d, stderr=%s", exitCode, stderr)
+
+	lower := strings.ToLower(stderr)
+
+	switch {
+	case strings.Contains(lower, "404") || strings.Contains(lower, "not found"):
+		repoHint := "the current repository"
+		if repo != "" {
+			repoHint = repo
+		}
+		return errors.New(console.FormatErrorWithSuggestions(
+			fmt.Sprintf("PR #%s not found in %s", prNumber, repoHint),
+			[]string{
+				"Verify that the pull request number is correct",
+				"Use --repo owner/repo to specify the target repository explicitly",
+				"Ensure you have read access to the repository",
+			},
+		))
+	case strings.Contains(lower, "403") || strings.Contains(lower, "forbidden") ||
+		strings.Contains(lower, "bad credentials") || strings.Contains(lower, "401") ||
+		strings.Contains(lower, "unauthorized"):
+		return errors.New(console.FormatErrorWithSuggestions(
+			"GitHub API authentication failed",
+			[]string{
+				"Run 'gh auth login' to authenticate with GitHub",
+				"Ensure your token has the 'repo' scope for private repositories",
+				"Check that GH_TOKEN or GITHUB_TOKEN is set correctly if using environment variables",
+			},
+		))
+	default:
+		return fmt.Errorf("gh api call failed (exit %d): %s", exitCode, stderr)
+	}
 }
 
 // checkRunsAPIResponse is the envelope returned by the check-runs endpoint.
@@ -206,7 +248,8 @@ func fetchCheckRuns(repoOverride string, sha string) ([]PRCheckRun, error) {
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return nil, fmt.Errorf("gh api call failed (exit %d): %s", exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+			stderr := strings.TrimSpace(string(exitErr.Stderr))
+			return nil, classifyGHAPIError(exitErr.ExitCode(), stderr, sha, repoOverride)
 		}
 		return nil, fmt.Errorf("gh api call failed: %w", err)
 	}
@@ -237,7 +280,8 @@ func fetchCommitStatuses(repoOverride string, sha string) ([]PRCommitStatus, err
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return nil, fmt.Errorf("gh api call failed (exit %d): %s", exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
+			stderr := strings.TrimSpace(string(exitErr.Stderr))
+			return nil, classifyGHAPIError(exitErr.ExitCode(), stderr, sha, repoOverride)
 		}
 		return nil, fmt.Errorf("gh api call failed: %w", err)
 	}

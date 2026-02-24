@@ -250,3 +250,52 @@ func TestChecksResultJSONShape(t *testing.T) {
 	require.Len(t, result.CheckRuns, 1, "should have one check run")
 	assert.Equal(t, "build", result.CheckRuns[0].Name, "check run name should be preserved")
 }
+
+// ---------------------------------------------------------------------------
+// classifyGHAPIError – error classification tests
+// ---------------------------------------------------------------------------
+
+func TestClassifyGHAPIError_NotFound(t *testing.T) {
+	err := classifyGHAPIError(1, "HTTP 404: Not Found", "42", "")
+	require.Error(t, err, "should return an error")
+	msg := err.Error()
+	assert.Contains(t, msg, "not found", "error should mention not found")
+	assert.Contains(t, msg, "#42", "error should mention PR number")
+	assert.Contains(t, msg, "current repository", "error should mention current repository when no repo override")
+}
+
+func TestClassifyGHAPIError_NotFoundWithRepo(t *testing.T) {
+	err := classifyGHAPIError(1, "HTTP 404: Not Found", "99", "myorg/myrepo")
+	require.Error(t, err, "should return an error")
+	msg := err.Error()
+	assert.Contains(t, msg, "myorg/myrepo", "error should mention the specified repo")
+}
+
+func TestClassifyGHAPIError_Forbidden(t *testing.T) {
+	err := classifyGHAPIError(1, "HTTP 403: Forbidden", "42", "")
+	require.Error(t, err, "should return an error")
+	msg := err.Error()
+	assert.Contains(t, msg, "authentication failed", "error should mention auth failure")
+	assert.Contains(t, msg, "gh auth login", "error should suggest running gh auth login")
+}
+
+func TestClassifyGHAPIError_Unauthorized(t *testing.T) {
+	err := classifyGHAPIError(1, "HTTP 401: Unauthorized (Bad credentials)", "42", "")
+	require.Error(t, err, "should return an error")
+	msg := err.Error()
+	assert.Contains(t, msg, "authentication failed", "error should mention auth failure")
+}
+
+func TestClassifyGHAPIError_BadCredentials(t *testing.T) {
+	err := classifyGHAPIError(1, "Bad credentials", "42", "")
+	require.Error(t, err, "should return an error")
+	msg := err.Error()
+	assert.Contains(t, msg, "authentication failed", "bad credentials should yield auth error")
+}
+
+func TestClassifyGHAPIError_Generic(t *testing.T) {
+	err := classifyGHAPIError(1, "HTTP 500: Internal Server Error", "42", "")
+	require.Error(t, err, "should return an error")
+	msg := err.Error()
+	assert.Contains(t, msg, "gh api call failed", "generic errors should surface exit code message")
+}
