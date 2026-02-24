@@ -17,6 +17,7 @@ This is a **dispatcher agent** that routes your request to the appropriate speci
 - **Upgrading workflows**: Routes to `upgrade-agentic-workflows` prompt
 - **Creating shared components**: Routes to `create-shared-agentic-workflow` prompt
 - **Fixing Dependabot PRs**: Routes to `dependabot` prompt — use this when Dependabot opens PRs that modify generated manifest files (`.github/workflows/package.json`, `.github/workflows/requirements.txt`, `.github/workflows/go.mod`). Never merge those PRs directly; instead update the source `.md` files and rerun `gh aw compile --dependabot` to bundle all fixes
+- **Report-generating workflows**: Also loads `report` supplemental prompt — consult when the workflow posts a report as a GitHub issue, discussion, or comment
 
 Workflows may optionally include:
 
@@ -106,6 +107,16 @@ When you interact with this agent, it will:
 - "Fix the open Dependabot PRs for npm dependencies"
 - "Bundle and close the Dependabot PRs for workflow dependencies"
 - "Update @playwright/test to fix the Dependabot PR"
+
+### Report Generation (supplemental)
+**Load alongside create or update** when the workflow posts a report as a GitHub issue, discussion, or comment.
+
+**Prompt file**: https://github.com/github/gh-aw/blob/main/.github/aw/report.md
+
+**Use cases**:
+- "Create a daily issues summary"
+- "Post a weekly metrics report as a discussion"
+- "Generate a security audit and post it as an issue"
 
 ## Instructions
 
