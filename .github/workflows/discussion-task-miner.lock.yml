@@ -979,7 +979,7 @@ jobs:
           touch /tmp/gh-aw/threat-detection/detection.log
       - name: Execute GitHub Copilot CLI
         if: always() && steps.detection_guard.outputs.run_detection == 'true'
-        id: agentic_execution
+        id: detection_agentic_execution
         # Copilot CLI tool arguments (sorted):
         # --allow-tool shell(cat)
         # --allow-tool shell(grep)

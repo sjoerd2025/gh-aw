@@ -1135,7 +1135,7 @@ jobs:
           fi
       - name: Execute Gemini CLI
         if: always() && steps.detection_guard.outputs.run_detection == 'true'
-        id: agentic_execution
+        id: detection_agentic_execution
         run: |
           set -o pipefail
           sudo -E awf --env-all --container-workdir "${GITHUB_WORKSPACE}" --allow-domains "*.googleapis.com,generativelanguage.googleapis.com,github.com,host.docker.internal,raw.githubusercontent.com,registry.npmjs.org" --log-level info --proxy-logs-dir /tmp/gh-aw/sandbox/firewall/logs --enable-host-access --image-tag 0.20.2 --skip-pull --enable-api-proxy \

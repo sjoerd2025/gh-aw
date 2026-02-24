@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -360,7 +361,10 @@ func (c *Compiler) buildDetectionEngineExecutionStep(data *WorkflowData) []strin
 	executionSteps := engine.GetExecutionSteps(threatDetectionData, logFile)
 	for _, step := range executionSteps {
 		for i, line := range step {
-			steps = append(steps, line+"\n")
+			// Prefix step IDs with "detection_" to avoid conflicts with agent job steps
+			// (e.g., "agentic_execution" is already used by the main engine execution step)
+			prefixed := strings.Replace(line, "id: agentic_execution", "id: detection_agentic_execution", 1)
+			steps = append(steps, prefixed+"\n")
 			// Inject the if condition after the first line (- name:)
 			if i == 0 {
 				steps = append(steps, fmt.Sprintf("        if: %s\n", detectionStepCondition))

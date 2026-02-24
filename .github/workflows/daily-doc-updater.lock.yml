@@ -969,7 +969,7 @@ jobs:
           touch /tmp/gh-aw/threat-detection/detection.log
       - name: Execute Claude Code CLI
         if: always() && steps.detection_guard.outputs.run_detection == 'true'
-        id: agentic_execution
+        id: detection_agentic_execution
         # Allowed tools (sorted):
         # - Bash(cat)
         # - Bash(grep)
