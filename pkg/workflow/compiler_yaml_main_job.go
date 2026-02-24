@@ -322,15 +322,6 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 		c.generateOutputCollectionStep(yaml, data)
 	}
 
-	// Add inline threat detection steps after output collection.
-	// Detection runs inside the agent job using sandbox.agent with fully blocked network.
-	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
-		detectionSteps := c.buildInlineDetectionSteps(data)
-		for _, line := range detectionSteps {
-			yaml.WriteString(line)
-		}
-	}
-
 	// Add engine-declared output files collection (if any)
 	if len(engine.GetDeclaredOutputFiles()) > 0 {
 		c.generateEngineOutputCollection(yaml, engine)
@@ -437,6 +428,15 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 
 	// Generate single unified artifact upload with all collected paths
 	c.generateUnifiedArtifactUpload(yaml, artifactPaths)
+
+	// Add inline threat detection steps after all agent artifact uploads.
+	// Detection runs inside the agent job using sandbox.agent with fully blocked network.
+	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
+		detectionSteps := c.buildInlineDetectionSteps(data)
+		for _, line := range detectionSteps {
+			yaml.WriteString(line)
+		}
+	}
 
 	// Add GitHub MCP app token invalidation step if configured (runs always, even on failure)
 	c.generateGitHubMCPAppTokenInvalidationStep(yaml, data)
