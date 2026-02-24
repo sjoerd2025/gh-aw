@@ -682,8 +682,8 @@ func TestRepoMemoryMaxPatchSizeValidation(t *testing.T) {
 			wantError:    false,
 		},
 		{
-			name:         "valid maximum size (102400 bytes = 100KB)",
-			maxPatchSize: 102400,
+			name:         "valid maximum size (20480 bytes = 20KB)",
+			maxPatchSize: 20480,
 			wantError:    false,
 		},
 		{
@@ -692,27 +692,22 @@ func TestRepoMemoryMaxPatchSizeValidation(t *testing.T) {
 			wantError:    false,
 		},
 		{
-			name:         "valid custom size (51200 bytes = 50KB)",
-			maxPatchSize: 51200,
-			wantError:    false,
-		},
-		{
 			name:         "invalid zero size",
 			maxPatchSize: 0,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got 0",
+			errorText:    "max-patch-size must be between 1 and 20480, got 0",
 		},
 		{
 			name:         "invalid negative size",
 			maxPatchSize: -1,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got -1",
+			errorText:    "max-patch-size must be between 1 and 20480, got -1",
 		},
 		{
 			name:         "invalid size exceeds maximum",
-			maxPatchSize: 102401,
+			maxPatchSize: 20481,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got 102401",
+			errorText:    "max-patch-size must be between 1 and 20480, got 20481",
 		},
 	}
 
@@ -762,13 +757,13 @@ func TestRepoMemoryMaxPatchSizeValidationArray(t *testing.T) {
 			name:         "invalid size in array (zero)",
 			maxPatchSize: 0,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got 0",
+			errorText:    "max-patch-size must be between 1 and 20480, got 0",
 		},
 		{
 			name:         "invalid size in array (exceeds max)",
-			maxPatchSize: 102401,
+			maxPatchSize: 20481,
 			wantError:    true,
-			errorText:    "max-patch-size must be between 1 and 102400, got 102401",
+			errorText:    "max-patch-size must be between 1 and 20480, got 20481",
 		},
 	}
 
