@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
@@ -276,6 +277,13 @@ func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	if modelConfigured {
 		geminiLog.Printf("Setting %s env var for model: %s", constants.GeminiCLIModelEnvVar, workflowData.EngineConfig.Model)
 		env[constants.GeminiCLIModelEnvVar] = workflowData.EngineConfig.Model
+	}
+
+	// Add custom environment variables from engine config.
+	// This allows users to override the default token expression, e.g.:
+	//   GEMINI_API_KEY: ${{ secrets.MY_ORG_GEMINI_KEY }}
+	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
+		maps.Copy(env, workflowData.EngineConfig.Env)
 	}
 
 	// Generate the execution step
