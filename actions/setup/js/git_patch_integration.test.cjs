@@ -380,7 +380,7 @@ describe("git patch integration tests", () => {
 
       // Fetch in working repo 2 and make changes
       execGit(["fetch", "origin"], { cwd: workingRepo2 });
-      execGit(["checkout", "pr-branch"], { cwd: workingRepo2 });
+      execGit(["checkout", "-b", "pr-branch", "--track", "origin/pr-branch"], { cwd: workingRepo2 });
 
       fs.writeFileSync(path.join(workingRepo2, "file2.txt"), "User 2 content\n");
       execGit(["add", "file2.txt"], { cwd: workingRepo2 });
