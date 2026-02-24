@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -146,8 +145,19 @@ func (c *Compiler) buildGitHubAppTokenMintStep(app *GitHubAppConfig, permissions
 		// Org-wide access: omit repositories field entirely
 		safeOutputsAppLog.Print("Using org-wide GitHub App token (repositories: *)")
 	} else if len(app.Repositories) > 0 {
-		reposStr := strings.Join(app.Repositories, ",")
-		steps = append(steps, fmt.Sprintf("          repositories: %s\n", reposStr))
+		if len(app.Repositories) == 1 {
+			steps = append(steps, fmt.Sprintf("          repositories: %s\n", app.Repositories[0]))
+		} else {
+			// Use YAML block scalar (newline-separated) for multiple repositories.
+			// Some versions of actions/create-github-app-token may fail silently
+			// with comma-separated repositories when combined with permission-* inputs,
+			// producing an empty token. Newline-separated is the alternative valid format
+			// per the action documentation and avoids this issue.
+			steps = append(steps, "          repositories: |-\n")
+			for _, repo := range app.Repositories {
+				steps = append(steps, fmt.Sprintf("            %s\n", repo))
+			}
+		}
 	} else {
 		// Extract repo name from github.repository (which is "owner/repo")
 		// Using GitHub Actions expression: split(github.repository, '/')[1]

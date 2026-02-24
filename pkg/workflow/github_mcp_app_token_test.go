@@ -253,3 +253,66 @@ Test org-wide GitHub MCP app token.
 	assert.Contains(t, lockContent, "owner:", "Should include owner field")
 	assert.Contains(t, lockContent, "app-id:", "Should include app-id field")
 }
+
+// TestGitHubMCPAppTokenMultipleRepositories tests that multiple repositories use block scalar format
+func TestGitHubMCPAppTokenMultipleRepositories(t *testing.T) {
+	compiler := NewCompilerWithVersion("1.0.0")
+
+	markdown := `---
+on: issues
+permissions:
+  contents: read
+  issues: read
+strict: false
+tools:
+  github:
+    mode: local
+    toolsets: [issues]
+    app:
+      app-id: ${{ vars.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      owner: 'myorg'
+      repositories:
+        - "repo-a"
+        - "repo-b"
+---
+
+# Test Multi-Repo Workflow
+
+Test workflow with multiple repositories in app token.
+`
+
+	// Create a temporary test file
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "test.md")
+	err := os.WriteFile(testFile, []byte(markdown), 0644)
+	require.NoError(t, err, "Failed to write test file")
+
+	// Compile the workflow
+	err = compiler.CompileWorkflow(testFile)
+	require.NoError(t, err, "Failed to compile workflow")
+
+	// Read the generated lock file (same name with .lock.yml extension)
+	lockFile := strings.TrimSuffix(testFile, ".md") + ".lock.yml"
+	content, err := os.ReadFile(lockFile)
+	require.NoError(t, err, "Failed to read lock file")
+	lockContent := string(content)
+
+	// Verify token minting step is present
+	assert.Contains(t, lockContent, "Generate GitHub App token", "Token minting step should be present")
+
+	// Verify repositories use block scalar format (not comma-separated inline)
+	// This is critical: comma-separated format can cause actions/create-github-app-token
+	// to silently produce an empty token for multi-repo configurations, which causes
+	// github-mcp-server to exit immediately ("GITHUB_PERSONAL_ACCESS_TOKEN not set").
+	assert.Contains(t, lockContent, "repositories: |-", "Should use YAML block scalar for multiple repositories")
+	assert.NotContains(t, lockContent, "repositories: repo-a,repo-b", "Should NOT use comma-separated inline format")
+
+	// Verify both repos appear in the block scalar
+	assert.Contains(t, lockContent, "repo-a", "Should include repo-a")
+	assert.Contains(t, lockContent, "repo-b", "Should include repo-b")
+
+	// Verify token minting step is correctly configured
+	assert.Contains(t, lockContent, "owner: myorg", "Should include owner")
+	assert.Contains(t, lockContent, "app-id: ${{ vars.APP_ID }}", "Should include app-id")
+}
