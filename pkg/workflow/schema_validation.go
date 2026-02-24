@@ -70,6 +70,12 @@ func getCompiledSchema() (*jsonschema.Schema, error) {
 			return
 		}
 
+		// Patch the schema to allow gh-aw-specific permissions before validation
+		if err := patchSchemaPermissions(schemaDoc); err != nil {
+			schemaCompileError = fmt.Errorf("failed to patch GitHub Actions schema: %w", err)
+			return
+		}
+
 		// Create compiler and add the schema as a resource
 		loader := jsonschema.NewCompiler()
 		schemaURL := "https://json.schemastore.org/github-workflow.json"
@@ -207,4 +213,39 @@ func getFieldExample(fieldPath string, err error) string {
 	}
 
 	return "" // No example available
+}
+
+// patchSchemaPermissions adds gh-aw-specific permission names to the permissions-event definition
+// so that the schema validator does not reject them. The GitHub Actions schema uses
+// additionalProperties: false on permissions-event, so any permission not listed there
+// will fail validation. We patch the schema in memory before compiling it.
+func patchSchemaPermissions(schemaDoc any) error {
+	docMap, ok := schemaDoc.(map[string]any)
+	if !ok {
+		return errors.New("schema root is not an object")
+	}
+
+	definitions, ok := docMap["definitions"].(map[string]any)
+	if !ok {
+		return errors.New("schema missing definitions")
+	}
+
+	permissionsEvent, ok := definitions["permissions-event"].(map[string]any)
+	if !ok {
+		return errors.New("schema missing permissions-event definition")
+	}
+
+	properties, ok := permissionsEvent["properties"].(map[string]any)
+	if !ok {
+		return errors.New("permissions-event missing properties")
+	}
+
+	// Allow copilot-requests: write which is injected by gh-aw when the
+	// copilot-requests feature flag is enabled.
+	properties[string(PermissionCopilotRequests)] = map[string]any{
+		"$ref": "#/definitions/permissions-level",
+	}
+
+	schemaValidationLog.Printf("Patched schema: added %s to permissions-event", PermissionCopilotRequests)
+	return nil
 }
