@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 
@@ -439,12 +440,29 @@ func GenerateSecretValidationStep(secretName, engineName, docsURL string) GitHub
 // secretNames: slice of secret names to validate (e.g., []string{"CODEX_API_KEY", "OPENAI_API_KEY"})
 // engineName: the display name of the engine (e.g., "Codex")
 // docsURL: URL to the documentation page for setting up the secret
-func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL string) GitHubActionStep {
+// envOverrides: optional map of env var overrides from engine.env (e.g., COPILOT_GITHUB_TOKEN → ${{ secrets.MY_SECRET }}).
+//
+// When a secret name appears in envOverrides, the override expression is used in the env section
+// instead of the default ${{ secrets.SECRET_NAME }}. This lets users redirect an engine's required
+// token to a different GitHub secret via engine.env, for example:
+//
+//	engine:
+//	  id: copilot
+//	  env:
+//	    COPILOT_GITHUB_TOKEN: ${{ secrets.MY_SECRET }}
+func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL string, envOverrides ...map[string]string) GitHubActionStep {
 	if len(secretNames) == 0 {
 		// This is a programming error - engine configurations should always provide secrets
 		// Log the error and return empty step to avoid breaking compilation
 		agenticEngineLog.Printf("ERROR: GenerateMultiSecretValidationStep called with empty secretNames for engine %s", engineName)
 		return GitHubActionStep{}
+	}
+
+	// Merge all override maps into a single lookup (later maps take precedence).
+	// maps.Copy is a no-op for nil source maps, so nil entries are safe.
+	merged := make(map[string]string)
+	for _, overrides := range envOverrides {
+		maps.Copy(merged, overrides)
 	}
 
 	// Build the step name
@@ -463,9 +481,15 @@ func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL
 		"        env:",
 	}
 
-	// Add env section with all secrets
+	// Add env section for each secret.
+	// When engine.env overrides the secret (e.g. COPILOT_GITHUB_TOKEN: ${{ secrets.MY_SECRET }}),
+	// use the override expression so the validation script receives the correct token value.
 	for _, secretName := range secretNames {
-		stepLines = append(stepLines, fmt.Sprintf("          %s: ${{ secrets.%s }}", secretName, secretName))
+		expr := fmt.Sprintf("${{ secrets.%s }}", secretName)
+		if override, ok := merged[secretName]; ok {
+			expr = override
+		}
+		stepLines = append(stepLines, fmt.Sprintf("          %s: %s", secretName, expr))
 	}
 
 	return GitHubActionStep(stepLines)
