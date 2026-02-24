@@ -215,3 +215,74 @@ func TestCodexEngineHasSecretValidation(t *testing.T) {
 		t.Error("Should pass both CODEX_API_KEY and OPENAI_API_KEY to the script")
 	}
 }
+
+// TestSkipSecretValidationWhenCustomEnvProvided verifies that the validate-secret step
+// is not added when engine.env is configured in the frontmatter. This allows users to
+// provide their own token configuration (e.g., using org-specific secret names) without
+// triggering a failure on the standard secret validation check.
+func TestSkipSecretValidationWhenCustomEnvProvided(t *testing.T) {
+	customEnv := map[string]string{
+		"COPILOT_GITHUB_TOKEN": "${{ secrets.ORG_GITHUB_COPILOT_TOKEN }}",
+	}
+
+	engines := []struct {
+		name   string
+		engine CodingAgentEngine
+	}{
+		{"copilot", NewCopilotEngine()},
+		{"claude", NewClaudeEngine()},
+		{"codex", NewCodexEngine()},
+		{"gemini", NewGeminiEngine()},
+	}
+
+	for _, tc := range engines {
+		t.Run(tc.name, func(t *testing.T) {
+			workflowData := &WorkflowData{
+				EngineConfig: &EngineConfig{
+					Env: customEnv,
+				},
+			}
+
+			steps := tc.engine.GetInstallationSteps(workflowData)
+
+			// None of the steps should contain the validate-secret step
+			for _, step := range steps {
+				stepContent := strings.Join(step, "\n")
+				if strings.Contains(stepContent, "id: validate-secret") {
+					t.Errorf("%s engine: expected no validate-secret step when engine.env is provided, but found one", tc.name)
+				}
+			}
+
+			// Also verify via EngineHasValidateSecretStep helper
+			if EngineHasValidateSecretStep(tc.engine, workflowData) {
+				t.Errorf("%s engine: EngineHasValidateSecretStep should return false when engine.env is provided", tc.name)
+			}
+		})
+	}
+}
+
+// TestSecretValidationPresentWithoutCustomEnv verifies that the validate-secret step
+// is still added when engine.env is not configured (standard behavior).
+func TestSecretValidationPresentWithoutCustomEnv(t *testing.T) {
+	engines := []struct {
+		name   string
+		engine CodingAgentEngine
+	}{
+		{"copilot", NewCopilotEngine()},
+		{"claude", NewClaudeEngine()},
+		{"codex", NewCodexEngine()},
+		{"gemini", NewGeminiEngine()},
+	}
+
+	for _, tc := range engines {
+		t.Run(tc.name, func(t *testing.T) {
+			workflowData := &WorkflowData{
+				EngineConfig: nil, // No custom env configured
+			}
+
+			if !EngineHasValidateSecretStep(tc.engine, workflowData) {
+				t.Errorf("%s engine: EngineHasValidateSecretStep should return true when engine.env is not provided", tc.name)
+			}
+		})
+	}
+}

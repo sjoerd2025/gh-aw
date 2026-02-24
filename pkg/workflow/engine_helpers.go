@@ -61,9 +61,21 @@ type EngineInstallConfig struct {
 	InstallStepName string
 }
 
+// engineHasCustomEnv returns true if the workflow data has custom environment variables
+// configured for the engine via engine.env. When custom env is provided, the
+// validate-secret step is skipped because the user is supplying their own token
+// configuration (e.g. COPILOT_GITHUB_TOKEN: ${{ secrets.ORG_GITHUB_COPILOT_TOKEN }}).
+func engineHasCustomEnv(workflowData *WorkflowData) bool {
+	return workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0
+}
+
 // GetBaseInstallationSteps returns the common installation steps for an engine.
 // This includes secret validation and npm package installation steps that are
 // shared across all engines.
+//
+// The validate-secret step is skipped when engine.env is configured, because the
+// user is providing their own token configuration and the standard secret names
+// may not be set.
 //
 // Parameters:
 //   - config: Engine-specific configuration for installation
@@ -76,13 +88,17 @@ func GetBaseInstallationSteps(config EngineInstallConfig, workflowData *Workflow
 
 	var steps []GitHubActionStep
 
-	// Add secret validation step
-	secretValidation := GenerateMultiSecretValidationStep(
-		config.Secrets,
-		config.Name,
-		config.DocsURL,
-	)
-	steps = append(steps, secretValidation)
+	// Add secret validation step (skip if custom env is provided via engine.env)
+	if !engineHasCustomEnv(workflowData) {
+		secretValidation := GenerateMultiSecretValidationStep(
+			config.Secrets,
+			config.Name,
+			config.DocsURL,
+		)
+		steps = append(steps, secretValidation)
+	} else {
+		engineHelpersLog.Printf("Skipping secret validation: custom engine.env provided for %s engine", config.Name)
+	}
 
 	// Determine step name - use InstallStepName if provided, otherwise default to "Install <Name>"
 	stepName := config.InstallStepName
@@ -443,10 +459,14 @@ func GetToolBinsEnvArg() []string {
 // This is used to determine whether the secret_verification_result job output should be added.
 //
 // The validate-secret step is only added by engines that include it in GetInstallationSteps():
-//   - Copilot engine: Adds step when GetRequiredSecretNames returns non-empty
-//   - Claude engine: Adds step when GetRequiredSecretNames returns non-empty
-//   - Codex engine: Adds step when GetRequiredSecretNames returns non-empty
+//   - Copilot engine: Adds step when engine.env is not configured
+//   - Claude engine: Adds step when engine.env is not configured
+//   - Codex engine: Adds step when engine.env is not configured
+//   - Gemini engine: Adds step when engine.env is not configured
 //   - Custom engine: Never adds this step (returns empty from GetInstallationSteps)
+//
+// When engine.env is configured, the validate-secret step is skipped because the user
+// is providing their own token configuration (e.g., using an org-specific secret name).
 //
 // Implementation Note:
 // This uses simple string matching which is acceptable because:
