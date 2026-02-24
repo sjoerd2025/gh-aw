@@ -76,13 +76,17 @@ func GetBaseInstallationSteps(config EngineInstallConfig, workflowData *Workflow
 
 	var steps []GitHubActionStep
 
-	// Add secret validation step
-	secretValidation := GenerateMultiSecretValidationStep(
-		config.Secrets,
-		config.Name,
-		config.DocsURL,
-	)
-	steps = append(steps, secretValidation)
+	// Add secret validation step (skipped when custom env is configured)
+	if workflowData.EngineConfig == nil || len(workflowData.EngineConfig.Env) == 0 {
+		secretValidation := GenerateMultiSecretValidationStep(
+			config.Secrets,
+			config.Name,
+			config.DocsURL,
+		)
+		steps = append(steps, secretValidation)
+	} else {
+		engineHelpersLog.Printf("Skipping secret validation for %s engine: custom engine.env is configured", config.Name)
+	}
 
 	// Determine step name - use InstallStepName if provided, otherwise default to "Install <Name>"
 	stepName := config.InstallStepName

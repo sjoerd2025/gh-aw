@@ -55,13 +55,17 @@ func (e *CopilotEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHu
 		InstallStepName: "Install GitHub Copilot CLI",
 	}
 
-	// Add secret validation step
-	secretValidation := GenerateMultiSecretValidationStep(
-		config.Secrets,
-		config.Name,
-		config.DocsURL,
-	)
-	steps = append(steps, secretValidation)
+	// Add secret validation step (skipped when custom env is configured)
+	if workflowData.EngineConfig == nil || len(workflowData.EngineConfig.Env) == 0 {
+		secretValidation := GenerateMultiSecretValidationStep(
+			config.Secrets,
+			config.Name,
+			config.DocsURL,
+		)
+		steps = append(steps, secretValidation)
+	} else {
+		copilotInstallLog.Print("Skipping secret validation: custom engine.env is configured")
+	}
 
 	// Determine Copilot version
 	copilotVersion := config.Version

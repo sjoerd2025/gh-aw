@@ -89,13 +89,17 @@ func (e *ClaudeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		InstallStepName: "Install Claude Code CLI",
 	}
 
-	// Add secret validation step
-	secretValidation := GenerateMultiSecretValidationStep(
-		config.Secrets,
-		config.Name,
-		config.DocsURL,
-	)
-	steps = append(steps, secretValidation)
+	// Add secret validation step (skipped when custom env is configured)
+	if workflowData.EngineConfig == nil || len(workflowData.EngineConfig.Env) == 0 {
+		secretValidation := GenerateMultiSecretValidationStep(
+			config.Secrets,
+			config.Name,
+			config.DocsURL,
+		)
+		steps = append(steps, secretValidation)
+	} else {
+		claudeLog.Print("Skipping secret validation: custom engine.env is configured")
+	}
 
 	// Determine Claude version
 	claudeVersion := config.Version
