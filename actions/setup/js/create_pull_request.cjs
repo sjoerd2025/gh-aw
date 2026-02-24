@@ -569,8 +569,10 @@ async function main(config = {}) {
       }
 
       // Patches are created with git format-patch, so use git am to apply them
+      // Use --3way to handle cross-repo patches where the patch base may differ from target repo
+      // This allows git to resolve create-vs-modify mismatches when a file exists in target but not source
       try {
-        await exec.exec(`git am ${patchFilePath}`);
+        await exec.exec(`git am --3way ${patchFilePath}`);
         core.info("Patch applied successfully");
       } catch (patchError) {
         core.error(`Failed to apply patch: ${patchError instanceof Error ? patchError.message : String(patchError)}`);
@@ -679,8 +681,8 @@ To apply the patch locally:
 gh run download ${runId} -n agent-artifacts -D /tmp/agent-artifacts-${runId}
 
 # The patch file will be at agent-artifacts/tmp/gh-aw/${patchFileName} after download
-# Apply the patch
-git am /tmp/agent-artifacts-${runId}/${patchFileName}
+# Apply the patch (--3way handles cross-repo patches where files may already exist)
+git am --3way /tmp/agent-artifacts-${runId}/${patchFileName}
 \`\`\`
 ${patchPreview}`;
 

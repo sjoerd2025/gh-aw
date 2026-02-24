@@ -340,7 +340,9 @@ async function main(config = {}) {
           // Non-fatal - extra empty commit will be skipped
         }
 
-        await exec.exec(`git am ${patchFilePath}`);
+        // Use --3way to handle cross-repo patches where the patch base may differ from target repo
+        // This allows git to resolve create-vs-modify mismatches when a file exists in target but not source
+        await exec.exec(`git am --3way ${patchFilePath}`);
         core.info("Patch applied successfully");
 
         // Push the applied commits to the branch

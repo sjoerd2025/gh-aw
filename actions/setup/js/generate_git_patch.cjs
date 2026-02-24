@@ -100,10 +100,31 @@ function generateGitPatch(branchName, options = {}) {
             execGitSync(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branchName}`], { cwd });
             baseRef = `origin/${branchName}`;
           } catch {
-            // Use merge-base with default branch as fallback
-            // Use "--" to prevent branch names starting with "-" from being interpreted as options
-            execGitSync(["fetch", "origin", "--", defaultBranch], { cwd });
-            baseRef = execGitSync(["merge-base", "--", `origin/${defaultBranch}`, branchName], { cwd }).trim();
+            // origin/branchName doesn't exist - use merge-base with default branch
+            // First check if origin/<defaultBranch> already exists locally (e.g., from checkout with fetch-depth: 0)
+            // This is important for cross-repo checkouts where persist-credentials: false prevents fetching
+            let hasLocalDefaultBranch = false;
+            try {
+              execGitSync(["show-ref", "--verify", "--quiet", `refs/remotes/origin/${defaultBranch}`], { cwd });
+              hasLocalDefaultBranch = true;
+            } catch {
+              // origin/<defaultBranch> doesn't exist locally, try to fetch it
+              try {
+                // Use "--" to prevent branch names starting with "-" from being interpreted as options
+                execGitSync(["fetch", "origin", "--", defaultBranch], { cwd });
+                hasLocalDefaultBranch = true;
+              } catch {
+                // Fetch failed (likely due to persist-credentials: false in cross-repo checkout)
+                // We'll try other strategies below
+              }
+            }
+
+            if (hasLocalDefaultBranch) {
+              baseRef = execGitSync(["merge-base", "--", `origin/${defaultBranch}`, branchName], { cwd }).trim();
+            } else {
+              // No remote refs available - fall through to Strategy 2
+              throw new Error("No remote refs available for merge-base calculation");
+            }
           }
         }
 
@@ -149,25 +170,90 @@ function generateGitPatch(branchName, options = {}) {
       } else if (currentHead === githubSha) {
         // No commits have been made since checkout
       } else {
-        // Check if GITHUB_SHA is an ancestor of current HEAD
+        // First verify GITHUB_SHA exists in this repo's git history
+        // In cross-repo checkout scenarios, GITHUB_SHA is from the workflow repo,
+        // not the target repo that's currently checked out
+        let shaExistsInRepo = false;
         try {
-          execGitSync(["merge-base", "--is-ancestor", githubSha, "HEAD"], { cwd });
+          execGitSync(["cat-file", "-e", githubSha], { cwd });
+          shaExistsInRepo = true;
+        } catch {
+          // GITHUB_SHA doesn't exist in this repo - likely a cross-repo checkout
+          // This is expected when workflow repo != checked out repo
+        }
 
-          // Count commits between GITHUB_SHA and HEAD
-          const commitCount = parseInt(execGitSync(["rev-list", "--count", `${githubSha}..HEAD`], { cwd }).trim(), 10);
+        if (shaExistsInRepo) {
+          // Check if GITHUB_SHA is an ancestor of current HEAD
+          try {
+            execGitSync(["merge-base", "--is-ancestor", githubSha, "HEAD"], { cwd });
 
-          if (commitCount > 0) {
-            // Generate patch from GITHUB_SHA to HEAD
-            const patchContent = execGitSync(["format-patch", `${githubSha}..HEAD`, "--stdout"], { cwd });
+            // Count commits between GITHUB_SHA and HEAD
+            const commitCount = parseInt(execGitSync(["rev-list", "--count", `${githubSha}..HEAD`], { cwd }).trim(), 10);
 
-            if (patchContent && patchContent.trim()) {
-              fs.writeFileSync(patchPath, patchContent, "utf8");
-              patchGenerated = true;
+            if (commitCount > 0) {
+              // Generate patch from GITHUB_SHA to HEAD
+              const patchContent = execGitSync(["format-patch", `${githubSha}..HEAD`, "--stdout"], { cwd });
+
+              if (patchContent && patchContent.trim()) {
+                fs.writeFileSync(patchPath, patchContent, "utf8");
+                patchGenerated = true;
+              }
+            }
+          } catch {
+            // GITHUB_SHA is not an ancestor of HEAD - repository state has diverged
+          }
+        }
+      }
+    }
+
+    // Strategy 3: Cross-repo fallback - find commits not reachable from any remote ref
+    // This handles cases where:
+    // - Cross-repo checkout with persist-credentials: false (can't fetch)
+    // - GITHUB_SHA is from a different repo
+    // - No origin/<defaultBranch> available locally
+    if (!patchGenerated && branchName) {
+      try {
+        // Get all remote refs
+        const remoteRefsOutput = execGitSync(["for-each-ref", "--format=%(refname)", "refs/remotes/"], { cwd }).trim();
+
+        if (remoteRefsOutput) {
+          // Build exclusion list from all remote refs
+          const remoteRefs = remoteRefsOutput.split("\n").filter(r => r);
+
+          if (remoteRefs.length > 0) {
+            // Find commits on current branch not reachable from any remote ref
+            // This gets commits the agent added that haven't been pushed anywhere
+            const excludeArgs = remoteRefs.flatMap(ref => ["--not", ref]);
+            const revListArgs = ["rev-list", "--count", branchName, ...excludeArgs];
+
+            const commitCount = parseInt(execGitSync(revListArgs, { cwd }).trim(), 10);
+
+            if (commitCount > 0) {
+              // Get the merge-base with the first remote ref (typically origin/HEAD or origin/main)
+              // to determine the starting point for the patch
+              let baseCommit;
+              for (const ref of remoteRefs) {
+                try {
+                  baseCommit = execGitSync(["merge-base", ref, branchName], { cwd }).trim();
+                  if (baseCommit) break;
+                } catch {
+                  // Try next ref
+                }
+              }
+
+              if (baseCommit) {
+                const patchContent = execGitSync(["format-patch", `${baseCommit}..${branchName}`, "--stdout"], { cwd });
+
+                if (patchContent && patchContent.trim()) {
+                  fs.writeFileSync(patchPath, patchContent, "utf8");
+                  patchGenerated = true;
+                }
+              }
             }
           }
-        } catch {
-          // GITHUB_SHA is not an ancestor of HEAD - repository state has diverged
         }
+      } catch {
+        // Strategy 3 failed - no remote refs available at all
       }
     }
   } catch (error) {
