@@ -939,15 +939,28 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	if permissions == "" {
 		// No permissions specified, just add contents: read
 		perms := NewPermissionsContentsRead()
+		// Add copilot-requests: write when the copilot-requests feature is enabled
+		if isFeatureEnabled(constants.CopilotRequestsFeatureFlag, data) {
+			perms.Set(PermissionCopilotRequests, PermissionWrite)
+		}
 		permissions = perms.RenderToYAML()
 	} else {
 		// Parse existing permissions and add contents: read
 		parser := NewPermissionsParser(permissions)
 		perms := parser.ToPermissions()
 
+		modified := false
 		// Only add contents: read if not already present
 		if level, exists := perms.Get(PermissionContents); !exists || level == PermissionNone {
 			perms.Set(PermissionContents, PermissionRead)
+			modified = true
+		}
+		// Add copilot-requests: write when the copilot-requests feature is enabled
+		if isFeatureEnabled(constants.CopilotRequestsFeatureFlag, data) {
+			perms.Set(PermissionCopilotRequests, PermissionWrite)
+			modified = true
+		}
+		if modified {
 			permissions = perms.RenderToYAML()
 		}
 	}

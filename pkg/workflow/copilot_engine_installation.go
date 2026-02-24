@@ -55,13 +55,18 @@ func (e *CopilotEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHu
 		InstallStepName: "Install GitHub Copilot CLI",
 	}
 
-	// Add secret validation step
-	secretValidation := GenerateMultiSecretValidationStep(
-		config.Secrets,
-		config.Name,
-		config.DocsURL,
-	)
-	steps = append(steps, secretValidation)
+	// Add secret validation step (skip when copilot-requests feature is enabled,
+	// because the workflow uses the built-in github.token instead of a custom secret)
+	if !isFeatureEnabled(constants.CopilotRequestsFeatureFlag, workflowData) {
+		secretValidation := GenerateMultiSecretValidationStep(
+			config.Secrets,
+			config.Name,
+			config.DocsURL,
+		)
+		steps = append(steps, secretValidation)
+	} else {
+		copilotInstallLog.Print("Skipping secret validation: copilot-requests feature enabled")
+	}
 
 	// Determine Copilot version
 	copilotVersion := config.Version

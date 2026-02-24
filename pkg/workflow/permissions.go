@@ -69,6 +69,7 @@ const (
 	PermissionAttestations     PermissionScope = "attestations"
 	PermissionChecks           PermissionScope = "checks"
 	PermissionContents         PermissionScope = "contents"
+	PermissionCopilotRequests  PermissionScope = "copilot-requests"
 	PermissionDeployments      PermissionScope = "deployments"
 	PermissionDiscussions      PermissionScope = "discussions"
 	PermissionIdToken          PermissionScope = "id-token"

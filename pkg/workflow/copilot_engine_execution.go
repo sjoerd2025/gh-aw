@@ -225,11 +225,17 @@ COPILOT_CLI_INSTRUCTION="$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"
 %s%s 2>&1 | tee %s`, mkdirCommands.String(), copilotCommand, logFile)
 	}
 
-	// Use COPILOT_GITHUB_TOKEN
+	// Use COPILOT_GITHUB_TOKEN, or the built-in github.token when copilot-requests is enabled.
 	// #nosec G101 -- This is NOT a hardcoded credential. It's a GitHub Actions expression template
 	// that GitHub Actions runtime replaces with the actual secret value. The string "${{ secrets.COPILOT_GITHUB_TOKEN }}"
 	// is a placeholder, not an actual credential.
-	copilotGitHubToken := "${{ secrets.COPILOT_GITHUB_TOKEN }}"
+	var copilotGitHubToken string
+	if isFeatureEnabled(constants.CopilotRequestsFeatureFlag, workflowData) {
+		copilotGitHubToken = "${{ github.token }}"
+		copilotExecLog.Print("Using github.token for COPILOT_GITHUB_TOKEN (copilot-requests feature enabled)")
+	} else {
+		copilotGitHubToken = "${{ secrets.COPILOT_GITHUB_TOKEN }}"
+	}
 
 	env := map[string]string{
 		"XDG_CONFIG_HOME":           "/home/runner",
