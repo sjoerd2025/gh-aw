@@ -79,10 +79,6 @@ func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error)
 	workflowData.ActionResolver = actionResolver
 	workflowData.ActionPinWarnings = c.actionPinWarnings
 
-	// Convert names: to labels: for issues/pull_request with labeled/unlabeled types
-	// This must run before extractYAMLSections so the generated on: YAML uses native label filtering
-	c.convertNamesToNativeLabelFilter(result.Frontmatter, workflowData)
-
 	// Extract YAML configuration sections from frontmatter
 	c.extractYAMLSections(result.Frontmatter, workflowData)
 
