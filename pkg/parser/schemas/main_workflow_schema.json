@@ -7272,6 +7272,68 @@
         }
       },
       "additionalProperties": false
+    },
+    "checkout": {
+      "description": "Controls the actions/checkout step emitted in the agent job. Supports a single object (configures the default repository checkout) or an array of checkout items. Items without 'repository'/'checkout-dir' configure the default workspace checkout; items with those fields create additional checkout steps.",
+      "oneOf": [
+        {
+          "description": "Single-object form: configures the default repository checkout.",
+          "$ref": "#/definitions/checkoutItem"
+        },
+        {
+          "type": "array",
+          "description": "Array form: the first root item (no repository/checkout-dir) configures the default checkout; additional items with repository/checkout-dir create extra checkout steps.",
+          "items": {
+            "$ref": "#/definitions/checkoutItem"
+          },
+          "minItems": 1
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "checkoutItem": {
+      "type": "object",
+      "description": "Configuration for a single actions/checkout step.",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "description": "Repository to check out in 'owner/repo' format. When absent, the current repository is used.",
+          "examples": ["owner/repo", "org/private-repo"]
+        },
+        "checkout-dir": {
+          "type": "string",
+          "description": "Relative path under GITHUB_WORKSPACE where the repository will be checked out. Corresponds to the actions/checkout 'path' parameter. When absent, the workspace root is used.",
+          "examples": ["./other-repo", "libs/shared"]
+        },
+        "ref": {
+          "type": "string",
+          "description": "Branch, tag, or SHA to check out. When absent, the ref that triggered the workflow is used.",
+          "examples": ["main", "v1.2.3", "feature/my-branch"]
+        },
+        "github-token": {
+          "type": "string",
+          "description": "Custom GitHub token to use for the checkout. Useful for accessing private repositories or for elevated permissions. When absent, the default GITHUB_TOKEN is used.",
+          "examples": ["${{ secrets.MY_CHECKOUT_TOKEN }}"]
+        },
+        "fetch-depth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of commits to fetch. 0 fetches the full history. When absent, the actions/checkout default (1 commit) is used.",
+          "examples": [0, 1, 10]
+        },
+        "submodules": {
+          "type": "string",
+          "enum": ["true", "recursive"],
+          "description": "Whether to check out submodules. 'true' checks out top-level submodules; 'recursive' checks out all nested submodules."
+        },
+        "lfs": {
+          "type": "boolean",
+          "description": "Whether to download Git LFS files. Defaults to false.",
+          "examples": [true]
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false,

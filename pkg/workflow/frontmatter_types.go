@@ -164,6 +164,12 @@ type FrontmatterConfig struct {
 
 	// Rate limiting configuration
 	RateLimit *RateLimitConfig `json:"rate-limit,omitempty"`
+
+	// Checkout controls how the default repository checkout step is emitted in
+	// the agent job. Can be a single object (configures the default checkout) or
+	// an array (first root item configures the default; additional items with
+	// repository/checkout-dir create extra checkout steps).
+	Checkout any `json:"checkout,omitempty"`
 }
 
 // unmarshalFromMap converts a value from a map[string]any to a destination variable

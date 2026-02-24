@@ -15,25 +15,18 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	needsCheckout := c.shouldAddCheckoutStep(data)
 	compilerYamlLog.Printf("Checkout step needed: %t", needsCheckout)
 
+	// Build the CheckoutManager and apply any user-configured checkout settings.
+	checkoutMgr := NewCheckoutManager(c.trialMode, c.trialLogicalRepoSlug, c.actionMode.IsDev())
+	if len(data.CheckoutConfig) > 0 {
+		checkoutMgr.ApplyUserCheckouts(data.CheckoutConfig)
+	}
+
 	// Add checkout step first if needed
 	if needsCheckout {
-		yaml.WriteString("      - name: Checkout repository\n")
-		fmt.Fprintf(yaml, "        uses: %s\n", GetActionPin("actions/checkout"))
-		// Always add with section for persist-credentials
-		yaml.WriteString("        with:\n")
-		yaml.WriteString("          persist-credentials: false\n")
-		// In trial mode without cloning, checkout the logical repo if specified
-		if c.trialMode {
-			if c.trialLogicalRepoSlug != "" {
-				fmt.Fprintf(yaml, "          repository: %s\n", c.trialLogicalRepoSlug)
-				// trialTargetRepoName := strings.Split(c.trialLogicalRepoSlug, "/")
-				// if len(trialTargetRepoName) == 2 {
-				// 	yaml.WriteString(fmt.Sprintf("          path: %s\n", trialTargetRepoName[1]))
-				// }
-			}
-			effectiveToken := getEffectiveGitHubToken("")
-			fmt.Fprintf(yaml, "          token: %s\n", effectiveToken)
-		}
+		// Emit the root (default workspace) checkout using the CheckoutManager.
+		// The manager merges user settings (fetch-depth, token, ref, etc.) with
+		// compiler-level trial-mode logic and always sets persist-credentials: false.
+		checkoutMgr.GenerateRootCheckoutStep(yaml)
 
 		// Add CLI build steps in dev mode (after automatic checkout, before other steps)
 		// This builds the gh-aw CLI and Docker image for use by the agentic-workflows MCP server
@@ -46,6 +39,13 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 				compilerYamlLog.Printf("Skipping CLI build steps in dev mode (agentic-workflows tool not enabled)")
 			}
 		}
+	}
+
+	// Emit any additional checkouts (e.g. cross-repo checkouts with checkout-dir).
+	// These are always emitted regardless of whether the root checkout is needed.
+	if checkoutMgr.HasAdditionalCheckouts() {
+		compilerYamlLog.Printf("Adding %d additional checkout steps", len(checkoutMgr.additionals))
+		checkoutMgr.GenerateAdditionalCheckoutSteps(yaml)
 	}
 
 	// Add checkout steps for repository imports
