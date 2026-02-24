@@ -106,13 +106,19 @@ func (e *GeminiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		InstallStepName: "Install Gemini CLI",
 	}
 
-	// Add secret validation step
-	secretValidation := GenerateMultiSecretValidationStep(
-		config.Secrets,
-		config.Name,
-		config.DocsURL,
-	)
-	steps = append(steps, secretValidation)
+	// Skip secret validation when a custom environment is provided — the user is
+	// supplying their own credentials via engine.env, so pre-validation of the
+	// well-known secrets does not apply.
+	if !engineHasCustomEnv(workflowData) {
+		secretValidation := GenerateMultiSecretValidationStep(
+			config.Secrets,
+			config.Name,
+			config.DocsURL,
+		)
+		steps = append(steps, secretValidation)
+	} else {
+		geminiLog.Printf("Skipping secret validation: custom engine.env provided")
+	}
 
 	// Determine Gemini version
 	geminiVersion := config.Version

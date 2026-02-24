@@ -8,6 +8,95 @@ import (
 	"testing"
 )
 
+// TestSkipSecretValidationWithCustomEnv verifies that the validate-secret step is
+// omitted from installation steps when the workflow has a custom engine.env.
+func TestSkipSecretValidationWithCustomEnv(t *testing.T) {
+	customEnvData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			Env: map[string]string{
+				"COPILOT_GITHUB_TOKEN": "${{ secrets.ORG_GITHUB_COPILOT_TOKEN }}",
+			},
+		},
+	}
+
+	tests := []struct {
+		name  string
+		steps []GitHubActionStep
+	}{
+		{
+			name:  "copilot engine with custom env",
+			steps: NewCopilotEngine().GetInstallationSteps(customEnvData),
+		},
+		{
+			name:  "claude engine with custom env",
+			steps: NewClaudeEngine().GetInstallationSteps(customEnvData),
+		},
+		{
+			name:  "codex engine with custom env",
+			steps: NewCodexEngine().GetInstallationSteps(customEnvData),
+		},
+		{
+			name:  "gemini engine with custom env",
+			steps: NewGeminiEngine().GetInstallationSteps(customEnvData),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, step := range tt.steps {
+				stepContent := strings.Join(step, "\n")
+				if strings.Contains(stepContent, "id: validate-secret") {
+					t.Errorf("%s: expected validate-secret step to be absent when engine.env is set, but found it in step:\n%s", tt.name, stepContent)
+				}
+			}
+		})
+	}
+}
+
+// TestSecretValidationPresentWithoutCustomEnv verifies that the validate-secret step
+// is still included when no custom engine.env is configured.
+func TestSecretValidationPresentWithoutCustomEnv(t *testing.T) {
+	emptyData := &WorkflowData{}
+
+	tests := []struct {
+		name  string
+		steps []GitHubActionStep
+	}{
+		{
+			name:  "copilot engine without custom env",
+			steps: NewCopilotEngine().GetInstallationSteps(emptyData),
+		},
+		{
+			name:  "claude engine without custom env",
+			steps: NewClaudeEngine().GetInstallationSteps(emptyData),
+		},
+		{
+			name:  "codex engine without custom env",
+			steps: NewCodexEngine().GetInstallationSteps(emptyData),
+		},
+		{
+			name:  "gemini engine without custom env",
+			steps: NewGeminiEngine().GetInstallationSteps(emptyData),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			found := false
+			for _, step := range tt.steps {
+				stepContent := strings.Join(step, "\n")
+				if strings.Contains(stepContent, "id: validate-secret") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("%s: expected validate-secret step to be present when engine.env is not set", tt.name)
+			}
+		})
+	}
+}
+
 func TestGenerateSecretValidationStep(t *testing.T) {
 	tests := []struct {
 		name        string

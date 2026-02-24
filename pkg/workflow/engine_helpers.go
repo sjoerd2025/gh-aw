@@ -61,6 +61,13 @@ type EngineInstallConfig struct {
 	InstallStepName string
 }
 
+// engineHasCustomEnv returns true if the workflow has a non-empty engine.env configuration.
+// When a custom environment is provided, the user is supplying their own credentials via
+// environment variables, so pre-validation of well-known secrets should be skipped.
+func engineHasCustomEnv(workflowData *WorkflowData) bool {
+	return workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0
+}
+
 // GetBaseInstallationSteps returns the common installation steps for an engine.
 // This includes secret validation and npm package installation steps that are
 // shared across all engines.
@@ -76,13 +83,19 @@ func GetBaseInstallationSteps(config EngineInstallConfig, workflowData *Workflow
 
 	var steps []GitHubActionStep
 
-	// Add secret validation step
-	secretValidation := GenerateMultiSecretValidationStep(
-		config.Secrets,
-		config.Name,
-		config.DocsURL,
-	)
-	steps = append(steps, secretValidation)
+	// Skip secret validation when a custom environment is provided — the user is
+	// supplying their own credentials via engine.env, so pre-validation of the
+	// well-known secrets does not apply.
+	if !engineHasCustomEnv(workflowData) {
+		secretValidation := GenerateMultiSecretValidationStep(
+			config.Secrets,
+			config.Name,
+			config.DocsURL,
+		)
+		steps = append(steps, secretValidation)
+	} else {
+		engineHelpersLog.Printf("Skipping secret validation: custom engine.env provided")
+	}
 
 	// Determine step name - use InstallStepName if provided, otherwise default to "Install <Name>"
 	stepName := config.InstallStepName
