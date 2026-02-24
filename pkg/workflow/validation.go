@@ -18,7 +18,7 @@
 //   - engine_validation.go: AI engine configuration validation
 //   - mcp_config_validation.go: MCP server configuration validation
 //   - template_validation.go: Template structure validation
-//   - firewall_validation.go: Firewall log-level validation
+//   - firewall_validation.go: Firewall configuration validation
 //   - gateway_validation.go: Gateway port validation
 //   - sandbox_validation.go: Sandbox and mounts validation
 //   - bundler_safety_validation.go: JavaScript bundle safety (require/module checks)

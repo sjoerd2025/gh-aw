@@ -238,21 +238,6 @@ network:
 
 Each engine also has a built-in default domain list for its CLI authentication and operation. See [`domains.go`](https://github.com/github/gh-aw/blob/main/pkg/workflow/domains.go) for the full lists.
 
-### Firewall Log Level
-
-Control the verbosity of AWF firewall logs using the `log-level` field:
-
-```yaml wrap
-network:
-  firewall:
-    log-level: info      # Options: debug, info, warn, error
-  allowed:
-    - defaults
-    - python
-```
-
-Available log levels: `debug` (verbose), `info` (default), `warn`, `error`.
-
 ### SSL Bump for HTTPS Inspection
 
 Enable SSL bump to allow the AWF firewall to inspect HTTPS traffic and filter by URL path patterns:
@@ -278,7 +263,7 @@ The `ssl-bump` feature enables deep packet inspection of HTTPS traffic, allowing
   - Supports wildcards (`*`) for flexible path matching
   - Example patterns: `https://github.com/githubnext/*`, `https://api.github.com/repos/*/issues`
 
-**Usage Example with Log Level:**
+**Usage Example:**
 
 ```yaml wrap
 network:
@@ -287,7 +272,6 @@ network:
     allow-urls:
       - "https://github.com/githubnext/*"
       - "https://api.github.com/repos/*"
-    log-level: debug
   allowed:
     - defaults
     - "github.com"

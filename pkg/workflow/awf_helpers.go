@@ -165,12 +165,8 @@ func BuildAWFArgs(config AWFCommandConfig) []string {
 		awfHelpersLog.Printf("Added blocked domains: %s", blockedDomains)
 	}
 
-	// Set log level
-	awfLogLevel := string(constants.AWFDefaultLogLevel)
-	if firewallConfig != nil && firewallConfig.LogLevel != "" {
-		awfLogLevel = firewallConfig.LogLevel
-	}
-	awfArgs = append(awfArgs, "--log-level", awfLogLevel)
+	// Set log level (always uses the default)
+	awfArgs = append(awfArgs, "--log-level", string(constants.AWFDefaultLogLevel))
 	awfArgs = append(awfArgs, "--proxy-logs-dir", string(constants.AWFProxyLogsDir))
 
 	// Add --enable-host-access when MCP servers are configured (gateway is used)
