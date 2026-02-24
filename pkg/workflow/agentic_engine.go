@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 
@@ -439,12 +440,22 @@ func GenerateSecretValidationStep(secretName, engineName, docsURL string) GitHub
 // secretNames: slice of secret names to validate (e.g., []string{"CODEX_API_KEY", "OPENAI_API_KEY"})
 // engineName: the display name of the engine (e.g., "Codex")
 // docsURL: URL to the documentation page for setting up the secret
-func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL string) GitHubActionStep {
+// envOverrides: optional map of env var name → custom expression (e.g. from engine.env).
+//
+//	When a secret name has an override (e.g. COPILOT_GITHUB_TOKEN: ${{ secrets.MY_SECRET }}),
+//	the override expression is used in the env section instead of the default ${{ secrets.<name> }}.
+func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL string, envOverrides ...map[string]string) GitHubActionStep {
 	if len(secretNames) == 0 {
 		// This is a programming error - engine configurations should always provide secrets
 		// Log the error and return empty step to avoid breaking compilation
 		agenticEngineLog.Printf("ERROR: GenerateMultiSecretValidationStep called with empty secretNames for engine %s", engineName)
 		return GitHubActionStep{}
+	}
+
+	// Merge all provided override maps (later maps take precedence)
+	overrides := map[string]string{}
+	for _, m := range envOverrides {
+		maps.Copy(overrides, m)
 	}
 
 	// Build the step name
@@ -463,9 +474,15 @@ func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL
 		"        env:",
 	}
 
-	// Add env section with all secrets
+	// Add env section with all secrets.
+	// Use the override expression when the user provided one via engine.env, otherwise
+	// fall back to the default ${{ secrets.<name> }} expression.
 	for _, secretName := range secretNames {
-		stepLines = append(stepLines, fmt.Sprintf("          %s: ${{ secrets.%s }}", secretName, secretName))
+		expr := fmt.Sprintf("${{ secrets.%s }}", secretName)
+		if override, ok := overrides[secretName]; ok {
+			expr = override
+		}
+		stepLines = append(stepLines, fmt.Sprintf("          %s: %s", secretName, expr))
 	}
 
 	return GitHubActionStep(stepLines)

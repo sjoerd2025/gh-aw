@@ -146,6 +146,84 @@ func TestGenerateMultiSecretValidationStep(t *testing.T) {
 	}
 }
 
+// TestGenerateMultiSecretValidationStepWithEnvOverrides verifies that engine.env overrides
+// are reflected in the validation step env section.
+func TestGenerateMultiSecretValidationStepWithEnvOverrides(t *testing.T) {
+	tests := []struct {
+		name         string
+		secretNames  []string
+		engineName   string
+		docsURL      string
+		envOverrides map[string]string
+		wantExpr     string
+		notWantExpr  string
+	}{
+		{
+			name:        "copilot token overridden via engine.env",
+			secretNames: []string{"COPILOT_GITHUB_TOKEN"},
+			engineName:  "GitHub Copilot CLI",
+			docsURL:     "https://example.com",
+			envOverrides: map[string]string{
+				"COPILOT_GITHUB_TOKEN": "${{ secrets.MY_SECRET }}",
+			},
+			wantExpr:    "COPILOT_GITHUB_TOKEN: ${{ secrets.MY_SECRET }}",
+			notWantExpr: "COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}",
+		},
+		{
+			name:        "anthropic key overridden via engine.env",
+			secretNames: []string{"ANTHROPIC_API_KEY"},
+			engineName:  "Claude Code",
+			docsURL:     "https://example.com",
+			envOverrides: map[string]string{
+				"ANTHROPIC_API_KEY": "${{ secrets.ORG_ANTHROPIC_KEY }}",
+			},
+			wantExpr:    "ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_KEY }}",
+			notWantExpr: "ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}",
+		},
+		{
+			name:        "override one of two secrets",
+			secretNames: []string{"CODEX_API_KEY", "OPENAI_API_KEY"},
+			engineName:  "Codex",
+			docsURL:     "https://example.com",
+			envOverrides: map[string]string{
+				"CODEX_API_KEY": "${{ secrets.MY_CODEX_KEY }}",
+			},
+			wantExpr:    "CODEX_API_KEY: ${{ secrets.MY_CODEX_KEY }}",
+			notWantExpr: "CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}",
+		},
+		{
+			name:        "irrelevant override does not change secret expressions",
+			secretNames: []string{"COPILOT_GITHUB_TOKEN"},
+			engineName:  "GitHub Copilot CLI",
+			docsURL:     "https://example.com",
+			envOverrides: map[string]string{
+				"OTHER_VAR": "some-value",
+			},
+			wantExpr:    "COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}",
+			notWantExpr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			step := GenerateMultiSecretValidationStep(tt.secretNames, tt.engineName, tt.docsURL, tt.envOverrides)
+			stepContent := strings.Join(step, "\n")
+
+			if !strings.Contains(stepContent, tt.wantExpr) {
+				t.Errorf("GenerateMultiSecretValidationStep() with overrides: missing expected expression:\nwant: %s\ngot:\n%s", tt.wantExpr, stepContent)
+			}
+			if tt.notWantExpr != "" && strings.Contains(stepContent, tt.notWantExpr) {
+				t.Errorf("GenerateMultiSecretValidationStep() with overrides: found unexpected expression:\nunwanted: %s\ngot:\n%s", tt.notWantExpr, stepContent)
+			}
+
+			// The step command must still reference the original secret NAME (not the override expr)
+			if !strings.Contains(stepContent, "validate_multi_secret.sh") {
+				t.Error("Expected step to call validate_multi_secret.sh")
+			}
+		})
+	}
+}
+
 func TestClaudeEngineHasSecretValidation(t *testing.T) {
 	engine := NewClaudeEngine()
 	workflowData := &WorkflowData{}
@@ -213,5 +291,96 @@ func TestCodexEngineHasSecretValidation(t *testing.T) {
 	}
 	if !strings.Contains(firstStep, "CODEX_API_KEY OPENAI_API_KEY") {
 		t.Error("Should pass both CODEX_API_KEY and OPENAI_API_KEY to the script")
+	}
+}
+
+// TestCopilotEngineValidationStepHonoursEnvOverride verifies that when the user provides
+// engine.env.COPILOT_GITHUB_TOKEN with a custom secret expression, the validation step
+// exposes the token via that expression rather than the default ${{ secrets.COPILOT_GITHUB_TOKEN }}.
+func TestCopilotEngineValidationStepHonoursEnvOverride(t *testing.T) {
+	engine := NewCopilotEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+			Env: map[string]string{
+				"COPILOT_GITHUB_TOKEN": "${{ secrets.MY_SECRET }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+	if len(steps) < 1 {
+		t.Fatal("Expected at least one installation step")
+	}
+
+	firstStep := strings.Join(steps[0], "\n")
+
+	// Must use the override expression
+	if !strings.Contains(firstStep, "COPILOT_GITHUB_TOKEN: ${{ secrets.MY_SECRET }}") {
+		t.Error("Validation step should reference the overridden secret expression secrets.MY_SECRET")
+	}
+	// Must NOT use the default expression
+	if strings.Contains(firstStep, "COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}") {
+		t.Error("Validation step should not reference the default secrets.COPILOT_GITHUB_TOKEN when overridden")
+	}
+}
+
+// TestClaudeEngineValidationStepHonoursEnvOverride verifies that Claude's validation step
+// uses a custom ANTHROPIC_API_KEY expression when provided via engine.env.
+func TestClaudeEngineValidationStepHonoursEnvOverride(t *testing.T) {
+	engine := NewClaudeEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			ID: "claude",
+			Env: map[string]string{
+				"ANTHROPIC_API_KEY": "${{ secrets.ORG_ANTHROPIC_KEY }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+	if len(steps) < 1 {
+		t.Fatal("Expected at least one installation step")
+	}
+
+	firstStep := strings.Join(steps[0], "\n")
+
+	if !strings.Contains(firstStep, "ANTHROPIC_API_KEY: ${{ secrets.ORG_ANTHROPIC_KEY }}") {
+		t.Error("Validation step should reference the overridden secret expression")
+	}
+	if strings.Contains(firstStep, "ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}") {
+		t.Error("Validation step should not reference the default secret when overridden")
+	}
+}
+
+// TestCodexEngineValidationStepHonoursEnvOverride verifies that Codex's validation step
+// uses a custom secret expression when provided via engine.env.
+func TestCodexEngineValidationStepHonoursEnvOverride(t *testing.T) {
+	engine := NewCodexEngine()
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{
+			ID: "codex",
+			Env: map[string]string{
+				"CODEX_API_KEY": "${{ secrets.MY_CODEX_KEY }}",
+			},
+		},
+	}
+
+	steps := engine.GetInstallationSteps(workflowData)
+	if len(steps) < 1 {
+		t.Fatal("Expected at least one installation step")
+	}
+
+	firstStep := strings.Join(steps[0], "\n")
+
+	if !strings.Contains(firstStep, "CODEX_API_KEY: ${{ secrets.MY_CODEX_KEY }}") {
+		t.Error("Validation step should reference the overridden CODEX_API_KEY expression")
+	}
+	if strings.Contains(firstStep, "CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}") {
+		t.Error("Validation step should not reference the default CODEX_API_KEY when overridden")
+	}
+	// Non-overridden secret should still use default expression
+	if !strings.Contains(firstStep, "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}") {
+		t.Error("Non-overridden OPENAI_API_KEY should still reference secrets.OPENAI_API_KEY")
 	}
 }
