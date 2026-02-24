@@ -145,6 +145,14 @@ func (c *Compiler) buildInitialWorkflowData(
 		agentImportSpec = ""
 	}
 
+	// Extract checkout configuration from parsed frontmatter (if available).
+	var checkoutEntries []*CheckoutConfig
+	checkoutDisabled := false
+	if toolsResult.parsedFrontmatter != nil {
+		checkoutDisabled = toolsResult.parsedFrontmatter.CheckoutDisabled
+		checkoutEntries = toolsResult.parsedFrontmatter.CheckoutEntries
+	}
+
 	return &WorkflowData{
 		Name:                  toolsResult.workflowName,
 		FrontmatterName:       toolsResult.frontmatterName,
@@ -182,6 +190,8 @@ func (c *Compiler) buildInitialWorkflowData(
 		HasExplicitGitHubTool: toolsResult.hasExplicitGitHubTool,
 		ActionMode:            c.actionMode,
 		InlinedImports:        inlinedImports,
+		CheckoutEntries:       checkoutEntries,
+		CheckoutDisabled:      checkoutDisabled,
 	}
 }
 

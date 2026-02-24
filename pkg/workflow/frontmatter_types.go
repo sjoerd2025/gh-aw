@@ -86,6 +86,34 @@ type PluginsConfig struct {
 	GitHubToken string   `json:"github-token,omitempty"` // Custom GitHub token for plugin installation
 }
 
+// CheckoutConfig represents the configuration for a single actions/checkout step.
+// It maps directly to the inputs supported by the actions/checkout action.
+// persist-credentials is always set to false and cannot be overridden.
+type CheckoutConfig struct {
+	// Repository to check out in "owner/repo" format. Empty = current (trigger) repository.
+	Repository string `json:"repository,omitempty"`
+	// Ref is the git ref (branch, tag, or SHA) to check out. Empty = the triggering ref.
+	Ref string `json:"ref,omitempty"`
+	// Path is the relative path under GITHUB_WORKSPACE to place the repository.
+	// Empty = GITHUB_WORKSPACE root (default workspace checkout).
+	Path string `json:"path,omitempty"`
+	// FetchDepth is the number of commits to fetch. 0 = full history.
+	// nil means use the actions/checkout default (shallow clone, depth 1).
+	FetchDepth *int `json:"fetch-depth,omitempty"`
+	// Token is the GitHub token to use for authentication.
+	// Empty = use the default GITHUB_TOKEN.
+	Token string `json:"token,omitempty"`
+	// Submodules controls submodule checkout: "", "false", "true", or "recursive".
+	Submodules string `json:"submodules,omitempty"`
+	// SparseCheckout specifies patterns for a sparse checkout (one path per line).
+	SparseCheckout string `json:"sparse-checkout,omitempty"`
+	// SparseCheckoutConeMode enables cone-mode optimization for sparse checkout.
+	// nil means use the actions/checkout default (true).
+	SparseCheckoutConeMode *bool `json:"sparse-checkout-cone-mode,omitempty"`
+	// LFS downloads Git-LFS files. nil means use the actions/checkout default (false).
+	LFS *bool `json:"lfs,omitempty"`
+}
+
 // RateLimitConfig represents rate limiting configuration for workflow triggers
 // Limits how many times a user can trigger a workflow within a time window
 type RateLimitConfig struct {
@@ -164,6 +192,20 @@ type FrontmatterConfig struct {
 
 	// Rate limiting configuration
 	RateLimit *RateLimitConfig `json:"rate-limit,omitempty"`
+
+	// Checkout controls how the actions/checkout step is emitted in the agent job.
+	// Supported values:
+	//   false              – skip the default checkout entirely
+	//   {…}               – configure the default (workspace-root) checkout
+	//   [{…}, {…}, …]     – emit multiple checkout steps
+	// persist-credentials is always forced to false; it cannot be overridden.
+	Checkout any `json:"checkout,omitempty"` // false, object, or array
+
+	// CheckoutEntries holds the parsed checkout configurations (not in JSON).
+	// nil = use the compiler's default behavior (single workspace-root checkout).
+	CheckoutEntries []*CheckoutConfig `json:"-"`
+	// CheckoutDisabled is true when checkout: false was specified (not in JSON).
+	CheckoutDisabled bool `json:"-"`
 }
 
 // unmarshalFromMap converts a value from a map[string]any to a destination variable
@@ -257,8 +299,72 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 		}
 	}
 
+	// Parse checkout field - supports false, object, or array formats
+	if config.Checkout != nil {
+		disabled, entries, err := parseCheckoutConfig(config.Checkout)
+		if err == nil {
+			config.CheckoutDisabled = disabled
+			config.CheckoutEntries = entries
+			frontmatterTypesLog.Printf("Parsed checkout config: disabled=%v, entries=%d", disabled, len(entries))
+		}
+	}
+
 	frontmatterTypesLog.Printf("Successfully parsed frontmatter config: name=%s, engine=%s", config.Name, config.Engine)
 	return &config, nil
+}
+
+// parseCheckoutConfig parses the checkout field which can be:
+//  1. Boolean false → skip checkout entirely
+//  2. Object → configure a single checkout (of the current repo by default)
+//  3. Array of objects → configure multiple checkouts
+//
+// Returns (disabled bool, entries []*CheckoutConfig, error).
+func parseCheckoutConfig(checkout any) (bool, []*CheckoutConfig, error) {
+	switch v := checkout.(type) {
+	case bool:
+		// checkout: false → disable
+		return !v, nil, nil
+
+	case map[string]any:
+		// Single object → one checkout entry
+		entry, err := checkoutEntryFromMap(v)
+		if err != nil {
+			return false, nil, fmt.Errorf("invalid checkout configuration: %w", err)
+		}
+		return false, []*CheckoutConfig{entry}, nil
+
+	case []any:
+		// Array of objects → multiple checkout entries
+		var entries []*CheckoutConfig
+		for i, item := range v {
+			itemMap, ok := item.(map[string]any)
+			if !ok {
+				return false, nil, fmt.Errorf("checkout entry %d must be an object", i)
+			}
+			entry, err := checkoutEntryFromMap(itemMap)
+			if err != nil {
+				return false, nil, fmt.Errorf("checkout entry %d: %w", i, err)
+			}
+			entries = append(entries, entry)
+		}
+		return false, entries, nil
+
+	default:
+		return false, nil, errors.New("checkout must be false, an object, or an array of objects")
+	}
+}
+
+// checkoutEntryFromMap converts a map[string]any to a CheckoutConfig using JSON round-trip.
+func checkoutEntryFromMap(m map[string]any) (*CheckoutConfig, error) {
+	jsonBytes, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal checkout entry: %w", err)
+	}
+	var entry CheckoutConfig
+	if err := json.Unmarshal(jsonBytes, &entry); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal checkout entry: %w", err)
+	}
+	return &entry, nil
 }
 
 // parseRuntimesConfig converts a map[string]any to RuntimesConfig
@@ -691,6 +797,15 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	}
 	if fc.SecretMasking != nil {
 		result["secret-masking"] = fc.SecretMasking
+	}
+
+	// Checkout configuration
+	if fc.CheckoutDisabled {
+		result["checkout"] = false
+	} else if len(fc.CheckoutEntries) > 0 {
+		result["checkout"] = fc.CheckoutEntries
+	} else if fc.Checkout != nil {
+		result["checkout"] = fc.Checkout
 	}
 
 	return result
