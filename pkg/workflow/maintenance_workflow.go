@@ -149,9 +149,15 @@ jobs:
 `)
 
 	// Get the setup action reference (local or remote based on mode)
-	// Pass nil for data since maintenance workflow doesn't have WorkflowData
-	// In release mode without data, it will return tag-based reference
-	setupActionRef := ResolveSetupActionReference(actionMode, version, actionTag, nil)
+	// Use the first available WorkflowData's ActionResolver to enable SHA pinning
+	var resolverData *WorkflowData
+	if len(workflowDataList) > 0 && workflowDataList[0].ActionResolver != nil {
+		resolverData = &WorkflowData{
+			ActionResolver:    workflowDataList[0].ActionResolver,
+			ActionPinWarnings: make(map[string]bool),
+		}
+	}
+	setupActionRef := ResolveSetupActionReference(actionMode, version, actionTag, resolverData)
 
 	// Add checkout step only in dev mode (for local action paths)
 	if actionMode == ActionModeDev {
