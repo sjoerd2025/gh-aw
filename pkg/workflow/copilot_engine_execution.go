@@ -71,6 +71,9 @@ func (e *CopilotEngine) GetExecutionSteps(workflowData *WorkflowData, logFile st
 	// Add --disable-builtin-mcps to disable built-in MCP servers
 	copilotArgs = append(copilotArgs, "--disable-builtin-mcps")
 
+	// Add --autopilot to enable autopilot mode by default
+	copilotArgs = append(copilotArgs, "--autopilot")
+
 	// Model is always passed via the native COPILOT_MODEL environment variable when configured.
 	// This avoids embedding the value directly in the shell command (which fails template injection
 	// validation for GitHub Actions expressions like ${{ inputs.model }}).

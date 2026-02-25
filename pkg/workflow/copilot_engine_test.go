@@ -174,6 +174,11 @@ func TestCopilotEngineExecutionSteps(t *testing.T) {
 		t.Errorf("Expected --disable-builtin-mcps flag in command, got:\n%s", stepContent)
 	}
 
+	// Test that --autopilot flag is present by default
+	if !strings.Contains(stepContent, "--autopilot") {
+		t.Errorf("Expected --autopilot flag in command, got:\n%s", stepContent)
+	}
+
 	// Test that mkdir commands are present for --add-dir directories
 	if !strings.Contains(stepContent, "mkdir -p /tmp/") {
 		t.Errorf("Expected 'mkdir -p /tmp/' command in step content:\n%s", stepContent)
