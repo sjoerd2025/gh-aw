@@ -1,63 +1,63 @@
-# Workflow Health Dashboard - 2026-02-24
+# Workflow Health Dashboard - 2026-02-25
 
 ## Overview
 - **Total workflows**: 158 executable (100% compiled ✅)
-- **Healthy**: 154 (97%)
-- **Failing (P1)**: 4 workflows (3%) — lockdown token failures (now 2 weeks streak)
+- **Healthy**: 153 (97%)
+- **Failing (P1)**: 4 workflows (3%) — lockdown token failures (ongoing, 3+ weeks)
 - **Critical**: 0 (0%)
 - **Compilation coverage**: 158/158 (100% ✅)
-- **Outdated lock files**: 0 (all up-to-date ✅)
-- **Overall health score**: 80/100 (↓ 2 from 82 — 4th lockdown workflow confirmed)
+- **Outdated lock files**: 0 (sub-second timing diff only — not actually stale ✅)
+- **Overall health score**: 78/100 (↓ 2 from 80 — fix path #17807 rejected)
 
-## Status: DEGRADED — P1 Lockdown Failures Growing
+## Status: DEGRADED — P1 Lockdown Failures, Fix Path Closed
 
-The lockdown token issue continues unresolved. Org Health Report confirmed as 4th failing workflow (2 consecutive weekly failures).
+Issue #17807 (remove lockdown:true patch) was **CLOSED as "not_planned"** on 2026-02-25 03:30.
+Lockdown issue root cause (#17414) also closed "not_planned" previously.
+No known fix path currently open for the 4 failing workflows.
 
 ### Health Assessment Summary
 
 - ✅ **0 compilation failures** (all 158 executable workflows compile)
 - ✅ **100% compilation coverage** (no missing lock files)
-- ✅ **0 outdated lock files**
-- ❌ **P1: Lockdown token missing** — 4 workflows failing (≥2 week streak)
-  - Issue Monster: ~50+ failures/day (every 30 min)
-  - PR Triage Agent: failing (every 6h)
-  - Daily Issues Report: failing (daily)
-  - **NEW**: Org Health Report: 2 consecutive weekly failures (#22 Feb 16, #23 Feb 23)
-- ✅ **All smoke tests on main**: Smoke Copilot, Claude, Codex, Gemini passing on main
-- ✅ **PR #18079 branch**: Smoke Claude/Copilot/Gemini failing on `merged_detection_job` branch — EXPECTED (WIP PR testing detection job merge)
-- ✅ **Metrics Collector**: 8/8 recent runs success
-- ✅ **13 total workflows have `lockdown: true`** — 4 confirmed failing
+- ✅ **0 truly outdated lock files** (21 files have sub-ms timing diff — same commit, not stale)
+- ❌ **P1: Lockdown token missing** — 4 workflows failing (3+ week streak)
+  - Issue Monster: ~50+ failures/day (every 30 min) — run #2116 failed today
+  - PR Triage Agent: failing (every 6h) — run #136 failed today
+  - Daily Issues Report: failing (daily) — run #115 failed today
+  - Org Health Report: failing (weekly) — run #22-#23 consecutive failures
+- ✅ **Smoke Copilot main**: passing (run #2122 success)
+- ✅ **Smoke Claude/Codex/Gemini**: passing
+- ✅ **Metrics Collector**: 5+ consecutive successes (run #69 success)
+- ⚠️ **AI Moderator**: mixed success/action_required — monitoring (yesterday had 1 failure)
 
 ## Root Cause: Lockdown Mode + Missing GH_AW_GITHUB_TOKEN
 
-13 workflows use `lockdown: true`:
-daily-issues-report, discussion-task-miner, grumpy-reviewer, issue-arborist,
-issue-monster, issue-triage-agent, org-health-report, pr-triage-agent,
-refiner, stale-repo-identifier, weekly-issue-summary, weekly-safe-outputs-spec-review,
-workflow-generator
+13 workflows use `lockdown: true`. Currently failing (high frequency):
+- issue-monster (every 30min) — ~50 fails/day
+- pr-triage-agent (every 6h) — ~4 fails/day
+- daily-issues-report (daily) — 1 fail/day
+- org-health-report (weekly) — 1 fail/week
 
-Currently failing (high frequency):
-- issue-monster (schedule: every 30min)
-- pr-triage-agent (schedule: every 6h)
-- daily-issues-report (schedule: daily)
-- org-health-report (schedule: weekly Monday ~09:00)
+**Fix path status**: CLOSED
+- #17414 (add GH_AW_GITHUB_TOKEN) — CLOSED "not_planned"
+- #17807 (remove lockdown:true) — CLOSED "not_planned" 2026-02-25
 
 ## Issues Tracked
 
-- **#17387** [P1] Issue Monster failed — OPEN (30+ comments, still failing)
-- **#16801** [P1] PR Triage Agent failed — OPEN
-- **#17864** [P1] Org Health Report failed — OPEN (same lockdown root cause)
-- **#17414** [Root Cause] GH_AW_GITHUB_TOKEN — CLOSED "not_planned" (2026-02-22)
-- **#17807** Fix: remove lockdown:true — OPEN (patch ready)
+- **#17387** [P1] Issue Monster failed — OPEN (165+ comments, run #2116 failed today)
+- **#16801** [P1] PR Triage Agent failed — OPEN (expires Feb 26, run #136 failed today)
+- **#17864** [P1] Org Health Report failed — OPEN (expires Mar 2)
+- **#17414** [Root Cause] GH_AW_GITHUB_TOKEN — CLOSED "not_planned"
+- **#17807** Fix: remove lockdown:true — CLOSED "not_planned" (2026-02-25)
 - **#17408** No-Op Runs — OPEN (normal behavior)
 
-## Actions Taken This Run (2026-02-24)
+## Actions Taken This Run (2026-02-25)
 
-- Added comment to #17387 with updated status (4th workflow now failing)
+- Added comment to #17387 with updated status (fix path closed, lockdown ongoing)
 - Updated workflow-health-latest.md and shared-alerts.md
-- Health score: 80/100 (↓ 2 from 82)
+- Health score: 78/100 (↓ 2 — fix path rejected, no new resolution path)
 
 ## Run Info
-- Timestamp: 2026-02-24T07:32:00Z
-- Workflow run: [§22341024382](https://github.com/github/gh-aw/actions/runs/22341024382)
-- Health score: 80/100 (↓ 2 from yesterday's 82)
+- Timestamp: 2026-02-25T07:32:00Z
+- Workflow run: [§22386814001](https://github.com/github/gh-aw/actions/runs/22386814001)
+- Health score: 78/100 (↓ 2 from yesterday's 80)

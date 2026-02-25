@@ -1,6 +1,41 @@
 # Shared Alerts - Meta-Orchestrator Coordination
 
-## Last Updated: 2026-02-24T07:32:00Z
+## Last Updated: 2026-02-25T07:32:00Z
+
+---
+
+## 2026-02-25 - Workflow Health Update
+
+**Status**: ⚠️ **DEGRADED** — P1 lockdown failures persist, all fix paths now CLOSED
+
+**Key Metrics** (as of 2026-02-25T07:32 UTC):
+- Workflow Health Score: **78/100** (↓ 2 from 80)
+- Executable Workflows: **158** (100% compiled)
+- Outdated Lock Files: **0** (✅ all current — 21 sub-second timing artifacts, not truly stale)
+- P1 Failures: **4 workflows** (stable from yesterday, but no fix path open)
+
+**Active Alerts**:
+- ❌ P1: GH_AW_GITHUB_TOKEN missing — 4 workflows failing — **ALL FIX PATHS CLOSED**
+  - Issue Monster (#17387, every 30 min), PR Triage Agent (#16801, every 6h)
+  - Daily Issues Report (#114, daily), Org Health Report (#17864, weekly)
+  - **#17414** (add token) — CLOSED "not_planned"
+  - **#17807** (remove lockdown:true) — CLOSED "not_planned" 2026-02-25
+  - **NO CURRENT FIX PATH** — manual intervention needed
+- ✅ All smoke tests on main: Copilot, Claude, Codex, Gemini passing
+- ✅ Metrics Collector: 5+ consecutive successes
+- ⚠️ AI Moderator: mixed — monitoring (one failure yesterday, run 22361284967)
+
+**For Campaign Manager**:
+- 158 workflows (100% compiled), ~97% healthy
+- P1 situation escalated: lockdown fix path rejected (#17807 closed not_planned)
+- No known resolution path — manual repo admin action needed
+- Consider escalating to repository maintainers
+
+**For Agent Performance Analyzer**:
+- Issue Monster: ~50+ failures/day (every 30 min) from lockdown — NOT agent quality issue
+- Daily Issues Report: 115 consecutive failures — lockdown related
+- Performance data skewed by lockdown infrastructure — affects quality scores
+- No fix path currently open — pattern will continue
 
 ---
 
@@ -35,26 +70,6 @@
 - Org Health Report: 2 consecutive weekly failures — lockdown related
 - Performance data still skewed by lockdown infrastructure issue
 - Fix in #17807 would eliminate this noise
-
----
-
-## 2026-02-23 - Workflow Health Update
-
-**Status**: ⚠️ **DEGRADED** — P1 lockdown token issue persists, 3 workflows failing
-
-**Key Metrics** (as of 2026-02-23T07:40 UTC):
-- Workflow Health Score: **82/100** (↓ 1 from 83)
-- Executable Workflows: **158** (100% compiled)
-- Outdated Lock Files: **0** (✅ all current)
-- P1 Failures: **3 workflows** (stable from yesterday)
-
-**Active Alerts**:
-- ❌ P1: GH_AW_GITHUB_TOKEN missing — 3 workflows failing — Issue #17414 CLOSED "not_planned"
-  - Issue Monster (~50 failures/day), PR Triage Agent (every 6h), Daily Issues Report (daily)
-  - **FIX AVAILABLE**: Issue #17807 has patch to remove `lockdown: true` → automatic detection
-- ✅ All smoke tests passing (Copilot, Claude, Codex, Gemini, Multi-PR)
-- ✅ Metrics Collector running successfully
-
 
 ---
 
