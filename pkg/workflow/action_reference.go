@@ -22,14 +22,14 @@ const (
 //   - actionMode: The action mode (dev or release)
 //   - version: The version string to use for release mode
 //   - actionTag: Optional override tag/SHA (takes precedence over version when in release mode)
-//   - data: Optional WorkflowData for SHA resolution (can be nil for standalone use)
+//   - resolver: Optional ActionResolver for dynamic SHA resolution (can be nil for standalone use)
 //
 // Returns:
 //   - For dev mode: "./actions/setup" (local path)
-//   - For release mode with data: "github/gh-aw/actions/setup@<sha> # <version>" (SHA-pinned)
-//   - For release mode without data: "github/gh-aw/actions/setup@<version>" (tag-based, SHA resolved later)
+//   - For release mode with resolver: "github/gh-aw/actions/setup@<sha> # <version>" (SHA-pinned)
+//   - For release mode without resolver: "github/gh-aw/actions/setup@<version>" (tag-based, SHA resolved later)
 //   - Falls back to local path if version is invalid in release mode
-func ResolveSetupActionReference(actionMode ActionMode, version string, actionTag string, data *WorkflowData) string {
+func ResolveSetupActionReference(actionMode ActionMode, version string, actionTag string, resolver *ActionResolver) string {
 	localPath := "./actions/setup"
 
 	// Dev mode - return local path
@@ -57,8 +57,12 @@ func ResolveSetupActionReference(actionMode ActionMode, version string, actionTa
 		// Construct the remote reference with tag: github/gh-aw/actions/setup@tag
 		remoteRef := fmt.Sprintf("%s/%s@%s", GitHubOrgRepo, actionPath, tag)
 
-		// If WorkflowData is available, try to resolve the SHA
-		if data != nil {
+		// If a resolver is available, try to resolve the SHA
+		if resolver != nil {
+			data := &WorkflowData{
+				ActionResolver:    resolver,
+				ActionPinWarnings: make(map[string]bool),
+			}
 			actionRepo := fmt.Sprintf("%s/%s", GitHubOrgRepo, actionPath)
 			pinnedRef, err := GetActionPinWithData(actionRepo, tag, data)
 			if err != nil {
@@ -73,7 +77,7 @@ func ResolveSetupActionReference(actionMode ActionMode, version string, actionTa
 			}
 		}
 
-		// If WorkflowData is not available or SHA resolution failed, return tag-based reference
+		// If no resolver or SHA resolution failed, return tag-based reference
 		// This is for backward compatibility with standalone workflow generators
 		actionRefLog.Printf("Release mode: using tag-based remote action reference: %s (SHA will be resolved later)", remoteRef)
 		return remoteRef
@@ -104,11 +108,15 @@ func (c *Compiler) resolveActionReference(localActionPath string, data *Workflow
 	// For ./actions/setup, check for compiler-level actionTag override first
 	if localActionPath == "./actions/setup" {
 		// Use compiler actionTag if available, otherwise check features
+		var resolver *ActionResolver
+		if data != nil {
+			resolver = data.ActionResolver
+		}
 		if c.actionTag != "" {
-			return ResolveSetupActionReference(c.actionMode, c.version, c.actionTag, data)
+			return ResolveSetupActionReference(c.actionMode, c.version, c.actionTag, resolver)
 		}
 		if !hasActionTag {
-			return ResolveSetupActionReference(c.actionMode, c.version, "", data)
+			return ResolveSetupActionReference(c.actionMode, c.version, "", resolver)
 		}
 	}
 

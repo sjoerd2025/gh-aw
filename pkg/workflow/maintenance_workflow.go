@@ -150,14 +150,11 @@ jobs:
 
 	// Get the setup action reference (local or remote based on mode)
 	// Use the first available WorkflowData's ActionResolver to enable SHA pinning
-	var resolverData *WorkflowData
-	if len(workflowDataList) > 0 && workflowDataList[0].ActionResolver != nil {
-		resolverData = &WorkflowData{
-			ActionResolver:    workflowDataList[0].ActionResolver,
-			ActionPinWarnings: make(map[string]bool),
-		}
+	var resolver *ActionResolver
+	if len(workflowDataList) > 0 {
+		resolver = workflowDataList[0].ActionResolver
 	}
-	setupActionRef := ResolveSetupActionReference(actionMode, version, actionTag, resolverData)
+	setupActionRef := ResolveSetupActionReference(actionMode, version, actionTag, resolver)
 
 	// Add checkout step only in dev mode (for local action paths)
 	if actionMode == ActionModeDev {
