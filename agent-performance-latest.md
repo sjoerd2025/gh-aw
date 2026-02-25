@@ -1,54 +1,60 @@
-# Agent Performance Analysis - 2026-02-24
+# Agent Performance Analysis - 2026-02-25
 
-**Run:** [§22362703459](https://github.com/github/gh-aw/actions/runs/22362703459)
-**Status:** ⚠️ DEGRADED — AI Moderator regression detected; non-IM success rate dropped to 95%
-**Analysis Period:** 2026-02-17 → 2026-02-24 (7-day window, 27 runs)
+**Run:** [§22408567616](https://github.com/github/gh-aw/actions/runs/22408567616)
+**Status:** ✅ IMPROVED — AI Moderator fully recovered; Issue Monster P1 lockdown persists (no fix path)
+**Analysis Period:** 2026-02-19 → 2026-02-25 (7-day focus, 14-day data)
 
 ## Executive Summary
 
-- **Agent Quality:** 91/100 (↓ 1 from 92)
-- **Agent Effectiveness:** 87/100 (↓ 1 from 88)
-- **Critical Agent Issues:** 1 new ⚠️ (AI Moderator GitHub MCP intermittency)
-- **Run Success Rate (non-IM):** 95% (20/21) ↓ from 100%
-- **Total Tokens:** ~17.7M | **Estimated Cost:** ~$6.39 (7d window)
-- **Total Runs:** 27 (21 success + 4 Issue Monster failures + 1 AI Moderator failure)
-- **Total Turns:** 138
+- **Agent Quality:** 89/100 (↓ 2 from 91)
+- **Agent Effectiveness:** 88/100 (↑ 1 from 87)
+- **Critical Agent Issues:** 1 ongoing ❌ (Issue Monster lockdown — ALL fix paths CLOSED)
+- **Non-IM Success Rate:** 96% (27/28) ↑ from 95%
+- **Total Cost (today):** ~$6.14 | **Total Tokens:** ~68.8M
+- **Total Runs (today):** 29 completed
 
 ## Key Metrics
 
 | Metric | Current | Previous | Change |
 |--------|---------|----------|--------|
-| Agent Quality | 91/100 | 92/100 | ↓ 1 |
-| Agent Effectiveness | 87/100 | 88/100 | ↓ 1 |
-| Non-IM Success Rate | 95% (20/21) | 100% (18/18) | ↓ 5% |
-| Critical Issues | 1 (AI Moderator) | 0 | ↑ 1 |
-| AI Moderator Score | 72/100 | 94/100 | ↓ 22 |
+| Agent Quality | 89/100 | 91/100 | ↓ 2 |
+| Agent Effectiveness | 88/100 | 87/100 | ↑ 1 |
+| Non-IM Success Rate | 96% (27/28) | 95% (20/21) | ↑ 1% |
+| Critical Issues | 1 (Issue Monster) | 1 (AI Moderator) | → type changed |
+| AI Moderator Score | 91/100 | 72/100 | ↑ 19 |
 
-## 🔴 NEW: AI Moderator GitHub MCP Intermittency (3/6 runs missing tools)
+## ✅ RESOLVED: AI Moderator GitHub MCP Recovery
 
-GitHub MCP `mode: local` (Docker) intermittently unavailable. 3 runs completed as success/noop silently skipping moderation. 1 run outright failed.
-- Failing run: [22361284967](https://github.com/github/gh-aw/actions/runs/22361284967)
-- Missing-tool runs: 22361207226, 22359803227, 22358411348
-- **~50% of AI Moderator triggers doing no moderation today**
+All 11 AI Moderator runs today completed successfully (was ~50% failure yesterday due to Docker MCP intermittency). `mode: remote` appears stable.
 
-## 🔥 P1 Still Burning: Issue Monster (4/4 failures today, 22nd+ period)
-Fix in #17807 still not applied.
+## 🔥 P0 Still Burning: Issue Monster (2/2 failures today)
+ALL fix paths now CLOSED:
+- #17414 (add GH_AW_GITHUB_TOKEN): CLOSED "not_planned"
+- #17807 (remove lockdown:true): CLOSED "not_planned" 2026-02-25
+- Manual admin intervention required
+
+## 🆕 NEW: Semantic Function Refactoring High Cost
+- $4.82/run, 469k tokens, 87 blocked firewall requests
+- Created issue #18388
+- Investigate blocked requests (likely Serena MCP local sockets)
 
 ## Top Performing Agents
 
-1. **The Great Escapi (95/100):** Security maintained, 6.1m
-2. **CI Failure Doctor (93/100):** 3/3 success, 7.4m avg (active CI failures)
-3. **Daily Safe Outputs Conformance Checker (92/100):** 1/1, 5.7m
-4. **Lockfile Statistics Analysis Agent (92/100):** 1/1, 10.1m
-5. **DeepReport (91/100):** 1/1, 9.0m
+1. **Smoke Tests Copilot/Claude/Codex (95/100):** All passing today
+2. **The Great Escapi (92/100):** Security maintained, 3.5m
+3. **AI Moderator (91/100):** 11/11 recovered ↑ from 72/100
+4. **Agent Container Smoke Test (90/100):** Clean, 3.5m
+5. **Daily Safe Outputs Conformance Checker (90/100):** 3.2m, 4 turns
 
 ## ⚠️ Monitor
 
-- **Daily Safe Output Tool Optimizer:** 14.7m — slowest non-meta workflow, watch for growth
-- **AI Moderator MCP:** Consider switching to `mode: remote`
+- **Semantic Function Refactoring:** $4.82/run — watch for cost growth
+- **Auto-Triage Issues:** 1/2 error today — may be lockdown-related
+- **Smoke Claude:** 12.2m, 40 turns — highest duration smoke test
 
 ## Active Issues / Tracking
 
-- ❌ **P1:** Issue Monster (+ PR Triage, Daily Issues, Org Health) failing — fix in #17807
-- ⚠️ **NEW:** AI Moderator GitHub MCP degradation — needs investigation
+- ❌ **P0:** Issue Monster + 3 related workflows failing — lockdown token missing, NO fix path
+- ✅ **RESOLVED:** AI Moderator Docker MCP degradation — remote mode stable
+- 🆕 **NEW:** Semantic Function Refactoring high cost — issue #18388
 - ✅ **All smoke tests:** Passing on main

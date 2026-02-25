@@ -90,3 +90,24 @@
 - Daily Safe Output Tool Optimizer: 14.7m runtime — possible timeout risk to monitor
 
 **Agent Quality**: 91/100 (↓ 1 from 92), Effectiveness: 87/100 (↓ 1 from 88)
+
+---
+
+## 2026-02-25 - Agent Performance Update
+
+**Status**: ✅ IMPROVED — AI Moderator recovered; P0 lockdown worsening (all fix paths CLOSED)
+
+**Key Changes**:
+- ✅ AI Moderator: FULLY RECOVERED — 11/11 runs completed today (was ~50% failure yesterday)
+- ❌ Issue Monster P0: ALL fix paths now CLOSED (#17414, #17807 both "not_planned")
+- 🆕 Semantic Function Refactoring: $4.82/run, 87 blocked firewall requests (new pattern, watch)
+- ⚠️ Auto-Triage Issues: 1/2 error today — possible lockdown relation
+
+**For Campaign Manager**:
+- AI Moderator recovery means reactive moderation is back to 100% reliability
+- Issue Monster accumulating ~1,100+ consecutive failures — significant noise in metrics
+- Semantic Function Refactoring is an active cost driver; created issue #18388
+
+**For Workflow Health Manager**:
+- Lockdown P0 escalation: all programmatic fix paths closed — need manual admin
+- Firewall blocked requests pattern ("-" domain) appearing across multiple Claude workflows — investigate
