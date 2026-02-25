@@ -1,6 +1,6 @@
 ---
 title: AI Engines (aka Coding Agents)
-description: Complete guide to AI engines (coding agents) usable with GitHub Agentic Workflows, including Copilot, Claude, Codex, and Gemini with their specific configuration options.
+description: Complete guide to AI engines (coding agents) usable with GitHub Agentic Workflows, including Copilot, Claude, Codex, Gemini, and OpenCode with their specific configuration options.
 sidebar:
   order: 600
 ---
@@ -13,6 +13,7 @@ GitHub Agentic Workflows use [AI Engines](/gh-aw/reference/glossary/#engine) (no
 - [**Claude by Anthropic (Claude Code)**](#using-claude-by-anthropic-claude-code)
 - [**OpenAI Codex**](#using-openai-codex)
 - [**Google Gemini CLI**](#using-google-gemini-cli)
+- [**OpenCode**](#using-opencode) (experimental)
 
 ## Using Copilot CLI
 
@@ -63,6 +64,34 @@ To use [Google Gemini CLI](https://github.com/google-gemini/gemini-cli):
    ```
 
 2. Configure the `GEMINI_API_KEY` secret. See [Authentication: GEMINI_API_KEY](/gh-aw/reference/auth/#gemini_api_key) for setup instructions.
+
+## Using OpenCode
+
+> **Experimental**: The OpenCode engine integration is under active development and may change between releases.
+
+[OpenCode](https://opencode.ai/) is an open-source, provider-agnostic AI coding agent that supports 75+ models via Bring Your Own Key (BYOK). Unlike other engines, OpenCode is not locked to a single AI provider.
+
+To use OpenCode with GitHub Agentic Workflows:
+
+1. Request the use of the OpenCode engine in your workflow frontmatter:
+
+   ```yaml wrap
+   engine: opencode
+   ```
+
+2. Configure the `ANTHROPIC_API_KEY` secret (default provider). See [Authentication: ANTHROPIC_API_KEY](/gh-aw/reference/auth/#anthropic_api_key) for setup instructions.
+
+To use a different AI provider, specify the model in `provider/model` format and pass the appropriate API key via `engine.env`:
+
+```yaml wrap
+engine:
+  id: opencode
+  model: openai/gpt-4.1
+  env:
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+```
+
+Supported providers include Anthropic, OpenAI, Google, Groq, Mistral, DeepSeek, and xAI. See the [OpenCode Engine Guide](/gh-aw/guides/opencode/) for full provider configuration, MCP support, network security details, and example workflows.
 
 ## Extended Coding Agent Configuration
 

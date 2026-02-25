@@ -7,7 +7,7 @@ sidebar:
 
 Control network access for AI engines using the top-level `network` field to specify which domains and services your agentic workflows can access during execution.
 
-> **Note**: Network permissions are supported by all four engines: Copilot, Claude, Codex, and Gemini (via the AWF firewall). See the [Implementation](#implementation) section for engine-specific details.
+> **Note**: Network permissions are supported by all five engines: Copilot, Claude, Codex, Gemini, and OpenCode (via the AWF firewall). See the [Implementation](#implementation) section for engine-specific details.
 
 If no `network:` permission is specified, it defaults to `network: defaults` which allows access to basic infrastructure domains (certificates, JSON schema, Ubuntu, common package mirrors, Microsoft sources).
 
@@ -209,9 +209,9 @@ When enabled, AWF:
 - Logs all network activity for audit purposes
 - Blocks access to domains not explicitly allowed
 
-### Claude, Codex, and Gemini Engines
+### Claude, Codex, Gemini, and OpenCode Engines
 
-The Claude, Codex, and Gemini engines use the same AWF firewall as the Copilot engine. Configure network permissions using the same `network.allowed` / `network.blocked` fields:
+The Claude, Codex, Gemini, and OpenCode engines use the same AWF firewall as the Copilot engine. Configure network permissions using the same `network.allowed` / `network.blocked` fields:
 
 ```yaml wrap
 # Claude
@@ -234,9 +234,18 @@ network:
   allowed:
     - defaults
     - node
+
+# OpenCode
+engine:
+  id: opencode
+  model: anthropic/claude-sonnet-4-20250514
+network:
+  allowed:
+    - defaults
+    - github
 ```
 
-Each engine also has a built-in default domain list for its CLI authentication and operation. See [`domains.go`](https://github.com/github/gh-aw/blob/main/pkg/workflow/domains.go) for the full lists.
+Each engine also has a built-in default domain list for its CLI authentication and operation. The OpenCode engine dynamically adds provider-specific API domains based on the model prefix (e.g., `openai/gpt-4.1` adds `api.openai.com`). See [`domains.go`](https://github.com/github/gh-aw/blob/main/pkg/workflow/domains.go) for the full lists and the [OpenCode Engine Guide](/gh-aw/guides/opencode/#network-security) for details on dynamic domain resolution.
 
 ### Firewall Log Level
 

@@ -182,6 +182,7 @@ export default defineConfig({
 						{ label: 'GitHub Actions Primer', link: '/guides/github-actions-primer/' },
 						{ label: 'Reusing Workflows', link: '/guides/packaging-imports/' },
 						{ label: 'Self-Hosted Runners', link: '/guides/self-hosted-runners/' },
+						{ label: 'OpenCode Engine', link: '/guides/opencode/' },
 						{ label: 'Using MCPs', link: '/guides/mcps/' },
 						{ label: 'Web Search', link: '/guides/web-search/' },
 					],

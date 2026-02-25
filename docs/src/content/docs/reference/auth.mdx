@@ -14,10 +14,11 @@ This page describes authentication settings for GitHub Agentic Workflows.
 
 You will need one of the following GitHub Actions secrets configured in your repository to authenticate the AI engine you choose:
 
-- **Copilot** – Add [`COPILOT_GITHUB_TOKEN`](#copilot_github_token)
-- **Claude by Anthropic** – Add [`ANTHROPIC_API_KEY`](#anthropic_api_key)
-- **Codex by OpenAI** – Add [`OPENAI_API_KEY`](#openai_api_key)
-- **Gemini by Google** – Add [`GEMINI_API_KEY`](#gemini_api_key)
+- **Copilot** -- Add [`COPILOT_GITHUB_TOKEN`](#copilot_github_token)
+- **Claude by Anthropic** -- Add [`ANTHROPIC_API_KEY`](#anthropic_api_key)
+- **Codex by OpenAI** -- Add [`OPENAI_API_KEY`](#openai_api_key)
+- **Gemini by Google** -- Add [`GEMINI_API_KEY`](#gemini_api_key)
+- **OpenCode** -- Add [`ANTHROPIC_API_KEY`](#anthropic_api_key) (default provider), or a provider-specific key via `engine.env` (see [OpenCode Engine Guide](/gh-aw/guides/opencode/#authentication-and-providers))
 
 Most workflows will run without any additional secrets or additional authentication.
 
