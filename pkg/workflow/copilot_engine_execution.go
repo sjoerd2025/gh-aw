@@ -74,6 +74,9 @@ func (e *CopilotEngine) GetExecutionSteps(workflowData *WorkflowData, logFile st
 	// Add --autopilot to enable autopilot mode by default
 	copilotArgs = append(copilotArgs, "--autopilot")
 
+	// Add --max-autopilot-continues to limit the number of autopilot continuations
+	copilotArgs = append(copilotArgs, "--max-autopilot-continues", "10")
+
 	// Model is always passed via the native COPILOT_MODEL environment variable when configured.
 	// This avoids embedding the value directly in the shell command (which fails template injection
 	// validation for GitHub Actions expressions like ${{ inputs.model }}).

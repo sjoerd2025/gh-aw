@@ -179,6 +179,11 @@ func TestCopilotEngineExecutionSteps(t *testing.T) {
 		t.Errorf("Expected --autopilot flag in command, got:\n%s", stepContent)
 	}
 
+	// Test that --max-autopilot-continues 10 flag is present
+	if !strings.Contains(stepContent, "--max-autopilot-continues 10") {
+		t.Errorf("Expected --max-autopilot-continues 10 flag in command, got:\n%s", stepContent)
+	}
+
 	// Test that mkdir commands are present for --add-dir directories
 	if !strings.Contains(stepContent, "mkdir -p /tmp/") {
 		t.Errorf("Expected 'mkdir -p /tmp/' command in step content:\n%s", stepContent)
