@@ -306,6 +306,9 @@ const (
 
 	// GeminiLLMGatewayPort is the port for the Gemini LLM gateway
 	GeminiLLMGatewayPort = 10003
+
+	// OpenCodeLLMGatewayPort is the port for the OpenCode LLM gateway
+	OpenCodeLLMGatewayPort = 10004
 )
 
 // DefaultMCPRegistryURL is the default MCP registry URL.
@@ -352,6 +355,10 @@ const (
 	EnvVarModelDetectionCodex = "GH_AW_MODEL_DETECTION_CODEX"
 	// EnvVarModelDetectionGemini configures the default Gemini model for detection
 	EnvVarModelDetectionGemini = "GH_AW_MODEL_DETECTION_GEMINI"
+	// EnvVarModelAgentOpenCode configures the default OpenCode model for agent execution
+	EnvVarModelAgentOpenCode = "GH_AW_MODEL_AGENT_OPENCODE"
+	// EnvVarModelDetectionOpenCode configures the default OpenCode model for detection
+	EnvVarModelDetectionOpenCode = "GH_AW_MODEL_DETECTION_OPENCODE"
 
 	// CopilotCLIModelEnvVar is the native environment variable name supported by the Copilot CLI
 	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
@@ -364,6 +371,10 @@ const (
 	// GeminiCLIModelEnvVar is the native environment variable name supported by the Gemini CLI
 	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
 	GeminiCLIModelEnvVar = "GEMINI_MODEL"
+
+	// OpenCodeCLIModelEnvVar is the native environment variable name for OpenCode model selection.
+	// OpenCode uses provider/model format (e.g., "anthropic/claude-sonnet-4-20250514").
+	OpenCodeCLIModelEnvVar = "OPENCODE_MODEL"
 
 	// Common environment variable names used across all engines
 
@@ -394,6 +405,9 @@ const DefaultCodexVersion Version = "0.104.0"
 
 // DefaultGeminiVersion is the default version of the Google Gemini CLI
 const DefaultGeminiVersion Version = "0.29.0"
+
+// DefaultOpenCodeVersion is the default version of the OpenCode CLI
+const DefaultOpenCodeVersion Version = "1.2.14"
 
 // DefaultGitHubMCPServerVersion is the default version of the GitHub MCP server Docker image
 const DefaultGitHubMCPServerVersion Version = "v0.31.0"
@@ -728,11 +742,13 @@ const (
 	CodexEngine EngineName = "codex"
 	// GeminiEngine is the Google Gemini engine identifier
 	GeminiEngine EngineName = "gemini"
+	// OpenCodeEngine is the OpenCode engine identifier
+	OpenCodeEngine EngineName = "opencode"
 )
 
 // AgenticEngines lists all supported agentic engine names
 // Note: This remains a string slice for backward compatibility with existing code
-var AgenticEngines = []string{string(ClaudeEngine), string(CodexEngine), string(CopilotEngine)}
+var AgenticEngines = []string{string(ClaudeEngine), string(CodexEngine), string(CopilotEngine), string(OpenCodeEngine)}
 
 // EngineOption represents a selectable AI engine with its display metadata and secret configuration
 type EngineOption struct {
@@ -773,6 +789,15 @@ var EngineOptions = []EngineOption{
 		AlternativeSecrets: []string{"CODEX_API_KEY"},
 		KeyURL:             "https://platform.openai.com/api-keys",
 		WhenNeeded:         "Codex/OpenAI engine workflows",
+	},
+	{
+		Value:              string(OpenCodeEngine),
+		Label:              "OpenCode",
+		Description:        "OpenCode multi-provider AI coding agent (BYOK)",
+		SecretName:         "ANTHROPIC_API_KEY",
+		AlternativeSecrets: []string{"OPENAI_API_KEY", "GOOGLE_API_KEY"},
+		KeyURL:             "https://opencode.ai/docs/get-started/",
+		WhenNeeded:         "OpenCode engine workflows (default: Anthropic provider)",
 	},
 }
 

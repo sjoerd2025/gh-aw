@@ -83,7 +83,7 @@ func TestAgenticEngines(t *testing.T) {
 		t.Error("AgenticEngines should not be empty")
 	}
 
-	expectedEngines := []string{"claude", "codex", "copilot"}
+	expectedEngines := []string{"claude", "codex", "copilot", "opencode"}
 	if len(AgenticEngines) != len(expectedEngines) {
 		t.Errorf("AgenticEngines length = %d, want %d", len(AgenticEngines), len(expectedEngines))
 	}
