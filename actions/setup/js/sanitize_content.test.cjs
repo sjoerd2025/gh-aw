@@ -482,6 +482,26 @@ describe("sanitize_content.cjs", () => {
       const result = sanitizeContent(input);
       expect(result).toBe(input);
     });
+
+    it("should preserve custom XML tags that are not HTML elements", () => {
+      const input = "<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>";
+      const result = sanitizeContent(input);
+      expect(result).toBe(input);
+    });
+
+    it("should preserve MSBuild XML tags in markdown code blocks", () => {
+      const input = "```xml\n<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>\n```";
+      const result = sanitizeContent(input);
+      expect(result).toBe(input);
+    });
+
+    it("should still convert known HTML elements like div and script", () => {
+      const result1 = sanitizeContent("<div>content</div>");
+      expect(result1).toBe("(div)content(/div)");
+
+      const result2 = sanitizeContent("<script>alert('xss')</script>");
+      expect(result2).toBe("(script)alert('xss')(/script)");
+    });
   });
 
   describe("ANSI escape sequence removal", () => {

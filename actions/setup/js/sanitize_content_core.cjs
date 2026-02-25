@@ -380,6 +380,99 @@ function convertXmlTags(s) {
     "ul",
   ];
 
+  // Known HTML5 elements - only these will be converted to prevent HTML injection.
+  // Custom XML elements (e.g., MSBuild, SVG custom, proprietary) are left unchanged
+  // since they cannot be rendered as HTML by GitHub's markdown renderer.
+  const knownHtmlElements = new Set([
+    ...allowedTags,
+    "a",
+    "address",
+    "area",
+    "article",
+    "aside",
+    "audio",
+    "base",
+    "bdi",
+    "bdo",
+    "body",
+    "button",
+    "canvas",
+    "caption",
+    "cite",
+    "col",
+    "colgroup",
+    "data",
+    "datalist",
+    "dd",
+    "dfn",
+    "dialog",
+    "div",
+    "dl",
+    "dt",
+    "embed",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "head",
+    "header",
+    "hgroup",
+    "html",
+    "iframe",
+    "img",
+    "input",
+    "label",
+    "legend",
+    "link",
+    "main",
+    "map",
+    "menu",
+    "meta",
+    "meter",
+    "nav",
+    "noscript",
+    "object",
+    "optgroup",
+    "option",
+    "output",
+    "picture",
+    "progress",
+    "q",
+    "rp",
+    "rt",
+    "ruby",
+    "samp",
+    "script",
+    "section",
+    "select",
+    "slot",
+    "small",
+    "source",
+    "style",
+    "template",
+    "textarea",
+    "tfoot",
+    "time",
+    "title",
+    "track",
+    "u",
+    "var",
+    "video",
+    "wbr",
+  ]);
+
+  // SVG elements that can be embedded in HTML5 and exploited via event handlers.
+  // Each element name is derived from the SVG specification.
+  for (const svgEl of "animate animateMotion animateTransform circle clipPath defs desc ellipse feBlend feColorMatrix feComponentTransfer feComposite feConvolveMatrix feDiffuseLighting feDisplacementMap feDropShadow feFlood feFuncA feFuncB feFuncG feFuncR feGaussianBlur feImage feMerge feMergeNode feMorphology feOffset fePointLight feSpecularLighting feSpotLight feTile feTurbulence filter foreignObject g image line linearGradient marker mask metadata mpath path pattern polygon polyline radialGradient rect set stop svg switch symbol text textPath tspan use view".split(
+    " "
+  )) {
+    knownHtmlElements.add(svgEl);
+    knownHtmlElements.add(svgEl.toLowerCase());
+  }
+  // MathML root element that can be embedded in HTML5.
+  knownHtmlElements.add("math");
+
   // First, process CDATA sections specially - convert tags inside them and the CDATA markers
   s = s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (match, content) => {
     // Convert tags inside CDATA content
@@ -391,7 +484,7 @@ function convertXmlTags(s) {
   // Convert opening tags: <tag> or <tag attr="value"> to (tag) or (tag attr="value")
   // Convert closing tags: </tag> to (/tag)
   // Convert self-closing tags: <tag/> or <tag /> to (tag/) or (tag /)
-  // But preserve allowed safe tags
+  // But preserve allowed safe tags and unknown (non-HTML) custom XML tags
   return s.replace(/<(\/?[A-Za-z!][^>]*?)>/g, (match, tagContent) => {
     // Extract tag name from the content (handle closing tags and attributes)
     const tagNameMatch = tagContent.match(/^\/?\s*([A-Za-z][A-Za-z0-9]*)/);
@@ -400,8 +493,11 @@ function convertXmlTags(s) {
       if (allowedTags.includes(tagName)) {
         return match; // Preserve allowed tags
       }
+      if (!knownHtmlElements.has(tagName)) {
+        return match; // Preserve non-HTML custom XML tags (e.g., MSBuild, custom namespaces)
+      }
     }
-    return `(${tagContent})`; // Convert other tags to parentheses
+    return `(${tagContent})`; // Convert known HTML tags to parentheses
   });
 }
 
