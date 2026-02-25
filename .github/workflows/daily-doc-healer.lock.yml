@@ -23,12 +23,13 @@
 #
 # Self-healing companion to the Daily Documentation Updater that detects documentation gaps missed by DDUw and proposes corrections
 #
-# gh-aw-metadata: {"schema_version":"v1","frontmatter_hash":"45e207ff106347ea571c9ccd0c2dc42df41e7b6fbae78cad01cd306492a8db5b"}
+# gh-aw-metadata: {"schema_version":"v1","frontmatter_hash":"688d103b38a890eb74d185e34c336314c841ba6b84fd17ed405aa33b7ada5da1"}
 
 name: "Daily Documentation Healer"
 "on":
   schedule:
-  - cron: "0 8 * * 1-5"
+  - cron: "59 18 * * *"
+    # Friendly format: daily (scattered)
   workflow_dispatch:
 
 permissions: {}

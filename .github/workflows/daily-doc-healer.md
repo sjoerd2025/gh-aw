@@ -3,8 +3,7 @@ name: Daily Documentation Healer
 description: Self-healing companion to the Daily Documentation Updater that detects documentation gaps missed by DDUw and proposes corrections
 on:
   schedule:
-    # Every weekday at 8am UTC (after DDUw runs at ~3am)
-    - cron: "0 8 * * 1-5"
+    - cron: daily
   workflow_dispatch:
 
 permissions:
