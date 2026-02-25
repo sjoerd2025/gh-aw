@@ -454,7 +454,7 @@ license-report: ## Generate CSV license report
 .PHONY: deps
 deps: check-node-version
 	go mod download
-	go mod tidy
+	go mod tidy -e
 	cd actions/setup/js && npm ci
 
 # Install development tools (including linter)
