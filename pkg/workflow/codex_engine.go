@@ -42,7 +42,6 @@ func NewCodexEngine() *CodexEngine {
 			supportsMaxContinuations: false, // Codex does not support --max-autopilot-continues-style continuation mode
 			supportsWebFetch:         false, // Codex does not have built-in web-fetch support
 			supportsWebSearch:        true,  // Codex has built-in web-search support
-			supportsPlugins:          false, // Codex CLI does not support plugin installation
 			llmGatewayPort:           constants.CodexLLMGatewayPort,
 		},
 	}

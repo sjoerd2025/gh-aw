@@ -30,7 +30,6 @@ func NewClaudeEngine() *ClaudeEngine {
 			supportsMaxContinuations: false, // Claude Code does not support --max-autopilot-continues-style continuation
 			supportsWebFetch:         true,  // Claude has built-in WebFetch support
 			supportsWebSearch:        true,  // Claude has built-in WebSearch support
-			supportsPlugins:          false, // Claude Code does not support plugin installation; use 'tools.mcp' for MCP server integration instead
 			llmGatewayPort:           constants.ClaudeLLMGatewayPort,
 		},
 	}
