@@ -107,6 +107,18 @@ checkout: false
 
 This is equivalent to omitting the checkout step from the agent job. Custom dev-mode steps (such as "Checkout actions folder") are unaffected.
 
+## Marking a Primary Repository (`current: true`)
+
+When a workflow running from a central repository targets a different repository, use `current: true` to tell the agent which repository to treat as its primary working target. The agent uses this as the default for all GitHub operations (creating issues, opening PRs, reading content) unless the prompt instructs otherwise. When omitted, the agent defaults to the repository where the workflow is running.
+
+```yaml wrap
+checkout:
+  - repository: org/target-repo
+    path: ./target
+    github-token: ${{ secrets.CROSS_REPO_PAT }}
+    current: true                                    # agent's primary target
+```
+
 ## Checkout Merging
 
 Multiple `checkout:` configurations can target the same path and repository. This is useful for monorepos where different parts of the repository must be merged into the same workspace directory with different settings (e.g., sparse checkout for some paths, full checkout for others).
@@ -119,18 +131,6 @@ When multiple `checkout:` entries target the same repository and path, their con
 - **LFS**: OR-ed (if any config enables `lfs`, the merged configuration enables it)
 - **Submodules**: First non-empty value wins for each `(repository, path)`; once set, later values are ignored
 - **Ref/Token/App**: First-seen wins
-
-## Marking a Primary Repository (`current: true`)
-
-When a workflow running from a central repository targets a different repository, use `current: true` to tell the agent which repository to treat as its primary working target. The agent uses this as the default for all GitHub operations (creating issues, opening PRs, reading content) unless the prompt instructs otherwise. When omitted, the agent defaults to the repository where the workflow is running.
-
-```yaml wrap
-checkout:
-  - repository: org/target-repo
-    path: ./target
-    github-token: ${{ secrets.CROSS_REPO_PAT }}
-    current: true                                    # agent's primary target
-```
 
 ## Related Documentation
 
