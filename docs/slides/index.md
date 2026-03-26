@@ -28,11 +28,21 @@ mermaid.initialize({ startOnLoad: true });
 
 ---
 
-# Pull Request Process
+# Pull Request
+
+> Code -> Reviewer - > Merge
+
+---
+
+# Pull Request + Agent
+
+> Issue -> Agent -> Reviewer - > Merge
 
 ---
 
 # Research → Plan → Act
+
+> Agent Research -> Human review -> Issue planning -> Assign to Agent -> Human Review -> Merge
 
 ---
 
@@ -50,20 +60,6 @@ mermaid.initialize({ startOnLoad: true });
 <!--
 https://github.com/github/gh-aw/issues/1920
 -->
-
----
-
-# Evolution: LLMs to SWE Agents
-
-**2021: GitHub Copilot** - AI-powered code completion
-
-**2022: ChatGPT** - Conversational AI assistant
-
-**2023: LLMs & Web UI Generators** - Prompt to Web App
-
-**2024: Agent CLIs** - Claude Code: File edit, bash
-
-**2025: MCP, SKILLS.md** - Unified tooling
 
 ---
 
@@ -93,7 +89,7 @@ on:
   issues:
     types: [opened]
 permissions:
-  issues: read # read-only by default
+  issues: read # agent read-only, zero secrets
 safe-outputs:
   add-comment: # guardrails for write operations
 ---
@@ -118,9 +114,9 @@ AI agents become dangerous when these **three capabilities** combine:
 
 ---
 
-# Useful Sandboxes: The Philosophy
+# Useful Sandboxes
 
-## Safe by design. Useful by default.
+## Safe by design, Useful by default
 
 > The best developer tools protect you from catastrophe while letting you build something real
 
@@ -140,21 +136,7 @@ These environments share one superpower:
 
 ---
 
-# What Makes a Sandbox "Useful"?
-
-## The beginner runtime principles
-
-- **Guardrails without walls** — protected, not trapped
-- **Immediate feedback** — actions produce visible results
-- **Progressive disclosure** — start simple, grow into complexity
-- **Real outputs** — even beginners ship something that matters
-- **Delight** — the sandbox feels like a superpower, not a restriction
-
-> The best sandboxes don't limit what's possible — they shape *how* it's possible
-
----
-
-# Trusted by Enterprises
+# Agentic Sandbox for Enterprise
 
 ## Safe by default
 
