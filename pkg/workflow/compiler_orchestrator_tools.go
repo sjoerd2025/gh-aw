@@ -17,8 +17,8 @@ var orchestratorToolsLog = logger.New("workflow:compiler_orchestrator_tools")
 type toolsProcessingResult struct {
 	tools                 map[string]any
 	runtimes              map[string]any
-	toolsTimeout          int
-	toolsStartupTimeout   int
+	toolsTimeout          string
+	toolsStartupTimeout   string
 	markdownContent       string
 	importedMarkdown      string   // Only imports WITH inputs (for compile-time substitution)
 	importPaths           []string // Import paths for runtime-import macro generation (imports without inputs)

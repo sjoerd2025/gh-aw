@@ -77,8 +77,8 @@ type ToolsConfig struct {
 	AgenticWorkflows *AgenticWorkflowsToolConfig `yaml:"agentic-workflows,omitempty"`
 	CacheMemory      *CacheMemoryToolConfig      `yaml:"cache-memory,omitempty"`
 	RepoMemory       *RepoMemoryToolConfig       `yaml:"repo-memory,omitempty"`
-	Timeout          *int                        `yaml:"timeout,omitempty"`
-	StartupTimeout   *int                        `yaml:"startup-timeout,omitempty"`
+	Timeout          *TemplatableInt32           `yaml:"timeout,omitempty"`
+	StartupTimeout   *TemplatableInt32           `yaml:"startup-timeout,omitempty"`
 
 	// Custom MCP tools (anything not in the above list)
 	Custom map[string]MCPServerConfig `yaml:",inline"`
@@ -215,10 +215,10 @@ func (t *ToolsConfig) ToMap() map[string]any {
 		result["repo-memory"] = t.RepoMemory.Raw
 	}
 	if t.Timeout != nil {
-		result["timeout"] = *t.Timeout
+		result["timeout"] = t.Timeout.ToValue()
 	}
 	if t.StartupTimeout != nil {
-		result["startup-timeout"] = *t.StartupTimeout
+		result["startup-timeout"] = t.StartupTimeout.ToValue()
 	}
 
 	// Add custom tools - convert MCPServerConfig to map[string]any

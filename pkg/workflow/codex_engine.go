@@ -5,7 +5,6 @@ import (
 	"maps"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -332,13 +331,15 @@ mkdir -p "$CODEX_HOME/logs"
 	}
 
 	// Add GH_AW_STARTUP_TIMEOUT environment variable (in seconds) if startup-timeout is specified
-	if workflowData.ToolsStartupTimeout > 0 {
-		env["GH_AW_STARTUP_TIMEOUT"] = strconv.Itoa(workflowData.ToolsStartupTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.startup-timeout }}")
+	if workflowData.ToolsStartupTimeout != "" {
+		env["GH_AW_STARTUP_TIMEOUT"] = workflowData.ToolsStartupTimeout
 	}
 
 	// Add GH_AW_TOOL_TIMEOUT environment variable (in seconds) if timeout is specified
-	if workflowData.ToolsTimeout > 0 {
-		env["GH_AW_TOOL_TIMEOUT"] = strconv.Itoa(workflowData.ToolsTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.tool-timeout }}")
+	if workflowData.ToolsTimeout != "" {
+		env["GH_AW_TOOL_TIMEOUT"] = workflowData.ToolsTimeout
 	}
 
 	// Set the model environment variable.

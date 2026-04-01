@@ -416,8 +416,8 @@ type WorkflowData struct {
 	RepoMemoryConfig            *RepoMemoryConfig         // parsed repo-memory configuration
 	QmdConfig                   *QmdToolConfig            // parsed qmd tool configuration (docs globs)
 	Runtimes                    map[string]any            // runtime version overrides from frontmatter
-	ToolsTimeout                int                       // timeout in seconds for tool/MCP operations (0 = use engine default)
-	ToolsStartupTimeout         int                       // timeout in seconds for MCP server startup (0 = use engine default)
+	ToolsTimeout                string                    // timeout for tool/MCP operations: numeric string (seconds) or GitHub Actions expression (empty = use engine default)
+	ToolsStartupTimeout         string                    // timeout for MCP server startup: numeric string (seconds) or GitHub Actions expression (empty = use engine default)
 	Features                    map[string]any            // feature flags and configuration options from frontmatter (supports bool and string values)
 	ActionCache                 *ActionCache              // cache for action pin resolutions
 	ActionResolver              *ActionResolver           // resolver for action pins

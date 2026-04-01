@@ -399,15 +399,17 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 
 	// Set timeout environment variables for Claude Code
 	// Use tools.startup-timeout if specified, otherwise default to DefaultMCPStartupTimeout
+	// For expressions, fall back to default (can't compute ms value at compile time)
 	startupTimeoutMs := int(constants.DefaultMCPStartupTimeout / time.Millisecond)
-	if workflowData.ToolsStartupTimeout > 0 {
-		startupTimeoutMs = workflowData.ToolsStartupTimeout * 1000 // convert seconds to milliseconds
+	if n := templatableIntValue(&workflowData.ToolsStartupTimeout); n > 0 {
+		startupTimeoutMs = n * 1000 // convert seconds to milliseconds
 	}
 
 	// Use tools.timeout if specified, otherwise default to DefaultToolTimeout
+	// For expressions, fall back to default (can't compute ms value at compile time)
 	timeoutMs := int(constants.DefaultToolTimeout / time.Millisecond)
-	if workflowData.ToolsTimeout > 0 {
-		timeoutMs = workflowData.ToolsTimeout * 1000 // convert seconds to milliseconds
+	if n := templatableIntValue(&workflowData.ToolsTimeout); n > 0 {
+		timeoutMs = n * 1000 // convert seconds to milliseconds
 	}
 
 	env["MCP_TIMEOUT"] = strconv.Itoa(startupTimeoutMs)
@@ -419,13 +421,15 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	applySafeOutputEnvToMap(env, workflowData)
 
 	// Add GH_AW_STARTUP_TIMEOUT environment variable (in seconds) if startup-timeout is specified
-	if workflowData.ToolsStartupTimeout > 0 {
-		env["GH_AW_STARTUP_TIMEOUT"] = strconv.Itoa(workflowData.ToolsStartupTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.startup-timeout }}")
+	if workflowData.ToolsStartupTimeout != "" {
+		env["GH_AW_STARTUP_TIMEOUT"] = workflowData.ToolsStartupTimeout
 	}
 
 	// Add GH_AW_TOOL_TIMEOUT environment variable (in seconds) if timeout is specified
-	if workflowData.ToolsTimeout > 0 {
-		env["GH_AW_TOOL_TIMEOUT"] = strconv.Itoa(workflowData.ToolsTimeout)
+	// Supports both literal integers and GitHub Actions expressions (e.g. "${{ inputs.tool-timeout }}")
+	if workflowData.ToolsTimeout != "" {
+		env["GH_AW_TOOL_TIMEOUT"] = workflowData.ToolsTimeout
 	}
 
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.MaxTurns != "" {

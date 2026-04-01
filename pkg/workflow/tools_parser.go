@@ -650,26 +650,60 @@ func parseRepoMemoryTool(val any) *RepoMemoryToolConfig {
 	return &RepoMemoryToolConfig{Raw: val}
 }
 
-// parseTimeoutTool converts raw timeout tool configuration
-func parseTimeoutTool(val any) *int {
-	if intVal, ok := val.(int); ok {
-		return &intVal
-	}
-	if floatVal, ok := val.(float64); ok {
-		intVal := int(floatVal)
-		return &intVal
+// parseTimeoutTool converts raw timeout tool configuration to a TemplatableInt32 value.
+// Accepts integers and GitHub Actions expressions (e.g. "${{ inputs.tool-timeout }}").
+func parseTimeoutTool(val any) *TemplatableInt32 {
+	switch v := val.(type) {
+	case int:
+		t := TemplatableInt32(strconv.Itoa(v))
+		return &t
+	case int64:
+		t := TemplatableInt32(strconv.FormatInt(v, 10))
+		return &t
+	case uint:
+		t := TemplatableInt32(strconv.FormatUint(uint64(v), 10))
+		return &t
+	case uint64:
+		t := TemplatableInt32(strconv.FormatUint(v, 10))
+		return &t
+	case float64:
+		t := TemplatableInt32(strconv.Itoa(int(v)))
+		return &t
+	case string:
+		if isExpressionString(v) {
+			t := TemplatableInt32(v)
+			return &t
+		}
+		return nil // reject non-expression strings
 	}
 	return nil
 }
 
-// parseStartupTimeoutTool converts raw startup-timeout tool configuration
-func parseStartupTimeoutTool(val any) *int {
-	if intVal, ok := val.(int); ok {
-		return &intVal
-	}
-	if floatVal, ok := val.(float64); ok {
-		intVal := int(floatVal)
-		return &intVal
+// parseStartupTimeoutTool converts raw startup-timeout tool configuration to a TemplatableInt32 value.
+// Accepts integers and GitHub Actions expressions (e.g. "${{ inputs.startup-timeout }}").
+func parseStartupTimeoutTool(val any) *TemplatableInt32 {
+	switch v := val.(type) {
+	case int:
+		t := TemplatableInt32(strconv.Itoa(v))
+		return &t
+	case int64:
+		t := TemplatableInt32(strconv.FormatInt(v, 10))
+		return &t
+	case uint:
+		t := TemplatableInt32(strconv.FormatUint(uint64(v), 10))
+		return &t
+	case uint64:
+		t := TemplatableInt32(strconv.FormatUint(v, 10))
+		return &t
+	case float64:
+		t := TemplatableInt32(strconv.Itoa(int(v)))
+		return &t
+	case string:
+		if isExpressionString(v) {
+			t := TemplatableInt32(v)
+			return &t
+		}
+		return nil // reject non-expression strings
 	}
 	return nil
 }

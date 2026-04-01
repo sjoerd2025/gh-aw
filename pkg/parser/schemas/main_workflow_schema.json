@@ -4029,15 +4029,34 @@
           ]
         },
         "timeout": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Timeout in seconds for tool/MCP server operations. Applies to all tools and MCP servers if supported by the engine. Default varies by engine (Claude: 60s, Codex: 120s).",
-          "examples": [60, 120, 300]
+          "description": "Timeout in seconds for tool/MCP server operations. Applies to all tools and MCP servers if supported by the engine. Default: 60 seconds (for both Claude and Codex). Supports GitHub Actions expressions for reusable workflow_call workflows.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "examples": [60, 120, 300]
+            },
+            {
+              "type": "string",
+              "description": "GitHub Actions expression (e.g. '${{ inputs.tool-timeout }}')",
+              "pattern": "^\\$\\{\\{.*\\}\\}$"
+            }
+          ]
         },
         "startup-timeout": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Timeout in seconds for MCP server startup. Applies to MCP server initialization if supported by the engine. Default: 120 seconds."
+          "description": "Timeout in seconds for MCP server startup. Applies to MCP server initialization if supported by the engine. Default: 120 seconds. Supports GitHub Actions expressions for reusable workflow_call workflows.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "examples": [30, 60, 120]
+            },
+            {
+              "type": "string",
+              "description": "GitHub Actions expression (e.g. '${{ inputs.startup-timeout }}')",
+              "pattern": "^\\$\\{\\{.*\\}\\}$"
+            }
+          ]
         },
         "serena": {
           "description": "REMOVED: Built-in support for Serena has been removed. Use the shared/mcp/serena.md workflow instead.",

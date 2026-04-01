@@ -252,7 +252,7 @@ tools:
 	require.NoError(t, err)
 	require.NotNil(t, result)
 
-	assert.Equal(t, 600, result.toolsTimeout, "Tools timeout should be extracted")
+	assert.Equal(t, "600", result.toolsTimeout, "Tools timeout should be extracted")
 }
 
 // TestProcessToolsAndMarkdown_StartupTimeout tests startup timeout extraction
@@ -296,7 +296,7 @@ tools:
 	require.NoError(t, err)
 	require.NotNil(t, result)
 
-	assert.Equal(t, 120, result.toolsStartupTimeout, "Startup timeout should be extracted")
+	assert.Equal(t, "120", result.toolsStartupTimeout, "Startup timeout should be extracted")
 }
 
 // TestProcessToolsAndMarkdown_InvalidTimeout tests invalid timeout values

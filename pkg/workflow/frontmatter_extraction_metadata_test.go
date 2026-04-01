@@ -103,7 +103,7 @@ func TestExtractToolsStartupTimeout(t *testing.T) {
 	tests := []struct {
 		name        string
 		tools       map[string]any
-		expected    int
+		expected    string
 		shouldError bool
 	}{
 		{
@@ -111,59 +111,59 @@ func TestExtractToolsStartupTimeout(t *testing.T) {
 			tools: map[string]any{
 				"startup-timeout": 30,
 			},
-			expected: 30,
+			expected: "30",
 		},
 		{
 			name: "int64 timeout",
 			tools: map[string]any{
 				"startup-timeout": int64(60),
 			},
-			expected: 60,
+			expected: "60",
 		},
 		{
 			name: "uint timeout",
 			tools: map[string]any{
 				"startup-timeout": uint(45),
 			},
-			expected: 45,
+			expected: "45",
 		},
 		{
 			name: "uint64 timeout",
 			tools: map[string]any{
 				"startup-timeout": uint64(90),
 			},
-			expected: 90,
+			expected: "90",
 		},
 		{
 			name: "float64 timeout",
 			tools: map[string]any{
 				"startup-timeout": 120.0,
 			},
-			expected: 120,
+			expected: "120",
 		},
 		{
 			name:     "nil tools",
 			tools:    nil,
-			expected: 0,
+			expected: "",
 		},
 		{
 			name:     "empty tools map",
 			tools:    map[string]any{},
-			expected: 0,
+			expected: "",
 		},
 		{
 			name: "startup-timeout not present",
 			tools: map[string]any{
 				"other-field": "value",
 			},
-			expected: 0,
+			expected: "",
 		},
 		{
 			name: "invalid type (string) - should error",
 			tools: map[string]any{
 				"startup-timeout": "not a number",
 			},
-			expected:    0,
+			expected:    "",
 			shouldError: true,
 		},
 		{
@@ -171,7 +171,7 @@ func TestExtractToolsStartupTimeout(t *testing.T) {
 			tools: map[string]any{
 				"startup-timeout": []int{1, 2, 3},
 			},
-			expected:    0,
+			expected:    "",
 			shouldError: true,
 		},
 		{
@@ -179,7 +179,7 @@ func TestExtractToolsStartupTimeout(t *testing.T) {
 			tools: map[string]any{
 				"startup-timeout": 0,
 			},
-			expected:    0,
+			expected:    "",
 			shouldError: true,
 		},
 		{
@@ -187,7 +187,7 @@ func TestExtractToolsStartupTimeout(t *testing.T) {
 			tools: map[string]any{
 				"startup-timeout": -5,
 			},
-			expected:    0,
+			expected:    "",
 			shouldError: true,
 		},
 		{
@@ -195,7 +195,21 @@ func TestExtractToolsStartupTimeout(t *testing.T) {
 			tools: map[string]any{
 				"startup-timeout": 1,
 			},
-			expected: 1,
+			expected: "1",
+		},
+		{
+			name: "expression - should be accepted",
+			tools: map[string]any{
+				"startup-timeout": "${{ inputs.startup-timeout }}",
+			},
+			expected: "${{ inputs.startup-timeout }}",
+		},
+		{
+			name: "expression with vars - should be accepted",
+			tools: map[string]any{
+				"startup-timeout": "${{ vars.STARTUP_TIMEOUT }}",
+			},
+			expected: "${{ vars.STARTUP_TIMEOUT }}",
 		},
 	}
 
@@ -212,7 +226,7 @@ func TestExtractToolsStartupTimeout(t *testing.T) {
 					t.Errorf("Expected no error but got: %v", err)
 				}
 				if result != tt.expected {
-					t.Errorf("extractToolsStartupTimeout() = %d, want %d", result, tt.expected)
+					t.Errorf("extractToolsStartupTimeout() = %q, want %q", result, tt.expected)
 				}
 			}
 		})

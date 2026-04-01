@@ -13,23 +13,28 @@ func TestClaudeEngineWithToolsTimeout(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		toolsTimeout   int
+		toolsTimeout   string
 		expectedEnvVar string
 	}{
 		{
 			name:           "default timeout when not specified",
-			toolsTimeout:   0,
-			expectedEnvVar: "", // GH_AW_TOOL_TIMEOUT not set when 0
+			toolsTimeout:   "",
+			expectedEnvVar: "", // GH_AW_TOOL_TIMEOUT not set when empty
 		},
 		{
 			name:           "custom timeout of 30 seconds",
-			toolsTimeout:   30,
+			toolsTimeout:   "30",
 			expectedEnvVar: "GH_AW_TOOL_TIMEOUT: 30", // env var in seconds
 		},
 		{
 			name:           "custom timeout of 120 seconds",
-			toolsTimeout:   120,
+			toolsTimeout:   "120",
 			expectedEnvVar: "GH_AW_TOOL_TIMEOUT: 120", // env var in seconds
+		},
+		{
+			name:           "expression timeout",
+			toolsTimeout:   "${{ inputs.tool-timeout }}",
+			expectedEnvVar: "GH_AW_TOOL_TIMEOUT: ${{ inputs.tool-timeout }}",
 		},
 	}
 
@@ -49,11 +54,11 @@ func TestClaudeEngineWithToolsTimeout(t *testing.T) {
 			// Check the execution step for timeout environment variables
 			stepContent := strings.Join([]string(executionSteps[0]), "\n")
 
-			// Determine expected timeouts in milliseconds
+			// Determine expected timeouts in milliseconds (only for literal values)
 			toolTimeoutMs := 60000     // default for tool operations
 			startupTimeoutMs := 120000 // default for startup
-			if tt.toolsTimeout > 0 {
-				toolTimeoutMs = tt.toolsTimeout * 1000
+			if n := templatableIntValue(&tt.toolsTimeout); n > 0 {
+				toolTimeoutMs = n * 1000
 			}
 
 			// Check for MCP_TIMEOUT (uses startup timeout, defaults to 120s)
@@ -86,9 +91,9 @@ func TestClaudeEngineWithToolsTimeout(t *testing.T) {
 					t.Errorf("Expected '%s' in execution step, got: %s", tt.expectedEnvVar, stepContent)
 				}
 			} else {
-				// When timeout is 0, GH_AW_TOOL_TIMEOUT should not be present
+				// When timeout is empty, GH_AW_TOOL_TIMEOUT should not be present
 				if strings.Contains(stepContent, "GH_AW_TOOL_TIMEOUT") {
-					t.Errorf("Did not expect GH_AW_TOOL_TIMEOUT in execution step when timeout is 0")
+					t.Errorf("Did not expect GH_AW_TOOL_TIMEOUT in execution step when timeout is empty")
 				}
 			}
 		})
@@ -100,27 +105,33 @@ func TestCodexEngineWithToolsTimeout(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		toolsTimeout    int
+		toolsTimeout    string
 		expectedTimeout string
 		expectedEnvVar  string
 	}{
 		{
 			name:            "default timeout when not specified",
-			toolsTimeout:    0,
-			expectedTimeout: "tool_timeout_sec = 60", // 60 seconds default (changed from 120)
-			expectedEnvVar:  "",                      // GH_AW_TOOL_TIMEOUT not set when 0
+			toolsTimeout:    "",
+			expectedTimeout: "tool_timeout_sec = 60", // 60 seconds default
+			expectedEnvVar:  "",                      // GH_AW_TOOL_TIMEOUT not set when empty
 		},
 		{
 			name:            "custom timeout of 30 seconds",
-			toolsTimeout:    30,
+			toolsTimeout:    "30",
 			expectedTimeout: "tool_timeout_sec = 30",
 			expectedEnvVar:  "GH_AW_TOOL_TIMEOUT: 30", // env var in seconds
 		},
 		{
 			name:            "custom timeout of 180 seconds",
-			toolsTimeout:    180,
+			toolsTimeout:    "180",
 			expectedTimeout: "tool_timeout_sec = 180",
 			expectedEnvVar:  "GH_AW_TOOL_TIMEOUT: 180", // env var in seconds
+		},
+		{
+			name:            "expression timeout uses default in TOML",
+			toolsTimeout:    "${{ inputs.tool-timeout }}",
+			expectedTimeout: "tool_timeout_sec = 60", // falls back to default in TOML
+			expectedEnvVar:  "GH_AW_TOOL_TIMEOUT: ${{ inputs.tool-timeout }}",
 		},
 	}
 
@@ -158,9 +169,9 @@ func TestCodexEngineWithToolsTimeout(t *testing.T) {
 					t.Errorf("Expected '%s' in execution step, got: %s", tt.expectedEnvVar, stepContent)
 				}
 			} else {
-				// When timeout is 0, GH_AW_TOOL_TIMEOUT should not be present
+				// When timeout is empty, GH_AW_TOOL_TIMEOUT should not be present
 				if strings.Contains(stepContent, "GH_AW_TOOL_TIMEOUT") {
-					t.Errorf("Did not expect GH_AW_TOOL_TIMEOUT in execution step when timeout is 0")
+					t.Errorf("Did not expect GH_AW_TOOL_TIMEOUT in execution step when timeout is empty")
 				}
 			}
 		})
@@ -173,13 +184,13 @@ func TestExtractToolsTimeout(t *testing.T) {
 	tests := []struct {
 		name            string
 		tools           map[string]any
-		expectedTimeout int
+		expectedTimeout string
 		shouldError     bool
 	}{
 		{
 			name:            "no timeout specified",
 			tools:           map[string]any{},
-			expectedTimeout: 0,
+			expectedTimeout: "",
 			shouldError:     false,
 		},
 		{
@@ -187,7 +198,7 @@ func TestExtractToolsTimeout(t *testing.T) {
 			tools: map[string]any{
 				"timeout": 45,
 			},
-			expectedTimeout: 45,
+			expectedTimeout: "45",
 			shouldError:     false,
 		},
 		{
@@ -195,7 +206,7 @@ func TestExtractToolsTimeout(t *testing.T) {
 			tools: map[string]any{
 				"timeout": int64(90),
 			},
-			expectedTimeout: 90,
+			expectedTimeout: "90",
 			shouldError:     false,
 		},
 		{
@@ -203,7 +214,7 @@ func TestExtractToolsTimeout(t *testing.T) {
 			tools: map[string]any{
 				"timeout": uint(75),
 			},
-			expectedTimeout: 75,
+			expectedTimeout: "75",
 			shouldError:     false,
 		},
 		{
@@ -211,7 +222,7 @@ func TestExtractToolsTimeout(t *testing.T) {
 			tools: map[string]any{
 				"timeout": uint64(120),
 			},
-			expectedTimeout: 120,
+			expectedTimeout: "120",
 			shouldError:     false,
 		},
 		{
@@ -219,13 +230,13 @@ func TestExtractToolsTimeout(t *testing.T) {
 			tools: map[string]any{
 				"timeout": 60.0,
 			},
-			expectedTimeout: 60,
+			expectedTimeout: "60",
 			shouldError:     false,
 		},
 		{
 			name:            "nil tools",
 			tools:           nil,
-			expectedTimeout: 0,
+			expectedTimeout: "",
 			shouldError:     false,
 		},
 		{
@@ -233,7 +244,7 @@ func TestExtractToolsTimeout(t *testing.T) {
 			tools: map[string]any{
 				"timeout": 0,
 			},
-			expectedTimeout: 0,
+			expectedTimeout: "",
 			shouldError:     true,
 		},
 		{
@@ -241,7 +252,7 @@ func TestExtractToolsTimeout(t *testing.T) {
 			tools: map[string]any{
 				"timeout": -5,
 			},
-			expectedTimeout: 0,
+			expectedTimeout: "",
 			shouldError:     true,
 		},
 		{
@@ -249,8 +260,24 @@ func TestExtractToolsTimeout(t *testing.T) {
 			tools: map[string]any{
 				"timeout": 1,
 			},
-			expectedTimeout: 1,
+			expectedTimeout: "1",
 			shouldError:     false,
+		},
+		{
+			name: "expression timeout",
+			tools: map[string]any{
+				"timeout": "${{ inputs.tool-timeout }}",
+			},
+			expectedTimeout: "${{ inputs.tool-timeout }}",
+			shouldError:     false,
+		},
+		{
+			name: "non-expression string - should fail",
+			tools: map[string]any{
+				"timeout": "not-a-number",
+			},
+			expectedTimeout: "",
+			shouldError:     true,
 		},
 	}
 
@@ -267,7 +294,7 @@ func TestExtractToolsTimeout(t *testing.T) {
 					t.Errorf("Expected no error but got: %v", err)
 				}
 				if timeout != tt.expectedTimeout {
-					t.Errorf("Expected timeout %d, got %d", tt.expectedTimeout, timeout)
+					t.Errorf("Expected timeout %q, got %q", tt.expectedTimeout, timeout)
 				}
 			}
 		})
@@ -279,23 +306,28 @@ func TestCopilotEngineWithToolsTimeout(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		toolsTimeout   int
+		toolsTimeout   string
 		expectedEnvVar string
 	}{
 		{
 			name:           "default timeout when not specified",
-			toolsTimeout:   0,
-			expectedEnvVar: "", // GH_AW_TOOL_TIMEOUT not set when 0
+			toolsTimeout:   "",
+			expectedEnvVar: "", // GH_AW_TOOL_TIMEOUT not set when empty
 		},
 		{
 			name:           "custom timeout of 45 seconds",
-			toolsTimeout:   45,
+			toolsTimeout:   "45",
 			expectedEnvVar: "GH_AW_TOOL_TIMEOUT: 45", // env var in seconds
 		},
 		{
 			name:           "custom timeout of 200 seconds",
-			toolsTimeout:   200,
+			toolsTimeout:   "200",
 			expectedEnvVar: "GH_AW_TOOL_TIMEOUT: 200", // env var in seconds
+		},
+		{
+			name:           "expression timeout",
+			toolsTimeout:   "${{ inputs.tool-timeout }}",
+			expectedEnvVar: "GH_AW_TOOL_TIMEOUT: ${{ inputs.tool-timeout }}",
 		},
 	}
 
@@ -321,9 +353,9 @@ func TestCopilotEngineWithToolsTimeout(t *testing.T) {
 					t.Errorf("Expected '%s' in execution step, got: %s", tt.expectedEnvVar, stepContent)
 				}
 			} else {
-				// When timeout is 0, GH_AW_TOOL_TIMEOUT should not be present
+				// When timeout is empty, GH_AW_TOOL_TIMEOUT should not be present
 				if strings.Contains(stepContent, "GH_AW_TOOL_TIMEOUT") {
-					t.Errorf("Did not expect GH_AW_TOOL_TIMEOUT in execution step when timeout is 0")
+					t.Errorf("Did not expect GH_AW_TOOL_TIMEOUT in execution step when timeout is empty")
 				}
 			}
 		})

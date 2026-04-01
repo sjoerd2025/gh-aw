@@ -38,8 +38,8 @@ func TestBuildInitialWorkflowData_BasicFields(t *testing.T) {
 		markdownContent:      "Full markdown content",
 		tools:                map[string]any{"bash": []string{"echo"}},
 		runtimes:             map[string]any{"node": "18"},
-		toolsTimeout:         300,
-		toolsStartupTimeout:  60,
+		toolsTimeout:         "300",
+		toolsStartupTimeout:  "60",
 		needsTextOutput:      true,
 		safeOutputs:          &SafeOutputsConfig{},
 		secretMasking:        &SecretMaskingConfig{},
@@ -80,8 +80,8 @@ func TestBuildInitialWorkflowData_BasicFields(t *testing.T) {
 	assert.NotNil(t, workflowData.ParsedTools)
 	assert.NotNil(t, workflowData.NetworkPermissions)
 	assert.NotNil(t, workflowData.SandboxConfig)
-	assert.Equal(t, 300, workflowData.ToolsTimeout)
-	assert.Equal(t, 60, workflowData.ToolsStartupTimeout)
+	assert.Equal(t, "300", workflowData.ToolsTimeout)
+	assert.Equal(t, "60", workflowData.ToolsStartupTimeout)
 	assert.True(t, workflowData.NeedsTextOutput)
 	assert.Equal(t, "agent.md", workflowData.AgentFile)
 }
@@ -1396,8 +1396,8 @@ func TestBuildInitialWorkflowData_FieldMapping(t *testing.T) {
 		workflowName:         "Test Name",
 		frontmatterName:      "Frontmatter Name",
 		trackerID:            "TRK-001",
-		toolsTimeout:         500,
-		toolsStartupTimeout:  100,
+		toolsTimeout:         "500",
+		toolsStartupTimeout:  "100",
 		needsTextOutput:      true,
 		markdownContent:      "# Content",
 		importedMarkdown:     "Imported",
@@ -1428,8 +1428,8 @@ func TestBuildInitialWorkflowData_FieldMapping(t *testing.T) {
 	assert.Equal(t, "Test Name", workflowData.Name)
 	assert.Equal(t, "Frontmatter Name", workflowData.FrontmatterName)
 	assert.Equal(t, "TRK-001", workflowData.TrackerID)
-	assert.Equal(t, 500, workflowData.ToolsTimeout)
-	assert.Equal(t, 100, workflowData.ToolsStartupTimeout)
+	assert.Equal(t, "500", workflowData.ToolsTimeout)
+	assert.Equal(t, "100", workflowData.ToolsStartupTimeout)
 	assert.True(t, workflowData.NeedsTextOutput)
 	assert.Equal(t, "# Content", workflowData.MarkdownContent)
 	assert.Equal(t, "Imported", workflowData.ImportedMarkdown)

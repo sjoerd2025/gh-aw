@@ -313,3 +313,10 @@ func templatableIntValue(value *string) int {
 	}
 	return 0 // expression strings are not evaluable at compile time
 }
+
+// isExpressionString returns true if s is a complete GitHub Actions expression
+// (i.e. the entire string starts with "${{" and ends with "}}").
+// This is the strict "entire value is an expression" check used for templatable fields.
+func isExpressionString(s string) bool {
+	return strings.HasPrefix(s, "${{") && strings.HasSuffix(s, "}}")
+}
