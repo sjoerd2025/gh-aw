@@ -6,7 +6,7 @@
  */
 
 const { generateFooterWithMessages, generateXMLMarker } = require("./messages_footer.cjs");
-const { generateWorkflowCallIdMarker } = require("./generate_footer.cjs");
+const { generateWorkflowCallIdMarker, matchesWorkflowId } = require("./generate_footer.cjs");
 const { getRepositoryUrl } = require("./get_repository_url.cjs");
 const { replaceTemporaryIdReferences, loadTemporaryIdMapFromResolved, resolveRepoIssueTarget } = require("./temporary_id.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
@@ -28,7 +28,6 @@ const { generateHistoryUrl } = require("./generate_history_link.cjs");
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "add_comment";
 
-// Copy helper functions from original file
 async function minimizeComment(github, nodeId, reason = "outdated") {
   const query = /* GraphQL */ `
     mutation ($nodeId: ID!, $classifier: ReportedContentClassifiers!) {
@@ -76,19 +75,7 @@ async function findCommentsWithTrackerId(github, owner, repo, issueNumber, workf
       break;
     }
 
-    // Filter comments that contain the workflow-id and are NOT reaction comments.
-    // Supports both the standalone marker format (<!-- gh-aw-workflow-id: value -->)
-    // and the combined XML marker format (<!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->).
-    const filteredComments = data
-      .filter(comment => {
-        if (!comment.body || comment.body.includes(`<!-- gh-aw-comment-type: reaction -->`)) return false;
-        // Standalone marker: <!-- gh-aw-workflow-id: value -->
-        if (comment.body.includes(`<!-- gh-aw-workflow-id: ${workflowId} -->`)) return true;
-        // Combined XML marker: <!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->
-        if (comment.body.includes(`<!-- gh-aw-agentic-workflow:`) && (comment.body.includes(`workflow_id: ${workflowId},`) || comment.body.includes(`workflow_id: ${workflowId} -->`))) return true;
-        return false;
-      })
-      .map(({ id, node_id, body }) => ({ id, node_id, body }));
+    const filteredComments = data.filter(comment => matchesWorkflowId(comment.body, workflowId)).map(({ id, node_id, body }) => ({ id, node_id, body }));
 
     comments.push(...filteredComments);
 
@@ -141,16 +128,7 @@ async function findDiscussionCommentsWithTrackerId(github, owner, repo, discussi
       break;
     }
 
-    const filteredComments = result.repository.discussion.comments.nodes
-      .filter(comment => {
-        if (!comment.body || comment.body.includes(`<!-- gh-aw-comment-type: reaction -->`)) return false;
-        // Standalone marker: <!-- gh-aw-workflow-id: value -->
-        if (comment.body.includes(`<!-- gh-aw-workflow-id: ${workflowId} -->`)) return true;
-        // Combined XML marker: <!-- gh-aw-agentic-workflow: ..., workflow_id: value, ... -->
-        if (comment.body.includes(`<!-- gh-aw-agentic-workflow:`) && (comment.body.includes(`workflow_id: ${workflowId},`) || comment.body.includes(`workflow_id: ${workflowId} -->`))) return true;
-        return false;
-      })
-      .map(({ id, body }) => ({ id, body }));
+    const filteredComments = result.repository.discussion.comments.nodes.filter(comment => matchesWorkflowId(comment.body, workflowId)).map(({ id, body }) => ({ id, body }));
 
     comments.push(...filteredComments);
 
@@ -260,28 +238,28 @@ async function commentOnDiscussion(github, owner, repo, discussionNumber, messag
 
   // 2. Add comment (with optional replyToId for threading)
   const mutation = replyToId
-    ? `mutation($dId: ID!, $body: String!, $replyToId: ID!) {
-        addDiscussionComment(input: { discussionId: $dId, body: $body, replyToId: $replyToId }) {
-          comment { 
-            id 
-            body 
-            createdAt 
-            url
+    ? /* GraphQL */ `
+        mutation ($dId: ID!, $body: String!, $replyToId: ID!) {
+          addDiscussionComment(input: { discussionId: $dId, body: $body, replyToId: $replyToId }) {
+            comment {
+              id
+              url
+            }
           }
         }
-      }`
-    : `mutation($dId: ID!, $body: String!) {
-        addDiscussionComment(input: { discussionId: $dId, body: $body }) {
-          comment { 
-            id 
-            body 
-            createdAt 
-            url
+      `
+    : /* GraphQL */ `
+        mutation ($dId: ID!, $body: String!) {
+          addDiscussionComment(input: { discussionId: $dId, body: $body }) {
+            comment {
+              id
+              url
+            }
           }
         }
-      }`;
+      `;
 
-  const variables = replyToId ? { dId: discussionId, body: message, replyToId } : { dId: discussionId, body: message };
+  const variables = { dId: discussionId, body: message, ...(replyToId ? { replyToId } : {}) };
 
   const result = await github.graphql(mutation, variables);
 
@@ -358,12 +336,8 @@ async function main(config = {}) {
     processedCount++;
 
     // Merge resolved temp IDs
-    if (resolvedTemporaryIds) {
-      for (const [tempId, resolved] of Object.entries(resolvedTemporaryIds)) {
-        if (!temporaryIdMap.has(tempId)) {
-          temporaryIdMap.set(tempId, resolved);
-        }
-      }
+    for (const [tempId, resolved] of Object.entries(resolvedTemporaryIds ?? {})) {
+      if (!temporaryIdMap.has(tempId)) temporaryIdMap.set(tempId, resolved);
     }
 
     // Resolve and validate target repository
