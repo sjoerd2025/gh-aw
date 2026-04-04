@@ -135,31 +135,61 @@ func ResolveIncludePath(filePath, baseDir string, cache *ImportCache) (string, e
 	}
 
 	remoteLog.Printf("Using local file resolution for: %s", filePath)
-	// Regular path, resolve relative to base directory
-	fullPath := filepath.Join(baseDir, filePath)
 
-	// Security check: ensure the resolved path is within the .github folder
-	// baseDir should be .github or a subdirectory within it
-	githubFolder := baseDir
 	// Find the .github folder by traversing up from baseDir
-	for !strings.HasSuffix(githubFolder, ".github") && githubFolder != "." && githubFolder != "/" {
-		githubFolder = filepath.Dir(githubFolder)
-		if githubFolder == "." || githubFolder == "/" {
-			// If we can't find .github folder, use baseDir
+	githubFolder := baseDir
+	for !strings.HasSuffix(githubFolder, ".github") {
+		parent := filepath.Dir(githubFolder)
+		if parent == githubFolder || parent == "." || parent == "/" {
+			// Reached filesystem root without finding .github; fall back to baseDir
 			githubFolder = baseDir
 			break
 		}
+		githubFolder = parent
 	}
 
+	// Determine resolution base and security scope for the file path.
+	// Paths starting with ".github/" or "/" are repo-root-relative and are resolved
+	// from the repository root rather than from baseDir.
+	// Normalize path separators for reliable prefix matching across platforms.
+	resolveBase := baseDir
+	securityBase := githubFolder
+	if strings.HasSuffix(githubFolder, ".github") {
+		repoRoot := filepath.Dir(githubFolder)
+		filePathSlash := filepath.ToSlash(filePath)
+		if strings.HasPrefix(filePathSlash, ".github/") {
+			// .github/-prefixed path: resolve from repo root, security scope stays .github/
+			resolveBase = repoRoot
+		} else if stripped, ok := strings.CutPrefix(filePathSlash, "/"); ok {
+			// Repo-root-absolute path: only .github/ and .agents/ subdirectories are accessible.
+			if !strings.HasPrefix(stripped, ".github/") && !strings.HasPrefix(stripped, ".agents/") {
+				remoteLog.Printf("Security: Path not within .github or .agents: %s", filePath)
+				return "", fmt.Errorf("security: path %s must be within .github or .agents folder", filePath)
+			}
+			filePath = filepath.FromSlash(stripped)
+			resolveBase = repoRoot
+			if strings.HasPrefix(stripped, ".agents/") {
+				securityBase = filepath.Join(repoRoot, ".agents")
+			} else {
+				// .github/-prefixed: security scope is the .github folder.
+				securityBase = githubFolder
+			}
+		}
+	}
+
+	// Resolve path relative to resolveBase
+	fullPath := filepath.Join(resolveBase, filePath)
+
 	// Normalize paths for comparison
-	normalizedGithubFolder := filepath.Clean(githubFolder)
+	normalizedSecurityBase := filepath.Clean(securityBase)
 	normalizedFullPath := filepath.Clean(fullPath)
 
-	// Check if fullPath is within githubFolder
-	relativePath, err := filepath.Rel(normalizedGithubFolder, normalizedFullPath)
+	// Check if fullPath is within the security scope
+	relativePath, err := filepath.Rel(normalizedSecurityBase, normalizedFullPath)
 	if err != nil || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) || filepath.IsAbs(relativePath) {
-		remoteLog.Printf("Security: Path escapes .github folder: %s (resolves to: %s)", filePath, relativePath)
-		return "", fmt.Errorf("security: path %s must be within .github folder (resolves to: %s)", filePath, relativePath)
+		allowedFolder := filepath.Base(normalizedSecurityBase)
+		remoteLog.Printf("Security: Path escapes allowed folder: %s (resolves to: %s)", filePath, relativePath)
+		return "", fmt.Errorf("security: path %s must be within %s folder (resolves to: %s)", filePath, allowedFolder, relativePath)
 	}
 
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {

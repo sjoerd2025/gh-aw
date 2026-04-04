@@ -126,6 +126,30 @@ func TestResolveIncludePath(t *testing.T) {
 	err = os.WriteFile(regularFile, []byte("test"), 0644)
 	require.NoError(t, err, "should write regular file")
 
+	// Create a repo-like structure: <repoRoot>/.github/workflows/, .github/agents/ and .agents/
+	repoRoot := filepath.Join(tempDir, "repo")
+	workflowsDir := filepath.Join(repoRoot, ".github", "workflows")
+	agentsDir := filepath.Join(repoRoot, ".github", "agents")
+	dotAgentsDir := filepath.Join(repoRoot, ".agents")
+	err = os.MkdirAll(workflowsDir, 0755)
+	require.NoError(t, err, "should create workflows dir")
+	err = os.MkdirAll(agentsDir, 0755)
+	require.NoError(t, err, "should create agents dir")
+	err = os.MkdirAll(dotAgentsDir, 0755)
+	require.NoError(t, err, "should create .agents dir")
+
+	workflowFile := filepath.Join(workflowsDir, "workflow.md")
+	err = os.WriteFile(workflowFile, []byte("test"), 0644)
+	require.NoError(t, err, "should write workflow file")
+
+	agentFile := filepath.Join(agentsDir, "planner.md")
+	err = os.WriteFile(agentFile, []byte("test"), 0644)
+	require.NoError(t, err, "should write agent file")
+
+	dotAgentFile := filepath.Join(dotAgentsDir, "agent.md")
+	err = os.WriteFile(dotAgentFile, []byte("test"), 0644)
+	require.NoError(t, err, "should write .agents file")
+
 	tests := []struct {
 		name     string
 		filePath string
@@ -149,6 +173,355 @@ func TestResolveIncludePath(t *testing.T) {
 			name:     "absolute path outside base dir is rejected for security",
 			filePath: "/etc/passwd",
 			baseDir:  tempDir,
+			wantErr:  true,
+		},
+		{
+			name:     "dotgithub-prefixed path resolves from repo root",
+			filePath: ".github/agents/planner.md",
+			baseDir:  workflowsDir,
+			expected: agentFile,
+		},
+		{
+			name:     "slash-dotgithub-prefixed path resolves from repo root",
+			filePath: "/.github/agents/planner.md",
+			baseDir:  workflowsDir,
+			expected: agentFile,
+		},
+		{
+			name:     "slash-dotagents-prefixed path resolves from repo root",
+			filePath: "/.agents/agent.md",
+			baseDir:  workflowsDir,
+			expected: dotAgentFile,
+		},
+		{
+			name:     "slash-prefixed path outside .github or .agents is rejected",
+			filePath: "/agents/agent.md",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+		{
+			name:     "relative path in workflows dir still works unchanged",
+			filePath: "workflow.md",
+			baseDir:  workflowsDir,
+			expected: workflowFile,
+		},
+		{
+			name:     "dotgithub-prefixed path that escapes repo root is rejected",
+			filePath: ".github/../../../etc/passwd",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+		{
+			name:     "slash-prefixed path that escapes repo root is rejected",
+			filePath: "/../../../etc/passwd",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ResolveIncludePath(tt.filePath, tt.baseDir, nil)
+
+			if tt.wantErr {
+				assert.Error(t, err, "ResolveIncludePath(%q, %q) should return error", tt.filePath, tt.baseDir)
+				return
+			}
+
+			require.NoError(t, err, "ResolveIncludePath(%q, %q) should not error", tt.filePath, tt.baseDir)
+			assert.Equal(t, tt.expected, result, "ResolveIncludePath(%q, %q) result", tt.filePath, tt.baseDir)
+		})
+	}
+}
+
+// TestResolveIncludePath_DotGithubRepo tests import path resolution when the repository
+// itself is named ".github" (e.g. an org's `org/.github` repository).  In that case the
+// on-disk layout is <parent>/.github/.github/workflows/ and the traversal logic must
+// correctly treat the inner ".github" directory as the special folder and
+// <parent>/.github/ as the repository root.
+func TestResolveIncludePath_DotGithubRepo(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "test_resolve_dotgithub_repo")
+	require.NoError(t, err, "should create temp dir")
+	defer os.RemoveAll(tempDir)
+
+	// Simulate a repo whose name is ".github": the repo root is <tempDir>/.github
+	// and the GitHub Actions folder lives at <tempDir>/.github/.github/workflows/.
+	dotGithubRepoRoot := filepath.Join(tempDir, ".github")
+	workflowsDir := filepath.Join(dotGithubRepoRoot, ".github", "workflows")
+	agentsDir := filepath.Join(dotGithubRepoRoot, ".github", "agents")
+	dotAgentsDir := filepath.Join(dotGithubRepoRoot, ".agents")
+
+	for _, dir := range []string{workflowsDir, agentsDir, dotAgentsDir} {
+		require.NoError(t, os.MkdirAll(dir, 0755), "should create dir %s", dir)
+	}
+
+	workflowFile := filepath.Join(workflowsDir, "workflow.md")
+	agentFile := filepath.Join(agentsDir, "planner.md")
+	dotAgentFile := filepath.Join(dotAgentsDir, "agent.md")
+
+	require.NoError(t, os.WriteFile(workflowFile, []byte("workflow"), 0644), "should write workflow file")
+	require.NoError(t, os.WriteFile(agentFile, []byte("planner"), 0644), "should write agent file")
+	require.NoError(t, os.WriteFile(dotAgentFile, []byte("dot-agents"), 0644), "should write .agents file")
+
+	tests := []struct {
+		name     string
+		filePath string
+		baseDir  string
+		expected string
+		wantErr  bool
+	}{
+		{
+			name:     "relative path still resolves within workflows dir",
+			filePath: "workflow.md",
+			baseDir:  workflowsDir,
+			expected: workflowFile,
+		},
+		{
+			name:     "dotgithub-prefixed path resolves from repo root inside .github repo",
+			filePath: ".github/agents/planner.md",
+			baseDir:  workflowsDir,
+			expected: agentFile,
+		},
+		{
+			name:     "slash-dotgithub-prefixed path resolves from repo root inside .github repo",
+			filePath: "/.github/agents/planner.md",
+			baseDir:  workflowsDir,
+			expected: agentFile,
+		},
+		{
+			name:     "slash-dotagents-prefixed path resolves from repo root inside .github repo",
+			filePath: "/.agents/agent.md",
+			baseDir:  workflowsDir,
+			expected: dotAgentFile,
+		},
+		{
+			name:     "slash-prefixed path outside .github or .agents is rejected inside .github repo",
+			filePath: "/agents/agent.md",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+		{
+			name:     "dotgithub-prefixed traversal is rejected inside .github repo",
+			filePath: ".github/../../../etc/passwd",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+		{
+			name:     "slash-prefixed traversal is rejected inside .github repo",
+			filePath: "/../../../etc/passwd",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ResolveIncludePath(tt.filePath, tt.baseDir, nil)
+
+			if tt.wantErr {
+				assert.Error(t, err, "ResolveIncludePath(%q, %q) should return error", tt.filePath, tt.baseDir)
+				return
+			}
+
+			require.NoError(t, err, "ResolveIncludePath(%q, %q) should not error", tt.filePath, tt.baseDir)
+			assert.Equal(t, tt.expected, result, "ResolveIncludePath(%q, %q) result", tt.filePath, tt.baseDir)
+		})
+	}
+}
+
+// TestResolveIncludePath_AllPathStyles exercises every path style that
+// ResolveIncludePath must handle:
+//
+//   - Explicit current-dir-relative  ("./file.md")
+//   - Standard relative              ("file.md", "subdir/file.md")
+//   - .github/-prefixed repo-root    (".github/agents/planner.md")
+//   - /.github/-prefixed repo-root   ("/.github/agents/planner.md")
+//   - /.agents/-prefixed repo-root   ("/.agents/agent.md")
+//   - Multi-level nested paths       (".github/agents/sub/nested.md", "/.agents/sub/nested.md")
+//   - Intra-.github traversal        (".github/agents/../workflows/workflow.md")
+//   - Traversal that escapes scope   (".github/../../../etc/passwd")
+//   - / prefix outside .github/.agents (rejected)
+//   - baseDir without .github parent (plain relative fallback)
+//   - Windows-style backslash paths  (normalized via filepath.ToSlash on Windows)
+func TestResolveIncludePath_AllPathStyles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "test_all_path_styles")
+	require.NoError(t, err, "should create temp dir")
+	defer os.RemoveAll(tempDir)
+
+	// Build a full repo layout:
+	//   <tempDir>/repo/
+	//     .github/
+	//       workflows/
+	//         workflow.md
+	//         sub/
+	//           nested.md
+	//       agents/
+	//         planner.md
+	//         sub/
+	//           nested.md
+	//     .agents/
+	//       agent.md
+	//       sub/
+	//         nested.md
+	repoRoot := filepath.Join(tempDir, "repo")
+	workflowsDir := filepath.Join(repoRoot, ".github", "workflows")
+	workflowsSubDir := filepath.Join(workflowsDir, "sub")
+	agentsDir := filepath.Join(repoRoot, ".github", "agents")
+	agentsSubDir := filepath.Join(agentsDir, "sub")
+	dotAgentsDir := filepath.Join(repoRoot, ".agents")
+	dotAgentsSubDir := filepath.Join(dotAgentsDir, "sub")
+
+	for _, dir := range []string{workflowsSubDir, agentsSubDir, dotAgentsSubDir} {
+		require.NoError(t, os.MkdirAll(dir, 0755), "should create dir %s", dir)
+	}
+
+	workflowFile := filepath.Join(workflowsDir, "workflow.md")
+	workflowNestedFile := filepath.Join(workflowsSubDir, "nested.md")
+	agentFile := filepath.Join(agentsDir, "planner.md")
+	agentNestedFile := filepath.Join(agentsSubDir, "nested.md")
+	dotAgentFile := filepath.Join(dotAgentsDir, "agent.md")
+	dotAgentNestedFile := filepath.Join(dotAgentsSubDir, "nested.md")
+
+	for _, f := range []string{workflowFile, workflowNestedFile, agentFile, agentNestedFile, dotAgentFile, dotAgentNestedFile} {
+		require.NoError(t, os.WriteFile(f, []byte("test"), 0644), "should write %s", f)
+	}
+
+	// A directory outside any .github tree for the "no ancestor" tests.
+	noGithubDir := filepath.Join(tempDir, "standalone")
+	require.NoError(t, os.MkdirAll(noGithubDir, 0755), "should create standalone dir")
+	standaloneFile := filepath.Join(noGithubDir, "helper.md")
+	require.NoError(t, os.WriteFile(standaloneFile, []byte("test"), 0644), "should write standalone file")
+
+	tests := []struct {
+		name     string
+		filePath string
+		baseDir  string
+		expected string
+		wantErr  bool
+	}{
+		// ── Standard relative paths ─────────────────────────────────────────────
+		{
+			name:     "bare filename relative to baseDir",
+			filePath: "workflow.md",
+			baseDir:  workflowsDir,
+			expected: workflowFile,
+		},
+		{
+			name:     "explicit dot-slash prefix",
+			filePath: "./workflow.md",
+			baseDir:  workflowsDir,
+			expected: workflowFile,
+		},
+		{
+			name:     "relative subdir path",
+			filePath: "sub/nested.md",
+			baseDir:  workflowsDir,
+			expected: workflowNestedFile,
+		},
+
+		// ── .github/-prefixed repo-root paths ───────────────────────────────────
+		{
+			name:     ".github/agents/planner.md resolves from repo root",
+			filePath: ".github/agents/planner.md",
+			baseDir:  workflowsDir,
+			expected: agentFile,
+		},
+		{
+			name:     ".github/agents/sub/nested.md resolves from repo root",
+			filePath: ".github/agents/sub/nested.md",
+			baseDir:  workflowsDir,
+			expected: agentNestedFile,
+		},
+		{
+			name:     ".github/workflows/workflow.md accessible via .github prefix",
+			filePath: ".github/workflows/workflow.md",
+			baseDir:  workflowsDir,
+			expected: workflowFile,
+		},
+		{
+			name:     "intra-.github traversal stays within scope",
+			filePath: ".github/agents/../workflows/workflow.md",
+			baseDir:  workflowsDir,
+			expected: workflowFile,
+		},
+
+		// ── /.github/-prefixed repo-root paths ──────────────────────────────────
+		{
+			name:     "/.github/agents/planner.md resolves from repo root",
+			filePath: "/.github/agents/planner.md",
+			baseDir:  workflowsDir,
+			expected: agentFile,
+		},
+		{
+			name:     "/.github/agents/sub/nested.md resolves from repo root",
+			filePath: "/.github/agents/sub/nested.md",
+			baseDir:  workflowsDir,
+			expected: agentNestedFile,
+		},
+		{
+			name:     "/.github/workflows/workflow.md accessible via slash prefix",
+			filePath: "/.github/workflows/workflow.md",
+			baseDir:  workflowsDir,
+			expected: workflowFile,
+		},
+
+		// ── /.agents/-prefixed repo-root paths ──────────────────────────────────
+		{
+			name:     "/.agents/agent.md resolves from repo root",
+			filePath: "/.agents/agent.md",
+			baseDir:  workflowsDir,
+			expected: dotAgentFile,
+		},
+		{
+			name:     "/.agents/sub/nested.md resolves from repo root",
+			filePath: "/.agents/sub/nested.md",
+			baseDir:  workflowsDir,
+			expected: dotAgentNestedFile,
+		},
+
+		// ── Security: traversal attempts ────────────────────────────────────────
+		{
+			name:     ".github prefix that escapes repo root is rejected",
+			filePath: ".github/../../../etc/passwd",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+		{
+			name:     "/.github prefix that escapes repo root is rejected",
+			filePath: "/.github/../../../etc/passwd",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+		{
+			name:     "/.agents prefix that escapes scope is rejected",
+			filePath: "/.agents/../../../etc/passwd",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+		{
+			name:     "slash prefix to disallowed top-level directory is rejected",
+			filePath: "/src/main.go",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+		{
+			name:     "slash prefix to /etc/passwd is rejected",
+			filePath: "/etc/passwd",
+			baseDir:  workflowsDir,
+			wantErr:  true,
+		},
+
+		// ── baseDir without a .github ancestor (plain relative fallback) ─────────
+		{
+			name:     "relative path from non-.github baseDir resolves locally",
+			filePath: "helper.md",
+			baseDir:  noGithubDir,
+			expected: standaloneFile,
+		},
+		{
+			name:     "missing file from non-.github baseDir returns error",
+			filePath: "missing.md",
+			baseDir:  noGithubDir,
 			wantErr:  true,
 		},
 	}

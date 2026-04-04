@@ -68,23 +68,48 @@ func ResolveIncludePath(filePath, baseDir string, cache *ImportCache) (string, e
 		return "", fmt.Errorf("remote imports not available in Wasm: %s", filePath)
 	}
 
-	fullPath := filepath.Join(baseDir, filePath)
-
 	githubFolder := baseDir
-	for !strings.HasSuffix(githubFolder, ".github") && githubFolder != "." && githubFolder != "/" {
-		githubFolder = filepath.Dir(githubFolder)
-		if githubFolder == "." || githubFolder == "/" {
+	for !strings.HasSuffix(githubFolder, ".github") {
+		parent := filepath.Dir(githubFolder)
+		if parent == githubFolder || parent == "." || parent == "/" {
 			githubFolder = baseDir
 			break
 		}
+		githubFolder = parent
 	}
 
-	normalizedGithubFolder := filepath.Clean(githubFolder)
+	resolveBase := baseDir
+	securityBase := githubFolder
+	if strings.HasSuffix(githubFolder, ".github") {
+		repoRoot := filepath.Dir(githubFolder)
+		filePathSlash := filepath.ToSlash(filePath)
+		if strings.HasPrefix(filePathSlash, ".github/") {
+			resolveBase = repoRoot
+		} else if stripped, ok := strings.CutPrefix(filePathSlash, "/"); ok {
+			// Repo-root-absolute path: only .github/ and .agents/ subdirectories are accessible.
+			if !strings.HasPrefix(stripped, ".github/") && !strings.HasPrefix(stripped, ".agents/") {
+				return "", fmt.Errorf("security: path %s must be within .github or .agents folder", filePath)
+			}
+			filePath = filepath.FromSlash(stripped)
+			resolveBase = repoRoot
+			if strings.HasPrefix(stripped, ".agents/") {
+				securityBase = filepath.Join(repoRoot, ".agents")
+			} else {
+				// .github/-prefixed: security scope is the .github folder.
+				securityBase = githubFolder
+			}
+		}
+	}
+
+	fullPath := filepath.Join(resolveBase, filePath)
+
+	normalizedSecurityBase := filepath.Clean(securityBase)
 	normalizedFullPath := filepath.Clean(fullPath)
 
-	relativePath, err := filepath.Rel(normalizedGithubFolder, normalizedFullPath)
+	relativePath, err := filepath.Rel(normalizedSecurityBase, normalizedFullPath)
 	if err != nil || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) || filepath.IsAbs(relativePath) {
-		return "", fmt.Errorf("security: path %s must be within .github folder (resolves to: %s)", filePath, relativePath)
+		allowedFolder := filepath.Base(normalizedSecurityBase)
+		return "", fmt.Errorf("security: path %s must be within %s folder (resolves to: %s)", filePath, allowedFolder, relativePath)
 	}
 
 	// In wasm builds, check the virtual filesystem first
