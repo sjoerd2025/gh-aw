@@ -788,6 +788,8 @@ describe("sendJobSetupSpan", () => {
     "GITHUB_ACTOR",
     "GITHUB_REPOSITORY",
     "GITHUB_EVENT_NAME",
+    "GITHUB_REF",
+    "GITHUB_SHA",
     "GH_AW_INFO_VERSION",
   ];
   let mkdirSpy, appendSpy;
@@ -1028,6 +1030,62 @@ describe("sendJobSetupSpan", () => {
     expect(resourceKeys).not.toContain("github.event_name");
   });
 
+  it("includes github.ref as resource attribute when GITHUB_REF is set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+    process.env.GITHUB_REF = "refs/heads/main";
+
+    await sendJobSetupSpan();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const resourceAttrs = body.resourceSpans[0].resource.attributes;
+    expect(resourceAttrs).toContainEqual({ key: "github.ref", value: { stringValue: "refs/heads/main" } });
+  });
+
+  it("omits github.ref resource attribute when GITHUB_REF is not set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+
+    await sendJobSetupSpan();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const resourceAttrs = body.resourceSpans[0].resource.attributes;
+    const resourceKeys = resourceAttrs.map(a => a.key);
+    expect(resourceKeys).not.toContain("github.ref");
+  });
+
+  it("includes github.sha as resource attribute when GITHUB_SHA is set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+    process.env.GITHUB_SHA = "abc1234567890def";
+
+    await sendJobSetupSpan();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const resourceAttrs = body.resourceSpans[0].resource.attributes;
+    expect(resourceAttrs).toContainEqual({ key: "github.sha", value: { stringValue: "abc1234567890def" } });
+  });
+
+  it("omits github.sha resource attribute when GITHUB_SHA is not set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+
+    await sendJobSetupSpan();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const resourceAttrs = body.resourceSpans[0].resource.attributes;
+    const resourceKeys = resourceAttrs.map(a => a.key);
+    expect(resourceKeys).not.toContain("github.sha");
+  });
+
   it("includes github.actions.run_url as resource attribute when repository and run_id are set", async () => {
     const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
     vi.stubGlobal("fetch", mockFetch);
@@ -1197,6 +1255,8 @@ describe("sendJobConclusionSpan", () => {
     "GITHUB_ACTOR",
     "GITHUB_REPOSITORY",
     "GITHUB_EVENT_NAME",
+    "GITHUB_REF",
+    "GITHUB_SHA",
     "INPUT_JOB_NAME",
     "GH_AW_AGENT_CONCLUSION",
   ];
@@ -1419,6 +1479,62 @@ describe("sendJobConclusionSpan", () => {
     const resourceAttrs = body.resourceSpans[0].resource.attributes;
     const resourceKeys = resourceAttrs.map(a => a.key);
     expect(resourceKeys).not.toContain("github.event_name");
+  });
+
+  it("includes github.ref as resource attribute when GITHUB_REF is set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+    process.env.GITHUB_REF = "refs/heads/main";
+
+    await sendJobConclusionSpan("gh-aw.job.conclusion");
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const resourceAttrs = body.resourceSpans[0].resource.attributes;
+    expect(resourceAttrs).toContainEqual({ key: "github.ref", value: { stringValue: "refs/heads/main" } });
+  });
+
+  it("omits github.ref resource attribute when GITHUB_REF is not set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+
+    await sendJobConclusionSpan("gh-aw.job.conclusion");
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const resourceAttrs = body.resourceSpans[0].resource.attributes;
+    const resourceKeys = resourceAttrs.map(a => a.key);
+    expect(resourceKeys).not.toContain("github.ref");
+  });
+
+  it("includes github.sha as resource attribute when GITHUB_SHA is set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+    process.env.GITHUB_SHA = "abc1234567890def";
+
+    await sendJobConclusionSpan("gh-aw.job.conclusion");
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const resourceAttrs = body.resourceSpans[0].resource.attributes;
+    expect(resourceAttrs).toContainEqual({ key: "github.sha", value: { stringValue: "abc1234567890def" } });
+  });
+
+  it("omits github.sha resource attribute when GITHUB_SHA is not set", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, statusText: "OK" });
+    vi.stubGlobal("fetch", mockFetch);
+
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+
+    await sendJobConclusionSpan("gh-aw.job.conclusion");
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const resourceAttrs = body.resourceSpans[0].resource.attributes;
+    const resourceKeys = resourceAttrs.map(a => a.key);
+    expect(resourceKeys).not.toContain("github.sha");
   });
 
   it("includes github.actions.run_url as resource attribute when repository and run_id are set", async () => {
