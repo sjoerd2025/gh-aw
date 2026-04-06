@@ -18,6 +18,7 @@ type toolsProcessingResult struct {
 	tools                 map[string]any
 	resolvedMCPServers    map[string]any // fully merged mcp-servers from main workflow and all imports
 	runtimes              map[string]any
+	runInstallScripts     bool // true when run-install-scripts: true is set (globally or per node runtime, from main + imports)
 	toolsTimeout          string
 	toolsStartupTimeout   string
 	markdownContent       string
@@ -155,6 +156,10 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		orchestratorToolsLog.Printf("Runtimes merge failed: %v", err)
 		return nil, fmt.Errorf("failed to merge runtimes: %w", err)
 	}
+
+	// Resolve run-install-scripts setting: true if global run-install-scripts is set, or if the node runtime
+	// has run-install-scripts: true, or if any imported workflow sets run-install-scripts (global or node-level).
+	runInstallScripts := resolveRunInstallScripts(result.Frontmatter, runtimes, importsResult.MergedRunInstallScripts)
 
 	// Warn on deprecated APM configuration fields that are now ignored
 	if _, hasDependencies := result.Frontmatter["dependencies"]; hasDependencies {
@@ -298,6 +303,7 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		tools:                 tools,
 		resolvedMCPServers:    allMCPServers,
 		runtimes:              runtimes,
+		runInstallScripts:     runInstallScripts,
 		toolsTimeout:          toolsTimeout,
 		toolsStartupTimeout:   toolsStartupTimeout,
 		markdownContent:       markdownContent,

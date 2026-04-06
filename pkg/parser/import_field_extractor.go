@@ -44,6 +44,7 @@ type importAccumulator struct {
 	skipBotsSet              map[string]bool
 	caches                   []string
 	features                 []map[string]any
+	runInstallScripts        bool // true if any imported workflow sets run-install-scripts: true (global or node-level)
 	agentFile                string
 	agentImportSpec          string
 	repositoryImports        []string
@@ -351,6 +352,33 @@ func (acc *importAccumulator) extractAllImportFields(content []byte, item import
 		}
 	}
 
+	// Extract run-install-scripts flag from imported file.
+	// If global run-install-scripts: true is set OR if runtimes.node.run-install-scripts: true is set,
+	// propagate to the accumulator (OR semantics: any import enabling it enables it overall).
+	if !acc.runInstallScripts {
+		if rsAny, hasRS := fm["run-install-scripts"]; hasRS {
+			if rsBool, ok := rsAny.(bool); ok && rsBool {
+				acc.runInstallScripts = true
+				log.Printf("Extracted run-install-scripts: true from import: %s", item.fullPath)
+			}
+		}
+		// Also check runtimes.node.run-install-scripts
+		if runtimesAny, hasRuntimes := fm["runtimes"]; hasRuntimes {
+			if runtimesMap, ok := runtimesAny.(map[string]any); ok {
+				if nodeAny, hasNode := runtimesMap["node"]; hasNode {
+					if nodeMap, ok := nodeAny.(map[string]any); ok {
+						if rsAny, hasRS := nodeMap["run-install-scripts"]; hasRS {
+							if rsBool, ok := rsAny.(bool); ok && rsBool {
+								acc.runInstallScripts = true
+								log.Printf("Extracted runtimes.node.run-install-scripts: true from import: %s", item.fullPath)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Extract observability from imported file (first-wins: only set if not yet populated).
 	// This ensures an imported workflow's OTLP config is visible to injectOTLPConfig even
 	// when the main workflow's frontmatter does not contain an observability section.
@@ -381,6 +409,7 @@ func (acc *importAccumulator) toImportsResult(topologicalOrder []string) *Import
 		MergedSteps:                 acc.stepsBuilder.String(),
 		CopilotSetupSteps:           acc.copilotSetupStepsBuilder.String(),
 		MergedRuntimes:              acc.runtimesBuilder.String(),
+		MergedRunInstallScripts:     acc.runInstallScripts,
 		MergedServices:              acc.servicesBuilder.String(),
 		MergedNetwork:               acc.networkBuilder.String(),
 		MergedPermissions:           acc.permissionsBuilder.String(),
