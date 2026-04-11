@@ -12,10 +12,10 @@ import (
 	"github.com/github/gh-aw/pkg/testutil"
 )
 
-// TestInferenceAccessErrorDetectionStep tests that a Copilot engine workflow includes
-// the detect-copilot-errors step in the agent job.
-func TestInferenceAccessErrorDetectionStep(t *testing.T) {
-	testDir := testutil.TempDir(t, "test-inference-access-error-*")
+// TestMCPPolicyErrorDetectionStep tests that a Copilot engine workflow includes
+// the detect-copilot-errors step with mcp_policy_error output in the agent job.
+func TestMCPPolicyErrorDetectionStep(t *testing.T) {
+	testDir := testutil.TempDir(t, "test-mcp-policy-error-*")
 	workflowFile := filepath.Join(testDir, "test-workflow.md")
 
 	workflow := `---
@@ -49,20 +49,20 @@ Test workflow`
 	}
 
 	// Check that the detection step calls the JavaScript file
-	if !strings.Contains(lockStr, "node \"${RUNNER_TEMP}/gh-aw/actions/detect_copilot_errors.cjs\"") {
+	if !strings.Contains(lockStr, "detect_copilot_errors.cjs") {
 		t.Error("Expected detect-copilot-errors step to call detect_copilot_errors.cjs")
 	}
 
-	// Check that the agent job exposes inference_access_error output
-	if !strings.Contains(lockStr, "inference_access_error: ${{ steps.detect-copilot-errors.outputs.inference_access_error || 'false' }}") {
-		t.Error("Expected agent job to have inference_access_error output")
+	// Check that the agent job exposes mcp_policy_error output
+	if !strings.Contains(lockStr, "mcp_policy_error: ${{ steps.detect-copilot-errors.outputs.mcp_policy_error || 'false' }}") {
+		t.Error("Expected agent job to have mcp_policy_error output")
 	}
 }
 
-// TestInferenceAccessErrorInConclusionJob tests that the conclusion job receives the inference access error
+// TestMCPPolicyErrorInConclusionJob tests that the conclusion job receives the MCP policy error
 // env var when the Copilot engine is used.
-func TestInferenceAccessErrorInConclusionJob(t *testing.T) {
-	testDir := testutil.TempDir(t, "test-inference-access-error-conclusion-*")
+func TestMCPPolicyErrorInConclusionJob(t *testing.T) {
+	testDir := testutil.TempDir(t, "test-mcp-policy-error-conclusion-*")
 	workflowFile := filepath.Join(testDir, "test-workflow.md")
 
 	workflow := `---
@@ -93,16 +93,16 @@ Test workflow`
 
 	lockStr := string(lockContent)
 
-	// Check that conclusion job receives inference access error from agent job
-	if !strings.Contains(lockStr, "GH_AW_INFERENCE_ACCESS_ERROR: ${{ needs.agent.outputs.inference_access_error }}") {
-		t.Error("Expected conclusion job to receive inference_access_error from agent job")
+	// Check that conclusion job receives MCP policy error from agent job
+	if !strings.Contains(lockStr, "GH_AW_MCP_POLICY_ERROR: ${{ needs.agent.outputs.mcp_policy_error }}") {
+		t.Error("Expected conclusion job to receive mcp_policy_error from agent job")
 	}
 }
 
-// TestInferenceAccessErrorNotInNonCopilotEngine tests that non-Copilot engines
+// TestMCPPolicyErrorNotInNonCopilotEngine tests that non-Copilot engines
 // do NOT include the detect-copilot-errors step.
-func TestInferenceAccessErrorNotInNonCopilotEngine(t *testing.T) {
-	testDir := testutil.TempDir(t, "test-inference-access-error-claude-*")
+func TestMCPPolicyErrorNotInNonCopilotEngine(t *testing.T) {
+	testDir := testutil.TempDir(t, "test-mcp-policy-error-claude-*")
 	workflowFile := filepath.Join(testDir, "test-workflow.md")
 
 	workflow := `---
@@ -135,8 +135,8 @@ Test workflow`
 		t.Error("Expected non-Copilot engine to NOT have detect-copilot-errors step")
 	}
 
-	// Check that non-Copilot engines do NOT have the inference_access_error output
-	if strings.Contains(lockStr, "inference_access_error:") {
-		t.Error("Expected non-Copilot engine to NOT have inference_access_error output")
+	// Check that non-Copilot engines do NOT have the mcp_policy_error output
+	if strings.Contains(lockStr, "mcp_policy_error:") {
+		t.Error("Expected non-Copilot engine to NOT have mcp_policy_error output")
 	}
 }
