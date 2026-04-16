@@ -7,7 +7,7 @@
  * Each CLI wrapper is a thin bash script that invokes this bridge with the
  * server configuration and user-provided command + arguments.
  *
- * Protocol flow: initialize → notifications/initialized → tools/call
+ * Protocol flow: initialize → notifications/initialized → (periodic ping) → tools/call
  *
  * All interactions are logged via core.* (shim.cjs) to console and
  * appended as JSONL entries to /tmp/gh-aw/mcp-cli-audit/<server>.jsonl
@@ -45,6 +45,12 @@ const TOOL_CALL_TIMEOUT_MS = 120000;
 
 /** Timeout (ms) for the notifications/initialized handshake step */
 const NOTIFY_TIMEOUT_MS = 10000;
+
+/** Interval (ms) for MCP keepalive pings during long-running tool calls */
+const KEEPALIVE_PING_INTERVAL_MS = 10000;
+
+/** Starting JSON-RPC ID for keepalive ping requests */
+const KEEPALIVE_PING_ID_START = 1000;
 
 // ---------------------------------------------------------------------------
 // Audit logging
@@ -291,6 +297,86 @@ async function mcpToolsCall(serverUrl, apiKey, sessionId, toolName, toolArgs, se
   });
 
   return resp;
+}
+
+/**
+ * Start periodic MCP ping requests to keep a session alive while a tool call runs.
+ *
+ * @param {string} serverUrl - HTTP URL of the MCP server endpoint
+ * @param {string} apiKey - Bearer token for gateway authentication
+ * @param {string} sessionId - Session ID from initialize (required for keepalive)
+ * @param {string} serverName - Server name (for logging/auditing)
+ * @returns {() => void} Stop function to clear the ping timer
+ */
+function startMcpKeepalivePings(serverUrl, apiKey, sessionId, serverName) {
+  const core = global.core;
+
+  if (!sessionId) {
+    core.warning(`[${serverName}] MCP keepalive disabled: no sessionId`);
+    return () => {};
+  }
+
+  /** @type {Record<string, string>} */
+  const headers = {
+    Authorization: apiKey,
+    "Mcp-Session-Id": sessionId,
+  };
+
+  let stopped = false;
+  let pingId = KEEPALIVE_PING_ID_START;
+  /** @type {NodeJS.Timeout | null} */
+  let nextTimer = null;
+
+  const runPing = async () => {
+    if (stopped) {
+      return;
+    }
+    const startMs = Date.now();
+    const currentPingId = pingId++;
+
+    try {
+      await httpPostJSON(
+        serverUrl,
+        headers,
+        {
+          jsonrpc: "2.0",
+          id: currentPingId,
+          method: "ping",
+        },
+        DEFAULT_HTTP_TIMEOUT_MS
+      );
+
+      const elapsedMs = Date.now() - startMs;
+      core.info(`[${serverName}] MCP keepalive ping: id=${currentPingId}, elapsed=${elapsedMs}ms`);
+      auditLog(serverName, { event: "keepalive_ping_done", pingId: currentPingId, elapsedMs });
+    } catch (err) {
+      const elapsedMs = Date.now() - startMs;
+      const message = err instanceof Error ? err.message : String(err);
+      core.warning(`[${serverName}] MCP keepalive ping failed: ${message}`);
+      auditLog(serverName, { event: "keepalive_ping_error", pingId: currentPingId, error: message, elapsedMs });
+    }
+    if (!stopped) {
+      nextTimer = setTimeout(runPing, KEEPALIVE_PING_INTERVAL_MS);
+    }
+  };
+
+  nextTimer = setTimeout(runPing, KEEPALIVE_PING_INTERVAL_MS);
+
+  auditLog(serverName, { event: "keepalive_started", intervalMs: KEEPALIVE_PING_INTERVAL_MS });
+  core.info(`[${serverName}] MCP keepalive started (interval=${KEEPALIVE_PING_INTERVAL_MS}ms)`);
+
+  return () => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    if (nextTimer) {
+      clearTimeout(nextTimer);
+      nextTimer = null;
+    }
+    auditLog(serverName, { event: "keepalive_stopped" });
+    core.info(`[${serverName}] MCP keepalive stopped`);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -578,11 +664,14 @@ async function main() {
   auditLog(serverName, { event: "call_start", tool: toolName, arguments: toolArgs });
 
   const callStartMs = Date.now();
+  /** @type {(() => void) | null} */
+  let stopKeepalive = null;
 
   try {
     // MCP session protocol: initialize → notifications/initialized → tools/call
     const sessionId = await mcpInitialize(serverUrl, apiKey, serverName);
     await mcpNotifyInitialized(serverUrl, apiKey, sessionId, serverName);
+    stopKeepalive = startMcpKeepalivePings(serverUrl, apiKey, sessionId, serverName);
     const resp = await mcpToolsCall(serverUrl, apiKey, sessionId, toolName, toolArgs, serverName);
 
     const totalMs = Date.now() - callStartMs;
@@ -607,6 +696,8 @@ async function main() {
     });
     process.stderr.write(`Error: ${message}\n`);
     process.exitCode = 1;
+  } finally {
+    stopKeepalive?.();
   }
 }
 
