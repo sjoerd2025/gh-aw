@@ -52,7 +52,7 @@ on: push
 on: push
 ---
 # No Engine Workflow`,
-			expectedSecretName: "COPILOT_GITHUB_TOKEN", // Defaults to copilot
+			expectedSecretName: "GEMINI_API_KEY", // Defaults to gemini
 			expectNil:          false,
 		},
 	}
@@ -222,15 +222,18 @@ on: push
 
 		secrets := getSecretsRequirementsForWorkflows([]string{workflowWithEngine, workflowWithoutEngine})
 
-		// Count engine secrets (should only have Copilot)
-		engineSecretCount := 0
+		// Collect engine-secret names. With the default engine now gemini, the
+		// engineless workflow contributes GEMINI_API_KEY while the explicit
+		// copilot workflow contributes COPILOT_GITHUB_TOKEN.
+		engineSecretNames := map[string]bool{}
 		for _, secret := range secrets {
 			if secret.IsEngineSecret {
-				engineSecretCount++
-				assert.Equal(t, "COPILOT_GITHUB_TOKEN", secret.Name, "Should only have Copilot secret")
+				engineSecretNames[secret.Name] = true
 			}
 		}
 
-		assert.Equal(t, 1, engineSecretCount, "Should have exactly one engine secret")
+		assert.True(t, engineSecretNames["COPILOT_GITHUB_TOKEN"], "Should include Copilot secret from explicit engine")
+		assert.True(t, engineSecretNames["GEMINI_API_KEY"], "Should include Gemini secret from default engine")
+		assert.Equal(t, 2, len(engineSecretNames), "Should have exactly two distinct engine secrets")
 	})
 }
