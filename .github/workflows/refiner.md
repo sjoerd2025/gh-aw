@@ -6,7 +6,7 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-engine: copilot
+engine: gemini
 imports:
   - shared/github-guard-policy.md
 tools:

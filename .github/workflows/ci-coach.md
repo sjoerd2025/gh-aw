@@ -10,7 +10,7 @@ permissions:
   pull-requests: read
   issues: read
 tracker-id: ci-coach-daily
-engine: copilot
+engine: gemini
 tools:
   mount-as-clis: true
   github:

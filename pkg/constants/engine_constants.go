@@ -24,8 +24,8 @@ const (
 	CrushEngine EngineName = "crush"
 
 	// DefaultEngine is the default agentic engine used when no engine is explicitly specified.
-	// Currently defaults to CopilotEngine.
-	DefaultEngine EngineName = CopilotEngine
+	// Currently defaults to GeminiEngine.
+	DefaultEngine EngineName = GeminiEngine
 )
 
 // AgenticEngines lists all supported agentic engine names.

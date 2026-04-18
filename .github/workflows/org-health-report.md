@@ -9,7 +9,7 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
-engine: copilot
+engine: gemini
 tools:
   mount-as-clis: true
   github:

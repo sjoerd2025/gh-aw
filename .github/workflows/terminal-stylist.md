@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
 
-engine: copilot
+engine: gemini
 
 timeout-minutes: 10
 

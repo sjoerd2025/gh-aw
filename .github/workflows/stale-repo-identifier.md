@@ -20,7 +20,7 @@ permissions:
 concurrency:
   job-discriminator: ${{ inputs.organization || github.run_id }}
 
-engine: copilot
+engine: gemini
 strict: true
 timeout-minutes: 45
 

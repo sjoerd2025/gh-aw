@@ -8,7 +8,7 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
-engine: copilot
+engine: gemini
 tools:
   mount-as-clis: true
   edit:
@@ -230,7 +230,7 @@ on:
 permissions:
   contents: read
   issues: write
-engine: copilot
+engine: gemini
 tools:
   github:
     toolsets: [default]

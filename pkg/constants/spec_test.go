@@ -28,8 +28,8 @@ func TestSpec_EngineConstants_NameValues(t *testing.T) {
 		{name: "CodexEngine value", constant: constants.CodexEngine, expected: "codex"},
 		// From spec: constants.GeminiEngine // "gemini"
 		{name: "GeminiEngine value", constant: constants.GeminiEngine, expected: "gemini"},
-		// From spec: constants.DefaultEngine // "copilot"
-		{name: "DefaultEngine is copilot", constant: constants.DefaultEngine, expected: "copilot"},
+		// From spec: constants.DefaultEngine // "gemini"
+		{name: "DefaultEngine is gemini", constant: constants.DefaultEngine, expected: "gemini"},
 	}
 
 	for _, tt := range tests {

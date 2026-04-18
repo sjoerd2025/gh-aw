@@ -10,7 +10,7 @@ permissions:
   actions: read
   discussions: read
 
-engine: copilot
+engine: gemini
 
 network:
   allowed:

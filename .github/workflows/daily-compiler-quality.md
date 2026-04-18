@@ -10,7 +10,7 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: daily-compiler-quality
-engine: copilot
+engine: gemini
 imports:
   - uses: shared/daily-audit-base.md
     with:

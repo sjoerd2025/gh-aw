@@ -13,7 +13,7 @@ permissions:
   pull-requests: read
   actions: read
 
-engine: copilot
+engine: gemini
 
 network:
   allowed:

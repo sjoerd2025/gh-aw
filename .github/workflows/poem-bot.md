@@ -26,7 +26,7 @@ permissions:
 
 # AI engine configuration
 engine:
-  id: copilot
+  id: gemini
   model: gpt-5
   bare: true
 

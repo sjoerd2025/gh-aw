@@ -14,7 +14,7 @@ permissions:
 
 tracker-id: daily-file-diet
 engine:
-  id: copilot
+  id: gemini
   agent: "developer.instructions"
 
 imports:

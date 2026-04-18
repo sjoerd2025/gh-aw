@@ -39,14 +39,14 @@ Changed the workflow frontmatter field `engine` to require an object instead of 
 If you have workflows using the old string format for the `engine` field:
 
 ```yaml
-engine: copilot
+engine: gemini
 ```
 
 Update them to use the new object format:
 
 ```yaml
 engine:
-  id: copilot
+  id: gemini
 ```
 
 This change applies to all workflows using the `engine` field in their frontmatter.

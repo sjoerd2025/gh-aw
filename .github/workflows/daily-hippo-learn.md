@@ -14,7 +14,7 @@ permissions:
 
 tracker-id: daily-hippo-learn
 engine:
-  id: copilot
+  id: gemini
   bare: true
 
 timeout-minutes: 30

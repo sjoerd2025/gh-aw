@@ -22,7 +22,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine: gemini
 strict: true
 network:
   allowed:

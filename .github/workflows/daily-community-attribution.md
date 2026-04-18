@@ -12,7 +12,7 @@ permissions:
   issues: read
 
 engine:
-  id: copilot
+  id: gemini
   model: claude-haiku-4-5
 timeout-minutes: 30
 

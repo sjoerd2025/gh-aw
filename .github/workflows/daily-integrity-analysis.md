@@ -13,7 +13,7 @@ permissions:
   discussions: read
 
 tracker-id: daily-integrity-analysis
-engine: copilot
+engine: gemini
 
 steps:
   - name: Install gh-aw CLI

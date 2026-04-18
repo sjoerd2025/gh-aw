@@ -10,7 +10,7 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: copilot-token-audit
-engine: copilot
+engine: gemini
 tools:
   mount-as-clis: true
   agentic-workflows:

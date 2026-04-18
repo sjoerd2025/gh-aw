@@ -23,7 +23,7 @@ permissions:
   contents: read
   security-events: read
 
-engine: copilot
+engine: gemini
 
 safe-outputs:
   create-issue:

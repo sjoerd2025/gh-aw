@@ -9,7 +9,7 @@ permissions:
   pull-requests: read
 strict: true
 tracker-id: weekly-editors-health-check
-engine: copilot
+engine: gemini
 timeout-minutes: 30
 
 network:

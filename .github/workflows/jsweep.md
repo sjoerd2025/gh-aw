@@ -9,7 +9,7 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: jsweep-daily
-engine: copilot
+engine: gemini
 runtimes:
   node:
     version: "20"

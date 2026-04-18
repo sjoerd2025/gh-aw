@@ -8,7 +8,7 @@ permissions:
   actions: read
   security-events: read
 tracker-id: malicious-code-scan
-engine: copilot
+engine: gemini
 safe-outputs:
   create-code-scanning-alert:
     driver: "Malicious Code Scanner"

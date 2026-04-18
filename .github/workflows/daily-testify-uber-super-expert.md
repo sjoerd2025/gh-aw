@@ -12,7 +12,7 @@ permissions:
   pull-requests: read
 
 tracker-id: daily-testify-uber-super-expert
-engine: copilot
+engine: gemini
 
 imports:
   - shared/activation-app.md

@@ -13,7 +13,7 @@ permissions:
   issues: read
   pull-requests: read
 
-engine: copilot
+engine: gemini
 
 imports:
   - shared/ffmpeg.md

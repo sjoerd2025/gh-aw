@@ -9,7 +9,7 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: portfolio-analyst-weekly
-engine: copilot
+engine: gemini
 network:
   allowed: [python]
 tools:

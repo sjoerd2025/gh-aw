@@ -21,7 +21,7 @@ permissions:
   pull-requests: read
   actions: read
   issues: read
-engine: copilot
+engine: gemini
 timeout-minutes: 20
 network:
   allowed:

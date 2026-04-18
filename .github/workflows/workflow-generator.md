@@ -13,7 +13,7 @@ permissions:
   issues: read
   pull-requests: read
 engine:
-  id: copilot
+  id: gemini
   agent: agentic-workflows
 imports:
   - shared/github-guard-policy.md

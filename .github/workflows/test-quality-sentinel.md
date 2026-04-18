@@ -8,7 +8,7 @@ permissions:
   contents: read
   pull-requests: read
 engine:
-  id: copilot
+  id: gemini
   max-continuations: 40
 tools:
   mount-as-clis: true

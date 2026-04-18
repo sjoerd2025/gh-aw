@@ -13,7 +13,7 @@ permissions:
   pull-requests: read
 
 tracker-id: ubuntu-image-analyzer
-engine: copilot
+engine: gemini
 imports:
   - shared/activation-app.md
 strict: true

@@ -11,7 +11,7 @@ permissions:
   pull-requests: read
 
 tracker-id: spec-extractor
-engine: copilot
+engine: gemini
 strict: true
 
 imports:

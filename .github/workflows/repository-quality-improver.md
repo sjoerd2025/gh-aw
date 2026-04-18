@@ -9,7 +9,7 @@ permissions:
   actions: read
   issues: read
   pull-requests: read
-engine: copilot
+engine: gemini
 imports:
   - uses: shared/daily-audit-discussion.md
     with:

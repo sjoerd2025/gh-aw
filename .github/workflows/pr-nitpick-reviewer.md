@@ -8,7 +8,7 @@ permissions:
   contents: read
   pull-requests: read
   actions: read
-engine: copilot
+engine: gemini
 safe-outputs:
   create-discussion:
     expires: 1d

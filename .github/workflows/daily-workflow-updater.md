@@ -13,7 +13,7 @@ permissions:
   issues: read
 
 tracker-id: daily-workflow-updater
-engine: copilot
+engine: gemini
 strict: true
 
 network:

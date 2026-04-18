@@ -9,7 +9,7 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
-engine: copilot
+engine: gemini
 strict: true
 tracker-id: agentic-observability-kit
 tools:
