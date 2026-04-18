@@ -14,7 +14,7 @@ permissions:
   discussions: read
   actions: read
 name: Smoke Copilot ARM64
-engine: copilot
+engine: gemini
 runs-on: ubuntu-24.04-arm
 imports:
   - shared/gh.md

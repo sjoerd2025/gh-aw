@@ -14,7 +14,7 @@ safe-outputs:
     expires: 2d
     title-prefix: "[linter] "
     labels: [automation, code-quality, cookie]
-engine: copilot
+engine: gemini
 name: Super Linter Report
 timeout-minutes: 15
 imports:

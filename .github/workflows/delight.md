@@ -13,7 +13,7 @@ permissions:
   pull-requests: read
 
 tracker-id: delight-daily
-engine: copilot
+engine: gemini
 strict: true
 
 network:

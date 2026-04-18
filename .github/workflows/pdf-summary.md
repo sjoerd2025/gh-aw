@@ -25,7 +25,7 @@ permissions:
   pull-requests: read
   discussions: read
 
-engine: copilot
+engine: gemini
 
 imports:
   - shared/mcp/markitdown.md

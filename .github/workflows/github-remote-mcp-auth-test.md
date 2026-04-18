@@ -8,7 +8,7 @@ permissions:
   issues: read
   discussions: read
 engine:
-  id: copilot
+  id: gemini
   model: gpt-5.1-codex-mini
 tools:
   mount-as-clis: true

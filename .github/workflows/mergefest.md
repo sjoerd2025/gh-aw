@@ -9,7 +9,7 @@ permissions:
   contents: read
   pull-requests: read
   actions: read
-engine: copilot
+engine: gemini
 tools:
   mount-as-clis: true
   bash:

@@ -13,7 +13,7 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
-engine: copilot
+engine: gemini
 imports:
   - shared/mcp/serena-go.md
 tools:

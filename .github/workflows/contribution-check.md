@@ -13,7 +13,7 @@ env:
   TARGET_REPOSITORY: ${{ vars.TARGET_REPOSITORY || github.repository }}
 
 engine:
-  id: copilot
+  id: gemini
   agent: contribution-checker
 
 tools:

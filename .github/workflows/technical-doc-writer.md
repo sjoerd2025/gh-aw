@@ -15,7 +15,7 @@ permissions:
   actions: read
 
 engine:
-  id: copilot
+  id: gemini
   agent: technical-doc-writer
 
 network:

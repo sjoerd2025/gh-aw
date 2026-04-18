@@ -12,7 +12,7 @@ permissions:
   pull-requests: read
 
 tracker-id: spec-librarian
-engine: copilot
+engine: gemini
 strict: true
 
 imports:

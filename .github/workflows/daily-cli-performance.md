@@ -31,7 +31,7 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: daily-cli-performance
-engine: copilot
+engine: gemini
 tools:
   mount-as-clis: true
   repo-memory:

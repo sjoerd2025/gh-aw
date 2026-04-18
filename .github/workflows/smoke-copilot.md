@@ -16,7 +16,7 @@ permissions:
   actions: read
 name: Smoke Copilot
 engine:
-  id: copilot
+  id: gemini
   max-continuations: 2
   bare: true
 imports:

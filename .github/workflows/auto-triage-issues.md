@@ -13,7 +13,7 @@ permissions:
   contents: read
   issues: read
 engine:
-  id: copilot
+  id: gemini
   model: gpt-4.1-mini
 strict: true
 network:

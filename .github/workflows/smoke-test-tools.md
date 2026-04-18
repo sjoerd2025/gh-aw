@@ -11,7 +11,7 @@ permissions:
   issues: read
   pull-requests: read
 name: Agent Container Smoke Test
-engine: copilot
+engine: gemini
 strict: true
 runtimes:
   node:

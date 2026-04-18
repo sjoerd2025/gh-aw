@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
   actions: read
-engine: copilot
+engine: gemini
 tracker-id: architecture-guardian
 tools:
   mount-as-clis: true

@@ -8,7 +8,7 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
-engine: copilot
+engine: gemini
 timeout-minutes: 45
 runtimes:
   node:

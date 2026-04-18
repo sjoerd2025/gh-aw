@@ -13,7 +13,7 @@ permissions:
   pull-requests: read
   actions: read
 engine:
-  id: copilot
+  id: gemini
   agent: adr-writer
 strict: true
 imports:

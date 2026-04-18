@@ -6,7 +6,7 @@ on:
 permissions:
   contents: read
   actions: read
-engine: copilot
+engine: gemini
 network:
   allowed:
     - defaults

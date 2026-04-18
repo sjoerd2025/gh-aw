@@ -391,7 +391,7 @@ permissions:
   contents: read
   actions: read
 
-engine: copilot
+engine: gemini
 
 safe-outputs:
   create-pull-request:

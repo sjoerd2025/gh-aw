@@ -1,6 +1,6 @@
 ---
 name: Test Project URL Explicit Requirement
-engine: copilot
+engine: gemini
 on:
   workflow_dispatch:
 

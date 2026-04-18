@@ -12,7 +12,7 @@ permissions:
   pull-requests: read
 
 tracker-id: update-astro
-engine: copilot
+engine: gemini
 strict: true
 
 timeout-minutes: 45

@@ -15,7 +15,7 @@ permissions:
 
 tracker-id: daily-news-weekday
 engine:
-  id: copilot
+  id: gemini
   bare: true
 
 timeout-minutes: 30  # Reduced from 45 since pre-fetching data is faster

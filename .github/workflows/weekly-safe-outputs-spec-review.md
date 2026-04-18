@@ -11,7 +11,7 @@ permissions:
   pull-requests: read
 
 tracker-id: weekly-safe-outputs-spec-review
-engine: copilot
+engine: gemini
 strict: true
 
 network:

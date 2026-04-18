@@ -10,7 +10,7 @@ permissions:
   issues: read
   actions: read
 tracker-id: refactoring-cadence
-engine: copilot
+engine: gemini
 tools:
   mount-as-clis: true
   github:

@@ -7,7 +7,7 @@ permissions:
   models: read
 
 engine:
-  id: copilot
+  id: gemini
   bare: true
 
 tools:

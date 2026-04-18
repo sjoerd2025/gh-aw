@@ -11,7 +11,7 @@ permissions:
   pull-requests: read
 
 tracker-id: daily-safe-output-integrator
-engine: copilot
+engine: gemini
 strict: true
 
 tools:
@@ -229,7 +229,7 @@ on:
 permissions:
   contents: read
   issues: read
-engine: copilot
+engine: gemini
 safe-outputs:
   <type-key>:
     max: <sensible-default-from-validation-config>
@@ -265,7 +265,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine: gemini
 safe-outputs:
   update-pull-request:
     max: 1
@@ -290,7 +290,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine: gemini
 safe-outputs:
   submit-pull-request-review:
     max: 1
@@ -315,7 +315,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine: gemini
 safe-outputs:
   reply-to-pull-request-review-comment:
     max: 1
@@ -340,7 +340,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine: gemini
 safe-outputs:
   resolve-pull-request-review-thread:
     max: 5
@@ -365,7 +365,7 @@ on:
 permissions:
   contents: read
   discussions: read
-engine: copilot
+engine: gemini
 safe-outputs:
   create-discussion:
     max: 1
@@ -392,7 +392,7 @@ on:
 permissions:
   contents: read
   issues: read
-engine: copilot
+engine: gemini
 safe-outputs:
   close-issue:
     max: 1
@@ -418,7 +418,7 @@ permissions:
   contents: read
   actions: read
   security-events: read
-engine: copilot
+engine: gemini
 safe-outputs:
   create-code-scanning-alerts:
     driver: "Test Scanner"
@@ -451,7 +451,7 @@ on:
 permissions:
   contents: read
   issues: read
-engine: copilot
+engine: gemini
 safe-outputs:
   link-sub-issue:
     max: 5
@@ -476,7 +476,7 @@ on:
 permissions:
   contents: read
   issues: read
-engine: copilot
+engine: gemini
 safe-outputs:
   update-project:
     max: 5
@@ -501,7 +501,7 @@ on:
 permissions:
   contents: read
   issues: read
-engine: copilot
+engine: gemini
 safe-outputs:
   create-project:
     max: 1
@@ -528,7 +528,7 @@ on:
 permissions:
   contents: read
   issues: read
-engine: copilot
+engine: gemini
 safe-outputs:
   create-project-status-update:
     max: 1
@@ -553,7 +553,7 @@ on:
 permissions:
   contents: read
   issues: read
-engine: copilot
+engine: gemini
 safe-outputs:
   remove-labels:
     max: 5
@@ -580,7 +580,7 @@ permissions:
   actions: read
   issues: read
   pull-requests: read
-engine: copilot
+engine: gemini
 safe-outputs:
   missing-data:
     max: 5

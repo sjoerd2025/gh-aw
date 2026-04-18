@@ -9,7 +9,7 @@ permissions:
   pull-requests: read
   actions: read
 tracker-id: weekly-blog-post-writer
-engine: copilot
+engine: gemini
 strict: true
 timeout-minutes: 30
 network:

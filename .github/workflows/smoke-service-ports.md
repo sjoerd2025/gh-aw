@@ -8,7 +8,7 @@ permissions:
   issues: read
   pull-requests: read
 name: Smoke Service Ports
-engine: copilot
+engine: gemini
 strict: true
 services:
   redis:

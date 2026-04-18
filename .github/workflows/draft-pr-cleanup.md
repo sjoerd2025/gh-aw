@@ -8,7 +8,7 @@ permissions:
   contents: read
   pull-requests: read
   # Note: PR write operations handled via safe-outputs
-engine: copilot
+engine: gemini
 strict: true
 tools:
   mount-as-clis: true

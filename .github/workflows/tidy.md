@@ -25,7 +25,7 @@ concurrency:
   group: tidy-${{ github.ref }}
   cancel-in-progress: true
 
-engine: copilot
+engine: gemini
 timeout-minutes: 10
 
 network:

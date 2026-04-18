@@ -9,7 +9,7 @@ permissions:
   actions: read
   issues: read
   pull-requests: read
-engine: copilot
+engine: gemini
 strict: false
 network:
   allowed: [defaults, node, "api.github.com", "proxy.golang.org", "sum.golang.org"]

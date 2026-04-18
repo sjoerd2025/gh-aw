@@ -14,7 +14,7 @@ permissions:
   contents: read
   actions: read
   pull-requests: read
-engine: copilot
+engine: gemini
 tools:
   mount-as-clis: true
   agentic-workflows:

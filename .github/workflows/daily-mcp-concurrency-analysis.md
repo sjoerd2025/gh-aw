@@ -12,7 +12,7 @@ permissions:
   pull-requests: read
 
 tracker-id: mcp-concurrency-analysis
-engine: copilot
+engine: gemini
 
 imports:
   - shared/reporting-otlp.md

@@ -105,7 +105,7 @@ func extractEngineConfigFromFile(filePath string) (string, *workflow.EngineConfi
 	if engineSetting != "" {
 		return engineSetting, engineConfig
 	}
-	return "copilot", engineConfig // Default engine
+	return "gemini", engineConfig // Default engine
 }
 
 // readWorkflowFileContent reads a workflow file's content as a string.

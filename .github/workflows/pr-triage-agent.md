@@ -8,7 +8,7 @@ permissions:
   issues: read
   pull-requests: read
   # Note: issues and discussions write handled via safe-outputs
-engine: copilot
+engine: gemini
 imports:
   - shared/github-guard-policy.md
 tools:

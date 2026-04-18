@@ -374,7 +374,7 @@ permissions:
   pull-requests: read
 
 engine:
-  id: copilot
+  id: gemini
   model: gpt-5.1-codex-mini
 
 imports:

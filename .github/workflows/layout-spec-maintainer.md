@@ -18,7 +18,7 @@ permissions:
   pull-requests: read
 
 tracker-id: layout-spec-maintainer
-engine: copilot
+engine: gemini
 strict: true
 
 cache:

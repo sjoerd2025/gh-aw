@@ -115,7 +115,7 @@ the palace is initialized and check the memory protocol.
 
 ```yaml
 ---
-engine: copilot
+engine: gemini
 imports:
   - shared/mcp/mempalace.md
 tools:

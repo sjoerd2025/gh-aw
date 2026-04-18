@@ -8,7 +8,7 @@ permissions:
   contents: read
   pull-requests: read
   security-events: read
-engine: copilot
+engine: gemini
 imports:
   - shared/security-analysis-base.md
   - shared/activation-app.md

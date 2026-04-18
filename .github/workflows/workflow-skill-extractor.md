@@ -12,7 +12,7 @@ permissions:
   pull-requests: read
 
 engine:
-  id: copilot
+  id: gemini
 
 timeout-minutes: 30
 

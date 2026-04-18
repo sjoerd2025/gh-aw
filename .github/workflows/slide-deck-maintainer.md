@@ -18,7 +18,7 @@ permissions:
 concurrency:
   job-discriminator: ${{ inputs.focus || github.run_id }}
 tracker-id: slide-deck-maintainer
-engine: copilot
+engine: gemini
 imports:
   - shared/activation-app.md
 timeout-minutes: 45

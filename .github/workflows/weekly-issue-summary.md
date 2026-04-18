@@ -10,7 +10,7 @@ on:
 permissions:
   issues: read
 tracker-id: weekly-issue-summary
-engine: copilot
+engine: gemini
 network:
   allowed:
     - defaults

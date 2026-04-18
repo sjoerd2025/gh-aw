@@ -18,7 +18,7 @@ permissions:
 
 strict: true
 
-engine: copilot
+engine: gemini
 
 timeout-minutes: 60
 
