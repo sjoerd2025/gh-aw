@@ -1,0 +1,60 @@
+name: Auto-Recompile Lock Files
+
+on:
+  push:
+    branches:
+      - fix/recompile-lock-files
+    paths:
+      - '.github/workflows/*.md'
+      - '!.github/workflows/*.lock.yml'
+
+jobs:
+  recompile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+
+      - name: Build gh-aw CLI
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags "-s -w" \
+            -o dist/gh-aw-linux-amd64 \
+            ./cmd/gh-aw
+          chmod +x dist/gh-aw-linux-amd64
+
+      - name: Install gh-aw
+        run: |
+          mkdir -p ~/.local/share/gh/extensions/gh-aw/bin
+          cp dist/gh-aw-linux-amd64 ~/.local/share/gh/extensions/gh-aw/bin/gh-aw
+          chmod +x ~/.local/share/gh/extensions/gh-aw/bin/gh-aw
+          echo "$HOME/.local/share/gh/extensions/gh-aw/bin" >> $GITHUB_PATH
+
+      - name: Recompile all workflows
+        run: |
+          gh-aw-linux-amd64 compile --all
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit recompiled lock files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/*.lock.yml
+          if git diff --cached --quiet; then
+            echo "No changes to lock files"
+          else
+            git commit -m "chore: recompile lock files after workflow updates"
+            git push
+          fi
