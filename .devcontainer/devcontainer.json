@@ -43,7 +43,17 @@
     "ghcr.io/devcontainers/features/copilot-cli:latest": {},
     "ghcr.io/devcontainers/features/docker-in-docker:4.0.0": {},
     "ghcr.io/devcontainers/features/git-lfs:1": {},
+    "ghcr.io/devcontainers-extra/features/npm-package:1": {},
+    "ghcr.io/devcontainers-extra/features/typescript:2": {},
+    "ghcr.io/stu-bell/devcontainer-features/gemini-cli:0": {},
+    "ghcr.io/devcontainers/features/go:1": {},
     "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers-extra/features/renovate-cli:2": {},
+    "ghcr.io/devcontainers-extra/features/uv:1": {},
+    "ghcr.io/devcontainers/features/copilot-cli:1": {},
+    "ghcr.io/marcozac/devcontainer-features/goreleaser:1": {},
+    "ghcr.io/devcontainers/features/copilot-cli:1": {},
+    "ghcr.io/devcontainers/features/rust:1": {},
     "ghcr.io/devcontainers/features/node:2.1.0": {
       "version": "24"
     }
