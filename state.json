@@ -1,0 +1,16 @@
+{
+  "counts": {
+    "prompt_compression": {
+      "caveman": 1
+    }
+  },
+  "runs": [
+    {
+      "run_id": "30553886377",
+      "timestamp": "2026-07-30T14:54:41.251Z",
+      "assignments": {
+        "prompt_compression": "caveman"
+      }
+    }
+  ]
+}
