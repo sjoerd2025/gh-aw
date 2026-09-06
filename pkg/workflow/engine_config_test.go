@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -204,7 +205,7 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedModel:         "gpt-4o",
 		},
 		{
-			name: "object format - top-level model overrides engine.model",
+			name: "object format - engine.model overrides top-level model",
 			frontmatter: map[string]any{
 				"engine": map[string]any{
 					"id":    "codex",
@@ -214,7 +215,7 @@ func TestExtractEngineConfig(t *testing.T) {
 			},
 			expectedEngineSetting: "codex",
 			expectedConfig:        &EngineConfig{ID: "codex"},
-			expectedModel:         "gpt-5",
+			expectedModel:         "gpt-4o",
 		},
 		{
 			// Empty top-level model: "" must NOT override engine.model.
@@ -542,6 +543,7 @@ func TestExtractEngineConfig(t *testing.T) {
 						"initial-delay-ms":   10000,
 						"backoff-multiplier": 2,
 						"max-delay-ms":       180000,
+						"watchdog-timeout":   120,
 					},
 				},
 			},
@@ -552,6 +554,7 @@ func TestExtractEngineConfig(t *testing.T) {
 				HarnessInitialDelayMs:    "10000",
 				HarnessBackoffMultiplier: "2",
 				HarnessMaxDelayMs:        "180000",
+				HarnessWatchdogTimeoutMs: "120000",
 			},
 		},
 		{
@@ -564,6 +567,7 @@ func TestExtractEngineConfig(t *testing.T) {
 						"initial-delay-ms":   "${{ vars.RETRY_DELAY }}",
 						"backoff-multiplier": "${{ vars.BACKOFF }}",
 						"max-delay-ms":       "${{ vars.MAX_DELAY }}",
+						"watchdog-timeout":   "${{ vars.WATCHDOG_TIMEOUT_SEC }}",
 					},
 				},
 			},
@@ -574,6 +578,7 @@ func TestExtractEngineConfig(t *testing.T) {
 				HarnessInitialDelayMs:    "${{ vars.RETRY_DELAY }}",
 				HarnessBackoffMultiplier: "${{ vars.BACKOFF }}",
 				HarnessMaxDelayMs:        "${{ vars.MAX_DELAY }}",
+				HarnessWatchdogTimeoutMs: "${{ vars.WATCHDOG_TIMEOUT_SEC }}",
 			},
 		},
 		{
@@ -664,6 +669,9 @@ func TestExtractEngineConfig(t *testing.T) {
 				}
 				if config.HarnessMaxDelayMs != test.expectedConfig.HarnessMaxDelayMs {
 					t.Errorf("Expected config.HarnessMaxDelayMs '%s', got '%s'", test.expectedConfig.HarnessMaxDelayMs, config.HarnessMaxDelayMs)
+				}
+				if config.HarnessWatchdogTimeoutMs != test.expectedConfig.HarnessWatchdogTimeoutMs {
+					t.Errorf("Expected config.HarnessWatchdogTimeoutMs '%s', got '%s'", test.expectedConfig.HarnessWatchdogTimeoutMs, config.HarnessWatchdogTimeoutMs)
 				}
 
 				if len(config.Env) != len(test.expectedConfig.Env) {
@@ -889,6 +897,96 @@ This is a test workflow.`,
 			}
 		})
 	}
+}
+
+func TestParseWorkflowWithSplitEngineModels(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "split-engine-model-test"), "workflow.md")
+	workflowContent := `---
+on: push
+permissions:
+  contents: read
+strict: false
+engine:
+  id: codex
+model: openai/gpt-4o-mini
+safe-outputs:
+  threat-detection:
+    engine:
+      id: copilot
+      model: gpt-5-mini
+---
+
+# Test Workflow
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	workflowData, err := NewCompiler().ParseWorkflowFile(workflowPath)
+	if err != nil {
+		t.Fatalf("ParseWorkflowFile failed: %v", err)
+	}
+
+	assert.Equal(t, "openai/gpt-4o-mini", workflowData.Model)
+	if assert.NotNil(t, workflowData.SafeOutputs) && assert.NotNil(t, workflowData.SafeOutputs.ThreatDetection) {
+		assert.Equal(t, "gpt-5-mini", workflowData.SafeOutputs.ThreatDetection.Model)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	metadata, legacy, err := ExtractMetadataFromLockFile(string(lockFile))
+	if err != nil {
+		t.Fatalf("ExtractMetadataFromLockFile failed: %v", err)
+	}
+	if metadata == nil {
+		t.Fatal("Expected compiled lock file to contain metadata")
+	}
+	if legacy {
+		t.Fatal("Expected compiled lock file to contain structured metadata")
+	}
+	assert.Equal(t, "openai/gpt-4o-mini", metadata.AgentModel)
+	assert.Equal(t, "gpt-5-mini", metadata.DetectionAgentModel)
+}
+
+func TestCompileCodexWithCopilotModel(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "codex-copilot-model-test"), "workflow.md")
+	workflowContent := `---
+on: push
+permissions:
+  contents: read
+  copilot-requests: write
+strict: false
+engine: codex
+model: copilot/auto
+---
+
+# Test Workflow
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	lock := string(lockFile)
+	assert.Contains(t, lock, "GH_AW_LLM_PROVIDER: github")
+	assert.Contains(t, lock, "COPILOT_GITHUB_TOKEN: ${{ github.token }}")
+	assert.Contains(t, lock, constants.CopilotBYOKDummyAPIKeyEnvVar+": "+constants.CopilotBYOKDummyAPIKey)
+	assert.Contains(t, lock, `export CODEX_API_KEY="$`+constants.CopilotBYOKDummyAPIKeyEnvVar+`"`)
+	assert.Contains(t, lock, "GH_AW_MODEL_AGENT_CODEX: auto")
+	assert.NotContains(t, lock, "secrets.CODEX_API_KEY")
+	assert.NotContains(t, lock, "secrets.OPENAI_API_KEY")
 }
 
 func TestEngineConfigurationWithModel(t *testing.T) {
@@ -1281,6 +1379,11 @@ func TestSupportsBareMode(t *testing.T) {
 		{
 			name:     "claude supports bare mode",
 			engine:   NewClaudeEngine(),
+			expected: true,
+		},
+		{
+			name:     "pi supports bare mode",
+			engine:   NewPiEngine(),
 			expected: true,
 		},
 		{

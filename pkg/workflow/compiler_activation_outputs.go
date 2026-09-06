@@ -20,11 +20,13 @@ func (c *Compiler) addActivationFeedbackAndValidationSteps(ctx *activationJobBui
 	if hasMaxDailyAICGuardrail(data) {
 		ctx.steps = append(ctx.steps, c.buildActivationDailyAICGuardrailStep(data)...)
 		ctx.outputs["daily_ai_credits_exceeded"] = "${{ steps.daily-effective-workflow-guardrail.outputs.daily_ai_credits_exceeded == 'true' }}"
+		ctx.outputs["daily_ai_credits_guardrail_status"] = "${{ steps.daily-effective-workflow-guardrail.outputs.daily_ai_credits_guardrail_status || '' }}"
 		ctx.outputs["daily_ai_credits_total_effective_tokens"] = "${{ steps.daily-effective-workflow-guardrail.outputs.daily_ai_credits_total_effective_tokens || '' }}"
 		ctx.outputs["daily_ai_credits_threshold"] = "${{ steps.daily-effective-workflow-guardrail.outputs.daily_ai_credits_threshold || '' }}"
 	}
 	c.addActivationReactionStep(ctx)
 	c.addActivationSecretValidationStep(ctx)
+	c.addActivationDockerSbxSecretsCheckStep(ctx)
 	c.addActivationOAuthTokenCheckStep(ctx)
 	c.addActivationCrossRepoGuidanceStep(ctx)
 	return nil
@@ -102,6 +104,20 @@ func (c *Compiler) configureActivationNeedsAndCondition(ctx *activationJobBuildC
 			compilerActivationJobLog.Printf("Added '%s' to activation dependencies: referenced in markdown body and has no explicit needs", jobName)
 		}
 	}
+
+	// Also scan engine.env values for needs.<job>.outputs.* expressions.
+	// This ensures custom jobs referenced in engine.env (e.g. to override COPILOT_GITHUB_TOKEN)
+	// are added as activation job dependencies so their outputs are available at activation time.
+	// Only jobs with NO explicit needs are added here; jobs with explicit needs that depend on
+	// pre_activation are already captured by getCustomJobsDependingOnPreActivation above.
+	engineEnvJobs := c.getEngineEnvReferencedCustomJobsWithNoExplicitNeeds(data)
+	for _, jobName := range engineEnvJobs {
+		if !slices.Contains(customJobsBeforeActivation, jobName) {
+			customJobsBeforeActivation = append(customJobsBeforeActivation, jobName)
+			compilerActivationJobLog.Printf("Added '%s' to activation dependencies: referenced in engine.env", jobName)
+		}
+	}
+
 	ctx.customJobsBeforeActivation = customJobsBeforeActivation
 
 	if ctx.preActivationJob {
@@ -139,9 +155,16 @@ func (c *Compiler) configureActivationNeedsAndCondition(ctx *activationJobBuildC
 // addActivationArtifactUploadStep appends the activation artifact upload step for downstream jobs.
 func (c *Compiler) addActivationArtifactUploadStep(ctx *activationJobBuildContext) {
 	compilerActivationJobLog.Print("Adding activation artifact upload step")
-	activationArtifactName := artifactPrefixExprForActivationJob(ctx.data) + constants.ActivationArtifactName
-	ctx.steps = append(ctx.steps, "      - name: Upload activation artifact\n")
-	ctx.steps = append(ctx.steps, "        if: success()\n")
+	activationArtifactName := artifactPrefixExprForActivationJob(ctx.data) + constants.ActivationArtifactName.String()
+	ctx.steps = append(ctx.steps, generateStageAmbientFoldersStep(ctx.data)...)
+	ctx.steps = append(ctx.steps,
+		"      - name: Stage prompt files for artifact upload\n",
+		"        run: |\n",
+		"          mkdir -p /tmp/gh-aw/aw-prompts\n",
+		"          cp -a \"${RUNNER_TEMP}/gh-aw/aw-prompts/.\" /tmp/gh-aw/aw-prompts/\n",
+	)
+	ctx.steps = append(ctx.steps, "      - name: "+constants.ActivationUploadArtifactStepName+"\n")
+	ctx.steps = append(ctx.steps, "        if: success() || failure()\n")
 	ctx.steps = append(ctx.steps, fmt.Sprintf("        uses: %s\n", c.getActionPin("actions/upload-artifact")))
 	ctx.steps = append(ctx.steps, "        with:\n")
 	ctx.steps = append(ctx.steps, fmt.Sprintf("          name: %s\n", activationArtifactName))
@@ -152,18 +175,21 @@ func (c *Compiler) addActivationArtifactUploadStep(ctx *activationJobBuildContex
 	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/aw-prompts/prompt.txt\n")
 	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/aw-prompts/prompt-template.txt\n")
 	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/aw-prompts/prompt-import-tree.json\n")
-	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/"+constants.GithubRateLimitsFilename+"\n")
+	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/"+constants.GithubRateLimitsFilename.String()+"\n")
 	ctx.steps = append(ctx.steps, "            /tmp/gh-aw/base\n")
+	if len(ctx.data.AmbientFolders) > 0 {
+		ctx.steps = append(ctx.steps, "            /tmp/gh-aw/ambient-folders\n")
+	}
 	engineID := resolveActivationEngineID(ctx.data)
 	// Include the engine-specific sub-agent staging directory only when inline agents are enabled.
 	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), ctx.data) {
-		subAgentDir := GetEngineSubAgentDir(engineID)
+		subAgentDir := engineConfigBaseDirForRegistry(c.engineRegistry, engineID) + "/agents"
 		ctx.steps = append(ctx.steps, fmt.Sprintf("            /tmp/gh-aw/%s\n", subAgentDir))
 	}
 	// Always include the engine-specific skill directory when either inline skills are enabled
 	// or frontmatter skills are configured (via Skills or SkillReferences).
 	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), ctx.data) || len(ctx.data.Skills) > 0 || len(ctx.data.SkillReferences) > 0 {
-		skillDir := GetEngineSkillDir(engineID)
+		skillDir := engineConfigBaseDirForRegistry(c.engineRegistry, engineID) + "/skills"
 		ctx.steps = append(ctx.steps, fmt.Sprintf("            /tmp/gh-aw/%s\n", skillDir))
 	}
 	ctx.steps = append(ctx.steps, "          if-no-files-found: ignore\n")

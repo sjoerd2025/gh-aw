@@ -14,6 +14,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -39,7 +40,9 @@ const (
 	ArtifactSetActivation ArtifactSet = "activation"
 
 	// ArtifactSetAgent downloads the unified agent artifact containing agent logs,
-	// safe outputs, token usage, and agent-side github_rate_limits.jsonl.
+	// safe outputs, token usage, and agent-side github_rate_limits.jsonl, plus the
+	// tiny fallback artifact that carries critical agent-output files when the
+	// unified upload fails.
 	ArtifactSetAgent ArtifactSet = "agent"
 
 	// ArtifactSetMCP downloads the agent artifact which now includes MCP
@@ -62,12 +65,17 @@ const (
 	ArtifactSetGitHubAPI ArtifactSet = "github-api"
 
 	// ArtifactSetExperiment downloads the experiment artifact containing A/B experiment
-	// state (state.json) uploaded by the activation job when experiments are declared.
+	// state (state.jsonl or state.json) uploaded by the activation job when experiments are declared.
 	ArtifactSetExperiment ArtifactSet = "experiment"
 
 	// ArtifactSetUsage downloads the compact usage artifact produced by the
 	// conclusion job (aw-info.jsonl, usage summaries, token usage JSONL).
 	ArtifactSetUsage ArtifactSet = "usage"
+
+	// ArtifactSetGraders downloads the artifacts that carry grader results
+	// (grader_results.json): the compact usage artifact, the agent artifact, and
+	// the fallback artifact used when uploading the unified agent artifact fails.
+	ArtifactSetGraders ArtifactSet = "graders"
 
 	// ArtifactSetEvals downloads the usage artifact, which now includes evals.jsonl
 	// produced by the evals job (copied into usage by the conclusion job).
@@ -80,22 +88,27 @@ const (
 // ResolveArtifactFilter means no filter is active so the caller downloads all artifacts).
 var artifactSetArtifacts = map[ArtifactSet][]string{
 	ArtifactSetAll:        nil, // no filtering – download all artifacts
-	ArtifactSetActivation: {constants.ActivationArtifactName},
-	ArtifactSetAgent:      {constants.AgentArtifactName},
-	ArtifactSetMCP:        {constants.AgentArtifactName},
-	ArtifactSetFirewall:   {constants.AgentArtifactName},
-	ArtifactSetDetection:  {constants.DetectionArtifactName},
+	ArtifactSetActivation: {constants.ActivationArtifactName.String()},
+	ArtifactSetAgent:      {constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
+	ArtifactSetMCP:        {constants.AgentArtifactName.String()},
+	ArtifactSetFirewall:   {constants.AgentArtifactName.String()},
+	ArtifactSetDetection:  {constants.DetectionArtifactName.String()},
 	// github-api: both jobs upload github_rate_limits.jsonl; fetch both for a complete view.
-	ArtifactSetGitHubAPI: {constants.ActivationArtifactName, constants.AgentArtifactName},
+	ArtifactSetGitHubAPI: {constants.ActivationArtifactName.String(), constants.AgentArtifactName.String()},
 	// experiment: A/B experiment state uploaded by the activation job.
-	ArtifactSetExperiment: {constants.ExperimentArtifactName},
+	ArtifactSetExperiment: {constants.ExperimentArtifactName.String()},
 	// usage: compact conclusion artifact for lightweight reporting/forecasting.
-	ArtifactSetUsage: {constants.UsageArtifactName},
+	ArtifactSetUsage: {constants.UsageArtifactName.String()},
 	// evals: evals results are now included in the usage artifact.
-	ArtifactSetEvals: {constants.UsageArtifactName},
+	ArtifactSetEvals: {constants.UsageArtifactName.String()},
+	// graders: grader results are included in the usage artifact, remain part of
+	// the unified agent artifact, and are preserved in the fallback transport.
+	ArtifactSetGraders: {constants.UsageArtifactName.String(), constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
 }
 
 const maxArtifactHintExamples = 2
+
+const downloadedArtifactsMarkerDir = ".downloaded-artifacts"
 
 // ValidArtifactSetNames returns a sorted list of valid artifact set names,
 // derived dynamically from the artifactSetArtifacts map to stay in sync automatically.
@@ -255,6 +268,20 @@ func findMissingFilterEntries(filter []string, outputDir string) []string {
 			dirs = append(dirs, e.Name())
 		}
 	}
+	if markers, markerErr := os.ReadDir(filepath.Join(outputDir, downloadedArtifactsMarkerDir)); markerErr == nil {
+		for _, marker := range markers {
+			if !marker.IsDir() {
+				dirs = append(dirs, marker.Name())
+			}
+		}
+	}
+
+	// A complete-download marker satisfies every filtered request: if it is
+	// present the caller already downloaded all artifacts for this run.
+	if slices.Contains(dirs, string(ArtifactSetAll)) {
+		artifactSetLog.Printf("Complete-download marker present in %s; all filter entries satisfied", outputDir)
+		return nil
+	}
 
 	var missing []string
 	for _, f := range filter {
@@ -266,7 +293,7 @@ func findMissingFilterEntries(filter []string, outputDir string) []string {
 			// hypothetical directory named "super-agent" would satisfy filter entry "agent",
 			// but in practice artifact directories in a run folder only come from GitHub
 			// Actions downloads and follow the "{hash}-{base}" or exact-base patterns.
-			if d == f || strings.HasSuffix(d, "-"+f) {
+			if d == f || strings.HasSuffix(d, "-"+f) || agentOutputTransportAlternates(f, d) {
 				found = true
 				break
 			}
@@ -281,6 +308,38 @@ func findMissingFilterEntries(filter []string, outputDir string) []string {
 		artifactSetLog.Printf("All %d artifact filter entries present in %s", len(filter), outputDir)
 	}
 	return missing
+}
+
+func agentOutputTransportAlternates(filterEntry, downloadedName string) bool {
+	if filterEntry == constants.AgentArtifactName.String() {
+		return artifactNameMatchesBase(downloadedName, constants.AgentOutputFallbackArtifactName.String())
+	}
+	if filterEntry == constants.AgentOutputFallbackArtifactName.String() {
+		return artifactNameMatchesBase(downloadedName, constants.AgentArtifactName.String())
+	}
+	return false
+}
+
+func artifactNameMatchesBase(name, base string) bool {
+	if base == "" {
+		return false
+	}
+	return name == base || strings.HasSuffix(name, "-"+base)
+}
+
+func markArtifactDownloaded(outputDir, artifactName string) error {
+	if err := validateArtifactName(artifactName); err != nil {
+		return err
+	}
+	markerDir := filepath.Join(outputDir, downloadedArtifactsMarkerDir)
+	if err := os.MkdirAll(markerDir, constants.DirPermPublic); err != nil {
+		return fmt.Errorf("failed to create downloaded artifact marker directory: %w", err)
+	}
+	markerPath := filepath.Join(markerDir, artifactName)
+	if err := os.WriteFile(markerPath, nil, constants.FilePermPublic); err != nil {
+		return fmt.Errorf("failed to write downloaded artifact marker: %w", err)
+	}
+	return nil
 }
 
 // applyEvalsArtifact appends the evals artifact set to artifacts when evalsOnly is true
@@ -299,6 +358,20 @@ func applyEvalsArtifact(artifacts []string, evalsOnly bool) []string {
 		!slices.Contains(artifacts, string(ArtifactSetUsage)) &&
 		!slices.Contains(artifacts, string(ArtifactSetAll)) {
 		return append(artifacts, string(ArtifactSetEvals))
+	}
+	return artifacts
+}
+
+// applyGradersArtifact appends the graders artifact set to artifacts when gradersOnly is true
+// and neither ArtifactSetGraders nor ArtifactSetAll is already present.
+func applyGradersArtifact(artifacts []string, gradersOnly bool) []string {
+	if len(artifacts) == 0 {
+		return artifacts
+	}
+	if gradersOnly &&
+		!slices.Contains(artifacts, string(ArtifactSetGraders)) &&
+		!slices.Contains(artifacts, string(ArtifactSetAll)) {
+		return append(artifacts, string(ArtifactSetGraders))
 	}
 	return artifacts
 }

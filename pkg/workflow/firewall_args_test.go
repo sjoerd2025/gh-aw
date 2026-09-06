@@ -18,6 +18,7 @@ func TestFirewallArgsInCopilotEngine(t *testing.T) {
 				ID: "copilot",
 			},
 			NetworkPermissions: &NetworkPermissions{
+				Allowed: []string{"copilot"},
 				Firewall: &FirewallConfig{
 					Enabled: true,
 				},
@@ -31,7 +32,7 @@ func TestFirewallArgsInCopilotEngine(t *testing.T) {
 
 		// Check that the command contains awf (AWF v0.15.0+ uses chroot mode by default)
 		if !strings.Contains(stepContent, "awf ") {
-			t.Error("Expected command to contain 'sudo -E awf'")
+			t.Error("Expected command to contain AWF")
 		}
 
 		// With config file support (default AWF version), domains appear in the JSON config
@@ -76,6 +77,7 @@ func TestFirewallArgsInCopilotEngine(t *testing.T) {
 				ID: "copilot",
 			},
 			NetworkPermissions: &NetworkPermissions{
+				Allowed: []string{"copilot"},
 				Firewall: &FirewallConfig{
 					Enabled: true,
 					Args:    []string{"--custom-arg", "value", "--another-flag"},

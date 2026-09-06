@@ -71,6 +71,9 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Description != "" {
 		result["description"] = fc.Description
 	}
+	if fc.Intent != "" {
+		result["intent"] = fc.Intent
+	}
 	if fc.Engine != nil {
 		result["engine"] = fc.Engine
 	}
@@ -83,9 +86,6 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.TrackerID != "" {
 		result["tracker-id"] = fc.TrackerID
 	}
-	if fc.Version != "" {
-		result["version"] = fc.Version
-	}
 	if fc.TimeoutMinutes != nil {
 		result["timeout-minutes"] = fc.TimeoutMinutes.ToValue()
 	}
@@ -94,6 +94,12 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	}
 	if len(fc.Labels) > 0 {
 		result["labels"] = fc.Labels
+	}
+	if len(fc.AmbientFolders) > 0 {
+		result["ambient-folders"] = fc.AmbientFolders
+	}
+	if fc.GitHubApp != nil {
+		result["github-app"] = githubAppConfigToMap(fc.GitHubApp)
 	}
 
 	// Configuration sections
@@ -119,6 +125,9 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.MCPScripts != nil {
 		// Convert MCPScriptsConfig to map - would need a ToMap method
 		result["mcp-scripts"] = fc.MCPScripts
+	}
+	if len(fc.Enclaves) > 0 {
+		result["enclaves"] = fc.Enclaves
 	}
 
 	// Event and trigger configuration
@@ -217,9 +226,6 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Imports != nil {
 		result["imports"] = fc.Imports
 	}
-	if fc.Include != nil {
-		result["include"] = fc.Include
-	}
 
 	// Metadata
 	if fc.Metadata != nil {
@@ -229,6 +235,37 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 		result["secret-masking"] = fc.SecretMasking
 	}
 
+	return result
+}
+
+func githubAppConfigToMap(app *GitHubAppConfig) map[string]any {
+	result := make(map[string]any)
+	if app.AppID != "" {
+		result["client-id"] = app.AppID
+	}
+	if app.PrivateKey != "" {
+		result["private-key"] = app.PrivateKey
+	}
+	if app.IgnoreIfMissing {
+		result["ignore-if-missing"] = true
+	}
+	if app.Owner != "" {
+		result["owner"] = app.Owner
+	}
+	if len(app.Repositories) > 0 {
+		repositories := make([]any, len(app.Repositories))
+		for i, repository := range app.Repositories {
+			repositories[i] = repository
+		}
+		result["repositories"] = repositories
+	}
+	if len(app.Permissions) > 0 {
+		permissions := make(map[string]any, len(app.Permissions))
+		for permission, level := range app.Permissions {
+			permissions[permission] = level
+		}
+		result["permissions"] = permissions
+	}
 	return result
 }
 
@@ -333,6 +370,9 @@ func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
 	if config.Checks != "" {
 		result["checks"] = config.Checks
 	}
+	if config.CodeQuality != "" {
+		result["code-quality"] = config.CodeQuality
+	}
 	if config.Contents != "" {
 		result["contents"] = config.Contents
 	}
@@ -347,6 +387,9 @@ func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
 	}
 	if config.Discussions != "" {
 		result["discussions"] = config.Discussions
+	}
+	if config.Drives != "" {
+		result["drives"] = config.Drives
 	}
 	if config.Packages != "" {
 		result["packages"] = config.Packages

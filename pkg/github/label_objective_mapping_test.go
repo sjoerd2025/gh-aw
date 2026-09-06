@@ -11,6 +11,7 @@ import (
 )
 
 func TestObjectiveMapping_ComputeObjectiveValue_Max(t *testing.T) {
+	t.Parallel()
 	mapping := &ObjectiveMapping{
 		LabelToValue: map[string]int{
 			"critical":      100,
@@ -36,6 +37,7 @@ func TestObjectiveMapping_ComputeObjectiveValue_Max(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := mapping.ComputeObjectiveValue(tt.labels)
 			assert.Equal(t, tt.expected, result)
 		})
@@ -43,6 +45,7 @@ func TestObjectiveMapping_ComputeObjectiveValue_Max(t *testing.T) {
 }
 
 func TestObjectiveMapping_ComputeObjectiveValue_Sum(t *testing.T) {
+	t.Parallel()
 	mapping := &ObjectiveMapping{
 		LabelToValue: map[string]int{
 			"critical":      100,
@@ -67,6 +70,7 @@ func TestObjectiveMapping_ComputeObjectiveValue_Sum(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := mapping.ComputeObjectiveValue(tt.labels)
 			assert.Equal(t, tt.expected, result)
 		})
@@ -74,6 +78,7 @@ func TestObjectiveMapping_ComputeObjectiveValue_Sum(t *testing.T) {
 }
 
 func TestObjectiveMapping_ComputeObjectiveValue_First(t *testing.T) {
+	t.Parallel()
 	mapping := &ObjectiveMapping{
 		LabelToValue: map[string]int{
 			"critical":      100,
@@ -99,6 +104,7 @@ func TestObjectiveMapping_ComputeObjectiveValue_First(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := mapping.ComputeObjectiveValue(tt.labels)
 			assert.Equal(t, tt.expected, result)
 		})
@@ -106,16 +112,19 @@ func TestObjectiveMapping_ComputeObjectiveValue_First(t *testing.T) {
 }
 
 func TestObjectiveMapping_ComputeObjectiveValue_Nil(t *testing.T) {
+	t.Parallel()
 	var mapping *ObjectiveMapping
 	assert.Equal(t, 0, mapping.ComputeObjectiveValue([]string{"any"}))
 }
 
 func TestObjectiveMapping_ComputeObjectiveValue_Empty(t *testing.T) {
+	t.Parallel()
 	mapping := &ObjectiveMapping{}
 	assert.Equal(t, 0, mapping.ComputeObjectiveValue([]string{"any"}))
 }
 
-func TestObjectiveMapping_GetObjectiveLabels(t *testing.T) {
+func TestObjectiveMapping_FilterObjectiveLabels(t *testing.T) {
+	t.Parallel()
 	mapping := &ObjectiveMapping{
 		LabelToValue: map[string]int{
 			"critical":      100,
@@ -137,13 +146,15 @@ func TestObjectiveMapping_GetObjectiveLabels(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := mapping.GetObjectiveLabels(tt.labels)
+			t.Parallel()
+			result := mapping.FilterObjectiveLabels(tt.labels)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
 }
 
 func TestDefaultObjectiveMapping(t *testing.T) {
+	t.Parallel()
 	mapping := DefaultObjectiveMapping()
 	require.NotNil(t, mapping)
 	assert.NotEmpty(t, mapping.LabelToValue)
@@ -158,6 +169,7 @@ func TestDefaultObjectiveMapping(t *testing.T) {
 }
 
 func TestObjectiveMapping_MarshalJSON(t *testing.T) {
+	t.Parallel()
 	mapping := &ObjectiveMapping{
 		LabelToValue: map[string]int{
 			"critical": 100,
@@ -179,7 +191,8 @@ func TestObjectiveMapping_MarshalJSON(t *testing.T) {
 	assert.Equal(t, mapping.PriorityLabels, unmarshaled.PriorityLabels)
 }
 
-func TestObjectiveMapping_ValidateLabelExists(t *testing.T) {
+func TestObjectiveMapping_HasObjectiveLabel(t *testing.T) {
+	t.Parallel()
 	mapping := &ObjectiveMapping{
 		LabelToValue: map[string]int{
 			"critical": 100,
@@ -187,14 +200,15 @@ func TestObjectiveMapping_ValidateLabelExists(t *testing.T) {
 		},
 	}
 
-	assert.True(t, mapping.ValidateLabelExists("critical"))
-	assert.True(t, mapping.ValidateLabelExists("CRITICAL"))
-	assert.True(t, mapping.ValidateLabelExists(" critical "))
-	assert.False(t, mapping.ValidateLabelExists("unknown"))
-	assert.False(t, (*ObjectiveMapping)(nil).ValidateLabelExists("any"))
+	assert.True(t, mapping.HasObjectiveLabel("critical"))
+	assert.True(t, mapping.HasObjectiveLabel("CRITICAL"))
+	assert.True(t, mapping.HasObjectiveLabel(" critical "))
+	assert.False(t, mapping.HasObjectiveLabel("unknown"))
+	assert.False(t, (*ObjectiveMapping)(nil).HasObjectiveLabel("any"))
 }
 
 func TestObjectiveMapping_GetAllLabels(t *testing.T) {
+	t.Parallel()
 	mapping := &ObjectiveMapping{
 		LabelToValue: map[string]int{
 			"zebra":  10,
@@ -208,6 +222,7 @@ func TestObjectiveMapping_GetAllLabels(t *testing.T) {
 }
 
 func TestObjectiveMapping_String(t *testing.T) {
+	t.Parallel()
 	mapping := DefaultObjectiveMapping()
 	str := mapping.String()
 	assert.Contains(t, str, "ObjectiveMapping")
@@ -217,7 +232,7 @@ func TestObjectiveMapping_String(t *testing.T) {
 	assert.Equal(t, "nil ObjectiveMapping", nilMapping.String())
 }
 
-func TestLoadObjectiveMappingFromConfig_EnvVar(t *testing.T) {
+func TestLoadObjectiveMapping_EnvVar(t *testing.T) {
 	// Save original env
 	originalEnv := os.Getenv("OBJECTIVE_MAPPING_JSON")
 	defer os.Setenv("OBJECTIVE_MAPPING_JSON", originalEnv)
@@ -226,25 +241,25 @@ func TestLoadObjectiveMappingFromConfig_EnvVar(t *testing.T) {
 	testMapping := `{"label_to_value": {"test-label": 42}, "multi_label_logic": "sum"}`
 	os.Setenv("OBJECTIVE_MAPPING_JSON", testMapping)
 
-	mapping := LoadObjectiveMappingFromConfig()
+	mapping := LoadObjectiveMapping()
 	require.NotNil(t, mapping)
 	assert.Equal(t, 42, mapping.LabelToValue["test-label"])
 	assert.Equal(t, "sum", mapping.MultiLabelLogic)
 }
 
-func TestLoadObjectiveMappingFromConfig_Default(t *testing.T) {
+func TestLoadObjectiveMapping_Default(t *testing.T) {
 	// Clear env to ensure fallback to default
 	originalEnv := os.Getenv("OBJECTIVE_MAPPING_JSON")
 	defer os.Setenv("OBJECTIVE_MAPPING_JSON", originalEnv)
 	os.Setenv("OBJECTIVE_MAPPING_JSON", "")
 
-	mapping := LoadObjectiveMappingFromConfig()
+	mapping := LoadObjectiveMapping()
 	require.NotNil(t, mapping)
 	assert.NotEmpty(t, mapping.LabelToValue)
 	assert.Equal(t, "max", mapping.MultiLabelLogic)
 }
 
-func TestLoadObjectiveMappingFromConfig_GitHubPathPreferred(t *testing.T) {
+func TestLoadObjectiveMapping_GitHubPathPreferred(t *testing.T) {
 	originalEnv := os.Getenv("OBJECTIVE_MAPPING_JSON")
 	defer os.Setenv("OBJECTIVE_MAPPING_JSON", originalEnv)
 	os.Setenv("OBJECTIVE_MAPPING_JSON", "")
@@ -260,13 +275,13 @@ func TestLoadObjectiveMappingFromConfig_GitHubPathPreferred(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(tempDir, ".github", "objective-mapping.json"), []byte(`{"label_to_value": {"github-path": 99}, "multi_label_logic": "max"}`), 0o644))
 	require.NoError(t, os.Chdir(tempDir))
 
-	mapping := LoadObjectiveMappingFromConfig()
+	mapping := LoadObjectiveMapping()
 	require.NotNil(t, mapping)
 	assert.Equal(t, 99, mapping.LabelToValue["github-path"])
 	assert.Equal(t, "max", mapping.MultiLabelLogic)
 }
 
-func TestLoadObjectiveMappingFromConfig_IgnoresLegacyPath(t *testing.T) {
+func TestLoadObjectiveMapping_IgnoresLegacyPath(t *testing.T) {
 	originalEnv := os.Getenv("OBJECTIVE_MAPPING_JSON")
 	defer os.Setenv("OBJECTIVE_MAPPING_JSON", originalEnv)
 	os.Setenv("OBJECTIVE_MAPPING_JSON", "")
@@ -282,13 +297,14 @@ func TestLoadObjectiveMappingFromConfig_IgnoresLegacyPath(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(tempDir, ".gh-aw", "objective-mapping.json"), []byte(`{"label_to_value": {"legacy-path": 77}, "multi_label_logic": "sum"}`), 0o644))
 	require.NoError(t, os.Chdir(tempDir))
 
-	mapping := LoadObjectiveMappingFromConfig()
+	mapping := LoadObjectiveMapping()
 	require.NotNil(t, mapping)
 	assert.NotContains(t, mapping.LabelToValue, "legacy-path")
 	assert.Equal(t, "max", mapping.MultiLabelLogic)
 }
 
 func TestObjectiveMapping_RealWorldScenario(t *testing.T) {
+	t.Parallel()
 	// Test realistic scenario from impact efficiency report
 	mapping := DefaultObjectiveMapping()
 

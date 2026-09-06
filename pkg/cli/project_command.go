@@ -13,12 +13,13 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/repoutil"
 	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/spf13/cobra"
 )
 
 var projectLog = logger.New("cli:project")
-var projectCommandRunGH = workflow.RunGH
+var projectCommandRunGHInputContext = workflow.RunGHInputContext
 
 // ProjectConfig holds configuration for creating a GitHub Project
 type ProjectConfig struct {
@@ -52,6 +53,7 @@ Available subcommands:
 	}
 
 	// Add subcommands
+	cmd.AddCommand(newLegacyGHGuardSubcommand())
 	cmd.AddCommand(NewProjectNewCommand())
 
 	return cmd
@@ -87,7 +89,7 @@ Project Setup:
 			withProjectSetup, _ := cmd.Flags().GetBool("with-project-setup")
 
 			if owner == "" {
-				return errors.New("--owner flag is required. Use '@me' for current user or specify org name")
+				return errors.New("--owner flag is missing. Expected '@me' for the current user or an organization login. Example: gh aw project new \"My Project\" --owner @me")
 			}
 
 			config := ProjectConfig{
@@ -226,19 +228,65 @@ func getCurrentUser(ctx context.Context) (string, error) {
 	return login, nil
 }
 
+// The GraphQL documents below are hardcoded static query templates. They are declared as
+// named constants (never built with fmt.Sprintf or string concatenation) so that all
+// user-controlled input, such as the project owner login, is passed exclusively through
+// GraphQL variables (CWE-89 / workflow-graphql-static-concat).
+const (
+	validateOrgOwnerQuery  = `query($login: String!) { organization(login: $login) { id login } }`
+	validateUserOwnerQuery = `query($login: String!) { user(login: $login) { id login } }`
+
+	orgOwnerNodeIDQuery  = `query($login: String!) { organization(login: $login) { id } }`
+	userOwnerNodeIDQuery = `query($login: String!) { user(login: $login) { id } }`
+
+	orgProjectFieldsQuery = `query($login: String!, $number: Int!) {
+		organization(login: $login) {
+			projectV2(number: $number) {
+				id
+				fields(first: 100) {
+					nodes {
+						... on ProjectV2SingleSelectField {
+							id
+							name
+							options { name color description }
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	userProjectFieldsQuery = `query($login: String!, $number: Int!) {
+		user(login: $login) {
+			projectV2(number: $number) {
+				id
+				fields(first: 100) {
+					nodes {
+						... on ProjectV2SingleSelectField {
+							id
+							name
+							options { name color description }
+						}
+					}
+				}
+			}
+		}
+	}`
+)
+
 // validateOwner validates that the owner exists
 func validateOwner(ctx context.Context, ownerType, owner string, verbose bool) error {
 	projectLog.Printf("Validating %s: %s", ownerType, owner)
 	console.LogVerbose(verbose, fmt.Sprintf("Validating %s exists: %s", ownerType, owner))
 
-	var query string
+	query := validateUserOwnerQuery
 	if ownerType == "org" {
-		query = `query($login: String!) { organization(login: $login) { id login } }`
-	} else {
-		query = `query($login: String!) { user(login: $login) { id login } }`
+		query = validateOrgOwnerQuery
 	}
 
-	_, err := projectCommandRunGH("Validating owner...", "api", "graphql", "-f", "query="+query, "-f", "login="+owner)
+	_, err := runProjectGraphQLQueryWithVariables(ctx, "Validating owner...", query, map[string]any{
+		"login": owner,
+	})
 	if err != nil {
 		if ownerType == "org" {
 			return fmt.Errorf("organization '%s' not found or not accessible", owner)
@@ -263,17 +311,16 @@ func getOwnerNodeId(ctx context.Context, ownerType, owner string, verbose bool) 
 	projectLog.Printf("Getting node ID for %s: %s", ownerType, owner)
 	console.LogVerbose(verbose, fmt.Sprintf("Getting node ID for %s: %s", ownerType, owner))
 
-	var query string
-	var jqPath string
+	query := userOwnerNodeIDQuery
+	jqPath := ".data.user.id"
 	if ownerType == "org" {
-		query = `query($login: String!) { organization(login: $login) { id } }`
+		query = orgOwnerNodeIDQuery
 		jqPath = ".data.organization.id"
-	} else {
-		query = `query($login: String!) { user(login: $login) { id } }`
-		jqPath = ".data.user.id"
 	}
 
-	output, err := projectCommandRunGH("Getting owner ID...", "api", "graphql", "-f", "query="+query, "-f", "login="+owner, "--jq", jqPath)
+	output, err := runProjectGraphQLQueryWithVariables(ctx, "Getting owner ID...", query, map[string]any{
+		"login": owner,
+	}, "--jq", jqPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to get owner node ID: %w", err)
 	}
@@ -285,6 +332,22 @@ func getOwnerNodeId(ctx context.Context, ownerType, owner string, verbose bool) 
 
 	console.LogVerbose(verbose, "✓ Got node ID: "+nodeId)
 	return nodeId, nil
+}
+
+func runProjectGraphQLQueryWithVariables(ctx context.Context, spinnerMessage, query string, variables map[string]any, args ...string) ([]byte, error) {
+	requestBody := map[string]any{
+		"query":     query,
+		"variables": variables,
+	}
+	requestJSON, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal GraphQL request: %w", err)
+	}
+
+	ghArgs := make([]string, 0, 4+len(args))
+	ghArgs = append(ghArgs, "api", "graphql", "--input", "-")
+	ghArgs = append(ghArgs, args...)
+	return projectCommandRunGHInputContext(ctx, spinnerMessage, bytes.NewReader(requestJSON), ghArgs...)
 }
 
 // createProject creates a GitHub Project V2
@@ -318,8 +381,7 @@ func createProject(ctx context.Context, ownerId, title string, verbose bool) (ma
 	output, err := workflow.RunGHInputContext(ctx, "Creating project...", bytes.NewReader(requestJSON), "api", "graphql", "--input", "-")
 	if err != nil {
 		// Check for permission errors
-		//nolint:errstringmatch // gh CLI GraphQL surfaces missing Projects scope as INSUFFICIENT_SCOPES text.
-		if strings.Contains(err.Error(), "INSUFFICIENT_SCOPES") || errorutil.IsNotFoundError(err) {
+		if errorutil.IsInsufficientScopesError(err) || errorutil.IsNotFoundError(err) {
 			return nil, errors.New("insufficient permissions. You need a PAT with Projects access (classic: 'project' scope, fine-grained: Organization → Projects: Read & Write). Set GH_AW_PROJECT_GITHUB_TOKEN or configure gh CLI with a suitable token")
 		}
 		return nil, fmt.Errorf("GraphQL mutation failed: %w", err)
@@ -334,17 +396,17 @@ func createProject(ctx context.Context, ownerId, title string, verbose bool) (ma
 	// Extract project data
 	data, ok := response["data"].(map[string]any)
 	if !ok {
-		return nil, errors.New("invalid response: missing 'data' field")
+		return nil, errors.New("response is missing the 'data' field. Expected the GitHub GraphQL mutation payload to include data.createProjectV2.projectV2. Example: run 'gh auth status' to verify token scopes, then retry the command")
 	}
 
 	createResult, ok := data["createProjectV2"].(map[string]any)
 	if !ok {
-		return nil, errors.New("invalid response: missing 'createProjectV2' field")
+		return nil, errors.New("response is missing the 'createProjectV2' field. Expected the GitHub GraphQL mutation payload to include data.createProjectV2.projectV2. Example: run 'gh auth status' to verify token scopes, then retry the command")
 	}
 
 	project, ok := createResult["projectV2"].(map[string]any)
 	if !ok {
-		return nil, errors.New("invalid response: missing 'projectV2' field")
+		return nil, errors.New("response is missing the 'projectV2' field. Expected the GitHub GraphQL mutation payload to include data.createProjectV2.projectV2. Example: run 'gh auth status' to verify token scopes, then retry the command")
 	}
 
 	console.LogVerbose(verbose, fmt.Sprintf("✓ Project created: #%v", project["number"]))
@@ -357,12 +419,10 @@ func linkProjectToRepo(ctx context.Context, projectId, repoSlug string, verbose 
 	console.LogVerbose(verbose, "Linking project to repository: "+repoSlug)
 
 	// Parse repo slug
-	parts := strings.Split(repoSlug, "/")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid repository format. Expected 'owner/repo', got '%s'", repoSlug)
+	repoOwner, repoName, err := repoutil.SplitRepoSlug(repoSlug)
+	if err != nil {
+		return fmt.Errorf("repository slug '%s' is not in owner/repo format. Expected '<owner>/<repo>'. Example: github/gh-aw", repoSlug)
 	}
-	repoOwner := parts[0]
-	repoName := parts[1]
 
 	// Get repository ID
 	repoIdQuery := `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { id } }`
@@ -417,16 +477,6 @@ func linkProjectToRepo(ctx context.Context, projectId, repoSlug string, verbose 
 	return nil
 }
 
-// escapeGraphQLString escapes special characters in GraphQL strings
-func escapeGraphQLString(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "\"", "\\\"")
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	s = strings.ReplaceAll(s, "\r", "\\r")
-	s = strings.ReplaceAll(s, "\t", "\\t")
-	return s
-}
-
 // projectURLInfo contains parsed project URL information
 type projectURLInfo struct {
 	scope         string // "users" or "orgs"
@@ -440,7 +490,7 @@ func parseProjectURL(projectURL string) (projectURLInfo, error) {
 	// Expected format: https://github.com/orgs/myorg/projects/123 or https://github.com/users/myuser/projects/123
 	parts := strings.Split(projectURL, "/")
 	if len(parts) < 6 {
-		return projectURLInfo{}, errors.New("invalid project URL format")
+		return projectURLInfo{}, errors.New("project URL format is not recognized. Expected https://github.com/orgs/<org>/projects/<number> or https://github.com/users/<user>/projects/<number>. Example: https://github.com/orgs/github/projects/123")
 	}
 
 	var scope, ownerLogin, numberStr string
@@ -456,7 +506,7 @@ func parseProjectURL(projectURL string) (projectURLInfo, error) {
 	}
 
 	if scope == "" {
-		return projectURLInfo{}, errors.New("invalid project URL: could not find orgs/users segment")
+		return projectURLInfo{}, errors.New("project URL is missing an 'orgs' or 'users' segment. Expected https://github.com/orgs/<org>/projects/<number> or https://github.com/users/<user>/projects/<number>. Example: https://github.com/users/octocat/projects/123")
 	}
 
 	projectNumber, err := strconv.Atoi(numberStr)
@@ -640,59 +690,29 @@ type statusFieldInfo struct {
 
 // getStatusField retrieves the Status field information for a project
 func getStatusField(ctx context.Context, info projectURLInfo, verbose bool) (statusFieldInfo, error) {
-	var query string
-	var jqProjectID, jqFields string
+	query := userProjectFieldsQuery
+	jqProjectID := ".data.user.projectV2.id"
+	jqFields := ".data.user.projectV2.fields.nodes"
 
-	projectNumberArg := "number=" + strconv.Itoa(info.projectNumber)
 	if info.scope == "orgs" {
-		query = `query($login: String!, $number: Int!) {
-			organization(login: $login) {
-				projectV2(number: $number) {
-					id
-					fields(first: 100) {
-						nodes {
-							... on ProjectV2SingleSelectField {
-								id
-								name
-								options { name color description }
-							}
-						}
-					}
-				}
-			}
-		}`
+		query = orgProjectFieldsQuery
 		jqProjectID = ".data.organization.projectV2.id"
 		jqFields = ".data.organization.projectV2.fields.nodes"
-	} else {
-		query = `query($login: String!, $number: Int!) {
-			user(login: $login) {
-				projectV2(number: $number) {
-					id
-					fields(first: 100) {
-						nodes {
-							... on ProjectV2SingleSelectField {
-								id
-								name
-								options { name color description }
-							}
-						}
-					}
-				}
-			}
-		}`
-		jqProjectID = ".data.user.projectV2.id"
-		jqFields = ".data.user.projectV2.fields.nodes"
 	}
 
 	// Get project ID
-	projectIDOutput, err := projectCommandRunGH("Getting project info...", "api", "graphql", "-f", "query="+query, "-f", "login="+info.ownerLogin, "-F", projectNumberArg, "--jq", jqProjectID)
+	variables := map[string]any{
+		"login":  info.ownerLogin,
+		"number": info.projectNumber,
+	}
+	projectIDOutput, err := runProjectGraphQLQueryWithVariables(ctx, "Getting project info...", query, variables, "--jq", jqProjectID)
 	if err != nil {
 		return statusFieldInfo{}, fmt.Errorf("failed to get project ID: %w", err)
 	}
 	projectID := strings.TrimSpace(string(projectIDOutput))
 
 	// Get fields
-	fieldsOutput, err := projectCommandRunGH("Getting project fields...", "api", "graphql", "-f", "query="+query, "-f", "login="+info.ownerLogin, "-F", projectNumberArg, "--jq", jqFields)
+	fieldsOutput, err := runProjectGraphQLQueryWithVariables(ctx, "Getting project fields...", query, variables, "--jq", jqFields)
 	if err != nil {
 		return statusFieldInfo{}, fmt.Errorf("failed to get project fields: %w", err)
 	}

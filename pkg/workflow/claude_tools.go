@@ -17,7 +17,7 @@ var claudeToolsLog = logger.New("workflow:claude_tools")
 const defaultClaudeTmpWritePath = "/tmp"
 
 // expandNeutralToolsToClaudeTools converts neutral tool names to Claude-specific tool configurations
-func (e *ClaudeEngine) expandNeutralToolsToClaudeTools(tools map[string]any) map[string]any {
+func (e *ClaudeEngine) expandNeutralToolsToClaudeTools(tools map[string]any) map[string]any { //nolint:largefunc // Existing neutral-tool expansion remains centralized.
 	claudeToolsLog.Printf("Starting neutral tools expansion: input_tools=%d", len(tools))
 	result := make(map[string]any)
 
@@ -82,15 +82,6 @@ func (e *ClaudeEngine) expandNeutralToolsToClaudeTools(tools map[string]any) map
 		_ = editTool
 	}
 
-	// Handle playwright tool by converting it to an MCP tool configuration
-	if _, hasPlaywright := tools["playwright"]; hasPlaywright {
-		// Create playwright as an MCP tool with the same tools available as copilot agent
-		playwrightMCP := map[string]any{
-			"allowed": GetPlaywrightTools(),
-		}
-		result["playwright"] = playwrightMCP
-	}
-
 	claudeToolsLog.Printf("Expansion complete: result_tools=%d, claude_allowed=%d", len(result), len(claudeAllowed))
 	return result
 }
@@ -119,12 +110,12 @@ func isExplicitlyDisabledTool(tool any) bool {
 // --permission-mode acceptEdits is in use, because acceptEdits actually enforces the
 // allowlist (unlike bypassPermissions which silently ignores it).
 // Panics if callers pass a Claude-specific tools section instead of neutral tools.
-func (e *ClaudeEngine) computeAllowedClaudeToolsString(tools map[string]any, safeOutputs *SafeOutputsConfig, cacheMemoryConfig *CacheMemoryConfig, mcpScripts *MCPScriptsConfig, sandboxConfig *SandboxConfig) string {
+func (e *ClaudeEngine) computeAllowedClaudeToolsString(tools map[string]any, safeOutputs *SafeOutputsConfig, cacheMemoryConfig *CacheMemoryConfig, driveMemoryConfig *DriveMemoryConfig, mcpScripts *MCPScriptsConfig, sandboxConfig *SandboxConfig) string {
 	claudeToolsLog.Print("Computing allowed Claude tools string")
 
 	tools = e.prepareClaudeToolsForAllowedList(tools)
 	allowedTools := collectClaudeAllowedTools(tools)
-	allowedTools = appendTopLevelClaudeTools(allowedTools, tools, cacheMemoryConfig)
+	allowedTools = appendTopLevelClaudeTools(allowedTools, tools, cacheMemoryConfig, driveMemoryConfig)
 	allowedTools = appendSandboxWritableTools(allowedTools, sandboxConfig)
 	allowedTools = appendSafeOutputsTools(allowedTools, safeOutputs)
 	allowedTools = appendMCPScriptsTools(allowedTools, mcpScripts)
@@ -138,6 +129,9 @@ func (e *ClaudeEngine) computeAllowedClaudeToolsString(tools map[string]any, saf
 	return strings.Join(allowedTools, ",")
 }
 
+// prepareClaudeToolsForAllowedList expands neutral tool definitions into Claude-specific
+// format. Panics if tools already contains a "claude" section key, since callers must only
+// ever pass neutral tool definitions at this stage (an internal invariant violation).
 func (e *ClaudeEngine) prepareClaudeToolsForAllowedList(tools map[string]any) map[string]any {
 	if tools == nil {
 		tools = make(map[string]any)
@@ -237,7 +231,7 @@ func isClaudeToolName(toolName string) bool {
 	return toolName != "" && toolName[0] >= 'A' && toolName[0] <= 'Z'
 }
 
-func appendTopLevelClaudeTools(allowedTools []string, tools map[string]any, cacheMemoryConfig *CacheMemoryConfig) []string {
+func appendTopLevelClaudeTools(allowedTools []string, tools map[string]any, cacheMemoryConfig *CacheMemoryConfig, driveMemoryConfig *DriveMemoryConfig) []string {
 	for toolName, toolValue := range tools {
 		if toolName == "claude" {
 			continue
@@ -245,11 +239,32 @@ func appendTopLevelClaudeTools(allowedTools []string, tools map[string]any, cach
 		switch toolName {
 		case "cache-memory":
 			allowedTools = appendCacheMemoryTools(allowedTools, cacheMemoryConfig)
+		case "drive-memory":
+			allowedTools = appendDriveMemoryTools(allowedTools, driveMemoryConfig)
 		case "agentic-workflows":
 			allowedTools = append(allowedTools, "mcp__"+string(constants.AgenticWorkflowsMCPServerID))
 		default:
 			allowedTools = appendMCPToolPermissions(allowedTools, toolName, toolValue)
 		}
+
+	}
+	return allowedTools
+}
+
+func appendDriveMemoryTools(allowedTools []string, config *DriveMemoryConfig) []string {
+	if config == nil {
+		return allowedTools
+	}
+	for _, drive := range config.Drives {
+		memoryDir := driveMemoryDirFor(drive.ID)
+		pattern := memoryDir + "/*" //nolint:manualpathconcat // Claude permission patterns require slash-separated globs.
+		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Read(%s)", pattern))
+		if !drive.RestoreOnly {
+			allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Write(%s)", pattern))
+			allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Edit(%s)", pattern))
+			allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("MultiEdit(%s)", pattern))
+		}
+		allowedTools = appendCacheMemoryBashTools(allowedTools, memoryDir)
 	}
 	return allowedTools
 }
@@ -260,7 +275,7 @@ func appendCacheMemoryTools(allowedTools []string, cacheMemoryConfig *CacheMemor
 	}
 	for _, cache := range cacheMemoryConfig.Caches {
 		cacheDir := cacheMemoryDirFor(cache.ID)
-		cacheDirPattern := cacheDir + "/*"
+		cacheDirPattern := cacheDir + "/*" //nolint:manualpathconcat // Claude permission patterns require slash-separated globs.
 		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Read(%s)", cacheDirPattern))
 		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Write(%s)", cacheDirPattern))
 		allowedTools = sliceutil.MergeUnique(allowedTools, fmt.Sprintf("Edit(%s)", cacheDirPattern))
@@ -301,7 +316,7 @@ func appendMCPToolPermissions(allowedTools []string, toolName string, toolValue 
 	if toolName == "github" {
 		return appendGitHubMCPTools(allowedTools, toolName, toolValue, mcpConfig)
 	}
-	if toolName == "playwright" || isCustomMCP {
+	if isCustomMCP {
 		return appendGenericMCPTools(allowedTools, toolName, mcpConfig)
 	}
 	return allowedTools
@@ -359,7 +374,13 @@ func appendSandboxWritableTools(allowedTools []string, sandboxConfig *SandboxCon
 	}
 	writablePaths := []string{defaultClaudeTmpWritePath}
 	if sandboxConfig.Agent != nil && sandboxConfig.Agent.Config != nil && sandboxConfig.Agent.Config.Filesystem != nil {
-		writablePaths = append(writablePaths, sandboxConfig.Agent.Config.Filesystem.AllowWrite...)
+		if allowWrite := sandboxConfig.Agent.Config.Filesystem.AllowWrite; allowWrite != nil {
+			if sandboxConfig.Agent.Runtime == AgentRuntimeCloudHypervisor {
+				writablePaths = allowWrite
+			} else {
+				writablePaths = append(writablePaths, allowWrite...)
+			}
+		}
 	}
 	seenPatterns := make(map[string]struct{}, len(writablePaths))
 	for _, writablePath := range writablePaths {
@@ -387,7 +408,7 @@ func normalizeSandboxWritablePattern(writablePath string) (string, bool) {
 	if strings.ContainsAny(path, "*?[]{}") {
 		return path, true
 	}
-	return strings.TrimRight(path, "/") + "/*", true
+	return strings.TrimRight(path, "/") + "/*", true //nolint:manualpathconcat // Claude permission patterns require slash-separated globs.
 }
 
 func appendSafeOutputsTools(allowedTools []string, safeOutputs *SafeOutputsConfig) []string {

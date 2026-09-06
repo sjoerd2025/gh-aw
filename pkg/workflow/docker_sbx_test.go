@@ -13,77 +13,55 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestGenerateDockerSbxInstallSteps verifies that all four docker-sbx install step
-// generators produce non-empty output with the expected key content.
+// TestGenerateDockerSbxInstallSteps verifies that all docker-sbx install step
+// generators produce non-empty output with the expected step names and script references.
 func TestGenerateDockerSbxInstallSteps(t *testing.T) {
 	t.Run("KVM check step", func(t *testing.T) {
 		step := generateDockerSbxKVMCheckStep()
 		require.NotEmpty(t, step, "KVM check step must not be empty")
 		content := strings.Join(step, "\n")
-		assert.Contains(t, content, "kvm", "must check for KVM availability")
-		assert.Contains(t, content, "test -e /dev/kvm", "must check /dev/kvm exists")
-		assert.Contains(t, content, "exit 1", "must fail with exit 1 when KVM is absent")
+		assert.Contains(t, content, "Check KVM availability for docker-sbx", "must have correct step name")
+		assert.Contains(t, content, "docker_sbx_kvm_check.sh", "must reference kvm check script")
+		assert.Contains(t, content, "${RUNNER_TEMP}/gh-aw/actions/", "must use RUNNER_TEMP script path")
 	})
 
 	t.Run("secrets check step", func(t *testing.T) {
 		step := generateDockerSbxSecretsCheckStep()
 		require.NotEmpty(t, step, "secrets check step must not be empty")
 		content := strings.Join(step, "\n")
-		assert.Contains(t, content, "DOCKER_PAT", "must check DOCKER_PAT secret")
-		assert.Contains(t, content, "DOCKER_USERNAME", "must check DOCKER_USERNAME secret")
-		assert.Contains(t, content, "secrets.DOCKER_PAT", "must reference secrets.DOCKER_PAT")
-		assert.Contains(t, content, "secrets.DOCKER_USERNAME", "must reference secrets.DOCKER_USERNAME")
-		assert.Contains(t, content, "exit 1", "must fail with exit 1 when secrets are missing")
+		assert.Contains(t, content, "Check Docker Hub secrets for docker-sbx", "must have correct step name")
+		assert.Contains(t, content, "id: docker-sbx-secrets", "must expose step outputs")
+		assert.Contains(t, content, "docker_sbx_secrets_check.sh", "must reference secrets check script")
+		assert.Contains(t, content, "DOCKER_PAT_VAL: ${{ secrets.DOCKER_PAT }}", "must pass DOCKER_PAT via env")
+		assert.Contains(t, content, "DOCKER_USERNAME_VAL: ${{ secrets.DOCKER_USERNAME }}", "must pass DOCKER_USERNAME via env")
 	})
 
 	t.Run("install step", func(t *testing.T) {
 		step := generateDockerSbxInstallStep()
 		require.NotEmpty(t, step, "install step must not be empty")
 		content := strings.Join(step, "\n")
-		assert.Contains(t, content, "docker-sbx", "must install docker-sbx package")
-		assert.Contains(t, content, "sbx version", "must verify sbx is installed")
-		assert.Contains(t, content, "chmod 666 /dev/kvm", "must fix KVM permissions")
-		assert.Contains(t, content, "get.docker.com", "must add Docker apt repo")
+		assert.Contains(t, content, "Install docker-sbx", "must have correct step name")
+		assert.Contains(t, content, "sudo_docker_sbx_install.sh", "must reference sudo install script")
+		assert.Contains(t, content, "${RUNNER_TEMP}/gh-aw/actions/", "must use RUNNER_TEMP script path")
 	})
 
 	t.Run("auth and daemon step", func(t *testing.T) {
 		step := generateDockerSbxAuthAndDaemonStep()
 		require.NotEmpty(t, step, "auth and daemon step must not be empty")
 		content := strings.Join(step, "\n")
-		assert.Contains(t, content, "sbx daemon start", "must start sbx daemon")
-		assert.Contains(t, content, "docker login", "must authenticate with Docker")
-		assert.Contains(t, content, "sbx login", "must authenticate sbx with Docker Hub")
-		assert.Contains(t, content, "sbx policy reset", "must reset sbx policy")
-		assert.Contains(t, content, "sbx policy init allow-all", "must init sbx allow-all policy")
-		assert.Contains(t, content, "docker/sandbox-templates:shell-docker", "must pre-pull template image")
-		assert.Contains(t, content, `export DOCKER_CONFIG="$(mktemp -d)"`, "must isolate Docker auth in a temporary config")
-		assert.Contains(t, content, `trap 'rm -rf "${DOCKER_CONFIG}"' EXIT`, "must clean up temporary Docker auth on exit")
-		// Secrets must be passed via env, not inline in the run: block
-		assert.Contains(t, content, "DOCKER_PAT_VAL: ${{ secrets.DOCKER_PAT }}", "must use env for DOCKER_PAT")
-		assert.Contains(t, content, "DOCKER_USERNAME_VAL: ${{ secrets.DOCKER_USERNAME }}", "must use env for DOCKER_USERNAME")
-		// The run: section must use env var references (${DOCKER_PAT_VAL}) not raw secret expressions.
-		// Extract the run: body to verify secret expressions don't appear in shell commands.
-		parts := strings.SplitN(content, "run: |", 2)
-		require.Len(t, parts, 2, "step must have a run: section")
-		runBody := parts[1]
-		assert.NotContains(t, runBody, "${{ secrets.DOCKER_PAT }}",
-			"raw secrets.DOCKER_PAT expression must not appear in shell commands")
-		assert.NotContains(t, runBody, "${{ secrets.DOCKER_USERNAME }}",
-			"raw secrets.DOCKER_USERNAME expression must not appear in shell commands")
+		assert.Contains(t, content, "Start docker-sbx daemon and authenticate", "must have correct step name")
+		assert.Contains(t, content, "docker_sbx_daemon.sh", "must reference daemon script")
+		assert.Contains(t, content, "DOCKER_PAT_VAL: ${{ secrets.DOCKER_PAT }}", "must pass DOCKER_PAT via env")
+		assert.Contains(t, content, "DOCKER_USERNAME_VAL: ${{ secrets.DOCKER_USERNAME }}", "must pass DOCKER_USERNAME via env")
 	})
 
 	t.Run("pre-flight step", func(t *testing.T) {
 		step := generateDockerSbxPreFlightStep()
 		require.NotEmpty(t, step, "pre-flight step must not be empty")
 		content := strings.Join(step, "\n")
-		assert.Contains(t, content, "sbx create", "must create a test sandbox")
-		assert.Contains(t, content, "test-sandbox-direct", "must use a named test sandbox")
-		assert.Contains(t, content, "sbx exec", "must exec a command in the sandbox")
-		assert.Contains(t, content, "uname -a", "must run uname -a as smoke test")
-		assert.Contains(t, content, "trap cleanup EXIT", "must register cleanup for smoke-test failures")
-		assert.Contains(t, content, "sbx stop", "must stop the test sandbox")
-		assert.Contains(t, content, "sbx rm", "must remove the test sandbox")
-		assert.Contains(t, content, "✅ sbx ready", "must confirm readiness")
+		assert.Contains(t, content, "Run docker-sbx pre-flight smoke test", "must have correct step name")
+		assert.Contains(t, content, "docker_sbx_preflight.sh", "must reference preflight script")
+		assert.Contains(t, content, "${RUNNER_TEMP}/gh-aw/actions/", "must use RUNNER_TEMP script path")
 	})
 
 	t.Run("credential refresh step", func(t *testing.T) {
@@ -91,18 +69,9 @@ func TestGenerateDockerSbxInstallSteps(t *testing.T) {
 		require.NotEmpty(t, step, "credential refresh step must not be empty")
 		content := strings.Join(step, "\n")
 		assert.Contains(t, content, "Refresh sbx credentials", "must have correct step name")
-		assert.Contains(t, content, "sbx login", "must re-authenticate with sbx login")
-		assert.Contains(t, content, "DOCKER_PAT_VAL: ${{ secrets.DOCKER_PAT }}", "must use env for DOCKER_PAT")
-		assert.Contains(t, content, "DOCKER_USERNAME_VAL: ${{ secrets.DOCKER_USERNAME }}", "must use env for DOCKER_USERNAME")
-		assert.Contains(t, content, "✅ sbx credentials refreshed", "must confirm refresh")
-		// The run: section must use env var references, not raw secret expressions.
-		parts := strings.SplitN(content, "run: |", 2)
-		require.Len(t, parts, 2, "step must have a run: section")
-		runBody := parts[1]
-		assert.NotContains(t, runBody, "${{ secrets.DOCKER_PAT }}",
-			"raw secrets expression must not appear in shell commands")
-		assert.NotContains(t, runBody, "${{ secrets.DOCKER_USERNAME }}",
-			"raw secrets expression must not appear in shell commands")
+		assert.Contains(t, content, "docker_sbx_credential_refresh.sh", "must reference credential refresh script")
+		assert.Contains(t, content, "DOCKER_PAT_VAL: ${{ secrets.DOCKER_PAT }}", "must pass DOCKER_PAT via env")
+		assert.Contains(t, content, "DOCKER_USERNAME_VAL: ${{ secrets.DOCKER_USERNAME }}", "must pass DOCKER_USERNAME via env")
 	})
 }
 
@@ -112,10 +81,8 @@ func TestDockerSbxInstallStepOrderInBuildNpmEngineInstallStepsWithAWF(t *testing
 	workflowData := &WorkflowData{
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:                    "awf",
-				Runtime:               AgentRuntimeDockerSbx,
-				NetworkIsolation:      false, // will be overridden by isDockerSbxRuntime
-				SudoExplicitlyEnabled: true,
+				ID:      "awf",
+				Runtime: AgentRuntimeDockerSbx,
 			},
 		},
 		NetworkPermissions: &NetworkPermissions{
@@ -183,9 +150,8 @@ func TestDockerSbxAWFArgs(t *testing.T) {
 			},
 			SandboxConfig: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
-					ID:                    "awf",
-					Runtime:               AgentRuntimeDockerSbx,
-					SudoExplicitlyEnabled: true,
+					ID:      "awf",
+					Runtime: AgentRuntimeDockerSbx,
 				},
 			},
 		},
@@ -215,9 +181,8 @@ func TestDockerSbxAWFArgsSuppressesTTY(t *testing.T) {
 			},
 			SandboxConfig: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
-					ID:                    "awf",
-					Runtime:               AgentRuntimeDockerSbx,
-					SudoExplicitlyEnabled: true,
+					ID:      "awf",
+					Runtime: AgentRuntimeDockerSbx,
 				},
 			},
 		},
@@ -263,9 +228,8 @@ func TestDockerSbxAWFArgsVersionGated(t *testing.T) {
 			},
 			SandboxConfig: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
-					ID:                    "awf",
-					Runtime:               AgentRuntimeDockerSbx,
-					SudoExplicitlyEnabled: true,
+					ID:      "awf",
+					Runtime: AgentRuntimeDockerSbx,
 				},
 			},
 		},
@@ -291,9 +255,8 @@ func TestDockerSbxAWFConfigJSON(t *testing.T) {
 			},
 			SandboxConfig: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
-					ID:                    "awf",
-					Runtime:               AgentRuntimeDockerSbx,
-					SudoExplicitlyEnabled: true,
+					ID:      "awf",
+					Runtime: AgentRuntimeDockerSbx,
 				},
 			},
 		},
@@ -324,7 +287,7 @@ func TestDockerSbxEngineCLIWiring(t *testing.T) {
 	workflowData := &WorkflowData{
 		Name:          "test-workflow",
 		EngineConfig:  &EngineConfig{ID: "claude"},
-		SandboxConfig: &SandboxConfig{Agent: &AgentSandboxConfig{ID: "awf", Runtime: AgentRuntimeDockerSbx, SudoExplicitlyEnabled: true}},
+		SandboxConfig: &SandboxConfig{Agent: &AgentSandboxConfig{ID: "awf", Runtime: AgentRuntimeDockerSbx}},
 		NetworkPermissions: &NetworkPermissions{
 			Firewall: &FirewallConfig{Enabled: true},
 		},
@@ -384,6 +347,40 @@ func TestDockerSbxEngineCLIWiring(t *testing.T) {
 		execContent := strings.Join(execSteps[0], "\n")
 		assert.Contains(t, execContent, `export PATH="${RUNNER_TEMP}/gh-aw/engine-cli/bin:$PATH"`)
 	})
+
+	t.Run("pi install and execution use sbx-visible CLI path", func(t *testing.T) {
+		engine := NewPiEngine()
+		workflowData.EngineConfig = &EngineConfig{ID: "pi"}
+		installSteps := engine.GetInstallationSteps(workflowData)
+		installContent := strings.Join(flattenSteps(installSteps), "\n")
+		assert.Contains(t, installContent, `npm install --ignore-scripts --prefix "${RUNNER_TEMP}/gh-aw/engine-cli" @earendil-works/pi-coding-agent@`+string(constants.DefaultPiVersion))
+		assert.Contains(t, installContent, `ln -sf "../node_modules/.bin/pi" "${RUNNER_TEMP}/gh-aw/engine-cli/bin/pi"`)
+
+		execSteps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
+		require.NotEmpty(t, execSteps)
+		execContent := strings.Join(execSteps[0], "\n")
+		assert.Contains(t, execContent, `export PATH="${RUNNER_TEMP}/gh-aw/engine-cli/bin:$PATH"`)
+	})
+
+	t.Run("pi execution uses sbx-visible CLI path even with firewall disabled", func(t *testing.T) {
+		// sandbox.agent.runtime: docker-sbx can be configured alongside an explicit
+		// network.firewall: false, which takes the non-AWF execution path. The
+		// staged CLI PATH export must still be present so the microVM can see `pi`.
+		nonFirewallWorkflowData := &WorkflowData{
+			Name:          "test-workflow",
+			EngineConfig:  &EngineConfig{ID: "pi"},
+			SandboxConfig: &SandboxConfig{Agent: &AgentSandboxConfig{ID: "awf", Runtime: AgentRuntimeDockerSbx}},
+			NetworkPermissions: &NetworkPermissions{
+				Firewall: &FirewallConfig{Enabled: false},
+			},
+		}
+
+		engine := NewPiEngine()
+		execSteps := engine.GetExecutionSteps(nonFirewallWorkflowData, "/tmp/gh-aw/test.log")
+		require.NotEmpty(t, execSteps)
+		execContent := strings.Join(execSteps[0], "\n")
+		assert.Contains(t, execContent, `export PATH="${RUNNER_TEMP}/gh-aw/engine-cli/bin:$PATH"`)
+	})
 }
 
 // flattenSteps joins a small slice of GitHubActionStep values so docker-sbx tests can
@@ -396,22 +393,20 @@ func flattenSteps(steps []GitHubActionStep) []string {
 	return lines
 }
 
-// TestDockerSbxNetworkIsolationAlwaysTrue verifies that isAWFNetworkIsolationEnabled
-// returns true for docker-sbx even when sudo: true sets NetworkIsolation=false.
+// TestDockerSbxNetworkIsolationAlwaysTrue verifies that the docker-sbx runtime profile
+// always enables network isolation.
 func TestDockerSbxNetworkIsolationAlwaysTrue(t *testing.T) {
 	workflowData := &WorkflowData{
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:                    "awf",
-				Runtime:               AgentRuntimeDockerSbx,
-				NetworkIsolation:      false, // sudo: true sets this to false normally
-				SudoExplicitlyEnabled: true,
+				ID:      "awf",
+				Runtime: AgentRuntimeDockerSbx,
 			},
 		},
 	}
 
 	assert.True(t, isAWFNetworkIsolationEnabled(workflowData),
-		"docker-sbx must always use network isolation regardless of sudo setting")
+		"docker-sbx must always use network isolation")
 }
 
 // TestDockerSbxContainerRuntimeEmpty verifies that getAgentContainerRuntime returns
@@ -436,9 +431,8 @@ func TestDockerSbxValidation_ArcDindIncompatible(t *testing.T) {
 	workflowData := &WorkflowData{
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:                    "awf",
-				Runtime:               AgentRuntimeDockerSbx,
-				SudoExplicitlyEnabled: true,
+				ID:      "awf",
+				Runtime: AgentRuntimeDockerSbx,
 			},
 		},
 		RunnerConfig: &RunnerConfig{Topology: RunnerTopologyArcDind},
@@ -454,28 +448,26 @@ func TestDockerSbxValidation_ArcDindIncompatible(t *testing.T) {
 	require.ErrorContains(t, err, "docker-sbx", "error must mention docker-sbx")
 }
 
-// TestDockerSbxValidation_SudoFalseRejected verifies that docker-sbx without
-// sudo: true is a compile-time error.
-func TestDockerSbxValidation_SudoFalseRejected(t *testing.T) {
+// TestDockerSbxValidation_RuntimeInstallFalseAllowsPreinstalledRuntime verifies that
+// preinstalled docker-sbx runners can skip installation.
+func TestDockerSbxValidation_RuntimeInstallFalseAllowsPreinstalledRuntime(t *testing.T) {
+	falseVal := false
 	workflowData := &WorkflowData{
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:                    "awf",
-				Runtime:               AgentRuntimeDockerSbx,
-				NetworkIsolation:      true,  // sudo: false
-				SudoExplicitlyEnabled: false, // sudo not explicitly set
+				ID:             "awf",
+				Runtime:        AgentRuntimeDockerSbx,
+				RuntimeInstall: &falseVal,
 			},
 		},
 		NetworkPermissions: &NetworkPermissions{
-			Firewall: &FirewallConfig{Enabled: true},
+			Firewall: &FirewallConfig{Enabled: true, Version: "v0.28.0"},
 		},
 		Tools: map[string]any{"github": map[string]any{"mode": "remote"}},
 	}
 
 	err := validateSandboxConfig(workflowData)
-	require.Error(t, err, "docker-sbx without sudo: true must produce a compile-time error")
-	require.ErrorContains(t, err, "sudo: true", "error must mention sudo: true")
-	require.ErrorContains(t, err, "docker-sbx", "error must mention docker-sbx")
+	require.NoError(t, err, "docker-sbx with runtime-install: false should allow preinstalled runtimes without sudo: true")
 }
 
 // TestDockerSbxValidation_DefaultVersionRejected verifies that docker-sbx is rejected
@@ -484,10 +476,8 @@ func TestDockerSbxValidation_DefaultVersionRejected(t *testing.T) {
 	workflowData := &WorkflowData{
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:                    "awf",
-				Runtime:               AgentRuntimeDockerSbx,
-				NetworkIsolation:      false, // sudo: true → NetworkIsolation=false (overridden by isDockerSbxRuntime)
-				SudoExplicitlyEnabled: true,
+				ID:      "awf",
+				Runtime: AgentRuntimeDockerSbx,
 				// Pin to a version that predates containerRuntime support.
 				Version: "v0.27.29",
 			},
@@ -509,11 +499,9 @@ func TestDockerSbxValidation_MinVersionSatisfied(t *testing.T) {
 	workflowData := &WorkflowData{
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:                    "awf",
-				Runtime:               AgentRuntimeDockerSbx,
-				NetworkIsolation:      false,
-				SudoExplicitlyEnabled: true,
-				Version:               string(constants.AWFContainerRuntimeMinVersion),
+				ID:      "awf",
+				Runtime: AgentRuntimeDockerSbx,
+				Version: string(constants.AWFContainerRuntimeMinVersion),
 			},
 		},
 		NetworkPermissions: &NetworkPermissions{
@@ -526,16 +514,14 @@ func TestDockerSbxValidation_MinVersionSatisfied(t *testing.T) {
 	assert.NoError(t, err, "docker-sbx with a supported AWF version must pass validation")
 }
 
-// TestDockerSbxStrictModeSudoSuppressed verifies that sandbox.agent.sudo: true combined
-// with runtime: docker-sbx does NOT produce a strict-mode error (sudo is required for
-// docker-sbx install and the deprecation warning is suppressed).
+// TestDockerSbxStrictModeSudoSuppressed verifies that runtime: docker-sbx does NOT
+// produce a strict-mode error: the compiler derives the required install privileges
+// from the runtime profile.
 func TestDockerSbxStrictModeSudoSuppressed(t *testing.T) {
 	sandboxConfig := &SandboxConfig{
 		Agent: &AgentSandboxConfig{
-			ID:                    "awf",
-			Runtime:               AgentRuntimeDockerSbx,
-			NetworkIsolation:      false,
-			SudoExplicitlyEnabled: true,
+			ID:      "awf",
+			Runtime: AgentRuntimeDockerSbx,
 		},
 	}
 
@@ -543,7 +529,7 @@ func TestDockerSbxStrictModeSudoSuppressed(t *testing.T) {
 	compiler.strictMode = true
 
 	err := compiler.validateStrictSandboxCustomization(sandboxConfig)
-	assert.NoError(t, err, "sudo:true + runtime:docker-sbx must NOT produce a strict-mode error")
+	assert.NoError(t, err, "runtime:docker-sbx must NOT produce a strict-mode error")
 }
 
 // TestIsDockerSbxRuntime verifies the isDockerSbxRuntime helper.
@@ -606,7 +592,6 @@ sandbox:
     id: awf
     runtime: docker-sbx
     version: v0.28.0
-    sudo: true
 ---
 
 # Test docker-sbx Runtime
@@ -628,6 +613,11 @@ sandbox:
 	assert.Contains(t, lockStr, "Check KVM availability", "compiled workflow must include KVM availability check")
 	// Secrets check step must be present.
 	assert.Contains(t, lockStr, "Check Docker Hub secrets", "compiled workflow must include Docker Hub secrets check")
+	assert.Contains(t, lockStr, "docker_sbx_secrets_result: ${{ steps.docker-sbx-secrets.outputs.verification_result }}", "activation job must expose docker-sbx secret check result")
+	assert.Contains(t, lockStr, "DOCKER_SBX_SECRETS_SOFT_FAIL: 'true'", "activation docker-sbx secret check must soft-fail")
+	assert.Contains(t, lockStr, "needs.activation.outputs.docker_sbx_secrets_result != 'failed'", "agent job must skip when docker-sbx secrets are missing")
+	assert.Contains(t, lockStr, "needs.activation.outputs.docker_sbx_secrets_result == 'failed'", "conclusion job must run when docker-sbx secrets are missing")
+	assert.Contains(t, lockStr, "GH_AW_DOCKER_SBX_SECRETS_RESULT: ${{ needs.activation.outputs.docker_sbx_secrets_result }}", "conclusion job must receive docker-sbx secret check result")
 	// docker-sbx install step must be present.
 	assert.Contains(t, lockStr, "Install docker-sbx", "compiled workflow must include docker-sbx install step")
 	// Auth and daemon step must be present.
@@ -660,4 +650,292 @@ sandbox:
 	execPos := strings.Index(lockStr, "agentic_execution")
 	assert.Greater(t, refreshPos, preflightPos, "credential refresh must come after pre-flight step")
 	assert.Less(t, refreshPos, execPos, "credential refresh must come before agent execution step")
+}
+
+// TestDockerSbxFrontmatterExtractionRuntimeInstallFalse verifies direct workflow
+// frontmatter accepts runtime-install: false and still emits credential refresh.
+func TestDockerSbxFrontmatterExtractionRuntimeInstallFalse(t *testing.T) {
+	workflowsDir := t.TempDir()
+
+	markdown := `---
+on:
+  workflow_dispatch:
+engine: copilot
+strict: false
+network:
+  allowed:
+    - "example.com"
+sandbox:
+  agent:
+    id: awf
+    runtime: docker-sbx
+    runtime-install: false
+    version: v0.28.0
+---
+
+# Test preinstalled docker-sbx Runtime
+`
+
+	testFile := filepath.Join(workflowsDir, "test-docker-sbx-runtime-install-false.md")
+	err := os.WriteFile(testFile, []byte(markdown), 0o644)
+	require.NoError(t, err)
+
+	compiler := NewCompiler()
+	err = compiler.CompileWorkflow(testFile)
+	require.NoError(t, err, "compilation with runtime-install: false must succeed without sandbox.agent.sudo")
+
+	lockContent, err := os.ReadFile(filepath.Join(workflowsDir, "test-docker-sbx-runtime-install-false.lock.yml"))
+	require.NoError(t, err)
+	lockStr := string(lockContent)
+
+	assert.NotContains(t, lockStr, "Check KVM availability", "compiled workflow must omit KVM check when runtime-install: false")
+	assert.Contains(t, lockStr, "Check Docker Hub secrets", "compiled workflow must include activation Docker Hub secrets check when runtime-install: false")
+	assert.Contains(t, lockStr, "docker_sbx_secrets_result: ${{ steps.docker-sbx-secrets.outputs.verification_result }}", "activation job must expose docker-sbx secret check result when runtime-install: false")
+	assert.NotContains(t, lockStr, "Install docker-sbx", "compiled workflow must omit docker-sbx install when runtime-install: false")
+	assert.NotContains(t, lockStr, "Start docker-sbx daemon", "compiled workflow must omit sbx daemon step when runtime-install: false")
+	assert.NotContains(t, lockStr, "pre-flight smoke test", "compiled workflow must omit pre-flight step when runtime-install: false")
+	assert.Contains(t, lockStr, "Refresh sbx credentials", "compiled workflow must still include credential refresh when runtime-install: false")
+}
+
+// TestDockerSbxShellScriptContent verifies that the shell scripts referenced by
+// the step generators exist and contain the expected key operations.
+func TestDockerSbxShellScriptContent(t *testing.T) {
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	shDir := filepath.Join(wd, "..", "..", "actions", "setup", "sh")
+
+	tests := []struct {
+		script   string
+		contains []string
+	}{
+		{
+			script: "docker_sbx_kvm_check.sh",
+			contains: []string{
+				"lsmod", "kvm", "/dev/kvm", "exit 1",
+			},
+		},
+		{
+			script: "docker_sbx_secrets_check.sh",
+			contains: []string{
+				"DOCKER_PAT_VAL", "DOCKER_USERNAME_VAL", "DOCKER_SBX_SECRETS_SOFT_FAIL", "verification_result=failed", "exit 1",
+			},
+		},
+		{
+			script: "sudo_docker_sbx_install.sh",
+			contains: []string{
+				"sudo", "apt-get install", "docker-sbx", "sbx version", "/dev/kvm",
+			},
+		},
+		{
+			script: "docker_sbx_daemon.sh",
+			contains: []string{
+				"sbx daemon start", "docker login", "sbx login",
+				"sbx policy reset", "sbx policy init allow-all",
+				"DOCKER_PAT_VAL", "DOCKER_USERNAME_VAL",
+				"DOCKER_CONFIG", "mktemp",
+				"for _ in $(seq 1 10); do",
+				"exit 1", // must fail fast when daemon does not start
+			},
+		},
+		{
+			script: "docker_sbx_preflight.sh",
+			contains: []string{
+				"sbx create", "test-sandbox-direct", "sbx exec", "uname -a",
+				"trap cleanup EXIT", "sbx stop", "sbx rm",
+			},
+		},
+		{
+			script: "docker_sbx_credential_refresh.sh",
+			contains: []string{
+				"sbx login", "DOCKER_PAT_VAL", "DOCKER_USERNAME_VAL",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.script, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(shDir, tc.script))
+			require.NoError(t, err, "script file must exist: %s", tc.script)
+			for _, s := range tc.contains {
+				assert.Contains(t, string(content), s, "script %s must contain %q", tc.script, s)
+			}
+		})
+	}
+}
+
+// TestSudoDockerSbxInstallScriptRequiresSudo verifies that the install script
+// is named with the sudo_ prefix (indicating it requires elevated privileges) and
+// that it actually invokes sudo.
+func TestSudoDockerSbxInstallScriptRequiresSudo(t *testing.T) {
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	script := filepath.Join(wd, "..", "..", "actions", "setup", "sh", "sudo_docker_sbx_install.sh")
+	content, err := os.ReadFile(script)
+	require.NoError(t, err, "sudo_docker_sbx_install.sh must exist")
+	assert.Contains(t, string(content), "sudo", "install script must invoke sudo")
+}
+
+// TestIsRuntimeInstallEnabled verifies the helper returns true by default and
+// respects the RuntimeInstall field only when a runtime is configured.
+func TestIsRuntimeInstallEnabled(t *testing.T) {
+	falseVal := false
+	trueVal := true
+
+	t.Run("nil workflowData returns true", func(t *testing.T) {
+		assert.True(t, isRuntimeInstallEnabled(nil))
+	})
+
+	t.Run("no runtime set - always true regardless of field", func(t *testing.T) {
+		wd := &WorkflowData{
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					RuntimeInstall: &falseVal, // set to false but no runtime
+				},
+			},
+		}
+		assert.True(t, isRuntimeInstallEnabled(wd), "noop when runtime is not set")
+	})
+
+	t.Run("runtime set, field nil - defaults to true", func(t *testing.T) {
+		wd := &WorkflowData{
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{Runtime: AgentRuntimeDockerSbx},
+			},
+		}
+		assert.True(t, isRuntimeInstallEnabled(wd))
+	})
+
+	t.Run("runtime set, runtime-install: true - returns true", func(t *testing.T) {
+		wd := &WorkflowData{
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Runtime:        AgentRuntimeDockerSbx,
+					RuntimeInstall: &trueVal,
+				},
+			},
+		}
+		assert.True(t, isRuntimeInstallEnabled(wd))
+	})
+
+	t.Run("runtime set, runtime-install: false - returns false", func(t *testing.T) {
+		wd := &WorkflowData{
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Runtime:        AgentRuntimeDockerSbx,
+					RuntimeInstall: &falseVal,
+				},
+			},
+		}
+		assert.False(t, isRuntimeInstallEnabled(wd))
+	})
+
+	t.Run("gvisor runtime, runtime-install: false - returns false", func(t *testing.T) {
+		wd := &WorkflowData{
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Runtime:        AgentRuntimeGVisor,
+					RuntimeInstall: &falseVal,
+				},
+			},
+		}
+		assert.False(t, isRuntimeInstallEnabled(wd))
+	})
+}
+
+// TestDockerSbxRuntimeInstallFalseOmitsInstallSteps verifies that when
+// runtime-install: false is set, the five installation steps (KVM check, secrets
+// check, install, daemon, pre-flight) are omitted from the install-step builder.
+// Credential refresh is validated separately in TestDockerSbxFrontmatterExtractionRuntimeInstallFalse.
+func TestDockerSbxRuntimeInstallFalseOmitsInstallSteps(t *testing.T) {
+	falseVal := false
+	workflowData := &WorkflowData{
+		SandboxConfig: &SandboxConfig{
+			Agent: &AgentSandboxConfig{
+				ID:             "awf",
+				Runtime:        AgentRuntimeDockerSbx,
+				RuntimeInstall: &falseVal,
+			},
+		},
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true},
+		},
+	}
+
+	steps := BuildNpmEngineInstallStepsWithAWF(nil, workflowData)
+	content := strings.Join(flattenSteps(steps), "\n")
+
+	// Install steps must be absent.
+	assert.NotContains(t, content, "Check KVM availability", "KVM check must be omitted when runtime-install: false")
+	assert.NotContains(t, content, "Check Docker Hub secrets", "secrets check must be omitted when runtime-install: false")
+	assert.NotContains(t, content, "sudo_docker_sbx_install.sh", "install step must be omitted when runtime-install: false")
+	assert.NotContains(t, content, "docker_sbx_daemon.sh", "daemon step must be omitted when runtime-install: false")
+	assert.NotContains(t, content, "docker-sbx pre-flight smoke test", "pre-flight must be omitted when runtime-install: false")
+}
+
+// TestDockerSbxBehaviorDefinedEngineCLIWiring verifies that behavior-defined engines
+// installed through npm (e.g. Crush) also stage their CLI into the sbx-visible path and
+// prepend it to the sandbox PATH. Without this the CLI is only present in the runner tool
+// cache, which is not mounted into the microVM, and the harness fails with ENOENT.
+func TestDockerSbxBehaviorDefinedEngineCLIWiring(t *testing.T) {
+	def := &EngineDefinition{
+		ID:          "sbxcrush",
+		DisplayName: "SbxCrush",
+		Behaviors: &EngineBehaviorDefinition{
+			Installation: &EngineInstallationDefinition{
+				PackageManager:     "npm",
+				PackageName:        "@charmland/crush",
+				Version:            "0.88.0",
+				StepName:           "Install SbxCrush",
+				IncludeNodeSetup:   true,
+				PostInstallScripts: true,
+			},
+			Execution: &EngineExecutionDefinition{
+				CommandName: "sbxcrush",
+				Args:        []string{"run"},
+				StepName:    "Execute SbxCrush CLI",
+			},
+			HarnessScript: "// harness\n",
+		},
+	}
+	engine, err := NewBehaviorDefinedEngine(def)
+	require.NoError(t, err)
+
+	for _, runtime := range []AgentRuntime{AgentRuntimeDockerSbx, AgentRuntimeCloudHypervisor} {
+		t.Run(string(runtime)+" install and execution use sbx-visible CLI path", func(t *testing.T) {
+			sbxWorkflow := &WorkflowData{
+				Name:          "test-workflow",
+				EngineConfig:  &EngineConfig{ID: "sbxcrush"},
+				SandboxConfig: &SandboxConfig{Agent: &AgentSandboxConfig{ID: "awf", Runtime: runtime}},
+				NetworkPermissions: &NetworkPermissions{
+					Firewall: &FirewallConfig{Enabled: true},
+				},
+			}
+
+			installContent := strings.Join(flattenSteps(engine.GetInstallationSteps(sbxWorkflow)), "\n")
+			assert.Contains(t, installContent, `npm install --prefix "${RUNNER_TEMP}/gh-aw/engine-cli" @charmland/crush@0.88.0`)
+			assert.Contains(t, installContent, `ln -sf "../node_modules/.bin/sbxcrush" "${RUNNER_TEMP}/gh-aw/engine-cli/bin/sbxcrush"`)
+
+			execSteps := engine.GetExecutionSteps(sbxWorkflow, "/tmp/gh-aw/test.log")
+			require.NotEmpty(t, execSteps)
+			execContent := strings.Join(execSteps[len(execSteps)-1], "\n")
+			assert.Contains(t, execContent, `export PATH="${RUNNER_TEMP}/gh-aw/engine-cli/bin:$PATH"`)
+		})
+	}
+
+	t.Run("non-microVM runtimes keep the host install only", func(t *testing.T) {
+		defaultWorkflow := &WorkflowData{
+			Name:         "test-workflow",
+			EngineConfig: &EngineConfig{ID: "sbxcrush"},
+			NetworkPermissions: &NetworkPermissions{
+				Firewall: &FirewallConfig{Enabled: true},
+			},
+		}
+		installContent := strings.Join(flattenSteps(engine.GetInstallationSteps(defaultWorkflow)), "\n")
+		assert.NotContains(t, installContent, `${RUNNER_TEMP}/gh-aw/engine-cli`)
+
+		execSteps := engine.GetExecutionSteps(defaultWorkflow, "/tmp/gh-aw/test.log")
+		require.NotEmpty(t, execSteps)
+		execContent := strings.Join(execSteps[len(execSteps)-1], "\n")
+		assert.NotContains(t, execContent, `${RUNNER_TEMP}/gh-aw/engine-cli/bin`)
+	})
 }

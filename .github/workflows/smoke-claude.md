@@ -2,7 +2,8 @@
 private: true
 emoji: "🧪"
 description: Smoke test workflow that validates Claude engine functionality by reviewing recent PRs twice daily
-on: 
+on:
+  schedule: every 2 days
   slash_command:
     name: smoke-claude
     strategy: centralized
@@ -36,14 +37,21 @@ imports:
   - shared/github-mcp-app.md
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/smoke-test-brevity.md
+  - shared/playwright-title-test.md
+  - shared/reporting.md
 network:
   allowed:
     - defaults
     - github
     - playwright
+    - content-autofill.googleapis.com
+    - www.google.com
+    - accounts.google.com
+    - android.clients.google.com
+    - www.gstatic.com
 sandbox:
   agent:
-    sudo: false
     config:
       filesystem:
         allowWrite:
@@ -56,7 +64,6 @@ tools:
     mode: gh-proxy
     toolsets: [repos, pull_requests]
   playwright:
-    mode: cli
   bash:
     - "*"
 runtimes:
@@ -141,8 +148,6 @@ features:
 ---
 
 # Smoke Test: Claude Engine Validation.
-
-**IMPORTANT: Keep all outputs extremely short and concise. Use single-line responses where possible. No verbose explanations.**
 
 ## Test Requirements
 

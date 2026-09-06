@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
@@ -103,7 +104,7 @@ This command always upgrades all Markdown files in .github/workflows.`,
 			}
 
 			if targetRepo != "" && targetOrg != "" {
-				return errors.New("cannot specify both --repo and --org flags; use --repo for a single repository or --org for organization-wide upgrades")
+				return errors.New("cannot specify both --repo and --org flags; use --repo for a single repository or --org for organization-wide upgrades. Example: gh aw upgrade --repo owner/repo")
 			}
 
 			if len(repoGlobs) > 0 && targetOrg == "" {
@@ -115,7 +116,7 @@ This command always upgrades all Markdown files in .github/workflows.`,
 			}
 
 			if createPR && createIssue {
-				return errors.New("cannot specify both --create-pull-request and --create-issue")
+				return errors.New("cannot specify both --create-pull-request and --create-issue. Example: gh aw upgrade --org my-org --create-pull-request")
 			}
 
 			// Handle audit mode
@@ -159,7 +160,7 @@ This command always upgrades all Markdown files in .github/workflows.`,
 			if createPR {
 				prBody := "This PR upgrades agentic workflows by applying the latest codemods, " +
 					"updating GitHub Actions versions, and recompiling all workflows."
-				_, err := CreatePRWithChanges("upgrade-agentic-workflows", "chore: upgrade agentic workflows",
+				_, err := CreatePRWithChanges(cmd.Context(), "upgrade-agentic-workflows", "chore: upgrade agentic workflows",
 					"Upgrade agentic workflows", prBody, verbose)
 				return err
 			}
@@ -457,6 +458,13 @@ func updateCopilotArtifacts(ctx context.Context, verbose bool) error {
 // path because os.Executable() returns a "(deleted)"-suffixed path after the binary
 // has been renamed out of the way during the upgrade.
 func relaunchWithSameArgs(extraFlag string, exeOverride string) error {
+	allowedExtraFlags := map[string]struct{}{
+		"--skip-extension-upgrade": {},
+	}
+	if _, ok := allowedExtraFlags[extraFlag]; !ok {
+		return fmt.Errorf("invalid relaunch flag %q: expected --skip-extension-upgrade", extraFlag)
+	}
+
 	var exe string
 	if exeOverride != "" {
 		exe = exeOverride
@@ -478,6 +486,9 @@ func relaunchWithSameArgs(extraFlag string, exeOverride string) error {
 	// Explicitly copy os.Args[1:] so appending the extra flag does not modify
 	// the original slice backing array.
 	newArgs := append(append([]string(nil), os.Args[1:]...), extraFlag)
+	if slices.ContainsFunc(newArgs, containsControlCharacters) {
+		return errors.New("invalid relaunch arguments: argument contains invalid control characters. Example: compile .github/workflows/example.md")
+	}
 	upgradeLog.Printf("Re-launching with new binary: %s %v", exe, newArgs)
 
 	// Validate the executable path before re-launching it (defense-in-depth).

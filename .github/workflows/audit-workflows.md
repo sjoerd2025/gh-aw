@@ -28,9 +28,8 @@ experiments:
     start_date: "2026-07-03"
     issue: 43177
 engine:
-  id: claude
-  mcp:
-    tool-timeout: 10m
+  id: codex
+  model-provider: openai
 tools:
   cli-proxy: true
   agentic-workflows:
@@ -51,20 +50,24 @@ imports:
       description: "Historical audit data and patterns"
       max-patch-size: 51200
   - ../skills/jqschema/SKILL.md
+  - shared/reporting.md
 
 
   - shared/otlp.md
   - shared/default-ai-credits-pricing.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 evals:
   - id: workflow_runs_audited
     question: Did the agent audit agentic workflow runs from the last 24 hours?
   - id: issues_identified_or_noop
     question: Were issues, missing tools, errors, and improvement opportunities identified, or was noop used when no problems were found?
+
+model: openai/gpt-5.4
 ---
 
 # Agentic Workflow Audit Agent
@@ -78,6 +81,12 @@ Daily audit all agentic workflow runs from the last 24 hours to identify issues,
 ## Current Context
 
 - **Repository**: ${{ github.repository }}
+
+## Report Formatting
+
+- Begin the final discussion with a concise `### Summary` of the key takeaway and recommendations.
+- Use `###` headings for report sections and `####` headings for subsections. Do not use `#` or `##` headings in the report body.
+- Keep critical findings and key metrics visible, and wrap long audit findings, evidence, or logs in `<details><summary><b>View full findings</b></summary>` blocks.
 
 ## 📊 Trend Charts
 
@@ -142,6 +151,7 @@ Before writing the final report, verify recommendations are concrete and evidenc
 
 When updating repo memory:
 - merge with existing data instead of overwriting useful history
+- serialize `workflow-trends.json` and `recommendations.json` as pretty-printed JSON with two-space indentation and a trailing newline; never store them as minified single-line JSON
 - keep stable IDs so issues, recommendations, and anomalies can be cross-referenced across days
 - increment recurrence and persistence counters when the same problem reappears
 - compare the current audit with prior entries before deciding whether something is new or ongoing
@@ -151,7 +161,6 @@ When updating repo memory:
 **Security**: Never execute untrusted code, validate data, sanitize paths
 **Quality**: Be thorough, specific, actionable, accurate  
 **Efficiency**: Use repo memory, batch operations, respect timeouts
-**Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
 Memory structure: `/tmp/gh-aw/repo-memory/default/{audit-history.jsonl,workflow-trends.json,known-issues.json,recommendations.json,anomalies.json,metrics-summary.json}`
 

@@ -4,7 +4,8 @@
 const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_PARSE } = require("./error_codes.cjs");
-const { parseTokenUsageJsonl, generateTokenUsageSummary } = require("./parse_mcp_gateway_log.cjs");
+const { parseTokenUsageJsonl, generateTokenUsageSummary, formatAICForOutput } = require("./parse_mcp_gateway_log.cjs");
+const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
 
 /**
  * Parses the firewall proxy token-usage.jsonl and appends a collapsible markdown
@@ -49,12 +50,24 @@ function getReadableTokenUsagePaths(paths) {
  * @returns {string}
  */
 function extractRequestId(line) {
-  const match = line.match(/"request_id"\s*:\s*"((?:\\.|[^"\\])*)"/);
-  return match ? match[1] : "";
+  const requestMatch = line.match(/"request_id"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  return requestMatch ? requestMatch[1] : "";
 }
 
 /**
- * Reads token usage files and deduplicates overlapping lines by request_id.
+ * Extracts a cross-file dedupe key with lightweight matching (no full JSON parse).
+ * @param {string} line
+ * @returns {string}
+ */
+function extractTokenUsageDedupeKey(line) {
+  const requestId = extractRequestId(line);
+  if (!requestId) return "";
+  const eventMatch = line.match(/"event"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  return `${eventMatch ? eventMatch[1] : "token_usage"}:${requestId}`;
+}
+
+/**
+ * Reads token usage files and deduplicates overlapping lines by event and request_id.
  * Falls back to raw line dedupe when request_id is absent.
  * @param {string[]} paths
  * @returns {string}
@@ -75,8 +88,7 @@ function readDedupedTokenUsage(paths) {
     for (const line of fileContent.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      const requestId = extractRequestId(trimmed);
-      const dedupeKey = requestId ? `request_id:${requestId}` : trimmed;
+      const dedupeKey = extractTokenUsageDedupeKey(trimmed) || trimmed;
       if (uniqueLineKeys.has(dedupeKey)) continue;
       uniqueLineKeys.add(dedupeKey);
       dedupedLines.push(trimmed);
@@ -97,12 +109,48 @@ function getSummaryTitle() {
 
 /**
  * Builds the token usage section for the GitHub step summary.
+ * The Working-Set Rebuild Factor block is emitted as a sibling of the token
+ * usage block: nesting a <details> inside another <details> prevents GitHub
+ * from rendering the markdown table that follows it.
  * @param {string} title
  * @param {string} markdown
+ * @param {ReturnType<typeof calculateWorkingSetFromJSONL>["workingSet"] | null} workingSet
  * @returns {string}
  */
-function buildStepSummarySection(title, markdown) {
-  return `### ${title}\n\n<details>\n<summary>Per-request AI credits and token totals</summary>\n\n${markdown}</details>\n\n`;
+function buildStepSummarySection(title, markdown, workingSet = null) {
+  const workingSetSection = buildWorkingSetDetailsSection(workingSet);
+  return `<details>\n<summary>${title}</summary>\n\nPer-request AI credits and token totals\n\n${markdown}</details>\n\n${workingSetSection}`;
+}
+
+/**
+ * Builds a progressive-disclosure block for the Working-Set Rebuild Factor.
+ * @param {ReturnType<typeof calculateWorkingSetFromJSONL>["workingSet"] | null} workingSet
+ * @returns {string}
+ */
+function buildWorkingSetDetailsSection(workingSet) {
+  if (!workingSet || typeof workingSet !== "object") return "";
+  const measurementState = workingSet.measurement_state || "unavailable";
+  const rebuildFactor = typeof workingSet.rebuild_factor === "number" && Number.isFinite(workingSet.rebuild_factor) ? workingSet.rebuild_factor : null;
+  const displayFactor = rebuildFactor === null ? "unavailable" : `${rebuildFactor.toFixed(2)}×`;
+  const displayInvocations = Number.isFinite(workingSet.invocations) ? workingSet.invocations.toLocaleString() : "0";
+  const displayCumulative = Number.isFinite(workingSet.cumulative_input_tokens) ? workingSet.cumulative_input_tokens.toLocaleString() : "0";
+  const displayPeak = Number.isFinite(workingSet.peak_input_tokens) ? workingSet.peak_input_tokens.toLocaleString() : "0";
+  const displayExcess = Number.isFinite(workingSet.rebuild_excess_tokens) ? workingSet.rebuild_excess_tokens.toLocaleString() : "0";
+
+  return [
+    "<details>",
+    `<summary>Working-Set Rebuild Factor (WSRF): ${displayFactor} (${measurementState})</summary>`,
+    "",
+    `- State: \`${measurementState}\``,
+    `- Invocations: ${displayInvocations}`,
+    `- Cumulative input tokens: ${displayCumulative}`,
+    `- Peak invocation input tokens: ${displayPeak}`,
+    `- Rebuild excess tokens: ${displayExcess}`,
+    "",
+    "</details>",
+    "",
+    "",
+  ].join("\n");
 }
 
 /**
@@ -130,10 +178,11 @@ function renderTokenTableAsPlainText(title, markdown) {
  * Falls back to the Actions summary API when the summary path is unavailable.
  * @param {string} title
  * @param {string} markdown
+ * @param {ReturnType<typeof calculateWorkingSetFromJSONL>["workingSet"] | null} workingSet
  * @returns {Promise<void>}
  */
-async function appendStepSummarySection(title, markdown) {
-  const section = buildStepSummarySection(title, markdown);
+async function appendStepSummarySection(title, markdown, workingSet = null) {
+  const section = buildStepSummarySection(title, markdown, workingSet);
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
   if (summaryPath) {
     try {
@@ -167,10 +216,14 @@ async function main() {
       core.info("Token usage file contained no valid entries");
       return;
     }
+    for (const warning of summary.aiCreditsWarnings) {
+      core.warning(`[ai-credits] ${warning}`);
+    }
     const markdown = generateTokenUsageSummary(summary);
+    const workingSet = calculateWorkingSetFromJSONL(content).workingSet;
     if (markdown.length > 0) {
       core.info(renderTokenTableAsPlainText(getSummaryTitle(), markdown));
-      await appendStepSummarySection(getSummaryTitle(), markdown);
+      await appendStepSummarySection(getSummaryTitle(), markdown, workingSet);
     }
 
     core.info("Token usage summary appended to step summary");
@@ -195,7 +248,7 @@ async function main() {
       cache_read_tokens: summary.totalCacheReadTokens,
       cache_write_tokens: summary.totalCacheWriteTokens,
       ambient_context: Math.round(summary.ambientContextTokens || 0),
-      ai_credits: Number((summary.totalAIC || 0).toFixed(3)),
+      ai_credits: summary.aiCreditsSource === "awf_reported" ? Number(summary.totalAIC.toFixed(6)) : Number((summary.totalAIC || 0).toFixed(3)),
       ...(primaryModel ? { primary_model: primaryModel } : {}),
     };
     fs.writeFileSync(AGENT_USAGE_PATH, JSON.stringify(agentUsage) + "\n");
@@ -205,8 +258,8 @@ async function main() {
       core.setOutput("primary_model", primaryModel);
       core.info(`Primary model: ${primaryModel}`);
     }
-    if (summary.totalAIC > 0) {
-      const aic = summary.totalAIC.toFixed(3);
+    if (summary.aiCreditsSource === "awf_reported" || summary.totalAIC > 0) {
+      const aic = formatAICForOutput(summary.totalAIC, summary.aiCreditsSource);
       core.exportVariable("GH_AW_AIC", aic);
       core.setOutput("aic", aic);
       core.info(`AI Credits: ${aic}`);
@@ -228,9 +281,11 @@ if (typeof module !== "undefined" && module.exports) {
     main,
     getReadableTokenUsagePaths,
     extractRequestId,
+    extractTokenUsageDedupeKey,
     readDedupedTokenUsage,
     getSummaryTitle,
     buildStepSummarySection,
+    buildWorkingSetDetailsSection,
     appendStepSummarySection,
     renderTokenTableAsPlainText,
     TOKEN_USAGE_AUDIT_PATH,
@@ -245,7 +300,7 @@ if (typeof module !== "undefined" && module.exports) {
 // Run main if called directly
 if (require.main === module) {
   main().catch(err => {
-    console.error(err && err.stack ? err.stack : String(err));
+    console.error(err instanceof Error && err.stack ? err.stack : getErrorMessage(err));
     process.exitCode = 1;
   });
 }

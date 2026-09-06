@@ -4,8 +4,13 @@ package colorwriter_test
 
 import (
 	"bytes"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -17,6 +22,7 @@ import (
 // TestSpec_PublicAPI_New validates the documented behavior of New from the
 // README.md specification.
 func TestSpec_PublicAPI_New(t *testing.T) {
+	t.Parallel()
 	t.Run("returns a usable writer wrapping the provided writer", func(t *testing.T) {
 		var buf bytes.Buffer
 		w := colorwriter.New(&buf, []string{"NO_COLOR=1"})
@@ -42,6 +48,7 @@ func TestSpec_PublicAPI_New(t *testing.T) {
 // TestSpec_PublicAPI_Stderr validates the documented behavior of Stderr from the
 // README.md specification.
 func TestSpec_PublicAPI_Stderr(t *testing.T) {
+	t.Parallel()
 	w := colorwriter.Stderr()
 	require.NotNil(t, w, "Stderr should return a non-nil io.Writer")
 	assert.Implements(t, (*io.Writer)(nil), w, "Stderr should return an io.Writer as documented")
@@ -50,6 +57,7 @@ func TestSpec_PublicAPI_Stderr(t *testing.T) {
 // TestSpec_PublicAPI_Degrade validates the documented behavior of Degrade from the
 // README.md specification.
 func TestSpec_PublicAPI_Degrade(t *testing.T) {
+	t.Parallel()
 	const ansiRed = "\x1b[31mhello\x1b[0m"
 
 	tests := []struct {
@@ -72,6 +80,11 @@ func TestSpec_PublicAPI_Degrade(t *testing.T) {
 			environ: []string{"TERM=xterm-256color", "CLICOLOR_FORCE=1"},
 			want:    ansiRed,
 		},
+		{
+			name:    "preserves ansi for interactive color terminals",
+			environ: []string{"TERM=xterm-256color"},
+			want:    ansiRed,
+		},
 	}
 
 	for _, tt := range tests {
@@ -86,4 +99,29 @@ func TestSpec_PublicAPI_Degrade(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestSpec_Implementation_DoesNotImportLogger(t *testing.T) {
+	t.Parallel()
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+
+	fset := token.NewFileSet()
+	checked := 0
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		checked++
+
+		parsed, err := parser.ParseFile(fset, file, nil, parser.ImportsOnly)
+		require.NoError(t, err, "parse %s", file)
+
+		for _, imp := range parsed.Imports {
+			path, err := strconv.Unquote(imp.Path.Value)
+			require.NoError(t, err, "unquote import in %s", file)
+			require.NotEqual(t, "github.com/github/gh-aw/pkg/logger", path, "%s must remain a low-level dependency of pkg/logger", file)
+		}
+	}
+	require.Positive(t, checked, "expected at least one non-test Go file in colorwriter")
 }

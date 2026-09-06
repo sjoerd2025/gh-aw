@@ -6,12 +6,12 @@ import (
 	"maps"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/syncutil"
 )
 
 var importsLog = logger.New("workflow:imports")
@@ -162,17 +162,12 @@ func (c *Compiler) MergeNetworkPermissions(topNetwork *NetworkPermissions, impor
 
 // getSafeOutputTypeKeys returns the list of safe output type keys from the embedded schema.
 // This is a cached wrapper around parser.GetSafeOutputTypeKeys() to avoid parsing on every call.
-var (
-	safeOutputTypeKeys     []string
-	safeOutputTypeKeysOnce sync.Once
-	safeOutputTypeKeysErr  error
-)
+var safeOutputTypeKeysLoader syncutil.OnceLoader[[]string]
 
 func getSafeOutputTypeKeys() ([]string, error) {
-	safeOutputTypeKeysOnce.Do(func() {
-		safeOutputTypeKeys, safeOutputTypeKeysErr = parser.GetSafeOutputTypeKeys()
+	return safeOutputTypeKeysLoader.Get(func() ([]string, error) {
+		return parser.GetSafeOutputTypeKeys()
 	})
-	return safeOutputTypeKeys, safeOutputTypeKeysErr
 }
 
 // MergeSafeOutputs merges safe-outputs configurations from imports into the top-level safe-outputs.
@@ -272,6 +267,11 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 				}{}
 			}
 		}
+		if topRawSafeOutputs != nil {
+			if _, exists := topRawSafeOutputs["steer"]; exists {
+				delete(config, "steer")
+			}
+		}
 
 		importedConfigs = append(importedConfigs, config)
 	}
@@ -296,6 +296,17 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Recompute the implicit report-incomplete create-issue default now that imports are
+	// merged. The default is originally computed from only the main workflow's own
+	// safe-outputs block, before Linear (or other) handlers supplied by an import are
+	// visible. Without recomputing here, a main workflow that declares only global fields
+	// (e.g. linear-token) could inherit an implicit `create-issue: true` default meant for
+	// a GitHub-only configuration, even though the merged result is Linear-only.
+	if result.ReportIncomplete != nil && result.ReportIncomplete.Implicit {
+		recomputed := defaultReportIncompleteCreateIssue(result)
+		result.ReportIncomplete.CreateIssue = &recomputed
 	}
 
 	// Apply protected-files exclude lists accumulated from type-conflicting imports.
@@ -427,6 +438,9 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 	}
 
 	// Merge meta-configuration fields (only set if empty/zero in result)
+	if !result.Steer && importedConfig.Steer {
+		result.Steer = true
+	}
 	if len(result.AllowedDomains) == 0 && len(importedConfig.AllowedDomains) > 0 {
 		result.AllowedDomains = importedConfig.AllowedDomains
 	}
@@ -441,6 +455,9 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 	}
 	if result.GitHubToken == "" && importedConfig.GitHubToken != "" {
 		result.GitHubToken = importedConfig.GitHubToken
+	}
+	if result.LinearToken == "" && importedConfig.LinearToken != "" {
+		result.LinearToken = importedConfig.LinearToken
 	}
 	if result.GitHubApp == nil && importedConfig.GitHubApp != nil {
 		result.GitHubApp = importedConfig.GitHubApp

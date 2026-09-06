@@ -27,7 +27,7 @@ print_timing() {
 
 # Required environment variables:
 # - MCP_GATEWAY_DOCKER_COMMAND: Container image to run (required)
-# - MCP_GATEWAY_API_KEY: API key for gateway authentication (required for converter scripts)
+# - MCP_GATEWAY_AGENT_ID: agent ID for gateway authentication (required for converter scripts)
 
 # Validate that container is specified (command execution is not supported per spec)
 if [ -z "$MCP_GATEWAY_DOCKER_COMMAND" ]; then
@@ -58,15 +58,42 @@ if [ -L /tmp/gh-aw ] || [ -L /tmp/gh-aw/mcp-config ]; then
   exit 1
 fi
 # Restrict directory permissions so only the runner process owner can read config files
-# (which contain bearer tokens and API keys)
+# (which contain bearer tokens and agent IDs)
 chmod 700 /tmp/gh-aw/mcp-config
+
+GATEWAY_STDOUT=/tmp/gh-aw/mcp-config/gateway-output.json
+# Keep unredacted gateway stderr outside the artifact directory. It is emitted
+# only through print_gateway_startup_diagnostics after redaction.
+GATEWAY_STDERR="$(mktemp /tmp/gh-aw-mcp-gateway-stderr.XXXXXX)"
+chmod 600 "$GATEWAY_STDERR"
+trap 'rm -f "$GATEWAY_STDERR"' EXIT
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_RENDERER="${SCRIPT_DIR}/render_log_to_stdout.sh"
+GATEWAY_STARTUP_MARKER="${MCP_GATEWAY_STARTUP_MARKER:-/tmp/gh-aw/mcp-gateway-started}"
+rm -f "$GATEWAY_STARTUP_MARKER"
+
+print_gateway_startup_diagnostics() {
+  echo "Gateway startup diagnostics:"
+  if [ -s "$GATEWAY_STDERR" ]; then
+    sed -E \
+      -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+      -e 's/((agent[_-]?id|api[_-]?key|token|secret|password|authorization)"?[[:space:]]*[:=][[:space:]]*"?)[^[:space:],}"]+/\1[REDACTED]/Ig' \
+      "$GATEWAY_STDERR" | bash "$LOG_RENDERER" "Gateway stderr"
+  else
+    echo "Gateway stderr: (empty)"
+  fi
+  if [ -s "$GATEWAY_STDOUT" ]; then
+    echo "Gateway stdout was captured but is not displayed because it may contain credentials."
+  else
+    echo "Gateway stdout: (empty)"
+  fi
+}
 
 # Validate container syntax first (before accessing files)
 # Container should be a valid docker command starting with "docker run"
 if ! echo "$MCP_GATEWAY_DOCKER_COMMAND" | grep -qE '^docker run'; then
   echo "ERROR: MCP_GATEWAY_DOCKER_COMMAND has incorrect syntax"
   echo "Expected: docker run command with image and arguments"
-  echo "Got: $MCP_GATEWAY_DOCKER_COMMAND"
   exit 1
 fi
 
@@ -96,10 +123,8 @@ MCP_CONFIG=$(cat)
 print_timing $CONFIG_READ_START "Configuration read from stdin"
 echo ""
 
-# Log the configuration for debugging
-echo "-------START MCP CONFIG-----------"
-echo "$MCP_CONFIG"
-echo "-------END MCP CONFIG-----------"
+# Configuration can contain credentials, so do not print it to the workflow log.
+echo "MCP configuration received; contents withheld because it may contain credentials."
 echo ""
 
 # Validate configuration is valid JSON
@@ -112,11 +137,7 @@ if ! echo "$MCP_CONFIG" | jq empty 2>/tmp/gh-aw/mcp-config/jq-error.log; then
     cat /tmp/gh-aw/mcp-config/jq-error.log
   fi
   echo ""
-  echo "Configuration content:"
-  echo "$MCP_CONFIG" | head -50
-  if [ $(echo "$MCP_CONFIG" | wc -l) -gt 50 ]; then
-    echo "... (truncated, showing first 50 lines)"
-  fi
+  echo "Configuration content is withheld because it may contain credentials."
   exit 1
 fi
 
@@ -138,8 +159,23 @@ if ! echo "$MCP_CONFIG" | jq -e '.gateway.domain' >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! echo "$MCP_CONFIG" | jq -e '.gateway.apiKey' >/dev/null 2>&1; then
-  echo "ERROR: Gateway configuration is missing required 'apiKey' field"
+AGENT_IDENTIFIER_ERROR=$(echo "$MCP_CONFIG" | jq -r '
+  if ((.gateway | has("agentId")) == (.gateway | has("agentIds"))) then
+    "ERROR: Gateway configuration must specify exactly one of '\''agentId'\'' or '\''agentIds'\''"
+  elif (.gateway | has("agentId")) then
+    if (.gateway.agentId | type == "string" and length > 0) then
+      ""
+    else
+      "ERROR: Gateway '\''agentId'\'' must be a non-empty string"
+    end
+  elif (.gateway.agentIds | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) then
+    ""
+  else
+    "ERROR: Gateway '\''agentIds'\'' must be a non-empty array of non-empty strings"
+  end
+')
+if [ -n "$AGENT_IDENTIFIER_ERROR" ]; then
+  echo "$AGENT_IDENTIFIER_ERROR"
   exit 1
 fi
 
@@ -161,14 +197,13 @@ docker rm -f awmg-mcpg 2>/dev/null && echo "Removed stale awmg-mcpg container" |
 echo ""
 
 # Start gateway process with container
-echo "Starting gateway with container: $MCP_GATEWAY_DOCKER_COMMAND"
-echo "Full docker command: $MCP_GATEWAY_DOCKER_COMMAND"
+echo "Starting gateway container..."
 echo ""
 GATEWAY_START_TIME=$(date +%s%3N)
 # Note: MCP_GATEWAY_DOCKER_COMMAND is the full docker command with all flags, mounts, and image
 # Pass MCP_GATEWAY_LOG_DIR to the container via -e flag
 echo "$MCP_CONFIG" | MCP_GATEWAY_LOG_DIR="$MCP_GATEWAY_LOG_DIR" $MCP_GATEWAY_DOCKER_COMMAND \
-  > /tmp/gh-aw/mcp-config/gateway-output.json 2> /tmp/gh-aw/mcp-logs/stderr.log &
+  > "$GATEWAY_STDOUT" 2> "$GATEWAY_STDERR" &
 
 GATEWAY_PID=$!
 echo "Gateway started with PID: $GATEWAY_PID"
@@ -178,12 +213,7 @@ if ps -p $GATEWAY_PID > /dev/null 2>&1; then
   echo "Gateway process confirmed running (PID: $GATEWAY_PID)"
 else
   echo "ERROR: Gateway process exited immediately after start"
-  echo ""
-  echo "Gateway stdout output:"
-  cat /tmp/gh-aw/mcp-config/gateway-output.json 2>/dev/null || echo "No stdout output available"
-  echo ""
-  echo "Gateway stderr logs:"
-  cat /tmp/gh-aw/mcp-logs/stderr.log 2>/dev/null || echo "No stderr logs available"
+  print_gateway_startup_diagnostics
   exit 1
 fi
 echo ""
@@ -197,12 +227,7 @@ if ! ps -p $GATEWAY_PID > /dev/null 2>&1; then
   echo "ERROR: Gateway process (PID: $GATEWAY_PID) exited during initialization"
   WAIT_STATUS=$(wait $GATEWAY_PID 2>/dev/null; echo $?)
   echo "Gateway exit status: $WAIT_STATUS"
-  echo ""
-  echo "Gateway stdout (errors are written here per MCP Gateway Specification):"
-  cat /tmp/gh-aw/mcp-config/gateway-output.json 2>/dev/null || echo "No stdout output available"
-  echo ""
-  echo "Gateway stderr logs (debug output):"
-  cat /tmp/gh-aw/mcp-logs/stderr.log || echo "No stderr logs available"
+  print_gateway_startup_diagnostics
   exit 1
 fi
 echo "Gateway process is still running (PID: $GATEWAY_PID)"
@@ -295,6 +320,8 @@ fi
 if [ "$HTTP_CODE" = "200" ] && [ -n "$HEALTH_RESPONSE" ]; then
   echo "Gateway is ready!"
   print_timing $HEALTH_CHECK_START "Health check wait"
+  touch "$GATEWAY_STARTUP_MARKER"
+  chmod 600 "$GATEWAY_STARTUP_MARKER"
 else
   echo ""
   echo "ERROR: Gateway failed to become ready"
@@ -312,12 +339,7 @@ else
   echo ""
   echo "Docker container status:"
   docker ps -a 2>/dev/null | head -20 || echo "Could not list docker containers"
-  echo ""
-  echo "Gateway stdout (errors are written here per MCP Gateway Specification):"
-  cat /tmp/gh-aw/mcp-config/gateway-output.json 2>/dev/null || echo "No stdout output available"
-  echo ""
-  echo "Gateway stderr logs (debug output):"
-  cat /tmp/gh-aw/mcp-logs/stderr.log || echo "No stderr logs available"
+  print_gateway_startup_diagnostics
   echo ""
   echo "Checking network connectivity to gateway port..."
   netstat -tlnp 2>/dev/null | grep ":${MCP_GATEWAY_PORT}" || ss -tlnp 2>/dev/null | grep ":${MCP_GATEWAY_PORT}" || echo "Port ${MCP_GATEWAY_PORT} does not appear to be listening"
@@ -345,31 +367,21 @@ print_timing $OUTPUT_WAIT_START "Gateway output wait"
 echo ""
 
 # Verify output was written
-if [ ! -s /tmp/gh-aw/mcp-config/gateway-output.json ]; then
+if [ ! -s "$GATEWAY_STDOUT" ]; then
   echo "ERROR: Gateway did not write output configuration"
-  echo ""
-  echo "Gateway stdout (should contain error or config):"
-  cat /tmp/gh-aw/mcp-config/gateway-output.json 2>/dev/null || echo "No stdout output available"
-  echo ""
-  echo "Gateway stderr logs:"
-  cat /tmp/gh-aw/mcp-logs/stderr.log || echo "No stderr logs available"
+  print_gateway_startup_diagnostics
   kill $GATEWAY_PID 2>/dev/null || true
   exit 1
 fi
 
-# Restrict gateway output file permissions - it contains the bearer token / API key
+# Restrict gateway output file permissions - it contains the bearer token / agent ID
 chmod 600 /tmp/gh-aw/mcp-config/gateway-output.json
 
 # Check if output contains an error payload instead of valid configuration
 # Per MCP Gateway Specification v1.0.0 section 9.1, errors are written to stdout as error payloads
-if jq -e '.error' /tmp/gh-aw/mcp-config/gateway-output.json >/dev/null 2>&1; then
+if jq -e '.error' "$GATEWAY_STDOUT" >/dev/null 2>&1; then
   echo "ERROR: Gateway returned an error payload instead of configuration"
-  echo ""
-  echo "Gateway error details:"
-  cat /tmp/gh-aw/mcp-config/gateway-output.json
-  echo ""
-  echo "Gateway stderr logs:"
-  cat /tmp/gh-aw/mcp-logs/stderr.log || echo "No stderr logs available"
+  print_gateway_startup_diagnostics
   kill $GATEWAY_PID 2>/dev/null || true
   exit 1
 fi
@@ -379,9 +391,9 @@ echo "Converting gateway configuration to agent format..."
 CONFIG_CONVERT_START=$(date +%s%3N)
 export MCP_GATEWAY_OUTPUT=/tmp/gh-aw/mcp-config/gateway-output.json
 
-# Validate MCP_GATEWAY_API_KEY is set (required by converter scripts)
-if [ -z "$MCP_GATEWAY_API_KEY" ]; then
-  echo "ERROR: MCP_GATEWAY_API_KEY environment variable must be set for converter scripts"
+# Validate MCP_GATEWAY_AGENT_ID is set (required by converter scripts)
+if [ -z "$MCP_GATEWAY_AGENT_ID" ]; then
+  echo "ERROR: MCP_GATEWAY_AGENT_ID environment variable must be set for converter scripts"
   echo "This variable should be set in the workflow before calling start_mcp_gateway.sh"
   exit 1
 fi
@@ -456,20 +468,15 @@ echo "Checking MCP server functionality..."
 MCP_CHECK_START=$(date +%s%3N)
 if [ -f ${RUNNER_TEMP}/gh-aw/actions/check_mcp_servers.sh ]; then
   echo "Running MCP server checks..."
-  # Store check diagnostic logs in /tmp/gh-aw/mcp-logs/start-gateway.log for artifact upload
-  # Use tee to output to both stdout and the log file
-  # Enable pipefail so the exit code comes from check_mcp_servers.sh, not tee
-  set -o pipefail
   if ! bash ${RUNNER_TEMP}/gh-aw/actions/check_mcp_servers.sh \
     /tmp/gh-aw/mcp-config/gateway-output.json \
     "http://localhost:${MCP_GATEWAY_PORT}" \
-    "${MCP_GATEWAY_API_KEY}" 2>&1 | tee /tmp/gh-aw/mcp-logs/start-gateway.log; then
+    "${MCP_GATEWAY_AGENT_ID}"; then
     echo "ERROR: MCP server checks failed - no servers could be connected"
     echo "Gateway process will be terminated"
     kill $GATEWAY_PID 2>/dev/null || true
     exit 1
   fi
-  set +o pipefail
   print_timing $MCP_CHECK_START "MCP server connectivity checks"
 else
   echo "WARNING: MCP server check script not found at ${RUNNER_TEMP}/gh-aw/actions/check_mcp_servers.sh"
@@ -512,10 +519,11 @@ print_timing $SCRIPT_START_TIME "Overall gateway startup"
 echo ""
 
 # Output PID as GitHub Actions step output for use in cleanup
-# Output port and API key for use in stop script (per MCP Gateway Specification v1.1.0)
+# Output port and agent ID for use in stop script (per MCP Gateway Specification v1.1.0)
 {
   echo "gateway-pid=$GATEWAY_PID"
   echo "gateway-port=${MCP_GATEWAY_PORT}"
-  echo "gateway-api-key=${MCP_GATEWAY_API_KEY}"
+  echo "gateway-agent-id=${MCP_GATEWAY_AGENT_ID}"
+  echo "gateway-api-key=${MCP_GATEWAY_AGENT_ID}"
   echo "gateway-domain=${MCP_GATEWAY_DOMAIN}"
 } >> "$GITHUB_OUTPUT"

@@ -5,6 +5,8 @@ const { validateTargetRepo, parseAllowedRepos, getDefaultTargetRepo } = require(
 
 const fs = require("fs");
 
+const normalizeConfiguredToolName = name => String(name).replace(/-/g, "_").toLowerCase();
+
 /**
  * Check whether a schema enforces strict object keys.
  * @param {any} inputSchema - Tool input schema
@@ -50,6 +52,44 @@ function sanitizeArgsBySchema(args, inputSchema, onUnknownKeysStripped) {
     onUnknownKeysStripped(strippedKeys);
   }
   return sanitizedArgs;
+}
+
+/**
+ * Map from safe-outputs config key to the tool-definition metadata field that marks a
+ * dynamically generated tool belonging to that config key. Such tools are named after their
+ * target (e.g. a tool named `my_workflow` for the `call_workflow` config key), so they cover
+ * the config key even though their name differs from it.
+ * @type {Record<string, string>}
+ */
+const DYNAMIC_TOOL_METADATA_BY_CONFIG_KEY = {
+  dispatch_workflow: "_workflow_name",
+  dispatch_repository: "_dispatch_repository_tool",
+  call_workflow: "_call_workflow_name",
+};
+
+/**
+ * Safe-outputs config keys that never correspond to an agent-facing tool: handler-only output
+ * types produced by other handlers, and global configuration knobs.
+ * @type {Set<string>}
+ */
+const NON_TOOL_CONFIG_KEYS = new Set(["create_report_incomplete_issue", "create_missing_tool_issue", "create_missing_data_issue", "mentions", "max_bot_mentions"]);
+
+/**
+ * Check whether a config key is already covered by a dynamically generated tool that was
+ * renamed after its target workflow/tool (identified by tool metadata rather than by name).
+ * @param {Array} tools - Array of tool definitions
+ * @param {string} normalizedKey - Normalized config key
+ * @returns {boolean} True when a tool of the same family is already defined
+ */
+function isConfigKeyCoveredByDynamicTool(tools, normalizedKey) {
+  const metadataKey = DYNAMIC_TOOL_METADATA_BY_CONFIG_KEY[normalizedKey];
+  if (!metadataKey) {
+    return false;
+  }
+  if (metadataKey === "_workflow_name" || metadataKey === "_call_workflow_name") {
+    return tools.some(tool => tool && hasValidWorkflowMetadataName(tool[metadataKey]));
+  }
+  return tools.some(tool => tool && tool[metadataKey]);
 }
 
 /**
@@ -130,11 +170,16 @@ function loadTools(server) {
 function attachHandlers(tools, handlers, logger) {
   const handlerMap = {
     create_issue: handlers.createIssueHandler,
+    jira_create_issue: handlers.jiraCreateIssueHandler,
+    jira_update_issue: handlers.jiraUpdateIssueHandler,
+    jira_add_comment: handlers.jiraAddCommentHandler,
+    jira_add_label: handlers.jiraAddLabelHandler,
     create_pull_request: handlers.createPullRequestHandler,
     push_to_pull_request_branch: handlers.pushToPullRequestBranchHandler,
     push_repo_memory: handlers.pushRepoMemoryHandler,
     upload_asset: handlers.uploadAssetHandler,
     upload_artifact: handlers.uploadArtifactHandler,
+    upload_code_coverage: handlers.uploadCodeCoverageHandler,
     create_project: handlers.createProjectHandler,
     add_comment: handlers.addCommentHandler,
     create_pull_request_review_comment: handlers.createPullRequestReviewCommentHandler,
@@ -142,10 +187,26 @@ function attachHandlers(tools, handlers, logger) {
     dismiss_pull_request_review: handlers.dismissPullRequestReviewHandler,
     update_issue: handlers.updateIssueHandler,
     update_pull_request: handlers.updatePullRequestHandler,
+    close_pull_request: handlers.closePullRequestHandler,
+    merge_pull_request: handlers.mergePullRequestHandler,
+    mark_pull_request_as_ready_for_review: handlers.markPullRequestAsReadyForReviewHandler,
+    add_reviewer: handlers.addReviewerHandler,
+    reply_to_pull_request_review_comment: handlers.replyToPullRequestReviewCommentHandler,
+    close_issue: handlers.closeIssueHandler,
+    add_labels: handlers.addLabelsHandler,
+    remove_labels: handlers.removeLabelsHandler,
+    update_discussion: handlers.updateDiscussionHandler,
+    close_discussion: handlers.closeDiscussionHandler,
+    ado_create_work_item: handlers.createWorkItemHandler,
+    ado_update_work_item: handlers.updateWorkItemHandler,
+    ado_comment_on_work_item: handlers.commentOnWorkItemHandler,
+    ado_assign_work_item: handlers.assignWorkItemHandler,
+    ado_link_work_items: handlers.linkWorkItemsHandler,
+    ado_upload_workitem_attachment: handlers.uploadWorkItemAttachmentHandler,
   };
 
   tools.forEach(tool => {
-    const handler = handlerMap[tool.name];
+    const handler = handlerMap[normalizeConfiguredToolName(tool.name)];
     if (handler) {
       tool.handler = handler;
     } else if (typeof handlers.defaultHandler === "function") {
@@ -157,9 +218,11 @@ function attachHandlers(tools, handlers, logger) {
       // Create a custom handler that wraps args in inputs and adds workflow_name
       const workflowName = tool._workflow_name.trim();
       tool.handler = args => {
-        // Wrap args in inputs property to match dispatch_workflow schema
+        const { ref, ...inputs } = args ?? {};
+        // Wrap workflow inputs in inputs and pass dispatch ref as top-level field
         return handlers.defaultHandler("dispatch_workflow")({
-          inputs: args,
+          ...(ref && { ref }),
+          ...(args !== undefined && { inputs }),
           workflow_name: workflowName,
         });
       };
@@ -222,19 +285,23 @@ function registerPredefinedTools(server, tools, config, registerTool, normalizeT
 
   tools.forEach(tool => {
     // Check if this is a regular tool matching a config key
-    if (Object.keys(config).find(configKey => normalizeTool(configKey) === tool.name)) {
+    const normalizedToolName = normalizeTool(tool.name);
+    if (Object.keys(config).find(configKey => normalizeTool(configKey) === normalizedToolName)) {
       let toolToRegister = tool;
-      const safetyWarning = toolSafetyWarnings[tool.name];
-      const isCreatePullRequestTool = tool.name === "create_pull_request" && config.create_pull_request;
+      const safetyWarning = toolSafetyWarnings[normalizedToolName];
+      const isCreatePullRequestTool = normalizedToolName === "create_pull_request" && config.create_pull_request;
       // Enrich create_pull_request tool description when target-repo is configured
       if (safetyWarning || isCreatePullRequestTool) {
+        // The handler is a function and cannot be structurally cloned, so it is
+        // separated out and re-attached to the clone below.
+        const { handler, ...cloneableTool } = tool;
         try {
-          toolToRegister = JSON.parse(JSON.stringify(tool));
+          toolToRegister = structuredClone(cloneableTool);
         } catch (err) {
           throw new Error("Failed to deep-copy tool " + tool.name + ": " + getErrorMessage(err), { cause: err });
         }
-        if (tool.handler) {
-          toolToRegister.handler = tool.handler;
+        if (handler) {
+          toolToRegister.handler = handler;
         }
         if (safetyWarning) {
           toolToRegister.description += safetyWarning;
@@ -324,8 +391,20 @@ function registerDynamicTools(server, tools, config, outputFile, registerTool, n
   Object.keys(config).forEach(configKey => {
     const normalizedKey = normalizeTool(configKey);
 
-    // Skip if it's already a predefined tool
-    if (server.tools[normalizedKey] || tools.find(t => t.name === normalizedKey)) {
+    // Skip config keys that are never exposed as agent-facing tools (handler-only output
+    // types and global configuration knobs).
+    if (NON_TOOL_CONFIG_KEYS.has(normalizedKey)) {
+      server.debug(`Skipping generic tool for non-tool config key: ${configKey}`);
+      return;
+    }
+
+    // Skip if it's already a predefined tool, or if a dynamically generated tool named after
+    // its target (identified by metadata) already covers this config key.
+    if (server.tools[normalizedKey] || tools.find(t => normalizeTool(t.name) === normalizedKey)) {
+      return;
+    }
+    if (isConfigKeyCoveredByDynamicTool(tools, normalizedKey)) {
+      server.debug(`Skipping generic tool for '${configKey}': already covered by dynamically generated tool(s)`);
       return;
     }
 
@@ -350,7 +429,7 @@ function registerDynamicTools(server, tools, config, outputFile, registerTool, n
         try {
           fs.appendFileSync(outputFile, `${JSON.stringify(entry)}\n`);
         } catch (err) {
-          throw new Error(`Failed to append to file ${outputFile}: ${String(err)}`, { cause: err });
+          throw new Error(`Failed to append to file ${outputFile}: ${getErrorMessage(err)}`, { cause: err });
         }
 
         // Use output from safe-job config if available

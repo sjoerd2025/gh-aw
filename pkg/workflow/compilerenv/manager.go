@@ -59,9 +59,16 @@ const (
 	// DefaultMaxTurns is the enterprise override for max-turns when it is not
 	// explicitly configured in workflow frontmatter.
 	DefaultMaxTurns = "GH_AW_DEFAULT_MAX_TURNS"
-	// DefaultTimeoutMinutes is the enterprise override for top-level timeout-minutes
-	// when it is not explicitly configured in workflow frontmatter.
+	// DefaultTimeoutMinutes is the GitHub Actions variable used for the default
+	// agentic execution step timeout when top-level timeout-minutes is not set.
 	DefaultTimeoutMinutes = "GH_AW_DEFAULT_TIMEOUT_MINUTES"
+	// DefaultAgentJobTimeoutMinutes is the GitHub Actions variable used for the
+	// default generated agent job timeout when jobs.agent.timeout-minutes is not set.
+	DefaultAgentJobTimeoutMinutes = "GH_AW_DEFAULT_AGENT_JOB_TIMEOUT_MINUTES"
+	// DefaultDetectionJobTimeoutMinutes is the GitHub Actions variable used for the
+	// default generated detection job timeout when jobs.detection.timeout-minutes
+	// is not set.
+	DefaultDetectionJobTimeoutMinutes = "GH_AW_DEFAULT_DETECTION_JOB_TIMEOUT_MINUTES"
 	// DefaultDetectionModel is the enterprise override for selecting the detection
 	// job model when threat-detection.engine.model is not set.
 	DefaultDetectionModel = "GH_AW_DEFAULT_DETECTION_MODEL"
@@ -72,6 +79,15 @@ const (
 	// DefaultUTC is the enterprise override for the project home timezone used
 	// when rendering local times in CLI output.
 	DefaultUTC = "GH_AW_DEFAULT_UTC"
+
+	// DefaultOTLPEndpoint is the GitHub Actions variable used as the fallback
+	// OTLP endpoint when observability.otlp.endpoint is not configured in
+	// workflow frontmatter (or any imported workflow).
+	DefaultOTLPEndpoint = "GH_AW_DEFAULT_OTLP_ENDPOINT"
+	// DefaultOTLPHeaders is the GitHub Actions secret used as the fallback OTLP
+	// exporter headers (comma-separated key=value pairs) that accompany
+	// DefaultOTLPEndpoint.
+	DefaultOTLPHeaders = "GH_AW_DEFAULT_OTLP_HEADERS"
 
 	// DefaultModelCopilot is the enterprise override for Copilot fallback model selection.
 	DefaultModelCopilot = "GH_AW_DEFAULT_MODEL_COPILOT"
@@ -124,6 +140,13 @@ func (m *Manager) ResolveDefaultTimeoutMinutes(fallback int) int {
 // default process-environment Manager.
 func ResolveDefaultTimeoutMinutes(fallback int) int {
 	return defaultManager.ResolveDefaultTimeoutMinutes(fallback)
+}
+
+// BuildTimeoutMinutesExpression builds a GitHub Actions expression that resolves
+// a default timeout from an Actions variable at runtime, falling back to the
+// compiled-in default when the variable is unset.
+func BuildTimeoutMinutesExpression(varName string, builtinDefault int) string {
+	return fmt.Sprintf("${{ fromJSON(vars.%s || '%d') }}", varName, builtinDefault)
 }
 
 // ResolveDefaultMaxTurnCacheMisses returns fallback when the env var is unset/invalid,
@@ -247,6 +270,21 @@ func BuildDefaultEvalsMaxAICreditsExpression(builtinDefault string) string {
 // returned as the fallback so that an unset variable is treated as "no limit".
 func BuildDefaultMaxTurnsExpression() string {
 	return fmt.Sprintf("${{ vars.%s || '' }}", DefaultMaxTurns)
+}
+
+// BuildDefaultOTLPEndpointExpression builds a vars expression that resolves the
+// OTLP endpoint at runtime from the GH_AW_DEFAULT_OTLP_ENDPOINT GitHub variable.
+// The expression evaluates to an empty string when the variable is unset, which
+// downstream runtime code treats as "observability disabled".
+func BuildDefaultOTLPEndpointExpression() string {
+	return fmt.Sprintf("${{ vars.%s }}", DefaultOTLPEndpoint)
+}
+
+// BuildDefaultOTLPHeadersExpression builds a secrets expression that resolves the
+// OTLP exporter headers at runtime from the GH_AW_DEFAULT_OTLP_HEADERS GitHub
+// secret. The expression evaluates to an empty string when the secret is unset.
+func BuildDefaultOTLPHeadersExpression() string {
+	return fmt.Sprintf("${{ secrets.%s }}", DefaultOTLPHeaders)
 }
 
 // BuildModelOverrideExpression builds a vars expression with primary model var, enterprise

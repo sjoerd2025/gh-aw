@@ -10,12 +10,14 @@ import (
 )
 
 func TestAddWizardCommandMentionsEngines(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddWizardCommand(func(string) error { return nil })
 	require.NotNil(t, cmd, "Add wizard command should be created")
-	assert.Contains(t, cmd.Long, "Copilot, Claude, Codex, Gemini, Antigravity, OpenCode, or Pi", "Add wizard help should mention all interactive engine options")
+	assert.Contains(t, cmd.Long, "Copilot, Claude, Codex, Gemini, or Pi", "Add wizard help should mention all interactive engine options")
 }
 
 func TestAddWizardCommand_UsesStandardThreePartWorkflowSpecWording(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddWizardCommand(func(string) error { return nil })
 	require.NotNil(t, cmd)
 
@@ -26,10 +28,11 @@ func TestAddWizardCommand_UsesStandardThreePartWorkflowSpecWording(t *testing.T)
 }
 
 func TestAddWizardCommand_FlagUsageMatchesAddCommand(t *testing.T) {
+	t.Parallel()
 	addCmd := NewAddCommand(validateEngineStub)
 	wizardCmd := NewAddWizardCommand(validateEngineStub)
 
-	for _, flagName := range []string{"append", "no-security-scanner"} {
+	for _, flagName := range []string{"append", "no-security-scanner", "gh-aw-ref"} {
 		addFlag := addCmd.Flags().Lookup(flagName)
 		wizardFlag := wizardCmd.Flags().Lookup(flagName)
 
@@ -40,9 +43,21 @@ func TestAddWizardCommand_FlagUsageMatchesAddCommand(t *testing.T) {
 }
 
 func TestAddWizardCommand_ExamplesMentionNewFlags(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddWizardCommand(func(string) error { return nil })
 	require.NotNil(t, cmd)
 
 	assert.Contains(t, cmd.Example, "--append \"custom footer\"", "add-wizard examples should show append usage")
 	assert.Contains(t, cmd.Example, "--no-security-scanner", "add-wizard examples should show no-security-scanner usage")
+	assert.Contains(t, cmd.Example, "--no-config", "add-wizard examples should show no-config usage")
+}
+
+func TestAddWizardCommand_HasNoConfigFlag(t *testing.T) {
+	t.Parallel()
+	cmd := NewAddWizardCommand(func(string) error { return nil })
+	require.NotNil(t, cmd)
+
+	flag := cmd.Flags().Lookup("no-config")
+	require.NotNil(t, flag, "add-wizard should define no-config")
+	assert.Equal(t, "false", flag.DefValue, "no-config should default to false")
 }

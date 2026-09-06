@@ -3,6 +3,7 @@ private: true
 emoji: "🌸"
 description: Smoke Copilot Auto — generates a haiku and posts it as a PR comment
 on:
+  schedule: every 2 days
   label_command:
     name: smoke
     events: [pull_request]
@@ -16,6 +17,9 @@ model: auto
 engine:
   id: copilot
   bare: true
+imports:
+  - shared/smoke-test-brevity.md
+  - shared/reporting.md
 tools:
   github:
     mode: gh-proxy
@@ -27,11 +31,12 @@ safe-outputs:
 timeout-minutes: 5
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Auto Haiku
-
-**IMPORTANT: Keep all outputs extremely short and concise.**
 
 ## Task
 

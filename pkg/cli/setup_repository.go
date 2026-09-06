@@ -10,8 +10,11 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/ctxutil"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/repoutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
@@ -103,8 +106,9 @@ func checkSetupRepositoryExists(ctx context.Context, repo string) (bool, error) 
 		return strings.TrimSpace(string(output)) != "", nil
 	}
 
-	message := strings.ToLower(string(output))
-	if strings.Contains(message, "could not resolve to a repository") || strings.Contains(message, "http 404") || strings.Contains(message, "not found") {
+	outputStr := string(output)
+	message := strings.ToLower(outputStr)
+	if strings.Contains(message, "could not resolve to a repository") || errorutil.IsNotFoundOutput(outputStr) {
 		return false, nil
 	}
 	return false, fmt.Errorf("failed to check repository %s: %w", repo, err)
@@ -307,10 +311,7 @@ func RunSetupAuth(opts SetupAuthOptions) error {
 }
 
 func runSetupAuthWithRuntime(opts SetupAuthOptions, runtime setupRepositoryRuntime) error {
-	ctx := opts.Ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := ctxutil.OrBackground(opts.Ctx)
 
 	configureDefaultGHHostFromOriginRemoteIfUnset()
 
@@ -352,10 +353,8 @@ func validateSetupRepositoryCheckOptions(opts SetupRepositoryCheckOptions) error
 }
 
 func isValidOwnerRepoSlug(repo string) bool {
-	parts := strings.Split(repo, "/")
-	return len(parts) == 2 &&
-		strings.TrimSpace(parts[0]) != "" &&
-		strings.TrimSpace(parts[1]) != ""
+	owner, name, err := repoutil.SplitRepoSlug(repo)
+	return err == nil && strings.TrimSpace(owner) != "" && strings.TrimSpace(name) != ""
 }
 
 func runSetupRepositoryCheckWithRuntime(opts SetupRepositoryCheckOptions, runtime setupRepositoryRuntime) error {
@@ -363,10 +362,7 @@ func runSetupRepositoryCheckWithRuntime(opts SetupRepositoryCheckOptions, runtim
 		return err
 	}
 
-	ctx := opts.Ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := ctxutil.OrBackground(opts.Ctx)
 
 	configureDefaultGHHostFromOriginRemoteIfUnset()
 

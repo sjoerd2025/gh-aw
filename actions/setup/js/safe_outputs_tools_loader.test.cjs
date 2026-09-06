@@ -91,6 +91,29 @@ describe("safe_outputs_tools_loader", () => {
   });
 
   describe("attachHandlers", () => {
+    it("attaches Azure DevOps handlers to namespaced public tool names", () => {
+      const tools = [{ name: "ado_create_work_item" }, { name: "ado_update_work_item" }, { name: "ado_comment_on_work_item" }, { name: "ado_assign_work_item" }, { name: "ado_link_work_items" }, { name: "ado_upload_workitem_attachment" }];
+      const handlers = {
+        createWorkItemHandler: vi.fn(),
+        updateWorkItemHandler: vi.fn(),
+        commentOnWorkItemHandler: vi.fn(),
+        assignWorkItemHandler: vi.fn(),
+        linkWorkItemsHandler: vi.fn(),
+        uploadWorkItemAttachmentHandler: vi.fn(),
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      expect(result.map(tool => tool.handler)).toEqual([
+        handlers.createWorkItemHandler,
+        handlers.updateWorkItemHandler,
+        handlers.commentOnWorkItemHandler,
+        handlers.assignWorkItemHandler,
+        handlers.linkWorkItemsHandler,
+        handlers.uploadWorkItemAttachmentHandler,
+      ]);
+    });
+
     it("should attach create_pull_request handler", () => {
       const tools = [
         { name: "create_pull_request", description: "Create PR" },
@@ -251,6 +274,37 @@ describe("safe_outputs_tools_loader", () => {
       });
     });
 
+    it("should pass ref as top-level field for dispatch_workflow handler", () => {
+      const tools = [{ name: "ci_workflow", description: "CI workflow", _workflow_name: "ci" }];
+      const mockHandlerFunction = vi.fn();
+      const defaultHandler = vi.fn(() => mockHandlerFunction);
+      const handlers = {
+        createPullRequestHandler: vi.fn(),
+        pushToPullRequestBranchHandler: vi.fn(),
+        uploadAssetHandler: vi.fn(),
+        defaultHandler: defaultHandler,
+      };
+
+      const result = attachHandlers(tools, handlers);
+
+      result[0].handler({ ref: "feature-branch", input1: "value1" });
+
+      expect(mockHandlerFunction).toHaveBeenCalledWith({
+        workflow_name: "ci",
+        ref: "feature-branch",
+        inputs: {
+          input1: "value1",
+        },
+      });
+      expect(mockHandlerFunction).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: expect.objectContaining({
+            ref: expect.anything(),
+          }),
+        })
+      );
+    });
+
     it("should handle dispatch_workflow with no inputs (empty object)", () => {
       const tools = [{ name: "no_inputs_workflow", description: "No inputs workflow", _workflow_name: "no-inputs" }];
       const mockHandlerFunction = vi.fn();
@@ -405,6 +459,43 @@ describe("safe_outputs_tools_loader", () => {
           }),
         })
       );
+    });
+
+    it("should keep strict-schema ref top-level for dispatch_workflow handler", () => {
+      const mockHandlerFunction = vi.fn();
+      const defaultHandler = vi.fn(() => mockHandlerFunction);
+      const tools = [
+        {
+          name: "dispatch_ci",
+          description: "Dispatch CI",
+          _workflow_name: "ci",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ref: { type: "string" },
+              issue_number: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      ];
+      const handlers = {
+        defaultHandler,
+      };
+
+      const result = attachHandlers(tools, handlers);
+      result[0].handler({
+        ref: "feature-branch",
+        issue_number: "123",
+      });
+
+      expect(mockHandlerFunction).toHaveBeenCalledWith({
+        workflow_name: "ci",
+        ref: "feature-branch",
+        inputs: {
+          issue_number: "123",
+        },
+      });
     });
 
     it("should log stripped key names before wrapping dispatch_workflow inputs", () => {
@@ -749,6 +840,101 @@ describe("safe_outputs_tools_loader", () => {
       registerDynamicTools(mockServer, tools, config, outputFile, registerTool, normalizeTool);
 
       expect(registerTool).not.toHaveBeenCalled();
+    });
+
+    it("should not register a generic call_workflow tool when a renamed call_workflow tool exists", () => {
+      const tools = [{ name: "agent_sandbox_stack", description: "Call agent-sandbox-stack", _call_workflow_name: "agent-sandbox-stack" }];
+      const config = {
+        call_workflow: { workflows: ["agent-sandbox-stack"] },
+      };
+      const outputFile = "/tmp/test-output.jsonl";
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerDynamicTools(mockServer, tools, config, outputFile, registerTool, normalizeTool);
+
+      expect(registerTool).not.toHaveBeenCalled();
+    });
+
+    it("should register generic call_workflow tool when renamed call_workflow metadata is invalid", () => {
+      const tools = [{ name: "agent_sandbox_stack", description: "Call agent-sandbox-stack", _call_workflow_name: "   " }];
+      const config = {
+        call_workflow: { workflows: ["agent-sandbox-stack"] },
+      };
+      const outputFile = "/tmp/test-output.jsonl";
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerDynamicTools(mockServer, tools, config, outputFile, registerTool, normalizeTool);
+
+      expect(registerTool).toHaveBeenCalledTimes(1);
+      expect(registerTool.mock.calls[0][1].name).toBe("call_workflow");
+    });
+
+    it("should not register generic dispatch_workflow or dispatch_repository tools when renamed tools exist", () => {
+      const tools = [
+        { name: "my_workflow", description: "Dispatch my-workflow", _workflow_name: "my-workflow" },
+        { name: "my_dispatch", description: "Dispatch repository event", _dispatch_repository_tool: "my_dispatch" },
+      ];
+      const config = {
+        dispatch_workflow: { workflows: ["my-workflow"] },
+        dispatch_repository: { tools: ["my_dispatch"] },
+      };
+      const outputFile = "/tmp/test-output.jsonl";
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerDynamicTools(mockServer, tools, config, outputFile, registerTool, normalizeTool);
+
+      expect(registerTool).not.toHaveBeenCalled();
+    });
+
+    it("should register generic dispatch_workflow tool when renamed dispatch_workflow metadata is invalid", () => {
+      const tools = [{ name: "my_workflow", description: "Dispatch my-workflow", _workflow_name: 123 }];
+      const config = {
+        dispatch_workflow: { workflows: ["my-workflow"] },
+      };
+      const outputFile = "/tmp/test-output.jsonl";
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerDynamicTools(mockServer, tools, config, outputFile, registerTool, normalizeTool);
+
+      expect(registerTool).toHaveBeenCalledTimes(1);
+      expect(registerTool.mock.calls[0][1].name).toBe("dispatch_workflow");
+    });
+
+    it("should not register generic tools for handler-only or global config keys", () => {
+      const tools = [{ name: "report_incomplete", description: "Report incomplete" }];
+      const config = {
+        report_incomplete: {},
+        create_report_incomplete_issue: {},
+        mentions: { allowed: [] },
+        max_bot_mentions: 3,
+      };
+      const outputFile = "/tmp/test-output.jsonl";
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerDynamicTools(mockServer, tools, config, outputFile, registerTool, normalizeTool);
+
+      expect(registerTool).not.toHaveBeenCalled();
+    });
+
+    it("should still register a generic tool for unrelated safe-job config keys", () => {
+      const tools = [{ name: "agent_sandbox_stack", description: "Call agent-sandbox-stack", _call_workflow_name: "agent-sandbox-stack" }];
+      const config = {
+        call_workflow: { workflows: ["agent-sandbox-stack"] },
+        custom_job: { description: "Custom job" },
+      };
+      const outputFile = "/tmp/test-output.jsonl";
+      const registerTool = vi.fn();
+      const normalizeTool = name => name.replace(/-/g, "_");
+
+      registerDynamicTools(mockServer, tools, config, outputFile, registerTool, normalizeTool);
+
+      expect(registerTool).toHaveBeenCalledTimes(1);
+      expect(registerTool.mock.calls[0][1].name).toBe("custom_job");
     });
 
     it("should create dynamic tool with input schema", () => {

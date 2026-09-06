@@ -1,7 +1,9 @@
 // Package stringbytesroundtrip implements a Go analysis linter that flags two
 // related but semantically distinct patterns:
-//   - string([]byte(s)) when s is already a string: genuinely redundant — the
-//     result is value-identical to s and both conversions can be removed.
+//   - string([]byte(s)) when the result and s have the predeclared string type:
+//     genuinely redundant — the result is value-identical to s and both
+//     conversions can be removed. For named string types, the inner conversion
+//     can still be removed, but an outer conversion may be necessary.
 //   - []byte(string(b)) when b is already a []byte: not redundant but wasteful
 //     — this is the defensive-copy idiom that produces a non-aliasing clone via
 //     two copies; prefer slices.Clone(b) or bytes.Clone(b) for a single copy.
@@ -12,41 +14,34 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/coverage"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the string-bytes-roundtrip analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "stringbytesroundtrip",
-	Doc:      "reports string([]byte(s)) as a redundant round-trip when s is already a string, and []byte(string(b)) as a wasteful two-copy clone when b is already a []byte (prefer slices.Clone or bytes.Clone)",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/stringbytesroundtrip",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
+var Analyzer = analyzerutil.New("stringbytesroundtrip", "reports string([]byte(s)) as a redundant round-trip when s is already a string, and []byte(string(b)) as a wasteful two-copy clone when b is already a []byte (prefer slices.Clone or bytes.Clone)", run)
+
+// hotThreshold gates findings on coverage data; see coverage package docs.
+var hotThreshold *int
+
+func init() {
+	hotThreshold = coverage.RegisterHotThresholdFlag(Analyzer)
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeRoundTrip(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeRoundTrip checks whether a conversion expression is a redundant
@@ -59,6 +54,9 @@ func analyzeRoundTrip(pass *analysis.Pass, n ast.Node, generatedFiles filecheck.
 	}
 	outerUnderlying, innerUnderlying, innerArgUnderlying, ok := roundTripUnderlyingTypes(pass, outer, inner)
 	if !ok {
+		return
+	}
+	if !coverage.ShouldApply(pass, outer.Pos(), *hotThreshold) {
 		return
 	}
 	if reportRedundantRoundTrip(pass, outer, inner, outerUnderlying, innerUnderlying, innerArgUnderlying) {
@@ -110,9 +108,18 @@ func reportRedundantRoundTrip(pass *analysis.Pass, outer, inner *ast.CallExpr, o
 		return false
 	}
 	argText := astutil.NodeText(pass.Fset, inner.Args[0])
+	outerText := astutil.NodeText(pass.Fset, outer.Fun)
+	innerText := astutil.NodeText(pass.Fset, inner.Fun)
+	if isExactString(pass.TypesInfo.TypeOf(outer)) && isExactString(pass.TypesInfo.TypeOf(inner.Args[0])) {
+		pass.ReportRangef(outer,
+			"%s(%s(%s)) is a redundant round-trip; both conversions can be removed; the inner %s conversion copies the string unnecessarily",
+			outerText, innerText, argText, innerText,
+		)
+		return true
+	}
 	pass.ReportRangef(outer,
-		"string([]byte(%s)) is a redundant round-trip; the inner []byte conversion copies the string unnecessarily",
-		argText,
+		"%s(%s(%s)) is a redundant round-trip; replace it with %s(%s); the inner %s conversion copies the string unnecessarily",
+		outerText, innerText, argText, outerText, argText, innerText,
 	)
 	return true
 }
@@ -128,9 +135,23 @@ func reportWastefulCloneRoundTrip(pass *analysis.Pass, outer, inner *ast.CallExp
 	)
 }
 
+// isStringType reports whether t is a string basic type. Callers pass an
+// already-.Underlying()-resolved type, so this also matches named string types.
 func isStringType(t types.Type) bool {
 	basic, ok := t.(*types.Basic)
 	return ok && basic.Kind() == types.String
+}
+
+// isExactString reports whether t denotes the predeclared string type, not a
+// named type whose underlying type is string. Unlike isStringType, which
+// expects an already-.Underlying()-resolved type, isExactString must be given
+// the raw type so it can tell string from `type MyString string`. Aliases are
+// resolved first, because an alias may denote either the predeclared string
+// (`type A = string`) or a named string type (`type A = MyString`). That
+// distinction matters because only the predeclared string can have both
+// conversions removed; a named string type still needs an outer conversion.
+func isExactString(t types.Type) bool {
+	return isStringType(types.Unalias(t))
 }
 
 func isByteSliceType(t types.Type) bool {

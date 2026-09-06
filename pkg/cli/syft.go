@@ -12,6 +12,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -35,7 +36,7 @@ type SyftScanResult struct {
 // runSyftOnLockFiles extracts container image references from lock-file manifests
 // and runs syft to generate SBOM data for each unique image.
 // SBOM files are persisted to disk and paths are returned in the results.
-func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
+func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error { //nolint:largefunc
 	if len(lockFiles) == 0 {
 		return nil
 	}
@@ -43,9 +44,7 @@ func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 	images := collectContainerImagesFromLockFiles(lockFiles)
 	if len(images) == 0 {
 		syftLog.Print("No container images found in lock files")
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("No container images found in lock files to scan with syft"))
-		}
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Running syft SBOM scanner (0 container images found in lock files)"))
 		return nil
 	}
 
@@ -100,23 +99,42 @@ func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 	return nil
 }
 
-func runSyftOnImage(ctx context.Context, imageRef, sbomDir string, verbose bool) (*SyftScanResult, error) {
+func runSyftOnImage(ctx context.Context, imageRef, sbomDir string, verbose bool) (*SyftScanResult, error) { //nolint:largefunc
 	syftLog.Printf("Scanning %s with syft", imageRef)
 
-	// #nosec G204 -- imageRef comes from compiled lock-file manifests and is passed
-	// as a direct process argument (no shell interpolation).
+	// Validate the image reference before it reaches docker: lock-file manifests can carry
+	// attacker-influenced content, and an image reference starting with "-" (or containing
+	// control characters) would otherwise be interpreted as a docker/syft option.
+	validatedImageRef, err := validateDockerImageRef(imageRef)
+	if err != nil {
+		return nil, err
+	}
+
+	dockerPath, err := fileutil.ResolveExecutablePath("docker")
+	if err != nil {
+		return nil, fmt.Errorf("docker command not found: %w", err)
+	}
+
+	syftImageRef, err := validateDockerImageRef(SyftImage)
+	if err != nil {
+		return nil, fmt.Errorf("invalid syft scanner image reference %q: %w", SyftImage, err)
+	}
+
+	// #nosec G204 -- dockerPath is resolved from the fixed executable name "docker" and
+	// validatedImageRef is allow-list validated above. exec.CommandContext passes args
+	// directly to the OS without shell interpretation, preventing command injection.
 	cmd := exec.CommandContext(
 		ctx,
-		"docker",
+		dockerPath,
 		"run",
 		"--rm",
-		SyftImage,
-		imageRef,
+		syftImageRef,
+		validatedImageRef,
 		"-o", "syft-json",
 	)
 
 	if verbose {
-		dockerCmd := fmt.Sprintf("docker run --rm %s %s -o syft-json", SyftImage, imageRef)
+		dockerCmd := shellJoinArgs([]string{"docker", "run", "--rm", syftImageRef, validatedImageRef, "-o", "syft-json"})
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Run syft directly: "+dockerCmd))
 	}
 

@@ -21,8 +21,8 @@ network:
   
 sandbox:
   agent:
+    runtime: cloud-hypervisor
     id: awf
-    sudo: false
 imports:
   - shared/otlp.md
 tools:

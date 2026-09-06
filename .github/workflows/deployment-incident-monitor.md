@@ -15,8 +15,11 @@ engine:
   copilot-sdk: true
 max-tool-denials: 3
 imports:
+  - shared/mcp-pagination.md
   - shared/reporting.md
   - shared/otlp.md
+features:
+  gh-aw-detection: true
 tools:
   cli-proxy: true
   github:
@@ -31,9 +34,6 @@ safe-outputs:
   noop:
 timeout-minutes: 10
 
-sandbox:
-  agent:
-    sudo: false
 evals:
   - id: incident-or-noop
     question: Did the agent either create an incident issue or call noop?

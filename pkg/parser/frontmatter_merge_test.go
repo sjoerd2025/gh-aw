@@ -183,6 +183,55 @@ func TestMergeTools(t *testing.T) {
 			},
 		},
 		{
+			name: "main runtime overrides imported runtime",
+			base: map[string]any{
+				"github": map[string]any{
+					"nested-config": map[string]any{
+						"runtime": "sbx",
+					},
+				},
+			},
+			additional: map[string]any{
+				"github": map[string]any{
+					"nested-config": map[string]any{
+						"runtime": "docker",
+					},
+				},
+			},
+			expected: map[string]any{
+				"github": map[string]any{
+					"nested-config": map[string]any{
+						"runtime": "sbx",
+					},
+				},
+			},
+		},
+		{
+			name: "imported runtime fills missing main field",
+			base: map[string]any{
+				"github": map[string]any{
+					"nested-config": map[string]any{
+						"timeout": 30,
+					},
+				},
+			},
+			additional: map[string]any{
+				"github": map[string]any{
+					"nested-config": map[string]any{
+						"runtime": "sbx",
+					},
+				},
+			},
+			expected: map[string]any{
+				"github": map[string]any{
+					"nested-config": map[string]any{
+						"timeout": 30,
+						"runtime": "sbx",
+					},
+				},
+			},
+		},
+		{
 			// bash: true in main workflow (or parent import) must win over an import's
 			// specific bash command list, e.g. ["ls", "cat"]. Both are valid bash tool
 			// configurations, but they are different types (bool vs array).

@@ -33,7 +33,7 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 	// tools can consume structured token data without parsing the step summary.
 	// Requires AWF v0.25.8+
 	if isFirewallEnabled(data) {
-		paths = append(paths, constants.TmpGhAwDirSlash+constants.TokenUsageFilename)
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.TokenUsageFilename.String())
 	}
 
 	// Collect agent stdio logs path for unified upload
@@ -41,7 +41,7 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 
 	// Include the pre-agent audit file (file listing of agent-related directories captured
 	// before agent execution) so it is available in the agent artifact for post-run inspection.
-	paths = append(paths, constants.PreAgentAuditFilePath)
+	paths = append(paths, constants.PreAgentAuditFilePath.String())
 
 	// Collect agent-generated files path for unified upload
 	// This directory is used by workflows that instruct the agent to write files
@@ -50,24 +50,29 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 
 	// Collect GitHub API rate-limit log for observability.
 	// Written by github_rate_limit_logger.cjs during REST API calls.
-	paths = append(paths, constants.TmpGhAwDirSlash+constants.GithubRateLimitsFilename)
+	paths = append(paths, constants.TmpGhAwDirSlash+constants.GithubRateLimitsFilename.String())
 
 	// Collect OTLP span mirror — enables post-hoc trace debugging without a live collector.
 	// Written by send_otlp_span.cjs; each line is a full OTLP/HTTP JSON traces payload.
 	// Only included when OTLP is configured for this workflow.
 	if isOTLPEnabled(data) {
-		paths = append(paths, constants.TmpGhAwDirSlash+constants.OtelJsonlFilename)
-		paths = append(paths, constants.TmpGhAwDirSlash+constants.OtlpExportErrorsFilename)
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.OtelJsonlFilename.String())
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.OtlpExportErrorsFilename.String())
+	}
+
+	// Collect grader manifest and results when graders are configured.
+	if data.Graders != nil && data.Graders.HasGraders() {
+		paths = append(paths, collectGraderArtifactPaths(data.Graders)...)
 	}
 
 	// Collect safe outputs and agent output paths for the unified artifact.
 	// These were previously uploaded as separate safe-output and agent-output artifacts.
 	if data.SafeOutputs != nil {
 		// Raw safe-output NDJSON (copied to /tmp/gh-aw/ by generateOutputCollectionStep)
-		paths = append(paths, constants.TmpGhAwDirSlash+constants.SafeOutputsFilename)
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.SafeOutputsFilename.String())
 		// Processed agent output JSON produced by collect_ndjson_output.cjs
-		paths = append(paths, constants.TmpGhAwDirSlash+constants.AgentOutputFilename)
-		if data.SafeOutputs.CommentMemory != nil {
+		paths = append(paths, constants.TmpGhAwDirSlash+constants.AgentOutputFilename.String())
+		if data.CommentMemoryConfig != nil {
 			paths = append(paths, constants.TmpCommentMemoryDir)
 		}
 	}
@@ -83,11 +88,14 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 	threatDetectionNeedsPatches := IsDetectionJobEnabled(data.SafeOutputs)
 	if usesPatchesAndCheckouts(data.SafeOutputs) || threatDetectionNeedsPatches {
 		paths = append(paths, constants.TmpAwPatchGlob)
-		// Bundle files are generated when patch-format: bundle is configured.
-		// Both formats use the same download path in the safe_outputs job, so
-		// include the bundle glob unconditionally alongside the patch glob.
-		// The artifact upload step already sets if-no-files-found: ignore, so
-		// this is safe even when no bundle files exist.
+		// Bundle files are generated when patch-format: bundle is configured and are
+		// required downstream to apply changes while preserving merge topology.
+		// Bundles are binary and cannot be text-scanned directly, but they are built
+		// from the same git commit range as the accompanying .patch file, so the
+		// .patch scanning above already covers the underlying diff content
+		// (see isKnownUnscannedButAllowedForUpload in step_order_validation.go). The
+		// artifact upload step already sets if-no-files-found: ignore, so including
+		// the bundle glob here is safe even when no bundle files exist.
 		paths = append(paths, constants.TmpAwBundleGlob)
 	}
 
@@ -102,13 +110,13 @@ func (c *Compiler) collectArtifactPaths(data *WorkflowData, engine CodingAgentEn
 			paths = append(paths, constants.AWFAuditDirExpr+"/")
 			paths = append(paths, constants.AWFReflectFilePathExpr)
 		} else {
-			paths = append(paths, constants.AWFConfigFilePath)
-			paths = append(paths, constants.AWFProxyLogsDir+"/")
-			paths = append(paths, constants.AWFAuditDir+"/")
+			paths = append(paths, constants.AWFConfigFilePath.String())
+			paths = append(paths, constants.AWFProxyLogsDir.String()+"/")
+			paths = append(paths, constants.AWFAuditDir.String()+"/")
 			// Include the AWF /reflect payload persisted by the agent harness.
 			// Co-located under /tmp/gh-aw/sandbox/firewall/ so the existing
 			// chmod -R a+rX step covers its permissions before upload.
-			paths = append(paths, constants.AWFReflectFilePath)
+			paths = append(paths, constants.AWFReflectFilePath.String())
 		}
 	}
 
@@ -189,6 +197,14 @@ func (c *Compiler) generatePostAgentCollectionAndUpload(yaml *strings.Builder, d
 	// Emit all GITHUB_STEP_SUMMARY log-parsing steps.
 	c.generateSummarySteps(yaml, data, engine)
 
+	// Run deterministic graders after trace data is available.
+	c.generateGradersStep(yaml, data)
+
+	// Re-scan grader output files for leaked secrets when custom grader scripts
+	// are present. Custom scripts evaluate trace data that may contain
+	// credential-bearing strings written after the initial workspace redaction.
+	c.generateGraderRedactionStep(yaml, yaml.String(), data)
+
 	// Write a minimal agent_output.json placeholder when the engine fails before
 	// producing any safe outputs, so downstream safe_outputs and conclusion jobs
 	// receive a valid (empty) JSON file instead of an ENOENT error.
@@ -221,6 +237,12 @@ func (c *Compiler) generatePostAgentCollectionAndUpload(yaml *strings.Builder, d
 	// This ensures artifacts are uploaded after the agent has finished modifying the cache
 	generateCacheMemoryArtifactUpload(yaml, data, c.getActionPin)
 
+	// Commit and validate drive-memory changes, then either publish them directly or
+	// stage them for the post-detection update job.
+	generateDriveMemoryGitCommitSteps(yaml, data)
+	generateDriveMemoryValidation(yaml, data)
+	generateDriveMemoryPersistence(yaml, data, c.getActionPin)
+
 	// Add safe-outputs assets artifact upload (after agent execution)
 	// This creates a separate artifact for assets that will be downloaded by upload_assets job
 	generateSafeOutputsAssetsArtifactUpload(yaml, data, c.getActionPin)
@@ -229,6 +251,11 @@ func (c *Compiler) generatePostAgentCollectionAndUpload(yaml *strings.Builder, d
 	// This creates a separate artifact for files the model staged for artifact upload,
 	// to be downloaded and processed by the upload_artifact job
 	generateSafeOutputsArtifactStagingUpload(yaml, data, c.getActionPin)
+
+	// Add safe-outputs upload-code-coverage staging upload (after agent execution)
+	// This creates a separate artifact for the coverage report file the model staged,
+	// to be downloaded and processed by the upload_code_coverage job
+	generateSafeOutputsCodeCoverageStagingUpload(yaml, data, c.getActionPin)
 
 	// Add post-steps (if any) after AI execution
 	c.generatePostSteps(yaml, data)
@@ -246,6 +273,7 @@ func (c *Compiler) generatePostAgentCollectionAndUpload(yaml *strings.Builder, d
 	// In workflow_call context, apply the per-invocation prefix to avoid name clashes.
 	agentArtifactPrefix := artifactPrefixExprForDownstreamJob(data)
 	compilerYamlLog.Printf("Emitting unified agent artifact upload with %d path(s)", len(artifactPaths))
+	c.generateAgentOutputFallbackUpload(yaml, data, agentArtifactPrefix)
 	c.generateUnifiedArtifactUpload(yaml, artifactPaths, agentArtifactPrefix)
 
 	// In dev mode the setup action is referenced via a local path (./actions/setup), so its files

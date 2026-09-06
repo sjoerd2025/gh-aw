@@ -9,9 +9,9 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
@@ -35,24 +35,14 @@ type candidate struct {
 }
 
 // Analyzer is the sprintfbool analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "sprintfbool",
-	Doc:      `reports fmt.Sprintf("%t", b) calls where b is a single bool value; use strconv.FormatBool(b) instead`,
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/sprintfbool",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("sprintfbool", `reports fmt.Sprintf("%t", b) calls where b is a single bool value; use strconv.FormatBool(b) instead`, run)
 
 func run(pass *analysis.Pass) (any, error) {
 	insp, err := astutil.Inspector(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +177,10 @@ func buildFormatBoolFix(
 	}}
 }
 
+// buildImportEdits returns TextEdits that add "strconv" to file and, when the
+// file's "fmt" import becomes unused after the fix, also remove it.
+// seenImportFiles prevents duplicate overlapping edits in files with multiple
+// violations.
 func buildImportEdits(
 	pass *analysis.Pass,
 	file *ast.File,
@@ -197,31 +191,15 @@ func buildImportEdits(
 		return nil
 	}
 
-	_, strconvImported := astutil.ImportedAs(file, pass.TypesInfo, strconvPkg)
 	_, fmtImported := astutil.ImportedAs(file, pass.TypesInfo, fmtPkg)
-
 	orphanFmt := fmtImported && orphanFmtByFile[file.Pos()]
-	needStrconv := !strconvImported
-	needRemoveFmt := orphanFmt
 
-	if !needStrconv && !needRemoveFmt {
+	edits, needed := astutil.SwapPkgImportEdits(pass, file, strconvPkg, fmtPkg, orphanFmt)
+	if !needed {
 		return nil
 	}
 	seenImportFiles[file.Pos()] = true
-
-	switch {
-	case needStrconv && needRemoveFmt:
-		return astutil.SwapImportEdits(pass.Fset, file, strconvPkg, fmtPkg)
-	case needStrconv:
-		if edit, ok := astutil.AddImportEdit(pass, file, strconvPkg); ok {
-			return []analysis.TextEdit{edit}
-		}
-	case needRemoveFmt:
-		if edit, ok := astutil.RemoveImportEdit(pass.Fset, file, fmtPkg); ok {
-			return []analysis.TextEdit{edit}
-		}
-	}
-	return nil
+	return edits
 }
 
 func replacementForCall(pass *analysis.Pass, call *ast.CallExpr, arg ast.Expr, file *ast.File) replacement {

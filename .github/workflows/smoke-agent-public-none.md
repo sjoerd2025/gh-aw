@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: "Guard policy smoke test: repos=public, min-integrity=none"
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-agent-public-none
     strategy: centralized
@@ -19,12 +20,14 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    runtime: cloud-hypervisor
+    id: awf
 name: "Smoke Agent: public/none"
 engine: claude
 strict: true
 tools:
+  cli-proxy: false
+  bash: false
   github:
     mode: local
     allowed-repos: "public"
@@ -42,10 +45,11 @@ safe-outputs:
     footer: "> 🤖 *Guard policy smoke test by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🔍 [{workflow_name}]({run_url}) testing guard policy: `repos=public, min-integrity=none`..."
     run-success: "✅ [{workflow_name}]({run_url}) completed guard policy test."
-    run-failure: "❌ [{workflow_name}]({run_url}) {status}. Check the logs for details."
+    run-failure: "❌ [{workflow_name}]({run_url}) {status} testing guard policy: `repos=public, min-integrity=none`. Check the logs for details."
 timeout-minutes: 10
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: false
 ---

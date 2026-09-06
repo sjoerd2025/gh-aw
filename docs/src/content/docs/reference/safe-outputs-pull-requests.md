@@ -5,22 +5,9 @@ sidebar:
   order: 801
 ---
 
-This page is the primary reference for pull-request-focused safe outputs:
+This page covers pull-request-focused safe outputs: [`create-pull-request`](#pull-request-creation-create-pull-request), [`update-pull-request`](#pull-request-updates-update-pull-request), [`close-pull-request`](#close-pull-request-close-pull-request), [`approve-workflow-run`](#approve-workflow-run-approve-workflow-run) (experimental), [`merge-pull-request`](#merge-pull-request-merge-pull-request) (experimental), [`create-pull-request-review-comment`](#pr-review-comments-create-pull-request-review-comment), [`submit-pull-request-review`](#submit-pr-review-submit-pull-request-review), [`reply-to-pull-request-review-comment`](#reply-to-pr-review-comment-reply-to-pull-request-review-comment), [`resolve-pull-request-review-thread`](#resolve-pr-review-thread-resolve-pull-request-review-thread), [`push-to-pull-request-branch`](#push-to-pr-branch-push-to-pull-request-branch), and [`add-reviewer`](#add-reviewer-add-reviewer).
 
-- [`create-pull-request`](#pull-request-creation-create-pull-request)
-- [`update-pull-request`](#pull-request-updates-update-pull-request)
-- [`close-pull-request`](#close-pull-request-close-pull-request)
-- [`merge-pull-request`](#merge-pull-request-merge-pull-request) (experimental)
-- [`create-pull-request-review-comment`](#pr-review-comments-create-pull-request-review-comment)
-- [`submit-pull-request-review`](#submit-pr-review-submit-pull-request-review)
-- [`reply-to-pull-request-review-comment`](#reply-to-pr-review-comment-reply-to-pull-request-review-comment)
-- [`resolve-pull-request-review-thread`](#resolve-pr-review-thread-resolve-pull-request-review-thread)
-- [`push-to-pull-request-branch`](#push-to-pr-branch-push-to-pull-request-branch)
-- [`add-reviewer`](#add-reviewer-add-reviewer)
-
-Code-writing types (`create-pull-request` and `push-to-pull-request-branch`) enforce [Protected Files](#protected-files) by default.
-
-For all other safe-output types see [Safe Outputs](/gh-aw/reference/safe-outputs/).
+Code-writing types (`create-pull-request` and `push-to-pull-request-branch`) enforce [Protected Files](#protected-files) by default. For all other safe-output types, see [Safe Outputs](/gh-aw/reference/safe-outputs/).
 
 ## Pull Request Creation (`create-pull-request:`)
 
@@ -48,6 +35,7 @@ safe-outputs:
     allowed-branches:             # restrict agent-selected source branch names (glob patterns)
       - feature/*
       - release/*
+    stacked: true                 # allow stacked pull requests (default: true)
     fallback-as-issue: false      # disable issue fallback (default: true)
     auto-close-issue: false       # don't auto-add "Fixes #N" to PR description (default: true)
     normalize-closing-keywords: true # strip backticks around recognized issue-closing keywords in PR body text
@@ -72,11 +60,59 @@ safe-outputs:
 
 See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for `target-repo`, `allowed-repos`, and authentication configuration.
 
+### Steering issues
+
+Configure steering independently at [`safe-outputs.steer`](/gh-aw/reference/safe-outputs/#steering-issues-steer). The pull request itself follows the normal `create-pull-request` flow: steering does not pre-create or override a branch, so `branch-prefix`, cross-repository targets, allowed branch policies, multiple outputs, and checkout configuration retain their standard behavior.
+
 ### Branch targeting
 
 `base-branch` sets the PR's target branch. Defaults to `github.base_ref` (PR event) or `github.ref_name` (push event). Use `allowed-base-branches` to let the agent pick the target branch at runtime — the agent supplies a `base` value in the tool call and it is accepted only if it matches one of the configured glob patterns.
 
 `allowed-branches` restricts which _source_ branch names the agent may use. The effective branch (agent-provided, or the checkout branch as fallback) must match a configured glob.
+
+### Stacked pull requests
+
+A _stacked_ pull request targets another pull request's branch instead of the default base branch, so a chain of dependent changes can be reviewed and merged one piece at a time: PR&nbsp;1 (`feature-1`) targets `main`, PR&nbsp;2 (`feature-2`) targets `feature-1`, and PR&nbsp;3 (`feature-3`) targets `feature-2`.
+
+Set `max` above `1` and emit one `create_pull_request` output per level of the stack, in dependency order (the base of a stacked pull request must already exist when the pull request is created):
+
+```yaml wrap
+safe-outputs:
+  create-pull-request:
+    max: 3
+    preserve-branch-name: true    # keeps `base` values predictable across the stack
+```
+
+```json
+{"type": "create_pull_request", "title": "Step 1", "body": "...", "branch": "feature-1"}
+{"type": "create_pull_request", "title": "Step 2", "body": "...", "branch": "feature-2", "base": "feature-1", "stack_position": 2, "stack_root": "main"}
+{"type": "create_pull_request", "title": "Step 3", "body": "...", "branch": "feature-3", "base": "feature-2", "stack_position": 3, "stack_root": "main", "dependencies": ["feature-1", "feature-2"]}
+```
+
+Behavior:
+
+- A `base` that names the branch of a pull request created earlier in the same run is accepted without `allowed-base-branches`, and is resolved to the branch that was actually pushed (branch names are salted unless `preserve-branch-name: true` is set). Any other `base` override still requires `allowed-base-branches`.
+- The base branch is verified to exist before the pull request is created. If it does not exist, the output fails with guidance to emit the stack in dependency order, or to target the default base branch.
+- Circular dependencies (a pull request whose base transitively depends on its own branch, or that lists its own branch in `dependencies`) are rejected.
+- Stack relationships are recorded in the pull request body: a `Depends on #N` reference for each dependency created in the same run, plus a machine-readable `<!-- gh-aw-stack: ... -->` comment holding `base`, `stack_position`, `stack_root`, and `dependencies`.
+
+#### Disabling stacked pull requests (GitHub Enterprise Server)
+
+Stacked pull requests may not be available on GitHub Enterprise Server or other GitHub instances. Turn the feature off so misuse fails fast with an explanatory error instead of an opaque API failure:
+
+```yaml wrap
+safe-outputs:
+  create-pull-request:
+    stacked: false
+```
+
+When disabled, any `create_pull_request` output whose `base` differs from the configured/default base branch is rejected with an error that suggests targeting the default base branch or re-enabling the feature where it is supported. Pull requests targeting the default base branch keep working, and `stack_position`, `stack_root`, and `dependencies` metadata is still recorded in the pull request body, so a workflow can be migrated between instances without editing the agent prompt.
+
+#### Migrating an existing workflow to a stack
+
+To migrate, raise `max` to the number of pull requests in the stack, set `preserve-branch-name: true` so each `base` value matches the original branch name, and instruct the agent to emit pull requests root-first with `base` pointing to the previous branch. On GitHub Enterprise Server, add `stacked: false` and keep the agent targeting the default base branch.
+
+Keep stacks small (three to four pull requests), emit them in dependency order, merge from the root upward, and prefer explicit `branch`/`base` names over auto-generated ones so the stack stays readable.
 
 ### Runtime reviewers and assignees
 
@@ -101,12 +137,7 @@ By default a random hex suffix is appended to the agent-provided branch name to 
 
 ### Other notes
 
-- `draft` is a **policy**, not a default — the agent cannot override it at runtime.
-- `auto-close-issue` (default `true`) appends `Fixes #N` to the PR description when the workflow is triggered from an issue. Set to `false` for partial-work or multi-PR flows.
-- `normalize-closing-keywords` strips wrapping backticks from recognized issue-closing keywords in the PR body (for example, `` `Closes #123` `` → `Closes #123`).
-- When `create-pull-request` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled.
-- PRs do not trigger CI by default. See [Triggering CI](/gh-aw/reference/triggering-ci/).
-- `create-pull-request` can be disabled at runtime without recompiling by setting the `GH_AW_POLICY_ALLOW_CREATE_PULL_REQUEST` GitHub Actions variable to `"false"` at repository, organization, or enterprise scope. See [Governance](/gh-aw/guides/governance/#disabling-create-pull-request-org-wide).
+`draft` is a **policy**, not a default, so the agent cannot override it at runtime. `auto-close-issue` (default `true`) appends `Fixes #N` when the workflow is triggered from an issue; set it to `false` for partial-work or multi-PR flows. `normalize-closing-keywords` removes wrapping backticks from recognized issue-closing keywords in the PR body (for example, `` `Closes #123` `` → `Closes #123`). When `create-pull-request` is configured, git commands (`checkout`, `branch`, `switch`, `add`, `rm`, `commit`, `merge`) are automatically enabled. PRs do not trigger CI by default; see [Triggering CI](/gh-aw/reference/triggering-ci/). You can also disable `create-pull-request` at runtime without recompiling by setting the `GH_AW_POLICY_ALLOW_CREATE_PULL_REQUEST` GitHub Actions variable to `"false"` at repository, organization, or enterprise scope. See [Governance](/gh-aw/reference/governance/#disabling-create-pull-request-org-wide).
 
 ### How it works
 
@@ -120,6 +151,19 @@ If the base branch advances between agent start and `safe_outputs` apply, the PR
 
 An older **patch transport** (`git format-patch` / `git am --3way`) is used when bundle data is unavailable. `--3way` resolves cleanly against an updated base when there are no conflicts; if it cannot, the patch is applied at the agent's original base commit and the PR UI shows the conflicts for manual resolution.
 
+:::caution[Shallow checkout and large monorepos]
+The merge-commit detection that auto-selects bundle transport inspects the commit range `origin/<branch>..<branch>` in the **agent's** workspace. With the default shallow checkout (`fetch-depth: 1`) `origin/<branch>` has no traversable ancestry, so `git rev-list` cannot exclude any commits and will report the entire local history as the range. On large monorepos this produces a count of tens of thousands of commits, which falsely appears to contain merge commits and can trigger an incorrect rewrite.
+
+The safe_outputs push job guards against this: if the commit range contains more than 100 commits **and** the repository is shallow, merge-commit detection emits a warning and returns false (preventing an incorrect bundle-transport selection). If the same implausible range then reaches the signed-push linearization step, that step throws with a clear error that includes the commit count. To resolve this, increase `fetch-depth` in your workflow checkout step:
+
+```yaml wrap
+checkout:
+  fetch-depth: 0   # fetch full history so merge-commit detection sees the correct range
+```
+
+Alternatively, set an explicit `fetch-depth` large enough to cover the branch history. The threshold is a best-effort guard — for very active branches on a full clone the depth-0 option is the most reliable workaround.
+:::
+
 :::note[Cross-repo targets]
 The `safe_outputs` job always mirrors the agent job's checkout layout. When a `checkout:` entry places a repository in a subdirectory (a `path:` is set), `safe_outputs` checks out **every** repository to the same location the agent used — the workflow repository at the workspace root plus each cross-repo checkout at its `path:` — regardless of whether `target-repo` names a specific repository or the wildcard `"*"`. This lets a specific `target-repo` (and the two-or-more cross-repo case) operate against an identical layout. When the target repository is checked out at the workspace root (no `path:`), it is checked out there in both jobs.
 :::
@@ -128,7 +172,7 @@ When `head-repo` is set, the preferred model is an ephemeral upstream-based bran
 
 ## Pull Request Updates (`update-pull-request:`)
 
-Updates PR title or body. Both fields are enabled by default. The `operation` field controls how body updates are applied: `append` (default), `prepend`, or `replace`.
+Updates PR title or body. Both fields are enabled by default. The `operation` field controls how body updates are applied: `replace` (default), `append`, `prepend`, or `replace-island` (updates a run-specific section delimited by HTML comments).
 
 ```yaml wrap
 safe-outputs:
@@ -153,7 +197,9 @@ If GitHub reports `There are no new commits on the base branch.` or `merge confl
 
 When using `target: "*"`, the agent must provide `pull_request_number` in the output to identify which pull request to update.
 
-**Operation Types**: Same as `update-issue` (`append`, `prepend`, `replace`). Title updates always replace the existing title. Disable fields by setting to `false`.
+**Operation Types**: Same as `update-issue` (`replace`, `append`, `prepend`, `replace-island`). Title updates always replace the existing title. Disable fields by setting to `false`.
+
+For `replace-island`, gh-aw automatically wraps the workflow-specific section in `<!-- gh-aw-island-start:<workflowId> -->` and `<!-- gh-aw-island-end:<workflowId> -->` markers. The first run appends a marked island; subsequent runs replace only the content between those markers.
 
 ## Close Pull Request (`close-pull-request:`)
 
@@ -169,6 +215,38 @@ safe-outputs:
     target-repo: "owner/repo"         # cross-repository
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
+
+## Approve Workflow Run (`approve-workflow-run:`)
+
+:::caution[Experimental]
+`approve-workflow-run` is an experimental safe output. `gh aw compile` emits an experimental feature warning when a workflow uses it.
+:::
+
+Approves a GitHub Actions workflow run in the "action required" state, such as runs for fork pull requests or pull requests created by Copilot. The agent supplies a positive integer `run_id`; the handler verifies that the run is a pull request run, is associated with an authorized pull request, and is still awaiting approval (status `action_required` or `waiting`, or conclusion `action_required`) before calling GitHub's workflow-run approval API.
+
+```yaml wrap
+safe-outputs:
+  approve-workflow-run:
+    max: 1
+    allowed-repos: # optional: fork repositories whose PRs may be approved
+      - contributor/gh-aw
+    comment: true # post a PR comment when the run starts (default: true)
+    staged: false
+    github-token: ${{ secrets.APPROVE_WORKFLOW_RUN_TOKEN }}
+    allowed-workflows:
+      - pull-request-*.yml
+    allowed-pull-requests:
+      - "123"
+    protected-files:
+      exclude:
+        - AGENTS.md
+```
+
+This operation requires `actions: write` and an explicit external `github-token` or `github-app`; the default `github.token` cannot approve workflow runs requiring approval. `pull-requests: write` is added when `comment` is enabled (the default); otherwise `pull-requests: read` is sufficient. GitHub App tokens are minted with the permissions the configuration requires. Use `staged: true` to preview an approval without accessing the GitHub API or consuming the configured `max` limit.
+
+`allowed-workflows` is required and restricts approval to workflow filenames matching one of its wildcard patterns. The handler compares the basename from GitHub's workflow metadata, treating `.yml` and `.yaml` as equivalent; directory paths are not accepted. Approvals permit any pending run from an allowed workflow whose associated pull requests are all authorized. By default, only the pull request that triggered the workflow is authorized. Use `allowed-pull-requests` to authorize additional pull requests; it accepts a list of string PR numbers or a GitHub Actions expression that resolves to a list of PR numbers. Invalid entries are not authorized. Only pull requests whose head branch lives in the current repository — including agent-initiated pull requests such as `copilot/*` branches — are approvable by default; pull requests from other repositories (forks) are refused unless their repository matches an `allowed-repos` entry, which supports wildcard patterns such as `org/*`. This safe output always refuses to run from a `pull_request_target` event. A workflow run that is not a pull request run, is not from an allowed workflow, has any unauthorized associated pull request, or has modified protected files is rejected. A run that is no longer awaiting approval — for example one that a maintainer or an earlier run already approved — is skipped rather than reported as a failure, so it does not fail the safe outputs step. Protected files use the standard manifest and protected-directory set; use `protected-files.exclude` to remove specific filenames or path prefixes from that set.
+
+After a successful approval, a comment announcing that the workflow run has started (linking to its run URL, with the standard generated attribution footer) is posted on each pull request associated with the run. Set `comment: false` to disable this behavior; comment failures are logged as warnings and never fail the approval.
 
 ## Merge Pull Request (`merge-pull-request:`)
 
@@ -266,13 +344,7 @@ safe-outputs:
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
 
-The `footer` field controls whether AI-generated footers are added to PR review comments:
-
-- `"always"` (default) - Always include footer on review comments
-- `"none"` - Never include footer on review comments
-- `"if-body"` - Only include footer when the review has a body text
-
-With `footer: "if-body"`, approval reviews without body text appear clean without the AI-generated footer, while reviews with explanatory text still include the footer for attribution.
+The `footer` field controls AI-generated footers on PR review comments: `"always"` (default) always includes one, `"none"` never does, and `"if-body"` includes one only when the review has body text. With `footer: "if-body"`, approval reviews without body text stay clean while reviews with explanatory text still include attribution.
 
 ## Resolve PR Review Thread (`resolve-pull-request-review-thread:`)
 
@@ -461,14 +533,7 @@ This protects against supply chain attacks where an AI agent could inadvertently
 
 ### What Is Protected
 
-The following are always protected regardless of policy (unless explicitly excluded):
-
-- **Package manifests**: `package.json`, `go.mod`, `go.sum`, `Gemfile`, `Pipfile`, `pyproject.toml`, and other runtime lockfiles.
-- **Security configuration**: `CODEOWNERS`, `DESIGN.md`.
-- **Agent instruction files**: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and other engine-specific instruction files.
-- **Common top-level documentation**: `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`. These files are frequently imported by agents as context, so they are protected by default.
-- **Specific protected directories**: `.github/`, `.agents/`, `.githooks/`, `.husky/`.
-- **Any top-level directory starting with `.`**: for example `.cursor/`, `.vscode/`, `.devcontainer/`, or any other hidden configuration directory at the repository root. This rule catches newly-created dot-directories without requiring an explicit list update.
+The following are always protected unless explicitly excluded: package manifests such as `package.json`, `go.mod`, `go.sum`, `Gemfile`, `Pipfile`, `pyproject.toml`, and other runtime lockfiles; security configuration such as `CODEOWNERS` and `DESIGN.md`; agent instruction files such as `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and other engine-specific instruction files; common top-level documentation such as `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md`, and `CODE_OF_CONDUCT.md`; specific protected directories such as `.github/`, `.agents/`, `.githooks/`, and `.husky/`; and any top-level directory starting with `.` such as `.cursor/`, `.vscode/`, or `.devcontainer/`. The dot-directory rule also catches newly created hidden configuration directories without requiring an explicit list update.
 
 ### Policy Options
 
@@ -676,7 +741,7 @@ Protection covers three categories:
 > [!NOTE]
 > Runtime manifests and governance files (`CODEOWNERS`, `DESIGN.md`) are matched by **basename only** (the filename without its directory path), so they are protected regardless of where they appear in the repository. Path-prefix rules (`.github/`, `.agents/`, `.githooks/`, `.husky/`, `.claude/`, `.codex/`) match the full relative path from the repository root.
 
-## Related Documentation
+## Learn More
 
 - [Cross-Repository Operations](/gh-aw/reference/cross-repository/) - Checkout, target-repo, allowed-repos, and fork-authentication rules
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Complete safe output reference

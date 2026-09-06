@@ -8,41 +8,34 @@ import (
 	"go/ast"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/coverage"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the strings-join-one analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "stringsjoinone",
-	Doc:      "reports strings.Join([]string{s}, sep) calls with a single-element slice literal where the separator is never used and the call is equivalent to just s",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/stringsjoinone",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
+var Analyzer = analyzerutil.New("stringsjoinone", "reports strings.Join([]string{s}, sep) calls with a single-element slice literal where the separator is never used and the call is equivalent to just s", run)
+
+// hotThreshold gates findings on coverage data; see coverage package docs.
+var hotThreshold *int
+
+func init() {
+	hotThreshold = coverage.RegisterHotThresholdFlag(Analyzer)
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeJoinOne(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeJoinOne checks whether a call is strings.Join with a single-element
@@ -81,20 +74,26 @@ func analyzeJoinOne(pass *analysis.Pass, n ast.Node, generatedFiles filecheck.Ge
 	if !isSafeToDiscardSeparator(pass, joinCall.Args[1]) {
 		return
 	}
+	if !coverage.ShouldApply(pass, call.Pos(), *hotThreshold) {
+		return
+	}
 
-	pass.Report(analysis.Diagnostic{
+	diag := analysis.Diagnostic{
 		Pos:     call.Pos(),
 		End:     call.End(),
 		Message: fmt.Sprintf("strings.Join called with a single-element slice; use %s directly", replacementText),
-		SuggestedFixes: []analysis.SuggestedFix{{
+	}
+	if !astutil.HasOverlappingComment(pass.Files, call.Pos(), call.End()) {
+		diag.SuggestedFixes = []analysis.SuggestedFix{{
 			Message: "Replace strings.Join call with " + replacementText,
 			TextEdits: []analysis.TextEdit{{
 				Pos:     call.Pos(),
 				End:     call.End(),
 				NewText: []byte(replacementText),
 			}},
-		}},
-	})
+		}}
+	}
+	pass.Report(diag)
 }
 
 // isSafeToDiscardSeparator reports whether sep is a compile-time constant and

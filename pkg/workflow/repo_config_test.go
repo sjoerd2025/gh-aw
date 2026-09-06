@@ -104,6 +104,18 @@ func TestLoadRepoConfig_ActionFailureIssueExpires(t *testing.T) {
 	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
 	assert.Equal(t, 72, cfg.Maintenance.ActionFailureIssueExpires, "action_failure_issue_expires should be parsed from aw.json")
 	assert.Equal(t, 72, cfg.ActionFailureIssueExpiresHours(), "accessor should return configured expiration")
+	assert.True(t, cfg.IsActionFailureIssueExpiresExplicit(), "explicit action_failure_issue_expires should be flagged as explicit")
+}
+
+func TestLoadRepoConfig_ActionFailureIssueExpiresNotExplicitWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"runs_on": "ubuntu-latest"}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
+	assert.Equal(t, DefaultActionFailureIssueExpiresHours, cfg.ActionFailureIssueExpiresHours(), "accessor should fall back to default")
+	assert.False(t, cfg.IsActionFailureIssueExpiresExplicit(), "action_failure_issue_expires should not be flagged explicit when absent from aw.json")
 }
 
 func TestLoadRepoConfig_MaintenanceCompileConfig(t *testing.T) {
@@ -210,7 +222,7 @@ func TestLoadRepoConfig_ContainerPinsKeyNoDigestAllowed(t *testing.T) {
 		},
 		{
 			name: "image without tag accepted",
-			key:  `"mcr.microsoft.com/playwright/mcp"`,
+			key:  `"alpine"`,
 		},
 		{
 			name:    "digest-pinned key rejected",
@@ -294,6 +306,7 @@ func TestLoadRepoConfig_DisabledJobs(t *testing.T) {
 	require.Len(t, cfg.Maintenance.DisabledJobs, 2, "disabled_jobs should be parsed")
 	assert.True(t, cfg.Maintenance.IsJobDisabled("close-expired-entities"), "hyphenated job name should match")
 	assert.True(t, cfg.Maintenance.IsJobDisabled("label_apply_safe_outputs"), "underscored lookup should match hyphen/underscore equivalently")
+	assert.False(t, cfg.Maintenance.IsJobDisabled("close.expired.entities"), "periods should not match hyphenated job names")
 	assert.False(t, cfg.Maintenance.IsJobDisabled("create_labels"), "unlisted jobs should remain enabled")
 }
 
@@ -311,12 +324,12 @@ func TestLoadRepoConfig_DisabledJobsRejectsInvalidOrDuplicateValues(t *testing.T
 		{
 			name:     "normalization-equivalent duplicate rejected",
 			awJSON:   `{"maintenance": {"disabled_jobs": ["close-expired-entities", "close_expired_entities"]}}`,
-			contains: "duplicate entries",
+			contains: "duplicate maintenance.disabled_jobs entries",
 		},
 		{
 			name:     "unknown job rejected",
 			awJSON:   `{"maintenance": {"disabled_jobs": ["apply_safe_outputz"]}}`,
-			contains: "unrecognized job",
+			contains: "unrecognized maintenance.disabled_jobs entry",
 		},
 	}
 
@@ -410,7 +423,7 @@ func TestLoadRepoConfig_InvalidUTC(t *testing.T) {
 
 	_, err := LoadRepoConfig(dir)
 	require.Error(t, err, "invalid timezone should return an error")
-	require.ErrorContains(t, err, "utc must be a numeric UTC offset")
+	require.ErrorContains(t, err, "must be a numeric UTC offset")
 }
 
 // TestFormatRunsOn tests the YAML serialisation of runs-on values.
@@ -502,6 +515,23 @@ func TestLoadRepoConfig_AutoUpgradeCron(t *testing.T) {
 		require.NotNil(t, cfg.AutoUpgrade, "auto_upgrade should be set")
 		assert.True(t, *cfg.AutoUpgrade, "empty object should imply enabled")
 		assert.Empty(t, cfg.AutoUpgradeCron, "AutoUpgradeCron should be empty when cron is omitted")
+	})
+
+	t.Run("object form loads upgrade options", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{"auto_upgrade": {"options": ["--pre-releases"]}}`)
+
+		cfg, err := LoadRepoConfig(dir)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"--pre-releases"}, cfg.AutoUpgradeOptions)
+	})
+
+	t.Run("rejects unsupported upgrade options", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{"auto_upgrade": {"options": ["--unknown"]}}`)
+
+		_, err := LoadRepoConfig(dir)
+		assert.Error(t, err, "unsupported auto-upgrade options should return an error")
 	})
 
 	t.Run("boolean true has no cron", func(t *testing.T) {

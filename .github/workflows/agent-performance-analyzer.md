@@ -16,8 +16,10 @@ engine:
 max-tool-denials: 3
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
+  github:
+    mode: local
   cli-proxy: true
   bash: [":*"]
   repo-memory:
@@ -32,6 +34,7 @@ imports:
   - shared/reporting.md
   - shared/otlp.md
   - shared/default-ai-credits-pricing.md
+  - shared/graders.md
 safe-outputs:
   create-issue:
     expires: 2d
@@ -74,6 +77,7 @@ evals:
     question: Did the agent analyze AI agent performance and quality metrics across the repository?
   - id: report_produced
     question: Was a report or discussion produced summarizing agent effectiveness findings?
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -110,8 +114,28 @@ Treat `copilot-swe-agent` as a built-in team member in attribution/engagement fi
 
 **CI vs. agentic workflow distinction:** Workflows such as `CWI`, `CGO`, `CI`, `CJS`, and `CPI` are plain CI workflows — not agentic workflows. An `action_required` conclusion on a CI workflow means GitHub is waiting for a maintainer to approve a pull-request workflow run (a GitHub Actions permission gate), **not** an agentic activation-refused. Do not count CI-workflow `action_required` runs as agentic AR. Report them separately under "CI approval-pending" and note that the fix is to approve the Copilot-bot's workflow runs at the org level or in the PR, not an agent-side change.
 
+Use `workflow_runs.executed` and its success rate for performance scoring. Do not score workflows
+with zero executed runs as failures; report high `skipped` or `action_required` counts separately as
+trigger or approval gating.
+
+**Command- and mention-triggered workflows:** Workflows whose frontmatter uses `slash_command`,
+`command`, or `mention` (for example `q`) are wired to `issues`, `issue_comment`, `discussion`, and
+`discussion_comment` events, so GitHub starts a run for **every** such event in the repository. The
+generated `pre_activation`/`activation` jobs then stop the run unless the body actually starts with
+the command. A low activated-run ratio plus a very short average runtime (roughly 5-30s) is the
+**designed** behavior of these workflows, not a defect. Never report their overall run count as an
+execution-success or activation-refused problem; compute their success rate over activated runs only
+and describe the remaining runs as "command gating (expected)".
+
+**Root-cause hygiene:** Before repeating a root cause carried over from shared memory
+(`shared-alerts.md`, `workflow-health-latest.md`), re-verify it against current evidence. If the note
+cites a PR or issue as the pending fix, check its current state: when it is already merged or closed
+and the metric has not moved, the attribution is stale — delete or replace it in `shared-alerts.md`
+and re-diagnose from the workflow's trigger configuration and recent run logs instead of restating
+it.
+
 ### Phase 1: Data Collection (10m)
-1. Load shared metrics/memory files (use `metrics-extractor` with listed paths).
+1. Load shared metrics/memory files (read each listed path and parse its contents; treat missing files as absent).
 2. Gather recent agent outputs (issues/PRs/discussions/comments + metadata).
 3. Review workflow runs/logs for decisions, errors, and resource use.
 4. Build per-agent profiles.
@@ -122,7 +146,7 @@ Treat `copilot-swe-agent` as a built-in team member in attribution/engagement fi
 7. Compare resource efficiency across agents.
 
 ### Phase 3: Pattern Detection (5m)
-8. Use `pattern-detector` on profiles for behavior classification.
+8. Classify behavior patterns for each agent profile (see recognized labels below).
 9. Analyze collaboration quality and conflicts.
 10. Assess ecosystem coverage gaps/redundancy.
 
@@ -368,6 +392,8 @@ The Metrics Collector workflow runs daily and stores performance metrics in a st
    - Agents affecting campaign success
    - Quality issues requiring workflow fixes
    - Performance patterns requiring campaign adjustments
+   - Remove or replace notes whose cited fix (PR/issue) is already merged or closed without the
+     metric improving, so later runs do not repeat a stale root cause
 
 **Format for memory files:**
 - Use markdown format only
@@ -407,6 +433,14 @@ The Metrics Collector workflow runs daily and stores performance metrics in a st
    - Extract agent decisions and actions
    - Capture error messages and warnings
    - Record resource usage metrics
+   - Use `workflow_runs.executed` as the denominator for success and effectiveness rates. Do not
+     score workflows with zero executed runs as failures; report high `skipped` or `action_required`
+     counts separately as trigger or approval gating.
+   - **Command/mention gating:** For workflows triggered by `slash_command`, `command`, or `mention`
+     (for example `q`), a run is started for every issue/comment/discussion event and stopped by the
+     `pre_activation`/`activation` jobs unless the body starts with the command. Score only their
+     activated runs; report the rest as "command gating (expected)" rather than as failures or
+     activation-refused incidents.
    - **CI vs. agentic distinction:** Workflows `CWI`, `CGO`, `CI`, `CJS`, and `CPI` are plain CI workflows, not agentic workflows. An `action_required` conclusion on a CI workflow means GitHub is waiting for a maintainer to approve a pull-request workflow run (a GitHub Actions permission gate). Do **not** count CI-workflow `action_required` as agentic activation-refused (AR). Track these separately as "CI approval-pending" and recommend approving the Copilot-bot's workflow runs at the org level rather than treating them as agent failures.
 
 4. **Build agent profiles:**
@@ -755,39 +789,6 @@ Execute all phases systematically and maintain an objective, data-driven approac
 - Use `bash` with `gh` for GitHub reads and to inspect `/tmp/gh-aw/repo-memory/default/` contents.
 - If required data stays inaccessible after 1-2 materially different attempts, call `report_incomplete` with the blocker instead of ending with prose only.
 - If the analysis completes but there is nothing actionable to create or update, call `noop` with a short summary of what you checked.
-## agent: `metrics-extractor`
----
-model: mai-code
-description: Reads shared repo-memory metric files and returns structured JSON with all relevant performance data
----
-You are a metrics extraction assistant. When given a newline-separated list of file paths (one path per line), read each file using bash and return a single JSON object containing all data found.
+## Behavior Pattern Classification
 
-For JSON files, parse and include the full content under a key matching the file's basename (without extension). For a directory path, list and read all files within it, using their basenames as keys. For markdown files, include the raw text under a key matching the filename.
-
-If a file does not exist or cannot be read, include `null` for that key.
-
-Return the result as a single valid JSON object with no additional commentary.
-
-## agent: `pattern-detector`
----
-model: mai-code
-description: Classifies agent behavioral patterns from profiles and returns a structured categorization of issues found
----
-You are an agent behavior classification assistant. When given a JSON object containing agent profiles (with fields such as output counts, types, success rates, and resource usage), classify each agent's behavioral patterns.
-
-For each agent, identify which of the following patterns apply:
-- **over-creation**: Output count significantly above expected baseline
-- **under-creation**: Output count significantly below expected baseline or zero
-- **repetition**: Duplicate or near-duplicate outputs detected
-- **scope-creep**: Outputs outside the agent's defined responsibility area
-- **inconsistency**: High variance in output counts or quality across runs
-
-Return a JSON object where each key is the agent name and the value is an array of detected pattern strings (empty array if none detected). Example:
-
-```json
-{
-  "agent-a": ["over-creation", "inconsistency"],
-  "agent-b": [],
-  "agent-c": ["under-creation"]
-}
-```
+When classifying per-agent behavior patterns in Phase 3, use only these recognized labels: `over-creation`, `under-creation`, `repetition`, `scope-creep`, `inconsistency`. Return an empty list for agents with no detected patterns, and base classifications only on the compact per-agent profile data already gathered (output counts, success rates, resource usage).

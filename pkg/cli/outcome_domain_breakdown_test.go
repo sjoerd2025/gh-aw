@@ -10,20 +10,21 @@ import (
 )
 
 func TestComputeDomainBreakdowns_SortsByValueThenLabel(t *testing.T) {
+	t.Parallel()
 	reports := []OutcomeReport{
 		{
-			Result:          OutcomeAccepted,
-			ObjectiveValue:  20,
-			ObjectiveLabels: []string{"beta"},
+			OutcomeEvaluation: OutcomeEvaluation{OutcomeStatus: OutcomeStatusAccepted},
+			ObjectiveValue:    20,
+			ObjectiveLabels:   []string{"beta"},
 		},
 		{
-			Result:          OutcomeAccepted,
-			ObjectiveValue:  20,
-			ObjectiveLabels: []string{"alpha"},
+			OutcomeEvaluation: OutcomeEvaluation{OutcomeStatus: OutcomeStatusAccepted},
+			ObjectiveValue:    20,
+			ObjectiveLabels:   []string{"alpha"},
 		},
 		{
-			Result:          OutcomeRejected,
-			ObjectiveLabels: []string{"gamma"},
+			OutcomeEvaluation: OutcomeEvaluation{OutcomeStatus: OutcomeStatusRejected},
+			ObjectiveLabels:   []string{"gamma"},
 		},
 	}
 

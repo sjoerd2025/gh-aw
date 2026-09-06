@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test for Claude engine on GitHub Inference that posts a concise PR summary comment
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-claude-on-copilot
     strategy: centralized
@@ -18,6 +19,8 @@ engine:
   model-provider: github
   bare: true
 strict: true
+imports:
+  - shared/reporting.md
 tools:
   github:
     mode: gh-proxy
@@ -27,6 +30,9 @@ safe-outputs:
     max: 1
     hide-older-comments: true
 timeout-minutes: 10
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Claude on GitHub Inference PR Summary

@@ -4,9 +4,10 @@ emoji: "🎭"
 description: Explores agentic-workflows custom agent behavior by generating software personas and analyzing responses to common automation tasks
 on: daily
 max-daily-ai-credits: 10000
-model: copilot/gpt-5.4
+model: openai/gpt-5.4
 engine:
-  id: pi
+  id: codex
+  model-provider: openai
 permissions:
   contents: read
   actions: read
@@ -37,11 +38,11 @@ experiments:
 # Note: max-turns not available for default Copilot engine (Claude only)
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
   agentic-workflows:
   cache-memory: true
 safe-outputs:
@@ -59,6 +60,7 @@ imports:
 
 
   - shared/otlp.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
 evals:
@@ -66,6 +68,7 @@ evals:
     question: Did the agent generate software personas for exploring custom agent behavior?
   - id: analysis_produced
     question: Was an analysis produced comparing agent responses across different automation tasks?
+
 ---
 
 # Agent Persona Explorer
@@ -148,6 +151,7 @@ Store all scenarios in cache memory.
   - Prompt clarity
   - Completeness
 - Notable patterns or issues (be concise)
+- If invocation fails: mark the scenario as `invocation_unavailable`, set quality scoring to `N/A`, and continue.
 
 **Assessment questions:** Does the suggestion include appropriate triggers (`on:`)? Correct tools (github, web-fetch, playwright, etc.)? Proper safe-outputs? Security best practices (minimal permissions, network restrictions)? A clear, actionable prompt?
 
@@ -161,7 +165,7 @@ For each selected scenario, invoke the "agentic-workflows" custom agent tool, pr
 - You are ONLY testing the agent's responses, NOT creating actual workflows
 - **Keep responses focused and concise** - summarize findings instead of verbose descriptions
 - Aim for quality over quantity - fewer well-analyzed scenarios are better than many shallow ones
-- **If any tool call fails, record the error briefly and move on to the next scenario** - do NOT retry or get stuck
+- **If any tool call fails, record the error briefly, mark scoring as unavailable for that scenario, and move on to the next scenario** - do NOT retry or get stuck
 
 ## Phase 4: Analyze Results (4 minutes)
 
@@ -175,6 +179,7 @@ Review all captured responses and identify:
 ### Quality Insights (summarize briefly)
 - Which scenarios received the best responses (average score > 4)?
 - Which scenarios received weak responses (average score < 3)?
+- If scenario invocation failed, note that scoring is unavailable for affected scenarios and exclude them from the numeric average.
 
 ### Potential Issues (only list critical issues)
 - Does the agent ever suggest insecure configurations?
@@ -189,7 +194,7 @@ Review all captured responses and identify:
 
 **MANDATORY OUTPUT**: Regardless of how many phases completed successfully, you MUST call either the `create issue` or the `noop` safe-output tool before finishing. Failing to call a safe-output tool is the most common cause of workflow failures.
 
-Create a GitHub issue with a **concise** summary report. Use the `create issue` safe-output to publish your findings. Even if only 1-2 scenarios were tested, create the issue with partial results.
+Create a GitHub issue with a **concise** summary report. Use the `create issue` safe-output to publish your findings. Even if only 1-2 scenarios were tested, create the issue with partial results. Treat invocation failures as a standard partial-results outcome and explicitly mark scoring as unavailable where applicable.
 
 **Issue title**: "Agent Persona Exploration - [DATE]" (e.g., "Agent Persona Exploration - 2024-01-16")
 
@@ -220,7 +225,7 @@ Example:
 - **Agent**: [name]
 - **Personas This Run**: [3 persona names]
 - **Scenarios Tested**: [count - should be 3-4, selected from the 6 generated in Phase 2 (2 per persona × 3 personas)]
-- **Average Quality Score**: [X.X/5.0]
+- **Average Quality Score**: [X.X/5.0 or N/A when invocation/scoring is unavailable]
 
 ### Key Findings (3-5 bullet points max)
 [High-level insights - keep concise]

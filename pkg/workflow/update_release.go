@@ -9,7 +9,6 @@ var updateReleaseLog = logger.New("workflow:update_release")
 // UpdateReleaseConfig holds configuration for updating GitHub releases from agent output
 type UpdateReleaseConfig struct {
 	UpdateEntityConfig `yaml:",inline"`
-	Footer             *string `yaml:"footer,omitempty"` // Controls whether AI-generated footer is added. When false, visible footer is omitted but XML markers are kept.
 }
 
 // parseUpdateReleaseConfig handles update-release configuration
@@ -19,7 +18,7 @@ func (c *Compiler) parseUpdateReleaseConfig(outputMap map[string]any) *UpdateRel
 		UpdateEntityRelease, "update-release", updateReleaseLog,
 		func(cfg *UpdateReleaseConfig) []UpdateEntityFieldSpec {
 			return []UpdateEntityFieldSpec{
-				{Name: "footer", Mode: FieldParsingTemplatableBool, StringDest: &cfg.Footer},
+				updateEntityFooterField(&cfg.Footer),
 			}
 		}, nil)
 }

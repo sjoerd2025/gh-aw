@@ -4,6 +4,88 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
 
 # Safe Outputs: GitHub Content
 
+- Jira operations are explicitly namespaced and run through Jira Cloud REST API v3:
+
+  ```yaml
+  safe-outputs:
+    jira-create-issue:
+      max: 1
+    jira-update-issue:
+      max: 1
+    jira-add-comment:
+      max: 1
+    jira-add-label:
+      max: 3
+  ```
+
+  | Frontmatter | Tool | Agent inputs |
+  |---|---|---|
+  | `jira-create-issue` | `jira_create_issue` | `project_key`, `issue_type`, `summary`, optional `description` |
+  | `jira-update-issue` | `jira_update_issue` | `issue_key` and at least one of `summary`, `description` |
+  | `jira-add-comment` | `jira_add_comment` | `issue_key`, `body` |
+  | `jira-add-label` | `jira_add_label` | `issue_key`, `label` |
+
+  Use the Jira-prefixed tool whenever the target is Jira. Unprefixed issue, comment, and label tools target GitHub. The compiler supplies `JIRA_BASE_URL` and supplies `JIRA_USER_EMAIL` and `JIRA_API_TOKEN` from same-named secrets; `safe-outputs.env` may override them. Description and comment strings are converted to ADF internally. Label addition is additive and preserves existing labels. Each Jira output supports `max` and `staged`; staged mode sends no HTTP request and does not require credentials.
+
+  Jira update, comment, and label operations require a known issue key. Same-run references to an issue created by `jira_create_issue` are not supported. The initial integration does not provide transitions, assignments, custom fields, label removal, JQL, bulk operations, or arbitrary REST calls.
+
+- **[Experimental]** Linear operations use the `LINEAR_API_KEY` secret and run through the Linear GraphQL API:
+
+  ```yaml
+  safe-outputs:
+    linear-create-issue:
+      max: 1
+      team-id: "TEAM_ID"
+      project-id: "PROJECT_ID"
+    linear-add-comment:
+      max: 1
+    linear-update-issue:
+      max: 1
+      title: true
+      body: true
+  ```
+
+  | Frontmatter | Tool | Agent inputs |
+  |---|---|---|
+  | `linear-create-issue` | `linear_create_issue` | `title`, `body` (team and optional project taken from config) |
+  | `linear-add-comment` | `linear_add_comment` | `body` (target issue) |
+  | `linear-update-issue` | `linear_update_issue` | `title`/`body`, gated by the matching `title:`/`body:` config flags |
+
+  `linear-token:` optionally overrides the `LINEAR_API_KEY` secret and is a top-level `safe-outputs:` field, not nested under `env:`. `linear-create-issue.project-id` optionally fixes created issues to a trusted Linear project identifier from its URL or model UUID. Each output supports `max` and `staged`. Only fields explicitly enabled in `update-issue` config (`title`, `body`) can be changed by the agent.
+
+- **[Experimental]** Azure DevOps work-item operations are namespaced `ado-*` and rely on an Azure DevOps MCP server (configured separately under `mcp-servers:`/`tools:`) for the underlying connection and credentials:
+
+  ```yaml
+  safe-outputs:
+    ado-create-work-item:
+      max: 1
+      work-item-type: "Bug"
+    ado-update-work-item:
+      max: 1
+      status: true
+      title: true
+    ado-comment-on-work-item:
+      max: 1
+      target: "*"
+    ado-assign-work-item:
+      max: 1
+    ado-link-work-items:
+      max: 5
+    ado-upload-workitem-attachment:
+      max: 1
+  ```
+
+  | Frontmatter | Tool | Agent inputs |
+  |---|---|---|
+  | `ado-create-work-item` | `ado_create_work_item` | `title`, `description`, optional `tags`, `temporary_id` |
+  | `ado-update-work-item` | `ado_update_work_item` | `id`, plus one of `title`/`body`/`state`/`area_path`/`iteration_path`/`assignee`/`tags` enabled via config |
+  | `ado-comment-on-work-item` | `ado_comment_on_work_item` | `work_item_id`, `body` |
+  | `ado-assign-work-item` | `ado_assign_work_item` | `work_item_id`, `assignee` (checked against `allowed`/`blocked`) |
+  | `ado-link-work-items` | `ado_link_work_items` | `source_id`, `target_id`, `link_type` (checked against `allowed-link-types`) |
+  | `ado-upload-workitem-attachment` | `ado_upload_workitem_attachment` | `work_item_id`, `file_path`, `staged_file` (checked against `max-file-size`/`allowed-extensions`) |
+
+  `ado-create-work-item` accepts a `temporary_id` (`#aw_xxxx`) so later outputs in the same run can reference a just-created work item. `target:` on update/comment/assign/link/attach constrains which work item IDs are addressable. Config-level allow-lists (`allowed-tags`, `allowed-area-prefixes`, `allowed-iteration-prefixes`, `allowed`, `blocked`, `allowed-link-types`, `allowed-extensions`) gate what the agent can set; unlisted values are rejected.
+
 - `create-issue:` - Safe GitHub issue creation (bugs, features)
 
   ```yaml
@@ -21,7 +103,9 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
       close-older-issues: true        # Optional: close previous issues from same workflow (default: false)
       close-older-key: "my-key"       # Optional: explicit deduplication key for close-older matching (uses gh-aw-close-key marker)
       deduplicate-by-title: true      # Optional: skip creating an issue when one with the same title exists; integer N allows fuzzy matches up to edit distance N (default: off)
+      require-temporary-id: true      # Optional: require temporary_id on every create_issue call (default: false)
       normalize-closing-keywords: true # Optional: strip backticks around recognized issue-closing keywords in body text
+      # create_issue output may set blocked_by to an issue reference or list of references
       footer: false                   # Optional: omit AI-generated footer while preserving XML markers (default: true)
       target-repo: "owner/repo"       # Optional: cross-repository
       allowed-repos: [owner/other]    # Optional: additional repos agent can target (agent uses `repo` field in output)
@@ -44,7 +128,7 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
       expires: 7   # auto-close after 7 days
   ```
 
-  Without `skip-if-match`, the workflow creates a new issue on every scheduled run even when an identical open issue already exists.
+  Without `skip-if-match`, the workflow creates a new issue on every scheduled run even when an identical open issue already exists. For the frequent-schedule variant that serves one item at a time and learns from how the previous issue was closed, see the [All You Can Eat Pattern](workflow-patterns.md#all-you-can-eat-pattern).
 
   **Temporary IDs and Sub-Issues:**
   When creating multiple issues, use `temporary_id` (format: `aw_` + 3-8 alphanumeric chars) to reference parent issues before creation. References like `#aw_abc123` in issue bodies are automatically replaced with actual issue numbers. Use the `parent` field to create sub-issue relationships:
@@ -53,6 +137,8 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
   {"type": "create_issue", "temporary_id": "aw_abc123", "title": "Parent", "body": "Parent issue"}
   {"type": "create_issue", "parent": "aw_abc123", "title": "Sub-task", "body": "References #aw_abc123"}
   ```
+
+  **Blocked-By Dependencies:** Set `blocked_by` in `create_issue` output to an issue number, temporary ID, `owner/repo#number` reference, GitHub issue URL, or a list of references. Temporary IDs are resolved before the issue is created, allowing dependent output to be emitted in any order. Attaching a dependency is best-effort: if the dependency API call fails the issue is still reported as created and the failure is logged as a warning.
 
   **Setting Issue Fields on Creation**: Agents can include a `fields` array in the `create_issue` output to set custom field values immediately after creation. Each item is `{"name": <field-display-name>, "value": <string-or-number>}`. Use a number for numeric fields; string for single-select, iteration title, date `YYYY-MM-DD`, or text. Restrict allowed names with `allowed-fields:`.
 
@@ -96,13 +182,16 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
       expires: 7                      # Optional: auto-close after 7 days (supports: 2h, 7d, 2w, 1m, 1y, or false)
       fallback-to-issue: true         # Optional: create issue if discussion creation fails (default: true)
       footer: false                   # Optional: omit AI-generated footer while preserving XML markers (default: true)
+      min-body-length: 100            # Optional: minimum required body length (default: 64)
       target-repo: "owner/repo"       # Optional: cross-repository
       allowed-repos: [owner/other]    # Optional: additional repos agent can target (agent uses `repo` field in output)
   ```
 
   `category` accepts name (e.g., "General"), slug (e.g., "general"), or ID (e.g., "DIC_kwDOGFsHUM4BsUn3"); defaults to the first category. Resolution tries ID, then name, then slug.
 
-  `close-older-discussions: true` closes up to 10 older discussions matching the same title prefix or labels as "OUTDATED" with a comment linking to the new one. Requires `title-prefix` or `labels`.
+  `close-older-discussions: true` closes up to 10 older open discussions matching the same embedded workflow-id marker (or `close-older-key` if set) as "OUTDATED" with a comment linking to the new one.
+
+  `create_discussion` output validation requires `body` minimum length: **64** characters by default; override with `min-body-length:`.
 
 - `close-discussion:` - Close discussions with comment and resolution
 
@@ -128,6 +217,7 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
       target: "*"                     # Optional: target for comments (default: "triggering")
       required-labels: [approved]     # Optional: ALL of these labels must be present on the issue/PR for the comment to be posted
       required-title-prefix: "[bot]" # Optional: issue/PR title must start with this prefix
+      allows-comment-ids: ["123456"] # Optional: trusted allowlist of comment IDs the agent may update when target is "*"
       hide-older-comments: true       # Optional: minimize previous comments from same workflow
       allowed-reasons: [outdated]     # Optional: restrict hiding reasons (default: outdated)
       normalize-closing-keywords: true # Optional: strip backticks around recognized issue-closing keywords in body text
@@ -168,6 +258,7 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
   safe-outputs:
     create-pull-request:
       title-prefix: "[ai] "           # Optional: prefix for PR titles
+      require-temporary-id: true      # Optional: require temporary_id on every create_pull_request call (default: false)
       branch-prefix: "signed/"        # Optional: prefix prepended to the PR branch name (e.g. for branch-protection conventions)
       labels: [automation, ai-agent]  # Optional: labels to attach to PRs
       allowed-labels: [bug, fix]      # Optional: restrict which labels the agent can set (any label allowed if omitted)
@@ -177,7 +268,7 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
       if-no-changes: "warn"           # Optional: "warn" (default), "error", or "ignore"
       allow-empty: false              # Optional: create PR with empty branch, no changes required (default: false)
       expires: 7                      # Optional: auto-close after 7 days (supports: 2h, 7d, 2w, 1m, 1y; min: 2h)
-      auto-merge: false               # Optional: enable auto-merge when checks pass (default: false)
+      auto-merge: squash             # Optional: false (default), true, or merge method: squash|merge|rebase
       base-branch: "vnext"            # Optional: base branch for PR (defaults to workflow's branch)
       preserve-branch-name: true      # Optional: skip random salt suffix on agent-specified branch names (default: false)
       recreate-ref: false             # Optional: force-recreate existing remote branch when preserve-branch-name is true (default: false)
@@ -189,7 +280,11 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
       fallback-as-issue: false        # Optional: when true (default), creates a fallback issue on PR creation failure; on permission errors, the issue includes a one-click link to create the PR via GitHub's compare URL
       auto-close-issue: false         # Optional: when true (default), adds "Fixes #N" closing keyword when triggered from an issue; set to false to prevent auto-closing the triggering issue on merge. Accepts a boolean or GitHub Actions expression.
       normalize-closing-keywords: true # Optional: strip backticks around recognized issue-closing keywords in PR body text
+      close-older-pull-requests: true # Optional: close previous PRs from same workflow (default: false)
+      close-older-key: "my-key"       # Optional: explicit deduplication key for close-older matching
       target-repo: "owner/repo"       # Optional: cross-repository
+      head-repo: "fork-owner/repo"    # Optional: head (fork) repository for cross-repository PRs; defaults to target-repo
+      head-github-token: ${{ secrets.HEAD_REPO_PAT }}  # Optional: token for branch writes to head-repo when it differs from target-repo
       github-token-for-extra-empty-commit: ${{ secrets.MY_CI_PAT }}  # Optional: PAT or "app" to trigger CI on created PRs
       allowed-files:                  # Recommended: always restrict to specific paths or extensions to limit agent scope
         - "src/**/*.ts"               # e.g. restrict to TypeScript source files
@@ -204,6 +299,7 @@ description: Safe-output reference for issue, discussion, comment, and pull requ
         - "main"
       max-patch-size: 2048            # Optional: per-output cap on git patch size in KB (overrides global; default: 4096 KB, max: 10240)
       max-patch-files: 50             # Optional: per-output cap on unique files in the patch (overrides global; default: 100)
+      stacked: true                   # Optional: allow PRs based on another PR branch from the same run (default: true; set false on GHES without stacked-PR support)
   ```
 
   **Dynamic Base Branch**: When `allowed-base-branches` is set, the agent can provide a `base` field in its output to override the default base branch for a single run — but only if the value matches one of the configured glob patterns. Without `allowed-base-branches`, only the static `base-branch:` is used. Accepts a literal array or a GitHub Actions expression resolving to a comma-separated list (e.g. `${{ inputs.allowed-base-branches }}`).

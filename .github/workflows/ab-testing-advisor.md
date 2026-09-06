@@ -18,6 +18,7 @@ network:
   - defaults
 imports:
 - shared/otlp.md
+- shared/graders.md
 safe-outputs:
   create-issue:
     close-older-issues: true
@@ -32,41 +33,19 @@ safe-outputs:
     title-prefix: "[ab-advisor] "
 description: Daily A/B testing advisor that picks a random agentic workflow without an experiments section, devises an experiment campaign to improve it, and creates a GitHub issue with the implementation task
 emoji: 🧪
-model: copilot/gpt-5.4
+model: openai/gpt-5.4
 engine:
-  bare: true
-  id: pi
+  id: codex
+  model-provider: openai
 strict: true
 timeout-minutes: 30
 tools:
   bash:
-  - find .github/workflows -maxdepth 1 -name "*.md" ! -name "shared" -type f
-  - grep -l "experiments:" .github/workflows/*.md
-  - grep -rL "experiments:" .github/workflows/*.md
-  - grep -rn "experiments:" .github/workflows/*.md
-  - cat .github/workflows/
-  - shuf -n 1
-  - awk
-  - wc -l
-  - ls .github/workflows/
-  - head -200
-  - grep -c
-  - grep
-  - echo
-  - date
-  - python3
-  - jq
-  - find
-  - cat
-  - sort
-  - basename
-  - tail
-  - uniq
-  - mkdir
+  - "*"
   cache-memory: true
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
     - default
     - actions
@@ -75,12 +54,13 @@ features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 evals:
   - id: experiment_issue_created
     question: Did the agent create a GitHub issue with an A/B experiment campaign for a selected workflow?
   - id: workflow_targeted
     question: Did the agent identify and target a workflow that lacks an experiments section?
+
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -177,7 +157,7 @@ Use the randomly selected dimension as your starting point. If after reading the
 **Accuracy & Quality**
 - `prompt_style`: Test concise vs. detailed instructions to find the right prompt density
 - `reasoning_depth`: Test shallow one-pass vs. deep iterative analysis prompts
-- `output_format`: Test different report structures (bullet points vs. prose vs. structured sections)
+- `output_format`: Test different report structures (bullet points vs. prose vs. structured sections vs. Simplified Technical English (STE) — short sentences, active voice, one instruction per sentence)
 
 **Latency & Reliability**
 - `timeout_setting`: Test different `timeout-minutes` values to find the sweet spot
@@ -197,6 +177,8 @@ For the chosen dimension, define:
 - **Guardrail metrics**: Things that must NOT degrade (e.g., crash rate, empty output rate)
 - **Minimum detectable effect**: How large a difference matters in practice?
 - **Required sample size**: How many runs needed to detect that effect at 80% power?
+
+**Every experiment must be paired with an eval.** Whenever success is best judged as a YES/NO question about the output (e.g., "did the report follow the assigned variant's style?"), declare that question under the workflow's `evals:` section and reference it from `metric` or `secondary_metrics` as `eval:<id>`. This lets `gh aw experiments analyze` show observed eval outcomes alongside quantitative metrics — do not propose an experiment without at least one accompanying eval question that checks whether the assigned variant's intended effect actually shows up in the output.
 
 #### Experiment Variants
 
@@ -238,7 +220,7 @@ experiments:
     description: "<what this test measures>"
     hypothesis: "H0: no change in <metric>. H1: <alternative hypothesis with expected effect size>"
     metric: <primary_metric>
-    secondary_metrics: [<secondary_metric1>, <secondary_metric2>]
+    secondary_metrics: [<secondary_metric1>, <secondary_metric2>, "eval:<eval_id>"]
     guardrail_metrics:
       - name: <guardrail_metric>
         direction: min
@@ -247,6 +229,14 @@ experiments:
     weight: [50, 50]
     start_date: "<YYYY-MM-DD>"
     issue: <this_issue_number>
+```
+
+Add the paired eval to the workflow's `evals:` section (create it if the workflow doesn't have one yet):
+
+```yaml
+evals:
+  - id: <eval_id>
+    question: "<YES/NO question checking whether the assigned variant's intended effect shows up in the output>"
 ```
 
 **Variant descriptions**:
@@ -278,6 +268,7 @@ Show the concrete before/after diff.
 ### Implementation Steps
 
 - [ ] Add `experiments:` section to frontmatter
+- [ ] Add the paired eval question to the `evals:` section
 - [ ] Add conditional blocks to workflow prompt body using `{{#if experiments.<name> == "<variant>" }}` (value-comparison form — never use the internal `__GH_AW_EXPERIMENTS__` env-var syntax)
 - [ ] Run `gh aw compile <workflow-name>` to regenerate lock file
 - [ ] Monitor experiment artifact uploaded per run to `/tmp/gh-aw/agent/experiments/state.json`
@@ -366,6 +357,7 @@ Propose how experiments should integrate with `gh aw audit` and OTEL observabili
 - Tag workflow runs with `experiment_name` and `variant` in OTEL span attributes
 - Surface experiment assignments in the `gh aw audit` output
 - Enable filtering audit logs by experiment variant to compare failure modes
+- Compare the Working-Set Rebuild Factor (`working_set.rebuild_factor` in `gh aw audit` output) across variants to detect context-efficiency regressions alongside cost and quality metrics
 - Add experiment metadata to the step summary generated by `pick_experiment.cjs`
 
 **Create the sub-issue with title**: `[ab-advisor] Improve experiment infrastructure: schema, reporting & audit`

@@ -15,7 +15,7 @@
 //
 // # Built-in Engines
 //
-// NewEngineCatalog registers the built-in engines: claude, codex, copilot, gemini, opencode, pi, antigravity.
+// NewEngineCatalog registers the built-in engines: claude, codex, copilot, gemini, pi.
 // Each EngineDefinition carries the engine's RuntimeID which maps to the corresponding
 // CodingAgentEngine registered in the EngineRegistry.
 //
@@ -28,9 +28,15 @@
 package workflow
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
@@ -61,33 +67,33 @@ const (
 type AuthDefinition struct {
 	// Strategy selects the authentication flow (api-key, oauth-client-credentials, bearer).
 	// Defaults to api-key when Secret is non-empty and Strategy is unset.
-	Strategy AuthStrategy `yaml:"strategy,omitempty"`
+	Strategy AuthStrategy `yaml:"strategy,omitempty" json:"strategy"`
 
 	// Secret is the env-var / GitHub Actions secret name that holds the raw API key or token.
 	// Required for api-key and bearer strategies.
-	Secret string `yaml:"secret,omitempty"`
+	Secret string `yaml:"secret,omitempty" json:"secret"`
 
 	// TokenURL is the OAuth token endpoint (e.g. "https://auth.example.com/oauth/token").
 	// Required for oauth-client-credentials strategy.
-	TokenURL string `yaml:"token-url,omitempty"`
+	TokenURL string `yaml:"token-url,omitempty" json:"token-url"`
 
 	// ClientIDRef is the secret name that holds the OAuth client ID.
 	// The "Ref" suffix indicates this is a reference to a GitHub Actions secret name,
 	// not the secret value itself. Required for oauth-client-credentials strategy.
-	ClientIDRef string `yaml:"client-id,omitempty"`
+	ClientIDRef string `yaml:"client-id,omitempty" json:"client-id"`
 
 	// ClientSecretRef is the secret name that holds the OAuth client secret.
 	// The "Ref" suffix indicates this is a reference to a GitHub Actions secret name,
 	// not the secret value itself. Required for oauth-client-credentials strategy.
-	ClientSecretRef string `yaml:"client-secret,omitempty"`
+	ClientSecretRef string `yaml:"client-secret,omitempty" json:"client-secret"`
 
 	// TokenField is the JSON field name in the token response that contains the access token.
 	// Defaults to "access_token" when empty.
-	TokenField string `yaml:"token-field,omitempty"`
+	TokenField string `yaml:"token-field,omitempty" json:"token-field"`
 
 	// HeaderName is the HTTP header to inject the token into (e.g. "api-key").
 	// Required when strategy is not bearer (bearer always uses Authorization header).
-	HeaderName string `yaml:"header-name,omitempty"`
+	HeaderName string `yaml:"header-name,omitempty" json:"header-name"`
 }
 
 // RequestShape describes non-standard URL and body transformations applied to each
@@ -95,15 +101,15 @@ type AuthDefinition struct {
 type RequestShape struct {
 	// PathTemplate is a URL path template with {model} and other variable placeholders
 	// (e.g. "/openai/deployments/{model}/chat/completions").
-	PathTemplate string `yaml:"path-template,omitempty"`
+	PathTemplate string `yaml:"path-template,omitempty" json:"path-template"`
 
 	// Query holds static or template query-parameter values appended to every request
 	// (e.g. {"api-version": "2024-10-01-preview"}).
-	Query map[string]string `yaml:"query,omitempty"`
+	Query map[string]string `yaml:"query,omitempty" json:"query"`
 
 	// BodyInject holds key/value pairs injected into the JSON request body before sending
 	// (e.g. {"appKey": "{APP_KEY_SECRET}"}).
-	BodyInject map[string]string `yaml:"body-inject,omitempty"`
+	BodyInject map[string]string `yaml:"body-inject,omitempty" json:"body-inject"`
 }
 
 // ProviderSelection identifies the AI provider for an engine (e.g. "anthropic", "openai").
@@ -124,18 +130,49 @@ type ModelSelection struct {
 // EngineCapabilitiesDefinition captures declarative engine capabilities loaded from
 // engine definition frontmatter.
 type EngineCapabilitiesDefinition struct {
-	ToolsAllowlist   bool `yaml:"tools-allowlist,omitempty"`
-	MaxTurns         bool `yaml:"max-turns,omitempty"`
-	WebSearch        bool `yaml:"web-search,omitempty"`
-	MaxContinuations bool `yaml:"max-continuations,omitempty"`
-	NativeAgentFile  bool `yaml:"native-agent-file,omitempty"`
-	BareMode         bool `yaml:"bare-mode,omitempty"`
+	ToolsAllowlist       bool `yaml:"tools-allowlist,omitempty"`
+	MaxTurns             bool `yaml:"max-turns,omitempty"`
+	WebSearch            bool `yaml:"web-search,omitempty"`
+	MaxContinuations     bool `yaml:"max-continuations,omitempty"`
+	NativeAgentFile      bool `yaml:"native-agent-file,omitempty"`
+	BareMode             bool `yaml:"bare-mode,omitempty"`
+	BashCommandAllowlist bool `yaml:"bash-command-allowlist,omitempty"`
+	BashDisable          bool `yaml:"bash-disable,omitempty"`
 }
 
 // ToRuntimeCapabilities converts the declarative capabilities definition into the
 // runtime EngineCapabilities struct used by CodingAgentEngine implementations.
 func (d EngineCapabilitiesDefinition) ToRuntimeCapabilities() EngineCapabilities {
-	return EngineCapabilities(d)
+	return EngineCapabilities{
+		ToolsAllowlist:       d.ToolsAllowlist,
+		MaxTurns:             d.MaxTurns,
+		WebSearch:            d.WebSearch,
+		MaxContinuations:     d.MaxContinuations,
+		NativeAgentFile:      d.NativeAgentFile,
+		BareMode:             d.BareMode,
+		BashCommandAllowlist: d.BashCommandAllowlist,
+		BashDisable:          d.BashDisable,
+	}
+}
+
+// EnginePluginsDefinition declares how a behavior-defined engine consumes Agent Plugins
+// (https://agent-plugins.org). Declaring this block enables the engine's Plugins capability.
+// Plugins are always checked out at their pinned commit SHA; `directory` stages each plugin
+// in a workspace folder scanned by the engine, and `install-args` runs the engine CLI's
+// plugin installation command. When both mechanisms are configured together, both run for
+// every plugin: the plugin is staged into `directory` and also installed via the CLI. This
+// intentional dual-install flow supports engines that need staged files for discovery plus a
+// registration command.
+type EnginePluginsDefinition struct {
+	// Directory is the workspace-relative folder the engine scans for plugins
+	// (for example ".cursor/plugins").
+	Directory string `yaml:"directory,omitempty"`
+	// CommandName overrides the CLI executable used for `install-args`.
+	// Defaults to the execution command name.
+	CommandName string `yaml:"command-name,omitempty"`
+	// InstallArgs are the CLI arguments placed before the local plugin path
+	// (for example ["plugin", "install"]).
+	InstallArgs []string `yaml:"install-args,omitempty"`
 }
 
 // EngineManifestDefinition describes engine-specific files and folders that alter
@@ -143,6 +180,17 @@ func (d EngineCapabilitiesDefinition) ToRuntimeCapabilities() EngineCapabilities
 type EngineManifestDefinition struct {
 	Files        []string `yaml:"files,omitempty"`
 	PathPrefixes []string `yaml:"path-prefixes,omitempty"`
+}
+
+// EngineNetworkDefinition declares the engine's default network requirements.
+// Defaults are always included. ProviderDomains maps a "provider/model" prefix
+// to the API domain that must additionally be reachable for that provider.
+type EngineNetworkDefinition struct {
+	Defaults        []string          `yaml:"defaults,omitempty"`
+	ProviderDomains map[string]string `yaml:"provider-domains,omitempty"`
+	// DefaultProvider names the provider key used when the model carries no
+	// "provider/" prefix. When empty, no provider domain is added.
+	DefaultProvider string `yaml:"default-provider,omitempty"`
 }
 
 // EngineInstallationDefinition describes how an engine CLI is installed.
@@ -192,6 +240,17 @@ type EngineExecutionDefinition struct {
 // behavior-defined engine.
 type EngineMCPDefinition struct {
 	ConfigPath string `yaml:"config-path,omitempty"`
+	// ConfigAdapter is the JavaScript source of a Node.js script that converts
+	// the MCP gateway's raw output configuration into the format expected by
+	// this engine. When non-empty the script is written to
+	// ${RUNNER_TEMP}/gh-aw/actions/<engine-id>_mcp_config_adapter.cjs before the
+	// MCP gateway starts, and start_mcp_gateway.cjs executes it (instead of a
+	// built-in per-engine converter) once the gateway has produced its output.
+	// The script can read MCP_GATEWAY_OUTPUT, MCP_GATEWAY_DOMAIN,
+	// MCP_GATEWAY_HOST_DOMAIN, MCP_GATEWAY_PORT and GH_AW_MCP_CLI_SERVERS from
+	// the environment, mirroring the built-in converters, and is expected to
+	// write its own config file (e.g. via ConfigPath above).
+	ConfigAdapter string `yaml:"config-adapter,omitempty"`
 }
 
 // EngineBehaviorDefinition captures declarative runtime behaviour for a custom
@@ -201,7 +260,9 @@ type EngineBehaviorDefinition struct {
 	SupportedEnvVarKeys []string                      `yaml:"supported-env-var-keys,omitempty"`
 	Capabilities        EngineCapabilitiesDefinition  `yaml:"capabilities,omitempty"`
 	Manifest            *EngineManifestDefinition     `yaml:"manifest,omitempty"`
+	Network             *EngineNetworkDefinition      `yaml:"network,omitempty"`
 	Installation        *EngineInstallationDefinition `yaml:"installation,omitempty"`
+	Plugins             *EnginePluginsDefinition      `yaml:"plugins,omitempty"`
 	ConfigFile          *EngineConfigFileDefinition   `yaml:"config-file,omitempty"`
 	Execution           *EngineExecutionDefinition    `yaml:"execution,omitempty"`
 	MCP                 *EngineMCPDefinition          `yaml:"mcp,omitempty"`
@@ -214,6 +275,15 @@ type EngineBehaviorDefinition struct {
 	// process.env.AWF_REFLECT_ENABLED / the AWF reflect JSON file to dynamically
 	// configure the engine CLI at runtime.
 	HarnessScript string `yaml:"harness-script,omitempty"`
+	// LogParser is the JavaScript source of a log-parser function for the engine.
+	// When non-empty, the script is written to
+	// ${RUNNER_TEMP}/gh-aw/actions/<engine-id>_log_parser.cjs before the post-agent
+	// log-parsing step runs.  The script must define a parseLog(logContent) function
+	// that returns {markdown, logEntries, mcpFailures, maxTurnsHit} — the same
+	// contract used by the built-in engine parsers (e.g. parse_claude_log.cjs).
+	// A createEngineLogParser wrapper is automatically appended so the author only
+	// needs to provide the parsing function; the wrapper handles exports and bootstrap.
+	LogParser string `yaml:"log-parser,omitempty"`
 }
 
 // AuthBinding maps a logical authentication role to a secret name.
@@ -250,10 +320,19 @@ func (a *AuthDefinition) RequiredSecretNames() []string {
 // It is separate from the runtime adapter (CodingAgentEngine) to allow the catalog
 // layer to carry identity and provider information without coupling to implementation.
 type EngineDefinition struct {
-	ID               string `yaml:"id"`
-	DisplayName      string `yaml:"display-name,omitempty"`
-	Description      string `yaml:"description,omitempty"`
-	Experimental     bool   `yaml:"experimental,omitempty"`
+	ID           string `yaml:"id"`
+	DisplayName  string `yaml:"display-name,omitempty"`
+	Description  string `yaml:"description,omitempty"`
+	Experimental bool   `yaml:"experimental,omitempty"`
+	// Version is the default engine version applied to EngineConfig.Version when
+	// the workflow's own frontmatter (or an inline engine override) does not set
+	// an explicit version. This lets a shared engine definition (e.g. a
+	// behavior-defined engine imported from a Markdown file) carry a pinned
+	// default version that downstream steps and env vars (such as
+	// GH_AW_ENGINE_VERSION) can rely on even when workflows omit engine.version.
+	Version string `yaml:"version,omitempty"`
+	// MCP indicates whether the engine supports MCP. Nil defaults to supported.
+	MCP              *bool  `yaml:"mcp,omitempty"`
 	GHSkillAgentName string `yaml:"gh-skill-agent-name,omitempty"`
 	// RuntimeID maps to the CodingAgentEngine registered in EngineRegistry.
 	// Defaults to ID when omitted.
@@ -281,8 +360,147 @@ type ResolvedEngineTarget struct {
 	Runtime    CodingAgentEngine // resolved adapter from the EngineRegistry
 }
 
+const (
+	knownEngineImportsOwner          = "github"
+	knownEngineImportsRepo           = "gh-aw"
+	knownEngineImportsPath           = ".github/aw/engines.json"
+	knownEngineImportsRef            = "refs/heads/main"
+	knownEngineImportsTimeout        = 3 * time.Second
+	knownEngineImportsMaxBytes int64 = 1 << 20
+)
+
+type knownEngineImportEntry struct {
+	ID     string `json:"id"`
+	Import string `json:"import"`
+}
+
+type knownEngineImportsFile struct {
+	Engines []knownEngineImportEntry `json:"engines"`
+}
+
+var (
+	knownEngineImportsMu     sync.Mutex
+	knownEngineImportsLoaded bool
+	knownEngineImports       map[string]string
+
+	knownEngineImportsRawBaseURL = "https://raw.githubusercontent.com"
+	knownEngineImportsHTTPClient = func() *http.Client {
+		return &http.Client{Timeout: knownEngineImportsTimeout}
+	}
+	knownEngineImportsDownload = func(ctx context.Context) ([]byte, error) {
+		return downloadKnownEngineImports(ctx, knownEngineImportsRawURL())
+	}
+)
+
+func knownEngineImportsRawURL() string {
+	return strings.TrimRight(knownEngineImportsRawBaseURL, "/") + "/" + strings.Join([]string{
+		knownEngineImportsOwner,
+		knownEngineImportsRepo,
+		knownEngineImportsRef,
+		knownEngineImportsPath,
+	}, "/")
+}
+
+func downloadKnownEngineImports(ctx context.Context, rawURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := knownEngineImportsHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			engineCatalogLog.Printf("Known engine import catalog close failed: %v", closeErr)
+		}
+	}()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(io.LimitReader(resp.Body, knownEngineImportsMaxBytes))
+}
+
+// knownEngineImportFor returns the shared import spec for a known external
+// engine. The first call fetches the catalog on demand and may block for up to
+// knownEngineImportsTimeout; fetch and parse failures are treated as an empty
+// catalog so engine validation remains unchanged.
+func knownEngineImportFor(id string) (string, bool) {
+	importPath, ok, initialized, download := func() (string, bool, bool, func(context.Context) ([]byte, error)) {
+		knownEngineImportsMu.Lock()
+		defer knownEngineImportsMu.Unlock()
+
+		if knownEngineImportsLoaded {
+			importPath, ok := knownEngineImports[strings.ToLower(id)]
+			return importPath, ok, true, nil
+		}
+
+		return "", false, false, knownEngineImportsDownload
+	}()
+	if initialized {
+		return importPath, ok
+	}
+
+	// Avoid holding the catalog mutex during the network fetch. Concurrent cold
+	// callers may each fetch once, but only the first completed result is cached.
+	loaded := loadKnownEngineImports(download)
+
+	knownEngineImportsMu.Lock()
+	defer knownEngineImportsMu.Unlock()
+	if !knownEngineImportsLoaded {
+		knownEngineImports = loaded
+		knownEngineImportsLoaded = true
+	}
+
+	importPath, ok = knownEngineImports[strings.ToLower(id)]
+	return importPath, ok
+}
+
+func loadKnownEngineImports(download func(context.Context) ([]byte, error)) map[string]string {
+	loaded := map[string]string{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), knownEngineImportsTimeout)
+	defer cancel()
+
+	content, err := download(ctx)
+	if err != nil {
+		engineCatalogLog.Printf("Known engine import catalog unavailable: %v", err)
+		return loaded
+	}
+
+	var catalog knownEngineImportsFile
+	if err := json.Unmarshal(content, &catalog); err != nil {
+		engineCatalogLog.Printf("Known engine import catalog invalid: %v", err)
+		return loaded
+	}
+
+	for _, engine := range catalog.Engines {
+		id := strings.ToLower(strings.TrimSpace(engine.ID))
+		importPath := strings.TrimSpace(engine.Import)
+		if id == "" || importPath == "" { //nolint:tolowerequalfold
+			continue
+		}
+		loaded[id] = knownEngineImportWithCompilerRef(importPath)
+	}
+	return loaded
+}
+
+func knownEngineImportWithCompilerRef(importPath string) string {
+	if strings.Contains(importPath, "@") {
+		return importPath
+	}
+	ref := versionToGitRef(GetVersion())
+	if ref == "" {
+		return importPath
+	}
+	return importPath + "@" + ref
+}
+
 // NewEngineCatalog creates an EngineCatalog that wraps the given EngineRegistry and
-// pre-registers the built-in engine definitions (claude, codex, copilot, gemini, opencode, pi, antigravity)
+// pre-registers the built-in engine definitions (claude, codex, copilot, gemini, pi)
 // loaded from the embedded Markdown files in data/engines/*.md.
 func NewEngineCatalog(registry *EngineRegistry) *EngineCatalog {
 	catalog := &EngineCatalog{
@@ -372,6 +590,11 @@ func (c *EngineCatalog) Resolve(id string, config *EngineConfig) (*ResolvedEngin
 			enginesStr,
 			suggestions[0],
 			constants.DocsEnginesURL)
+	}
+
+	if importPath, ok := knownEngineImportFor(id); ok {
+		errMsg += fmt.Sprintf("\n\nTip: %q is a known engine with a shared definition file. Import it before using this engine:\n\nimports:\n  - %s",
+			id, importPath)
 	}
 
 	return nil, errors.New(errMsg)

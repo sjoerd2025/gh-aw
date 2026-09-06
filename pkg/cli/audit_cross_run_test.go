@@ -14,6 +14,7 @@ import (
 )
 
 func TestBuildCrossRunAuditReport_EmptyInputs(t *testing.T) {
+	t.Parallel()
 	report := buildCrossRunAuditReport([]crossRunInput{})
 
 	assert.Equal(t, 0, report.RunsAnalyzed, "Should have 0 runs analyzed")
@@ -25,6 +26,7 @@ func TestBuildCrossRunAuditReport_EmptyInputs(t *testing.T) {
 }
 
 func TestBuildCrossRunAuditReport_SingleRunWithData(t *testing.T) {
+	t.Parallel()
 	inputs := []crossRunInput{
 		{
 			RunID:        100,
@@ -68,6 +70,7 @@ func TestBuildCrossRunAuditReport_SingleRunWithData(t *testing.T) {
 }
 
 func TestBuildCrossRunAuditReport_MultipleRuns(t *testing.T) {
+	t.Parallel()
 	inputs := []crossRunInput{
 		{
 			RunID:        100,
@@ -159,6 +162,7 @@ func TestBuildCrossRunAuditReport_MultipleRuns(t *testing.T) {
 }
 
 func TestBuildCrossRunAuditReport_AllRunsWithoutData(t *testing.T) {
+	t.Parallel()
 	inputs := []crossRunInput{
 		{RunID: 100, WorkflowName: "wf", Conclusion: "success", FirewallAnalysis: nil},
 		{RunID: 200, WorkflowName: "wf", Conclusion: "failure", FirewallAnalysis: nil},
@@ -174,6 +178,7 @@ func TestBuildCrossRunAuditReport_AllRunsWithoutData(t *testing.T) {
 }
 
 func TestBuildCrossRunAuditReport_DomainInventorySorted(t *testing.T) {
+	t.Parallel()
 	inputs := []crossRunInput{
 		{
 			RunID:        100,
@@ -245,8 +250,8 @@ func TestRenderCrossRunReportJSON(t *testing.T) {
 
 	err := renderCrossRunReportJSON(report)
 
-	w.Close()
 	os.Stdout = oldStdout
+	w.Close()
 
 	require.NoError(t, err, "renderCrossRunReportJSON should not error")
 
@@ -305,8 +310,8 @@ func TestRenderCrossRunReportMarkdown(t *testing.T) {
 
 	renderCrossRunReportMarkdown(report)
 
-	w.Close()
 	os.Stdout = oldStdout
+	w.Close()
 
 	var buf bytes.Buffer
 	_, err := buf.ReadFrom(r)
@@ -345,6 +350,7 @@ func TestRenderPrettyMetricsTrend_IncludesDurationWithoutTokens(t *testing.T) {
 }
 
 func TestNewLogsCommand_HasFormatFlag(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 
 	// Check that the --format flag exists
@@ -365,6 +371,7 @@ func TestNewLogsCommand_HasFormatFlag(t *testing.T) {
 }
 
 func TestLogsCommand_FormatPrecedence(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		jsonOutput bool
@@ -432,6 +439,7 @@ func TestLogsCommand_FormatPrecedence(t *testing.T) {
 }
 
 func TestLogsCommand_RepoParsingWithHost(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		repoFlag  string
@@ -491,6 +499,7 @@ func TestLogsCommand_RepoParsingWithHost(t *testing.T) {
 }
 
 func TestBuildCrossRunAuditReport_MetricsTrend(t *testing.T) {
+	t.Parallel()
 	inputs := []crossRunInput{
 		{
 			RunID:        100,
@@ -539,6 +548,7 @@ func TestBuildCrossRunAuditReport_MetricsTrend(t *testing.T) {
 }
 
 func TestBuildCrossRunAuditReport_MCPHealth(t *testing.T) {
+	t.Parallel()
 	inputs := []crossRunInput{
 		{
 			RunID:        100,
@@ -546,8 +556,12 @@ func TestBuildCrossRunAuditReport_MCPHealth(t *testing.T) {
 			Conclusion:   "success",
 			MCPToolUsage: &MCPToolUsageData{
 				Servers: []MCPServerStats{
-					{ServerName: "github", ToolCallCount: 10, ErrorCount: 0},
-					{ServerName: "safeoutputs", ToolCallCount: 5, ErrorCount: 1},
+					{
+						MCPServerStatsBase: MCPServerStatsBase{ServerName: "github", ToolCallCount: 10, ErrorCount: 0},
+					},
+					{
+						MCPServerStatsBase: MCPServerStatsBase{ServerName: "safeoutputs", ToolCallCount: 5, ErrorCount: 1},
+					},
 				},
 			},
 		},
@@ -557,7 +571,9 @@ func TestBuildCrossRunAuditReport_MCPHealth(t *testing.T) {
 			Conclusion:   "success",
 			MCPToolUsage: &MCPToolUsageData{
 				Servers: []MCPServerStats{
-					{ServerName: "github", ToolCallCount: 8, ErrorCount: 2},
+					{
+						MCPServerStatsBase: MCPServerStatsBase{ServerName: "github", ToolCallCount: 8, ErrorCount: 2},
+					},
 				},
 			},
 		},
@@ -578,8 +594,8 @@ func TestBuildCrossRunAuditReport_MCPHealth(t *testing.T) {
 	require.NotNil(t, githubHealth, "Should find github server health")
 	assert.Equal(t, 2, githubHealth.RunsConnected, "Github should be connected in 2 runs")
 	assert.Equal(t, 2, githubHealth.TotalRuns, "Total runs should be 2")
-	assert.Equal(t, 18, githubHealth.TotalCalls, "Total calls should be 18")
-	assert.Equal(t, 2, githubHealth.TotalErrors, "Total errors should be 2")
+	assert.Equal(t, 18, githubHealth.ToolCallCount, "Total calls should be 18")
+	assert.Equal(t, 2, githubHealth.ErrorCount, "Total errors should be 2")
 	assert.InDelta(t, 2.0/18.0, githubHealth.ErrorRate, 0.001, "Error rate should be 2/18")
 	// 2/18 = ~11.1% error rate, which is > mcpErrorRateThreshold (10%), so it IS unreliable
 	assert.True(t, githubHealth.Unreliable, "Github should be unreliable (error rate 11% > mcpErrorRateThreshold)")
@@ -599,11 +615,13 @@ func TestBuildCrossRunAuditReport_MCPHealth(t *testing.T) {
 }
 
 func TestBuildMetricsTrend_Empty(t *testing.T) {
+	t.Parallel()
 	trend := buildMetricsTrend(nil)
 	assert.Equal(t, 0, trend.TotalTokens, "Empty rows should produce zero total tokens")
 }
 
 func TestBuildMetricsTrend_NoSpikes(t *testing.T) {
+	t.Parallel()
 	rows := []metricsRawRow{
 		{runID: 1, tokens: 100, turns: 3},
 		{runID: 2, tokens: 110, turns: 4},
@@ -637,13 +655,11 @@ func TestRenderCrossRunReportMarkdown_IncludesNewSections(t *testing.T) {
 		},
 		MCPHealth: []MCPServerCrossRunHealth{
 			{
-				ServerName:    "github",
-				RunsConnected: 2,
-				TotalRuns:     2,
-				TotalCalls:    20,
-				TotalErrors:   1,
-				ErrorRate:     0.05,
-				Unreliable:    false,
+				MCPServerStatsBase: MCPServerStatsBase{ServerName: "github", ToolCallCount: 20, ErrorCount: 1},
+				RunsConnected:      2,
+				TotalRuns:          2,
+				ErrorRate:          0.05,
+				Unreliable:         false,
 			},
 		},
 		ErrorTrend: ErrorTrendData{
@@ -698,8 +714,8 @@ func TestRenderCrossRunReportMarkdown_IncludesNewSections(t *testing.T) {
 
 	renderCrossRunReportMarkdown(report)
 
-	w.Close()
 	os.Stdout = oldStdout
+	w.Close()
 
 	var buf bytes.Buffer
 	_, _ = buf.ReadFrom(r)
@@ -717,6 +733,7 @@ func TestRenderCrossRunReportMarkdown_IncludesNewSections(t *testing.T) {
 }
 
 func TestBuildDrain3InsightsFromCrossRunInputs_Empty(t *testing.T) {
+	t.Parallel()
 	insights := buildDrain3InsightsFromCrossRunInputs(nil)
 	assert.Nil(t, insights, "should return nil for empty inputs")
 
@@ -725,6 +742,7 @@ func TestBuildDrain3InsightsFromCrossRunInputs_Empty(t *testing.T) {
 }
 
 func TestBuildDrain3InsightsFromCrossRunInputs_WithInputs(t *testing.T) {
+	t.Parallel()
 	inputs := []crossRunInput{
 		{
 			RunID:        1,
@@ -786,6 +804,7 @@ func TestBuildDrain3InsightsFromCrossRunInputs_WithInputs(t *testing.T) {
 }
 
 func TestBuildCrossRunAuditReport_IncludesDrain3Insights(t *testing.T) {
+	t.Parallel()
 	inputs := []crossRunInput{
 		{
 			RunID:        100,
@@ -844,8 +863,8 @@ func TestRenderCrossRunReportMarkdown_IncludesDrain3Section(t *testing.T) {
 
 	renderCrossRunReportMarkdown(report)
 
-	w.Close()
 	os.Stdout = oldStdout
+	w.Close()
 
 	var buf bytes.Buffer
 	_, _ = buf.ReadFrom(r)
@@ -856,4 +875,33 @@ func TestRenderCrossRunReportMarkdown_IncludesDrain3Section(t *testing.T) {
 	assert.Contains(t, output, "2 anomalous event pattern(s) detected", "Should include second insight title")
 	assert.Contains(t, output, "plan=1 finish=1", "Should include evidence")
 	assert.Contains(t, output, "🔴", "Should include high severity icon")
+}
+
+func TestMCPServerCrossRunHealthJSONSchema(t *testing.T) {
+	t.Parallel()
+	health := MCPServerCrossRunHealth{
+		MCPServerStatsBase: MCPServerStatsBase{ServerName: "github", ToolCallCount: 18, ErrorCount: 2},
+		RunsConnected:      2,
+		TotalRuns:          3,
+		ErrorRate:          0.5,
+		Unreliable:         true,
+	}
+
+	data, err := json.Marshal(health)
+	require.NoError(t, err, "Marshalling cross-run health should succeed")
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(data, &decoded), "Result should be valid JSON")
+
+	assert.Equal(t, "github", decoded["server_name"], "server_name key should be preserved")
+	assert.InDelta(t, 18, decoded["total_calls"], 0.001, "total_calls key should be preserved")
+	assert.InDelta(t, 2, decoded["total_errors"], 0.001, "total_errors key should be preserved")
+	assert.InDelta(t, 2, decoded["runs_connected"], 0.001, "runs_connected key should be preserved")
+	assert.InDelta(t, 3, decoded["total_runs"], 0.001, "total_runs key should be preserved")
+	assert.InDelta(t, 0.5, decoded["error_rate"], 0.001, "error_rate key should be preserved")
+	assert.Equal(t, true, decoded["unreliable"], "unreliable key should be preserved")
+
+	var roundTripped MCPServerCrossRunHealth
+	require.NoError(t, json.Unmarshal(data, &roundTripped), "Unmarshalling should succeed")
+	assert.Equal(t, health, roundTripped, "Round-tripped value should equal the original")
 }

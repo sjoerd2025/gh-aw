@@ -18,10 +18,11 @@ func TestBuiltinModelAliases(t *testing.T) {
 	expectedFamilies := []string{
 		"sonnet", "sonnet-6x", "haiku", "opus", "opusplan",
 		"gpt-5", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5.1", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "mai-code", "mai-code-1-flash-picker", "reasoning",
-		"gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-3-pro", "gemini-3-flash", "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.5-flash", "gemini-3.6-flash", "antigravity", "lyria", "computer-use", "robotics", "deep-research",
+		"gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-3-pro", "gemini-3-flash", "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash", "antigravity", "lyria", "computer-use", "robotics", "deep-research",
 		"nano-banana",
 		"vision", "image-generation",
-		"mini", "large", "auto", "any", "agent", "small-agent", "copilot", "claude", "codex", "gemini", "summarization",
+		"grok",
+		"mini", "large", "auto", "any", "agent", "small-agent", "copilot", "claude", "codex", "gemini", "summarization", "detection", "evals",
 	}
 	for _, family := range expectedFamilies {
 		patterns, ok := aliases[family]
@@ -32,7 +33,7 @@ func TestBuiltinModelAliases(t *testing.T) {
 
 	// Vendor aliases should include at least one copilot/* pattern.
 	// Meta-aliases (mini, large, auto) reference other alias names and are excluded here.
-	vendorFamilies := []string{"sonnet", "sonnet-6x", "haiku", "opus", "gpt-5", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "mai-code", "mai-code-1-flash-picker", "reasoning", "gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-3-pro", "gemini-3-flash", "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.5-flash", "gemini-3.6-flash", "antigravity", "lyria", "nano-banana", "computer-use", "robotics", "deep-research", "raptor-mini"}
+	vendorFamilies := []string{"sonnet", "sonnet-6x", "haiku", "opus", "gpt-5", "gpt-5.5", "gpt-5.4", "gpt-5.3", "gpt-5.2", "gpt-5-mini", "gpt-5-nano", "gpt-5-codex", "gpt-5-pro", "mai-code", "mai-code-1-flash-picker", "reasoning", "gemini-flash", "gemini-flash-lite", "gemini-pro", "gemini-3-pro", "gemini-3-flash", "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash", "antigravity", "lyria", "nano-banana", "computer-use", "robotics", "deep-research", "raptor-mini", "grok"}
 	for _, family := range vendorFamilies {
 		patterns := aliases[family]
 		hasCopilot := false
@@ -59,6 +60,7 @@ func TestBuiltinModelAliases(t *testing.T) {
 	assert.Equal(t, []string{"copilot/gpt-5.1*", "openai/gpt-5.1*"}, aliases["gpt-5.1"], "gpt-5.1 should map to copilot/openai gpt-5.1 family")
 	assert.Equal(t, []string{"copilot/gemini-3.5*flash*", "google/gemini-3.5*flash*", "gemini/gemini-3.5*flash*"}, aliases["gemini-3.5-flash"], "gemini-3.5-flash should map to provider-specific Gemini 3.5 Flash patterns")
 	assert.Equal(t, []string{"copilot/gemini-3.6*flash*", "google/gemini-3.6*flash*", "gemini/gemini-3.6*flash*"}, aliases["gemini-3.6-flash"], "gemini-3.6-flash should map to provider-specific Gemini 3.6 Flash patterns")
+	assert.Equal(t, []string{"copilot/gemini-3.7*flash*", "google/gemini-3.7*flash*", "gemini/gemini-3.7*flash*"}, aliases["gemini-3.7-flash"], "gemini-3.7-flash should map to provider-specific Gemini 3.7 Flash patterns")
 	assert.Contains(t, aliases["antigravity"], "copilot/antigravity*", "antigravity should include copilot/ provider pattern")
 	assert.Equal(t, []string{"google/lyria*", "gemini/lyria*", "copilot/lyria*"}, aliases["lyria"], "lyria should map to provider-specific Lyria patterns")
 	assert.Equal(t, []string{"copilot/nano-banana*", "google/nano-banana*", "gemini/nano-banana*"}, aliases["nano-banana"], "nano-banana should map to provider-specific patterns")
@@ -72,6 +74,7 @@ func TestBuiltinModelAliases(t *testing.T) {
 	assert.Contains(t, aliases["image-generation"], "copilot/gpt-image*", "image-generation should include copilot gpt-image patterns")
 	assert.Contains(t, aliases["image-generation"], "openai/gpt-image*", "image-generation should include openai gpt-image patterns")
 	assert.Contains(t, aliases["image-generation"], "google/imagen*", "image-generation should include google imagen patterns")
+	assert.Equal(t, []string{"copilot/*grok*", "openai/*grok*"}, aliases["grok"], "grok should map to copilot and openai grok patterns")
 
 	// Meta-aliases reference other alias names (resolved recursively by AWF).
 	assert.Equal(t, []string{"haiku", "gpt-5-mini", "gpt-5-nano", "gemini-flash-lite"}, aliases["mini"], "mini should reference haiku, gpt-5-mini, gpt-5-nano, and gemini-flash-lite")
@@ -84,6 +87,8 @@ func TestBuiltinModelAliases(t *testing.T) {
 	assert.Equal(t, []string{"copilot/*", "anthropic/*", "openai/*", "google/*", "gemini/*"}, aliases["any"], "any should provide a provider-wide catch-all fallback chain")
 	assert.Equal(t, []string{"sonnet-6x", "gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-5.3", "gemini-pro", "any"}, aliases["agent"], "agent should default to the configured high-capability fallback chain before any-model fallback")
 	assert.Equal(t, []string{"haiku", "gpt-5-mini", "gemini-flash"}, aliases["small-agent"], "small-agent should default to the small/fast model fallback chain")
+	assert.Equal(t, []string{"small"}, aliases["detection"], "detection should resolve through small-sized models")
+	assert.Equal(t, []string{"small"}, aliases["evals"], "evals should resolve through small-sized models")
 	assert.Equal(t, []string{"agent"}, aliases["copilot"], "copilot should define per-engine default fallback chain")
 	assert.Equal(t, []string{"agent"}, aliases["claude"], "claude should define per-engine default fallback chain")
 	assert.Equal(t, []string{"agent"}, aliases["codex"], "codex should define per-engine default fallback chain")

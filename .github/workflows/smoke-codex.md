@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test workflow that validates Codex engine functionality by reviewing recent PRs twice daily
 on:
+  schedule: every 2 days
   restore-memory: true
   slash_command:
     name: smoke-codex
@@ -21,11 +22,13 @@ on:
   reaction: "hooray"
   status-comment: true
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
 name: Smoke Codex
 engine: codex
+model: copilot/gpt-5.3-codex
 imports:
   - shared/gh.md
   - shared/reporting-otlp.md
@@ -33,6 +36,8 @@ imports:
   - shared/trufflehog.md
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/smoke-test-brevity.md
+  - shared/playwright-title-test.md
 network:
   allowed:
     - defaults
@@ -45,7 +50,6 @@ tools:
   github:
     mode: gh-proxy
   playwright:
-    mode: cli
   edit:
   bash:
     - "*"
@@ -81,6 +85,7 @@ safe-outputs:
       run-failure: "🌑 The shadows whisper... [{workflow_name}]({run_url}) {status}. The oracle requires further meditation..."
     actions:
       add-smoked-label:
+        # zizmor: ignore[github_action_from_unverified_creator_used]
         uses: actions-ecosystem/action-add-labels@v1.1.3
         description: Add the 'smoked' label to the current pull request
         env:
@@ -91,15 +96,12 @@ checkout:
     current: true
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Codex Engine Validation
-
-**CRITICAL EFFICIENCY REQUIREMENTS:**
-- Keep ALL outputs extremely short and concise. Use single-line responses.
-- NO verbose explanations or unnecessary context.
-- Minimize file reading - only read what is absolutely necessary for the task.
-- Use targeted, specific queries - avoid broad searches or large data retrievals.
 
 ## Test Requirements
 
@@ -107,7 +109,7 @@ features:
 2. **Serena MCP Testing**: 
    - Use the Serena MCP server tool `activate_project` to initialize the workspace at `${{ github.workspace }}` and verify it succeeds (do NOT use bash to run go commands)
    - After initialization, use the `find_symbol` tool to search for symbols and verify that at least 3 symbols are found in the results
-3. **Playwright Testing**: Use playwright-cli to navigate to https://github.com and verify the page title contains "GitHub": run `playwright-cli browser_navigate --url https://github.com` then `playwright-cli browser_snapshot` in bash
+3. **Playwright CLI Testing**: Run `playwright-cli open https://github.com`, then run `playwright-cli snapshot` and verify the page title contains "GitHub".
 4. **Web Fetch Testing**: Use the web-fetch MCP tool to fetch https://github.com and verify the response contains "GitHub" (do NOT use bash or playwright for this test - use the web-fetch MCP tool directly)
 5. **File Writing Testing**: Create a test file `/tmp/gh-aw/agent/smoke-test-codex-${{ github.run_id }}.txt` with content "Smoke test passed for Codex at $(date)" (create the directory if it doesn't exist)
 6. **Bash Tool Testing**: Execute bash commands to verify file creation was successful (use `cat` to read the file back)

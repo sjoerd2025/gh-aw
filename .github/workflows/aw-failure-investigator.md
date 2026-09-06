@@ -1,9 +1,10 @@
 ---
 emoji: "🔍"
-description: Investigates [aw] failures from the last 6 hours, correlates with open agentic-workflows issues, closes fixed issues, and opens focused fix sub-issues when needed
+description: Investigates [aw] failures from the last 6 hours, correlates with open agentic-workflows issues, closes consolidated failures as duplicates, and opens focused fix sub-issues when needed
 on:
   schedule:
-    - cron: "every 6h"
+    - cron: "every 30m"
+  cooldown: 6h
   workflow_dispatch:
 max-daily-ai-credits: 10000
 permissions:
@@ -31,11 +32,11 @@ experiments:
     issue: 36105
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [actions, issues, pull_requests]
   bash: ["*"]
 cache:
@@ -49,6 +50,12 @@ safe-outputs:
     labels: [agentic-workflows, automation, cookie]
     max: 2
     group: true
+  close-issue:
+    target: "*"
+    required-labels: [agentic-workflows]
+    required-title-prefix: "[aw]"
+    state-reason: duplicate
+    max: 100
   update-issue:
     target: "*"
     max: 10
@@ -64,259 +71,289 @@ imports:
 
   - shared/otlp.md
   - shared/default-ai-credits-pricing.md
+  - shared/graders.md
 steps:
   - name: Deterministic pre-fetch for failure analysis
+    uses: actions/github-script@v9.0.0
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    run: |
-      set -euo pipefail
-      mkdir -p /tmp/gh-aw/agent/failure-investigator
-      python3 - <<'PY'
-      import json
-      import os
-      import subprocess
-      from datetime import datetime, timedelta, timezone
-      from pathlib import Path
-      from urllib.parse import urlencode
-      
-      REPO = os.environ["GITHUB_REPOSITORY"]
-      OUT = "/tmp/gh-aw/agent/failure-investigator/prefetch.json"
-      TRACKER_ID = "aw-failure-investigator"
-      LOOKBACK_HOURS = 6
-      FAILURE_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "cancelled"}
-      MAX_DISCOVERY_PAGES = 20
-      # Most dominant signatures appear in the final 30-60 lines.
-      MAX_LOG_TAIL_LINES = 50
-      # Deep-dive budget: investigate at most this many distinct failed runs.
-      MAX_FAILURES_TO_DETAIL = 5
-      AGENTIC_WORKFLOW_PATHS = {
-          f".github/workflows/{path.name}"
-          for path in Path(".github/workflows").glob("*.lock.yml")
-      }
-      
-      def cmd_display(args):
-          return " ".join(args)
-      
-      def run_json(args):
-          try:
-              out = subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
-              return json.loads(out)
-          except subprocess.CalledProcessError as error:
-              print(f"Warning: command failed: {cmd_display(args)}")
-              print(error.output)
-              return None
-          except json.JSONDecodeError as error:
-              print(f"Warning: non-JSON output from command: {cmd_display(args)} ({error})")
-              return None
-          except OSError as error:
-              print(f"Warning: could not execute command: {cmd_display(args)} ({error})")
-              return None
-      
-      def run_text(args):
-          try:
-              return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
-          except subprocess.CalledProcessError as error:
-              print(f"Warning: command failed: {cmd_display(args)}")
-              print(error.output)
-              return ""
-          except OSError as error:
-              print(f"Warning: could not execute command: {cmd_display(args)} ({error})")
-              return ""
-      
-      def run_api_json(endpoint, params):
-          query = urlencode(params)
-          return run_json(["gh", "api", f"{endpoint}?{query}"])
-      
-      def is_failure_conclusion(conclusion):
-          return (conclusion or "").lower() in FAILURE_CONCLUSIONS
-      
-      def normalize_workflow_path(path):
-          return (path or "").split("@", 1)[0]
-      
-      def is_agentic_workflow_path(path):
-          workflow_path = normalize_workflow_path(path)
-          if AGENTIC_WORKFLOW_PATHS:
-              return workflow_path in AGENTIC_WORKFLOW_PATHS
-          print("Warning: no local .lock.yml workflows found; falling back to workflow path suffix matching")
-          return workflow_path.endswith(".lock.yml")
-      
-      def isoformat_z(dt):
-          return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-      
-      def list_failed_agentic_runs():
-          created_since = isoformat_z(datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS))
-          page = 1
-          failed_runs = []
-      
-          while True:
-              response = run_api_json(
-                  f"repos/{REPO}/actions/runs",
-                  {
-                      "exclude_pull_requests": "true",
-                      "status": "completed",
-                      "created": f">={created_since}",
-                      "per_page": "100",
-                      "page": str(page),
-                  },
-              ) or {}
-              workflow_runs = response.get("workflow_runs") or []
-              if not workflow_runs:
-                  break
-      
-              for run in workflow_runs:
-                  workflow_path = normalize_workflow_path(run.get("path"))
-                  if not is_agentic_workflow_path(workflow_path):
-                      continue
-                  if not is_failure_conclusion(run.get("conclusion")):
-                      continue
-      
-                  failed_runs.append(
-                      {
-                          "run_id": run.get("id"),
-                          "workflow_name": run.get("name"),
-                          "workflow_path": workflow_path,
-                          "created_at": run.get("created_at"),
-                          "status": run.get("status"),
-                          "conclusion": run.get("conclusion"),
-                          "url": run.get("html_url"),
-                      }
-                  )
-      
-              if len(workflow_runs) < 100:
-                  break
-              if page >= MAX_DISCOVERY_PAGES:
-                  print(f"Warning: reached pagination cap ({MAX_DISCOVERY_PAGES} pages) while listing workflow runs")
-                  break
-              page += 1
-      
-          failed_runs.sort(key=lambda run: run.get("created_at") or "", reverse=True)
-          return failed_runs
-      
-      failed_runs = list_failed_agentic_runs()
-      
-      # Cap the number of runs to detail so the payload stays compact.
-      failure_details = []
-      for run in failed_runs[:MAX_FAILURES_TO_DETAIL]:
-          run_id = run.get("run_id")
-          if not run_id:
-              continue
-      
-          run_view = run_json(
-              [
-                  "gh",
-                  "run",
-                  "view",
-                  str(run_id),
-                  "--repo",
-                  REPO,
-                  "--json",
-                  "databaseId,url,name,workflowName,createdAt,conclusion,status,jobs",
-              ]
-          )
-          if not run_view:
-              continue
-      
-          failed_job_names = []
-          failed_steps = []
-          truncated_error_logs = []
-          agent_job_conclusion = None
-          for job in run_view.get("jobs", []):
-              job_name = job.get("name")
-              job_conclusion = (job.get("conclusion") or "").lower()
-              if (job_name or "").lower() == "agent":
-                  agent_job_conclusion = job_conclusion or None
-      
-              if is_failure_conclusion(job_conclusion):
-                  if job_name:
-                      failed_job_names.append(job_name)
-                  for step in job.get("steps", []):
-                      if is_failure_conclusion(step.get("conclusion")):
-                          failed_steps.append(
-                              {
-                                  "job_id": job.get("databaseId"),
-                                  "job_name": job_name,
-                                  "step_name": step.get("name"),
-                              }
-                          )
-      
-                  job_id = job.get("databaseId")
-                  if job_id:
-                      log_text = run_text(
-                          [
-                              "gh",
-                              "run",
-                              "view",
-                              str(run_id),
-                              "--repo",
-                              REPO,
-                              "--job",
-                              str(job_id),
-                              "--log-failed",
-                          ]
-                      )
-                      if log_text:
-                          tail_lines = log_text.splitlines()[-MAX_LOG_TAIL_LINES:]
-                          truncated_error_logs.append(
-                              {
-                                  "job_id": job_id,
-                                  "job_name": job_name,
-                                  "line_count": len(tail_lines),
-                                  "tail_lines": "\n".join(tail_lines),
-                              }
-                          )
-      
-          failure_details.append(
-              {
-                  "run_id": run_id,
-                  "workflow_name": run_view.get("workflowName") or run_view.get("name"),
-                  "workflow_path": run.get("workflow_path"),
-                  "url": run_view.get("url"),
-                  "created_at": run_view.get("createdAt"),
-                  "status": run_view.get("status"),
-                  "conclusion": run_view.get("conclusion"),
-                  "failed_job_names": sorted(set(failed_job_names)),
-                  "agent_job_conclusion": agent_job_conclusion,
-                  "failed_steps": failed_steps,
-                  "truncated_error_logs": truncated_error_logs,
+    with:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+      script: |
+        const fs = require('fs');
+        const path = require('path');
+        const { execFileSync } = require('child_process');
+
+        const REPO = process.env.GITHUB_REPOSITORY;
+        const OUT = '/tmp/gh-aw/agent/failure-investigator/prefetch.json';
+        const TRACKER_ID = 'aw-failure-investigator';
+        const LOOKBACK_HOURS = 6;
+        const FAILURE_CONCLUSIONS = new Set(['failure', 'timed_out', 'startup_failure']);
+        const MAX_DISCOVERY_PAGES = 20;
+        const MAX_LOG_TAIL_LINES = 50;
+        const FAULT_MARKER = /\b(?:error|panic|exception|traceback|fatal|abort|segfault|coredump)\b|(?:process|command).*(?:failed|exit code)|(?:exit code|non-zero exit)/i;
+        const MAX_FAILURES_TO_DETAIL = 5;
+        const workflowsDir = '.github/workflows';
+        const AGENTIC_WORKFLOW_PATHS = fs.existsSync(workflowsDir)
+          ? new Set(
+              fs
+                .readdirSync(workflowsDir)
+                .filter((name) => name.endsWith('.lock.yml'))
+                .map((name) => `.github/workflows/${name}`),
+            )
+          : new Set();
+
+        function cmdDisplay(args) {
+          return ['gh', ...args].join(' ');
+        }
+
+        function commandOutput(error) {
+          const stdout = Buffer.isBuffer(error?.stdout) ? error.stdout.toString('utf8') : error?.stdout || '';
+          const stderr = Buffer.isBuffer(error?.stderr) ? error.stderr.toString('utf8') : error?.stderr || '';
+          return `${stdout}${stderr}`.trim();
+        }
+
+        function runJson(args) {
+          let out;
+          try {
+            out = execFileSync('gh', args, { encoding: 'utf8' });
+          } catch (error) {
+            core.warning(`Command failed: ${cmdDisplay(args)}`);
+            const output = commandOutput(error);
+            if (output) core.warning(output);
+            return null;
+          }
+          try {
+            return JSON.parse(out);
+          } catch (error) {
+            core.warning(`Non-JSON output from command: ${cmdDisplay(args)} (${error.message})`);
+            return null;
+          }
+        }
+
+        function runText(args) {
+          try {
+            return execFileSync('gh', args, { encoding: 'utf8' });
+          } catch (error) {
+            core.warning(`Command failed: ${cmdDisplay(args)}`);
+            const output = commandOutput(error);
+            if (output) core.warning(output);
+            return '';
+          }
+        }
+
+        function runApiJson(endpoint, params) {
+          const query = new URLSearchParams(params).toString();
+          return runJson(['api', `${endpoint}?${query}`]);
+        }
+
+        function isFailureConclusion(conclusion) {
+          return FAILURE_CONCLUSIONS.has(String(conclusion || '').toLowerCase());
+        }
+
+        function normalizeWorkflowPath(workflowPath) {
+          return String(workflowPath || '').split('@', 1)[0];
+        }
+
+        function isAgenticWorkflowPath(workflowPath) {
+          const normalizedPath = normalizeWorkflowPath(workflowPath);
+          if (AGENTIC_WORKFLOW_PATHS.size > 0) {
+            return AGENTIC_WORKFLOW_PATHS.has(normalizedPath);
+          }
+          core.warning('No local .lock.yml workflows found; falling back to workflow path suffix matching');
+          return normalizedPath.endsWith('.lock.yml');
+        }
+
+        function captureErrorWindow(logText) {
+          const lines = logText.split(/\r?\n/);
+          let markerIndex = null;
+          for (let index = lines.length - 1; index >= 0; index -= 1) {
+            if (FAULT_MARKER.test(lines[index])) {
+              markerIndex = index;
+              break;
+            }
+          }
+
+          let capturedLines;
+          if (markerIndex === null) {
+            capturedLines = lines.slice(-MAX_LOG_TAIL_LINES);
+          } else {
+            const start = Math.max(0, Math.min(markerIndex - Math.floor(MAX_LOG_TAIL_LINES / 2), lines.length - MAX_LOG_TAIL_LINES));
+            const end = Math.min(lines.length, start + MAX_LOG_TAIL_LINES);
+            capturedLines = lines.slice(start, end);
+          }
+
+          const hasFaultMarker = capturedLines.some((line) => FAULT_MARKER.test(line));
+          return { capturedLines, hasFaultMarker };
+        }
+
+        function isoformatZ(date) {
+          return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+        }
+
+        function listFailedAgenticRuns() {
+          const createdSince = isoformatZ(new Date(Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000));
+          let page = 1;
+          const failedRuns = [];
+
+          while (true) {
+            const response =
+              runApiJson(`repos/${REPO}/actions/runs`, {
+                exclude_pull_requests: 'true',
+                status: 'completed',
+                created: `>=${createdSince}`,
+                per_page: '100',
+                page: String(page),
+              }) || {};
+            const workflowRuns = response.workflow_runs || [];
+            if (workflowRuns.length === 0) {
+              break;
+            }
+
+            for (const run of workflowRuns) {
+              const workflowPath = normalizeWorkflowPath(run.path);
+              if (!isAgenticWorkflowPath(workflowPath)) continue;
+              if (!isFailureConclusion(run.conclusion)) continue;
+
+              failedRuns.push({
+                run_id: run.id,
+                workflow_name: run.name,
+                workflow_path: workflowPath,
+                created_at: run.created_at,
+                status: run.status,
+                conclusion: run.conclusion,
+                url: run.html_url,
+              });
+            }
+
+            if (workflowRuns.length < 100) break;
+            if (page >= MAX_DISCOVERY_PAGES) {
+              core.warning(`Reached pagination cap (${MAX_DISCOVERY_PAGES} pages) while listing workflow runs`);
+              break;
+            }
+            page += 1;
+          }
+
+          failedRuns.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+          return failedRuns;
+        }
+
+        const failedRuns = listFailedAgenticRuns();
+
+        const failureDetails = [];
+        for (const run of failedRuns.slice(0, MAX_FAILURES_TO_DETAIL)) {
+          const runId = run.run_id;
+          if (!runId) continue;
+
+          const runView = runJson([
+            'run',
+            'view',
+            String(runId),
+            '--repo',
+            REPO,
+            '--json',
+            'databaseId,url,name,workflowName,createdAt,conclusion,status,jobs',
+          ]);
+          if (!runView) continue;
+
+          const failedJobNames = [];
+          const failedSteps = [];
+          const truncatedErrorLogs = [];
+          let agentJobConclusion = null;
+
+          for (const job of runView.jobs || []) {
+            const jobName = job.name;
+            const jobConclusion = String(job.conclusion || '').toLowerCase();
+            if (String(jobName || '').toLowerCase() === 'agent') {
+              agentJobConclusion = jobConclusion || null;
+            }
+
+            if (isFailureConclusion(jobConclusion)) {
+              if (jobName) failedJobNames.push(jobName);
+
+              for (const step of job.steps || []) {
+                if (isFailureConclusion(step.conclusion)) {
+                  failedSteps.push({
+                    job_id: job.databaseId,
+                    job_name: jobName,
+                    step_name: step.name,
+                  });
+                }
               }
-          )
-      
-      existing_tracking_issues = run_json(
-          [
-              "gh",
-              "issue",
-              "list",
-              "--repo",
-              REPO,
-              "--state",
-              "open",
-              "--search",
-              f"gh-aw-tracker-id: {TRACKER_ID}",
-              "--limit",
-              "100",
-              "--json",
-              "number,title,state,url,labels,createdAt,updatedAt",
-          ]
-      ) or []
-      
-      payload = {
-          "generated_at": datetime.now(timezone.utc).isoformat(),
-          "repository": REPO,
-          "lookback_window": f"{LOOKBACK_HOURS}h",
-          "failed_run_ids": [run.get("run_id") for run in failed_runs if run.get("run_id")],
-          "failures": failure_details,
-          "existing_tracking_issues": existing_tracking_issues,
-      }
-      
-      with open(OUT, "w", encoding="utf-8") as f:
-          json.dump(payload, f, indent=2)
-          f.write("\n")
-      
-      print(f"Wrote deterministic prefetch payload to {OUT}")
-      print(f"Failed runs in payload: {len(payload['failed_run_ids'])}")
-      print(f"Existing tracking issues in payload: {len(existing_tracking_issues)}")
-      PY
+
+              const jobId = job.databaseId;
+              if (jobId) {
+                const logText = runText([
+                  'run',
+                  'view',
+                  String(runId),
+                  '--repo',
+                  REPO,
+                  '--job',
+                  String(jobId),
+                  '--log',
+                ]);
+                if (logText) {
+                  const { capturedLines, hasFaultMarker } = captureErrorWindow(logText);
+                  truncatedErrorLogs.push({
+                    job_id: jobId,
+                    job_name: jobName,
+                    line_count: capturedLines.length,
+                    tail_lines: capturedLines.join('\n'),
+                    capture_likely_missed_fault: !hasFaultMarker,
+                  });
+                }
+              }
+            }
+          }
+
+          failureDetails.push({
+            run_id: runId,
+            workflow_name: runView.workflowName || runView.name,
+            workflow_path: run.workflow_path,
+            url: runView.url,
+            created_at: runView.createdAt,
+            status: runView.status,
+            conclusion: runView.conclusion,
+            failed_job_names: [...new Set(failedJobNames)].sort(),
+            agent_job_conclusion: agentJobConclusion,
+            failed_steps: failedSteps,
+            truncated_error_logs: truncatedErrorLogs,
+          });
+        }
+
+        const existingTrackingIssues =
+          runJson([
+            'issue',
+            'list',
+            '--repo',
+            REPO,
+            '--state',
+            'open',
+            '--search',
+            `gh-aw-tracker-id: ${TRACKER_ID}`,
+            '--limit',
+            '100',
+            '--json',
+            'number,title,state,url,labels,createdAt,updatedAt',
+          ]) || [];
+
+        const payload = {
+          generated_at: new Date().toISOString(),
+          repository: REPO,
+          lookback_window: `${LOOKBACK_HOURS}h`,
+          failed_run_ids: failedRuns.map((run) => run.run_id).filter(Boolean),
+          failures: failureDetails,
+          existing_tracking_issues: existingTrackingIssues,
+        };
+
+        fs.mkdirSync(path.dirname(OUT), { recursive: true });
+        fs.writeFileSync(OUT, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+
+        core.info(`Wrote deterministic prefetch payload to ${OUT}`);
+        core.info(`Failed runs in payload: ${payload.failed_run_ids.length}`);
+        core.info(`Existing tracking issues in payload: ${existingTrackingIssues.length}`);
 features:
   gh-aw-detection: true
 evals:
@@ -324,6 +361,9 @@ evals:
     question: Did the agent investigate agentic workflow failures from the last 6 hours and produce findings?
   - id: issues_created_or_closed
     question: Were fix sub-issues created for unresolved failures, or were resolved tracking issues closed?
+  - id: consolidated_failures_closed
+    question: When failures were consolidated into or matched against an existing issue, were all corresponding source failure issues closed as duplicates with comments referencing that issue?
+
 ---
 
 # [aw] Failure Investigator (6h)
@@ -342,7 +382,7 @@ Investigate agentic workflow failures from the last 6 hours and produce actionab
 1. Find recent failures from agentic workflows in the last 6 hours.
 2. Correlate findings with currently open `agentic-workflows` issues.
 3. Perform large-scale failure analysis using logs + audit + audit-diff.
-4. Close fixed/stale issues first, then create only the minimum necessary linked fix sub-issues.
+4. When repeated failures are already tracked by an open `agentic-workflows` issue, do not open a new issue for them — close the new duplicate source failure issues and associate them with the existing issue. Close fixed/stale issues first, then create only the minimum necessary linked fix sub-issues for genuinely uncovered failures, and close every source failure issue represented by a consolidated issue.
 
 ## Required Investigation Steps
 
@@ -356,7 +396,7 @@ Definitions for step 0 clustering:
 - comparator run ID: nearest successful run of the same workflow when available, otherwise nearest prior failed run
 Only call additional logs/list APIs when a required field is missing or stale.
 
-**Early exit**: If `failed_run_ids` is empty, or every failure signature is already covered by an open issue in `existing_tracking_issues`, call `noop` immediately with a brief explanation and stop.
+**Early exit**: If `failed_run_ids` is empty, call `noop` immediately with a brief explanation and stop. If every failure signature is already covered by an open issue in `existing_tracking_issues`, skip steps 1-3 (no new classification or analysis needed) and go straight to step 4 to close every covered source failure issue as a duplicate of its existing tracking issue.
 
 ### 1) Classify failures and correlate with existing issues
 
@@ -368,7 +408,7 @@ It returns which clusters are already tracked (matched) and which are new gaps.
 
 Keep the combined cluster + tracking mapping in context for steps 2-4.
 
-**Early exit**: If all untracked clusters from `issue-matcher` are P2 severity (no P0 or P1 gaps), call `noop` with a brief explanation and stop.
+**Early exit**: If all untracked clusters from `issue-matcher` are P2 severity (no P0 or P1 gaps), skip steps 2-3 (no deepened evidence or audit-diff needed) but still continue to step 4: matched clusters still need their represented source failure issues closed as duplicates, and any P2 gaps still need to be reflected in the existing coverage. Only call `noop` at this point if there are also no `matched` clusters with open source failure issues to close.
 
 ### 2) Deepen evidence for untracked clusters
 
@@ -382,9 +422,14 @@ Use `agentic-workflows` MCP `audit-diff` to compare **the single highest-severit
 
 Identify regressions and deltas (metrics/tooling/firewall/MCP behavior) that support fix recommendations.
 
-### 4) Close fixed issues first, then add focused sub-issues
+### 4) Close fixed issues, add focused sub-issues, then close consolidated failures
 
 First, identify currently open `agentic-workflows` issues that are now fixed, stale, or no longer actionable based on fresh evidence, and close them using `update-issue`.
+
+Before closing a tool-denial-limit issue (for example, exceeded denial/guardrail failures), verify there is at least one
+linked commit after the issue was opened that touches the affected workflow `.md` or `.lock.yml` path. If no such commit
+exists, do **not** close the issue as completed; keep it open and add/update a tracking comment with the missing workflow
+fix evidence.
 
 Then, if new uncovered work remains, add **sub-issues** for concrete fixes to the **most recent open parent report issue** instead of creating a new parent by default.
 
@@ -396,6 +441,15 @@ Each new sub-issue must include:
 - probable root cause
 - specific proposed remediation
 - success criteria / verification
+
+For every cluster the `issue-matcher` agent already matched to an existing open `agentic-workflows` issue, and for any consolidated parent report or fix issue selected or filed above, identify every open source failure issue represented by that existing or consolidated issue. Source failure issues are the automated `[aw]` issues for the included workflow failures, such as issues reporting that a workflow failed or produced an incomplete result.
+
+Close **every** represented source failure issue with `close_issue`:
+- set `issue_number` to the source failure issue
+- set `duplicate_of` to the existing or consolidated issue number
+- set `body` to `Consolidated into #<existing or consolidated issue number>.`
+
+The configured close reason marks these issues as duplicates. Use the actual issue number in both `duplicate_of` and the comment. Do not close the existing/consolidated issue itself, its remediation sub-issues, or source failure issues that were not included in it.
 
 ## Tone Variant Instructions
 
@@ -420,7 +474,7 @@ For sub-issues, prioritize high-quality actionable items, avoid duplicates unles
 description: Groups pre-fetched failure runs into severity-ranked clusters by error signature and workflow
 model: small
 ---
-You receive a JSON array of `failures` from the pre-fetch payload. Each entry has `run_id`, `workflow_name`, `workflow_path`, `conclusion`, `failed_job_names`, `failed_steps`, and `truncated_error_logs`.
+You receive a JSON array of `failures` from the pre-fetch payload. Each entry has `run_id`, `workflow_name`, `workflow_path`, `conclusion`, `failed_job_names`, `failed_steps`, and `truncated_error_logs`. Treat a `truncated_error_logs` entry with `capture_likely_missed_fault: true` as insufficient evidence, never as a failure signature.
 
 Group failures into clusters:
 1. Cluster by dominant error signature extracted from `truncated_error_logs[].tail_lines`; group failures from the same workflow with matching signatures together.
@@ -455,8 +509,8 @@ description: Extracts per-cluster audit evidence including dominant errors, tool
 model: small
 ---
 Given failure clusters with their `truncated_error_logs` from the prefetch payload:
-1. If a cluster has ≥10 lines of pre-fetched error logs, extract evidence directly from those logs — do **not** call `audit`.
-2. Only call `agentic-workflows` MCP `audit` when pre-fetched logs are missing or fewer than 5 lines. Cap total `audit` calls at **2** across all clusters.
+1. If a cluster has ≥10 lines of pre-fetched error logs and none has `capture_likely_missed_fault: true`, extract evidence directly from those logs — do **not** call `audit`.
+2. Only call `agentic-workflows` MCP `audit` when pre-fetched logs are missing, fewer than 5 lines, or `capture_likely_missed_fault: true`. Cap total `audit` calls at **2** across all clusters.
 3. When calling `audit`, request only `artifacts: ["usage", "agent"]` to limit download size.
 
 Extract dominant error, tool-failure pattern, anomalies, and failure class.

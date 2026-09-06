@@ -1,6 +1,11 @@
 package workflow
 
-import "github.com/github/gh-aw/pkg/logger"
+import (
+	"fmt"
+	"strings"
+
+	"github.com/github/gh-aw/pkg/logger"
+)
 
 var frontmatterExtractionSecurityLog = logger.New("workflow:frontmatter_extraction_security")
 
@@ -69,7 +74,7 @@ func (c *Compiler) extractNetworkPermissions(frontmatter map[string]any) *Networ
 }
 
 // extractSandboxConfig extracts sandbox configuration from front matter
-func (c *Compiler) extractSandboxConfig(frontmatter map[string]any) *SandboxConfig {
+func (c *Compiler) extractSandboxConfig(frontmatter map[string]any) *SandboxConfig { //nolint:largefunc // Existing parser handles legacy and current sandbox shapes in one place.
 	frontmatterExtractionSecurityLog.Print("Extracting sandbox configuration from frontmatter")
 
 	sandbox, exists := frontmatter["sandbox"]
@@ -121,9 +126,9 @@ func (c *Compiler) extractSandboxConfig(frontmatter map[string]any) *SandboxConf
 		config.MCP = c.extractMCPGatewayConfig(mcpVal)
 	}
 
-	// If we found agent field, return the new format config
-	if config.Agent != nil {
-		frontmatterExtractionSecurityLog.Print("Sandbox configured with new format (agent)")
+	// Agent and MCP select the new sandbox format.
+	if config.Agent != nil || config.MCP != nil {
+		frontmatterExtractionSecurityLog.Print("Sandbox configured with new format")
 		return config
 	}
 
@@ -143,7 +148,7 @@ func (c *Compiler) extractSandboxConfig(frontmatter map[string]any) *SandboxConf
 }
 
 // extractAgentSandboxConfig extracts agent sandbox configuration
-func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
+func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig { //nolint:largefunc // Existing parser handles all sandbox.agent fields in one pass.
 	// Handle boolean format: agent: false (disables agent sandbox but keeps MCP gateway)
 	if agentBool, ok := agentVal.(bool); ok {
 		if !agentBool {
@@ -204,22 +209,6 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 		}
 	}
 
-	// Extract sudo (AWF topology egress mode).
-	// Semantics are inverted from the frontmatter field:
-	//   sudo: false  → no sudo = network isolation mode  → NetworkIsolation=true
-	//   sudo: true   → sudo enabled = normal mode        → NetworkIsolation=false  (deprecated; error in strict mode, warning otherwise)
-	//   (omitted)    → default = network isolation mode  → NetworkIsolation=true   (same as sudo: false)
-	agentConfig.NetworkIsolation = true // Default: sudo: false (network isolation enabled)
-	if sudoVal, hasSudo := agentObj["sudo"]; hasSudo {
-		if sudoBool, ok := sudoVal.(bool); ok {
-			agentConfig.NetworkIsolation = !sudoBool
-			if sudoBool {
-				// sudo: true was explicitly set; record it so validation can warn/error.
-				agentConfig.SudoExplicitlyEnabled = true
-			}
-		}
-	}
-
 	// Extract config for SRT
 	if configVal, hasConfig := agentObj["config"]; hasConfig {
 		agentConfig.Config = c.extractSRTConfig(configVal)
@@ -266,6 +255,14 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 		}
 	}
 
+	// Extract memory (memory limit for the AWF container)
+	if memoryVal, hasMemory := agentObj["memory"]; hasMemory {
+		if memoryStr, ok := memoryVal.(string); ok {
+			agentConfig.Memory = memoryStr
+			frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.memory: %s", memoryStr)
+		}
+	}
+
 	// Extract runtime (container runtime for the agent container)
 	if runtimeVal, hasRuntime := agentObj["runtime"]; hasRuntime {
 		if runtimeStr, ok := runtimeVal.(string); ok {
@@ -274,11 +271,49 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 		}
 	}
 
-	// Extract legacy-security (opt-in to legacy sudo/iptables mode)
-	if legacyVal, hasLegacy := agentObj["legacy-security"]; hasLegacy {
-		if legacyStr, ok := legacyVal.(string); ok && legacyStr == "enable" {
-			agentConfig.LegacySecurity = true
-			frontmatterExtractionSecurityLog.Print("Extracted sandbox.agent.legacy-security: enable")
+	// Extract runtime-install (controls generation of runtime install steps)
+	if runtimeInstallVal, hasRuntimeInstall := agentObj["runtime-install"]; hasRuntimeInstall {
+		if runtimeInstallBool, ok := runtimeInstallVal.(bool); ok {
+			agentConfig.RuntimeInstall = &runtimeInstallBool
+			frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.runtime-install: %t", runtimeInstallBool)
+		}
+	}
+
+	// Extract allow-host-ports (additional host TCP ports for the AWF sandbox)
+	if portsVal, hasPorts := agentObj["allow-host-ports"]; hasPorts {
+		if portsSlice, ok := portsVal.([]any); ok {
+			for _, portVal := range portsSlice {
+				switch v := portVal.(type) {
+				case int:
+					agentConfig.AllowHostPorts = append(agentConfig.AllowHostPorts, v)
+				case int64:
+					agentConfig.AllowHostPorts = append(agentConfig.AllowHostPorts, int(v))
+				case uint64:
+					agentConfig.AllowHostPorts = append(agentConfig.AllowHostPorts, int(v))
+				case float64:
+					if float64(int(v)) == v {
+						agentConfig.AllowHostPorts = append(agentConfig.AllowHostPorts, int(v))
+					}
+				}
+			}
+			frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.allow-host-ports: %v", agentConfig.AllowHostPorts)
+		}
+	}
+
+	// Extract images (digest-pinned AWF infrastructure image manifest)
+	if imagesVal, hasImages := agentObj["images"]; hasImages {
+		if imagesObj, ok := imagesVal.(map[string]any); ok {
+			agentConfig.Images = make(map[string]string, len(imagesObj))
+			for role, value := range imagesObj {
+				if valueStr, ok := value.(string); ok {
+					agentConfig.Images[role] = strings.TrimSpace(valueStr)
+					continue
+				}
+				// Preserve non-string values as their formatted form so validation
+				// can report an actionable error instead of silently dropping them.
+				agentConfig.Images[role] = fmt.Sprintf("%v", value)
+			}
+			frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.images: %d role(s)", len(agentConfig.Images))
 		}
 	}
 
@@ -298,6 +333,23 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 				agentConfig.ModelFallback = &value
 				frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.model-fallback")
 			}
+		}
+	}
+
+	// Extract token-steering (AWF API proxy token steering enable/disable flag).
+	if tsVal, hasTS := agentObj["token-steering"]; hasTS {
+		if value, ok := tsVal.(bool); ok {
+			agentConfig.TokenSteering = &value
+			frontmatterExtractionSecurityLog.Print("Extracted sandbox.agent.token-steering")
+		}
+	}
+
+	// Extract ca-cert (host path to an additional CA certificate for API proxy
+	// upstream TLS verification; maps to apiProxy.caCert).
+	if caCertVal, hasCACert := agentObj["ca-cert"]; hasCACert {
+		if value, ok := caCertVal.(string); ok {
+			agentConfig.CACert = strings.TrimSpace(value)
+			frontmatterExtractionSecurityLog.Print("Extracted sandbox.agent.ca-cert")
 		}
 	}
 
@@ -345,7 +397,7 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 // extractMCPGatewayConfig extracts MCP gateway configuration from frontmatter
 // Per MCP Gateway Specification v1.0.0: Only container-based execution is supported.
 // Direct command execution is not supported.
-func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig {
+func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig { //nolint:largefunc // Existing parser handles all sandbox.mcp fields in one pass.
 	// Handle nil or boolean false
 	if mcpVal == nil {
 		return nil
@@ -400,10 +452,10 @@ func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig 
 		}
 	}
 
-	// Extract apiKey
-	if apiKeyVal, hasAPIKey := mcpObj["api-key"]; hasAPIKey {
-		if apiKeyStr, ok := apiKeyVal.(string); ok {
-			mcpConfig.APIKey = apiKeyStr
+	// Extract agent ID
+	if agentIDVal, hasAgentID := mcpObj["agent-id"]; hasAgentID {
+		if agentIDStr, ok := agentIDVal.(string); ok {
+			mcpConfig.AgentID = agentIDStr
 		}
 	}
 
@@ -541,7 +593,7 @@ func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig 
 }
 
 // extractSRTConfig extracts Sandbox Runtime configuration from a map
-func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
+func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig { //nolint:largefunc // Existing SRT config extraction preserves legacy key handling.
 	configObj, ok := configVal.(map[string]any)
 	if !ok {
 		return nil
@@ -625,6 +677,7 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 			// Extract allowWrite
 			if allowWrite, hasAllowWrite := filesystemObj["allowWrite"]; hasAllowWrite {
 				if pathsSlice, ok := allowWrite.([]any); ok {
+					fsConfig.AllowWrite = []string{}
 					for _, path := range pathsSlice {
 						if pathStr, ok := path.(string); ok {
 							fsConfig.AllowWrite = append(fsConfig.AllowWrite, pathStr)

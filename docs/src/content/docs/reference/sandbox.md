@@ -22,9 +22,9 @@ Configure the coding agent sandbox type to control how the AI engine is isolated
 sandbox:
   agent: awf
 
-# Disable coding agent sandbox - requires an operator-authored justification
+# Disable coding agent sandbox - requires an explicit feature flag
 features:
-  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+  dangerously-disable-sandbox-agent: true
 sandbox:
   agent: false
 
@@ -37,23 +37,43 @@ If `sandbox` is not specified in your workflow, it defaults to `sandbox.agent: a
 
 **Disabling Coding Agent Sandbox**
 
-Setting `sandbox.agent: false` disables the agent firewall while keeping the MCP gateway enabled. This removes a trust boundary and should only be used when strictly necessary.
+Setting `sandbox.agent: false` disables the agent firewall while keeping the MCP gateway enabled. This removes a trust boundary and is only supported when `strict: false`.
 
-To disable the agent sandbox, you **must** add `features.dangerously-disable-sandbox-agent` with a literal justification string of at least 20 characters. The justification must explain why the trust boundary is being removed and is stored for diagnostics and audit. The following values are rejected by the compiler:
-
-- Boolean `true` — no longer accepted as a legacy shorthand
-- Expressions such as `${{ inputs.reason }}` — must be a static literal
-- Strings shorter than 20 characters after trimming whitespace
+To disable the agent sandbox, you **must** set `features.dangerously-disable-sandbox-agent: true`. Missing, false, and non-boolean values are rejected by the compiler.
 
 ```yaml wrap
 features:
-  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+  dangerously-disable-sandbox-agent: true
 sandbox:
   agent: false
+strict: false
 ```
 
 > [!WARNING]
-> Disabling the agent sandbox removes a security trust boundary. The `dangerously-disable-sandbox-agent` value is a permanent, reviewable record of why this workflow runs without the agent firewall. Write a reason that will be meaningful to future reviewers.
+> Disabling the agent sandbox removes a security trust boundary and is always rejected in strict mode. Only use this opt-out in controlled environments where the agent can be trusted with direct network access.
+
+### Runtime Profiles
+
+`sandbox.agent.runtime` is the single selector for the sandbox security and topology profile. Each value resolves to one supported combination of container runtime, AWF privileges, and host access:
+
+| Runtime | Effective behavior |
+| --- | --- |
+| `docker` (default) | Default Docker runtime, rootless AWF, network isolation |
+| `docker-sudo-iptables` | Docker with privileged AWF, legacy `iptables` networking, and host/service access |
+| `gvisor` | **Deprecated:** gVisor with strict network isolation |
+| `docker-sbx` | **Deprecated:** KVM microVM; the compiler handles the required privileged setup |
+| `cloud-hypervisor` | Preview KVM runtime with its required privileged launcher |
+
+Omitting `runtime` is equivalent to `runtime: docker`, which keeps the secure default. Prefer `docker`; `gvisor` and `docker-sbx` are deprecated and will be removed in a future release.
+
+```yaml wrap
+sandbox:
+  agent:
+    runtime: docker-sudo-iptables
+    allow-host-ports: [9000]
+```
+
+The compiler derives every privilege the selected runtime needs, including the `sudo` used by the gVisor and Docker sbx installation steps. Unsupported combinations — such as `allow-host-ports` outside `docker-sudo-iptables`, or `runtime-install` outside `gvisor` and `docker-sbx` — fail at compile time. See [Agent Runtimes](/gh-aw/reference/agent-runtimes/) for runner prerequisites.
 
 ### MCP Gateway (Experimental)
 
@@ -66,7 +86,7 @@ features:
 sandbox:
   mcp:
     port: 8080
-    api-key: "${{ secrets.MCP_GATEWAY_API_KEY }}"
+    agent-id: "${{ secrets.MCP_GATEWAY_AGENT_ID }}"
 ```
 
 ### Combined Configuration
@@ -118,6 +138,33 @@ All host binaries are available without explicit mounts: system utilities, `gh`,
 > [!WARNING]
 > Docker socket is hidden for security. Agents cannot spawn containers.
 
+#### Host Service Ports (`services:`)
+
+The AWF sandbox reaches GitHub Actions `services:` containers through `--allow-host-service-ports`, which resolves each service's actual (possibly dynamically assigned) host port at runtime. This mechanism, and the explicit `allow-host-ports` escape hatch below, both require `sandbox.agent.runtime: docker-sudo-iptables`: the default (strict) runtime profile does not provide a route to host services, even when host-access flags are combined.
+
+```yaml wrap
+sandbox:
+  agent:
+    runtime: docker-sudo-iptables
+
+services:
+  postgres:
+    image: postgres:18
+    ports:
+      - 5432:5432
+```
+
+For host daemons that are not declared in `services:`, add an explicit allowlist (also `docker-sudo-iptables` only):
+
+```yaml wrap
+sandbox:
+  agent:
+    runtime: docker-sudo-iptables
+    allow-host-ports: [9000]
+```
+
+Use `allow-host-ports` only for ports that cannot be represented by `services:`. The compiler rejects values outside the TCP port range `1` through `65535`, and rejects ports AWF always blocks as dangerous (e.g. `22`, `3306`, `5432`, `6379`, `9200`) — reach those through `services:` instead.
+
 #### Environment Variables
 
 AWF passes all environment variables via `--env-all`. The host `PATH` is captured as `AWF_HOST_PATH` and restored inside the container, preserving setup action tool paths.
@@ -144,6 +191,80 @@ jobs:
 
 Use `go build` or `python3` - both are available.
 ```
+
+#### Memory Limit (`sandbox.agent.memory`)
+
+By default, AWF uses its own built-in memory limit for the agent container. Set `sandbox.agent.memory` to override this limit on large-memory runners:
+
+```yaml wrap
+sandbox:
+  agent:
+    memory: 8g
+```
+
+Valid values are a positive integer followed by a unit: `b`, `k`, `m`, or `g` (case-insensitive). Examples: `512m`, `4g`, `8g`, `1024m`.
+
+When omitted, AWF's own default memory limit applies. Specifying an invalid format (e.g., `48gb` or `48`) is rejected at compile time.
+
+> [!NOTE]
+> Exit code 137 means the process received `SIGKILL`. A memory limit can be one cause, but verify with logs before changing `memory`. If you increase `memory`, leave headroom for the runner OS and other processes.
+
+#### Model fallback (`sandbox.agent.model-fallback`)
+
+AWF's API proxy resolves unrecognized model selections against its built-in model catalog and may rewrite them. Set `model-fallback: false` to pass the configured model through to the provider verbatim:
+
+```yaml wrap
+sandbox:
+  agent:
+    model-fallback: false
+```
+
+This is required for providers whose model identifiers are not in the built-in catalog (BYOK Azure OpenAI deployment names, self-hosted routers), where rewriting causes HTTP 404 `model_not_found`. When an [`OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` custom endpoint](/gh-aw/reference/engines/#custom-api-endpoints-via-environment-variables) is configured in `engine.env`, model fallback is disabled automatically; set this field explicitly to override that default.
+
+#### Token steering (`sandbox.agent.token-steering`)
+
+AWF enables API proxy token steering by default. To keep the explicitly configured provider and model, disable it for a workflow:
+
+```yaml wrap
+sandbox:
+  agent:
+    token-steering: false
+```
+
+#### Custom infrastructure images (`sandbox.agent.images`)
+
+Self-hosted and air-gapped deployments can mirror, scan, approve, and preload every privileged image AWF launches. Set `sandbox.agent.images` to select digest-pinned replacements for AWF's infrastructure images (requires AWF v0.28.4 or newer):
+
+```yaml wrap
+sandbox:
+  agent:
+    version: v0.28.4
+    images:
+      squid: registry.example.com/approved/squid:v0.28.4@sha256:<64-hex-digest>
+      agent: registry.example.com/approved/agent:v0.28.4@sha256:<64-hex-digest>
+      apiProxy: registry.example.com/approved/api-proxy:v0.28.4@sha256:<64-hex-digest>
+```
+
+The compiler emits the manifest as `container.images` in the generated AWF configuration.
+
+Supported image roles: `squid`, `agent`, `apiProxy`, `cliProxy`, `buildTools`, `dohProxy`, `enclaveScript`, `enclaveAgent`, `enclaveMcpServer`, and `dindStaging`.
+
+Rules enforced at compile time:
+
+- Every value must be a literal, registry-qualified reference with both a tag and an immutable digest: `registry/repository:tag@sha256:<64 lowercase hex characters>`. Expressions (`${{ ... }}`), environment interpolation, and any other dynamic value are rejected, so no runtime input can influence an infrastructure image.
+- Unknown roles are rejected.
+- The manifest must cover every role required by the enabled features: `squid`, `agent`, and `apiProxy` are always required; `cliProxy` is required with [`tools.github.mode: gh-proxy`](/gh-aw/reference/tools/), the `integrity-reactions` feature, or raw `--difc-proxy-host` AWF arguments; `buildTools` is required with [`runner.topology: arc-dind`](/gh-aw/reference/self-hosted-runners/); `dohProxy` is required when legacy-security raw AWF arguments enable `--dns-over-https`; `dindStaging` is required when raw AWF arguments enable `--dind-pre-stage-dirs`, `--dind-stage-engine-binary-path`, or `--dind-stage-engine-binary-target-path`; `enclaveScript` and `enclaveAgent` are required for their corresponding [enclave](/gh-aw/experimental/enclaves/) executors, and `enclaveMcpServer` is required whenever any enclave is enabled. AWF fails closed rather than falling back to a default, so an incomplete manifest is a compile error.
+- The manifest cannot be combined with controls that select a different effective image: SSL bump, per-enclave `image` overrides, and AWF arguments such as `--image-tag`, `--image-registry`, `--agent-image`, `--build-local`, `--sysroot-image`, and `--dind-staging-image`. The compiler-owned `container.imageTag` is suppressed when the manifest is set.
+
+Omit the field to keep AWF's default role references and gh-aw's existing digest-pin resolution.
+
+> [!NOTE]
+> AWF does not accept registry credentials in configuration. The Docker daemon on the runner must already be authenticated to the registry hosting these images.
+
+> [!NOTE]
+> Repository-level `.github/workflows/aw.json` `container_pins` mappings already participate in AWF predownload and lock metadata by redirecting AWF's default references. They do not configure the role references AWF resolves at runtime. `sandbox.agent.images` is the authoritative per-workflow runtime manifest and matching predownload set.
+>
+> `container_pins` never redirects an AWF role supplied by `sandbox.agent.images`: each manifest reference is already a complete, digest-pinned literal, so gh-aw pre-pulls and records it in lock metadata unchanged. Mappings continue to transform non-AWF workflow containers, and they continue to transform default AWF predownload references when `sandbox.agent.images` is omitted.
 
 #### Copilot BYOK request customization (`sandbox.agent.targets.copilot`)
 
@@ -367,7 +488,7 @@ jobs:
 Review the failing tests and apply a fix. Build artifacts are pre-cached.
 ```
 
-## Related Documentation
+## Learn More
 
 - [Network Permissions](/gh-aw/reference/network/) - Configure network access controls
 - [AI Engines](/gh-aw/reference/engines/) - Engine-specific configuration

@@ -9,10 +9,15 @@ set +o histexpand
 # install_awf_binary.sh to avoid executing unverified downloaded scripts.
 #
 # Arguments:
-#   VERSION    - Optional Copilot CLI version to install (default: latest release)
+#   VERSION    - Optional Copilot CLI version to install. When omitted, the script
+#                resolves the version via compat.json (using GH_AW_COMPILED_VERSION) and
+#                falls back to DEFAULT_COPILOT_VERSION baked into this script.
 #   --rootless - Install to ~/.local/bin without sudo; appends that directory to
 #                $GITHUB_PATH so subsequent steps find the binary.  Use this on
 #                ARC/DinD runners that enforce allowPrivilegeEscalation: false.
+#
+# Environment overrides (testing):
+#   COPILOT_INSTALL_DIR - Override the install directory (default: /usr/local/bin).
 #
 # Security features:
 #   - Downloads binary directly from GitHub releases (no installer script execution)
@@ -24,9 +29,14 @@ set -euo pipefail
 # Configuration
 SECONDS_PER_DAY=86400
 COPILOT_REPO="github/copilot-cli"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${COPILOT_INSTALL_DIR:-/usr/local/bin}"
 COPILOT_DIR="${HOME}/.copilot"
 COPILOT_TOOLCACHE_MAX_DEPTH=4
+# DEFAULT_COPILOT_VERSION is the baked-in fallback used when neither an explicit version
+# argument nor a GH_AW_COMPILED_VERSION-backed compat.json lookup is available.
+# It is the last resort (priority 3) after engine.version (priority 1) and
+# compat.json toolcache lookup (priority 2).
+DEFAULT_COPILOT_VERSION="1.0.80"
 COMPAT_URL="${COPILOT_COMPAT_URL:-https://raw.githubusercontent.com/github/gh-aw-actions/main/.github/aw/compat.json}"
 COMPILED_GH_AW_VERSION="${GH_AW_COMPILED_VERSION:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +60,16 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+OS="$(uname -s)"
+IS_WINDOWS=false
+case "$OS" in
+  MINGW*|MSYS*|CYGWIN*)
+    IS_WINDOWS=true
+    ROOTLESS=true
+    INSTALL_DIR="${HOME}/.local/bin"
+    ;;
+esac
 
 # In rootless mode, install into the user's home directory instead of /usr/local/bin
 # so that ARC/DinD runners with allowPrivilegeEscalation: false can run without sudo.
@@ -95,8 +115,7 @@ echo "Cleaning up stale AWF chroot directories..."
 maybe_sudo find /tmp -maxdepth 1 -name 'awf-*-chroot-home' -type d -exec rm -rf -- {} + 2>/dev/null || true
 maybe_sudo find /tmp -maxdepth 1 -name 'awf-chroot-*' -type d -exec rm -rf -- {} + 2>/dev/null || true
 
-# Detect OS and architecture
-OS="$(uname -s)"
+# Detect architecture
 ARCH="$(uname -m)"
 
 # Map architecture to Copilot CLI naming
@@ -110,10 +129,15 @@ esac
 case "$OS" in
   Linux) PLATFORM="linux" ;;
   Darwin) PLATFORM="darwin" ;;
+  MINGW*|MSYS*|CYGWIN*) PLATFORM="win32" ;;
   *) echo "ERROR: Unsupported operating system: ${OS}"; exit 1 ;;
 esac
 
-TARBALL_NAME="copilot-${PLATFORM}-${ARCH_NAME}.tar.gz"
+if [ "$IS_WINDOWS" = "true" ]; then
+  TARBALL_NAME="copilot-${PLATFORM}-${ARCH_NAME}.zip"
+else
+  TARBALL_NAME="copilot-${PLATFORM}-${ARCH_NAME}.tar.gz"
+fi
 REQUESTED_VERSION="${VERSION:-latest}"
 
 echo "Installing GitHub Copilot CLI${VERSION:+ version $VERSION} (os: ${OS}, arch: ${ARCH})..."
@@ -199,7 +223,7 @@ download_compat_json() {
   local source_file="$2"
 
   echo "Attempting to download compatibility matrix from ${COMPAT_URL}..." >&2
-  if curl -fsSL --retry 3 --retry-delay 5 -o "$compat_file" "$COMPAT_URL"; then
+  if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o "$compat_file" "$COMPAT_URL"; then
     echo "$COMPAT_URL" > "$source_file"
     echo "Successfully downloaded compatibility matrix from ${COMPAT_URL}" >&2
     return 0
@@ -225,7 +249,7 @@ resolve_compat_with_jq() {
   local compiled_version="$2"
   local compiled_no_v="${compiled_version#v}"
   
-  jq -r --arg compiled "$compiled_no_v" '
+  jq -r --arg compiled "$compiled_no_v" --arg compiled_version "$compiled_version" '
     # Semver comparison: returns -1 if a<b, 0 if equal, 1 if a>b
     def semver_cmp(a; b):
       (a | split(".") | map(tonumber)) as $a_parts |
@@ -251,9 +275,11 @@ resolve_compat_with_jq() {
       $row["min-agent"] as $min_agent |
       $row["max-agent"] as $max_agent |
       
-      # Check if gh-aw version is in range
-      if (semver_cmp($compiled; $min_aw) >= 0) and
-         (($max_aw == "*") or (semver_cmp($compiled; $max_aw) <= 0)) then
+      # Use the open row for development builds, which do not have a semver release tag.
+      if (($compiled_version == "dev") and ($row.open == true)) or
+         (($compiled_version != "dev") and
+          (semver_cmp($compiled; $min_aw) >= 0) and
+          (($max_aw == "*") or (semver_cmp($compiled; $max_aw) <= 0))) then
         "\($max_agent)|\($idx)|\($min_aw)|\($max_aw)|\($min_agent)|\($max_agent)|\($cache_ttl)"
       else empty end
     ) | first // ""
@@ -272,7 +298,7 @@ resolve_version_from_compat() {
     return 1
   fi
 
-  if [[ ! "$compiled_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  if [[ ! "$compiled_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$compiled_version" != "dev" ]]; then
     echo "GH_AW_COMPILED_VERSION '${compiled_version}' is not in vMAJOR.MINOR.PATCH format; skipping compatibility matrix resolution." >&2
     return 1
   fi
@@ -484,12 +510,19 @@ activate_cached_copilot_bin() {
   if [ -n "${GITHUB_PATH:-}" ]; then
     echo "  Exporting ${cached_copilot_dir} to GITHUB_PATH (${GITHUB_PATH})"
     echo "$cached_copilot_dir" >> "${GITHUB_PATH}"
+  else
+    echo "  GITHUB_PATH not set — relying on ${INSTALL_DIR}/copilot"
+  fi
+
+  # The agent is launched with the hardcoded absolute path ${INSTALL_DIR}/copilot, which
+  # PATH additions cannot satisfy, so always materialize that path. A small wrapper is used
+  # instead of symlinking or copying the cached script to avoid broken relative paths.
+  if [ "$cached_copilot_bin" = "${INSTALL_DIR}/copilot" ]; then
+    echo "  Cached binary already lives at ${INSTALL_DIR}/copilot — no wrapper needed"
     return 0
   fi
 
-  # Outside GitHub Actions there is no GITHUB_PATH file, so install a small wrapper
-  # instead of symlinking or copying the cached script and risking broken relative paths.
-  echo "  GITHUB_PATH not set — installing wrapper at ${INSTALL_DIR}/copilot"
+  echo "  Installing wrapper at ${INSTALL_DIR}/copilot"
   wrapper_path="${TEMP_DIR}/copilot"
   cat > "$wrapper_path" <<EOF
 #!/usr/bin/env bash
@@ -503,7 +536,10 @@ EOF
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-# Resolve a compatible Copilot version from compat matrix unless the caller passed an explicit version.
+# Version resolution follows this priority order:
+# 1. Explicit VERSION argument (from engine.version in the workflow)
+# 2. Compat.json toolcache lookup (requires GH_AW_COMPILED_VERSION to select the right window)
+# 3. DEFAULT_COPILOT_VERSION baked into this script
 if [ -z "$VERSION" ]; then
   echo "No explicit Copilot CLI version requested. Attempting compat-driven version resolution..."
   if RESOLVED_COMPAT_INFO="$(resolve_version_from_compat "$COMPILED_GH_AW_VERSION" "${TEMP_DIR}/compat.json")"; then
@@ -513,11 +549,9 @@ if [ -z "$VERSION" ]; then
     echo "Using compat-resolved Copilot CLI window: ${COMPAT_MATCHED_MIN_AGENT}..${COMPAT_MATCHED_MAX_AGENT}"
     echo "Will install compat max-agent ${VERSION} if no cached version satisfies the window."
   else
-    echo "ERROR: Failed to resolve Copilot CLI version from compatibility matrix." >&2
-    echo "ERROR: Cannot install without a compatible version." >&2
-    echo "To fix: Pass an explicit version as an argument (e.g., 'install_copilot_cli.sh 1.0.56')" >&2
-    echo "   or ensure GH_AW_COMPILED_VERSION matches a row in .github/aw/compat.json" >&2
-    exit 1
+    echo "Compat resolution unavailable; falling back to baked-in default version: ${DEFAULT_COPILOT_VERSION}" >&2
+    VERSION="$DEFAULT_COPILOT_VERSION"
+    REQUESTED_VERSION="$DEFAULT_COPILOT_VERSION"
   fi
 else
   echo "Explicit Copilot CLI version argument provided (${VERSION}); skipping compat matrix resolution."
@@ -529,9 +563,17 @@ if CACHED_COPILOT_BIN="$(find_cached_copilot_bin "$REQUESTED_VERSION" "${COMPAT_
   activate_cached_copilot_bin "$CACHED_COPILOT_BIN"
 
   echo "Verifying cached Copilot CLI installation..."
+  # The agent is spawned with the absolute path ${INSTALL_DIR}/copilot, so that path must
+  # exist even when the CLI itself came from the toolcache.
+  if [ ! -x "${INSTALL_DIR}/copilot" ]; then
+    echo "ERROR: Cached Copilot CLI activation failed - ${INSTALL_DIR}/copilot is missing or not executable"
+    exit 1
+  fi
+
   RESOLVED_COPILOT="$(command -v copilot 2>/dev/null || true)"
   if [ -n "$RESOLVED_COPILOT" ]; then
     echo "  Resolved copilot binary: ${RESOLVED_COPILOT}"
+    echo "  Canonical install path: ${INSTALL_DIR}/copilot"
     "$RESOLVED_COPILOT" --version
     echo "✓ Copilot CLI installation complete (cached)"
     exit 0
@@ -558,11 +600,11 @@ CHECKSUMS_URL="${BASE_URL}/SHA256SUMS.txt"
 
 # Download checksums
 echo "Downloading checksums from ${CHECKSUMS_URL}..."
-curl -fsSL --retry 3 --retry-delay 5 -o "${TEMP_DIR}/SHA256SUMS.txt" "${CHECKSUMS_URL}"
+curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "${TEMP_DIR}/SHA256SUMS.txt" "${CHECKSUMS_URL}"
 
 # Download binary tarball
 echo "Downloading binary from ${TARBALL_URL}..."
-curl -fsSL --retry 3 --retry-delay 5 -o "${TEMP_DIR}/${TARBALL_NAME}" "${TARBALL_URL}"
+curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "${TEMP_DIR}/${TARBALL_NAME}" "${TARBALL_URL}"
 
 # Verify checksum
 echo "Verifying SHA256 checksum for ${TARBALL_NAME}..."
@@ -587,8 +629,24 @@ echo "✓ Checksum verification passed for ${TARBALL_NAME}"
 
 # Extract and install binary
 echo "Installing binary to ${INSTALL_DIR}..."
-maybe_sudo tar -xz -C "${INSTALL_DIR}" -f "${TEMP_DIR}/${TARBALL_NAME}"
-maybe_sudo chmod +x "${INSTALL_DIR}/copilot"
+if [ "$IS_WINDOWS" = "true" ]; then
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -qo "${TEMP_DIR}/${TARBALL_NAME}" -d "${INSTALL_DIR}"
+  elif command -v 7z >/dev/null 2>&1; then
+    7z x -y "-o${INSTALL_DIR}" "${TEMP_DIR}/${TARBALL_NAME}" >/dev/null
+  else
+    echo "ERROR: unzip or 7z is required for Windows installation"
+    exit 1
+  fi
+  cat > "${INSTALL_DIR}/copilot" <<EOF
+#!/usr/bin/env bash
+exec "${INSTALL_DIR}/copilot.exe" "\$@"
+EOF
+  chmod +x "${INSTALL_DIR}/copilot"
+else
+  maybe_sudo tar -xz -C "${INSTALL_DIR}" -f "${TEMP_DIR}/${TARBALL_NAME}"
+  maybe_sudo chmod +x "${INSTALL_DIR}/copilot"
+fi
 
 # In rootless mode, add the install dir to PATH for subsequent steps.
 # $GITHUB_PATH is the mechanism for persisting PATH additions across steps in GitHub Actions.

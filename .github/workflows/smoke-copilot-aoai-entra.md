@@ -2,7 +2,8 @@
 private: true
 emoji: "🧪"
 description: Smoke Copilot - AOAI (Entra)
-on: 
+on:
+  schedule: every 2 days
   slash_command:
     name: smoke-copilot-aoai-entra
     strategy: centralized
@@ -51,6 +52,7 @@ imports:
     with:
       azure-client-id: adb907fd-188c-4029-b67f-2559d96b2f1b
       azure-tenant-id: 398a6654-997b-47e9-b12b-9515b896b4de
+  - shared/smoke-test-brevity.md
 network:
   allowed:
     - defaults
@@ -70,7 +72,6 @@ tools:
     trusted-users:
       - pelikhan
   playwright:
-    mode: cli
   web-fetch:
   cli-proxy: true
 runtimes:
@@ -153,6 +154,9 @@ safe-outputs:
       run-success: "📰 VERDICT: [{workflow_name}]({run_url}) has concluded. All systems operational. This is a developing story. 🎤"
       run-failure: "📰 DEVELOPING STORY: [{workflow_name}]({run_url}) reports {status}. Our correspondents are investigating the incident..."
 timeout-minutes: 15
+# Per-run cost guardrail: healthy runs cost ~27 AI credits, so 60 leaves
+# headroom while capping the token burn of a runaway or failing run.
+max-ai-credits: 60
 experiments:
   caveman: [yes, no]
   subagent_model: [small, large]
@@ -164,6 +168,9 @@ evals:
   - id: subagent_model_goal_met
     question: Does the agent output show that the objective for experiment subagent_model was successfully completed?
 
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Copilot Engine Validation (AOAI Entra BYOK)
@@ -177,8 +184,6 @@ mode with Microsoft Entra authentication, via the `FOUNDRY_OPENAI_ENDPOINT`,
 {{#if experiments.caveman }}
 Talk like a caveman in all your responses and outputs. Use short, broken sentences. Me test. You run.
 {{/if}}
-
-**IMPORTANT: Keep all outputs extremely short and concise. Use single-line responses where possible. No verbose explanations.**
 
 ## Hard Limit: `add_comment` Budget
 
@@ -207,8 +212,8 @@ Run each check NOW and mark as ✅/❌. Do NOT create files to automate this —
 8. Discussion interaction: get latest discussion with `github-discussion-query` (`limit=1`, `jq=".[0]"`), extract number, then `add_comment` to that discussion.
 9. Build: run `GOCACHE=/tmp/gh-aw/agent/go-cache GOMODCACHE=/tmp/gh-aw/agent/go-mod make build`.
 10. Artifact upload (only if build passes): stage `./gh-aw` at `$RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/gh-aw` and call `upload_artifact` with `path: "gh-aw"`.
-11. Discussion create: call `create_discussion` in `announcements` with label `ai-generated`, title `copilot was here`, temp ID `aw_smoke_discussion`.
-12. Workflow dispatch: call `dispatch_workflow` for `haiku-printer` with an original testing/automation haiku.
+11. Discussion create: call `create_discussion` in `announcements` with label `ai-generated`, title `copilot was here`, and `temporary_id: "aw_discuss"`.
+12. Workflow dispatch: call `dispatch_workflow` for `haiku-printer`, set top-level `ref` to `${{ github.event.repository.default_branch }}`, and include `inputs.message` with an original testing/automation haiku (non-empty string).
 13. PR review tools: add 1-2 inline `create_pull_request_review_comment` comments, submit review with event `COMMENT`, then reply to most recent existing review comment ID when available.
 14. Comment memory: append an original 3-line haiku to `/tmp/gh-aw/comment-memory/*.md`.
 15. Sub-agent: use `file-summarizer` on `README.md`.
@@ -234,7 +239,7 @@ Run each check NOW and mark as ✅/❌. Do NOT create files to automate this —
    - Overall status: PASS or FAIL
    - Mention the pull request author and any assignees
 
-4. **Only if this workflow was NOT triggered by a pull_request event**: Use the `add_comment` tool to add a **fun and creative comment** to the newly created discussion (use the temporary ID `aw_smoke_discussion` from step 11) - be playful and entertaining in your comment
+4. **Only if this workflow was NOT triggered by a pull_request event**: Use the `add_comment` tool to add a **fun and creative comment** to the newly created discussion (use `item_number: "aw_discuss"` from step 11) - be playful and entertaining in your comment
 
 5. Use the `send_slack_message` tool to send a brief summary message (e.g., "Smoke test ${{ github.run_id }}: All tests passed! ✅")
 

@@ -12,11 +12,9 @@ permissions:
   actions: read
   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 tracker-id: linter-miner
+model: copilot/mai-code-1-flash-picker
 engine:
   id: copilot
   copilot-sdk: true
@@ -28,7 +26,7 @@ network:
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default, discussions, issues, repos]
   cache-memory:
     key: linter-miner-state-${{ github.workflow }}
@@ -38,6 +36,7 @@ tools:
 imports:
   - shared/mcp/serena-go.md
   - shared/otlp.md
+  - shared/reporting.md
 pre-agent-steps:
   - name: Preload linter source and cache context
     run: |
@@ -64,6 +63,7 @@ pre-agent-steps:
         echo "[]" > /tmp/gh-aw/agent/prior-linters.json
       fi
 safe-outputs:
+  steer: true
   create-pull-request:
     title-prefix: "[linter-miner] "
     labels: [automation, go-linters, cookie]
@@ -78,6 +78,9 @@ safe-outputs:
   noop:
 timeout-minutes: 120
 max-turns: 1000
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Linter Miner
@@ -178,7 +181,7 @@ Call the `create-pull-request` safe output with:
 ## agent: `discussion-miner`
 ---
 description: Mines GitHub Discussions and Issues for recurring Go code patterns, anti-patterns, and bugs that could be caught by a static linter
-model: kiwi
+model: copilot/mai-code-1-flash-picker
 ---
 You are a Go code-review analyst. Your job is to search GitHub Discussions and Issues in the current repository for evidence of recurring Go code patterns or errors that could benefit from automatic static analysis.
 
@@ -211,7 +214,7 @@ Be concise. List at most 5 candidates.
 ## agent: `code-pattern-scanner`
 ---
 description: Scans the Go source with Serena and grep to find error-prone patterns that would benefit from a custom linter
-model: inherited
+model: copilot/mai-code-1-flash-picker
 ---
 You are a Go static-analysis expert. Scan the non-test Go files under `pkg/` and `cmd/` of this repository for recurring error-prone patterns that are not already caught by existing linters.
 
@@ -228,7 +231,7 @@ Output a JSON array of candidate linter ideas (same schema as discussion-miner).
 ## agent: `linter-writer`
 ---
 description: Implements a new Go analysis linter package following the pkg/linters/largefunc conventions
-model: inherited
+model: copilot/mai-code-1-flash-picker
 ---
 You are a Go engineer implementing a custom `go/analysis` linter.
 

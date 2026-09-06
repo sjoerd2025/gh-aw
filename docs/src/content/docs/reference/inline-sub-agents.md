@@ -15,20 +15,40 @@ Start a sub-agent block with a level-2 heading in the following form:
 ## agent: `name`
 ```
 
-The block continues until the next `##` heading or end of file. There is no explicit closing marker.
+When a matching `## end agent: \`name\`` marker is present, the block continues until that marker even if the block contains other `##` headings. Without an explicit end marker, the block continues until the next `##` heading or end of file.
+
+### Explicit end marker
+
+Add a closing heading to bound the block explicitly instead of relying on the next `##` heading or EOF:
+
+```markdown
+## agent: `name`
+...
+## end agent: `name`
+```
+
+```markdown
+## agent: `file-summarizer`
+---
+description: Summarizes files
+---
+You are a file summarization assistant.
+## end agent: `file-summarizer`
+```
+
+Use the explicit end marker when the block appears in the middle of a document — for example via an [import](/gh-aw/reference/imports/) — or when the sub-agent instructions themselves need `##` headings.
+
+Without an explicit end marker, the block still ends at the next `##` heading or EOF.
+
+When a sub-agent block is brought in via `{{#runtime-import ...}}` and has no explicit end marker, the runtime import resolver automatically inserts one at the implicit boundary. This prevents the imported block from swallowing later content, such as another import or the rest of the workflow body. An explicit end marker is still recommended for clarity.
 
 ### Name constraints
 
-- Must start with a lowercase letter (`a–z`)
-- May contain only `a–z`, `0–9`, `_`, and `-`
-- Examples: `file-summarizer`, `code_reviewer`, `pr-analyst`
+Names must start with a lowercase letter (`a–z`) and may contain only `a–z`, `0–9`, `_`, and `-`. Examples: `file-summarizer`, `code_reviewer`, `pr-analyst`.
 
 ### Structure
 
-Each sub-agent block contains:
-
-1. **YAML frontmatter** (optional) — wrapped in `---` delimiters
-2. **Instructions** — natural language prompt for the agent
+Each sub-agent block contains optional YAML frontmatter wrapped in `---` delimiters, followed by the agent instructions.
 
 ```markdown
 ## agent: `file-summarizer`
@@ -101,7 +121,7 @@ The sub-agent block at the bottom is extracted before the workflow runs and has 
 
 ## Example: Multiple Sub-Agents in One Workflow
 
-A single workflow file may contain more than one sub-agent block. Each block starts with its own `## agent: \`name\`` heading and ends at the next `##` heading or EOF.
+A workflow file may contain multiple sub-agent blocks. Each starts with `## agent: \`name\`` and ends at a matching `## end agent: \`name\`` marker, the next `##` heading, or EOF.
 
 ```aw wrap
 ## agent: `summarizer`
@@ -119,10 +139,10 @@ description: Reviews code for quality issues
 Review the given code for bugs, style issues, and potential improvements.
 ```
 
-## Related Documentation
+## Learn More
 
-- [Importing Copilot Agent Files](/gh-aw/reference/copilot-custom-agents/) — Importing agents from `.github/agents/`
-- [DeterministicOps](/gh-aw/patterns/deterministic-ops/) — Combining deterministic steps with AI reasoning
-- [Markdown](/gh-aw/reference/markdown/) — Workflow markdown body reference
-- [Workflow Structure](/gh-aw/reference/workflow-structure/) — Overall workflow file organization
-- [Frontmatter](/gh-aw/reference/frontmatter/) — YAML configuration options
+- [Importing Copilot Agent Files](/gh-aw/reference/copilot-custom-agents/) for agents stored in `.github/agents/`
+- [DeterministicOps](/gh-aw/patterns/deterministic-ops/) for combining deterministic steps with AI reasoning
+- [Markdown](/gh-aw/reference/markdown/) for workflow markdown syntax
+- [Workflow Structure](/gh-aw/reference/workflow-structure/) for overall file organization
+- [Frontmatter](/gh-aw/reference/frontmatter/) for YAML configuration options

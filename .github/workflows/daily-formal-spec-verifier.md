@@ -23,6 +23,9 @@ max-tool-denials: 3
 strict: true
 timeout-minutes: 25
 
+network:
+  allowed: [defaults, go]
+
 imports:
   - uses: shared/daily-issue-base.md
     with:
@@ -34,7 +37,7 @@ imports:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   github:

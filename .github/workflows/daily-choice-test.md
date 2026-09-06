@@ -22,11 +22,12 @@ network:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
       - default
 

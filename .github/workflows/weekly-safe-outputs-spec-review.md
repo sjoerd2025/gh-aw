@@ -10,10 +10,12 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
 
 tracker-id: weekly-safe-outputs-spec-review
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 strict: true
 
 network:
@@ -22,10 +24,8 @@ network:
     - github
 
 sandbox:
-  agent:  # Firewall enabled
+  agent:
     id: awf
-    sudo: false
-
 imports:
   - shared/github-guard-policy.md
 
@@ -43,6 +43,7 @@ tools:
       - pull_requests
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 7d
     title-prefix: "[spec-review] "

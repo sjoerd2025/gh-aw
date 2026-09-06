@@ -8,16 +8,20 @@ sidebar:
 
 ## What is GitHub Agentic Workflows?
 
-**GitHub Agentic Workflows** (`gh-aw`) is an open-source [GitHub CLI](https://cli.github.com/) extension from [GitHub](https://github.com/github) for writing agentic AI workflows in natural-language markdown and running them as GitHub Actions.
+**GitHub Agentic Workflows** (`gh-aw`) is an open-source [GitHub CLI](https://cli.github.com/) extension from [GitHub](https://github.com/github) for defining AI-powered repository automation and running AI agents through GitHub Actions. Each agentic workflow combines YAML frontmatter for triggers, permissions, tools, and AI engine selection with a Markdown body containing natural-language instructions. The `gh aw compile` command validates that source and generates the `.lock.yml` workflow that GitHub Actions executes.
 
-Write a markdown file that describes what you want the agent to do, then run `gh aw compile` to turn it into a GitHub Actions workflow with strong security guardrails.
+GitHub Agentic Workflows complements deterministic GitHub Actions workflows. Keep builds, tests, linting, deployments, and reproducible scripts deterministic; use an agentic workflow when a task needs reasoning, investigation, interpretation, or content and code generation. The supported agent-job path defaults to sandboxing and read-only permissions, with controlled write operations available through safe outputs.
+
+Start with the [GitHub Agentic Workflows quickstart](/gh-aw/setup/quick-start/), then learn how to [create an agentic workflow](/gh-aw/setup/creating-workflows/), [choose an AI engine](/gh-aw/reference/engines/), [review the security architecture](/gh-aw/introduction/architecture/), or [browse the gallery by task](/gh-aw/gallery/).
 
 ## Project
 
-- **Repository**: [github/gh-aw](https://github.com/github/gh-aw)
-- **Install**: `gh extension install github/gh-aw`
-- **License**: [MIT](https://github.com/github/gh-aw/blob/main/LICENSE)
-- **Changelog**: [CHANGELOG.md](https://github.com/github/gh-aw/blob/main/CHANGELOG.md)
+| Resource | Link |
+| --- | --- |
+| Repository | [github/gh-aw](https://github.com/github/gh-aw) |
+| Install | `gh extension install github/gh-aw` |
+| License | [MIT](https://github.com/github/gh-aw/blob/main/LICENSE) |
+| Changelog | [CHANGELOG.md](https://github.com/github/gh-aw/blob/main/CHANGELOG.md) |
 
 ## Team
 
@@ -27,10 +31,6 @@ GitHub Agentic Workflows is built and maintained by the [GitHub Next](https://gi
 
 Join [GitHub Discussions](https://github.com/github/gh-aw/discussions) for questions, ideas, and announcements, share feedback in the [Community discussion](https://github.com/orgs/community/discussions/186451), or chat in the [GitHub Next Discord](https://gh.io/next-discord).
 
-## Contributing
+## Contributing and security
 
-Contributions are welcome. See [CONTRIBUTING.md](https://github.com/github/gh-aw/blob/main/CONTRIBUTING.md) for setup and guidelines.
-
-## Security
-
-For vulnerability reports, see [SECURITY.md](https://github.com/github/gh-aw/blob/main/SECURITY.md).
+Contributions are welcome. See [CONTRIBUTING.md](https://github.com/github/gh-aw/blob/main/CONTRIBUTING.md) for setup and guidelines. For vulnerability reports, see [SECURITY.md](https://github.com/github/gh-aw/blob/main/SECURITY.md).

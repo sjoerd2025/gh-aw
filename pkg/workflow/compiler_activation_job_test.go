@@ -30,6 +30,40 @@ const workflowCallRef = "${{ steps.resolve-host-repo.outputs.target_checkout_ref
 // callee repository in cross-repo scenarios.
 const sameRepoCondition = "steps.resolve-host-repo.outputs.target_repo == github.repository"
 
+func TestActivationArtifactUploadRunsAfterSuccessOrFailure(t *testing.T) {
+	compiler := NewCompiler()
+	job, err := compiler.buildActivationJob(&WorkflowData{Name: "Test Workflow"}, false, "", "test.lock.yml")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	steps := strings.Join(job.Steps, "")
+	uploadStep := extractWorkflowStepByName(t, steps, "Upload activation artifact")
+	assert.Contains(t, uploadStep, "if: success() || failure()")
+	assert.NotContains(t, uploadStep, "if: always()")
+}
+
+func TestOperationalValueGraderScopesActionsReadToActivation(t *testing.T) {
+	compiler := NewCompiler()
+	data := operationalValueGraderWorkflowData(".github/graders/example-operational-value.sh")
+	data.Name = "Operational Value"
+	data.StaleCheckDisabled = true
+	data.Permissions = "permissions:\n  contents: read"
+
+	job, err := compiler.buildActivationJob(data, false, "", "operational-value.lock.yml")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	assert.Contains(t, job.Permissions, "actions: read")
+	assert.Equal(t, "${{ steps.generate_aw_info.outputs.run_created_at }}", job.Outputs["run_created_at"])
+
+	steps := strings.Join(job.Steps, "")
+	assert.Contains(t, steps, "GH_AW_INFO_FETCH_RUN_CREATED_AT: \"true\"")
+	assert.Contains(t, steps, "await main(core, context)")
+
+	mainPermissions, err := compiler.buildMainJobPermissions(data)
+	require.NoError(t, err)
+	assert.NotContains(t, mainPermissions, "actions: read")
+}
+
 func TestGenerateCheckoutGitHubFolderForActivation_WorkflowCall(t *testing.T) {
 	tests := []struct {
 		name                  string
@@ -813,6 +847,45 @@ func TestGenerateCheckoutGitHubFolderForActivation_ActionsModeSetupPath(t *testi
 	}
 }
 
+func TestGenerateCheckoutGitHubFolderForActivation_LocalSkillSparseCheckout(t *testing.T) {
+	c := NewCompiler(WithVersion("dev"))
+	c.SetActionMode(ActionModeRelease)
+	data := &WorkflowData{
+		On: `"on":
+  issues:
+    types: [opened]`,
+		SkillReferences: []SkillReference{
+			{Skill: "skills/rig"},
+			{Skill: "./skills/another"},
+			{Skill: ".github/skills/infra"},
+			{Skill: "githubnext/skills@1f181b37d3fe5862ab590648f25a292e345b5de6"},
+		},
+	}
+
+	steps := c.generateCheckoutGitHubFolderForActivation(data)
+	combined := strings.Join(steps, "")
+
+	assert.Contains(t, combined, "\n            skills\n", "local skill dirs outside .github/.agents should be included in sparse checkout")
+	assert.Equal(t, 1, strings.Count(combined, "\n            skills\n"), "top-level local skill dir should not be duplicated")
+	assert.Contains(t, combined, "\n            .github\n", ".github remains in sparse checkout by default")
+}
+
+func TestLocalSkillSparseCheckoutTopLevelDirs(t *testing.T) {
+	data := &WorkflowData{
+		SkillReferences: []SkillReference{
+			{Skill: "skills/rig"},
+			{Skill: "./skills/another"},
+			{Skill: ".github/skills/infra"},
+			{Skill: "team-skills"},
+			{Skill: "skills/../bad"},
+			{Skill: "../outside"},
+			{Skill: "githubnext/skills@1f181b37d3fe5862ab590648f25a292e345b5de6"},
+		},
+	}
+
+	assert.Equal(t, []string{"skills", ".github", "team-skills"}, localSkillSparseCheckoutTopLevelDirs(data))
+}
+
 // TestGenerateGitHubFolderCheckoutStep_ExtraPaths verifies that extraPaths are
 // correctly appended to the sparse-checkout list.
 func TestGenerateGitHubFolderCheckoutStep_ExtraPaths(t *testing.T) {
@@ -1066,7 +1139,7 @@ func TestBuildActivationJobWrapsRepositoryStepErrors(t *testing.T) {
 	compiler := NewCompiler(WithVersion("dev"))
 	compiler.SetActionMode(ActionModeDev)
 
-	// Using the opencode engine with a malformed model (leading slash → empty provider prefix)
+	// Using the Pi engine with a malformed model (leading slash → empty provider prefix)
 	// causes computeActivationSanitizationDomains to return an error. NeedsTextOutput must
 	// be true so that addActivationTextOutputStep is reached and the error is triggered.
 	data := &WorkflowData{
@@ -1074,7 +1147,7 @@ func TestBuildActivationJobWrapsRepositoryStepErrors(t *testing.T) {
 		NeedsTextOutput: true,
 		Model:           "/bad-provider",
 		EngineConfig: &EngineConfig{
-			ID: "opencode",
+			ID: "pi",
 		},
 	}
 
@@ -1232,5 +1305,72 @@ func TestResolveSymlinkExtraPaths(t *testing.T) {
 			}
 		}
 		assert.Equal(t, 1, count, "already-present path should not be duplicated")
+	})
+}
+
+func TestActivationEventSet(t *testing.T) {
+	t.Run("string on value", func(t *testing.T) {
+		events, ok := activationEventSet("on: issues")
+		require.True(t, ok)
+		assert.Equal(t, map[string]struct{}{"issues": {}}, events)
+	})
+
+	t.Run("list on value", func(t *testing.T) {
+		events, ok := activationEventSet("on: [issues, pull_request]")
+		require.True(t, ok)
+		assert.Equal(t, map[string]struct{}{"issues": {}, "pull_request": {}}, events)
+	})
+
+	t.Run("map on value excludes metadata trigger fields", func(t *testing.T) {
+		onSection := "on:\n  issues:\n    types: [opened]\n  reaction: eyes\n  stop-after: +48h\n"
+		events, ok := activationEventSet(onSection)
+		require.True(t, ok)
+		assert.Equal(t, map[string]struct{}{"issues": {}}, events, "metadata fields like reaction/stop-after should be excluded")
+	})
+
+	t.Run("invalid yaml returns not ok", func(t *testing.T) {
+		events, ok := activationEventSet("on: [unterminated")
+		assert.False(t, ok)
+		assert.Empty(t, events)
+	})
+
+	t.Run("missing on key returns not ok", func(t *testing.T) {
+		events, ok := activationEventSet("permissions:\n  contents: read\n")
+		assert.False(t, ok)
+		assert.Empty(t, events)
+	})
+
+	t.Run("unsupported on value type returns not ok", func(t *testing.T) {
+		events, ok := activationEventSet("on: 5\n")
+		assert.False(t, ok)
+		assert.Empty(t, events)
+	})
+}
+
+func TestBuildCentralizedCommandOnSection(t *testing.T) {
+	t.Run("single event produces synthetic on section", func(t *testing.T) {
+		result := buildCentralizedCommandOnSection([]string{"issues"})
+		assert.Equal(t, "on:\n  issues:\n    types: [created]\n", result)
+	})
+
+	t.Run("pull_request_comment and issue_comment dedupe to issue_comment", func(t *testing.T) {
+		result := buildCentralizedCommandOnSection([]string{"pull_request_comment", "issue_comment"})
+		assert.Equal(t, "on:\n  issue_comment:\n    types: [created]\n", result)
+	})
+
+	t.Run("unknown identifiers produce empty on section", func(t *testing.T) {
+		result := buildCentralizedCommandOnSection([]string{"not-a-real-event"})
+		assert.Empty(t, result)
+	})
+
+	t.Run("empty input defaults to all comment events", func(t *testing.T) {
+		expected := "on:\n" +
+			"  issues:\n    types: [created]\n" +
+			"  issue_comment:\n    types: [created]\n" +
+			"  pull_request:\n    types: [created]\n" +
+			"  pull_request_review_comment:\n    types: [created]\n" +
+			"  discussion:\n    types: [created]\n" +
+			"  discussion_comment:\n    types: [created]\n"
+		assert.Equal(t, expected, buildCentralizedCommandOnSection(nil))
 	})
 }

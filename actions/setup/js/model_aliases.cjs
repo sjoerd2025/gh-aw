@@ -7,12 +7,23 @@
  * @returns {string}
  */
 function reduceModelNameToIdentifier(modelName) {
-  const normalized = String(modelName || "")
-    .trim()
-    .toLowerCase();
+  const normalized = stripModelProviderPrefix(
+    String(modelName || "")
+      .trim()
+      .toLowerCase()
+  );
   if (!normalized) return "";
 
   if (normalized === "opus" || normalized === "sonnet" || normalized === "haiku") {
+    return normalized;
+  }
+
+  // Exact-name shortcuts for opus/sonnet/haiku are handled above. This guard
+  // returns any remaining short (< 6 chars) pure-alphanumeric name verbatim so
+  // that tokens like "o1", "auto", or "gpt" are not padded with spurious zeros.
+  // Names containing non-alphanumeric characters (hyphens, pipes, etc.) fall
+  // through to the family shortcuts or the fallback sanitizer below.
+  if (normalized.length < 6 && /^[a-z0-9]+$/.test(normalized)) {
     return normalized;
   }
 
@@ -21,14 +32,22 @@ function reduceModelNameToIdentifier(modelName) {
   const FALLBACK_DIGIT_LENGTH = 2;
   const FALLBACK_PADDING_CHAR = "x";
 
+  /**
+   * @param {string} family - Fixed alphanumeric family name from the table below
+   * @returns {RegExp}
+   */
+  const buildFamilyVersionPattern = family =>
+    // eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- VERSION_SUFFIX_PATTERN is an intentional regex fragment and `family` is a fixed alphanumeric literal
+    new RegExp(`${family}${VERSION_SUFFIX_PATTERN}`);
+
   /** @type {Array<{ familyPattern: RegExp, versionPattern: RegExp, prefix: string }>} */
   const shortcuts = [
-    { familyPattern: /sonnet/, versionPattern: new RegExp(`sonnet${VERSION_SUFFIX_PATTERN}`), prefix: "sonnet" },
-    { familyPattern: /opus/, versionPattern: new RegExp(`opus${VERSION_SUFFIX_PATTERN}`), prefix: "opus" },
-    { familyPattern: /haiku/, versionPattern: new RegExp(`haiku${VERSION_SUFFIX_PATTERN}`), prefix: "haiku" },
-    { familyPattern: /gpt/, versionPattern: new RegExp(`gpt${VERSION_SUFFIX_PATTERN}`), prefix: "gpt" },
-    { familyPattern: /^o[0-9](?:$|[-_])/, versionPattern: new RegExp(`o${VERSION_SUFFIX_PATTERN}`), prefix: "o" },
-    { familyPattern: /gemini/, versionPattern: new RegExp(`gemini${VERSION_SUFFIX_PATTERN}`), prefix: "gem" },
+    { familyPattern: /sonnet/, versionPattern: buildFamilyVersionPattern("sonnet"), prefix: "sonnet" },
+    { familyPattern: /opus/, versionPattern: buildFamilyVersionPattern("opus"), prefix: "opus" },
+    { familyPattern: /haiku/, versionPattern: buildFamilyVersionPattern("haiku"), prefix: "haiku" },
+    { familyPattern: /gpt/, versionPattern: buildFamilyVersionPattern("gpt"), prefix: "gpt" },
+    { familyPattern: /^o[0-9](?:$|[-_])/, versionPattern: buildFamilyVersionPattern("o"), prefix: "o" },
+    { familyPattern: /gemini/, versionPattern: buildFamilyVersionPattern("gemini"), prefix: "gem" },
   ];
 
   for (const { familyPattern, versionPattern, prefix } of shortcuts) {
@@ -38,6 +57,20 @@ function reduceModelNameToIdentifier(modelName) {
   }
 
   return buildFallbackModelIdentifier(normalized, FALLBACK_LETTER_LENGTH, FALLBACK_DIGIT_LENGTH, FALLBACK_PADDING_CHAR);
+}
+
+/**
+ * Strip a provider prefix from a model name (e.g. "copilot/mai-code-1-flash-picker"
+ * becomes "mai-code-1-flash-picker") so the identifier reflects the model, not the provider.
+ *
+ * @param {string} normalizedModelName
+ * @returns {string}
+ */
+function stripModelProviderPrefix(normalizedModelName) {
+  const slashIndex = normalizedModelName.lastIndexOf("/");
+  if (slashIndex === -1) return normalizedModelName;
+  const modelPart = normalizedModelName.slice(slashIndex + 1).trim();
+  return modelPart || normalizedModelName;
 }
 
 /**
@@ -86,7 +119,8 @@ function extractKnownModelTierSuffix(normalizedModelName) {
  * @returns {boolean}
  */
 function hasDelimitedModelQualifier(normalizedModelName, qualifier) {
-  return new RegExp(`(^|[-_\\s])${qualifier}($|[-_\\s])`).test(normalizedModelName);
+  const escapedQualifier = qualifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[-_\\s])${escapedQualifier}($|[-_\\s])`).test(normalizedModelName);
 }
 
 /**

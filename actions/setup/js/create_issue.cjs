@@ -4,7 +4,7 @@
 const { sanitizeLabelContent } = require("./sanitize_label_content.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
-const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
+const { generateFooterWithMessages, getBodyFooterMessage, getDetectionCautionAlert } = require("./messages_footer.cjs");
 const { getBodyHeader, getDisclosureHeader } = require("./messages_header.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
@@ -20,7 +20,7 @@ const { renderTemplateFromFile } = require("./messages_core.cjs");
 const { createExpirationLine, addExpirationToFooter } = require("./ephemerals.cjs");
 const { MAX_SUB_ISSUES, getSubIssueCount, linkSubIssue } = require("./sub_issue_helpers.cjs");
 const { closeOlderIssues, searchOlderIssues, addIssueComment } = require("./close_older_issues.cjs");
-const { parseBoolTemplatable } = require("./templatable.cjs");
+const { parseBoolTemplatable, parseIntTemplatable } = require("./templatable.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
@@ -30,6 +30,7 @@ const { MAX_LABELS, MAX_ASSIGNEES } = require("./constants.cjs");
 const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
 const { parseDeduplicateByTitle, normalizeTitleForDedup, findDuplicateByTitle } = require("./issue_title_dedup.cjs");
 const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const MAX_GITHUB_BODY_LENGTH = 65536;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const ISSUE_FIELD_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const RECENTLY_CLOSED_DEDUP_DAYS = 30;
@@ -271,51 +272,63 @@ async function resolveIssueNodeId(githubClient, owner, repo, issueNumber) {
 }
 
 /**
+ * GraphQL query used to discover issue field definitions for a repository.
+ * Exported so integration tests can validate the exact query sent in production
+ * against the live schema, instead of maintaining a separate copy that could drift.
+ */
+const ISSUE_FIELDS_QUERY = `query($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    issueFields(first: 100) {
+      nodes {
+        __typename
+        ... on IssueFieldText {
+          id
+          name
+          dataType
+        }
+        ... on IssueFieldNumber {
+          id
+          name
+          dataType
+        }
+        ... on IssueFieldDate {
+          id
+          name
+          dataType
+        }
+        ... on IssueFieldSingleSelect {
+          id
+          name
+          dataType
+          options {
+            id
+            name
+          }
+        }
+        ... on IssueFieldMultiSelect {
+          id
+          name
+          dataType
+          options {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/**
  * Fetch issue field metadata from repository.
- * Returns configured field definitions including types, options, and iterations.
+ * Returns configured field definitions including types and options.
  * @param {Object} githubClient
  * @param {string} owner
  * @param {string} repo
  * @returns {Promise<Array<any>>}
  */
 async function fetchIssueFields(githubClient, owner, repo) {
-  const result = await githubClient.graphql(
-    `query($owner: String!, $repo: String!) {
-      repository(owner: $owner, name: $repo) {
-        issueFields(first: 100) {
-          nodes {
-            __typename
-            ... on IssueField {
-              id
-              name
-              dataType
-            }
-            ... on IssueFieldSingleSelect {
-              id
-              name
-              dataType
-              options {
-                id
-                name
-              }
-            }
-            ... on IssueFieldIteration {
-              id
-              name
-              dataType
-              configuration {
-                iterations {
-                  id
-                  title
-                }
-              }
-            }
-          }
-        }
-      }
-    }`,
-    { owner, repo }
-  );
+  const result = await githubClient.graphql(ISSUE_FIELDS_QUERY, { owner, repo });
 
   return Array.isArray(result?.repository?.issueFields?.nodes) ? result.repository.issueFields.nodes.filter(Boolean) : [];
 }
@@ -362,14 +375,23 @@ function buildIssueFieldMutationInput(requestedFields, availableFields) {
       return { fieldId: matchedField.id, singleSelectOptionId: selectedOption.id };
     }
 
-    if (dataType === "ITERATION") {
-      const iterations = matchedField?.configuration?.iterations;
-      const availableIterations = Array.isArray(iterations) ? iterations : [];
-      const selectedIteration = availableIterations.find(iteration => typeof iteration?.title === "string" && iteration.title.toLowerCase() === String(field.value).toLowerCase());
-      if (!selectedIteration) {
-        throw new Error(`${ERR_VALIDATION}: invalid iteration "${field.value}" for issue field "${field.name}". Available iterations: ${availableIterations.map(iteration => iteration.title).join(", ") || "(none)"}`);
+    if (dataType === "MULTI_SELECT") {
+      const options = Array.isArray(matchedField.options) ? matchedField.options : [];
+      const requestedValues = String(field.value)
+        .split(",")
+        .map(value => value.trim())
+        .filter(Boolean);
+      if (requestedValues.length === 0) {
+        throw new Error(`${ERR_VALIDATION}: issue field "${field.name}" requires at least one selected option`);
       }
-      return { fieldId: matchedField.id, singleSelectOptionId: selectedIteration.id };
+      const multiSelectOptionIds = requestedValues.map(value => {
+        const selectedOption = options.find(option => typeof option?.name === "string" && option.name.toLowerCase() === value.toLowerCase());
+        if (!selectedOption) {
+          throw new Error(`${ERR_VALIDATION}: invalid option "${value}" for issue field "${field.name}". Available options: ${options.map(option => option.name).join(", ") || "(none)"}`);
+        }
+        return selectedOption.id;
+      });
+      return { fieldId: matchedField.id, multiSelectOptionIds };
     }
 
     return { fieldId: matchedField.id, textValue: String(field.value) };
@@ -377,19 +399,121 @@ function buildIssueFieldMutationInput(requestedFields, availableFields) {
 }
 
 /**
- * Apply issue field values to a newly-created issue.
- * Resolves metadata and sends the setIssueFieldValue GraphQL mutation.
- * @param {{githubClient: Object, owner: string, repo: string, issueNumber: number, fields: Array<{name: string, value: string|number}>}} params
+ * Parse and resolve an issue reference used by create_issue.blocked_by.
+ * Supports issue numbers, cross-repository references, URLs, and temporary IDs.
+ *
+ * @param {string|number} value
+ * @param {Map<string, {repo: string, number: number}>} temporaryIdMap
+ * @param {string} defaultRepo
+ * @param {boolean} [allowUnresolvedTemporaryIds] - When true (staged mode), unresolved temporary IDs are reported instead of deferring
+ * @returns {{target: {repo: string, number: number}|null, deferred?: boolean, unresolvedTemporaryId?: string, error?: string}}
+ */
+function resolveBlockedByReference(value, temporaryIdMap, defaultRepo, allowUnresolvedTemporaryIds = false) {
+  const raw = String(value).trim();
+  if (isTemporaryId(raw)) {
+    const resolved = temporaryIdMap.get(normalizeTemporaryId(raw));
+    if (!resolved) {
+      if (allowUnresolvedTemporaryIds) {
+        return { target: null, unresolvedTemporaryId: raw };
+      }
+      return { target: null, deferred: true, error: `Unresolved temporary ID: ${raw}` };
+    }
+    return { target: { repo: resolved.repo, number: resolved.number } };
+  }
+
+  const numericMatch = raw.match(/^#?([1-9]\d*)$/);
+  const crossRepoMatch = raw.match(/^([\w.-]+\/[\w.-]+)#([1-9]\d*)$/);
+  const urlMatch = raw.match(/^https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/issues\/([1-9]\d*)(?:[?#/].*)?$/);
+  const match = crossRepoMatch || urlMatch;
+  const repo = match ? match[1] : defaultRepo;
+  const numberString = match ? match[2] : numericMatch?.[1];
+  const number = Number(numberString);
+
+  if (!repo || !Number.isSafeInteger(number) || number < 1) {
+    return {
+      target: null,
+      error: `Invalid blocked_by reference '${raw}'. Expected an issue number, owner/repo#number, GitHub issue URL, or temporary ID.`,
+    };
+  }
+  return { target: { repo, number } };
+}
+
+/**
+ * Normalize blocked_by to a list of resolved issue references.
+ *
+ * @param {unknown} blockedBy
+ * @param {Map<string, {repo: string, number: number}>} temporaryIdMap
+ * @param {string} defaultRepo
+ * @param {boolean} [allowUnresolvedTemporaryIds] - When true (staged mode), unresolved temporary IDs are kept as display-only references instead of deferring
+ * @returns {{targets: Array<{repo: string, number: number}>, references: Array<string>, deferred?: boolean, error?: string}}
+ */
+function resolveBlockedByReferences(blockedBy, temporaryIdMap, defaultRepo, allowUnresolvedTemporaryIds = false) {
+  if (blockedBy === undefined || blockedBy === null) {
+    return { targets: [], references: [] };
+  }
+  const values = Array.isArray(blockedBy) ? blockedBy : [blockedBy];
+  const targets = [];
+  // Display references in declared order, including temporary IDs left unresolved in staged mode
+  const references = [];
+  const seen = new Set();
+
+  for (const value of values) {
+    if (typeof value !== "string" && typeof value !== "number") {
+      return { targets: [], references: [], error: "create_issue 'blocked_by' must be an issue reference or an array of issue references" };
+    }
+    const resolved = resolveBlockedByReference(value, temporaryIdMap, defaultRepo, allowUnresolvedTemporaryIds);
+    if (resolved.deferred) {
+      return { targets: [], references: [], deferred: true, error: resolved.error };
+    }
+    if (resolved.unresolvedTemporaryId) {
+      if (!seen.has(resolved.unresolvedTemporaryId)) {
+        seen.add(resolved.unresolvedTemporaryId);
+        references.push(resolved.unresolvedTemporaryId);
+      }
+      continue;
+    }
+    if (!resolved.target) {
+      return { targets: [], references: [], error: resolved.error };
+    }
+    const key = `${resolved.target.repo.toLowerCase()}#${resolved.target.number}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      targets.push(resolved.target);
+      references.push(`${resolved.target.repo}#${resolved.target.number}`);
+    }
+  }
+  return { targets, references };
+}
+
+/**
+ * Discover and validate issue field mutation inputs against the repository's configured
+ * fields (schema, unknown-field, and invalid-option checks). Performed before issue
+ * creation so invalid `fields` payloads fail fast without leaving an orphaned issue.
+ * @param {Object} githubClient
+ * @param {string} owner
+ * @param {string} repo
+ * @param {Array<{name: string, value: string|number}>} fields
+ * @returns {Promise<Array<any>>}
+ */
+async function resolveIssueFieldMutationInput(githubClient, owner, repo, fields) {
+  if (!Array.isArray(fields) || fields.length === 0) {
+    return [];
+  }
+  const availableFields = await fetchIssueFields(githubClient, owner, repo);
+  return buildIssueFieldMutationInput(fields, availableFields);
+}
+
+/**
+ * Apply pre-validated issue field mutation inputs to a newly-created issue.
+ * @param {{githubClient: Object, owner: string, repo: string, issueNumber: number, issueFieldsInput: Array<any>}} params
  * @returns {Promise<void>}
  */
-async function applyIssueFields({ githubClient, owner, repo, issueNumber, fields }) {
-  if (!Array.isArray(fields) || fields.length === 0) {
+async function submitIssueFieldMutation({ githubClient, owner, repo, issueNumber, issueFieldsInput }) {
+  if (!Array.isArray(issueFieldsInput) || issueFieldsInput.length === 0) {
     return;
   }
 
   const issueId = await resolveIssueNodeId(githubClient, owner, repo, issueNumber);
-  const availableFields = await fetchIssueFields(githubClient, owner, repo);
-  const issueFields = buildIssueFieldMutationInput(fields, availableFields);
 
   await githubClient.graphql(
     `mutation($input: SetIssueFieldValueInput!) {
@@ -402,7 +526,7 @@ async function applyIssueFields({ githubClient, owner, repo, issueNumber, fields
     {
       input: {
         issueId,
-        issueFields,
+        issueFields: issueFieldsInput,
       },
     }
   );
@@ -546,6 +670,7 @@ async function main(config = {}) {
   // Create an authenticated GitHub client. Uses config["github-token"] when set
   // (for cross-repository operations), otherwise falls back to the step-level github.
   const githubClient = await createAuthenticatedGitHubClient(config);
+  const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
   let allowedMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
     allowedMentionAliases = config.allowedMentionAliases;
@@ -669,6 +794,17 @@ async function main(config = {}) {
     }
     const { repo: qualifiedItemRepo, repoParts } = repoResult;
 
+    // In staged mode no issues are created, so temporary IDs never resolve; validate the
+    // references without deferring so dependent issues still get a staged preview.
+    const blockedBy = resolveBlockedByReferences(message.blocked_by, temporaryIdMap, qualifiedItemRepo, isStaged);
+    if (blockedBy.deferred) {
+      core.info(`Deferring create_issue: ${blockedBy.error}`);
+      return { success: false, deferred: true, error: blockedBy.error };
+    }
+    if (blockedBy.error) {
+      return { success: false, error: blockedBy.error };
+    }
+
     // Get or generate the temporary ID for this issue
     const tempIdResult = getOrGenerateTemporaryId(message, "issue");
     if (tempIdResult.error) {
@@ -739,9 +875,15 @@ async function main(config = {}) {
       .filter((assignee, index, arr) => arr.indexOf(assignee) === index);
 
     let issueFields;
+    let preparedIssueFieldsInput = [];
     try {
       issueFields = normalizeIssueFields(message.fields);
       validateAllowedIssueFields(issueFields, allowedIssueFields);
+      if (issueFields.length > 0) {
+        // Discover and validate field schema/options before creating the issue so
+        // invalid `fields` payloads fail fast without leaving an orphaned issue.
+        preparedIssueFieldsInput = await resolveIssueFieldMutationInput(githubClient, repoParts.owner, repoParts.repo, issueFields);
+      }
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };
     }
@@ -775,7 +917,7 @@ async function main(config = {}) {
     processedBody = removeDuplicateTitleFromDescription(title, processedBody);
 
     // Sanitize body content to neutralize @mentions, URLs, and other security risks
-    processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases });
+    processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases, maxMentions });
 
     const bodyLines = processedBody.split("\n");
 
@@ -791,6 +933,15 @@ async function main(config = {}) {
 
     // Sanitize title for Unicode security and remove any duplicate prefixes
     title = sanitizeTitle(title, titlePrefix);
+
+    // Sanitization can empty the title (e.g. the agent supplied only the title
+    // prefix, or every character was stripped). GitHub rejects a blank title with
+    // "title can't be blank", which fails the whole safe_outputs job, so fall back
+    // to a generic title instead.
+    if (!title.trim()) {
+      core.warning(`create_issue title became empty after sanitization — falling back to "Agent Output"`);
+      title = "Agent Output";
+    }
 
     // Apply title prefix (only if it doesn't already exist)
     title = applyTitlePrefix(title, titlePrefix);
@@ -926,7 +1077,12 @@ async function main(config = {}) {
         expiresHours,
         "Issue"
       );
-      bodyLines.push(``, ``, footer);
+      bodyLines.push(``, footer);
+    }
+
+    const bodyFooter = getBodyFooterMessage(config.body_footer, { workflowName, runUrl });
+    if (bodyFooter) {
+      bodyLines.push(``, bodyFooter.trimEnd());
     }
 
     // Add standalone workflow-id marker for searchability (consistent with comments)
@@ -1013,6 +1169,10 @@ async function main(config = {}) {
     // If in staged mode, preview the issue without creating it
     if (isStaged) {
       logStagedPreviewInfo(`Would create issue in ${qualifiedItemRepo} with title: ${title}`);
+      const stagedBlockedBy = blockedBy.references;
+      if (stagedBlockedBy.length > 0) {
+        logStagedPreviewInfo(`Would mark issue as blocked by: ${stagedBlockedBy.join(", ")}`);
+      }
       if (deduplicateByTitle.enabled) {
         recordSeenTitle(qualifiedItemRepo, title, normalizedTitle);
       }
@@ -1028,11 +1188,15 @@ async function main(config = {}) {
           fields: issueFields,
           bodyLength: body.length,
           temporaryId,
+          ...(stagedBlockedBy.length > 0 ? { blockedBy: stagedBlockedBy } : {}),
         },
       };
     }
 
     try {
+      if (body.length > MAX_GITHUB_BODY_LENGTH) {
+        throw new Error(`${ERR_VALIDATION}: Issue body exceeds GitHub's maximum length of ${MAX_GITHUB_BODY_LENGTH} characters`);
+      }
       const { data: issue } = await withRetry(
         () =>
           githubClient.rest.issues.create({
@@ -1055,12 +1219,12 @@ async function main(config = {}) {
 
       if (issueFields.length > 0) {
         try {
-          await applyIssueFields({
+          await submitIssueFieldMutation({
             githubClient,
             owner: repoParts.owner,
             repo: repoParts.repo,
             issueNumber: issue.number,
-            fields: issueFields,
+            issueFieldsInput: preparedIssueFieldsInput,
           });
           core.info(`Applied ${issueFields.length} issue field(s) to ${qualifiedItemRepo}#${issue.number}`);
         } catch (error) {
@@ -1070,6 +1234,35 @@ async function main(config = {}) {
             success: false,
             error: `Issue ${qualifiedItemRepo}#${issue.number} was created, but issue fields could not be applied: ${fieldError}`,
           };
+        }
+      }
+
+      // Dependency attachment is best-effort: the issue already exists at this point,
+      // so a dependency API failure must not report the whole create_issue as failed.
+      /** @type {Array<string>} */
+      const blockedByFailures = [];
+      for (const blockedIssue of blockedBy.targets) {
+        const [blockedOwner, blockedRepo] = blockedIssue.repo.split("/");
+        try {
+          const { data: blocker } = await githubClient.rest.issues.get({
+            owner: blockedOwner,
+            repo: blockedRepo,
+            issue_number: blockedIssue.number,
+          });
+          if (!Number.isSafeInteger(blocker?.id) || blocker.id < 1) {
+            throw new Error(`${ERR_VALIDATION}: Issue ${blockedIssue.repo}#${blockedIssue.number} did not return a valid issue ID`);
+          }
+          await githubClient.request("POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by", {
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            issue_number: issue.number,
+            issue_id: blocker.id,
+          });
+          core.info(`Added blocked-by dependency: ${qualifiedItemRepo}#${issue.number} <- ${blockedIssue.repo}#${blockedIssue.number}`);
+        } catch (error) {
+          const dependencyError = getErrorMessage(error);
+          blockedByFailures.push(`${blockedIssue.repo}#${blockedIssue.number}: ${dependencyError}`);
+          core.warning(`Issue ${qualifiedItemRepo}#${issue.number} was created, but blocked-by dependency ${blockedIssue.repo}#${blockedIssue.number} could not be added: ${dependencyError}`);
         }
       }
 
@@ -1189,7 +1382,7 @@ async function main(config = {}) {
           core.info("✓ Successfully linked issue #" + issue.number + " as sub-issue of #" + effectiveParentIssueNumber);
         } catch (error) {
           core.info(`Warning: Could not link sub-issue to parent: ${getErrorMessage(error)}`);
-          core.info(`Error details: ${error instanceof Error ? error.stack : String(error)}`);
+          core.info(`Error details: ${error instanceof Error && error.stack ? error.stack : getErrorMessage(error)}`);
           // Fallback: add a comment if sub-issue linking fails
           try {
             core.info(`Attempting fallback: adding comment to parent issue #${effectiveParentIssueNumber}...`);
@@ -1215,6 +1408,7 @@ async function main(config = {}) {
         number: issue.number,
         url: issue.html_url,
         temporaryId: temporaryId,
+        ...(blockedByFailures.length > 0 ? { blocked_by_errors: blockedByFailures } : {}),
         _repo: qualifiedItemRepo, // For tracking in the closure
       };
     } catch (error) {
@@ -1236,4 +1430,4 @@ async function main(config = {}) {
   };
 }
 
-module.exports = { main, createParentIssueTemplate, searchForExistingParent, getSubIssueCount };
+module.exports = { main, createParentIssueTemplate, searchForExistingParent, getSubIssueCount, ISSUE_FIELDS_QUERY };

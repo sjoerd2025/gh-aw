@@ -7,7 +7,7 @@ import (
 	"github.com/github/gh-aw/pkg/setutil"
 )
 
-// commentOutProcessedFieldsInOnSection comments out draft, fork, forks, names, labels, manual-approval, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, needs, restore-memory, and stale-check fields in the on section
+// commentOutProcessedFieldsInOnSection comments out draft, max-stack, fork, forks, names, labels, manual-approval, cooldown, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, needs, restore-memory, and stale-check fields in the on section
 // These fields are processed separately and should be commented for documentation
 // Exception: names fields in sections with __gh_aw_native_label_filter__ marker in frontmatter are NOT commented out
 func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmatter map[string]any) string {
@@ -34,6 +34,7 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 	}
 
 	result = dedentTrailingOnCommentBlock(result)
+	frontmatterLog.Printf("Processed 'on' section: %d input lines, %d native label filter section(s)", len(lines), len(nativeLabelFilterSections))
 	return strings.Join(result, "\n")
 }
 
@@ -53,6 +54,7 @@ func newOnSectionLine(raw string) onSectionLine {
 
 type onSectionCleanupState struct {
 	inPullRequest                bool
+	inPullRequestReview          bool
 	inIssues                     bool
 	inDiscussion                 bool
 	inIssueComment               bool
@@ -119,7 +121,7 @@ func collectNativeLabelFilterSections(frontmatter map[string]any) map[string]str
 }
 
 func (s *onSectionCleanupState) inEventSection() bool {
-	return s.inPullRequest || s.inIssues || s.inDiscussion || s.inIssueComment
+	return s.inPullRequest || s.inPullRequestReview || s.inIssues || s.inDiscussion || s.inIssueComment
 }
 
 func (s *onSectionCleanupState) handleEventSectionEntry(info onSectionLine, result *[]string) bool {
@@ -140,7 +142,7 @@ func (s *onSectionCleanupState) detectEventSection(info onSectionLine) (string, 
 		return "", false
 	}
 	switch info.trimmed {
-	case "pull_request:", "issues:", "discussion:", "issue_comment:", "deployment_status:", "workflow_run:":
+	case "pull_request:", "pull_request_review:", "issues:", "discussion:", "issue_comment:", "deployment_status:", "workflow_run:":
 		return strings.TrimSuffix(info.trimmed, ":"), true
 	default:
 		return "", false
@@ -148,10 +150,12 @@ func (s *onSectionCleanupState) detectEventSection(info onSectionLine) (string, 
 }
 
 func (s *onSectionCleanupState) activateEventSection(section string, indent int) {
+	frontmatterLog.Printf("Entering event section %q at indent %d", section, indent)
 	s.resetTopLevelExtensionState()
 	s.inCommentBlock = false
 	s.commentBlockIndent = ""
 	s.inPullRequest = section == "pull_request"
+	s.inPullRequestReview = section == "pull_request_review"
 	s.inIssues = section == "issues"
 	s.inDiscussion = section == "discussion"
 	s.inIssueComment = section == "issue_comment"
@@ -198,6 +202,7 @@ func (s *onSectionCleanupState) leaveCurrentEventSection(info onSectionLine) {
 	}
 	if s.currentSectionIndent >= 0 && info.indent <= s.currentSectionIndent {
 		s.inPullRequest = false
+		s.inPullRequestReview = false
 		s.inIssues = false
 		s.inDiscussion = false
 		s.inIssueComment = false
@@ -392,6 +397,8 @@ func (s *onSectionCleanupState) commentSimpleTopLevelField(info onSectionLine) (
 	switch {
 	case strings.HasPrefix(info.trimmed, "manual-approval:"):
 		return true, " # Manual approval processed as environment field in activation job"
+	case strings.HasPrefix(info.trimmed, "cooldown:"):
+		return true, " # Cooldown processed as run history check in pre-activation job"
 	case strings.HasPrefix(info.trimmed, "stop-after:"):
 		return true, " # Stop-after processed as stop-time check in pre-activation job"
 	case strings.HasPrefix(info.trimmed, "restore-memory:"):
@@ -513,6 +520,8 @@ func (s *onSectionCleanupState) commentPullRequestAndTriggerField(info onSection
 	switch {
 	case s.inPullRequest && strings.Contains(info.trimmed, "draft:"):
 		return true, " # Draft filtering applied via job conditions"
+	case (s.inPullRequest || s.inPullRequestReview) && strings.HasPrefix(info.trimmed, "max-stack:"):
+		return true, " # Stack filtering applied via job conditions"
 	case s.inPullRequest && strings.HasPrefix(info.trimmed, "forks:"):
 		return true, " # Fork filtering applied via job conditions"
 	case s.inForksArray && strings.HasPrefix(info.trimmed, "-"):
@@ -663,6 +672,7 @@ func dedentTrailingOnCommentBlock(lines []string) []string {
 		}
 	}
 
+	frontmatterLog.Printf("Dedenting trailing 'on' comment block: lines %d-%d", start, last)
 	for i := start; i <= last; i++ {
 		lines[i] = strings.TrimLeft(lines[i], " \t")
 	}
@@ -702,7 +712,7 @@ func (c *Compiler) addZizmorIgnoreForWorkflowRun(yamlStr string) string {
 		// Match lines that are only 'workflow_run:' (possibly with trailing whitespace or a comment)
 		// e.g., 'workflow_run:', 'workflow_run: # comment', '  workflow_run:'
 		// But not 'someworkflow_run:', 'workflow_run: value', etc.
-		if idx := strings.Index(trimmedLine, "workflow_run:"); idx == 0 {
+		if strings.HasPrefix(trimmedLine, "workflow_run:") {
 			after := strings.TrimSpace(trimmedLine[len("workflow_run:"):])
 			// Only allow if nothing or only a comment follows
 			if after == "" || strings.HasPrefix(after, "#") {

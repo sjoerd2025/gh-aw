@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -406,8 +407,8 @@ updates:
 	}
 
 	updatedStr := string(updated)
-	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`) {
-		t.Fatal("managed github/gh-aw-actions ignore entry should be added")
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions/*"`) {
+		t.Fatal("managed github/gh-aw-actions wildcard ignore entry should be added")
 	}
 }
 
@@ -473,8 +474,8 @@ updates:
 	if !strings.Contains(updatedStr, `dependency-name: "actions/checkout"`) {
 		t.Fatal("user-defined ignore entry should be preserved")
 	}
-	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`) {
-		t.Fatal("managed github/gh-aw-actions ignore entry should be added")
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions/*"`) {
+		t.Fatal("managed github/gh-aw-actions wildcard ignore entry should be added")
 	}
 	if !strings.Contains(updatedStr, managedDependabotIgnoreComment) {
 		t.Fatal("managed ignore entry should include the compiler-managed inline comment")
@@ -512,17 +513,16 @@ updates:
 	if !strings.Contains(updatedStr, "ignore:") {
 		t.Fatal("ignore block should still be present")
 	}
-	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`) {
-		t.Fatal("managed github/gh-aw-actions ignore entry should be added when ignore is null")
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions/*"`) {
+		t.Fatal("managed github/gh-aw-actions wildcard ignore entry should be added when ignore is null")
 	}
 }
 
-func TestReconcileManagedDependabotIgnores_MigratesLegacyWildcardPattern(t *testing.T) {
+func TestReconcileManagedDependabotIgnores_DoesNotDuplicateExistingWildcard(t *testing.T) {
 	compiler := NewCompiler()
 	tempDir := testutil.TempDir(t, "test-*")
 	dependabotPath := filepath.Join(tempDir, "dependabot.yml")
 
-	// Simulate an existing dependabot.yml with the old /**  pattern added by a previous compiler version.
 	original := `version: 2
 updates:
   - package-ecosystem: github-actions
@@ -530,15 +530,13 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      - dependency-name: "github/gh-aw-actions/**" # Managed by gh aw compile. Version-locked to the gh-aw compiler; do not bump.
-      - dependency-name: "actions/checkout"
+      - dependency-name: "github/gh-aw-actions/*" # Managed by gh aw compile. Version-locked to the gh-aw compiler; do not bump.
 `
 	if err := os.WriteFile(dependabotPath, []byte(original), 0644); err != nil {
 		t.Fatalf("failed to write test dependabot.yml: %v", err)
 	}
 
-	err := compiler.ReconcileManagedDependabotIgnores(dependabotPath)
-	if err != nil {
+	if err := compiler.ReconcileManagedDependabotIgnores(dependabotPath); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 
@@ -546,18 +544,73 @@ updates:
 	if err != nil {
 		t.Fatalf("failed to read updated dependabot.yml: %v", err)
 	}
+	if string(updated) != original {
+		t.Fatal("existing compiler-managed wildcard ignore entry should not be duplicated or rewritten")
+	}
+}
 
+func TestReconcileManagedDependabotIgnores_UsesCustomActionsRepoWildcard(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.SetActionsRepo("owner/repo")
+	tempDir := testutil.TempDir(t, "test-*")
+	dependabotPath := filepath.Join(tempDir, "dependabot.yml")
+
+	original := `version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/.github/workflows"
+    schedule:
+      interval: weekly
+`
+	if err := os.WriteFile(dependabotPath, []byte(original), 0644); err != nil {
+		t.Fatalf("failed to write test dependabot.yml: %v", err)
+	}
+
+	if err := compiler.ReconcileManagedDependabotIgnores(dependabotPath); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	updated, err := os.ReadFile(dependabotPath)
+	if err != nil {
+		t.Fatalf("failed to read updated dependabot.yml: %v", err)
+	}
+	if !strings.Contains(string(updated), `dependency-name: "owner/repo/*"`) {
+		t.Fatal("custom actions repository wildcard ignore entry should be added")
+	}
+}
+
+func TestReconcileManagedDependabotIgnores_PreservesUserAuthoredExactPattern(t *testing.T) {
+	compiler := NewCompiler()
+	tempDir := testutil.TempDir(t, "test-*")
+	dependabotPath := filepath.Join(tempDir, "dependabot.yml")
+
+	original := `version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/.github/workflows"
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "github/gh-aw-actions"
+`
+	if err := os.WriteFile(dependabotPath, []byte(original), 0644); err != nil {
+		t.Fatalf("failed to write test dependabot.yml: %v", err)
+	}
+
+	if err := compiler.ReconcileManagedDependabotIgnores(dependabotPath); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	updated, err := os.ReadFile(dependabotPath)
+	if err != nil {
+		t.Fatalf("failed to read updated dependabot.yml: %v", err)
+	}
 	updatedStr := string(updated)
-	// The correct (non-wildcard) entry must be present so DependaBot respects the rule.
-	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`) {
-		t.Fatal("correct managed github/gh-aw-actions ignore entry should be added alongside the legacy entry")
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions"`+"\n") {
+		t.Fatal("user-authored exact ignore entry should be preserved")
 	}
-	// User-defined entries must be preserved.
-	if !strings.Contains(updatedStr, `dependency-name: "actions/checkout"`) {
-		t.Fatal("user-defined ignore entry should be preserved during migration")
-	}
-	if !strings.Contains(updatedStr, managedDependabotIgnoreComment) {
-		t.Fatal("managed ignore entry should include the compiler-managed inline comment")
+	if !strings.Contains(updatedStr, `dependency-name: "github/gh-aw-actions/*"`) {
+		t.Fatal("managed wildcard ignore entry should be added alongside user-authored exact entry")
 	}
 }
 
@@ -572,7 +625,7 @@ func TestGenerateDependabotManifests_NoDependencies(t *testing.T) {
 		},
 	}
 
-	err := compiler.GenerateDependabotManifests(workflows, tempDir, false)
+	err := compiler.GenerateDependabotManifests(context.Background(), workflows, tempDir, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -584,11 +637,33 @@ func TestGenerateDependabotManifests_NoDependencies(t *testing.T) {
 	}
 }
 
+// setupFakeFailingNpm puts a fake "npm" binary on PATH for the duration of the test
+// that always fails immediately, instead of letting tests hit the real npm registry
+// over the network, which is slow and unreliable in offline/sandboxed CI.
+func setupFakeFailingNpm(t *testing.T) {
+	t.Helper()
+	fakeBinDir := testutil.TempDir(t, "fake-bin-*")
+	fakeNpm := filepath.Join(fakeBinDir, "npm")
+	script := "#!/bin/sh\necho 'simulated npm failure' >&2\nexit 1\n"
+	if err := os.WriteFile(fakeNpm, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake npm binary: %v", err)
+	}
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 func TestGenerateDependabotManifests_WithDependencies(t *testing.T) {
 	compiler := NewCompiler()
 	tempDir := testutil.TempDir(t, "test-*")
 	workflowDir := filepath.Join(tempDir, ".github", "workflows")
 	os.MkdirAll(workflowDir, 0755)
+	fakeBinDir := testutil.TempDir(t, "fake-bin-*")
+	fakeNpm := filepath.Join(fakeBinDir, "npm")
+	if err := os.WriteFile(fakeNpm, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("failed to write fake npm binary: %v", err)
+	}
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	setupFakeFailingNpm(t)
 
 	// Workflow with npm dependencies
 	workflows := []*WorkflowData{
@@ -598,7 +673,7 @@ func TestGenerateDependabotManifests_WithDependencies(t *testing.T) {
 	}
 
 	// Note: This will fail npm install, but we can test the package.json generation
-	_ = compiler.GenerateDependabotManifests(workflows, workflowDir, false)
+	_ = compiler.GenerateDependabotManifests(context.Background(), workflows, workflowDir, false)
 
 	// In non-strict mode, npm failure is just a warning
 	// Check that package.json was created
@@ -632,6 +707,8 @@ func TestGenerateDependabotManifests_StrictMode(t *testing.T) {
 	workflowDir := filepath.Join(tempDir, ".github", "workflows")
 	os.MkdirAll(workflowDir, 0755)
 
+	setupFakeFailingNpm(t)
+
 	// Workflow with npm dependencies
 	workflows := []*WorkflowData{
 		{
@@ -640,16 +717,126 @@ func TestGenerateDependabotManifests_StrictMode(t *testing.T) {
 	}
 
 	// In strict mode, npm failure should cause an error
-	strictErr := compiler.GenerateDependabotManifests(workflows, workflowDir, false)
+	strictErr := compiler.GenerateDependabotManifests(context.Background(), workflows, workflowDir, false)
 
-	// We expect an error in strict mode when npm install fails
-	// (unless npm is installed and the package is available)
-	// The test validates that strict mode propagates errors correctly
-	if strictErr != nil {
-		// This is expected if npm is not available
-		if _, lookupErr := os.Stat("/usr/bin/npm"); os.IsNotExist(lookupErr) {
-			t.Logf("npm not available, strict mode error expected: %v", strictErr)
-		}
+	// We expect an error in strict mode since the fake npm always fails
+	if strictErr == nil {
+		t.Error("expected an error in strict mode when npm install fails")
+	}
+}
+
+func TestGeneratePackageLock_DisablesNpmScripts(t *testing.T) {
+	compiler := NewCompiler()
+	workflowDir := testutil.TempDir(t, "workflow-*")
+	fakeBinDir := testutil.TempDir(t, "fake-bin-*")
+
+	argsFile := filepath.Join(workflowDir, "npm-args.txt")
+	envFile := filepath.Join(workflowDir, "npm-ignore-scripts-env.txt")
+
+	fakeNpm := filepath.Join(fakeBinDir, "npm")
+	script := `#!/bin/sh
+printf "%s\n" "$@" > "$GH_AW_TEST_ARGS_FILE"
+printf "%s" "$NPM_CONFIG_IGNORE_SCRIPTS" > "$GH_AW_TEST_ENV_FILE"
+touch package-lock.json
+`
+	if err := os.WriteFile(fakeNpm, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake npm binary: %v", err)
+	}
+
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GH_AW_TEST_ARGS_FILE", argsFile)
+	t.Setenv("GH_AW_TEST_ENV_FILE", envFile)
+
+	if err := compiler.generatePackageLock(context.Background(), workflowDir); err != nil {
+		t.Fatalf("generatePackageLock() error = %v", err)
+	}
+
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read recorded npm args: %v", err)
+	}
+	args := string(argsData)
+	if !strings.Contains(args, "install\n") {
+		t.Fatalf("expected npm args to contain install, got: %q", args)
+	}
+	if !strings.Contains(args, "--package-lock-only\n") {
+		t.Fatalf("expected npm args to contain --package-lock-only, got: %q", args)
+	}
+	if !strings.Contains(args, "--ignore-scripts\n") {
+		t.Fatalf("expected npm args to contain --ignore-scripts, got: %q", args)
+	}
+
+	envData, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("failed to read recorded NPM_CONFIG_IGNORE_SCRIPTS: %v", err)
+	}
+	if string(envData) != "true" {
+		t.Fatalf("expected NPM_CONFIG_IGNORE_SCRIPTS=true, got: %q", string(envData))
+	}
+}
+
+func TestGeneratePackageLock_UsesNormalizedWorkflowDir(t *testing.T) {
+	compiler := NewCompiler()
+	parentDir := testutil.TempDir(t, "parent-*")
+	workflowDir := filepath.Join(parentDir, "workflow")
+	fakeBinDir := testutil.TempDir(t, "fake-bin-*")
+
+	if err := os.Mkdir(workflowDir, 0o755); err != nil {
+		t.Fatalf("failed to create workflow directory: %v", err)
+	}
+
+	pwdFile := filepath.Join(parentDir, "npm-pwd.txt")
+	fakeNpm := filepath.Join(fakeBinDir, "npm")
+	script := `#!/bin/sh
+pwd > "$GH_AW_TEST_PWD_FILE"
+touch package-lock.json
+`
+	if err := os.WriteFile(fakeNpm, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake npm binary: %v", err)
+	}
+
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GH_AW_TEST_PWD_FILE", pwdFile)
+	t.Chdir(parentDir)
+
+	if err := compiler.generatePackageLock(context.Background(), "workflow"); err != nil {
+		t.Fatalf("generatePackageLock() error = %v", err)
+	}
+
+	pwdData, err := os.ReadFile(pwdFile)
+	if err != nil {
+		t.Fatalf("failed to read recorded npm working directory: %v", err)
+	}
+	if strings.TrimSpace(string(pwdData)) != workflowDir {
+		t.Fatalf("expected npm to run in %q, got %q", workflowDir, strings.TrimSpace(string(pwdData)))
+	}
+	if _, err := os.Stat(filepath.Join(workflowDir, "package-lock.json")); err != nil {
+		t.Fatalf("expected package-lock.json in normalized workflow directory: %v", err)
+	}
+}
+
+func TestGeneratePackageLock_RejectsInvalidWorkflowDir(t *testing.T) {
+	compiler := NewCompiler()
+
+	tests := []struct {
+		name        string
+		workflowDir string
+	}{
+		{name: "empty", workflowDir: ""},
+		{name: "whitespace", workflowDir: "   "},
+		{name: "control character", workflowDir: "bad\nworkflow-dir"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := compiler.generatePackageLock(context.Background(), tt.workflowDir)
+			if err == nil {
+				t.Fatal("expected error for invalid workflow directory")
+			}
+			if !strings.Contains(err.Error(), "invalid workflow directory") {
+				t.Fatalf("expected invalid workflow directory error, got: %v", err)
+			}
+		})
 	}
 }
 
@@ -981,6 +1168,34 @@ func TestGenerateGoMod(t *testing.T) {
 	}
 }
 
+func TestGenerateGoMod_SkipsEmptyRequireBlock(t *testing.T) {
+	compiler := NewCompiler()
+	tempDir := testutil.TempDir(t, "test-*")
+	goModPath := filepath.Join(tempDir, "go.mod")
+
+	deps := []GoDependency{
+		{Path: "github.com/user/tool", Version: "latest"},
+		{Path: "golang.org/x/tools"},
+	}
+
+	if err := compiler.generateGoMod(goModPath, deps, false); err != nil {
+		t.Fatalf("failed to generate go.mod: %v", err)
+	}
+
+	data, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("failed to read go.mod: %v", err)
+	}
+
+	content := string(data)
+	if !strings.Contains(content, "module github.com/github/gh-aw-workflows-deps") {
+		t.Fatalf("go.mod should contain the generated module declaration:\n%s", content)
+	}
+	if strings.Contains(content, "require (") {
+		t.Fatalf("go.mod should not contain a require block when all dependencies are skipped:\n%s", content)
+	}
+}
+
 // Tests for multi-ecosystem support
 
 func TestGenerateDependabotConfig_MultipleEcosystems(t *testing.T) {
@@ -1049,6 +1264,8 @@ func TestGenerateDependabotManifests_AllEcosystems(t *testing.T) {
 	workflowDir := filepath.Join(tempDir, ".github", "workflows")
 	os.MkdirAll(workflowDir, 0755)
 
+	setupFakeFailingNpm(t)
+
 	// Workflow with npm, pip, and go dependencies
 	workflows := []*WorkflowData{
 		{
@@ -1060,8 +1277,8 @@ go install github.com/user/tool@v1.0.0
 		},
 	}
 
-	// This will skip npm install (no npm in test env), but should generate manifest files
-	_ = compiler.GenerateDependabotManifests(workflows, workflowDir, false)
+	// This will fail npm install (fake npm always fails), but should still generate manifest files
+	_ = compiler.GenerateDependabotManifests(context.Background(), workflows, workflowDir, false)
 
 	// Check that package.json was created
 	packageJSONPath := filepath.Join(workflowDir, "package.json")

@@ -3,6 +3,9 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -232,6 +235,33 @@ func TestAddRepoParameterIfNeededClosePullRequestWithAllowedRepos(t *testing.T) 
 	assert.Contains(t, repoProp["description"].(string), "org/default-repo", "description should include default repo")
 }
 
+func TestRepoTargetAccessorsMatchHandlerMetadata(t *testing.T) {
+	accessors := getRepoTargetAccessors()
+	for _, handler := range safeOutputHandlers {
+		if !isRepoTargetHandler(handler) {
+			continue
+		}
+
+		t.Run(handler.ToolName, func(t *testing.T) {
+			config := &SafeOutputsConfig{}
+			output := reflect.ValueOf(config).Elem().FieldByName(handler.StructField)
+			require.True(t, output.IsValid(), "handler struct field must exist")
+
+			output.Set(reflect.New(output.Type().Elem()))
+			output = output.Elem()
+			output.FieldByName("AllowedRepos").Set(reflect.ValueOf([]string{handler.ToolName + "/allowed"}))
+			output.FieldByName("TargetRepoSlug").SetString(handler.ToolName + "/target")
+
+			accessor, ok := accessors[handler.ToolName]
+			require.True(t, ok, "repo target handler must have an accessor")
+			targetConfig := accessor(config)
+			require.NotNil(t, targetConfig)
+			assert.Equal(t, []string{handler.ToolName + "/allowed"}, targetConfig.allowedRepos)
+			assert.Equal(t, handler.ToolName+"/target", targetConfig.targetRepoSlug)
+		})
+	}
+}
+
 func TestParseUpdateIssuesConfigWithWildcardTargetRepo(t *testing.T) {
 	compiler := &Compiler{}
 	outputMap := map[string]any{
@@ -256,7 +286,7 @@ func TestGenerateDispatchWorkflowToolBasic(t *testing.T) {
 		},
 	}
 
-	tool := generateDispatchWorkflowTool("deploy-app", workflowInputs)
+	tool := generateDispatchWorkflowTool("deploy-app", workflowInputs, nil)
 
 	assert.Equal(t, "deploy_app", tool["name"], "Tool name should be normalized")
 	assert.Equal(t, "deploy-app", tool["_workflow_name"], "Internal workflow name should be preserved")
@@ -276,7 +306,7 @@ func TestGenerateDispatchWorkflowToolBasic(t *testing.T) {
 
 // TestGenerateDispatchWorkflowToolEmptyInputs tests dispatch workflow tool with no inputs.
 func TestGenerateDispatchWorkflowToolEmptyInputs(t *testing.T) {
-	tool := generateDispatchWorkflowTool("simple-workflow", make(map[string]any))
+	tool := generateDispatchWorkflowTool("simple-workflow", make(map[string]any), nil)
 
 	assert.Equal(t, "simple_workflow", tool["name"], "Name should be normalized")
 
@@ -311,7 +341,7 @@ func TestGenerateDispatchWorkflowToolRequiredSorted(t *testing.T) {
 
 	// Run multiple times to catch non-determinism from map iteration
 	for i := range 10 {
-		tool := generateDispatchWorkflowTool("cleanup-worker", workflowInputs)
+		tool := generateDispatchWorkflowTool("cleanup-worker", workflowInputs, nil)
 
 		inputSchema, ok := tool["inputSchema"].(map[string]any)
 		require.True(t, ok, "inputSchema should be present (iteration %d)", i)
@@ -324,8 +354,76 @@ func TestGenerateDispatchWorkflowToolRequiredSorted(t *testing.T) {
 	}
 }
 
-// TestGenerateFilteredToolsJSONWithStandardOutputs tests that standard safe outputs produce
-// the expected tools in the filtered output (regression test for the completeness check).
+// TestGenerateDispatchWorkflowToolWithAllowedRefs tests that a 'ref' parameter is injected
+// into the tool schema when allowed-refs is configured. This ensures the agent can supply
+// a target ref that is validated against the configured glob patterns by the runtime handler.
+func TestGenerateDispatchWorkflowToolWithAllowedRefs(t *testing.T) {
+	workflowInputs := map[string]any{
+		"model": map[string]any{
+			"description": "Model to run",
+			"type":        "string",
+			"required":    true,
+		},
+	}
+	allowedRefs := []string{"silencer/*", "refs/heads/main"}
+
+	tool := generateDispatchWorkflowTool("t3000-unit-tests", workflowInputs, allowedRefs)
+
+	assert.Equal(t, "t3000_unit_tests", tool["name"], "Tool name should be normalized")
+
+	inputSchema, ok := tool["inputSchema"].(map[string]any)
+	require.True(t, ok, "inputSchema should be present")
+
+	properties, ok := inputSchema["properties"].(map[string]any)
+	require.True(t, ok, "properties should be present")
+
+	// ref property should be injected
+	refProp, ok := properties["ref"].(map[string]any)
+	require.True(t, ok, "ref property should exist when allowed-refs is configured")
+	assert.Equal(t, "string", refProp["type"], "ref property should be a string")
+	assert.Contains(t, refProp["description"].(string), "silencer/*", "ref description should mention allowed patterns")
+	assert.Contains(t, refProp["description"].(string), "refs/heads/main", "ref description should mention all allowed patterns")
+	assert.Contains(t, refProp["description"].(string), "pull request head", "ref description should explain the PR comment fallback")
+
+	// ref should not be in required (it is optional)
+	required, hasRequired := inputSchema["required"].([]string)
+	if hasRequired {
+		assert.NotContains(t, required, "ref", "ref should not be required")
+	}
+
+	// description should mention the allowed patterns
+	desc := tool["description"].(string)
+	assert.Contains(t, desc, "silencer/*", "tool description should mention allowed ref patterns")
+}
+
+// TestGenerateDispatchWorkflowToolNoRefWithoutAllowedRefs tests that no 'ref' property
+// is added when allowed-refs is not configured (nil or empty).
+func TestGenerateDispatchWorkflowToolNoRefWithoutAllowedRefs(t *testing.T) {
+	workflowInputs := map[string]any{
+		"platform": map[string]any{
+			"description": "Target platform",
+			"type":        "string",
+			"required":    true,
+		},
+	}
+
+	for _, allowedRefs := range [][]string{nil, {}} {
+		tool := generateDispatchWorkflowTool("build-workflow", workflowInputs, allowedRefs)
+
+		inputSchema, ok := tool["inputSchema"].(map[string]any)
+		require.True(t, ok, "inputSchema should be present")
+
+		properties, ok := inputSchema["properties"].(map[string]any)
+		require.True(t, ok, "properties should be present")
+
+		_, hasRef := properties["ref"]
+		assert.False(t, hasRef, "ref property should not be present when allowed-refs is not configured")
+
+		required, ok := inputSchema["required"].([]string)
+		require.True(t, ok, "required should be present for required workflow input")
+		assert.Equal(t, []string{"platform"}, required, "required should only include workflow inputs, not ref")
+	}
+}
 
 // TestComputeRequiredFieldRemovalsCloseDiscussion verifies that allow-body: false for
 // close-discussion produces a required field removal for the body field.
@@ -412,6 +510,26 @@ func TestComputeRequiredFieldAdditionsDisabledByDefault(t *testing.T) {
 	assert.Empty(t, additions)
 }
 
+func TestComputeRequiredFieldAdditionsSubmitPRReviewEventRequiredWhenCommentDisallowed(t *testing.T) {
+	additions := computeRequiredFieldAdditions(&SafeOutputsConfig{
+		SubmitPullRequestReview: &SubmitPullRequestReviewConfig{
+			AllowedEvents: []string{"APPROVE"},
+		},
+	})
+
+	assert.Equal(t, []string{"event"}, additions["submit_pull_request_review"])
+}
+
+func TestComputeRequiredFieldAdditionsSubmitPRReviewEventOptionalWhenCommentAllowed(t *testing.T) {
+	additions := computeRequiredFieldAdditions(&SafeOutputsConfig{
+		SubmitPullRequestReview: &SubmitPullRequestReviewConfig{
+			AllowedEvents: []string{"COMMENT", "REQUEST_CHANGES"},
+		},
+	})
+
+	assert.NotContains(t, additions, "submit_pull_request_review")
+}
+
 func TestComputeRequiredFieldAdditionsIssueIntentDefaultDisabled(t *testing.T) {
 	additions := computeRequiredFieldAdditions(&SafeOutputsConfig{
 		CloseIssues:   &CloseIssuesConfig{},
@@ -489,6 +607,54 @@ func TestComputePropertyInjectionsNilConfig(t *testing.T) {
 func TestComputePropertyInjectionsNilCloseIssues(t *testing.T) {
 	injections := computePropertyInjections(&SafeOutputsConfig{})
 	assert.Empty(t, injections)
+}
+
+// TestComputePropertyInjectionsNilSubmitPRReview verifies that nil submit-pull-request-review
+// does not add submit_pull_request_review property injections.
+func TestComputePropertyInjectionsNilSubmitPRReview(t *testing.T) {
+	injections := computePropertyInjections(&SafeOutputsConfig{
+		SubmitPullRequestReview: nil,
+	})
+	assert.NotContains(t, injections, "submit_pull_request_review")
+}
+
+// TestComputePropertyInjectionsAllowedEventsSubmitPRReview verifies that a configured
+// allowed-events list narrows the submit_pull_request_review event enum in the tool schema.
+func TestComputePropertyInjectionsAllowedEventsSubmitPRReview(t *testing.T) {
+	injections := computePropertyInjections(&SafeOutputsConfig{
+		SubmitPullRequestReview: &SubmitPullRequestReviewConfig{
+			AllowedEvents: []string{"COMMENT"},
+		},
+	})
+
+	require.Contains(t, injections, "submit_pull_request_review")
+	prop, ok := injections["submit_pull_request_review"]["event"].(map[string]any)
+	require.True(t, ok, "event should be a property map")
+	assert.Equal(t, []string{"COMMENT"}, prop["enum"])
+}
+
+// TestComputePropertyInjectionsAllowedEventsMultipleSubmitPRReview verifies multiple allowed
+// events are all present in the narrowed enum.
+func TestComputePropertyInjectionsAllowedEventsMultipleSubmitPRReview(t *testing.T) {
+	injections := computePropertyInjections(&SafeOutputsConfig{
+		SubmitPullRequestReview: &SubmitPullRequestReviewConfig{
+			AllowedEvents: []string{"COMMENT", "REQUEST_CHANGES"},
+		},
+	})
+
+	prop, ok := injections["submit_pull_request_review"]["event"].(map[string]any)
+	require.True(t, ok, "event should be a property map")
+	assert.Equal(t, []string{"COMMENT", "REQUEST_CHANGES"}, prop["enum"])
+}
+
+// TestComputePropertyInjectionsNoAllowedEventsSubmitPRReview verifies that no injection
+// happens when allowed-events is not configured, so the static schema's full enum applies.
+func TestComputePropertyInjectionsNoAllowedEventsSubmitPRReview(t *testing.T) {
+	injections := computePropertyInjections(&SafeOutputsConfig{
+		SubmitPullRequestReview: &SubmitPullRequestReviewConfig{},
+	})
+
+	assert.NotContains(t, injections, "submit_pull_request_review", "no allowed-events should not inject an event enum")
 }
 
 // TestPreprocessStateReasonListSlice verifies that a []any slice is converted to allowed-state-reason.
@@ -620,4 +786,76 @@ func TestComputePropertyInjectionsAddsGenericDataForBodyTypes(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, "#/0/inputSchema/$defs/structured_data", prop["$ref"])
 	}
+}
+
+// TestGenerateDynamicTools_DispatchWorkflow_YAMLExtension verifies that generateDynamicTools
+// correctly sets the .yaml extension in WorkflowFiles when the target workflow uses a .yaml file.
+func TestGenerateDynamicTools_DispatchWorkflow_YAMLExtension(t *testing.T) {
+	tmpDir := t.TempDir()
+	awDir := filepath.Join(tmpDir, ".github", "aw")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(awDir, 0755))
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+
+	// Create a .yaml workflow (not .yml) with a workflow_dispatch trigger
+	yamlWorkflow := "name: Deploy\non:\n  workflow_dispatch:\n    inputs:\n      env:\n        description: Environment\n        type: string\n"
+	require.NoError(t, os.WriteFile(filepath.Join(workflowsDir, "deploy.yaml"), []byte(yamlWorkflow), 0644))
+
+	markdownPath := filepath.Join(awDir, "gateway.md")
+
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			DispatchWorkflow: &DispatchWorkflowConfig{
+				Workflows: []string{"deploy"},
+			},
+		},
+	}
+
+	tools, err := generateDynamicTools(data, markdownPath)
+	require.NoError(t, err)
+
+	// WorkflowFiles must use .yaml, not .yml
+	require.NotNil(t, data.SafeOutputs.DispatchWorkflow.WorkflowFiles)
+	assert.Equal(t, ".yaml", data.SafeOutputs.DispatchWorkflow.WorkflowFiles["deploy"],
+		"WorkflowFiles extension must be .yaml when only .yaml exists")
+
+	// A tool must have been generated for the workflow
+	require.Len(t, tools, 1, "one tool expected for the dispatch workflow")
+	assert.Equal(t, "deploy", tools[0]["_workflow_name"])
+}
+
+// TestGenerateDynamicTools_CallWorkflow_YAMLExtension verifies that generateDynamicTools
+// correctly sets the .yaml extension in the WorkflowFiles relative path for call_workflow.
+func TestGenerateDynamicTools_CallWorkflow_YAMLExtension(t *testing.T) {
+	tmpDir := t.TempDir()
+	awDir := filepath.Join(tmpDir, ".github", "aw")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(awDir, 0755))
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+
+	// Create a .yaml reusable workflow (workflow_call trigger)
+	yamlWorkflow := "name: Worker\non:\n  workflow_call:\n    inputs:\n      task:\n        description: Task to run\n        type: string\n"
+	require.NoError(t, os.WriteFile(filepath.Join(workflowsDir, "worker.yaml"), []byte(yamlWorkflow), 0644))
+
+	markdownPath := filepath.Join(awDir, "gateway.md")
+
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			CallWorkflow: &CallWorkflowConfig{
+				Workflows: []string{"worker"},
+			},
+		},
+	}
+
+	tools, err := generateDynamicTools(data, markdownPath)
+	require.NoError(t, err)
+
+	// WorkflowFiles relative path must use .yaml, not .yml
+	require.NotNil(t, data.SafeOutputs.CallWorkflow.WorkflowFiles)
+	assert.Equal(t, "./.github/workflows/worker.yaml", data.SafeOutputs.CallWorkflow.WorkflowFiles["worker"],
+		"WorkflowFiles path must end in .yaml when only .yaml exists")
+
+	// A tool must have been generated for the call workflow
+	require.Len(t, tools, 1, "one tool expected for the call workflow")
+	assert.Equal(t, "worker", tools[0]["_call_workflow_name"])
 }

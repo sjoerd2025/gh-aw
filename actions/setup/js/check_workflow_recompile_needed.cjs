@@ -4,7 +4,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { getFooterWorkflowRecompileMessage, getFooterWorkflowRecompileCommentMessage, generateXMLMarker, getDetectionCautionAlert } = require("./messages_footer.cjs");
 const fs = require("fs");
-const { getGitAuthEnv } = require("./git_helpers.cjs");
+const { getGitAuthEnv } = require("./git_auth_helpers.cjs");
 const { resolvePullRequestRepo } = require("./pr_helpers.cjs");
 const { pushSignedCommits } = require("./push_signed_commits.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
@@ -111,7 +111,7 @@ async function filterFilesNeedingUpdate(comparisonRef, changedFiles, workspaceDi
     try {
       workingTreeContent = fs.readFileSync(workingTreePath, "utf8");
     } catch (err) {
-      throw new Error(`Failed to read file ${workingTreePath}: ${String(err)}`, { cause: err });
+      throw new Error(`Failed to read file ${workingTreePath}: ${getErrorMessage(err)}`, { cause: err });
     }
     const { stdout, exitCode } = await exec.getExecOutput("git", ["show", `${comparisonRef}:${file}`], {
       ignoreReturnCode: true,

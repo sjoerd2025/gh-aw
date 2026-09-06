@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -46,8 +47,7 @@ func TestValidateSandboxConfig(t *testing.T) {
 			data: &WorkflowData{
 				SandboxConfig: &SandboxConfig{
 					Agent: &AgentSandboxConfig{
-						Type:             SandboxTypeAWF,
-						NetworkIsolation: true,
+						Type: SandboxTypeAWF,
 					},
 				},
 				Tools: map[string]any{
@@ -64,10 +64,10 @@ func TestValidateSandboxConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "sandbox.agent false with valid justification",
+			name: "sandbox.agent false with feature enabled",
 			data: &WorkflowData{
 				Features: map[string]any{
-					"dangerously-disable-sandbox-agent": "controlled environment with no internet access",
+					"dangerously-disable-sandbox-agent": true,
 				},
 				SandboxConfig: &SandboxConfig{
 					Agent: &AgentSandboxConfig{
@@ -77,7 +77,7 @@ func TestValidateSandboxConfig(t *testing.T) {
 			},
 		},
 		{
-			name: "sandbox.agent false without justification",
+			name: "sandbox.agent false without feature",
 			data: &WorkflowData{
 				SandboxConfig: &SandboxConfig{
 					Agent: &AgentSandboxConfig{
@@ -89,10 +89,10 @@ func TestValidateSandboxConfig(t *testing.T) {
 			errorMsg:    "dangerously-disable-sandbox-agent",
 		},
 		{
-			name: "sandbox.agent false with short justification",
+			name: "sandbox.agent false with feature disabled",
 			data: &WorkflowData{
 				Features: map[string]any{
-					"dangerously-disable-sandbox-agent": "too short",
+					"dangerously-disable-sandbox-agent": false,
 				},
 				SandboxConfig: &SandboxConfig{
 					Agent: &AgentSandboxConfig{
@@ -101,13 +101,13 @@ func TestValidateSandboxConfig(t *testing.T) {
 				},
 			},
 			expectError: true,
-			errorMsg:    "at least 20 characters",
+			errorMsg:    "dangerously-disable-sandbox-agent",
 		},
 		{
-			name: "sandbox.agent false with expression justification",
+			name: "sandbox.agent false with legacy feature",
 			data: &WorkflowData{
 				Features: map[string]any{
-					"dangerously-disable-sandbox-agent": "${{ inputs.reason }}",
+					"dangerously-disable-sandbox": true,
 				},
 				SandboxConfig: &SandboxConfig{
 					Agent: &AgentSandboxConfig{
@@ -116,7 +116,22 @@ func TestValidateSandboxConfig(t *testing.T) {
 				},
 			},
 			expectError: true,
-			errorMsg:    "expressions",
+			errorMsg:    "dangerously-disable-sandbox-agent",
+		},
+		{
+			name: "sandbox.agent false with non-boolean feature",
+			data: &WorkflowData{
+				Features: map[string]any{
+					"dangerously-disable-sandbox-agent": "true",
+				},
+				SandboxConfig: &SandboxConfig{
+					Agent: &AgentSandboxConfig{
+						Disabled: true,
+					},
+				},
+			},
+			expectError: true,
+			errorMsg:    "dangerously-disable-sandbox-agent",
 		},
 	}
 
@@ -143,12 +158,13 @@ func TestApplySandboxDefaults(t *testing.T) {
 		expected               *SandboxConfig
 		expectDefaultWritePath bool
 		expectedAllowWrite     []string
+		unexpectedAllowWrite   []string
 	}{
 		{
 			name:                   "nil config creates default with AWF",
 			config:                 nil,
 			engine:                 &EngineConfig{ID: "copilot"},
-			expectDefaultWritePath: true,
+			expectDefaultWritePath: false,
 			expected: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
 					Type: SandboxTypeAWF,
@@ -163,7 +179,7 @@ func TestApplySandboxDefaults(t *testing.T) {
 				},
 			},
 			engine:                 &EngineConfig{ID: "copilot"},
-			expectDefaultWritePath: true,
+			expectDefaultWritePath: false,
 			expected: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
 					Type: SandboxTypeAWF,
@@ -180,7 +196,7 @@ func TestApplySandboxDefaults(t *testing.T) {
 				},
 			},
 			engine:                 &EngineConfig{ID: "gemini"},
-			expectDefaultWritePath: true,
+			expectDefaultWritePath: false,
 			expected: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
 					Type:    SandboxTypeAWF,
@@ -195,7 +211,7 @@ func TestApplySandboxDefaults(t *testing.T) {
 				Agent: &AgentSandboxConfig{},
 			},
 			engine:                 &EngineConfig{ID: "copilot"},
-			expectDefaultWritePath: true,
+			expectDefaultWritePath: false,
 			expected: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
 					Type: SandboxTypeAWF,
@@ -219,7 +235,10 @@ func TestApplySandboxDefaults(t *testing.T) {
 			},
 		},
 		{
-			name: "existing allowWrite entries are preserved",
+			// Explicit allowWrite on a compose runtime is honoured verbatim: no implicit
+			// default path is added, because narrowing compose bind mounts turns the
+			// container rootfs read-only and breaks AWF's /tmp/awf-init mount.
+			name: "existing allowWrite entries are preserved without seeding a default",
 			config: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
 					Type: SandboxTypeAWF,
@@ -231,8 +250,82 @@ func TestApplySandboxDefaults(t *testing.T) {
 				},
 			},
 			engine:                 &EngineConfig{ID: "claude"},
+			expectDefaultWritePath: false,
+			expectedAllowWrite:     []string{"/tmp/custom"},
+			expected: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type: SandboxTypeAWF,
+				},
+			},
+		},
+		{
+			// Cloud Hypervisor narrows the /workspace and /tmp/gh-aw exports independently,
+			// so the default write path alone would leave /workspace (and the CH-managed
+			// HOME under it) read-only. See ensureDefaultAgentWritePath.
+			name: "cloud-hypervisor runtime seeds agent, logs, workspace and awf-home write paths",
+			config: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type:    SandboxTypeAWF,
+					Runtime: AgentRuntimeCloudHypervisor,
+				},
+			},
+			engine:                 &EngineConfig{ID: "copilot"},
 			expectDefaultWritePath: true,
-			expectedAllowWrite:     []string{"/tmp/custom", defaultAgentWorkspaceWritePath},
+			expectedAllowWrite:     []string{defaultAgentWorkspaceWritePath, defaultAgentLogsWritePath, cloudHypervisorWorkspaceWritePath, cloudHypervisorAwfHomeWritePath},
+			expected: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type: SandboxTypeAWF,
+				},
+			},
+		},
+		{
+			name: "cloud-hypervisor runtime does not grant Copilot logs path to other engines",
+			config: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type:    SandboxTypeAWF,
+					Runtime: AgentRuntimeCloudHypervisor,
+				},
+			},
+			engine:                 &EngineConfig{ID: "claude"},
+			expectDefaultWritePath: true,
+			expectedAllowWrite:     []string{defaultAgentWorkspaceWritePath, cloudHypervisorWorkspaceWritePath, cloudHypervisorAwfHomeWritePath},
+			unexpectedAllowWrite:   []string{defaultAgentLogsWritePath},
+			expected: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type: SandboxTypeAWF,
+				},
+			},
+		},
+		{
+			name: "cloud-hypervisor runtime seeds mcp-config write path for codex engine",
+			config: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type:    SandboxTypeAWF,
+					Runtime: AgentRuntimeCloudHypervisor,
+				},
+			},
+			engine:                 &EngineConfig{ID: "codex"},
+			expectDefaultWritePath: true,
+			expectedAllowWrite:     []string{defaultAgentWorkspaceWritePath, constants.TmpMcpConfigDir, cloudHypervisorWorkspaceWritePath, cloudHypervisorAwfHomeWritePath},
+			unexpectedAllowWrite:   []string{defaultAgentLogsWritePath},
+			expected: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type: SandboxTypeAWF,
+				},
+			},
+		},
+		{
+			name: "cloud-hypervisor runtime does not grant codex mcp-config path to other engines",
+			config: &SandboxConfig{
+				Agent: &AgentSandboxConfig{
+					Type:    SandboxTypeAWF,
+					Runtime: AgentRuntimeCloudHypervisor,
+				},
+			},
+			engine:                 &EngineConfig{ID: "claude"},
+			expectDefaultWritePath: true,
+			expectedAllowWrite:     []string{defaultAgentWorkspaceWritePath, cloudHypervisorWorkspaceWritePath, cloudHypervisorAwfHomeWritePath},
+			unexpectedAllowWrite:   []string{constants.TmpMcpConfigDir},
 			expected: &SandboxConfig{
 				Agent: &AgentSandboxConfig{
 					Type: SandboxTypeAWF,
@@ -263,7 +356,85 @@ func TestApplySandboxDefaults(t *testing.T) {
 				require.NotNil(t, result.Agent.Config.Filesystem)
 				assert.Contains(t, result.Agent.Config.Filesystem.AllowWrite, expectedPath)
 			}
+			for _, unexpectedPath := range tt.unexpectedAllowWrite {
+				require.NotNil(t, result.Agent.Config)
+				require.NotNil(t, result.Agent.Config.Filesystem)
+				assert.NotContains(t, result.Agent.Config.Filesystem.AllowWrite, unexpectedPath)
+			}
 		})
+	}
+}
+
+func TestEnsureCacheMemoryWritePaths(t *testing.T) {
+	sandboxConfig := applySandboxDefaults(&SandboxConfig{
+		Agent: &AgentSandboxConfig{
+			Type:    SandboxTypeAWF,
+			Runtime: AgentRuntimeCloudHypervisor,
+		},
+	}, &EngineConfig{ID: "claude"})
+	cacheMemoryConfig := &CacheMemoryConfig{
+		Caches: []CacheMemoryEntry{
+			{ID: "default"},
+			{ID: "session"},
+		},
+	}
+
+	ensureCacheMemoryWritePaths(sandboxConfig, cacheMemoryConfig)
+	ensureCacheMemoryWritePaths(sandboxConfig, cacheMemoryConfig)
+
+	require.NotNil(t, sandboxConfig.Agent.Config)
+	require.NotNil(t, sandboxConfig.Agent.Config.Filesystem)
+	assert.Equal(t, []string{
+		defaultAgentWorkspaceWritePath,
+		cloudHypervisorWorkspaceWritePath,
+		cloudHypervisorAwfHomeWritePath,
+		"/tmp/gh-aw/cache-memory",
+		"/tmp/gh-aw/cache-memory-session",
+	}, sandboxConfig.Agent.Config.Filesystem.AllowWrite)
+}
+
+func TestEnsureRepoMemoryWritePaths(t *testing.T) {
+	sandboxConfig := applySandboxDefaults(&SandboxConfig{
+		Agent: &AgentSandboxConfig{
+			Type:    SandboxTypeAWF,
+			Runtime: AgentRuntimeCloudHypervisor,
+		},
+	}, &EngineConfig{ID: "claude"})
+	repoMemoryConfig := &RepoMemoryConfig{
+		Memories: []RepoMemoryEntry{
+			{ID: "default"},
+			{ID: "notes"},
+		},
+	}
+
+	ensureRepoMemoryWritePaths(sandboxConfig, repoMemoryConfig)
+	ensureRepoMemoryWritePaths(sandboxConfig, repoMemoryConfig)
+
+	require.NotNil(t, sandboxConfig.Agent.Config)
+	require.NotNil(t, sandboxConfig.Agent.Config.Filesystem)
+	assert.Equal(t, []string{
+		defaultAgentWorkspaceWritePath,
+		cloudHypervisorWorkspaceWritePath,
+		cloudHypervisorAwfHomeWritePath,
+		"/tmp/gh-aw/repo-memory/default",
+		"/tmp/gh-aw/repo-memory/notes",
+	}, sandboxConfig.Agent.Config.Filesystem.AllowWrite)
+}
+
+func TestEnsureRepoMemoryWritePathsSkipsNonCloudHypervisorRuntime(t *testing.T) {
+	sandboxConfig := applySandboxDefaults(&SandboxConfig{
+		Agent: &AgentSandboxConfig{
+			Type: SandboxTypeAWF,
+		},
+	}, &EngineConfig{ID: "claude"})
+	repoMemoryConfig := &RepoMemoryConfig{
+		Memories: []RepoMemoryEntry{{ID: "default"}},
+	}
+
+	ensureRepoMemoryWritePaths(sandboxConfig, repoMemoryConfig)
+
+	if sandboxConfig.Agent.Config != nil && sandboxConfig.Agent.Config.Filesystem != nil {
+		assert.NotContains(t, sandboxConfig.Agent.Config.Filesystem.AllowWrite, "/tmp/gh-aw/repo-memory/default")
 	}
 }
 
@@ -343,6 +514,58 @@ func TestMergeImportedSandboxAgentMounts(t *testing.T) {
 
 func TestDefaultAgentWorkspaceWritePath(t *testing.T) {
 	assert.Equal(t, "/tmp/gh-aw/agent", defaultAgentWorkspaceWritePath)
+}
+
+func TestMergeImportedSandboxAgentRuntimeInstall(t *testing.T) {
+	trueVal := true
+	falseVal := false
+
+	tests := []struct {
+		name     string
+		initial  *SandboxConfig
+		imported *bool
+		expected *bool
+	}{
+		{
+			name:     "nil import leaves config unchanged",
+			initial:  &SandboxConfig{Agent: &AgentSandboxConfig{RuntimeInstall: &trueVal}},
+			imported: nil,
+			expected: &trueVal,
+		},
+		{
+			name:     "false import overrides explicit true",
+			initial:  &SandboxConfig{Agent: &AgentSandboxConfig{RuntimeInstall: &trueVal}},
+			imported: &falseVal,
+			expected: &falseVal,
+		},
+		{
+			name:     "true import does not override explicit false",
+			initial:  &SandboxConfig{Agent: &AgentSandboxConfig{RuntimeInstall: &falseVal}},
+			imported: &trueVal,
+			expected: &falseVal,
+		},
+		{
+			name:     "true import initializes unset field",
+			initial:  &SandboxConfig{Agent: &AgentSandboxConfig{}},
+			imported: &trueVal,
+			expected: &trueVal,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			merged := mergeImportedSandboxAgentRuntimeInstall(tt.initial, tt.imported)
+			if tt.imported == nil {
+				assert.Equal(t, tt.initial, merged)
+				return
+			}
+
+			require.NotNil(t, merged)
+			require.NotNil(t, merged.Agent)
+			require.NotNil(t, merged.Agent.RuntimeInstall)
+			assert.Equal(t, *tt.expected, *merged.Agent.RuntimeInstall)
+		})
+	}
 }
 
 func TestWorkflowHashWithSandbox(t *testing.T) {

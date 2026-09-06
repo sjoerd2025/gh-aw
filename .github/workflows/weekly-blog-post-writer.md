@@ -8,6 +8,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  issues: read
   pull-requests: read
   actions: read
 tracker-id: weekly-blog-post-writer
@@ -37,8 +38,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
-
 tools:
   cli-proxy: true
   agentic-workflows:
@@ -81,10 +80,12 @@ steps:
       echo "Wrote pre-fetched merged PRs to /tmp/gh-aw/agent/merged-prs.json"
 
 imports:
+  - shared/mcp-pagination.md
   - shared/github-guard-policy.md
 
   - shared/otlp.md
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 7d
     title-prefix: "[blog] "

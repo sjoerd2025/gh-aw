@@ -11,17 +11,18 @@
 
 const { loadAgentOutput } = require("./load_agent_output.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { ERR_CONFIG, ERR_PARSE, ERR_VALIDATION } = require("./error_codes.cjs");
-const { hasUnresolvedTemporaryIds, replaceTemporaryIdReferences, replaceArtifactUrlReferences, normalizeTemporaryId } = require("./temporary_id.cjs");
+const { ERR_CONFIG, ERR_PARSE, ERR_VALIDATION, SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
+const { classifySafeOutputResult, computeSafeOutputsStatus, isFailedProcessingResult } = require("./safe_outputs_status.cjs");
+const { hasUnresolvedTemporaryIds, replaceTemporaryIdReferences, replaceArtifactUrlReferences, normalizeTemporaryId, extractTemporaryIdReferences, getCreatedTemporaryId } = require("./temporary_id.cjs");
 const { generateMissingInfoSections } = require("./missing_info_formatter.cjs");
 const { setCollectedMissings } = require("./missing_messages_helper.cjs");
 const { writeSafeOutputSummaries } = require("./safe_output_summary.cjs");
 const { getAssignToAgentAssigned, getAssignToAgentErrors, getAssignToAgentErrorCount, writeAssignToAgentSummary } = require("./assign_to_agent.cjs");
-const { getCreateAgentSessionNumber, getCreateAgentSessionUrl, writeCreateAgentSessionSummary } = require("./create_agent_session.cjs");
 const { createPrReviewBufferRegistry } = require("./pr_review_buffer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
-const { createManifestLogger, ensureManifestExists, extractCreatedItemFromResult, writeTemporaryIdMapFile } = require("./safe_output_manifest.cjs");
+const { parseIntTemplatable } = require("./templatable.cjs");
+const { createManifestLogger, ensureManifestExists, extractCreatedItemFromResult, writeTemporaryIdMapFile, writeSafeOutputErrorReport } = require("./safe_output_manifest.cjs");
 const { loadCustomSafeOutputJobTypes, loadCustomSafeOutputScriptHandlers, loadCustomSafeOutputActionHandlers, isStagedMode } = require("./safe_output_helpers.cjs");
 const { emitSafeOutputActionOutputs } = require("./safe_outputs_action_outputs.cjs");
 const { listCommentMemoryFiles, COMMENT_MEMORY_DIR } = require("./comment_memory_helpers.cjs");
@@ -36,7 +37,14 @@ const GITHUB_TOKEN_CONFIG_KEY = "github-token";
  * Maps safe output types to their handler module file paths
  */
 const HANDLER_MAP = {
+  linear_create_issue: "./linear_create_issue.cjs",
+  linear_add_comment: "./linear_add_comment.cjs",
+  linear_update_issue: "./linear_update_issue.cjs",
   create_issue: "./create_issue.cjs",
+  jira_create_issue: "./jira_create_issue.cjs",
+  jira_update_issue: "./jira_update_issue.cjs",
+  jira_add_comment: "./jira_add_comment.cjs",
+  jira_add_label: "./jira_add_label.cjs",
   add_comment: "./add_comment.cjs",
   comment_memory: "./comment_memory.cjs",
   create_discussion: "./create_discussion.cjs",
@@ -44,6 +52,7 @@ const HANDLER_MAP = {
   close_discussion: "./close_discussion.cjs",
   add_labels: "./add_labels.cjs",
   remove_labels: "./remove_labels.cjs",
+  replace_label: "./replace_label.cjs",
   update_issue: "./update_issue.cjs",
   update_discussion: "./update_discussion.cjs",
   link_sub_issue: "./link_sub_issue.cjs",
@@ -59,6 +68,7 @@ const HANDLER_MAP = {
   merge_pull_request: "./merge_pull_request.cjs",
   close_pull_request: "./close_pull_request.cjs",
   mark_pull_request_as_ready_for_review: "./mark_pull_request_as_ready_for_review.cjs",
+  approve_workflow_run: "./approve_workflow_run.cjs",
   hide_comment: "./hide_comment.cjs",
   set_issue_type: "./set_issue_type.cjs",
   set_issue_field: "./set_issue_field.cjs",
@@ -82,9 +92,16 @@ const HANDLER_MAP = {
   report_incomplete: "./report_incomplete_handler.cjs",
   create_report_incomplete_issue: "./create_report_incomplete_issue.cjs",
   create_project: "./create_project.cjs",
+  ado_create_work_item: "./create_work_item.cjs",
+  ado_update_work_item: "./update_work_item.cjs",
+  ado_comment_on_work_item: "./comment_on_work_item.cjs",
+  ado_assign_work_item: "./assign_work_item.cjs",
+  ado_link_work_items: "./link_work_items.cjs",
+  ado_upload_workitem_attachment: "./upload_workitem_attachment.cjs",
   create_project_status_update: "./create_project_status_update.cjs",
   update_project: "./update_project.cjs",
   upload_artifact: "./upload_artifact.cjs",
+  upload_code_coverage: "./upload_code_coverage.cjs",
 };
 
 /**
@@ -122,7 +139,12 @@ const WTD3_REQUIREMENT_ID = "WTD3";
  * @type {Set<string>}
  */
 const THREAT_WARNING_REVIEWABLE_TYPES = new Set([
+  "linear_create_issue",
+  "linear_add_comment",
   "create_issue",
+  "jira_create_issue",
+  "jira_update_issue",
+  "jira_add_comment",
   "add_comment",
   "create_pull_request",
   "comment_memory",
@@ -143,6 +165,8 @@ const THREAT_WARNING_REVIEWABLE_TYPES = new Set([
   "missing_data",
   "create_report_incomplete_issue",
   "report_incomplete",
+  "ado_create_work_item",
+  "ado_comment_on_work_item",
 ]);
 
 /**
@@ -161,6 +185,7 @@ const THREAT_WARNING_CONVERTIBLE_TYPES = new Map([["push_to_pull_request_branch"
  * @type {Set<string>}
  */
 const THREAT_WARNING_ABORT_TYPES = new Set([
+  "linear_update_issue",
   "noop",
   "close_issue",
   "link_sub_issue",
@@ -168,10 +193,13 @@ const THREAT_WARNING_ABORT_TYPES = new Set([
   "close_pull_request",
   "merge_pull_request",
   "mark_pull_request_as_ready_for_review",
+  "approve_workflow_run",
   "resolve_pull_request_review_thread",
   "dismiss_pull_request_review",
   "add_labels",
+  "jira_add_label",
   "remove_labels",
+  "replace_label",
   "add_reviewer",
   "assign_milestone",
   "assign_to_agent",
@@ -184,11 +212,16 @@ const THREAT_WARNING_ABORT_TYPES = new Set([
   "update_project",
   "upload_asset",
   "upload_artifact",
+  "upload_code_coverage",
   "dispatch_workflow",
   "dispatch_repository",
   "call_workflow",
   "autofix_code_scanning_alert",
   "create_agent_session",
+  "ado_update_work_item",
+  "ado_assign_work_item",
+  "ado_link_work_items",
+  "ado_upload_workitem_attachment",
 ]);
 
 /**
@@ -288,6 +321,14 @@ function loadConfig() {
 const PR_REVIEW_HANDLER_TYPES = new Set(["create_pull_request_review_comment", "submit_pull_request_review"]);
 
 /**
+ * @type {WeakMap<Map<string, Function>, Map<string, string>>} Records why configured handlers failed to
+ * load, keyed by the handler map returned from loadHandlers(). The reasons are surfaced when a message
+ * is skipped because no handler was loaded. Scoping by handler map keeps concurrent loadHandlers()
+ * invocations isolated from each other.
+ */
+const handlerLoadErrorsByHandlerMap = new WeakMap();
+
+/**
  * Wrap a handler so project-safe-output execution can temporarily bind global.github
  * to the handler-specific authenticated client.
  *
@@ -328,6 +369,10 @@ function wrapWithClientRebinding(type, messageHandler, handlerGithubClient) {
  */
 async function loadHandlers(config, prReviewBufferRegistry, resolvedAllowedMentionAliases = []) {
   const messageHandlers = new Map();
+
+  /** @type {Map<string, string>} */
+  const handlerLoadErrors = new Map();
+  handlerLoadErrorsByHandlerMap.set(messageHandlers, handlerLoadErrors);
 
   core.info("Loading and initializing safe output handlers based on configuration...");
 
@@ -379,6 +424,7 @@ async function loadHandlers(config, prReviewBufferRegistry, resolvedAllowedMenti
           messageHandlers.set(type, wrapWithClientRebinding(type, messageHandler, handlerGithubClient));
           core.info(`✓ Loaded and initialized handler for: ${type}`);
         } else {
+          handlerLoadErrors.set(type, "handler module does not export a main function");
           core.warning(`Handler module ${type} does not export a main function`);
         }
       } catch (error) {
@@ -388,6 +434,7 @@ async function loadHandlers(config, prReviewBufferRegistry, resolvedAllowedMenti
           throw error;
         }
         // For other errors (e.g., module not found), log warning and continue
+        handlerLoadErrors.set(type, errorMessage);
         core.warning(`Failed to load handler for ${type}: ${errorMessage}`);
       }
     } else {
@@ -432,11 +479,13 @@ async function loadHandlers(config, prReviewBufferRegistry, resolvedAllowedMenti
             core.info(`✓ Loaded and initialized custom script handler for: ${scriptType}`);
           }
         } else {
+          handlerLoadErrors.set(scriptType, "custom script module does not export a main function");
           core.warning(`Custom script handler module ${scriptType} does not export a main function — skipping`);
         }
       } catch (error) {
         // Non-fatal: log a warning and continue loading the remaining handlers. A broken
         // custom script should not prevent built-in or other custom handlers from running.
+        handlerLoadErrors.set(scriptType, getErrorMessage(error));
         core.warning(`Failed to load custom script handler for ${scriptType}: ${getErrorMessage(error)} — this handler will be skipped`);
       }
     }
@@ -463,9 +512,11 @@ async function loadHandlers(config, prReviewBufferRegistry, resolvedAllowedMenti
             core.info(`✓ Loaded and initialized custom action handler for: ${actionType}`);
           }
         } else {
+          handlerLoadErrors.set(actionType, "custom action module does not export a main function");
           core.warning(`Custom action handler module does not export a main function — skipping ${actionType}`);
         }
       } catch (error) {
+        handlerLoadErrors.set(actionType, getErrorMessage(error));
         core.warning(`Failed to load custom action handler for ${actionType}: ${getErrorMessage(error)} — this handler will be skipped`);
       }
     }
@@ -622,9 +673,6 @@ function rollbackReviewResultsForPR(results, repo, prNumber, errorMessage) {
  * the skip must be back-propagated here so the Processing Summary reflects the actual
  * outcome (skipped) rather than a misleading success count.
  *
- * Note: uses `skipReason` (not `reason`) so that the step-summary generator does not
- * treat these entries as delegated-step skips and omit them from the output.
- *
  * @param {Array<{type: string, success: boolean, skipped?: boolean, skipReason?: string}>} results - Processing results to mutate
  * @param {string} skipReason - Human-readable reason for the skip
  */
@@ -657,18 +705,8 @@ function skipReviewResultsForPR(results, repo, prNumber, skipReason) {
   }
 }
 
-/**
- * Determine whether a processing result is a non-skipped, non-deferred, non-cancelled failure.
- *
- * @param {{success?: boolean, deferred?: boolean, skipped?: boolean, cancelled?: boolean}|null|undefined} result
- * @returns {boolean}
- */
-function isFailedProcessingResult(result) {
-  return Boolean(result?.success === false && !result?.deferred && !result?.skipped && !result?.cancelled);
-}
-
 /** Types whose failures are surfaced as warnings rather than failing the safe_outputs job. */
-const REPORT_ONLY_FAILURE_TYPES = new Set(["assign_to_agent", "upload_artifact"]);
+const REPORT_ONLY_FAILURE_TYPES = new Set(["assign_to_agent", "upload_artifact", "upload_code_coverage"]);
 
 /**
  * Determine whether a failed result should be reported without failing the safe_outputs job.
@@ -698,6 +736,123 @@ function partitionFailureResults(results) {
 }
 
 /**
+ * Export item-level safe-output status as GitHub Actions outputs.
+ *
+ * @param {{itemsSucceeded: number, itemsApplied?: number, itemsSkipped?: number, itemsWarnings?: number, itemsCancelled?: number, itemsDeferred?: number, itemsFailed: number, status: string}} status
+ */
+function setSafeOutputsStatusOutputs(status) {
+  core.setOutput("items_succeeded", String(status.itemsSucceeded));
+  core.setOutput("items_applied", String(status.itemsApplied ?? status.itemsSucceeded));
+  core.setOutput("items_skipped", String(status.itemsSkipped ?? 0));
+  core.setOutput("items_warnings", String(status.itemsWarnings ?? 0));
+  core.setOutput("items_cancelled", String(status.itemsCancelled ?? 0));
+  core.setOutput("items_deferred", String(status.itemsDeferred ?? 0));
+  core.setOutput("items_failed", String(status.itemsFailed));
+  core.setOutput("status", status.status);
+}
+
+/**
+ * @param {string} type
+ * @param {number} messageIndex
+ * @param {Record<string, any>} result
+ * @returns {Record<string, any>}
+ */
+function buildSkippedResult(type, messageIndex, result) {
+  const message = result.reason || result.warning || result.error || "Handler returned skipped: true";
+  return {
+    type,
+    messageIndex,
+    success: result.success === true,
+    skipped: true,
+    ...(result.warning ? { warning: result.warning } : {}),
+    ...(result.reason ? { reason: result.reason } : {}),
+    ...(result.reasonCode ? { reasonCode: result.reasonCode } : {}),
+    ...(result.errorCode ? { errorCode: result.errorCode } : {}),
+    error: message,
+    result,
+  };
+}
+
+/**
+ * Compute the processing order (original message indices) so that temporary-ID
+ * producers run before consumers while preserving the original order for
+ * independent messages and dependency cycles.
+ *
+ * @param {Array<Record<string, any>>} messages
+ * @returns {Array<number>} original message indices in processing order
+ */
+function sortMessageIndicesByTemporaryIdDependencies(messages) {
+  const producers = new Map();
+  messages.forEach((message, index) => {
+    const temporaryId = getCreatedTemporaryId(message);
+    if (temporaryId && !producers.has(temporaryId)) {
+      producers.set(temporaryId, index);
+    }
+  });
+
+  /** @type {Array<Array<number>>} */
+  const dependents = messages.map(() => []);
+  const inDegree = messages.map(() => 0);
+  messages.forEach((message, index) => {
+    const dependencies = message.type === "create_issue" ? extractTemporaryIdReferences({ blocked_by: message.blocked_by }) : new Set();
+    for (const temporaryId of dependencies) {
+      const producerIndex = producers.get(temporaryId);
+      if (producerIndex !== undefined && producerIndex !== index) {
+        dependents[producerIndex].push(index);
+        inDegree[index]++;
+      }
+    }
+  });
+
+  /** @type {Array<number>} */
+  const ready = [];
+  /** @param {number} index */
+  const pushReady = index => {
+    // Keep the ready queue ordered by original message index so independent
+    // messages keep their original relative order (stable topological sort).
+    let position = ready.length;
+    while (position > 0 && ready[position - 1] > index) position--;
+    ready.splice(position, 0, index);
+  };
+  inDegree.forEach((degree, index) => {
+    if (degree === 0) pushReady(index);
+  });
+  /** @type {Array<number>} */
+  const sorted = [];
+  while (ready.length > 0) {
+    const index = ready.shift();
+    if (index === undefined) break;
+    sorted.push(index);
+    for (const dependentIndex of dependents[index]) {
+      inDegree[dependentIndex]--;
+      if (inDegree[dependentIndex] === 0) {
+        pushReady(dependentIndex);
+      }
+    }
+  }
+
+  if (sorted.length !== messages.length) {
+    core.warning("Temporary ID dependency cycle detected; preserving original order for cyclic safe outputs");
+    const sortedIndices = new Set(sorted);
+    for (let index = 0; index < messages.length; index++) {
+      if (!sortedIndices.has(index)) sorted.push(index);
+    }
+  }
+  return sorted;
+}
+
+/**
+ * Sort messages so temporary-ID producers run before consumers while preserving
+ * the original order for independent messages and dependency cycles.
+ *
+ * @param {Array<Record<string, any>>} messages
+ * @returns {Array<Record<string, any>>}
+ */
+function sortMessagesByTemporaryIdDependencies(messages) {
+  return sortMessageIndicesByTemporaryIdDependencies(messages).map(index => messages[index]);
+}
+
+/**
  * Process all messages from agent output in the order they appear
  * Dispatches each message to the appropriate handler while maintaining shared state (temporary ID map)
  * Tracks outputs created with unresolved temporary IDs and generates synthetic updates after resolution
@@ -708,6 +863,7 @@ function partitionFailureResults(results) {
  * @returns {Promise<{success: boolean, results: Array<any>, temporaryIdMap: Object, artifactUrlMap: Map<string, string>, outputsWithUnresolvedIds: Array<any>, missings: Object, codePushFailures: Array<{type: string, error: string}>}>}
  */
 async function processMessages(messageHandlers, messages, onItemCreated = null) {
+  const processingOrder = sortMessageIndicesByTemporaryIdDependencies(messages);
   const results = [];
   const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || "";
 
@@ -756,8 +912,9 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
 
   core.info(`Processing ${messages.length} message(s) in order of appearance...`);
 
-  // Process messages in order of appearance
-  for (let i = 0; i < messages.length; i++) {
+  // Process messages in dependency order while reporting original message indices
+  for (let position = 0; position < processingOrder.length; position++) {
+    const i = processingOrder[position];
     const message = messages[i];
     const messageType = message.type;
 
@@ -806,6 +963,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
           messageIndex: i,
           success: false,
           skipped: true,
+          delegated: true,
           reason: "Handled by standalone step",
         });
         continue;
@@ -840,20 +998,23 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
           messageIndex: i,
           success: false,
           skipped: true,
+          delegated: true,
           reason: "Handled by custom safe output job",
         });
         continue;
       }
 
       // Unknown message type - warn the user
-      core.warning(
-        `⚠️ No handler loaded for message type '${messageType}' (message ${i + 1}/${messages.length}). The message will be skipped. This may happen if the safe output type is not configured in the workflow's safe-outputs section.`
-      );
+      const loadError = handlerLoadErrorsByHandlerMap.get(messageHandlers)?.get(messageType);
+      const warning = loadError
+        ? `No handler available for message type '${messageType}' (message ${i + 1}/${messages.length}). The handler was configured but failed to load: ${loadError}`
+        : `No handler loaded for message type '${messageType}' (message ${i + 1}/${messages.length}). The message will be skipped. This may happen if the safe output type is not configured in the workflow's safe-outputs section.`;
+      core.warning(warning);
       results.push({
         type: messageType,
         messageIndex: i,
         success: false,
-        error: `No handler loaded for type '${messageType}'`,
+        error: loadError ? `No handler loaded for type '${messageType}': ${loadError}` : `No handler loaded for type '${messageType}'`,
       });
       continue;
     }
@@ -906,18 +1067,14 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
       // Call the message handler with the individual message and resolved temp IDs
       const result = await messageHandler(effectiveMessage, resolvedTemporaryIds, temporaryIdMap);
 
-      // Check if the handler explicitly returned a skipped result (e.g. if_no_changes: warn/ignore).
-      // Skipped results should NOT trigger fail-fast cancellation of subsequent messages.
-      if (result && result.success === false && result.skipped === true && !result.deferred) {
-        const msg = result.error || "Handler returned success: false with skipped: true";
+      // Check if the handler explicitly returned a skipped result (e.g. policy filters,
+      // no-op warnings, or if_no_changes: warn/ignore). Skipped results should NOT
+      // trigger fail-fast cancellation of subsequent messages, and any summary-safe
+      // diagnostics supplied by the handler must be preserved.
+      if (result && result.skipped === true && !result.deferred) {
+        const msg = result.reason || result.warning || result.error || "Handler returned skipped: true";
         core.info(`⏭ Message ${i + 1} (${messageType}) skipped — ${msg}`);
-        results.push({
-          type: messageType,
-          messageIndex: i,
-          success: false,
-          skipped: true,
-          error: msg,
-        });
+        results.push(buildSkippedResult(messageType, i, result));
         continue;
       }
 
@@ -967,6 +1124,11 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
         });
         core.info(`Registered temporary ID: ${result.temporaryId} -> ${result.repo}#${result.number}`);
       }
+      if (result && result.temporaryId && result.temporaryIdEntry) {
+        const normalizedTempId = normalizeTemporaryId(result.temporaryId);
+        temporaryIdMap.set(normalizedTempId, result.temporaryIdEntry);
+        core.info(`Registered Azure DevOps temporary ID: ${result.temporaryId}`);
+      }
 
       // If this was a successful upload_artifact, register the artifact URL so that
       // subsequent messages can have '#aw_ID' references replaced with the real URL.
@@ -1006,7 +1168,21 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
       // Check if this output was created with unresolved temporary IDs
       // For create_issue, create_discussion, add_comment - check if body has unresolved IDs
 
-      // Handle add_comment which returns an array of comments
+      // Handle the current add_comment result shape.
+      if (messageType === "add_comment" && result?.commentId && result?.repo) {
+        const contentToCheck = getContentToCheck(messageType, message, result);
+        if (contentToCheck && hasUnresolvedTemporaryIds(contentToCheck, temporaryIdMap, artifactUrlMap)) {
+          core.info(`Comment ${result.commentId} on ${result.repo}#${result.itemNumber} was created with unresolved temporary IDs - tracking for update`);
+          outputsWithUnresolvedIds.push({
+            type: messageType,
+            message,
+            result,
+            originalTempIdMapSize: tempIdMapSizeBefore,
+          });
+        }
+      }
+
+      // Handle the legacy add_comment result shape.
       if (messageType === "add_comment" && Array.isArray(result)) {
         const contentToCheck = getContentToCheck(messageType, message, result);
         if (contentToCheck && hasUnresolvedTemporaryIds(contentToCheck, temporaryIdMap, artifactUrlMap)) {
@@ -1017,12 +1193,7 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
               outputsWithUnresolvedIds.push({
                 type: messageType,
                 message: message,
-                result: {
-                  commentId: comment._tracking.commentId,
-                  itemNumber: comment._tracking.itemNumber,
-                  repo: comment._tracking.repo,
-                  isDiscussion: comment._tracking.isDiscussion,
-                },
+                result: { ...comment._tracking, ...(comment.body ? { body: comment.body } : {}) },
                 originalTempIdMapSize: tempIdMapSizeBefore,
               });
             }
@@ -1091,15 +1262,31 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
         // Call the handler again with updated temp ID map
         const result = await deferred.handler(deferred.message, resolvedTemporaryIds, temporaryIdMap);
 
+        if (result && result.skipped === true && !result.deferred) {
+          const msg = result.reason || result.warning || result.error || "Handler returned skipped: true";
+          core.info(`⏭ Retry of message ${deferred.messageIndex + 1} (${deferred.type}) skipped — ${msg}`);
+          const resultIndex = results.findIndex(r => r.messageIndex === deferred.messageIndex);
+          if (resultIndex >= 0) {
+            results[resultIndex] = buildSkippedResult(deferred.type, deferred.messageIndex, result);
+          }
+          continue;
+        }
+
         // Check if the handler explicitly returned a failure
         if (result && result.success === false && !result.deferred) {
           const errorMsg = result.error || "Handler returned success: false";
           core.error(`✗ Retry of message ${deferred.messageIndex + 1} (${deferred.type}) failed: ${errorMsg}`);
-          // Update the result to error
+          // Replace the deferred record so terminal retry failures classify as failed.
           const resultIndex = results.findIndex(r => r.messageIndex === deferred.messageIndex);
           if (resultIndex >= 0) {
-            results[resultIndex].success = false;
-            results[resultIndex].error = errorMsg;
+            results[resultIndex] = {
+              type: deferred.type,
+              messageIndex: deferred.messageIndex,
+              success: false,
+              deferred: false,
+              error: errorMsg,
+              result: { ...result, success: false, deferred: false, error: errorMsg },
+            };
           }
           continue;
         }
@@ -1141,6 +1328,10 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
                 originalTempIdMapSize: tempIdMapSizeBefore,
               });
             }
+            if (result && result.temporaryId && result.temporaryIdEntry) {
+              const normalizedTempId = normalizeTemporaryId(result.temporaryId);
+              temporaryIdMap.set(normalizedTempId, result.temporaryIdEntry);
+            }
           }
 
           // Update the result to success
@@ -1155,11 +1346,19 @@ async function processMessages(messageHandlers, messages, onItemCreated = null) 
           logCreatedItemFromResult(onItemCreated, deferred.type, result);
         }
       } catch (error) {
-        core.error(`✗ Retry of message ${deferred.messageIndex + 1} (${deferred.type}) failed: ${getErrorMessage(error)}`);
-        // Update the result to error
+        const errorMsg = getErrorMessage(error);
+        core.error(`✗ Retry of message ${deferred.messageIndex + 1} (${deferred.type}) failed: ${errorMsg}`);
+        // Replace the deferred record so terminal retry exceptions classify as failed.
         const resultIndex = results.findIndex(r => r.messageIndex === deferred.messageIndex);
         if (resultIndex >= 0) {
-          results[resultIndex].error = getErrorMessage(error);
+          results[resultIndex] = {
+            type: deferred.type,
+            messageIndex: deferred.messageIndex,
+            success: false,
+            deferred: false,
+            error: errorMsg,
+            result: { success: false, deferred: false, error: errorMsg },
+          };
         }
       }
     }
@@ -1196,7 +1395,7 @@ function getContentToCheck(messageType, message, result) {
     case "create_discussion":
       return message.body || "";
     case "add_comment":
-      return message.body || "";
+      return result?.body || message.body || "";
     case "comment_memory":
       return result?.managedBody || message.body || "";
     case "create_pull_request":
@@ -1213,9 +1412,11 @@ function getContentToCheck(messageType, message, result) {
  * @param {string} repo - Repository in "owner/repo" format
  * @param {number} issueNumber - Issue number to update
  * @param {string} updatedBody - Updated body content with resolved temp IDs
+ * @param {string[]} [allowedMentionAliases] - Mention aliases allowed by the workflow
+ * @param {number} [maxMentions] - Maximum distinct allowed mentions to preserve
  * @returns {Promise<void>}
  */
-async function updateIssueBody(github, context, repo, issueNumber, updatedBody, allowedMentionAliases = []) {
+async function updateIssueBody(github, context, repo, issueNumber, updatedBody, allowedMentionAliases = [], maxMentions = undefined) {
   const [owner, repoName] = repo.split("/");
 
   core.info(`Updating issue ${repo}#${issueNumber} body with resolved temporary IDs`);
@@ -1224,7 +1425,7 @@ async function updateIssueBody(github, context, repo, issueNumber, updatedBody, 
     owner,
     repo: repoName,
     issue_number: issueNumber,
-    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases }),
+    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases, maxMentions }),
   });
 
   core.info(`✓ Updated issue ${repo}#${issueNumber}`);
@@ -1237,9 +1438,11 @@ async function updateIssueBody(github, context, repo, issueNumber, updatedBody, 
  * @param {string} repo - Repository in "owner/repo" format
  * @param {number} prNumber - Pull request number to update
  * @param {string} updatedBody - Updated body content with resolved temp IDs
+ * @param {string[]} [allowedMentionAliases] - Mention aliases allowed by the workflow
+ * @param {number} [maxMentions] - Maximum distinct allowed mentions to preserve
  * @returns {Promise<void>}
  */
-async function updatePullRequestBody(github, context, repo, prNumber, updatedBody, allowedMentionAliases = []) {
+async function updatePullRequestBody(github, context, repo, prNumber, updatedBody, allowedMentionAliases = [], maxMentions = undefined) {
   const [owner, repoName] = repo.split("/");
 
   core.info(`Updating pull request ${repo}#${prNumber} body with resolved temporary IDs`);
@@ -1248,7 +1451,7 @@ async function updatePullRequestBody(github, context, repo, prNumber, updatedBod
     owner,
     repo: repoName,
     pull_number: prNumber,
-    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases }),
+    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases, maxMentions }),
   });
 
   core.info(`✓ Updated pull request ${repo}#${prNumber}`);
@@ -1261,9 +1464,11 @@ async function updatePullRequestBody(github, context, repo, prNumber, updatedBod
  * @param {string} repo - Repository in "owner/repo" format
  * @param {number} discussionNumber - Discussion number to update
  * @param {string} updatedBody - Updated body content with resolved temp IDs
+ * @param {string[]} [allowedMentionAliases] - Mention aliases allowed by the workflow
+ * @param {number} [maxMentions] - Maximum distinct allowed mentions to preserve
  * @returns {Promise<void>}
  */
-async function updateDiscussionBody(github, context, repo, discussionNumber, updatedBody, allowedMentionAliases = []) {
+async function updateDiscussionBody(github, context, repo, discussionNumber, updatedBody, allowedMentionAliases = [], maxMentions = undefined) {
   const [owner, repoName] = repo.split("/");
 
   core.info(`Updating discussion ${repo}#${discussionNumber} body with resolved temporary IDs`);
@@ -1301,7 +1506,7 @@ async function updateDiscussionBody(github, context, repo, discussionNumber, upd
 
   await github.graphql(mutation, {
     discussionId,
-    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases }),
+    body: sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases, maxMentions }),
   });
 
   core.info(`✓ Updated discussion ${repo}#${discussionNumber}`);
@@ -1315,14 +1520,16 @@ async function updateDiscussionBody(github, context, repo, discussionNumber, upd
  * @param {number} commentId - Comment ID to update
  * @param {string} updatedBody - Updated body content with resolved temp IDs
  * @param {boolean} isDiscussion - Whether this is a discussion comment
+ * @param {string[]} [allowedMentionAliases] - Mention aliases allowed by the workflow
+ * @param {number} [maxMentions] - Maximum distinct allowed mentions to preserve
  * @returns {Promise<void>}
  */
-async function updateCommentBody(github, context, repo, commentId, updatedBody, isDiscussion = false, allowedMentionAliases = []) {
+async function updateCommentBody(github, context, repo, commentId, updatedBody, isDiscussion = false, allowedMentionAliases = [], maxMentions = undefined) {
   const [owner, repoName] = repo.split("/");
 
   core.info(`Updating comment ${commentId} body with resolved temporary IDs`);
 
-  const sanitizedBody = sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases });
+  const sanitizedBody = sanitizeContent(updatedBody, { allowedAliases: allowedMentionAliases, maxMentions });
 
   if (isDiscussion) {
     // For discussion comments, we need to use GraphQL
@@ -1362,9 +1569,11 @@ async function updateCommentBody(github, context, repo, commentId, updatedBody, 
  * @param {Array<{type: string, message: any, result: any, originalTempIdMapSize: number}>} trackedOutputs - Outputs that need updating
  * @param {Map<string, {repo: string, number: number}>} temporaryIdMap - Current temporary ID map
  * @param {Map<string, string>} [artifactUrlMap] - Optional artifact URL map for resolving artifact references
+ * @param {string[]} [allowedMentionAliases] - Mention aliases allowed by the workflow
+ * @param {number} [maxMentions] - Maximum distinct allowed mentions to preserve
  * @returns {Promise<number>} Number of successful updates
  */
-async function processSyntheticUpdates(github, context, trackedOutputs, temporaryIdMap, artifactUrlMap, allowedMentionAliases = []) {
+async function processSyntheticUpdates(github, context, trackedOutputs, temporaryIdMap, artifactUrlMap, allowedMentionAliases = [], maxMentions = undefined) {
   let updateCount = 0;
 
   core.info(`\n=== Processing Synthetic Updates ===`);
@@ -1397,17 +1606,17 @@ async function processSyntheticUpdates(github, context, trackedOutputs, temporar
             // Update based on the original type
             switch (tracked.type) {
               case "create_issue":
-                await updateIssueBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases);
+                await updateIssueBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases, maxMentions);
                 updateCount++;
                 break;
               case "create_discussion":
-                await updateDiscussionBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases);
+                await updateDiscussionBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases, maxMentions);
                 updateCount++;
                 break;
               case "add_comment":
                 // Update comment using the tracked comment ID
                 if (tracked.result.commentId) {
-                  await updateCommentBody(github, context, tracked.result.repo, tracked.result.commentId, updatedContent, tracked.result.isDiscussion, allowedMentionAliases);
+                  await updateCommentBody(github, context, tracked.result.repo, tracked.result.commentId, updatedContent, tracked.result.isDiscussion, allowedMentionAliases, maxMentions);
                   updateCount++;
                 } else {
                   core.debug(`Skipping synthetic update for comment - comment ID not tracked`);
@@ -1415,14 +1624,14 @@ async function processSyntheticUpdates(github, context, trackedOutputs, temporar
                 break;
               case "comment_memory":
                 if (tracked.result.commentId) {
-                  await updateCommentBody(github, context, tracked.result.repo, tracked.result.commentId, updatedContent, false, allowedMentionAliases);
+                  await updateCommentBody(github, context, tracked.result.repo, tracked.result.commentId, updatedContent, false, allowedMentionAliases, maxMentions);
                   updateCount++;
                 } else {
                   core.debug(`Skipping synthetic update for comment_memory - comment ID not tracked`);
                 }
                 break;
               case "create_pull_request":
-                await updatePullRequestBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases);
+                await updatePullRequestBody(github, context, tracked.result.repo, tracked.result.number, updatedContent, allowedMentionAliases, maxMentions);
                 updateCount++;
                 break;
               default:
@@ -1448,6 +1657,24 @@ async function processSyntheticUpdates(github, context, trackedOutputs, temporar
 }
 
 /**
+ * Best-effort write of the structured safe-output failure report.
+ *
+ * The report is uploaded with the safe-outputs-items artifact (which uses
+ * `if: always()`), so a failing "Process Safe Outputs" step leaves behind
+ * machine-readable diagnostics even after the job logs expire. Writing the
+ * report must never mask the original failure, so errors are swallowed.
+ *
+ * @param {{errorCode?: string, message?: string, failures?: Array<{type?: string, errorCode?: string, error?: string}>}} report
+ */
+function recordSafeOutputFailure(report) {
+  try {
+    writeSafeOutputErrorReport({ status: "failure", ...report });
+  } catch (error) {
+    core.warning(`Failed to write safe output error report: ${getErrorMessage(error)}`);
+  }
+}
+
+/**
  * Main entry point for the handler manager
  * This is called by the consolidated safe output step
  *
@@ -1459,6 +1686,9 @@ async function main() {
   const isStaged = isStagedMode();
   /** @type {string | null} */
   let failedOutputsMessage = null;
+  /** @type {Array<{type?: string, errorCode?: string, error?: string}>} */
+  let failureDetails = [];
+  let statusOutputsSet = false;
 
   try {
     core.info("Safe Output Handler Manager starting...");
@@ -1483,6 +1713,8 @@ async function main() {
       if (!isStaged) ensureManifestExists();
       core.setOutput("temporary_id_map", "{}");
       core.setOutput("processed_count", "0");
+      setSafeOutputsStatusOutputs({ itemsSucceeded: 0, itemsFailed: 0, status: "success" });
+      statusOutputsSet = true;
       return;
     }
 
@@ -1504,6 +1736,7 @@ async function main() {
     }
 
     const allowedMentionAliases = config.mentions != null ? await resolveAllowedMentionsFromPayload(context, github, core, config.mentions) : [];
+    const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
 
     // Load and initialize handlers based on configuration (factory pattern)
     const messageHandlers = await loadHandlers(config, prReviewBufferRegistry, allowedMentionAliases);
@@ -1515,6 +1748,8 @@ async function main() {
       // Set empty outputs for downstream steps
       core.setOutput("temporary_id_map", "{}");
       core.setOutput("processed_count", "0");
+      setSafeOutputsStatusOutputs({ itemsSucceeded: 0, itemsFailed: 0, status: "success" });
+      statusOutputsSet = true;
       return;
     }
 
@@ -1585,28 +1820,30 @@ async function main() {
       // Convert temp ID map back to Map
       const temporaryIdMap = new Map(Object.entries(processingResult.temporaryIdMap));
 
-      syntheticUpdateCount = await processSyntheticUpdates(github, context, processingResult.outputsWithUnresolvedIds, temporaryIdMap, processingResult.artifactUrlMap, allowedMentionAliases);
+      syntheticUpdateCount = await processSyntheticUpdates(github, context, processingResult.outputsWithUnresolvedIds, temporaryIdMap, processingResult.artifactUrlMap, allowedMentionAliases, maxMentions);
     }
 
     // Write step summaries for all processed safe-outputs
     await writeSafeOutputSummaries(processingResult.results, allMessages);
 
     // Log summary
-    const successCount = processingResult.results.filter(r => r.success).length;
+    const safeOutputsStatus = computeSafeOutputsStatus(processingResult.results);
+    const successCount = safeOutputsStatus.itemsSucceeded;
     const { fatalFailures, reportOnlyFailures } = partitionFailureResults(processingResult.results);
     const failureCount = fatalFailures.length;
     const reportOnlyFailureCount = reportOnlyFailures.length;
     const cancelledCount = processingResult.results.filter(r => r.cancelled).length;
     const deferredCount = processingResult.results.filter(r => r.deferred).length;
-    const skippedStandaloneResults = processingResult.results.filter(r => r.skipped && r.reason === "Handled by standalone step");
-    const skippedCustomJobResults = processingResult.results.filter(r => r.skipped && r.reason === "Handled by custom safe output job");
+    const skippedStandaloneResults = processingResult.results.filter(r => r.delegated && r.reason === "Handled by standalone step");
+    const skippedCustomJobResults = processingResult.results.filter(r => r.delegated && r.reason === "Handled by custom safe output job");
     const skippedNoHandlerResults = processingResult.results.filter(r => !r.success && !r.skipped && r.error?.includes("No handler loaded"));
-    const skippedHandlerResults = processingResult.results.filter(r => r.skipped && !r.reason && !r.deferred && !r.cancelled);
+    const skippedHandlerResults = processingResult.results.filter(r => classifySafeOutputResult(r) === "skipped");
 
     core.info(`\n=== Processing Summary ===`);
     core.info(`Total messages: ${processingResult.results.length}`);
+    core.info(`Status: ${safeOutputsStatus.status}`);
     core.info(`Successful: ${successCount}`);
-    core.info(`Failed: ${failureCount}`);
+    core.info(`Failed: ${safeOutputsStatus.itemsFailed}`);
     if (reportOnlyFailureCount > 0) {
       core.info(`Reported assignment failures: ${reportOnlyFailureCount}`);
     }
@@ -1644,6 +1881,11 @@ async function main() {
       const failedItemLines = fatalFailures.map(r => `  - ${r.type}: ${r.error || "Unknown error"}`);
       const failedItems = failedItemLines.join("\n");
       failedOutputsMessage = `${failureCount} safe output(s) failed:\n${failedItems}`;
+      failureDetails = fatalFailures.map(r => ({
+        type: r.type,
+        ...(r.errorCode ? { errorCode: r.errorCode } : {}),
+        error: r.error || "Unknown error",
+      }));
     }
     if (reportOnlyFailureCount > 0) {
       const reportOnlyTypes = [...new Set(reportOnlyFailures.map(r => r.type || "unknown"))];
@@ -1671,12 +1913,15 @@ async function main() {
 
     // Export processed count for consistency with project handler
     core.setOutput("processed_count", String(successCount));
+    setSafeOutputsStatusOutputs(safeOutputsStatus);
+    statusOutputsSet = true;
 
     // Export assign_to_agent outputs when the handler was loaded
     if (messageHandlers.has("assign_to_agent")) {
-      const assignToAgentAssigned = getAssignToAgentAssigned();
-      const assignToAgentErrors = getAssignToAgentErrors();
-      const assignToAgentErrorCount = getAssignToAgentErrorCount();
+      const assignToAgentHandler = messageHandlers.get("assign_to_agent");
+      const assignToAgentAssigned = getAssignToAgentAssigned(assignToAgentHandler);
+      const assignToAgentErrors = getAssignToAgentErrors(assignToAgentHandler);
+      const assignToAgentErrorCount = getAssignToAgentErrorCount(assignToAgentHandler);
       core.setOutput("assign_to_agent_assigned", assignToAgentAssigned);
       core.setOutput("assign_to_agent_assignment_errors", assignToAgentErrors);
       core.setOutput("assign_to_agent_assignment_error_count", assignToAgentErrorCount.toString());
@@ -1684,17 +1929,19 @@ async function main() {
         core.warning(`${assignToAgentErrorCount} agent assignment(s) failed`);
       }
       core.info(`Exported assign_to_agent outputs (${assignToAgentErrorCount} error(s))`);
-      await writeAssignToAgentSummary();
+      await writeAssignToAgentSummary(assignToAgentHandler);
     }
 
     // Export create_agent_session outputs when the handler was loaded
     if (messageHandlers.has("create_agent_session")) {
-      const sessionNumber = getCreateAgentSessionNumber();
-      const sessionUrl = getCreateAgentSessionUrl();
+      /** @type {any} */
+      const createAgentSessionHandler = messageHandlers.get("create_agent_session");
+      const sessionNumber = createAgentSessionHandler.getSessionNumber();
+      const sessionUrl = createAgentSessionHandler.getSessionUrl();
       core.setOutput("session_number", sessionNumber);
       core.setOutput("session_url", sessionUrl);
       core.info(`Exported create_agent_session outputs (session_number=${sessionNumber})`);
-      await writeCreateAgentSessionSummary();
+      await createAgentSessionHandler.writeSummary();
     }
 
     // Export create_discussion errors for conclusion job
@@ -1742,16 +1989,22 @@ async function main() {
     if (!isStaged) ensureManifestExists();
 
     if (failedOutputsMessage !== null) {
+      recordSafeOutputFailure({ errorCode: SAFE_OUTPUT_E099, message: failedOutputsMessage, failures: failureDetails });
       core.setFailed(failedOutputsMessage);
       return;
     }
     core.info("Safe Output Handler Manager completed");
   } catch (error) {
     const handlerError = `${ERR_VALIDATION}: Handler manager failed: ${getErrorMessage(error)}`;
+    if (!statusOutputsSet) {
+      setSafeOutputsStatusOutputs({ itemsSucceeded: 0, itemsFailed: 0, status: "failure" });
+    }
     if (failedOutputsMessage !== null) {
+      recordSafeOutputFailure({ errorCode: ERR_VALIDATION, message: `${failedOutputsMessage}\n${handlerError}`, failures: failureDetails });
       core.setFailed(`${failedOutputsMessage}\n${handlerError}`);
       return;
     }
+    recordSafeOutputFailure({ errorCode: ERR_VALIDATION, message: handlerError, failures: failureDetails });
     core.setFailed(handlerError);
   } finally {
     // Guarantee the manifest file exists for artifact upload even when the handler fails.
@@ -1771,6 +2024,8 @@ module.exports = {
   loadConfig,
   loadHandlers,
   processMessages,
+  sortMessagesByTemporaryIdDependencies,
+  sortMessageIndicesByTemporaryIdDependencies,
   buildCommentMemoryMessagesFromFiles,
   rollbackReviewResults,
   rollbackReviewResultsForPR,
@@ -1780,4 +2035,7 @@ module.exports = {
   isFailedProcessingResult,
   isReportOnlyFailureResult,
   partitionFailureResults,
+  computeSafeOutputsStatus,
+  setSafeOutputsStatusOutputs,
+  processSyntheticUpdates,
 };

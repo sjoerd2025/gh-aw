@@ -10,6 +10,7 @@ import (
 )
 
 func TestGetNetworkFirewallCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	// Verify codemod metadata
@@ -21,6 +22,7 @@ func TestGetNetworkFirewallCodemod(t *testing.T) {
 }
 
 func TestNetworkFirewallCodemod_RemovesFirewallTrue(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -53,6 +55,7 @@ permissions:
 }
 
 func TestNetworkFirewallCodemod_RemovesFirewallFalse(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -82,10 +85,11 @@ permissions:
 	assert.NotContains(t, result, "firewall:", "Should remove firewall field")
 	assert.Contains(t, result, "sandbox:", "Should add sandbox block")
 	assert.Contains(t, result, "agent: false", "Should convert firewall false to sandbox.agent: false")
-	assert.NotContains(t, result, "dangerously-disable-sandbox-agent", "Codemod must not silently invent a justification; operator must provide one")
+	assert.NotContains(t, result, "dangerously-disable-sandbox-agent", "Codemod must not silently enable the sandbox opt-out; operator must provide it")
 }
 
 func TestNetworkFirewallCodemod_NoNetworkField(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -111,6 +115,7 @@ permissions:
 }
 
 func TestNetworkFirewallCodemod_NoFirewallField(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -142,6 +147,7 @@ permissions:
 }
 
 func TestNetworkFirewallCodemod_SkipsWhenSandboxExists(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -179,6 +185,7 @@ permissions:
 }
 
 func TestNetworkFirewallCodemod_MigratesFirewallFalseIntoExistingSandbox(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -209,10 +216,11 @@ sandbox:
 	assert.Contains(t, result, "sandbox:", "Should preserve existing sandbox block")
 	assert.Contains(t, result, "mcp: true", "Should preserve existing sandbox settings")
 	assert.Contains(t, result, "agent: false", "Should migrate firewall false to sandbox.agent: false")
-	assert.NotContains(t, result, "dangerously-disable-sandbox-agent", "Codemod must not silently invent a justification; operator must provide one")
+	assert.NotContains(t, result, "dangerously-disable-sandbox-agent", "Codemod must not silently enable the sandbox opt-out; operator must provide it")
 }
 
-func TestNetworkFirewallCodemod_PreservesExistingSandboxDisableJustification(t *testing.T) {
+func TestNetworkFirewallCodemod_PreservesExistingSandboxDisableFeature(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -220,7 +228,7 @@ on: workflow_dispatch
 network:
   firewall: false
 features:
-  dangerously-disable-sandbox-agent: "already documented justification string with enough detail"
+  dangerously-disable-sandbox-agent: true
 sandbox:
   mcp: true
 ---
@@ -233,7 +241,7 @@ sandbox:
 			"firewall": false,
 		},
 		"features": map[string]any{
-			"dangerously-disable-sandbox-agent": "already documented justification string with enough detail",
+			"dangerously-disable-sandbox-agent": true,
 		},
 		"sandbox": map[string]any{
 			"mcp": true,
@@ -244,11 +252,11 @@ sandbox:
 
 	require.NoError(t, err)
 	assert.True(t, applied)
-	assert.Contains(t, result, `dangerously-disable-sandbox-agent: "already documented justification string with enough detail"`)
-	assert.NotContains(t, result, "migrated from deprecated", "Should not overwrite existing justification with a generic one")
+	assert.Contains(t, result, "dangerously-disable-sandbox-agent: true")
 }
 
 func TestNetworkFirewallCodemod_MigratesFirewallVersionIntoExistingSandbox(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -287,6 +295,7 @@ sandbox:
 }
 
 func TestNetworkFirewallCodemod_PreservesOtherNetworkFields(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -321,6 +330,7 @@ network:
 }
 
 func TestNetworkFirewallCodemod_PreservesMarkdown(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -356,6 +366,7 @@ key: value
 }
 
 func TestNetworkFirewallCodemod_PreservesComments(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -388,6 +399,7 @@ network:
 }
 
 func TestNetworkFirewallCodemod_FirewallWithNestedProperties(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -427,6 +439,7 @@ permissions:
 }
 
 func TestNetworkFirewallCodemod_NullFirewallAddsSandboxAgent(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -454,6 +467,7 @@ network:
 }
 
 func TestNetworkFirewallCodemod_PreservesFirewallVersionInSandboxAgent(t *testing.T) {
+	t.Parallel()
 	codemod := getNetworkFirewallCodemod()
 
 	content := `---
@@ -485,6 +499,7 @@ network:
 }
 
 func TestNormalizeFirewallVersion_Float32Uses32BitPrecision(t *testing.T) {
+	t.Parallel()
 	version, ok := normalizeFirewallVersion(float32(0.9))
 	require.True(t, ok)
 	assert.Equal(t, "0.9", version)

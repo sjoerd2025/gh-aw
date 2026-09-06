@@ -39,6 +39,7 @@ func TestBuildExperimentSpecJSONWithConfigs(t *testing.T) {
 	experiments := map[string][]string{
 		"style": {"concise", "detailed"},
 	}
+
 	configs := map[string]*ExperimentConfig{
 		"style": {
 			Variants:    []string{"concise", "detailed"},
@@ -56,6 +57,26 @@ func TestBuildExperimentSpecJSONWithConfigs(t *testing.T) {
 	assert.Contains(t, got, `"start_date"`, "should include start_date key")
 	assert.Contains(t, got, `"end_date"`, "should include end_date key")
 	assert.Contains(t, got, "concise", "should include variant value")
+}
+
+func TestBuildExperimentSpecJSONWithContinualConfig(t *testing.T) {
+	experiments := map[string][]string{"optimization": {"control", "candidate"}}
+	configs := map[string]*ExperimentConfig{
+		"optimization": {
+			Variants: experiments["optimization"],
+			Continual: &ContinualExperimentConfig{
+				Seed: "stable-seed",
+				Ramp: []int{10, 25, 50},
+			},
+		},
+	}
+	got := buildExperimentSpecJSON(experiments, configs, []string{"optimization"})
+	assert.JSONEq(t, `{"optimization":{"variants":["control","candidate"],"continual":{"seed":"stable-seed","ramp":[10,25,50]}}}`, got)
+}
+
+func TestValidateContinualRamp(t *testing.T) {
+	require.NoError(t, validateContinualRamp("optimization", &ContinualExperimentConfig{Ramp: []int{5, 20, 50}}))
+	require.Error(t, validateContinualRamp("optimization", &ContinualExperimentConfig{Ramp: []int{20, 10}}))
 }
 
 func TestBuildExperimentSpecJSONEscaping(t *testing.T) {
@@ -131,6 +152,8 @@ func TestGenerateExperimentSteps_CacheStorage(t *testing.T) {
 func TestGenerateExperimentSteps_SpecJSON(t *testing.T) {
 	c := &Compiler{}
 	data := &WorkflowData{
+		FrontmatterHash: "frontmatter-hash",
+		BodyHash:        "body-hash",
 		Experiments: map[string][]string{
 			"style": {"concise", "detailed"},
 		},
@@ -138,6 +161,14 @@ func TestGenerateExperimentSteps_SpecJSON(t *testing.T) {
 	steps := c.generateExperimentSteps(data)
 	joined := strings.Join(steps, "")
 	assert.Contains(t, joined, `{"style":["concise","detailed"]}`, "spec JSON should be embedded in the step")
+	assert.Contains(t, joined, "GH_AW_HARNESS_VERSION: frontmatter-hash:body-hash", "assignment should use the compiled workflow hashes")
+}
+
+func TestExperimentHarnessVersionUsesAvailableCompiledHashes(t *testing.T) {
+	assert.Equal(t, "frontmatter-hash:body-hash", experimentHarnessVersion(&WorkflowData{FrontmatterHash: "frontmatter-hash", BodyHash: "body-hash"}))
+	assert.Equal(t, "frontmatter-hash", experimentHarnessVersion(&WorkflowData{FrontmatterHash: "frontmatter-hash"}))
+	assert.Equal(t, "body-hash", experimentHarnessVersion(&WorkflowData{BodyHash: "body-hash"}))
+	assert.Equal(t, "unknown", experimentHarnessVersion(&WorkflowData{}))
 }
 
 func TestGenerateExperimentSteps_SingleQuoteEscaping(t *testing.T) {
@@ -216,6 +247,8 @@ func TestBuildExperimentArtifactDownloadStep_NoPrefix(t *testing.T) {
 	joined := strings.Join(steps, "")
 	// Artifact name should include the sanitized workflow ID as prefix.
 	assert.Contains(t, joined, "          name: smokecopilot-experiment\n", "artifact name should include sanitized workflow ID")
+	assert.NotContains(t, joined, "          pattern: smokecopilot-experiment\n", "single-artifact downloads should avoid ambiguous pattern matching")
+	assert.NotContains(t, joined, "          merge-multiple: true\n", "single-artifact downloads should not merge multiple matches")
 }
 
 // ── extractExperimentConfigsFromFrontmatter ───────────────────────────────
@@ -433,7 +466,7 @@ func TestExtractExperimentsStorageFromFrontmatter(t *testing.T) {
 	tests := []struct {
 		name        string
 		frontmatter map[string]any
-		want        string
+		want        ExperimentStorageMode
 	}{
 		{
 			name:        "no experiments key returns repo default",
@@ -533,11 +566,37 @@ func TestParseExperimentMetricEvalReference(t *testing.T) {
 	}
 }
 
+func TestParseExperimentMetricGraderReference(t *testing.T) {
+	tests := []struct {
+		name      string
+		metric    string
+		wantID    string
+		wantMatch bool
+	}{
+		{name: "empty metric", metric: "", wantID: "", wantMatch: false},
+		{name: "normal metric", metric: "aic", wantID: "", wantMatch: false},
+		{name: "grader colon format", metric: "grader:loops", wantID: "loops", wantMatch: true},
+		{name: "grader dotted format", metric: "graders.loops", wantID: "loops", wantMatch: true},
+		{name: "grader dotted with suffix", metric: "graders.loops.value", wantID: "loops", wantMatch: true},
+		{name: "grader empty id", metric: "grader:", wantID: "", wantMatch: true},
+		{name: "graders empty id", metric: "graders.", wantID: "", wantMatch: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotID, gotMatch := ParseExperimentMetricGraderReference(tt.metric)
+			assert.Equal(t, tt.wantID, gotID)
+			assert.Equal(t, tt.wantMatch, gotMatch)
+		})
+	}
+}
+
 func TestValidateExperimentMetricReferences(t *testing.T) {
 	tests := []struct {
 		name    string
 		configs map[string]*ExperimentConfig
 		evals   *EvalsConfig
+		graders *GradersConfig
 		wantErr string
 	}{
 		{
@@ -546,6 +605,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 				"prompt_style": {Metric: "aic"},
 			},
 			evals:   nil,
+			graders: nil,
 			wantErr: "",
 		},
 		{
@@ -556,6 +616,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "builds", Question: "Does it build?"}},
 			},
+			graders: nil,
 			wantErr: "",
 		},
 		{
@@ -566,6 +627,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "builds", Question: "Does it build?"}},
 			},
+			graders: nil,
 			wantErr: "",
 		},
 		{
@@ -576,6 +638,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "tests", Question: "Do tests pass?"}},
 			},
+			graders: nil,
 			wantErr: `references unknown eval "builds"`,
 		},
 		{
@@ -584,6 +647,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 				"prompt_style": {Metric: "eval:builds"},
 			},
 			evals:   nil,
+			graders: nil,
 			wantErr: `references eval "builds" but no evals are declared`,
 		},
 		{
@@ -594,7 +658,8 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "builds", Question: "Does it build?"}},
 			},
-			wantErr: "must include a non-empty eval id",
+			graders: nil,
+			wantErr: "expected eval reference format eval:<question_id>",
 		},
 		{
 			name: "eval colon metric trims whitespace from id",
@@ -604,13 +669,124 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "builds", Question: "Does it build?"}},
 			},
+			graders: nil,
+			wantErr: "",
+		},
+		{
+			name: "grader metric references existing grader",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader:loops"},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"loops": {ID: "loops"},
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "grader dotted metric references existing grader",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "graders.loops.value"},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"loops": {ID: "loops"},
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "grader reference rejected when grader id is unknown",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader:loops"},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"retries": {ID: "retries"},
+				},
+			},
+			wantErr: `references unknown grader "loops"`,
+		},
+		{
+			name: "grader reference rejected when graders are not declared",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader:loops"},
+			},
+			evals:   nil,
+			graders: nil,
+			wantErr: `references grader "loops" but no graders are declared`,
+		},
+		{
+			name: "grader reference requires non empty id",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader:"},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"loops": {ID: "loops"},
+				},
+			},
+			wantErr: "expected grader reference format grader:<grader_id>",
+		},
+		{
+			name: "grader colon metric trims whitespace from id",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader: loops "},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"loops": {ID: "loops"},
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "grader guardrail references existing grader",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {
+					GuardrailMetrics: []GuardrailMetric{{Name: "grader:loops", Threshold: "<=1"}},
+				},
+			},
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{"loops": {ID: "loops"}},
+			},
+			wantErr: "",
+		},
+		{
+			name: "grader guardrail rejects unknown grader",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {
+					GuardrailMetrics: []GuardrailMetric{{Name: "grader:loops", Threshold: "<=1"}},
+				},
+			},
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{"retries": {ID: "retries"}},
+			},
+			wantErr: `guardrail_metrics: references unknown grader "loops"`,
+		},
+		{
+			name: "eval guardrail references existing eval",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {
+					GuardrailMetrics: []GuardrailMetric{{Name: "eval:quality", Threshold: ">=0.9"}},
+				},
+			},
+			evals: &EvalsConfig{
+				Questions: []EvalDefinition{{ID: "quality", Question: "Is quality acceptable?"}},
+			},
 			wantErr: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateExperimentMetricReferences(tt.configs, tt.evals)
+			err := validateExperimentMetricReferences(tt.configs, tt.evals, tt.graders)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 				return

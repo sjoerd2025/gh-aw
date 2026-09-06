@@ -27,11 +27,13 @@ func NewGeminiEngine() *GeminiEngine {
 			experimental:     false,
 			ghSkillAgentName: "gemini-cli",
 			capabilities: EngineCapabilities{
-				ToolsAllowlist:   true,
-				MaxTurns:         true,
-				MaxContinuations: false, // Gemini CLI does not support --max-autopilot-continues-style continuation mode
-				WebSearch:        false,
-				NativeAgentFile:  false, // Gemini does not support agent file natively; the compiler prepends the agent file content to prompt.txt
+				ToolsAllowlist:       true,
+				MCP:                  true,
+				MaxTurns:             true,
+				MaxContinuations:     false, // Gemini CLI does not support --max-autopilot-continues-style continuation mode
+				WebSearch:            false,
+				NativeAgentFile:      false, // Gemini does not support agent file natively; the compiler prepends the agent file content to prompt.txt
+				BashCommandAllowlist: true,  // Gemini enforces tools.bash allowlist via tools.core: [run_shell_command(cmd)]
 			},
 			dedicatedLLMGatewayPort: constants.GeminiLLMGatewayPort,
 		},
@@ -45,7 +47,7 @@ func (e *GeminiEngine) GetModelEnvVarName() string {
 }
 
 // GetRequiredSecretNames returns the list of secrets required by the Gemini engine
-// This includes GEMINI_API_KEY and optionally MCP_GATEWAY_API_KEY, GITHUB_MCP_SERVER_TOKEN,
+// This includes GEMINI_API_KEY and optionally MCP_GATEWAY_AGENT_ID, GITHUB_MCP_SERVER_TOKEN,
 // HTTP MCP header secrets, and mcp-scripts secrets.
 // When Google/Vertex WIF (github-oidc + provider=google) is configured, no static API key
 // is needed and only common MCP secrets are returned.
@@ -57,7 +59,7 @@ func (e *GeminiEngine) GetRequiredSecretNames(workflowData *WorkflowData) []stri
 		secrets = append(secrets, "GEMINI_API_KEY")
 	}
 
-	// Add common MCP secrets (MCP_GATEWAY_API_KEY if MCP servers present, mcp-scripts secrets)
+	// Add common MCP secrets (MCP_GATEWAY_AGENT_ID if MCP servers present, mcp-scripts secrets)
 	secrets = append(secrets, collectCommonMCPSecrets(workflowData)...)
 
 	// Add GitHub token for GitHub MCP server if present
@@ -89,15 +91,12 @@ func (e *GeminiEngine) GetSupportedEnvVarKeys() []string {
 // GetSecretValidationStep returns the secret validation step for the Gemini engine.
 // Returns an empty step if custom command is specified or if Google/Vertex WIF is configured.
 func (e *GeminiEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
-	if isGeminiVertexWIF(workflowData) {
-		return GitHubActionStep{}
-	}
-	return BuildDefaultSecretValidationStep(
-		workflowData,
-		[]string{"GEMINI_API_KEY"},
-		"Gemini CLI",
-		"https://geminicli.com/docs/get-started/authentication/",
-	)
+	return BuildEngineSecretValidationStep(workflowData, EngineSecretValidationConfig{
+		SecretNames: []string{"GEMINI_API_KEY"},
+		EngineName:  "Gemini CLI",
+		DocsURL:     "https://geminicli.com/docs/get-started/authentication/",
+		Skip:        isGeminiVertexWIF,
+	})
 }
 
 // isGeminiVertexWIF returns true when the workflow is configured to use Google
@@ -119,8 +118,8 @@ func (e *GeminiEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 
 	// Skip installation if custom command is specified
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
-		geminiLog.Printf("Skipping installation steps: custom command specified (%s)", workflowData.EngineConfig.Command)
-		return []GitHubActionStep{}
+		geminiLog.Printf("Skipping Gemini CLI installation: custom command specified (%s)", workflowData.EngineConfig.Command)
+		return buildNpmEngineInstallStepsWithAWF(nil, workflowData, false)
 	}
 
 	// Normalize engine config version when not explicitly set, so downstream consumers
@@ -184,7 +183,7 @@ func (e *GeminiEngine) GetPreBundleSteps(workflowData *WorkflowData) []GitHubAct
 }
 
 // GetExecutionSteps returns the GitHub Actions steps for executing Gemini
-func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string) []GitHubActionStep {
+func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile string) []GitHubActionStep { //nolint:largefunc // Existing Gemini step assembly is kept in generated order.
 	geminiLog.Printf("Generating execution steps for Gemini engine: workflow=%s, firewall=%v", workflowData.Name, isFirewallEnabled(workflowData))
 
 	var steps []GitHubActionStep
@@ -267,7 +266,7 @@ func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 
 		command = BuildAWFCommand(AWFCommandConfig{
 			EngineName:     "gemini",
-			EngineCommand:  geminiCommandWithPath,
+			EngineCommand:  buildShellHarnessCommand("gemini", geminiCommandWithPath),
 			LogFile:        logFile,
 			WorkflowData:   workflowData,
 			UsesTTY:        false,
@@ -285,7 +284,7 @@ func (e *GeminiEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 printf '%%s' "$(date +%%s%%3N)" > %s
 touch %s
 (umask 177 && touch %s)
-%s 2>&1 | tee -a %s`, AgentCLIStartMsPath, AgentStepSummaryPath, logFile, geminiCommand, logFile)
+%s 2>&1 | tee -a %s`, AgentCLIStartMsPath, AgentStepSummaryPath, logFile, buildShellHarnessCommand("gemini", geminiCommand), logFile)
 	}
 
 	// Build environment variables
@@ -293,9 +292,10 @@ touch %s
 	env := map[string]string{
 		"GH_AW_PROMPT": constants.AwPromptsFile,
 		// Tag the step as a GitHub AW agentic execution for discoverability by agents
-		"GITHUB_AW":        "true",
-		"GITHUB_WORKSPACE": "${{ github.workspace }}",
-		"RUNNER_TEMP":      "${{ runner.temp }}",
+		"GITHUB_AW":             "true",
+		"GITHUB_WORKSPACE":      "${{ github.workspace }}",
+		"RUNNER_TEMP":           "${{ runner.temp }}",
+		"GH_AW_TIMEOUT_MINUTES": resolveStepTimeoutValue(workflowData),
 		// Override GITHUB_STEP_SUMMARY with a path that exists inside the sandbox.
 		// The runner's original path is unreachable within the AWF isolated filesystem;
 		// we create this file before the agent starts and append it to the real
@@ -310,6 +310,7 @@ touch %s
 		// approval mode when the workspace is untrusted, which causes exit code 55.
 		"GEMINI_CLI_TRUST_WORKSPACE": "true",
 	}
+	applyPlaywrightBrowserEnv(env, workflowData)
 	if !vertexWIF {
 		// Set static API key when WIF is not configured.
 		// When WIF is active, authentication is handled by the AWF api-proxy sidecar
@@ -345,6 +346,7 @@ touch %s
 
 	// Add safe outputs env
 	applySafeOutputEnvToMap(env, workflowData)
+	applyDefaultMaxAICreditsEnvToMap(env, workflowData)
 
 	// Propagate W3C trace context so engine spans nest under the gh-aw.agent.setup span.
 	applyTraceContextEnvToMap(env)
@@ -400,6 +402,9 @@ touch %s
 		"        id: agentic_execution",
 	}
 
+	// Add timeout at step level (GitHub Actions standard)
+	stepLines = append(stepLines, "        timeout-minutes: "+resolveStepTimeoutValue(workflowData))
+
 	// Filter environment variables for security
 	allowedSecrets := e.GetRequiredSecretNames(workflowData)
 	filteredEnv := FilterEnvForSecrets(env, allowedSecrets)
@@ -409,7 +414,7 @@ touch %s
 	addCliProxyGHTokenToEnv(filteredEnv, workflowData)
 
 	// Format step with command and env
-	stepLines = FormatStepWithCommandAndEnv(stepLines, command, filteredEnv)
+	stepLines = FormatStepWithCommandAndEnv(stepLines, wrapAgentExecutionCommand(command), filteredEnv)
 
 	steps = append(steps, GitHubActionStep(stepLines))
 	return steps

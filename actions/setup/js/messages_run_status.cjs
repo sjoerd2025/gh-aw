@@ -7,8 +7,8 @@
  * for workflow execution notifications.
  */
 
-const { getMessages, renderTemplate, toSnakeCase } = require("./messages_core.cjs");
-const { getDetectionReasonText, getThreatDetectedMarkerTemplate, normalizeThreatKinds, isToolingFailureReason } = require("./threat_detection_warning.cjs");
+const { getMessages, renderTemplate, renderTemplateFromFile, toSnakeCase, getPromptPath } = require("./messages_core.cjs");
+const { getDetectionReasonText, getThreatDetectedMarkerTemplate, getThreatEngineErrorMarkerTemplate, normalizeThreatKinds, isToolingFailureReason } = require("./threat_detection_warning.cjs");
 
 /**
  * Renders a message using a custom template from config or a default template.
@@ -28,6 +28,7 @@ function renderConfiguredMessage(messageKey, defaultTemplate, ctx) {
  * @property {string} workflowName - Name of the workflow
  * @property {string} runUrl - URL of the workflow run
  * @property {string} eventType - Event type description (e.g., "issue", "pull request", "discussion")
+ * @property {string} [emoji] - Optional workflow emoji override
  */
 
 /**
@@ -36,7 +37,8 @@ function renderConfiguredMessage(messageKey, defaultTemplate, ctx) {
  * @returns {string} Run-started message
  */
 function getRunStartedMessage(ctx) {
-  return renderConfiguredMessage("runStarted", "🚀 [{workflow_name}]({run_url}) has started processing this {event_type}", ctx);
+  const normalizedEmoji = typeof ctx?.emoji === "string" && ctx.emoji.trim() ? ctx.emoji.trim() : "🚀";
+  return renderConfiguredMessage("runStarted", "{emoji} [{workflow_name}]({run_url}) has started processing this {event_type}", { ...ctx, emoji: normalizedEmoji });
 }
 
 /**
@@ -153,12 +155,15 @@ function getCommitPushedMessage(ctx) {
 function getDetectionWarningMessage(ctx) {
   const reasonText = getDetectionReasonText(ctx.reason);
   const isEngineError = isToolingFailureReason(ctx.reason);
-  if (isEngineError) {
-    const defaultTemplate = `> [!WARNING]\n> threat detection engine error\n> The threat detection engine encountered an error and could not complete analysis. This is a tooling failure, not a security finding.\n> ${getThreatDetectedMarkerTemplate()}\n>\n> <details>\n> <summary>Details</summary>\n>\n> {reason_text}\n>\n> Review the [workflow run logs]({run_url}) for details.\n> </details>`;
-    return renderConfiguredMessage("detectionEngineError", defaultTemplate, { ...ctx, reasonText, threatKinds: normalizeThreatKinds(ctx.reason) });
+  const templateFile = isEngineError ? "threat_detection_engine_error.md" : "threat_detection_caution.md";
+  const messageKey = isEngineError ? "detectionEngineError" : "detectionWarning";
+  const markerTemplate = isEngineError ? getThreatEngineErrorMarkerTemplate() : getThreatDetectedMarkerTemplate();
+  const messages = getMessages();
+  const configTemplate = messages?.[messageKey];
+  if (configTemplate) {
+    return renderTemplate(configTemplate, toSnakeCase({ ...ctx, reasonText, threat_detected_marker: markerTemplate, threatKinds: normalizeThreatKinds(ctx.reason) }));
   }
-  const defaultTemplate = `> [!CAUTION]\n> agentic threat detected\n> Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.\n> ${getThreatDetectedMarkerTemplate()}\n>\n> <details>\n> <summary>Details</summary>\n>\n> {reason_text}\n>\n> Review the [workflow run logs]({run_url}) for details.\n> </details>`;
-  return renderConfiguredMessage("detectionWarning", defaultTemplate, { ...ctx, reasonText, threatKinds: normalizeThreatKinds(ctx.reason) });
+  return renderTemplateFromFile(getPromptPath(templateFile), toSnakeCase({ ...ctx, reasonText, threat_detected_marker: markerTemplate, threatKinds: normalizeThreatKinds(ctx.reason) })).trimEnd();
 }
 
 module.exports = {

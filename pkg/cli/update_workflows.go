@@ -14,10 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/github/gh-aw/pkg/constants"
-
 	"github.com/github/gh-aw/pkg/console"
-	"github.com/github/gh-aw/pkg/gitutil"
+	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/semverutil"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -25,6 +24,7 @@ import (
 
 var defaultBranchCache sync.Map
 var branchCommitCache sync.Map
+var updateNoticeCache sync.Map
 
 // updatePublicAPIClient is a shared HTTP client used for unauthenticated GitHub
 // API fallback calls in the update workflow path. It carries a timeout to
@@ -42,6 +42,16 @@ type latestBranchCommitInfo struct {
 	CommittedAt time.Time
 }
 
+type cachedDefaultBranch struct {
+	branch string
+	err    error
+}
+
+type cachedBranchCommit struct {
+	info latestBranchCommitInfo
+	err  error
+}
+
 // clearUpdateResolutionCaches clears per-run ref-resolution caches so update
 // operations always start from fresh repository state.
 func clearUpdateResolutionCaches() {
@@ -53,7 +63,18 @@ func clearUpdateResolutionCaches() {
 		branchCommitCache.Delete(key)
 		return true
 	})
+	updateNoticeCache.Range(func(key, value any) bool {
+		updateNoticeCache.Delete(key)
+		return true
+	})
 	clearVersionLabelCache()
+}
+
+func printUpdateInfoOnce(message string) {
+	if _, loaded := updateNoticeCache.LoadOrStore(message, struct{}{}); loaded {
+		return
+	}
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(message))
 }
 
 // UpdateWorkflowsOptions configures workflow update behavior.
@@ -146,13 +167,12 @@ func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
 	}
 
 	// Show summary
-	showUpdateSummary(successfulUpdates, failedUpdates)
+	showUpdateSummary(successfulUpdates, failedUpdates, opts.NoCompile)
 
 	if len(successfulUpdates) == 0 {
 		// If all failures were due to GitHub API rate limiting, treat as non-fatal.
 		// Rate limiting is a transient infrastructure condition, not a code error.
 		if len(failedUpdates) > 0 && allFailuresAreRateLimited(failedUpdates) {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("All workflow updates skipped due to GitHub API rate limiting"))
 			return nil
 		}
 		return errors.New("no workflows were successfully updated")
@@ -166,7 +186,7 @@ func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
 // (non-fatal) from genuine update failures (fatal).
 func allFailuresAreRateLimited(failures []updateFailure) bool {
 	for _, f := range failures {
-		if !gitutil.IsRateLimitError(f.Error) {
+		if !errorutil.IsRateLimitError(f.Error) {
 			return false
 		}
 	}
@@ -316,7 +336,7 @@ func resolveLatestRefWithDeps(ctx context.Context, deps workflowUpdateDeps, repo
 	if !isExemptFromCoolDown(repo) && commitCoolDown > 0 {
 		if result := checkCommitCoolDownWithDate(repo, currentRef, latestCommit.CommittedAt, commitCoolDown); result.InCoolDown {
 			cooldownLog.Printf("Workflow source %s branch %s: %s", repo, currentRef, result.Message)
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping commit candidate %s@%s: %s", repo, currentRef, result.Message)))
+			printUpdateInfoOnce(fmt.Sprintf("Skipping commit candidate %s@%s: %s", repo, currentRef, result.Message))
 			return latestRefResolution{Ref: currentRef, CoolDownBlocked: true}, nil
 		}
 	}
@@ -353,7 +373,7 @@ func resolveLatestCommitFromDefaultBranchWithDeps(ctx context.Context, deps work
 	if !isExemptFromCoolDown(repo) && coolDown > 0 {
 		if result := checkCommitCoolDownWithDate(repo, defaultBranch, latestCommit.CommittedAt, coolDown); result.InCoolDown {
 			cooldownLog.Printf("Workflow source %s default branch %s: %s", repo, defaultBranch, result.Message)
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping commit candidate %s@%s: %s", repo, defaultBranch, result.Message)))
+			printUpdateInfoOnce(fmt.Sprintf("Skipping commit candidate %s@%s: %s", repo, defaultBranch, result.Message))
 			return latestRefResolution{Ref: currentSHA, CoolDownBlocked: true}, nil
 		}
 	}
@@ -365,17 +385,14 @@ func resolveLatestCommitFromDefaultBranchWithDeps(ctx context.Context, deps work
 // repeating identical GitHub API calls during batched update runs.
 func getRepoDefaultBranchCached(ctx context.Context, repo string) (string, error) {
 	if cached, ok := defaultBranchCache.Load(repo); ok {
-		if branch, isString := cached.(string); isString {
-			return branch, nil
+		if result, ok := cached.(cachedDefaultBranch); ok {
+			return result.branch, result.err
 		}
 	}
 
 	branch, err := getRepoDefaultBranch(ctx, repo)
-	if err != nil {
-		return "", err
-	}
-	defaultBranchCache.Store(repo, branch)
-	return branch, nil
+	defaultBranchCache.Store(repo, cachedDefaultBranch{branch: branch, err: err})
+	return branch, err
 }
 
 // getLatestBranchCommitInfoCached wraps getLatestBranchCommitInfo with a cache
@@ -383,17 +400,14 @@ func getRepoDefaultBranchCached(ctx context.Context, repo string) (string, error
 func getLatestBranchCommitInfoCached(ctx context.Context, repo, branch string) (latestBranchCommitInfo, error) {
 	key := repoBranchKey{repo: repo, branch: branch}
 	if cached, ok := branchCommitCache.Load(key); ok {
-		if info, ok := cached.(latestBranchCommitInfo); ok {
-			return info, nil
+		if result, ok := cached.(cachedBranchCommit); ok {
+			return result.info, result.err
 		}
 	}
 
 	info, err := getLatestBranchCommitInfo(ctx, repo, branch)
-	if err != nil {
-		return latestBranchCommitInfo{}, err
-	}
-	branchCommitCache.Store(key, info)
-	return info, nil
+	branchCommitCache.Store(key, cachedBranchCommit{info: info, err: err})
+	return info, err
 }
 
 // fetchPublicGitHubAPI makes an unauthenticated GET request to the GitHub public
@@ -457,7 +471,7 @@ func fetchPublicReleaseTagsPaginated(ctx context.Context, repo string) ([]string
 // getRepoDefaultBranch fetches the default branch name for a repository.
 func getRepoDefaultBranch(ctx context.Context, repo string) (string, error) {
 	output, err := workflow.RunGHContext(ctx, "Fetching repo info...", "api", "/repos/"+repo, "--jq", ".default_branch")
-	if err != nil && gitutil.IsAuthError(err.Error()) {
+	if err != nil && errorutil.IsAuthError(err.Error()) {
 		updateLog.Printf("GitHub API auth failed for %s, retrying without token", repo)
 		body, fallbackErr := fetchPublicGitHubAPI(ctx, "/repos/"+repo)
 		if fallbackErr != nil {
@@ -491,7 +505,7 @@ func getLatestBranchCommitInfo(ctx context.Context, repo, branch string) (latest
 	// URL-encode the branch name since it may contain slashes (e.g. "feature/foo")
 	endpoint := fmt.Sprintf("/repos/%s/commits/%s", repo, url.PathEscape(branch))
 	output, err := workflow.RunGHContext(ctx, "Fetching commit info...", "api", endpoint)
-	if err != nil && gitutil.IsAuthError(err.Error()) {
+	if err != nil && errorutil.IsAuthError(err.Error()) {
 		updateLog.Printf("GitHub API auth failed for branch %s of %s, retrying without token", branch, repo)
 		body, fallbackErr := fetchPublicGitHubAPI(ctx, endpoint)
 		if fallbackErr != nil {
@@ -549,7 +563,7 @@ func defaultWorkflowUpdateDeps() workflowUpdateDeps {
 		runReleasesAPI: func(ctx context.Context, repo string) ([]byte, error) {
 			endpoint := fmt.Sprintf("/repos/%s/releases", repo)
 			output, err := workflow.RunGHContext(ctx, "Fetching releases...", "api", "--paginate", endpoint, "--jq", ".[].tag_name")
-			if err != nil && gitutil.IsAuthError(err.Error()) {
+			if err != nil && errorutil.IsAuthError(err.Error()) {
 				updateLog.Printf("GitHub API auth failed for releases of %s, retrying without token", repo)
 				tags, fallbackErr := fetchPublicReleaseTagsPaginated(ctx, repo)
 				if fallbackErr != nil {
@@ -896,10 +910,10 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 	updateLog.Printf("Successfully updated workflow %s from %s to %s", wf.Name, currentRef, latestRef)
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Updated %s from %s to %s", wf.Name, shortRef(currentRef), shortRef(latestRef))))
 
-	// Compile the updated workflow with refreshStopTime enabled (unless --no-compile is set)
+	// Compile the updated workflow using the same path as the compile command.
 	if !opts.NoCompile {
 		updateLog.Printf("Compiling updated workflow: %s", wf.Name)
-		if err := compileWorkflowWithRefresh(ctx, wf.Path, opts.Verbose, false, opts.EngineOverride, true, opts.Approve); err != nil {
+		if err := compileWorkflowsForUpdate(ctx, []string{wf.Path}, opts.WorkflowsDir, opts.EngineOverride, opts.Verbose, opts.Approve); err != nil {
 			updateLog.Printf("Compilation failed for workflow %s: %v", wf.Name, err)
 			return fmt.Errorf("failed to compile updated workflow: %w", err)
 		}

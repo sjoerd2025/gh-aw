@@ -27,10 +27,12 @@ func (f fakeReleaseClient) DoWithContext(ctx context.Context, method string, pat
 func TestShouldCheckForUpdate(t *testing.T) {
 	// Save original environment
 	origCI := os.Getenv("CI")
+	origCopilotAgentSessionID := os.Getenv("COPILOT_AGENT_SESSION_ID")
 	origMCP := os.Getenv("GH_AW_MCP_SERVER")
 	origGetLastCheckFilePath := getLastCheckFilePathFunc
 	defer func() {
 		os.Setenv("CI", origCI)
+		os.Setenv("COPILOT_AGENT_SESSION_ID", origCopilotAgentSessionID)
 		os.Setenv("GH_AW_MCP_SERVER", origMCP)
 		getLastCheckFilePathFunc = origGetLastCheckFilePath
 	}()
@@ -100,6 +102,7 @@ func TestShouldCheckForUpdate(t *testing.T) {
 				os.Unsetenv("CI")
 				os.Unsetenv("CONTINUOUS_INTEGRATION")
 				os.Unsetenv("GITHUB_ACTIONS")
+				os.Unsetenv("COPILOT_AGENT_SESSION_ID")
 			} else {
 				os.Setenv("CI", tt.ciEnv)
 			}
@@ -170,6 +173,8 @@ func TestIsRunningAsMCPServer(t *testing.T) {
 }
 
 func TestGetLastCheckFilePath(t *testing.T) {
+	t.Parallel()
+
 	path := getLastCheckFilePath()
 	if path == "" {
 		t.Error("getLastCheckFilePath() returned empty string")
@@ -230,87 +235,6 @@ func TestUpdateLastCheckTime(t *testing.T) {
 	}
 }
 
-func TestCheckForUpdatesWithNoCheckUpdateFlag(t *testing.T) {
-	// This test verifies that checkForUpdates respects the noCheckUpdate flag
-	// and doesn't make any API calls when the flag is true
-
-	// Save original environment and function
-	origCI := os.Getenv("CI")
-	origGithubActions := os.Getenv("GITHUB_ACTIONS")
-	origContinuousIntegration := os.Getenv("CONTINUOUS_INTEGRATION")
-	origGetLastCheckFilePath := getLastCheckFilePathFunc
-	defer func() {
-		if origCI != "" {
-			os.Setenv("CI", origCI)
-		} else {
-			os.Unsetenv("CI")
-		}
-		if origGithubActions != "" {
-			os.Setenv("GITHUB_ACTIONS", origGithubActions)
-		} else {
-			os.Unsetenv("GITHUB_ACTIONS")
-		}
-		if origContinuousIntegration != "" {
-			os.Setenv("CONTINUOUS_INTEGRATION", origContinuousIntegration)
-		} else {
-			os.Unsetenv("CONTINUOUS_INTEGRATION")
-		}
-		getLastCheckFilePathFunc = origGetLastCheckFilePath
-	}()
-
-	// Ensure we're not in CI mode
-	os.Unsetenv("CI")
-	os.Unsetenv("GITHUB_ACTIONS")
-	os.Unsetenv("CONTINUOUS_INTEGRATION")
-
-	// Create temporary directory for last check file
-	tmpDir := t.TempDir()
-	lastCheckFile := filepath.Join(tmpDir, lastCheckFileName)
-
-	// Override the function to use temp directory
-	getLastCheckFilePathFunc = func() string {
-		return lastCheckFile
-	}
-
-	// Call checkForUpdates with noCheckUpdate=true
-	checkForUpdates(true, false)
-
-	// Verify that no last check file was created (since check was skipped)
-	if _, err := os.Stat(lastCheckFile); err == nil {
-		t.Error("Last check file should not be created when noCheckUpdate=true")
-	}
-}
-
-func TestCheckForUpdatesInCIMode(t *testing.T) {
-	// Save original environment and function
-	origCI := os.Getenv("CI")
-	origGetLastCheckFilePath := getLastCheckFilePathFunc
-	defer func() {
-		os.Setenv("CI", origCI)
-		getLastCheckFilePathFunc = origGetLastCheckFilePath
-	}()
-
-	// Set CI environment
-	os.Setenv("CI", "true")
-
-	// Create temporary directory for last check file
-	tmpDir := t.TempDir()
-	lastCheckFile := filepath.Join(tmpDir, lastCheckFileName)
-
-	// Override the function to use temp directory
-	getLastCheckFilePathFunc = func() string {
-		return lastCheckFile
-	}
-
-	// Call checkForUpdates
-	checkForUpdates(false, false)
-
-	// Verify that no last check file was created (since check was skipped in CI)
-	if _, err := os.Stat(lastCheckFile); err == nil {
-		t.Error("Last check file should not be created in CI mode")
-	}
-}
-
 func TestCheckForUpdatesAsync_ContextCancellation(t *testing.T) {
 	// Test that async update check respects context cancellation
 	origGetLastCheckFilePath := getLastCheckFilePathFunc
@@ -322,6 +246,7 @@ func TestCheckForUpdatesAsync_ContextCancellation(t *testing.T) {
 	t.Setenv("CI", "")
 	t.Setenv("GITHUB_ACTIONS", "")
 	t.Setenv("CONTINUOUS_INTEGRATION", "")
+	t.Setenv("COPILOT_AGENT_SESSION_ID", "")
 	t.Setenv("GH_AW_MCP_SERVER", "")
 
 	// Create temporary directory for last check file
@@ -362,6 +287,7 @@ func TestCheckForUpdatesAsync_JoinsGoroutine(t *testing.T) {
 	t.Setenv("CI", "")
 	t.Setenv("GITHUB_ACTIONS", "")
 	t.Setenv("CONTINUOUS_INTEGRATION", "")
+	t.Setenv("COPILOT_AGENT_SESSION_ID", "")
 	t.Setenv("GH_AW_MCP_SERVER", "")
 
 	// Create temporary directory for last check file
@@ -408,6 +334,8 @@ func TestCheckForUpdatesAsync_JoinsGoroutine(t *testing.T) {
 }
 
 func TestFindLatestPublishedReleaseTag(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name     string
 		releases []Release
@@ -456,6 +384,8 @@ func TestFindLatestPublishedReleaseTag(t *testing.T) {
 }
 
 func TestGetLatestReleaseWithClient_StableReleaseUsesLatestEndpoint(t *testing.T) {
+	t.Parallel()
+
 	client := fakeReleaseClient{
 		do: func(ctx context.Context, method string, path string, body io.Reader, response any) error {
 			assert.Equal(t, http.MethodGet, method)
@@ -476,6 +406,8 @@ func TestGetLatestReleaseWithClient_StableReleaseUsesLatestEndpoint(t *testing.T
 }
 
 func TestGetLatestReleaseWithClient_IncludePrereleasesUsesReleasesEndpoint(t *testing.T) {
+	t.Parallel()
+
 	client := fakeReleaseClient{
 		do: func(ctx context.Context, method string, path string, body io.Reader, response any) error {
 			assert.Equal(t, http.MethodGet, method)
@@ -496,6 +428,8 @@ func TestGetLatestReleaseWithClient_IncludePrereleasesUsesReleasesEndpoint(t *te
 }
 
 func TestGetLatestReleaseWithClient_PropagatesContextErrors(t *testing.T) {
+	t.Parallel()
+
 	client := fakeReleaseClient{
 		do: func(ctx context.Context, method string, path string, body io.Reader, response any) error {
 			return context.Canceled
@@ -509,6 +443,8 @@ func TestGetLatestReleaseWithClient_PropagatesContextErrors(t *testing.T) {
 }
 
 func TestIsCurrentVersionAtLeastLatest(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name           string
 		currentVersion string
@@ -561,6 +497,8 @@ func TestIsCurrentVersionAtLeastLatest(t *testing.T) {
 }
 
 func TestGitHubDotComRESTClientOptions(t *testing.T) {
+	t.Parallel()
+
 	opts := gitHubDotComRESTClientOptions()
 	assert.Equal(t, "github.com", opts.Host)
 	assert.Equal(t, constants.DefaultHTTPClientTimeout, opts.Timeout)

@@ -17,6 +17,7 @@ import (
 )
 
 func TestNewDoctorCommand(t *testing.T) {
+	t.Parallel()
 	cmd := NewDoctorCommand()
 
 	require.NotNil(t, cmd)
@@ -28,9 +29,11 @@ func TestNewDoctorCommand(t *testing.T) {
 	assert.NotNil(t, cmd.Flags().Lookup("dir"), "should expose --dir flag")
 	assert.NotNil(t, cmd.Flags().Lookup("require-owner-type"), "should expose --require-owner-type flag")
 	assert.False(t, cmd.HasSubCommands())
+	assert.Contains(t, cmd.Flags().Lookup("repo").Usage, "owner/repo format only", "doctor --repo help should explicitly document its narrower repo format")
 }
 
 func TestDoctorCommandUsesNoArgs(t *testing.T) {
+	t.Parallel()
 	cmd := NewDoctorCommand()
 	require.NotNil(t, cmd.Args)
 	require.NoError(t, cmd.Args(cmd, []string{}))
@@ -38,28 +41,33 @@ func TestDoctorCommandUsesNoArgs(t *testing.T) {
 }
 
 func TestDoctorCommandAdvertisesJSONExample(t *testing.T) {
+	t.Parallel()
 	cmd := NewDoctorCommand()
 	assert.Contains(t, cmd.Example, "gh aw doctor --json")
 	assert.Contains(t, cmd.Example, "gh aw doctor --repo github/gh-aw --json")
 }
 
 func TestDoctorCommandLongMentionsEnterpriseHostFallback(t *testing.T) {
+	t.Parallel()
 	cmd := NewDoctorCommand()
 	assert.Contains(t, cmd.Long, "auto-detects the host from the git remote")
 	assert.Contains(t, cmd.Long, "gh auth login --hostname <host>")
 }
 
 func TestDoctorCommandExampleHasNoTabs(t *testing.T) {
+	t.Parallel()
 	cmd := NewDoctorCommand()
 	assert.NotContains(t, cmd.Example, "\t")
 }
 
 func TestDoctorCommandRequireOwnerTypeDefault(t *testing.T) {
+	t.Parallel()
 	cmd := NewDoctorCommand()
 	require.Equal(t, "any", cmd.Flags().Lookup("require-owner-type").DefValue)
 }
 
 func TestDoctorCommandInheritsVerboseFlagFromRoot(t *testing.T) {
+	t.Parallel()
 	cmd := NewDoctorCommand()
 	assert.Nil(t, cmd.Flags().Lookup("verbose"))
 

@@ -21,6 +21,8 @@ network:
   allowed: [defaults]
 imports:
   - shared/otlp.md
+  - shared/reporting.md
+  - shared/graders.md
 tools:
   bash:
     - "*"
@@ -42,8 +44,12 @@ pre-agent-steps:
         }
       '
 
-      ./gh-aw --help > "${output_dir}/main.txt"
+      ./gh-aw --help > "${output_dir}/main.txt" 2>&1
       mapfile -t top_commands < <(awk "${extract_commands}" "${output_dir}/main.txt" | sort -u)
+      if [ ${#top_commands[@]} -eq 0 ]; then
+        echo "No top-level commands were parsed from ./gh-aw --help output" >&2
+        exit 1
+      fi
 
       for cmd in "${top_commands[@]}"; do
         if ! ./gh-aw "$cmd" --help > "${output_dir}/${cmd}.txt" 2>&1; then
@@ -65,6 +71,10 @@ pre-agent-steps:
         exit 1
       fi
       cat "${help_files[@]}" > /tmp/gh-aw/agent/all-help.txt
+      if [ ! -s /tmp/gh-aw/agent/all-help.txt ]; then
+        echo "Combined help output is empty" >&2
+        exit 1
+      fi
       wc -l /tmp/gh-aw/agent/all-help.txt | awk '{print "Pre-collected help lines:", $1}'
 safe-outputs:
   create-issue:
@@ -77,12 +87,13 @@ features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 evals:
   - id: cli_inspected
     question: Did the agent inspect the gh-aw CLI commands and analyze their output for inconsistencies, typos, or documentation gaps?
   - id: issue_created_or_noop
     question: Was an issue created with specific CLI inconsistencies found, or was noop used when no issues were detected?
+
 ---
 
 # CLI Consistency Checker
@@ -103,15 +114,17 @@ Read `/tmp/gh-aw/agent/all-help.txt` and use it as the primary input for analysi
 
 ## Step 2: Analyze for Consistency Problems
 
+Manually scan `/tmp/gh-aw/agent/all-help.txt` and the per-command help files in `/tmp/gh-aw/agent/help-output/` for typos, flag-naming inconsistencies, and mismatches against `docs/src/content/docs/setup/cli.md`.
+
 Look for:
 - Help style and terminology inconsistencies
-- Use the `typo-grammar-extractor` agent to collect typo, grammar, capitalization, and punctuation issues across `/tmp/gh-aw/agent/all-help.txt`.
+- Typos, grammar mistakes, inconsistent capitalization, and punctuation issues
 - Do examples in help text actually work?
 - Are file paths correct (e.g., `.github/workflows`)?
 - Are flag combinations valid?
 - Do command descriptions match their actual behavior?
-- Use the `docs-vs-help-comparer` agent to list every mismatch between `docs/src/content/docs/setup/cli.md` and `/tmp/gh-aw/agent/all-help.txt`.
-- Use the `flag-consistency-analyzer` agent to enumerate flag-naming and negation-style inconsistencies across all command help files.
+- Does `docs/src/content/docs/setup/cli.md` match `/tmp/gh-aw/agent/all-help.txt`?
+- Are flag names, short/long flag pairings, and `--no-...` negation patterns consistent across command help files?
 
 ## Step 3: Report Findings
 
@@ -151,47 +164,3 @@ All CLI output comes from the repository's own codebase, so treat it as trusted 
 - Compare CLI output with documentation
 - Create issues for any inconsistencies found
 - Keep reporting concise but complete
-## agent: `typo-grammar-extractor`
----
-description: Extracts typo, grammar, capitalization, and punctuation issues from CLI help output
-model: mai-code
----
-Read `/tmp/gh-aw/agent/all-help.txt` and scan for typos, grammar mistakes,
-inconsistent capitalization, and punctuation issues in the CLI help text.
-Return a concise bulleted list. For each finding include:
-- the affected command or section when identifiable
-- the exact quoted text
-- the issue type
-- a suggested fix
-If nothing is wrong, say `No issues found.`
-
-## agent: `flag-consistency-analyzer`
----
-description: Finds inconsistent flag names, short forms, and negation patterns across help files
-model: mai-code
----
-Read all per-command help files in `/tmp/gh-aw/agent/help-output/`.
-Compare related commands for inconsistent flag names, short/long flag pairings,
-and `--no-...` negation patterns.
-Return a concise bulleted list. For each finding include:
-- the affected help files or commands
-- the exact quoted flag text
-- the inconsistency
-- a suggested normalization
-If nothing is wrong, say `No issues found.`
-
-## agent: `docs-vs-help-comparer`
----
-description: Compares CLI setup docs against generated help output and reports drift
-model: mai-code
----
-Compare `docs/src/content/docs/setup/cli.md` against
-`/tmp/gh-aw/agent/all-help.txt`.
-List every mismatch involving missing commands, mismatched flag lists, drifted
-descriptions, or stale examples.
-Return a concise bulleted list. For each finding include:
-- the docs location or heading when identifiable
-- the exact quoted docs text
-- the exact quoted help text
-- a suggested fix
-If nothing is wrong, say `No issues found.`

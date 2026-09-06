@@ -4,9 +4,13 @@ package cli
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsSemanticVersionTag(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		ref  string
@@ -35,6 +39,7 @@ func TestIsSemanticVersionTag(t *testing.T) {
 }
 
 func TestParseVersion(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		input     string
@@ -134,6 +139,7 @@ func TestParseVersion(t *testing.T) {
 }
 
 func TestVersionIsNewer(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		version string
@@ -157,14 +163,10 @@ func TestVersionIsNewer(t *testing.T) {
 			v := parseVersion(tt.version)
 			other := parseVersion(tt.other)
 
-			if v == nil || other == nil {
-				t.Fatalf("failed to parse versions: %q or %q", tt.version, tt.other)
-			}
+			require.NotNil(t, v, "parseVersion(%q) should not return nil", tt.version)
+			require.NotNil(t, other, "parseVersion(%q) should not return nil", tt.other)
 
-			got := v.IsNewer(other)
-			if got != tt.want {
-				t.Errorf("(%q).IsNewer(%q) = %v, want %v", tt.version, tt.other, got, tt.want)
-			}
+			assert.Equal(t, tt.want, v.IsNewer(other), "(%q).IsNewer(%q)", tt.version, tt.other)
 		})
 	}
 }

@@ -13,11 +13,18 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 tracker-id: daily-reliability-review
-engine: claude
+engine:
+  id: opencode
+model: copilot/claude-sonnet-4.5
 strict: true
+network:
+  allowed:
+    - defaults
+    - github
+    - go
+    - node
 tools:
   bash: true
   cli-proxy: true
@@ -35,6 +42,7 @@ safe-outputs:
     close-older-issues: true
 timeout-minutes: 30
 imports:
+  - shared/opencode.md
   - uses: shared/daily-issue-base.md
     with:
       title-prefix: "[reliability] "
@@ -42,6 +50,7 @@ imports:
       labels: [observability, automated-analysis]
   - shared/sentry.md
   - shared/mcp/sentry.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 evals:
@@ -106,8 +115,6 @@ Order findings by:
 - If `search_events` is unavailable, fall back to `list_events` and filter client-side.
 
 ## Output
-
-**Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
 Create exactly one GitHub issue.
 

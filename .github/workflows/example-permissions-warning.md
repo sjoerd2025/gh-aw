@@ -10,9 +10,6 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
 imports:
   - shared/otlp.md
@@ -20,8 +17,15 @@ tools:
   cli-proxy: true
   github:
     toolsets: [repos, issues, pull_requests]
+engine:
+  id: codex
+  model-provider: openai
+model: openai/gpt-5.4
 strict: false
 
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Example: Properly Provisioned Permissions

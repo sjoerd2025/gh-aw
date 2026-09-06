@@ -1,79 +1,20 @@
 package cli
 
 import (
-	"bufio"
-	"encoding/base64"
-	"encoding/json"
-	"errors"
+	"context"
 	"fmt"
-	"io"
-	"net/url"
+	"maps"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"slices"
-	"strconv"
-	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/parser"
-	"github.com/github/gh-aw/pkg/setutil"
-	"github.com/github/gh-aw/pkg/sliceutil"
-	"github.com/github/gh-aw/pkg/tty"
 	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/spf13/cobra"
 )
 
 var experimentsLog = logger.New("cli:experiments_command")
 
-// experimentsBranchPrefix is the git branch prefix used to identify experiment state branches.
-const experimentsBranchPrefix = "experiments/"
-
-// ExperimentState represents the state.json format stored in experiments/* branches.
-// This matches the format written by pick_experiment.cjs.
-type ExperimentState struct {
-	Counts map[string]map[string]int `json:"counts"` // experiment name → variant → count
-	Runs   []ExperimentRunRecord     `json:"runs,omitempty"`
-}
-
-// ExperimentRunRecord represents a single workflow run in the state history.
-type ExperimentRunRecord struct {
-	RunID       string            `json:"run_id"`
-	Timestamp   string            `json:"timestamp"`
-	Assignments map[string]string `json:"assignments"`
-}
-
-// ExperimentVariantStats holds counts for all variants of one named A/B experiment.
-type ExperimentVariantStats struct {
-	Name     string         `json:"name"`
-	Variants map[string]int `json:"variants"` // variant → count
-	Total    int            `json:"total"`
-}
-
-// ExperimentInfo represents a single experiment workflow for list output.
-type ExperimentInfo struct {
-	WorkflowID  string `json:"workflow_id" console:"header:Workflow"`
-	Branch      string `json:"branch" console:"header:Branch"`
-	Experiments int    `json:"experiments" console:"header:Experiments"`
-	TotalRuns   int    `json:"total_runs" console:"header:Total Runs"`
-	LastRun     string `json:"last_run" console:"header:Last Run"`
-}
-
-// ExperimentDetails represents detailed information about a specific experiment workflow.
-type ExperimentDetails struct {
-	WorkflowID  string                   `json:"workflow_id"`
-	Branch      string                   `json:"branch"`
-	TotalRuns   int                      `json:"total_runs"`
-	Experiments []ExperimentVariantStats `json:"experiments"`
-	RecentRuns  []ExperimentRunRecord    `json:"recent_runs,omitempty"`
-	// Analyses holds the statistical analysis for each named experiment.
-	// Populated by RunExperimentsAnalyze; absent in list output.
-	Analyses []ExperimentAnalysis `json:"analyses,omitempty"`
-}
-
-// ExperimentsListConfig holds configuration for the experiments list subcommand.
 type ExperimentsListConfig struct {
 	RepoOverride string
 	JSONOutput   bool
@@ -94,8 +35,9 @@ func NewExperimentsCommand() *cobra.Command {
 		Long: `List and analyze experiment workflow branches in the repository.
 
 Experiments are tracked via git branches with the "experiments/" prefix (e.g.,
-experiments/my-workflow). Each branch stores a state.json file written by the
-workflow's pick_experiment step, containing variant counts and run history.
+experiments/my-workflow). Each branch stores a state.jsonl or state.json file
+written by the workflow's pick_experiment step, containing variant counts and
+run history.
 
 Available subcommands:
   - list    - List all experiment workflow branches (default)
@@ -131,7 +73,7 @@ func NewExperimentsListSubcommand() *cobra.Command {
 		Short: "List all experiment workflow branches",
 		Long: `List all experiment workflow branches in the repository.
 
-Reads the state.json file from each experiments/* branch and shows a summary
+Reads the state.jsonl/state.json file from each experiments/* branch and shows a summary
 of each workflow's A/B experiments: number of experiments defined, total runs,
 and timestamp of the most recent run.`,
 		Example: `  ` + string(constants.CLIExtensionPrefix) + ` experiments list                             # List all experiments
@@ -163,7 +105,7 @@ func NewExperimentsAnalyzeSubcommand() *cobra.Command {
 The experiment argument is the workflow ID (branch name without the "experiments/"
 prefix, e.g., "my-workflow" for the "experiments/my-workflow" branch).
 
-Reads the state.json file from the branch and shows per-variant counts, total
+Reads the state.jsonl/state.json file from the branch and shows per-variant counts, total
 runs, and the most recent run assignments.`,
 		Example: `  ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow              # Analyze experiments/my-workflow
   ` + string(constants.CLIExtensionPrefix) + ` experiments analyze my-workflow --json       # Output in JSON format
@@ -205,9 +147,9 @@ func RunExperimentsList(config ExperimentsListConfig) error {
 	}
 
 	if config.JSONOutput {
-		jsonBytes, err := json.MarshalIndent(experiments, "", "  ")
+		jsonBytes, err := marshalIndentJSONOrWrap(experiments, "experiments list")
 		if err != nil {
-			return fmt.Errorf("failed to marshal JSON: %w", err)
+			return err
 		}
 		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
@@ -234,8 +176,6 @@ func RunExperimentsAnalyze(config ExperimentsAnalyzeConfig) error {
 	experimentsLog.Printf("Analyzing experiment: name=%s, repo=%s, json=%v",
 		config.ExperimentName, config.RepoOverride, config.JSONOutput)
 
-	branchName := experimentsBranchPrefix + config.ExperimentName
-
 	// Load experiment configs and evals from the workflow frontmatter to enrich the statistical
 	// output with hypothesis text, analysis_type, min_samples, guardrail thresholds, and resolved
 	// eval metric questions.
@@ -243,47 +183,35 @@ func RunExperimentsAnalyze(config ExperimentsAnalyzeConfig) error {
 	// defaults (min_samples=20, equal expected proportions, no hypothesis displayed).
 	// This ensures the command remains functional even when the workflow .md file is absent
 	// (e.g., when analysing experiments from a remote repository without the workflow checked out).
-	var frontmatterResult experimentFrontmatterResult
-	if config.RepoOverride != "" {
-		frontmatterResult = loadRemoteExperimentConfigs(config.RepoOverride, config.ExperimentName)
-	} else {
-		frontmatterResult = loadLocalExperimentConfigs(config.ExperimentName)
-	}
-	experimentsLog.Printf("Loaded %d experiment config(s) for %s", len(frontmatterResult.ExperimentConfigs), config.ExperimentName)
-
-	var details *ExperimentDetails
-	var err error
-
-	if config.RepoOverride != "" {
-		details, err = fetchRemoteExperimentDetails(config.RepoOverride, branchName, config.ExperimentName)
-	} else {
-		details, err = fetchLocalExperimentDetails(branchName, config.ExperimentName)
-	}
-
+	frontmatterResult, details, metricEvalResults, err := loadExperimentAnalysisInputs(config)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, console.FormatErrorMessage(err.Error()))
 		return nil
 	}
 
-	var metricEvalResults map[string]MetricEvalResults
-	if config.RepoOverride != "" {
-		metricEvalResults = loadRemoteMetricEvalResults(config.RepoOverride, details.WorkflowID)
-	} else {
-		metricEvalResults = loadLocalMetricEvalResults(details.WorkflowID)
+	metricObservationSets, cleanup, err := loadMetricObservationSetsForAnalysis(
+		details,
+		frontmatterResult,
+		config.RepoOverride,
+	)
+	if err != nil {
+		return err
 	}
+	defer cleanup()
 
 	// Compute statistical analyses for each named experiment.
-	details.Analyses = computeExperimentAnalyses(
+	details.Analyses = computeExperimentAnalysesWithObservationBundle(
 		details.Experiments,
 		frontmatterResult.ExperimentConfigs,
 		frontmatterResult.Evals,
 		metricEvalResults,
+		metricObservationSets,
 	)
 
 	if config.JSONOutput {
-		jsonBytes, err := json.MarshalIndent(details, "", "  ")
+		jsonBytes, err := marshalIndentJSONOrWrap(details, "experiment details")
 		if err != nil {
-			return fmt.Errorf("failed to marshal JSON: %w", err)
+			return err
 		}
 		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
@@ -291,6 +219,153 @@ func RunExperimentsAnalyze(config ExperimentsAnalyzeConfig) error {
 
 	printExperimentDetails(details)
 	return nil
+}
+
+func loadExperimentAnalysisInputs(
+	config ExperimentsAnalyzeConfig,
+) (experimentFrontmatterResult, *ExperimentDetails, map[string]MetricEvalResults, error) {
+	branchName := experimentsBranchPrefix + config.ExperimentName
+	var frontmatter experimentFrontmatterResult
+	var details *ExperimentDetails
+	var err error
+	if config.RepoOverride != "" {
+		frontmatter = loadRemoteExperimentConfigs(config.RepoOverride, config.ExperimentName)
+		details, err = fetchRemoteExperimentDetails(config.RepoOverride, branchName, config.ExperimentName)
+	} else {
+		frontmatter = loadLocalExperimentConfigs(config.ExperimentName)
+		details, err = fetchLocalExperimentDetails(branchName, config.ExperimentName)
+	}
+	if err != nil {
+		return frontmatter, nil, nil, err
+	}
+	experimentsLog.Printf("Loaded %d experiment config(s) for %s", len(frontmatter.ExperimentConfigs), config.ExperimentName)
+	reconcileExperimentDetailsWithConfigs(details, frontmatter.ExperimentConfigs)
+	if config.RepoOverride != "" {
+		return frontmatter, details, loadRemoteMetricEvalResults(config.RepoOverride, details.WorkflowID), nil
+	}
+	return frontmatter, details, loadLocalMetricEvalResults(details.WorkflowID), nil
+}
+
+// reconcileExperimentDetailsWithConfigs filters each experiment's persisted variant counts
+// down to the variant labels currently declared in the workflow's frontmatter (variants:
+// list). Variant keys are never removed from state.Counts once written, so a workflow that
+// renames or removes variants otherwise leaves stale labels (e.g. from an earlier model
+// name) mixed in with current ones forever; those stale counts would skew the chi-square
+// balance test and the max-count "last selected variant" heuristic. When an experiment has
+// no matching config (or the config declares no variants), its counts are left untouched.
+func reconcileExperimentDetailsWithConfigs(details *ExperimentDetails, configs map[string]*workflow.ExperimentConfig) {
+	if details == nil || len(configs) == 0 {
+		return
+	}
+	for i, exp := range details.Experiments {
+		cfg := configs[exp.Name]
+		if cfg == nil || len(cfg.Variants) == 0 {
+			continue
+		}
+		filtered := filterDeclaredVariantCounts(exp.Variants, cfg.Variants)
+		if stale := staleVariantNames(exp.Variants, filtered); len(stale) > 0 {
+			experimentsLog.Printf("Experiment %q: dropping %d stale variant(s) %v (not in declared variants %v)", exp.Name, len(stale), stale, cfg.Variants)
+		}
+		details.Experiments[i].Variants = filtered
+		details.Experiments[i].Total = sumVariantCounts(filtered)
+	}
+}
+
+// loadMetricObservationSetsForAnalysis resolves grader-backed and eval-backed experiment
+// metrics and attributes their per-run measurements to variants using the persisted
+// assignment history, returning one merged map of observation sets and a single cleanup
+// closure. An experiment's metric references exactly one of a grader or an eval, so the
+// two resolved maps never collide.
+type experimentMetricObservationSets struct {
+	Primary    map[string]*graderMetricObservationSet
+	Guardrails map[string]map[string]*graderMetricObservationSet
+}
+
+func loadMetricObservationSetsForAnalysis(
+	details *ExperimentDetails,
+	frontmatter experimentFrontmatterResult,
+	repoOverride string,
+) (*experimentMetricObservationSets, func(), error) {
+	graderSets, graderGuardrails, cleanup, err := loadGraderObservationSetsForAnalysis(details, frontmatter, repoOverride)
+	if err != nil {
+		return nil, func() {}, err
+	}
+
+	evalSets, evalGuardrails, err := loadEvalObservationSetsForAnalysis(details, frontmatter, repoOverride)
+	if err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	if graderSets == nil {
+		graderSets = make(map[string]*graderMetricObservationSet, len(evalSets))
+	}
+	maps.Copy(graderSets, evalSets)
+	if graderGuardrails == nil {
+		graderGuardrails = make(map[string]map[string]*graderMetricObservationSet, len(evalGuardrails))
+	}
+	mergeGuardrailObservationSets(graderGuardrails, evalGuardrails)
+	return &experimentMetricObservationSets{Primary: graderSets, Guardrails: graderGuardrails}, cleanup, nil
+}
+
+func loadGraderObservationSetsForAnalysis(
+	details *ExperimentDetails,
+	frontmatter experimentFrontmatterResult,
+	repoOverride string,
+) (map[string]*graderMetricObservationSet, map[string]map[string]*graderMetricObservationSet, func(), error) {
+	refs, err := resolveGraderMetricReferences(frontmatter.ExperimentConfigs, frontmatter.Graders)
+	if err != nil {
+		return nil, nil, func() {}, err
+	}
+	guardrailRefs, err := resolveGraderGuardrailMetricReferences(frontmatter.ExperimentConfigs, frontmatter.Graders)
+	if err != nil {
+		return nil, nil, func() {}, err
+	}
+	runRefs := observationRunReferences(refs, guardrailRefs)
+	if len(runRefs) == 0 {
+		return nil, nil, func() {}, nil
+	}
+	tempDir, err := os.MkdirTemp("", "gh-aw-experiment-graders-*")
+	if err != nil {
+		return nil, nil, func() {}, fmt.Errorf("failed to prepare grader artifact cache: %w", err)
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(tempDir)
+	}
+	source := newGitHubGraderRunArtifactSource(tempDir, repoOverride)
+	runData := loadGraderRunData(context.Background(), details.Runs, runRefs, source)
+	sets := buildGraderMetricObservationSets(details.Experiments, details.Runs, refs, runData, frontmatter.Graders)
+	guardrailSets := buildGraderGuardrailObservationSets(details, guardrailRefs, runData, frontmatter.Graders)
+	return sets, guardrailSets, cleanup, nil
+}
+
+// loadEvalObservationSetsForAnalysis resolves eval-backed experiment metrics and attributes
+// their per-run YES/NO answers to variants using the persisted assignment history, mirroring
+// the grader observation pipeline so eval-backed metrics get the same statistical comparisons.
+func loadEvalObservationSetsForAnalysis(
+	details *ExperimentDetails,
+	frontmatter experimentFrontmatterResult,
+	repoOverride string,
+) (map[string]*graderMetricObservationSet, map[string]map[string]*graderMetricObservationSet, error) {
+	refs, err := resolveEvalMetricReferences(frontmatter.ExperimentConfigs, frontmatter.Evals)
+	if err != nil {
+		return nil, nil, err
+	}
+	guardrailRefs, err := resolveEvalGuardrailMetricReferences(frontmatter.ExperimentConfigs, frontmatter.Evals)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(refs) == 0 && len(guardrailRefs) == 0 {
+		return nil, nil, nil
+	}
+	var evalRecords []evalResultRecord
+	if repoOverride != "" {
+		evalRecords = loadRemoteEvalResultRecords(repoOverride, details.WorkflowID)
+	} else {
+		evalRecords = loadLocalEvalResultRecords(details.WorkflowID)
+	}
+	sets := buildEvalMetricObservationSets(details.Experiments, details.Runs, refs, evalRecords)
+	guardrailSets := buildEvalGuardrailObservationSets(details, guardrailRefs, evalRecords)
+	return sets, guardrailSets, nil
 }
 
 // computeExperimentAnalyses computes statistical analyses for all named experiments.
@@ -302,8 +377,33 @@ func computeExperimentAnalyses(
 	evals *workflow.EvalsConfig,
 	metricEvalResults map[string]MetricEvalResults,
 ) []ExperimentAnalysis {
+	return computeExperimentAnalysesWithObservations(experiments, configs, evals, metricEvalResults, nil)
+}
+
+func computeExperimentAnalysesWithObservations(
+	experiments []ExperimentVariantStats,
+	configs map[string]*workflow.ExperimentConfig,
+	evals *workflow.EvalsConfig,
+	metricEvalResults map[string]MetricEvalResults,
+	graderObservationSets map[string]*graderMetricObservationSet,
+) []ExperimentAnalysis {
+	return computeExperimentAnalysesWithObservationBundle(experiments, configs, evals, metricEvalResults, &experimentMetricObservationSets{
+		Primary: graderObservationSets,
+	})
+}
+
+func computeExperimentAnalysesWithObservationBundle(
+	experiments []ExperimentVariantStats,
+	configs map[string]*workflow.ExperimentConfig,
+	evals *workflow.EvalsConfig,
+	metricEvalResults map[string]MetricEvalResults,
+	observationSets *experimentMetricObservationSets,
+) []ExperimentAnalysis {
 	if len(experiments) == 0 {
 		return nil
+	}
+	if observationSets == nil {
+		observationSets = &experimentMetricObservationSets{}
 	}
 	analyses := make([]ExperimentAnalysis, 0, len(experiments))
 	for _, exp := range experiments {
@@ -311,650 +411,77 @@ func computeExperimentAnalyses(
 		if configs != nil {
 			cfg = configs[exp.Name]
 		}
-		analyses = append(analyses, computeExperimentAnalysis(exp, cfg, evals, metricEvalResults))
+		analyses = append(analyses, computeExperimentAnalysisWithObservationBundle(
+			exp,
+			cfg,
+			evals,
+			metricEvalResults,
+			observationSets.Primary[exp.Name],
+			observationSets.Guardrails[exp.Name],
+		))
 	}
 	return analyses
 }
 
-type evalResultRecord struct {
-	ID        string `json:"id"`
-	Answer    string `json:"answer"`
-	RunID     string `json:"runid"`
-	Timestamp string `json:"timestamp"`
-}
-
-func loadLocalMetricEvalResults(workflowID string) map[string]MetricEvalResults {
-	branchName := workflow.WorkflowStateBranchName(constants.EvalsBranchPrefix, workflowID)
-	ref := "origin/" + branchName
-	if !gitRefExists(ref) {
-		if !gitRefExists(branchName) {
-			return nil
+func mergeGuardrailObservationSets(
+	target map[string]map[string]*graderMetricObservationSet,
+	source map[string]map[string]*graderMetricObservationSet,
+) {
+	for experimentName, sourceSets := range source {
+		if target[experimentName] == nil {
+			target[experimentName] = make(map[string]*graderMetricObservationSet)
 		}
-		ref = branchName
-	}
-	cmd := exec.Command("git", "show", ref+":"+constants.EvalsResultFilename)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	return summarizeMetricEvalResults(out)
-}
-
-func loadRemoteMetricEvalResults(repoOverride, workflowID string) map[string]MetricEvalResults {
-	branchName := workflow.WorkflowStateBranchName(constants.EvalsBranchPrefix, workflowID)
-	decoded, err := readRemoteRepoBranchFile(repoOverride, branchName, constants.EvalsResultFilename, "")
-	if err != nil {
-		return nil
-	}
-	return summarizeMetricEvalResults(decoded)
-}
-
-func summarizeMetricEvalResults(data []byte) map[string]MetricEvalResults {
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	results := map[string]MetricEvalResults{}
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var record evalResultRecord
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			continue
-		}
-		if record.ID == "" {
-			continue
-		}
-		summary := results[record.ID]
-		summary.Total++
-		switch strings.ToUpper(strings.TrimSpace(record.Answer)) {
-		case "YES":
-			summary.Yes++
-		case "NO":
-			summary.No++
-		default:
-			summary.Unknown++
-		}
-		summary.LatestAnswer = strings.ToUpper(strings.TrimSpace(record.Answer))
-		summary.LatestRunID = record.RunID
-		results[record.ID] = summary
-	}
-	if len(results) == 0 {
-		return nil
-	}
-	return results
-}
-
-// experimentFrontmatterResult holds both the experiment configs and evals config parsed
-// from a workflow's frontmatter.
-type experimentFrontmatterResult struct {
-	ExperimentConfigs map[string]*workflow.ExperimentConfig
-	Evals             *workflow.EvalsConfig
-}
-
-// loadLocalExperimentConfigs reads the workflow .md file for the given experiment name
-// and returns the ExperimentConfig map and EvalsConfig from its frontmatter.
-// experimentName is the sanitized workflow ID (the part after "experiments/" in the branch name).
-// Returns a zero-value result when the workflow file cannot be found or parsed.
-func loadLocalExperimentConfigs(experimentName string) experimentFrontmatterResult {
-	experimentsLog.Printf("Loading local experiment configs for %s", experimentName)
-
-	filePath := findWorkflowFileForExperiment(experimentName)
-	if filePath == "" {
-		experimentsLog.Printf("No workflow file found for experiment %s", experimentName)
-		return experimentFrontmatterResult{}
-	}
-
-	// Verify that the resolved path is within .github/workflows/ to prevent path traversal.
-	// findWorkflowFileForExperiment returns paths from filepath.Glob with a relative base dir,
-	// so convert both sides to absolute paths before the prefix check.
-	absFilePath, err := filepath.Abs(filePath)
-	if err != nil {
-		experimentsLog.Printf("Failed to resolve absolute path for %s: %v", filePath, err)
-		return experimentFrontmatterResult{}
-	}
-	workflowsDir, err := filepath.Abs(getWorkflowsDir())
-	if err != nil {
-		experimentsLog.Printf("Failed to resolve workflows dir: %v", err)
-		return experimentFrontmatterResult{}
-	}
-	if !strings.HasPrefix(absFilePath, workflowsDir+string(filepath.Separator)) {
-		experimentsLog.Printf("Refusing to read workflow file outside .github/workflows/: %s", absFilePath)
-		return experimentFrontmatterResult{}
-	}
-
-	content, err := os.ReadFile(absFilePath) // #nosec G304 -- path confirmed within .github/workflows/
-	if err != nil {
-		experimentsLog.Printf("Failed to read workflow file %s: %v", absFilePath, err)
-		return experimentFrontmatterResult{}
-	}
-
-	result, err := parser.ExtractFrontmatterFromContent(string(content))
-	if err != nil {
-		experimentsLog.Printf("Failed to parse frontmatter from %s: %v", filePath, err)
-		return experimentFrontmatterResult{}
-	}
-
-	cfg, err := workflow.ParseFrontmatterConfig(result.Frontmatter)
-	if err != nil {
-		experimentsLog.Printf("Failed to parse frontmatter config from %s: %v", filePath, err)
-		return experimentFrontmatterResult{}
-	}
-
-	evals, err := workflow.ParseEvalsFromFrontmatter(result.Frontmatter)
-	if err != nil {
-		experimentsLog.Printf("Failed to parse evals config from %s: %v", filePath, err)
-		// Non-fatal: continue without evals resolution.
-	}
-
-	return experimentFrontmatterResult{
-		ExperimentConfigs: cfg.ExperimentConfigs,
-		Evals:             evals,
+		maps.Copy(target[experimentName], sourceSets)
 	}
 }
 
-// loadRemoteExperimentConfigs fetches the workflow .md file from the repository default branch
-// via the GitHub API and returns the ExperimentConfig map and EvalsConfig from its frontmatter.
-// Returns a zero-value result when the file cannot be fetched or parsed.
-func loadRemoteExperimentConfigs(repoOverride, experimentName string) experimentFrontmatterResult {
-	experimentsLog.Printf("Loading remote experiment configs for %s from %s", experimentName, repoOverride)
-
-	// Build the candidate list. First, use the directory listing to find the exact filename
-	// whose sanitized basename matches experimentName (e.g. "ci-coach" for "cicoach").
-	// Fall back to the bare experiment name if the listing is unavailable.
-	candidates := workflowFileCandidates(experimentName)
-	if resolved := findRemoteWorkflowFilenameForExperiment(repoOverride, experimentName); resolved != "" && resolved != experimentName {
-		// Prepend the resolved name so it is tried before the bare sanitized form.
-		// Skip when resolved == experimentName to avoid a redundant fetch.
-		candidates = append([]string{resolved}, candidates...)
+func observationRunReferences(
+	primary map[string]string,
+	guardrails map[string]map[string]string,
+) map[string]struct{} {
+	experimentNames := make(map[string]struct{}, len(primary)+len(guardrails))
+	for experimentName := range primary {
+		experimentNames[experimentName] = struct{}{}
 	}
-
-	for _, candidate := range candidates {
-		apiPath := constants.WorkflowsDirSlash + candidate + ".md"
-		args := []string{"api",
-			"repos/{owner}/{repo}/contents/" + url.PathEscape(apiPath),
-			"--jq", ".content",
-			"--repo", repoOverride,
-		}
-		cmd := workflow.ExecGH(args...)
-		out, err := cmd.Output()
-		if err != nil {
-			continue
-		}
-
-		b64 := strings.Join(strings.Fields(strings.TrimSpace(string(out))), "")
-		decoded, err := base64.StdEncoding.DecodeString(b64)
-		if err != nil {
-			experimentsLog.Printf("Failed to base64-decode workflow file %s: %v", candidate, err)
-			continue
-		}
-
-		result, err := parser.ExtractFrontmatterFromContent(string(decoded))
-		if err != nil {
-			continue
-		}
-
-		cfg, err := workflow.ParseFrontmatterConfig(result.Frontmatter)
-		if err != nil {
-			continue
-		}
-
-		evals, err := workflow.ParseEvalsFromFrontmatter(result.Frontmatter)
-		if err != nil {
-			experimentsLog.Printf("Failed to parse evals config from %s: %v", apiPath, err)
-			// Non-fatal: continue without evals resolution.
-		}
-
-		if len(cfg.ExperimentConfigs) > 0 {
-			experimentsLog.Printf("Loaded remote configs from %s", apiPath)
-			return experimentFrontmatterResult{
-				ExperimentConfigs: cfg.ExperimentConfigs,
-				Evals:             evals,
-			}
-		}
+	for experimentName := range guardrails {
+		experimentNames[experimentName] = struct{}{}
 	}
-
-	experimentsLog.Printf("No remote workflow file found for experiment %s", experimentName)
-	return experimentFrontmatterResult{}
+	return experimentNames
 }
 
-// findRemoteWorkflowFilenameForExperiment lists .md files in .github/workflows/ via the
-// GitHub API and returns the basename (without .md) of the first file whose sanitized name
-// matches experimentName. This mirrors findWorkflowFileForExperiment for remote repos.
-// Returns "" when the directory cannot be listed or no match is found.
-func findRemoteWorkflowFilenameForExperiment(repoOverride, experimentName string) string {
-	args := []string{"api",
-		"repos/{owner}/{repo}/contents/.github/workflows",
-		"--jq", `[.[] | select(.name | endswith(".md")) | .name]`,
-		"--repo", repoOverride,
-	}
-	cmd := workflow.ExecGH(args...)
-	out, err := cmd.Output()
-	if err != nil {
-		experimentsLog.Printf("Failed to list remote workflow files from %s: %v", repoOverride, err)
-		return ""
-	}
-
-	var filenames []string
-	if err := json.Unmarshal(out, &filenames); err != nil {
-		experimentsLog.Printf("Failed to parse remote workflow file listing: %v", err)
-		return ""
-	}
-
-	return matchWorkflowFilenameByExperiment(filenames, experimentName)
-}
-
-// matchWorkflowFilenameByExperiment returns the basename (without .md) of the first file in
-// filenames whose sanitized name matches experimentName. Returns "" when no match is found.
-// Logs a warning when more than one file maps to the same sanitized name.
-//
-// Note: normalizeWorkflowID calls filepath.Base internally, so any path prefix in filenames
-// is stripped before matching. Callers that supply bare filenames (e.g. "my-flow.md") are
-// unaffected; callers supplying full paths (e.g. ".github/workflows/my-flow.md") will have
-// the directory component removed — only the basename is returned and compared.
-func matchWorkflowFilenameByExperiment(filenames []string, experimentName string) string {
-	var matches []string
-	for _, filename := range filenames {
-		base := normalizeWorkflowID(filename)
-		if workflow.SanitizeWorkflowIDForCacheKey(base) == experimentName {
-			matches = append(matches, base)
+func buildGraderGuardrailObservationSets(
+	details *ExperimentDetails,
+	refs map[string]map[string]string,
+	runData map[string]graderRunData,
+	graders *workflow.GradersConfig,
+) map[string]map[string]*graderMetricObservationSet {
+	result := make(map[string]map[string]*graderMetricObservationSet, len(refs))
+	for experimentName, metrics := range refs {
+		result[experimentName] = make(map[string]*graderMetricObservationSet, len(metrics))
+		for metricName, graderID := range metrics {
+			sets := buildGraderMetricObservationSets(
+				details.Experiments, details.Runs, map[string]string{experimentName: graderID}, runData, graders,
+			)
+			result[experimentName][metricName] = sets[experimentName]
 		}
 	}
-	if len(matches) == 0 {
-		return ""
-	}
-	if len(matches) > 1 {
-		experimentsLog.Printf("Ambiguous experiment name %q: multiple workflow files match (%s); using first", experimentName, strings.Join(matches, ", "))
-	}
-	return matches[0]
+	return result
 }
 
-// findWorkflowFileForExperiment scans .github/workflows/ for a .md file whose sanitized
-// basename (lowercase, hyphens removed) matches the given experiment name.
-// Returns the file path or "" when no match is found.
-func findWorkflowFileForExperiment(experimentName string) string {
-	mdFiles, err := getMarkdownWorkflowFiles("")
-	if err != nil {
-		return ""
-	}
-	for _, f := range mdFiles {
-		base := normalizeWorkflowID(f)
-		if workflow.SanitizeWorkflowIDForCacheKey(base) == experimentName {
-			return f
+func buildEvalGuardrailObservationSets(
+	details *ExperimentDetails,
+	refs map[string]map[string]string,
+	evalRecords []evalResultRecord,
+) map[string]map[string]*graderMetricObservationSet {
+	result := make(map[string]map[string]*graderMetricObservationSet, len(refs))
+	for experimentName, metrics := range refs {
+		result[experimentName] = make(map[string]*graderMetricObservationSet, len(metrics))
+		for metricName, evalID := range metrics {
+			sets := buildEvalMetricObservationSets(
+				details.Experiments, details.Runs, map[string]string{experimentName: evalID}, evalRecords,
+			)
+			result[experimentName][metricName] = sets[experimentName]
 		}
 	}
-	return ""
-}
-
-// workflowFileCandidates returns a fallback list of candidate workflow file basenames (without .md)
-// for remote lookups when the directory listing is unavailable. The sanitized form
-// (hyphens removed, lowercased) is irreversible, so only the experiment name itself is
-// returned here. The caller should prefer findRemoteWorkflowFilenameForExperiment which
-// resolves the real filename by scanning the remote directory.
-func workflowFileCandidates(experimentName string) []string {
-	// Return the experiment name as-is as a last-resort fallback.
-	return []string{experimentName}
-}
-
-// fetchLocalExperiments lists experiment branches and reads their state from the local git repo.
-func fetchLocalExperiments() ([]ExperimentInfo, error) {
-	experimentsLog.Print("Fetching local experiment branches via git for-each-ref")
-
-	cmd := exec.Command("git", "for-each-ref",
-		"--sort=-committerdate",
-		"--format=%(refname:short)",
-		"refs/remotes/origin/"+experimentsBranchPrefix+"*",
-		"refs/heads/"+experimentsBranchPrefix+"*",
-	)
-	output, err := cmd.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 128 {
-			return []ExperimentInfo{}, nil
-		}
-		return nil, fmt.Errorf("failed to list experiment branches: %w", err)
-	}
-
-	seen := make(map[string]struct {
-	})
-	var experiments []ExperimentInfo
-
-	for line := range strings.SplitSeq(strings.TrimSpace(string(output)), "\n") {
-		if line == "" {
-			continue
-		}
-		workflowID := extractExperimentName(line)
-		if workflowID == "" || setutil.Contains(seen, workflowID) {
-			continue
-		}
-		seen[workflowID] = struct {
-		}{}
-
-		branchName := experimentsBranchPrefix + workflowID
-		// Prefer remote ref; fall back to local.
-		ref := "origin/" + branchName
-		if !gitRefExists(ref) {
-			ref = branchName
-		}
-		state := readLocalExperimentState(ref)
-		experiments = append(experiments, experimentInfoFromState(workflowID, branchName, state))
-	}
-
-	return experiments, nil
-}
-
-// fetchRemoteExperiments lists experiment branches and reads their state via the GitHub API.
-func fetchRemoteExperiments(repoOverride string) ([]ExperimentInfo, error) {
-	experimentsLog.Printf("Fetching remote experiment branches: repo=%s", repoOverride)
-
-	args := []string{"api", "repos/{owner}/{repo}/branches",
-		"--paginate",
-		"--jq", `[.[] | select(.name | startswith("` + experimentsBranchPrefix + `")) | .name]`,
-		"--repo", repoOverride,
-	}
-	cmd := workflow.ExecGH(args...)
-	output, err := cmd.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return nil, fmt.Errorf("failed to fetch branches (exit %d): %s", exitErr.ExitCode(), strings.TrimSpace(string(exitErr.Stderr)))
-		}
-		return nil, fmt.Errorf("failed to fetch branches: %w", err)
-	}
-
-	branchNames, err := parsePagedJSONArray[string](string(output))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse branch list: %w", err)
-	}
-
-	var experiments []ExperimentInfo
-	for _, branchName := range branchNames {
-		workflowID := strings.TrimPrefix(branchName, experimentsBranchPrefix)
-		state := readRemoteExperimentState(repoOverride, branchName)
-		experiments = append(experiments, experimentInfoFromState(workflowID, branchName, state))
-	}
-
-	return experiments, nil
-}
-
-// fetchLocalExperimentDetails reads the state.json from a local experiment branch.
-func fetchLocalExperimentDetails(branchName, workflowID string) (*ExperimentDetails, error) {
-	experimentsLog.Printf("Fetching local experiment details: branch=%s", branchName)
-
-	ref := "origin/" + branchName
-	if !gitRefExists(ref) {
-		if !gitRefExists(branchName) {
-			return nil, fmt.Errorf("experiment branch %q not found locally (tried origin/%s and %s)",
-				branchName, branchName, branchName)
-		}
-		ref = branchName
-	}
-
-	state := readLocalExperimentState(ref)
-	return experimentDetailsFromState(workflowID, branchName, state), nil
-}
-
-// fetchRemoteExperimentDetails reads the state.json from a remote experiment branch.
-func fetchRemoteExperimentDetails(repoOverride, branchName, workflowID string) (*ExperimentDetails, error) {
-	experimentsLog.Printf("Fetching remote experiment details: repo=%s, branch=%s", repoOverride, branchName)
-
-	// Verify the branch exists.
-	encodedBranch := url.PathEscape(branchName)
-	checkArgs := []string{"api",
-		"repos/{owner}/{repo}/branches/" + encodedBranch,
-		"--jq", ".name",
-		"--repo", repoOverride,
-	}
-	checkCmd := workflow.ExecGH(checkArgs...)
-	if _, err := checkCmd.Output(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			stderr := strings.TrimSpace(string(exitErr.Stderr))
-			if strings.Contains(stderr, "404") || strings.Contains(stderr, "not found") {
-				return nil, fmt.Errorf("experiment %q not found in %s", workflowID, repoOverride)
-			}
-			return nil, fmt.Errorf("failed to fetch experiment branch (exit %d): %s", exitErr.ExitCode(), stderr)
-		}
-		return nil, fmt.Errorf("failed to fetch experiment branch: %w", err)
-	}
-
-	state := readRemoteExperimentState(repoOverride, branchName)
-	return experimentDetailsFromState(workflowID, branchName, state), nil
-}
-
-// readLocalExperimentState reads state.json from a local git ref (e.g. "origin/experiments/foo").
-// Returns an empty state when the file is absent or cannot be parsed.
-func readLocalExperimentState(ref string) *ExperimentState {
-	cmd := exec.Command("git", "show", ref+":state.json")
-	out, err := cmd.Output()
-	if err != nil {
-		return emptyExperimentState()
-	}
-	return parseExperimentState(out)
-}
-
-// readRemoteExperimentState fetches state.json from an experiments/* branch via the GitHub API.
-// Returns an empty state on any error (branch missing, file absent, parse failure).
-func readRemoteExperimentState(repoOverride, branchName string) *ExperimentState {
-	decoded, err := readRemoteRepoBranchFile(repoOverride, branchName, "state.json", "")
-	if err != nil {
-		return emptyExperimentState()
-	}
-	return parseExperimentState(decoded)
-}
-
-// parseExperimentState unmarshals raw JSON into an ExperimentState.
-// Returns an empty state when parsing fails or the data is invalid.
-func parseExperimentState(data []byte) *ExperimentState {
-	var state ExperimentState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return emptyExperimentState()
-	}
-	// Validate: state.json must have a counts object.
-	if state.Counts == nil {
-		state.Counts = map[string]map[string]int{}
-	}
-	return &state
-}
-
-// emptyExperimentState returns a zero-value ExperimentState with an initialised Counts map.
-func emptyExperimentState() *ExperimentState {
-	return &ExperimentState{Counts: map[string]map[string]int{}}
-}
-
-// experimentInfoFromState builds an ExperimentInfo summary from a state.json.
-func experimentInfoFromState(workflowID, branchName string, state *ExperimentState) ExperimentInfo {
-	return ExperimentInfo{
-		WorkflowID:  workflowID,
-		Branch:      branchName,
-		Experiments: len(state.Counts),
-		TotalRuns:   experimentTotalRuns(state),
-		LastRun:     experimentLastRun(state),
-	}
-}
-
-// experimentDetailsFromState builds ExperimentDetails from a state.json.
-func experimentDetailsFromState(workflowID, branchName string, state *ExperimentState) *ExperimentDetails {
-	experiments := make([]ExperimentVariantStats, 0, len(state.Counts))
-	for name, variants := range state.Counts {
-		total := 0
-		for _, c := range variants {
-			total += c
-		}
-		experiments = append(experiments, ExperimentVariantStats{
-			Name:     name,
-			Variants: variants,
-			Total:    total,
-		})
-	}
-	slices.SortFunc(experiments, func(a, b ExperimentVariantStats) int {
-		switch {
-		case a.Name < b.Name:
-			return -1
-		case a.Name > b.Name:
-			return 1
-		default:
-			return 0
-		}
-	})
-
-	recentRuns := state.Runs
-	const maxRecentRuns = 10
-	if len(recentRuns) > maxRecentRuns {
-		recentRuns = recentRuns[len(recentRuns)-maxRecentRuns:]
-	}
-
-	return &ExperimentDetails{
-		WorkflowID:  workflowID,
-		Branch:      branchName,
-		TotalRuns:   experimentTotalRuns(state),
-		Experiments: experiments,
-		RecentRuns:  recentRuns,
-	}
-}
-
-// experimentTotalRuns returns the total number of runs recorded in the state.
-// Prefers the runs array length when non-empty; falls back to summing all variant counts.
-func experimentTotalRuns(state *ExperimentState) int {
-	if len(state.Runs) > 0 {
-		return len(state.Runs)
-	}
-	total := 0
-	for _, variants := range state.Counts {
-		for _, c := range variants {
-			total += c
-		}
-	}
-	return total
-}
-
-// experimentLastRun returns the date (YYYY-MM-DD) of the most recent run, or "" if unknown.
-func experimentLastRun(state *ExperimentState) string {
-	if len(state.Runs) == 0 {
-		return ""
-	}
-	ts := state.Runs[len(state.Runs)-1].Timestamp
-	if len(ts) >= 10 {
-		return ts[:10]
-	}
-	return ts
-}
-
-// extractExperimentName extracts the workflow ID from a branch ref.
-//
-//	"origin/experiments/my-workflow" → "my-workflow"
-//	"experiments/my-workflow"        → "my-workflow"
-//	"experiments/"                   → "" (bare prefix, rejected by callers)
-func extractExperimentName(ref string) string {
-	ref = strings.TrimPrefix(ref, "origin/")
-	if !strings.HasPrefix(ref, experimentsBranchPrefix) {
-		return ""
-	}
-	// An empty result here (bare "experiments/" ref) is acceptable: callers
-	// guard against empty workflow IDs with `if workflowID == ""` checks.
-	return strings.TrimPrefix(ref, experimentsBranchPrefix)
-}
-
-// gitRefExists reports whether a git ref exists locally.
-func gitRefExists(ref string) bool {
-	cmd := exec.Command("git", "rev-parse", "--verify", ref)
-	return cmd.Run() == nil
-}
-
-// printExperimentDetails renders experiment details to stderr in human-readable form.
-func printExperimentDetails(d *ExperimentDetails) {
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Experiment workflow: "+d.WorkflowID))
-	fmt.Fprintf(os.Stderr, "  Branch:     %s\n", d.Branch)
-	fmt.Fprintf(os.Stderr, "  Total runs: %d\n", d.TotalRuns)
-
-	if len(d.Experiments) > 0 {
-		for _, exp := range d.Experiments {
-			// Sort variants for deterministic display.
-			type kv struct {
-				k string
-				v int
-			}
-			pairs := make([]kv, 0, len(exp.Variants))
-			for k, v := range exp.Variants {
-				pairs = append(pairs, kv{k, v})
-			}
-			slices.SortFunc(pairs, func(a, b kv) int {
-				switch {
-				case a.k < b.k:
-					return -1
-				case a.k > b.k:
-					return 1
-				default:
-					return 0
-				}
-			})
-			rows := make([][]string, 0, len(pairs))
-			for _, p := range pairs {
-				pct := 0
-				if exp.Total > 0 {
-					pct = p.v * 100 / exp.Total
-				}
-				rows = append(rows, []string{p.k, strconv.Itoa(p.v), strconv.Itoa(pct) + "%"})
-			}
-			if len(rows) > 0 {
-				fmt.Fprintf(os.Stderr, "\n%s", console.RenderTable(console.TableConfig{
-					Title:   fmt.Sprintf("%s (total: %d)", exp.Name, exp.Total),
-					Headers: []string{"Variant", "Count", "Percent"},
-					Rows:    rows,
-					TTYFunc: tty.IsStderrTerminal,
-				}))
-			}
-		}
-	} else {
-		fmt.Fprintln(os.Stderr, "\nNo experiment data found (state.json not present or empty).")
-	}
-
-	printExperimentAnalyses(d.Analyses)
-
-	if len(d.RecentRuns) > 0 {
-		rows := make([][]string, 0, len(d.RecentRuns))
-		for _, run := range d.RecentRuns {
-			date := run.Timestamp
-			if len(date) >= 10 {
-				date = date[:10]
-			}
-			rows = append(rows, []string{date, run.RunID, formatAssignments(run.Assignments)})
-		}
-		fmt.Fprintf(os.Stderr, "\n%s", console.RenderTable(console.TableConfig{
-			Title:   "Recent runs",
-			Headers: []string{"Date", "Run ID", "Assignments"},
-			Rows:    rows,
-			TTYFunc: tty.IsStderrTerminal,
-		}))
-	}
-}
-
-// formatAssignments formats a map of experiment→variant as "k=v, k=v" sorted by key.
-func formatAssignments(assignments map[string]string) string {
-	if len(assignments) == 0 {
-		return "-"
-	}
-	keys := sliceutil.SortedKeys(assignments)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, k+"="+assignments[k])
-	}
-	return strings.Join(parts, ", ")
-}
-
-// parsePagedJSONArray parses multiple JSON arrays (one per page from --paginate)
-// concatenated in the output and returns a merged slice.
-func parsePagedJSONArray[T any](output string) ([]T, error) {
-	var result []T
-	decoder := json.NewDecoder(strings.NewReader(output))
-	for {
-		var page []T
-		if err := decoder.Decode(&page); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, err
-		}
-		result = append(result, page...)
-	}
-	return result, nil
+	return result
 }

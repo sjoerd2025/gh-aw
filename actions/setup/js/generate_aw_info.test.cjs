@@ -28,6 +28,14 @@ const mockContext = {
   repo: { owner: "github", repo: "my-repo" },
 };
 
+const mockGithub = {
+  rest: {
+    actions: {
+      getWorkflowRun: vi.fn(),
+    },
+  },
+};
+
 describe("generate_aw_info.cjs", () => {
   let main;
   let awInfoPath;
@@ -51,17 +59,20 @@ describe("generate_aw_info.cjs", () => {
     process.env.GH_AW_INFO_WORKFLOW_NAME = "my-workflow";
     process.env.GH_AW_INFO_EXPERIMENTAL = "false";
     process.env.GH_AW_INFO_SUPPORTS_TOOLS_ALLOWLIST = "true";
+    delete process.env.GH_AW_INFO_CACHE_MEMORY;
     process.env.GH_AW_INFO_STAGED = "false";
     process.env.GH_AW_INFO_ALLOWED_DOMAINS = "[]";
     process.env.GH_AW_INFO_FIREWALL_ENABLED = "false";
     process.env.GH_AW_INFO_AWF_VERSION = "";
     process.env.GH_AW_INFO_AWMG_VERSION = "";
     process.env.GH_AW_INFO_FIREWALL_TYPE = "";
+    process.env.GH_AW_INFO_AGENT_RUNTIME = "";
     process.env.GH_AW_INFO_FRONTMATTER_SOURCE = "";
     process.env.GH_AW_INFO_FRONTMATTER_EMOJI = "";
     process.env.GH_AW_INFO_BODY_MODIFIED = "";
     process.env.GH_AW_INFO_FEATURES = "";
     process.env.GH_AW_INFO_SKILLS = "";
+    delete process.env.GH_AW_INFO_FETCH_RUN_CREATED_AT;
 
     // Dynamic import to get fresh module state
     const module = await import("./generate_aw_info.cjs");
@@ -91,6 +102,7 @@ describe("generate_aw_info.cjs", () => {
     expect(awInfo.workflow_name).toBe("my-workflow");
     expect(awInfo.experimental).toBe(false);
     expect(awInfo.supports_tools_allowlist).toBe(true);
+    expect(awInfo.cache_memory).toBe(false);
     expect(awInfo.run_id).toBe(12345);
     expect(awInfo.run_number).toBe(42);
     expect(awInfo.sha).toBe("abc123def456");
@@ -101,6 +113,20 @@ describe("generate_aw_info.cjs", () => {
     expect(awInfo.firewall_enabled).toBe(false);
     expect(awInfo.features).toBeUndefined();
     expect(awInfo.created_at).toBeTruthy();
+  });
+
+  it("should expose the authoritative run creation time when requested", async () => {
+    process.env.GH_AW_INFO_FETCH_RUN_CREATED_AT = "true";
+    mockGithub.rest.actions.getWorkflowRun.mockResolvedValue({ data: { created_at: "2026-08-24T12:00:00Z" } });
+
+    await main(mockCore, mockContext, mockGithub);
+
+    expect(mockGithub.rest.actions.getWorkflowRun).toHaveBeenCalledWith({
+      owner: "github",
+      repo: "my-repo",
+      run_id: 12345,
+    });
+    expect(mockCore.setOutput).toHaveBeenCalledWith("run_created_at", "2026-08-24T12:00:00Z");
   });
 
   it("should include features from GH_AW_INFO_FEATURES and preserve value types", async () => {
@@ -193,6 +219,14 @@ describe("generate_aw_info.cjs", () => {
     expect(awInfo.cli_version).toBeUndefined();
   });
 
+  it("should set cache_memory to true when GH_AW_INFO_CACHE_MEMORY is true", async () => {
+    process.env.GH_AW_INFO_CACHE_MEMORY = "true";
+    await main(mockCore, mockContext);
+
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.cache_memory).toBe(true);
+  });
+
   it("should parse allowed domains from JSON env var", async () => {
     process.env.GH_AW_INFO_ALLOWED_DOMAINS = '["github.com","api.github.com"]';
     await main(mockCore, mockContext);
@@ -228,6 +262,21 @@ describe("generate_aw_info.cjs", () => {
     expect(awInfo.firewall_enabled).toBe(true);
     expect(awInfo.awf_version).toBe("v0.23.0");
     expect(awInfo.steps.firewall).toBe("squid");
+  });
+
+  it("should set agent_runtime from env var", async () => {
+    process.env.GH_AW_INFO_AGENT_RUNTIME = "gvisor";
+    await main(mockCore, mockContext);
+
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.agent_runtime).toBe("gvisor");
+  });
+
+  it("should default agent_runtime to empty string when not set", async () => {
+    await main(mockCore, mockContext);
+
+    const awInfo = JSON.parse(fs.readFileSync(awInfoPath, "utf8"));
+    expect(awInfo.agent_runtime).toBe("");
   });
 
   it("should fail when model name contains an unresolved GitHub Actions expression", async () => {

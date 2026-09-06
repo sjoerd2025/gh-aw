@@ -3,6 +3,7 @@
 
 /** @type {typeof import("fs")} */
 const fs = require("fs");
+const path = require("path");
 const { generateStagedPreview } = require("./staged_preview.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { pushSignedCommits } = require("./push_signed_commits.cjs");
@@ -15,15 +16,17 @@ const { detectForkPR, checkBranchPushable } = require("./pr_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { checkFileProtection, checkFileProtectionPostApply } = require("./manifest_file_helpers.cjs");
+const { POLICY_FILE_PROTECTION_DENIED_REASON_CODE } = require("./error_codes.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { renderTemplateFromFile, buildProtectedFileList, getPromptPath } = require("./messages_core.cjs");
 const { withGitHubHostToken } = require("./git_auth_helpers.cjs");
 const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits, isShallowOrSparseCheckout, linearizeRangeAsCommit, ensureSafeDirectoryTrust } = require("./git_helpers.cjs");
-const { normalizeCommitSHA } = require("./commit_sha_helpers.cjs");
+const { extractPatchBaseCommit } = require("./commit_sha_helpers.cjs");
 const { findRepoCheckout } = require("./find_repo_checkout.cjs");
-const { getThreatDetectedMarker } = require("./threat_detection_warning.cjs");
+const { getThreatWarningPresentation } = require("./threat_detection_warning.cjs");
 const { attachExecutionState } = require("./safe_output_execution_metadata.cjs");
 const { resolveTransportPaths } = require("./resolve_transport_paths.cjs");
+const { buildManualBranchApplyCommands } = require("./create_pull_request_helpers.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -113,11 +116,53 @@ function parsePositiveInteger(value) {
  * @returns {Promise<string[]>}
  */
 async function getBundlePreApplyFiles(exec, gitOptions, rangeBaseRef, bundleRef) {
-  const bundleDiffResult = await exec.getExecOutput("git", ["diff", "--name-only", "--no-renames", `${rangeBaseRef}..${bundleRef}`], gitOptions);
-  return bundleDiffResult.stdout
-    .split("\n")
-    .map(f => f.trim())
-    .filter(Boolean);
+  const bundleDiffResult = await exec.getExecOutput("git", ["diff", "--name-only", "--no-renames", "-z", `${rangeBaseRef}..${bundleRef}`], gitOptions);
+  return bundleDiffResult.stdout.split("\0").filter(Boolean);
+}
+
+async function fetchBundlePrerequisites(exec, core, gitAuthEnv, baseGitOpts, prerequisiteCommits, logPrefix = "") {
+  core.warning(`${logPrefix}bundle fetch failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
+  core.info(`${logPrefix}fetching ${prerequisiteCommits.length} prerequisite commit(s) from origin`);
+  // Use --filter=blob:none only when the local repo is already shallow or sparse —
+  // in a full clone we already have all blobs and must not convert the repo to a
+  // partial clone (which would trigger lazy blob fetches on later operations).
+  const prereqGitOpts = { env: { ...process.env, ...gitAuthEnv }, ...baseGitOpts };
+  const useBlobFilter = await isShallowOrSparseCheckout(exec, prereqGitOpts);
+  const prerequisiteFetchArgs = useBlobFilter ? ["fetch", "--filter=blob:none", "origin", ...prerequisiteCommits] : ["fetch", "origin", ...prerequisiteCommits];
+  if (useBlobFilter) {
+    core.info(`${logPrefix}using --filter=blob:none for prerequisite fetch (shallow or sparse checkout detected)`);
+  }
+  await exec.exec("git", prerequisiteFetchArgs, prereqGitOpts);
+  core.info(`${logPrefix}fetched prerequisite commits from origin successfully`);
+}
+
+/**
+ * Measure the expanded blob size of files changed by the applied agent commits.
+ * Deleted files contribute zero bytes because no new content is being introduced.
+ *
+ * @param {Record<string, unknown>} gitOptions
+ * @param {string[]} files
+ * @returns {number}
+ */
+function getChangedBlobSizeBytes(gitOptions, files) {
+  let total = 0;
+  const cwd = typeof gitOptions.cwd === "string" && gitOptions.cwd ? gitOptions.cwd : process.cwd();
+  const resolvedCwd = path.resolve(cwd);
+  for (const file of files) {
+    const filePath = path.resolve(resolvedCwd, file);
+    if (filePath !== resolvedCwd && !filePath.startsWith(`${resolvedCwd}${path.sep}`)) {
+      continue;
+    }
+    try {
+      const stats = fs.statSync(filePath);
+      if (stats.isFile()) {
+        total += stats.size;
+      }
+    } catch {
+      // Stat failure is ignored: deleted files have no expanded content to add to the limit.
+    }
+  }
+  return total;
 }
 
 /**
@@ -414,7 +459,7 @@ async function main(config = {}) {
     try {
       patchContent = fs.readFileSync(patchFilePath, "utf8");
     } catch (err) {
-      throw new Error(`Failed to read file ${patchFilePath}: ${String(err)}`, { cause: err });
+      throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
     }
 
     // Check for actual error conditions
@@ -432,15 +477,8 @@ async function main(config = {}) {
     // Validate patch/bundle size against `max_patch_size`.
     //
     // Size-check source of truth, in order of preference:
-    //   1. `message.diff_size` — the incremental net diff size recorded at
-    //      patch/bundle generation time (this is the correct quantity to cap:
-    //      how much the PR branch will actually change as a result of the push).
-    //   2. For bundle transport: the on-disk bundle file size.
-    //   3. For patch transport: the format-patch file size.
-    //
-    // Using `diff_size` when present fixes the long-running branch case where
-    // the transport file accumulates per-commit metadata + per-commit diffs and
-    // can be many MB even when each iteration only changes a few KB.
+    // Use the uncompressed patch representation for both transport modes.
+    // Bundle size is compressed and can undercount highly compressible changes.
     if (!isEmpty) {
       const patchSizeBytes = Buffer.byteLength(patchContent, "utf8");
       const patchSizeKb = Math.ceil(patchSizeBytes / 1024);
@@ -455,21 +493,8 @@ async function main(config = {}) {
       }
       const bundleSizeKb = Math.ceil(bundleSizeBytes / 1024);
 
-      const diffSizeBytesRaw = message.diff_size;
-      const haveDiffSize = typeof diffSizeBytesRaw === "number" && diffSizeBytesRaw >= 0;
-
-      let sizeForCheckBytes;
-      let sizeLabel;
-      if (haveDiffSize) {
-        sizeForCheckBytes = diffSizeBytesRaw;
-        sizeLabel = "Incremental diff size";
-      } else if (hasBundleFile) {
-        sizeForCheckBytes = bundleSizeBytes;
-        sizeLabel = "Bundle size";
-      } else {
-        sizeForCheckBytes = patchSizeBytes;
-        sizeLabel = "Patch size";
-      }
+      const sizeForCheckBytes = patchSizeBytes;
+      const sizeLabel = "Patch size";
       const sizeForCheckKb = Math.ceil(sizeForCheckBytes / 1024);
 
       if (hasBundleFile) {
@@ -481,14 +506,7 @@ async function main(config = {}) {
 
       if (sizeForCheckKb > maxSizeKb) {
         let msg;
-        if (haveDiffSize) {
-          const transportLabel = hasBundleFile ? `Bundle size: ${bundleSizeKb} KB` : `Patch file size: ${patchSizeKb} KB`;
-          msg = `Incremental diff size (${sizeForCheckKb} KB) exceeds maximum allowed size (${maxSizeKb} KB). ${transportLabel}.`;
-        } else if (hasBundleFile) {
-          msg = `Bundle size (${sizeForCheckKb} KB) exceeds maximum allowed size (${maxSizeKb} KB)`;
-        } else {
-          msg = `Patch size (${sizeForCheckKb} KB) exceeds maximum allowed size (${maxSizeKb} KB)`;
-        }
+        msg = `Patch size (${sizeForCheckKb} KB) exceeds maximum allowed size (${maxSizeKb} KB)`;
         return { success: false, error: msg };
       }
 
@@ -507,8 +525,8 @@ async function main(config = {}) {
           protection.source === "allowlist"
             ? `Cannot push to pull request branch: patch modifies files outside the allowed-files list (${filesStr}). Add the files to the allowed-files configuration field or remove them from the patch.`
             : `Cannot push to pull request branch: patch modifies protected files (${filesStr}). Add them to the allowed-files configuration field or set protected-files: fallback-to-issue to create a review issue instead.`;
-        core.error(msg);
-        return { success: false, error: msg };
+        core.warning(msg);
+        return { success: false, skipped: true, reasonCode: POLICY_FILE_PROTECTION_DENIED_REASON_CODE, error: msg };
       }
       if (protection.action === "fallback") {
         protectedFilesForFallback = protection.files;
@@ -552,7 +570,7 @@ async function main(config = {}) {
             try {
               patchStats = fs.readFileSync(patchFilePath, "utf8");
             } catch (err) {
-              throw new Error(`Failed to read file ${patchFilePath}: ${String(err)}`, { cause: err });
+              throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
             }
             if (patchStats.trim()) {
               content += `**Changes:** Patch file exists with ${patchStats.split("\n").length} lines\n\n`;
@@ -799,7 +817,14 @@ async function main(config = {}) {
     const createProtectedFilesFallbackIssue = async files => {
       const runUrl = buildWorkflowRunUrl(context, context.repo);
       const runId = context.runId;
-      const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
+      const artifactFileName = hasBundleFile ? bundleFilePath.replace("/tmp/gh-aw/", "") : patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
+      const applyInstructions = buildManualBranchApplyCommands({
+        hasBundleFile,
+        runId,
+        artifactFileName,
+        branchName,
+        branchRemote: branchRemoteName,
+      });
       const githubServer = process.env.GITHUB_SERVER_URL || "https://github.com";
       const prUrl = `${githubServer}/${repoParts.owner}/${repoParts.repo}/pull/${pullNumber}`;
       const issueTitle = `[gh-aw] Protected Files: ${prTitle || `PR #${pullNumber}`}`;
@@ -812,7 +837,7 @@ async function main(config = {}) {
         run_url: runUrl,
         run_id: runId,
         branch_name: branchName,
-        patch_file_name: patchFileName,
+        apply_instructions: applyInstructions,
       });
 
       try {
@@ -965,8 +990,8 @@ async function main(config = {}) {
       // Pin patch application to the recorded base commit captured at patch-generation time.
       // This avoids applying a patch generated from an older branch tip onto a newer remote tip.
       // If the commit is unavailable (e.g. cross-repo/missing object), continue with current HEAD.
-      if (!hasBundleFile && message.base_commit) {
-        const recordedBaseCommit = normalizeCommitSHA(message.base_commit);
+      if (!hasBundleFile) {
+        const recordedBaseCommit = extractPatchBaseCommit(patchContent);
         if (recordedBaseCommit) {
           core.info(`Patch route base_commit resolved: ${recordedBaseCommit}`);
           try {
@@ -992,8 +1017,6 @@ async function main(config = {}) {
           } catch (baseCommitError) {
             core.warning(`Unable to use recorded base_commit ${recordedBaseCommit}; applying patch on current branch HEAD: ${getErrorMessage(baseCommitError)}`);
           }
-        } else if (String(message.base_commit).trim()) {
-          core.warning(`Ignoring invalid base_commit value for patch apply: ${String(message.base_commit).trim()}`);
         }
       }
 
@@ -1028,23 +1051,54 @@ async function main(config = {}) {
             // (e.g. when the commit is on a ref not in the fetch refspec).
             const prerequisiteCommits = extractBundlePrerequisiteCommits(initialFetchErrorOutput);
             if (prerequisiteCommits.length > 0) {
-              core.warning(`Bundle fetch failed due to ${prerequisiteCommits.length} missing prerequisite commit(s); fetching prerequisites from origin and retrying`);
-              core.info(`Fetching ${prerequisiteCommits.length} prerequisite commit(s) from origin`);
-              // Use --filter=blob:none only when the local repo is already shallow or sparse —
-              // in a full clone we already have all blobs and must not convert the repo to a
-              // partial clone (which would trigger lazy blob fetches on later operations).
-              const prereqGitOpts = { env: { ...process.env, ...gitAuthEnv }, ...baseGitOpts };
-              const useBlobFilter = await isShallowOrSparseCheckout(exec, prereqGitOpts);
-              const prerequisiteFetchArgs = useBlobFilter ? ["fetch", "--filter=blob:none", "origin", ...prerequisiteCommits] : ["fetch", "origin", ...prerequisiteCommits];
-              if (useBlobFilter) {
-                core.info("Using --filter=blob:none for prerequisite fetch (shallow or sparse checkout detected)");
-              }
-              await exec.exec("git", prerequisiteFetchArgs, prereqGitOpts);
-              core.info("Fetched prerequisite commits from origin successfully");
+              await fetchBundlePrerequisites(exec, core, gitAuthEnv, baseGitOpts, prerequisiteCommits);
               await exec.exec("git", ["fetch", bundleFilePath, bundleFetchRef], baseGitOpts);
               core.info("Bundle fetch retry succeeded after prerequisite recovery");
             } else {
-              throw new Error(`Failed to fetch bundle: ${initialFetchErrorOutput}`);
+              core.warning(`Bundle fetch from refs/heads/${branchName} failed: ${initialFetchErrorOutput}; resolving source ref from bundle heads`);
+              const { stdout: bundleHeadsOutput } = await exec.getExecOutput("git", ["bundle", "list-heads", bundleFilePath], baseGitOpts);
+              const bundleHeads = bundleHeadsOutput
+                .split("\n")
+                .map(line => line.trim().split(/\s+/))
+                // Bundles produced here advertise SHA-1 object IDs; reject malformed entries.
+                .filter(parts => parts.length === 2 && /^[0-9a-f]{40}$/.test(parts[0]) && parts[1]);
+              const branchRefChecks = await Promise.all(
+                bundleHeads
+                  .filter(([, ref]) => ref.startsWith("refs/heads/"))
+                  .map(async ([, ref]) => ({
+                    ref,
+                    isValid: (await exec.getExecOutput("git", ["check-ref-format", ref], { ...baseGitOpts, ignoreReturnCode: true })).exitCode === 0,
+                  }))
+              );
+              const branchRefs = branchRefChecks.filter(({ isValid }) => isValid).map(({ ref }) => ref);
+
+              let bundleSourceRef;
+              if (branchRefs.length === 1) {
+                bundleSourceRef = branchRefs[0];
+              } else if (branchRefs.length === 0) {
+                const headRefs = bundleHeads.filter(([, ref]) => ref === "HEAD");
+                if (headRefs.length !== 1) {
+                  throw new Error(`Failed to resolve bundle source ref from list-heads: expected exactly 1 HEAD entry, found ${headRefs.length}`);
+                }
+                bundleSourceRef = "HEAD";
+              } else {
+                throw new Error(`Failed to resolve bundle source ref from list-heads: expected exactly 1 refs/heads entry, found ${branchRefs.length}`);
+              }
+
+              core.info(`Fetching resolved bundle source ${bundleSourceRef} into ${bundleRef}`);
+              const resolvedBundleFetchRef = `${bundleSourceRef}:${bundleRef}`;
+              const resolvedBundleFetch = await exec.getExecOutput("git", ["fetch", bundleFilePath, resolvedBundleFetchRef], { ...baseGitOpts, ignoreReturnCode: true });
+              if (resolvedBundleFetch.exitCode !== 0) {
+                const resolvedFetchErrorOutput = resolvedBundleFetch.stderr || `exit code ${resolvedBundleFetch.exitCode}`;
+                const resolvedPrerequisiteCommits = extractBundlePrerequisiteCommits(resolvedFetchErrorOutput);
+                if (resolvedPrerequisiteCommits.length === 0) {
+                  throw new Error(`Failed to fetch resolved bundle source ${bundleSourceRef}: ${resolvedFetchErrorOutput}`);
+                }
+
+                await fetchBundlePrerequisites(exec, core, gitAuthEnv, baseGitOpts, resolvedPrerequisiteCommits, "[resolved] ");
+                await exec.exec("git", ["fetch", bundleFilePath, resolvedBundleFetchRef], baseGitOpts);
+                core.info("Resolved bundle fetch retry succeeded after prerequisite recovery");
+              }
             }
           }
           core.info(`Fetched bundle to ${bundleRef}`);
@@ -1065,8 +1119,8 @@ async function main(config = {}) {
                   bundleProtection.source === "post-apply"
                     ? `Cannot push to pull request branch: bundle modifies files outside the allowed-files list (${filesStr}). Add the files to the allowed-files configuration field or remove them from the bundle.`
                     : `Cannot push to pull request branch: bundle modifies protected files (${filesStr}). Add them to the allowed-files configuration field or set protected-files: fallback-to-issue to create a review issue instead.`;
-                core.error(msg);
-                return { success: false, error: msg };
+                core.warning(msg);
+                return { success: false, skipped: true, reasonCode: POLICY_FILE_PROTECTION_DENIED_REASON_CODE, error: msg };
               }
               if (bundleProtection.action === "fallback") {
                 core.warning(`Protected file protection triggered (fallback-to-issue): ${bundleProtection.files.join(", ")}. Will create review issue instead of pushing.`);
@@ -1218,11 +1272,8 @@ async function main(config = {}) {
       // (see github/agentic-workflows#539)
       let agentChangedFiles = [];
       {
-        const diffResult = await exec.getExecOutput("git", ["diff", "--name-only", "--no-renames", `${rangeBaseRef}..HEAD`], baseGitOpts);
-        const actualFiles = diffResult.stdout
-          .split("\n")
-          .map(f => f.trim())
-          .filter(Boolean);
+        const diffResult = await exec.getExecOutput("git", ["diff", "--name-only", "--no-renames", "-z", `${rangeBaseRef}..HEAD`], baseGitOpts);
+        const actualFiles = diffResult.stdout.split("\0").filter(Boolean);
         agentChangedFiles = actualFiles;
         if (actualFiles.length > 0) {
           core.info(`Post-apply verification: ${actualFiles.length} file(s) actually modified`);
@@ -1239,6 +1290,15 @@ async function main(config = {}) {
             core.warning(`Post-apply: Protected file protection triggered (fallback-to-issue): ${postApplyProtection.files.join(", ")}`);
             await exec.exec("git", ["reset", "--hard", rangeBaseRef], baseGitOpts);
             return await createProtectedFilesFallbackIssue(postApplyProtection.files);
+          }
+
+          const changedBlobSizeBytes = getChangedBlobSizeBytes(baseGitOpts, actualFiles);
+          const changedBlobSizeKb = Math.ceil(changedBlobSizeBytes / 1024);
+          core.info(`Changed content size: ${changedBlobSizeKb} KB (maximum allowed: ${maxSizeKb} KB)`);
+          if (changedBlobSizeKb > maxSizeKb) {
+            const msg = `Changed content size (${changedBlobSizeKb} KB) exceeds maximum allowed size (${maxSizeKb} KB)`;
+            await exec.exec("git", ["reset", "--hard", rangeBaseRef], baseGitOpts);
+            return { success: false, error: msg };
           }
         }
       }
@@ -1304,11 +1364,12 @@ async function main(config = {}) {
           // For fork-backed PRs, use an owner-qualified head reference.
           const reviewHeadRef = pushRemoteUrl ? `${pushRepoParts.owner}:${reviewBranchName}` : reviewBranchName;
           const detectionReasonEnv = process.env.GH_AW_DETECTION_REASON || "unknown";
+          const warning = getThreatWarningPresentation(detectionReasonEnv);
           const prBody = [
-            "> [!CAUTION]",
-            "> agentic threat detected",
-            "> Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.",
-            `> ${getThreatDetectedMarker(detectionReasonEnv)}`,
+            `> [!${warning.admonition}]`,
+            `> ${warning.title}`,
+            `> ${warning.summary}`,
+            `> ${warning.marker}`,
             ">",
             `> **Reason:** ${detectionReasonEnv}`,
             ">",

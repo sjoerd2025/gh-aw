@@ -3,7 +3,7 @@
 
 const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { ERR_API } = require("./error_codes.cjs");
+const { ERR_API, ERR_SYSTEM } = require("./error_codes.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { generateFooterWithExpiration } = require("./ephemerals.cjs");
 const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
@@ -12,6 +12,7 @@ const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { formatAIC } = require("./model_costs.cjs");
 const { reduceModelNameToIdentifier } = require("./model_aliases.cjs");
+const { buildNoopConclusionSummary } = require("./conclusion_summary.cjs");
 /**
  * Search for or create the parent issue for all agentic workflow no-op runs
  * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
@@ -54,7 +55,7 @@ async function ensureAgentRunsIssue() {
   try {
     parentBodyContent = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
 
   const parentBody = generateFooterWithExpiration({
@@ -78,24 +79,40 @@ async function ensureAgentRunsIssue() {
 }
 
 /**
- * Build the AIC suffix string for use in comment footers.
- * Includes agent, threat-detection, and evals AIC when available.
- * Returns a string like " · 0.001 AIC" or "" when not available.
+ * Parse a raw AIC environment variable value and return it as a positive number.
+ * Returns undefined when the value is absent, non-numeric, or non-positive.
+ * @param {string|undefined} raw
+ * @returns {number|undefined}
+ */
+function parsePositiveAIC(raw) {
+  const parsed = raw ? Number.parseFloat(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * @param {string} label
+ * @param {number|undefined} value
+ * @param {string|undefined} [modelAlias]
  * @returns {string}
  */
-function buildAICSuffix() {
-  const agentRaw = process.env.GH_AW_AIC;
-  const detectionRaw = process.env.GH_AW_THREAT_DETECTION_AIC;
-  const evalsRaw = process.env.GH_AW_EVALS_AIC;
-  const agentAIC = agentRaw ? Number.parseFloat(agentRaw) : NaN;
-  const detectionAIC = detectionRaw ? Number.parseFloat(detectionRaw) : NaN;
-  const evalsAIC = evalsRaw ? Number.parseFloat(evalsRaw) : NaN;
-  const compressedModelName = reduceModelNameToIdentifier(process.env.GH_AW_PRIMARY_MODEL || process.env.GH_AW_ENGINE_MODEL);
-  const totalAIC = (Number.isFinite(agentAIC) && agentAIC > 0 ? agentAIC : 0) + (Number.isFinite(detectionAIC) && detectionAIC > 0 ? detectionAIC : 0) + (Number.isFinite(evalsAIC) && evalsAIC > 0 ? evalsAIC : 0);
-  if (totalAIC <= 0) {
+function buildAICEntry(label, value, modelAlias) {
+  const formatted = typeof value === "number" ? formatAIC(value) : "";
+  if (!formatted) {
     return "";
   }
-  return ` · ${compressedModelName ? `${compressedModelName} · ` : ""}${formatAIC(totalAIC)} AIC`;
+  const prefix = [label, modelAlias].filter(Boolean).join(" ");
+  return ` · ${prefix ? `${prefix}${modelAlias ? " · " : " "}` : ""}${formatted} AIC`;
+}
+
+function buildAICSuffix() {
+  const agentAIC = parsePositiveAIC(process.env.GH_AW_AIC);
+  const detectionAIC = parsePositiveAIC(process.env.GH_AW_THREAT_DETECTION_AIC);
+  const evalsAIC = parsePositiveAIC(process.env.GH_AW_EVALS_AIC);
+  const compressedModelName = reduceModelNameToIdentifier(process.env.GH_AW_PRIMARY_MODEL || process.env.GH_AW_ENGINE_MODEL);
+  const agentSuffix = buildAICEntry("", agentAIC, compressedModelName);
+  const detectionSuffix = buildAICEntry("⌖", detectionAIC);
+  const evalsSuffix = buildAICEntry("◇", evalsAIC);
+  return `${agentSuffix}${detectionSuffix}${evalsSuffix}`;
 }
 
 /**
@@ -136,6 +153,27 @@ function buildHistoryLink() {
 }
 
 /**
+ * Render the no-op comment body shared by the no-op runs issue comment and the
+ * comment posted on other run-scoped tracking items.
+ * @param {string} workflowName
+ * @param {string} message
+ * @param {string} runUrl
+ * @returns {string}
+ */
+function buildNoopCommentBody(workflowName, message, runUrl) {
+  const commentTemplatePath = getPromptPath("noop_comment.md");
+  const commentBody = renderTemplateFromFile(commentTemplatePath, {
+    workflow_name: workflowName,
+    message,
+    run_url: runUrl,
+    aic_suffix: buildAICSuffix(),
+    ambient_context_suffix: buildAmbientContextSuffix(),
+    history_link: buildHistoryLink(),
+  });
+  return sanitizeContent(commentBody, { maxLength: 65000 });
+}
+
+/**
  * Process no-op safe outputs and optionally post to the no-op runs issue.
  * This merged step replaces the separate "Process no-op messages" + "Handle No-Op Message"
  * steps, eliminating the cross-step output dependency on GH_AW_NOOP_MESSAGE.
@@ -155,9 +193,13 @@ async function main() {
       return;
     }
 
-    const maxCount = parseInt(process.env.GH_AW_NOOP_MAX || "0", 10);
+    const maxCount = Number(process.env.GH_AW_NOOP_MAX || "0");
+    if (!Number.isFinite(maxCount) || !Number.isSafeInteger(maxCount) || maxCount < 0) {
+      throw new Error(`${ERR_SYSTEM}: GH_AW_NOOP_MAX must be a non-negative integer`);
+    }
+    const limitedMaxCount = maxCount;
     const allNoopItems = (result.items || []).filter(/** @param {any} item */ item => item.type === "noop");
-    const noopItems = maxCount > 0 ? allNoopItems.slice(0, maxCount) : allNoopItems;
+    const noopItems = limitedMaxCount > 0 ? allNoopItems.slice(0, limitedMaxCount) : allNoopItems;
 
     if (noopItems.length === 0) {
       core.info("No noop items found in agent output");
@@ -169,27 +211,23 @@ async function main() {
 
     // --- Staged mode: preview only, do not post ---
     if (isStagedMode()) {
-      let summaryContent = "## 🎭 Staged Mode: No-Op Messages Preview\n\n";
-      summaryContent += "The following messages would be logged if staged mode was disabled:\n\n";
-      for (let i = 0; i < noopItems.length; i++) {
-        const item = noopItems[i];
-        summaryContent += `### Message ${i + 1}\n`;
-        summaryContent += `${item.message}\n\n`;
-        summaryContent += "---\n\n";
-      }
+      const summaryContent = buildNoopConclusionSummary(
+        noopItems.map(item => item.message),
+        { runUrl: process.env.GH_AW_RUN_URL, staged: true }
+      );
       await core.summary.addRaw(summaryContent).write();
       core.info("📝 No-op message preview written to step summary");
       return;
     }
 
     // --- Write step summary ---
-    let summaryContent = "\n\n## No-Op Messages\n\n";
-    summaryContent += "The following messages were logged for transparency:\n\n";
-    for (let i = 0; i < noopItems.length; i++) {
-      const item = noopItems[i];
-      core.info(`No-op message ${i + 1}: ${item.message}`);
-      summaryContent += `- ${item.message}\n`;
+    for (let index = 0; index < noopItems.length; index++) {
+      core.info(`No-op message ${index + 1}: ${noopItems[index].message}`);
     }
+    const summaryContent = buildNoopConclusionSummary(
+      noopItems.map(item => item.message),
+      { runUrl: process.env.GH_AW_RUN_URL }
+    );
     await core.summary.addRaw(summaryContent).write();
 
     // Export for downstream steps/jobs
@@ -201,6 +239,16 @@ async function main() {
     const runUrl = process.env.GH_AW_RUN_URL || "";
     const agentConclusion = process.env.GH_AW_AGENT_CONCLUSION || "";
     const reportAsIssue = process.env.GH_AW_NOOP_REPORT_AS_ISSUE !== "false"; // Default to true
+
+    // Render the comment body once so later steps (e.g. discarding an unused
+    // another run-scoped tracking item) can post the exact same message.
+    let commentBody = "";
+    try {
+      commentBody = buildNoopCommentBody(workflowName, noopMessage, runUrl);
+      core.setOutput("noop_comment_body", commentBody);
+    } catch (error) {
+      core.warning(`Could not render no-op comment body: ${getErrorMessage(error)}`);
+    }
 
     core.info(`Workflow name: ${workflowName}`);
     core.info(`Run URL: ${runUrl}`);
@@ -247,26 +295,18 @@ async function main() {
       return;
     }
 
-    // Load and render comment template from file
-    const commentTemplatePath = getPromptPath("noop_comment.md");
-    const commentBody = renderTemplateFromFile(commentTemplatePath, {
-      workflow_name: workflowName,
-      message: noopMessage,
-      run_url: runUrl,
-      aic_suffix: buildAICSuffix(),
-      ambient_context_suffix: buildAmbientContextSuffix(),
-      history_link: buildHistoryLink(),
-    });
-
-    // Sanitize the full comment body
-    const fullCommentBody = sanitizeContent(commentBody, { maxLength: 65000 });
+    // Reuse the comment body rendered above; it is empty only when rendering failed.
+    if (!commentBody) {
+      core.warning("No-op comment body is unavailable, skipping no-op message posting");
+      return;
+    }
 
     try {
       await github.rest.issues.createComment({
         owner,
         repo,
         issue_number: noopRunsIssue.number,
-        body: fullCommentBody,
+        body: commentBody,
       });
 
       core.info(`✓ Posted no-op message to no-op runs issue #${noopRunsIssue.number}`);

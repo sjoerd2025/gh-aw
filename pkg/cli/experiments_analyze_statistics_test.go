@@ -14,6 +14,7 @@ import (
 
 // TestChiSquarePValue verifies the Wilson-Hilferty approximation against known values.
 func TestChiSquarePValue(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		chi2    float64
@@ -91,6 +92,7 @@ func TestChiSquarePValue(t *testing.T) {
 
 // TestExpectedProportions verifies equal and weighted proportion computations.
 func TestExpectedProportions(t *testing.T) {
+	t.Parallel()
 	t.Run("equal proportions when no config", func(t *testing.T) {
 		names := []string{"A", "B", "C"}
 		got := expectedProportions(names, nil)
@@ -172,8 +174,75 @@ func TestExpectedProportions(t *testing.T) {
 	})
 }
 
+func TestExperimentVariantCounts(t *testing.T) {
+	t.Parallel()
+
+	t.Run("includes declared variants with zero counts", func(t *testing.T) {
+		exp := ExperimentVariantStats{
+			Variants: map[string]int{"control": 3},
+		}
+		cfg := &workflow.ExperimentConfig{
+			Variants: []string{"control", "candidate"},
+		}
+
+		got := experimentVariantCounts(exp, cfg, true)
+
+		assert.Equal(t, map[string]int{"control": 3, "candidate": 0}, got)
+	})
+
+	t.Run("returns observed variants when declared variants are excluded", func(t *testing.T) {
+		exp := ExperimentVariantStats{
+			Variants: map[string]int{"control": 3},
+		}
+		cfg := &workflow.ExperimentConfig{
+			Variants: []string{"control", "candidate"},
+		}
+
+		got := experimentVariantCounts(exp, cfg, false)
+
+		assert.Equal(t, exp.Variants, got)
+	})
+
+	t.Run("drops stale variant keys no longer declared", func(t *testing.T) {
+		exp := ExperimentVariantStats{
+			Variants: map[string]int{"control": 3, "candidate": 5, "legacy-variant": 1},
+		}
+		cfg := &workflow.ExperimentConfig{
+			Variants: []string{"control", "candidate"},
+		}
+
+		got := experimentVariantCounts(exp, cfg, false)
+
+		assert.Equal(t, map[string]int{"control": 3, "candidate": 5}, got, "stale variant no longer in cfg.Variants should be dropped")
+	})
+
+	t.Run("drops stale variant keys and adds missing declared variants with zero counts", func(t *testing.T) {
+		exp := ExperimentVariantStats{
+			Variants: map[string]int{"control": 3, "legacy-variant": 1},
+		}
+		cfg := &workflow.ExperimentConfig{
+			Variants: []string{"control", "candidate"},
+		}
+
+		got := experimentVariantCounts(exp, cfg, true)
+
+		assert.Equal(t, map[string]int{"control": 3, "candidate": 0}, got)
+	})
+
+	t.Run("returns observed variants when config is nil", func(t *testing.T) {
+		exp := ExperimentVariantStats{
+			Variants: map[string]int{"control": 3},
+		}
+
+		got := experimentVariantCounts(exp, nil, true)
+
+		assert.Equal(t, exp.Variants, got)
+	})
+}
+
 // TestComputeExperimentAnalysis verifies the end-to-end statistical computation.
 func TestComputeExperimentAnalysis(t *testing.T) {
+	t.Parallel()
 	t.Run("balanced two-variant experiment below min_samples", func(t *testing.T) {
 		exp := ExperimentVariantStats{
 			Name:     "style",
@@ -205,6 +274,7 @@ func TestComputeExperimentAnalysis(t *testing.T) {
 		}
 		a := computeExperimentAnalysis(exp, cfg, nil, nil)
 		assert.Equal(t, 5, a.MinSamples, "min_samples from config")
+		assert.Equal(t, ExperimentReadinessReady, a.Readiness, "count >= min_samples → READY")
 		assert.Equal(t, "READY_FOR_ANALYSIS", a.Recommendation, "count >= min_samples → READY")
 		for _, v := range a.Variants {
 			assert.False(t, v.BelowMinSamples, "no variant should be below min_samples=5")
@@ -285,6 +355,28 @@ func TestComputeExperimentAnalysis(t *testing.T) {
 		assert.Less(t, a.PValue, balanceSignificanceThreshold, "p < 0.05 for extreme imbalance")
 	})
 
+	t.Run("stale variant labels excluded from balance test when reconciled against config", func(t *testing.T) {
+		// Regression test for github/gh-aw#58489: legacy variant labels left over from a
+		// renamed variant set (e.g. "small-agent"/"agent") must not be counted toward the
+		// chi-square balance test once the workflow's frontmatter no longer declares them.
+		exp := ExperimentVariantStats{
+			Name:     "model_size",
+			Variants: map[string]int{"gpt-5.4": 28, "gpt-5.4-mini": 18, "small-agent": 1, "agent": 1},
+			Total:    48,
+		}
+		cfg := &workflow.ExperimentConfig{
+			Variants: []string{"gpt-5.4", "gpt-5.4-mini"},
+		}
+		a := computeExperimentAnalysis(exp, cfg, nil, nil)
+		assert.True(t, a.IsBalanced, "28/18 split should be balanced once stale labels are excluded")
+		assert.GreaterOrEqual(t, a.PValue, balanceSignificanceThreshold)
+		require.Len(t, a.Variants, 2, "stale variant keys should not appear in the analysis")
+		for _, v := range a.Variants {
+			assert.NotEqual(t, "small-agent", v.Name)
+			assert.NotEqual(t, "agent", v.Name)
+		}
+	})
+
 	t.Run("empty experiment returns EXTEND with zero total", func(t *testing.T) {
 		exp := ExperimentVariantStats{
 			Name:     "empty",
@@ -326,6 +418,22 @@ func TestComputeExperimentAnalysis(t *testing.T) {
 		require.Len(t, a.Variants, 2, "two variants")
 		assert.InDelta(t, 70.0, a.Variants[0].ExpectedPct, 0.1, "control expected 70%")
 		assert.InDelta(t, 30.0, a.Variants[1].ExpectedPct, 0.1, "variant expected 30%")
+	})
+
+	t.Run("continual ramp skips fixed-allocation balance check", func(t *testing.T) {
+		exp := ExperimentVariantStats{
+			Name:     "optimization",
+			Variants: map[string]int{"candidate": 2, "control": 18},
+			Total:    20,
+		}
+		cfg := &workflow.ExperimentConfig{
+			Variants:  []string{"control", "candidate"},
+			Continual: &workflow.ContinualExperimentConfig{Seed: "stable-seed", Ramp: []int{10, 25}},
+		}
+		a := computeExperimentAnalysis(exp, cfg, nil, nil)
+		assert.True(t, a.IsBalanced, "changing ramp allocations should not be tested against a fixed split")
+		assert.Zero(t, a.ChiSquare)
+		assert.Zero(t, a.PValue)
 	})
 
 	t.Run("metric from config (plain)", func(t *testing.T) {
@@ -478,6 +586,7 @@ func TestComputeExperimentAnalysis(t *testing.T) {
 
 // TestComputeExperimentAnalyses tests the bulk analysis function.
 func TestComputeExperimentAnalyses(t *testing.T) {
+	t.Parallel()
 	t.Run("empty experiments returns nil", func(t *testing.T) {
 		result := computeExperimentAnalyses(nil, nil, nil, nil)
 		assert.Nil(t, result, "nil experiments should return nil")
@@ -516,6 +625,7 @@ func TestComputeExperimentAnalyses(t *testing.T) {
 
 // TestExperimentAnalysisJSONOutput verifies that ExperimentAnalysis serialises correctly.
 func TestExperimentAnalysisJSONOutput(t *testing.T) {
+	t.Parallel()
 	exp := ExperimentVariantStats{
 		Name:     "style",
 		Variants: map[string]int{"concise": 12, "detailed": 8},
@@ -542,7 +652,12 @@ func TestExperimentAnalysisJSONOutput(t *testing.T) {
 	assert.Equal(t, "H0: no change. H1: concise is better.", result["hypothesis"], "hypothesis field")
 	assert.Equal(t, "t_test", result["analysis_type"], "analysis_type field")
 	assert.EqualValues(t, 30, result["min_samples"], "min_samples field")
+	assert.Equal(t, "COLLECTING", result["readiness"], "readiness field")
 	assert.Equal(t, "EXTEND", result["recommendation"], "recommendation field (below min_samples)")
+	assert.Equal(t, "EXTEND", result["decision"], "deterministic decision field")
+	assert.Equal(t, "insufficient_samples", result["reason_code"], "structured decision reason")
+	assert.Contains(t, result, "decision_policy", "normalized policy should be machine-readable")
+	assert.Contains(t, result, "decision_guardrails", "guardrail summary should be machine-readable")
 
 	variants, ok := result["variants"].([]any)
 	require.True(t, ok, "variants should be an array")
@@ -555,6 +670,7 @@ func TestExperimentAnalysisJSONOutput(t *testing.T) {
 
 // TestExperimentAnalysisBonferroniAbsent verifies BonferroniAlpha is omitted for K < 3.
 func TestExperimentAnalysisBonferroniAbsent(t *testing.T) {
+	t.Parallel()
 	exp := ExperimentVariantStats{
 		Name:     "binary",
 		Variants: map[string]int{"yes": 10, "no": 10},
@@ -574,6 +690,7 @@ func TestExperimentAnalysisBonferroniAbsent(t *testing.T) {
 
 // TestMinSamplesDefaultApplied verifies the default min_samples value is 20.
 func TestMinSamplesDefaultApplied(t *testing.T) {
+	t.Parallel()
 	exp := ExperimentVariantStats{
 		Name:     "test",
 		Variants: map[string]int{"A": 10, "B": 10},
@@ -585,6 +702,7 @@ func TestMinSamplesDefaultApplied(t *testing.T) {
 
 // TestChiSquarePValueMonotonicity verifies that larger chi2 values produce smaller p-values.
 func TestChiSquarePValueMonotonicity(t *testing.T) {
+	t.Parallel()
 	prev := chiSquarePValue(0.1, 1)
 	for _, chi2 := range []float64{0.5, 1.0, 2.0, 3.841, 6.0, 10.0} {
 		p := chiSquarePValue(chi2, 1)
@@ -595,6 +713,7 @@ func TestChiSquarePValueMonotonicity(t *testing.T) {
 
 // TestChiSquarePValueReturnRange verifies p-values are always in [0, 1].
 func TestChiSquarePValueReturnRange(t *testing.T) {
+	t.Parallel()
 	inputs := []struct {
 		chi2 float64
 		df   int
@@ -611,6 +730,7 @@ func TestChiSquarePValueReturnRange(t *testing.T) {
 
 // TestObservedPctSumsToHundred verifies that observed percentages sum to ~100%.
 func TestObservedPctSumsToHundred(t *testing.T) {
+	t.Parallel()
 	exp := ExperimentVariantStats{
 		Name:     "pct_test",
 		Variants: map[string]int{"A": 7, "B": 13},
@@ -626,6 +746,7 @@ func TestObservedPctSumsToHundred(t *testing.T) {
 
 // TestExpectedPctSumsToHundred verifies expected percentages sum to ~100%.
 func TestExpectedPctSumsToHundred(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		variants map[string]int
@@ -658,6 +779,7 @@ func TestExpectedPctSumsToHundred(t *testing.T) {
 
 // TestReadyForAnalysisAllAboveMinSamples verifies the recommendation when all counts >= min_samples.
 func TestReadyForAnalysisAllAboveMinSamples(t *testing.T) {
+	t.Parallel()
 	exp := ExperimentVariantStats{
 		Name:     "ready",
 		Variants: map[string]int{"X": 25, "Y": 30},
@@ -678,6 +800,7 @@ func TestReadyForAnalysisAllAboveMinSamples(t *testing.T) {
 
 // TestPartiallyBelowMinSamples verifies EXTEND when only some variants are below threshold.
 func TestPartiallyBelowMinSamples(t *testing.T) {
+	t.Parallel()
 	exp := ExperimentVariantStats{
 		Name:     "partial",
 		Variants: map[string]int{"above": 25, "below": 5},
@@ -701,6 +824,7 @@ func TestPartiallyBelowMinSamples(t *testing.T) {
 
 // TestChiSquarePerfectBalance verifies that chi² = 0 for a perfectly balanced sample.
 func TestChiSquarePerfectBalance(t *testing.T) {
+	t.Parallel()
 	exp := ExperimentVariantStats{
 		Name:     "perfect",
 		Variants: map[string]int{"A": 10, "B": 10, "C": 10},
@@ -715,6 +839,7 @@ func TestChiSquarePerfectBalance(t *testing.T) {
 // TestFindWorkflowFileForExperiment verifies that the function returns "" in isolation
 // (no .github/workflows directory in the test working directory).
 func TestFindWorkflowFileForExperiment(t *testing.T) {
+	t.Parallel()
 	// In the test environment, no .github/workflows directory is available relative to cwd.
 	// The function should return "" without panicking.
 	result := findWorkflowFileForExperiment("nonexistent_experiment")
@@ -724,6 +849,7 @@ func TestFindWorkflowFileForExperiment(t *testing.T) {
 // TestMatchWorkflowFilenameByExperiment verifies that the helper correctly resolves
 // hyphenated workflow filenames from sanitized experiment branch names.
 func TestMatchWorkflowFilenameByExperiment(t *testing.T) {
+	t.Parallel()
 	files := []string{
 		"ci-coach.md",
 		"daily-issues-report.md",
@@ -755,6 +881,7 @@ func TestMatchWorkflowFilenameByExperiment(t *testing.T) {
 // TestMatchWorkflowFilenameByExperimentAmbiguous verifies that the first match is returned
 // and a warning is logged when multiple files share the same sanitized name.
 func TestMatchWorkflowFilenameByExperimentAmbiguous(t *testing.T) {
+	t.Parallel()
 	// "ci-coach.md" and "cicoach.md" both sanitize to "cicoach".
 	files := []string{"ci-coach.md", "cicoach.md"}
 	got := matchWorkflowFilenameByExperiment(files, "cicoach")
@@ -765,6 +892,7 @@ func TestMatchWorkflowFilenameByExperimentAmbiguous(t *testing.T) {
 // The real resolution is handled by findRemoteWorkflowFilenameForExperiment; this list
 // is only used as a last-resort fallback when the directory listing is unavailable.
 func TestWorkflowFileCandidates(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		experimentName string
 		wantContains   string
@@ -784,6 +912,7 @@ func TestWorkflowFileCandidates(t *testing.T) {
 
 // TestAnalysisWithNilConfig verifies analysis runs cleanly without a config.
 func TestAnalysisWithNilConfig(t *testing.T) {
+	t.Parallel()
 	exp := ExperimentVariantStats{
 		Name:     "no_config",
 		Variants: map[string]int{"on": 8, "off": 12},
@@ -804,6 +933,7 @@ func TestAnalysisWithNilConfig(t *testing.T) {
 
 // TestComputeExperimentAnalysisDegenerateVariants tests degenerate experiments with < 2 variants.
 func TestComputeExperimentAnalysisDegenerateVariants(t *testing.T) {
+	t.Parallel()
 	t.Run("zero variants returns EXTEND", func(t *testing.T) {
 		exp := ExperimentVariantStats{
 			Name:     "no_variants",

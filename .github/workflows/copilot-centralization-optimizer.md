@@ -10,12 +10,16 @@ permissions:
   copilot-requests: write
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
   repo-memory:
     branch-name: memory/copilot-centralization-optimizer
     description: Long-lived centralization trend snapshots and history
     file-glob: ["*.json", "*.jsonl"]
+engine:
+  id: codex
+  model-provider: github
+model: copilot/gpt-5.3-codex
 strict: true
 max-ai-credits: 250
 max-daily-ai-credits: 1000
@@ -304,6 +308,10 @@ evals:
     question: Did the agent identify repeated cross-user prompt patterns suitable for centralization?
   - id: recommendations_produced
     question: Were recommendations produced for new workflows, tools, shared prompts, or other automations?
+imports:
+  - shared/reporting.md
+features:
+  gh-aw-detection: true
 ---
 
 # Copilot Centralization Optimizer

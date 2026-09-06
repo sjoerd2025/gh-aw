@@ -2,7 +2,7 @@
 private: true
 emoji: "🦸"
 name: Avenger
-description: Hourly CI fixer — merges origin/main, runs recompile/fmt/lint/test/wasm-golden and creates a PR for any fixable issues. Skips if CI is passing.
+description: Hourly CI fixer — merges origin/main, applies targeted CI fixes, and creates a PR for fixable issues. Skips if CI is passing.
 on:
   schedule:
     - cron: "23 * * * *"  # Every hour at minute 23 (offset to avoid thundering herd)
@@ -13,11 +13,15 @@ permissions:
   actions: read
   issues: read
   pull-requests: read
+env:
+  GOTOOLCHAIN: auto
+  GH_AW_HARNESS_MAX_RETRIES: "4"
 tracker-id: avenger-ci
 max-turns: 50
-model: claude-haiku-4.5
+model: openai/gpt-5.4
 engine:
-  id: claude
+  id: codex
+  model-provider: openai
 network:
   allowed:
     - defaults
@@ -25,17 +29,16 @@ network:
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   bash: ["*"]
   edit:
 sandbox:
   agent:
     id: awf
-    sudo: false
+    runtime: cloud-hypervisor
     mounts:
       - "/usr/bin/make:/usr/bin/make:ro"
-      - "/usr/bin/go:/usr/bin/go:ro"
       - "/usr/local/bin/node:/usr/local/bin/node:ro"
       - "/usr/local/bin/npm:/usr/local/bin/npm:ro"
       - "/usr/local/lib/node_modules:/usr/local/lib/node_modules:ro"
@@ -108,6 +111,7 @@ steps:
   - name: Install development dependencies
     run: make deps-dev
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[avenger] "
@@ -119,6 +123,7 @@ safe-outputs:
 timeout-minutes: 45
 imports:
   - shared/otlp.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
 evals:
@@ -126,6 +131,7 @@ evals:
     question: Did the agent assess the current CI state and determine if intervention was needed?
   - id: pr_created_or_skipped
     question: Was a PR created with CI fixes, or was the run correctly skipped because CI was already passing?
+
 ---
 
 # Avenger — Hourly CI Fixer
@@ -139,12 +145,20 @@ You are **Avenger**, an automated hourly CI repair agent. Your mission is to kee
 - **CI Status**: ${{ needs.check_ci_status.outputs.ci_status }}
 - **CI Run ID**: ${{ needs.check_ci_status.outputs.ci_run_id }}
 
+## Runtime Budget (Hard Requirement)
+
+- Finish the entire run (analysis + fix + validation + PR/noop) within **8 minutes**.
+- Keep commands targeted to the failing CI signal. Do **not** run broad exploratory commands.
+- Never run `go build ./...` or `go test ./...`/`go test ./pkg/...` directly.
+- Never run background long-running checks with polling loops (`sleep` + `pgrep` + repeated `tail`).
+
 ## Step 0: Verify CI Status
 
 Before doing anything:
 
 1. **If CI Status is "success"**: CI was passing at activation time — call `noop` immediately with "CI is passing on main branch - no cleanup needed" and **stop**.
-2. **If CI Status is "failure"**: Re-verify using the live API:
+2. **If CI Status is "failure"**: Proceed with the repair sequence below using the CI Run ID from the pre-check.
+3. **If CI Status is missing or ambiguous**: Re-verify using the live API:
    ```bash
    gh run list --workflow=ci.yml --branch=main --limit=2 --json conclusion,status,databaseId
    ```
@@ -179,35 +193,52 @@ git diff --name-only HEAD origin/main | grep '^\.github/workflows/.*\.md$'
 
 > **Note**: `.github/workflows/**` files are automatically excluded from the pull request by the safe-outputs configuration, so recompile output will not be included in the PR even when it runs.
 
-## Step 3: Format sources
+## Step 3: Inspect the failing CI run first (mandatory)
+
+Use the CI Run ID from pre-check and identify the first failed job and failing signal before running any local validation:
+
+```bash
+gh run view "${{ needs.check_ci_status.outputs.ci_run_id }}" --json jobs
+```
+
+Then inspect only the failing job logs and extract the concrete failure category (formatting, lint, tests, wasm golden, compile, or other).
+
+- If the failure is not actionable or is clearly infra/transient (network outage, rate limit, runner outage), call `noop` with a brief explanation and stop.
+- If actionable, apply the smallest fix that maps directly to the failure signal.
+
+## Step 4: Format sources (only when relevant)
 
 ```bash
 make fmt
 ```
 
-## Step 4: Update wasm golden files
+Run this only when the failing CI signal points to formatting (or when your code edits require formatting).
+
+## Step 5: Update wasm golden files (only for wasm-golden failures)
 
 ```bash
 make update-wasm-golden
 ```
 
-This regenerates expected output files for the wasm golden tests. Run it unconditionally — it is fast and idempotent.
+Run this only when the failing CI signal indicates wasm golden drift.
 
-## Step 5: Fix lint issues
+## Step 6: Fix lint issues (only for lint failures)
 
 ```bash
 make lint
 ```
 
-Analyze any lint errors and fix them. Re-run `make lint` after each fix to confirm the error is resolved. If a lint error cannot be fixed automatically after 3 attempts, document it and move on.
+Analyze lint errors and fix them. Re-run `make lint` once to confirm.
 
-## Step 6: Fix test failures
+**Important — `golangci-lint` sandbox limitation**: `golangci-lint` is not preinstalled in this sandbox and network egress to fetch it is blocked by the firewall. If `make lint` (or `make golint`) reports `golangci-lint is not installed`, this is a known environment limitation — **do not** attempt to install it via `go install`, `curl`, or any other network call. Skip the `golangci-lint`-specific portion of linting, note it in the PR body, and move on immediately to the next step. Do not retry the install more than once.
+
+## Step 7: Fix test failures (only for test failures)
 
 ```bash
 make test-unit
 ```
 
-Analyze any test failures and fix them. If a test failure is too complex to fix automatically after 3 attempts, document it and move on.
+Analyze test failures and fix them. Run `make test-unit` at most once for verification after your fix. If it cannot complete quickly within the runtime budget, call `noop` with what blocked progress.
 
 ## File-Count Guard Before PR Creation
 
@@ -227,7 +258,8 @@ git diff --cached --name-only | wc -l
 - **Be systematic**: Work through each step in sequence.
 - **Be efficient**: Avoid verbose analysis; act directly.
 - **One issue at a time**: Confirm the current step passes before moving to the next.
-- **Token Budget Awareness**: Hard limit is 25 turns. If approaching the limit, commit what you have and create the PR.
+- **Runtime Budget Awareness**: Hard limit is 8 minutes. Prefer a small complete fix over broad validation.
+- **Token Budget Awareness**: Hard limit is 50 turns. If approaching the limit, finish with a safe-output action.
 
 ## Mandatory Exit Protocol
 

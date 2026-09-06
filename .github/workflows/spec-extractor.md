@@ -114,7 +114,7 @@ pre-agent-steps:
 
           echo "### Imports"
           echo '```'
-          find "pkg/$PKG" -name '*.go' ! -name '*_test.go' -type f | xargs grep -h "import" 2>/dev/null | sort -u || true
+          find "pkg/$PKG" -name '*.go' ! -name '*_test.go' -type f -print0 | xargs -0 grep -h "import" 2>/dev/null | sort -u || true
           echo '```'
 
           echo "### Existing README.md"
@@ -144,6 +144,7 @@ tools:
     - "git status"
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 3d
     title-prefix: "[spec-extractor] "

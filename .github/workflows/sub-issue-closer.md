@@ -9,17 +9,19 @@ on:
 permissions:
   contents: read
   issues: read
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 strict: true
 network:
   allowed:
     - defaults
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
       - issues
 safe-outputs:
@@ -37,6 +39,9 @@ evals:
   - id: issues_closed_or_noop
     question: Were completed parent issues closed with a comment, or does the agent output confirm no issues were ready to close?
 
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Sub-Issue Closer 🔒

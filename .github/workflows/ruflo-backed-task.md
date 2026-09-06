@@ -14,9 +14,6 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
 engine: claude
 
@@ -28,6 +25,7 @@ network:
 
 imports:
   - shared/mcp/ruflo.md
+  - shared/reporting.md
 
 tools:
   startup-timeout: 300
@@ -40,6 +38,7 @@ tools:
   bash: true
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[ruflo] "

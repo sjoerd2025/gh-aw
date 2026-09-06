@@ -13,6 +13,7 @@ import (
 )
 
 func TestParseGatewayLogs(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		logContent    string
@@ -53,7 +54,7 @@ func TestParseGatewayLogs(t *testing.T) {
 `,
 			wantServers:   3,
 			wantRequests:  3,
-			wantToolCalls: 3,
+			wantToolCalls: 0,
 			wantErrors:    0,
 			wantErr:       false,
 		},
@@ -81,6 +82,7 @@ invalid json line
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Create a temporary directory
 			tmpDir := t.TempDir()
 
@@ -110,6 +112,7 @@ invalid json line
 }
 
 func TestParseGatewayLogsFileNotFound(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	metrics, err := parseGatewayLogs(tmpDir, false)
@@ -120,6 +123,7 @@ func TestParseGatewayLogsFileNotFound(t *testing.T) {
 }
 
 func TestGatewayToolMetrics(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Create a log with multiple calls to the same tool
@@ -156,6 +160,7 @@ func TestGatewayToolMetrics(t *testing.T) {
 }
 
 func TestRenderGatewayMetricsTable(t *testing.T) {
+	t.Parallel()
 	// Create metrics with some data
 	metrics := &GatewayMetrics{
 		TotalRequests:  10,
@@ -221,6 +226,7 @@ func TestRenderGatewayMetricsTable(t *testing.T) {
 }
 
 func TestRenderGatewayMetricsTableEmpty(t *testing.T) {
+	t.Parallel()
 	// Test with nil metrics
 	output := renderGatewayMetricsTable(nil, false)
 	assert.Empty(t, output)
@@ -234,6 +240,7 @@ func TestRenderGatewayMetricsTableEmpty(t *testing.T) {
 }
 
 func TestGatewayTruncateString(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		input  string
@@ -268,6 +275,7 @@ func TestGatewayTruncateString(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := stringutil.Truncate(tt.input, tt.maxLen)
 			assert.Equal(t, tt.want, result)
 			assert.LessOrEqual(t, len(result), tt.maxLen)
@@ -276,6 +284,7 @@ func TestGatewayTruncateString(t *testing.T) {
 }
 
 func TestProcessGatewayLogEntry(t *testing.T) {
+	t.Parallel()
 	metrics := &GatewayMetrics{
 		Servers: make(map[string]*GatewayServerMetrics),
 	}
@@ -323,6 +332,7 @@ func TestProcessGatewayLogEntry(t *testing.T) {
 }
 
 func TestProcessGatewayLogEntryDifcFiltered(t *testing.T) {
+	t.Parallel()
 	metrics := &GatewayMetrics{
 		Servers: make(map[string]*GatewayServerMetrics),
 	}
@@ -361,6 +371,7 @@ func TestProcessGatewayLogEntryDifcFiltered(t *testing.T) {
 }
 
 func TestParseRPCMessagesDifcFiltered(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	content := `{"timestamp":"2024-01-12T10:00:00.000000000Z","type":"DIFC_FILTERED","server_id":"github","tool_name":"pull_request_read","reason":"Resource has lower integrity than agent requires.","author_login":"octocat","author_association":"CONTRIBUTOR","html_url":"https://github.com/github/gh-aw/pull/42","number":"42"}
@@ -402,7 +413,62 @@ func TestParseRPCMessagesDifcFiltered(t *testing.T) {
 	assert.Equal(t, 2, githubServer.FilteredCount)
 }
 
+// TestParseRPCMessagesSchemaV2Format verifies that parseRPCMessages correctly parses
+// real-world rpc-messages.jsonl entries that use the schema "rpc-message/v2" format:
+// a top-level "event" field ("rpc_request"/"rpc_response") and "_schema" marker instead
+// of the legacy top-level "type" field ("REQUEST"/"RESPONSE"). Regression test for
+// https://github.com/github/gh-aw/issues/53254.
+func TestParseRPCMessagesSchemaV2Format(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+
+	content := `{"timestamp":"2026-08-15T23:48:42.233Z","event":"rpc_request","_schema":"rpc-message/v2","direction":"OUT","server_id":"github","method":"tools/call","payload":{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}}
+{"timestamp":"2026-08-15T23:48:42.259Z","event":"rpc_response","_schema":"rpc-message/v2","direction":"IN","server_id":"github","payload":{"jsonrpc":"2.0","id":1,"result":{}}}
+`
+	logPath := filepath.Join(tmpDir, "rpc-messages.jsonl")
+	require.NoError(t, os.WriteFile(logPath, []byte(content), 0644))
+
+	metrics, err := parseRPCMessages(logPath, false)
+	require.NoError(t, err)
+	require.NotNil(t, metrics)
+
+	assert.Equal(t, 1, metrics.TotalRequests, "should count the REQUEST despite missing top-level 'type'")
+	assert.Equal(t, 1, metrics.TotalToolCalls, "should count the tools/call request as a tool call")
+	require.Len(t, metrics.Servers, 1)
+
+	server := metrics.Servers["github"]
+	require.NotNil(t, server)
+	assert.Equal(t, 1, server.RequestCount)
+	assert.Equal(t, 1, server.ToolCallCount)
+}
+
+// TestRPCMessageEntryEffectiveType verifies the normalization helper used to bridge
+// the legacy top-level "type" field and the "event" field used by schema "rpc-message/v2".
+func TestRPCMessageEntryEffectiveType(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		entry RPCMessageEntry
+		want  string
+	}{
+		{"legacy type takes precedence", RPCMessageEntry{Type: "REQUEST", Event: "rpc_response"}, "REQUEST"},
+		{"rpc_request maps to REQUEST", RPCMessageEntry{Event: "rpc_request"}, "REQUEST"},
+		{"rpc_response maps to RESPONSE", RPCMessageEntry{Event: "rpc_response"}, "RESPONSE"},
+		{"difc_filtered maps to DIFC_FILTERED", RPCMessageEntry{Event: "difc_filtered"}, "DIFC_FILTERED"},
+		{"unknown event passes through", RPCMessageEntry{Event: "something_else"}, "something_else"},
+		{"empty entry returns empty string", RPCMessageEntry{}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, tt.entry.EffectiveType())
+		})
+	}
+}
+
 func TestGetSortedServerNames(t *testing.T) {
+	t.Parallel()
 	metrics := &GatewayMetrics{
 		Servers: map[string]*GatewayServerMetrics{
 			"github": {
@@ -430,6 +496,7 @@ func TestGetSortedServerNames(t *testing.T) {
 }
 
 func TestGatewayLogsWithMethodField(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Test with method field instead of tool_name
@@ -447,18 +514,19 @@ func TestGatewayLogsWithMethodField(t *testing.T) {
 
 	assert.Len(t, metrics.Servers, 1)
 	assert.Equal(t, 2, metrics.TotalRequests)
-	assert.Equal(t, 2, metrics.TotalToolCalls)
+	assert.Equal(t, 1, metrics.TotalToolCalls)
 
 	server := metrics.Servers["github"]
 	require.NotNil(t, server)
-	assert.Len(t, server.Tools, 2)
+	assert.Len(t, server.Tools, 1)
 
-	// Check that methods were tracked as tools
-	assert.Contains(t, server.Tools, "tools/list")
+	// Protocol discovery remains a request but is not counted as tool usage.
+	assert.NotContains(t, server.Tools, "tools/list")
 	assert.Contains(t, server.Tools, "tools/call")
 }
 
 func TestGatewayLogsParsingIntegration(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Create a comprehensive test log
@@ -535,6 +603,7 @@ func TestGatewayLogsParsingIntegration(t *testing.T) {
 }
 
 func TestParseGatewayLogsFromMCPLogsSubdirectory(t *testing.T) {
+	t.Parallel()
 	// Create temp directory for test
 	tmpDir := t.TempDir()
 
@@ -568,6 +637,7 @@ func TestParseGatewayLogsFromMCPLogsSubdirectory(t *testing.T) {
 }
 
 func TestParseRPCMessages(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		logContent    string
@@ -639,6 +709,7 @@ func TestParseRPCMessages(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmpDir := t.TempDir()
 			logPath := filepath.Join(tmpDir, "rpc-messages.jsonl")
 			err := os.WriteFile(logPath, []byte(tt.logContent), 0644)
@@ -663,6 +734,7 @@ func TestParseRPCMessages(t *testing.T) {
 }
 
 func TestParseGatewayLogsFallsBackToRPCMessages(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Create mcp-logs/rpc-messages.jsonl (no gateway.jsonl present)
@@ -688,7 +760,9 @@ func TestParseGatewayLogsFallsBackToRPCMessages(t *testing.T) {
 }
 
 func TestFindRPCMessagesPath(t *testing.T) {
+	t.Parallel()
 	t.Run("rpc-messages in mcp-logs subdirectory", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		mcpDir := filepath.Join(tmpDir, "mcp-logs")
 		require.NoError(t, os.MkdirAll(mcpDir, 0755))
@@ -700,6 +774,7 @@ func TestFindRPCMessagesPath(t *testing.T) {
 	})
 
 	t.Run("rpc-messages in root directory", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		rpcPath := filepath.Join(tmpDir, "rpc-messages.jsonl")
 		require.NoError(t, os.WriteFile(rpcPath, []byte("{}"), 0644))
@@ -709,6 +784,7 @@ func TestFindRPCMessagesPath(t *testing.T) {
 	})
 
 	t.Run("mcp-logs subdirectory takes priority over root", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		mcpDir := filepath.Join(tmpDir, "mcp-logs")
 		require.NoError(t, os.MkdirAll(mcpDir, 0755))
@@ -722,6 +798,7 @@ func TestFindRPCMessagesPath(t *testing.T) {
 	})
 
 	t.Run("not found returns empty string", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		result := findRPCMessagesPath(tmpDir)
 		assert.Empty(t, result, "should return empty string when not found")
@@ -729,6 +806,7 @@ func TestFindRPCMessagesPath(t *testing.T) {
 }
 
 func TestBuildToolCallsFromRPCMessages(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	rpcContent := `{"timestamp":"2024-01-12T10:00:00.000000000Z","direction":"OUT","type":"REQUEST","server_id":"github","payload":{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}}
@@ -770,6 +848,7 @@ func TestBuildToolCallsFromRPCMessages(t *testing.T) {
 // always being null when parseRPCMessages counted tool calls in the summary but
 // buildToolCallsFromRPCMessages skipped null-ID requests).
 func TestBuildToolCallsFromRPCMessagesNullID(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Requests with null ID (id:null) - these are counted in the summary by parseRPCMessages
@@ -796,7 +875,30 @@ func TestBuildToolCallsFromRPCMessagesNullID(t *testing.T) {
 	assert.True(t, toolNames["issue_read"], "should include issue_read")
 }
 
+// TestBuildToolCallsFromRPCMessagesSchemaV2Format verifies that buildToolCallsFromRPCMessages
+// handles the real-world schema "rpc-message/v2" format ("event" field instead of "type").
+func TestBuildToolCallsFromRPCMessagesSchemaV2Format(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+
+	rpcContent := `{"timestamp":"2026-08-15T23:48:42.233Z","event":"rpc_request","_schema":"rpc-message/v2","direction":"OUT","server_id":"github","method":"tools/call","payload":{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}}
+{"timestamp":"2026-08-15T23:48:42.400Z","event":"rpc_response","_schema":"rpc-message/v2","direction":"IN","server_id":"github","payload":{"jsonrpc":"2.0","id":1,"result":{}}}
+`
+	logPath := filepath.Join(tmpDir, "rpc-messages.jsonl")
+	require.NoError(t, os.WriteFile(logPath, []byte(rpcContent), 0644))
+
+	calls, err := buildToolCallsFromRPCMessages(logPath)
+	require.NoError(t, err, "should build tool calls without error")
+	require.Len(t, calls, 1, "should have 1 tool call")
+
+	assert.Equal(t, "list_issues", calls[0].ToolName)
+	assert.Equal(t, "github", calls[0].ServerName)
+	assert.Equal(t, "success", calls[0].Status)
+	assert.NotEmpty(t, calls[0].Duration, "duration should be set for paired request/response")
+}
+
 func TestParseRPCMessagesGuardPolicyErrors(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Test rpc-messages.jsonl with guard policy error responses:
@@ -855,6 +957,7 @@ func TestParseRPCMessagesGuardPolicyErrors(t *testing.T) {
 }
 
 func TestParseRPCMessagesGuardPolicyWithoutData(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Guard policy error without the optional data field
@@ -880,6 +983,7 @@ func TestParseRPCMessagesGuardPolicyWithoutData(t *testing.T) {
 }
 
 func TestIsGuardPolicyErrorCode(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		code     int
 		expected bool
@@ -903,6 +1007,7 @@ func TestIsGuardPolicyErrorCode(t *testing.T) {
 }
 
 func TestGuardPolicyReasonFromCode(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, "access_denied", guardPolicyReasonFromCode(-32001))
 	assert.Equal(t, "repo_not_allowed", guardPolicyReasonFromCode(-32002))
 	assert.Equal(t, "insufficient_permissions", guardPolicyReasonFromCode(-32003))
@@ -913,6 +1018,7 @@ func TestGuardPolicyReasonFromCode(t *testing.T) {
 }
 
 func TestProcessGatewayLogEntryGuardPolicyBlocked(t *testing.T) {
+	t.Parallel()
 	metrics := &GatewayMetrics{
 		Servers: make(map[string]*GatewayServerMetrics),
 	}
@@ -946,6 +1052,7 @@ func TestProcessGatewayLogEntryGuardPolicyBlocked(t *testing.T) {
 }
 
 func TestBuildGuardPolicySummary(t *testing.T) {
+	t.Parallel()
 	metrics := &GatewayMetrics{
 		TotalGuardBlocked: 5,
 		GuardPolicyEvents: []GuardPolicyEvent{
@@ -982,6 +1089,7 @@ func TestBuildGuardPolicySummary(t *testing.T) {
 }
 
 func TestExtractMCPToolUsageDataWithGuardPolicy(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Create rpc-messages.jsonl with guard policy errors
@@ -1014,6 +1122,7 @@ func TestExtractMCPToolUsageDataWithGuardPolicy(t *testing.T) {
 // fall back to the "error"/"level" fields to produce "success" or "error" rather than
 // leaving Status blank (which downstream agents render as "unknown").
 func TestExtractToolCallsStatusInference(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		logLine      string
@@ -1052,6 +1161,7 @@ func TestExtractToolCallsStatusInference(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmpDir := t.TempDir()
 			gatewayLogPath := filepath.Join(tmpDir, "gateway.jsonl")
 			require.NoError(t, os.WriteFile(gatewayLogPath, []byte(tt.logLine+"\n"), 0600))
@@ -1071,6 +1181,7 @@ func TestExtractToolCallsStatusInference(t *testing.T) {
 // counts a tool-call entry as an error when "level":"error" is set, even if the
 // "status" and "error" fields are absent (post-OTel format drift).
 func TestProcessGatewayLogEntryLevelErrorCounting(t *testing.T) {
+	t.Parallel()
 	metrics := &GatewayMetrics{
 		Servers: make(map[string]*GatewayServerMetrics),
 	}

@@ -2,11 +2,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import crypto from "crypto";
+import http from "http";
 const core = { info: vi.fn(), warning: vi.fn(), debug: vi.fn(), setFailed: vi.fn() };
 global.core = core;
 const {
   processRuntimeImports,
   processRuntimeImport,
+  fetchUrlContent,
+  closeUnterminatedInlineMarkers,
   hasFrontMatter,
   removeXMLComments,
   neutralizeSystemTags,
@@ -17,6 +21,7 @@ const {
   extractAndReplacePlaceholders,
   generatePlaceholderName,
 } = require("./runtime_import.cjs");
+const { extractInlineSkills } = require("./extract_inline_skills.cjs");
 describe("runtime_import", () => {
   let tempDir;
   let githubDir;
@@ -740,7 +745,48 @@ describe("runtime_import", () => {
           fs.writeFileSync(path.join(tempDir, "outside.md"), "Outside content");
           // Use ../../ to escape .github/workflows and go up to the temp directory
           await expect(processRuntimeImport("../../outside.md", !1, tempDir)).rejects.toThrow("Security: Path");
+        }),
+        it("should reject symlinks escaping the .github folder", async () => {
+          fs.writeFileSync(path.join(tempDir, "outside.md"), "Outside content");
+          fs.symlinkSync(path.join(tempDir, "outside.md"), path.join(workflowsDir, "outside-link.md"));
+
+          await expect(processRuntimeImport("outside-link.md", !1, tempDir)).rejects.toThrow("must remain within its allowed folder after resolving symlinks");
+        }),
+        it("should reject symlinks escaping the .agents folder", async () => {
+          const agentsDir = path.join(tempDir, ".agents");
+          fs.mkdirSync(agentsDir, { recursive: true });
+          fs.writeFileSync(path.join(tempDir, "outside.md"), "Outside content");
+          fs.symlinkSync(path.join(tempDir, "outside.md"), path.join(agentsDir, "outside-link.md"));
+
+          await expect(processRuntimeImport(".agents/outside-link.md", !1, tempDir)).rejects.toThrow("must remain within its allowed folder after resolving symlinks");
         }));
+      it("should implicitly close an unterminated inline skill block so it cannot swallow spliced-in content", async () => {
+        const content = "## skill: `reporting`\n\nGuidelines here.\n";
+        fs.writeFileSync(path.join(workflowsDir, "unterminated-skill.md"), content);
+        const result = await processRuntimeImport("unterminated-skill.md", !1, tempDir);
+        expect(result).toContain("## skill: `reporting`");
+        expect(result).toContain("## end skill: `reporting`");
+      });
+      it("should implicitly close an unterminated inline sub-agent block so it cannot swallow spliced-in content", async () => {
+        const content = "## agent: `helper`\n\nAgent instructions.\n";
+        fs.writeFileSync(path.join(workflowsDir, "unterminated-agent.md"), content);
+        const result = await processRuntimeImport("unterminated-agent.md", !1, tempDir);
+        expect(result).toContain("## agent: `helper`");
+        expect(result).toContain("## end agent: `helper`");
+      });
+      it("should leave an already explicitly closed inline skill block unchanged", async () => {
+        const content = "## skill: `reporting`\n\nGuidelines here.\n\n## end skill: `reporting`\n";
+        fs.writeFileSync(path.join(workflowsDir, "terminated-skill.md"), content);
+        const result = await processRuntimeImport("terminated-skill.md", !1, tempDir);
+        expect(result.match(/## end skill: `reporting`/g)).toHaveLength(1);
+      });
+      it("should not add end markers when no skill/agent markers are present", async () => {
+        const content = "# Just a heading\n\nSome content.\n";
+        fs.writeFileSync(path.join(workflowsDir, "no-markers.md"), content);
+        const result = await processRuntimeImport("no-markers.md", !1, tempDir);
+        expect(result).toBe(content);
+        expect(result).not.toContain("## end");
+      });
     }),
     describe("processRuntimeImports", () => {
       (it("should process single runtime-import macro", async () => {
@@ -784,6 +830,47 @@ describe("runtime_import", () => {
           fs.writeFileSync(path.join(workflowsDir, "inline.md"), "inline content");
           const result = await processRuntimeImports("Before {{#runtime-import inline.md}} after", tempDir);
           expect(result).toBe("Before inline content after");
+        }),
+        it("should resolve needs output expressions in runtime-imported content from hash env vars", async () => {
+          const issueNumbersExpr = "needs.select.outputs.issue_numbers";
+          const markerExpr = "needs.select.outputs.marker";
+          const issueNumbersEnv = "GH_AW_EXPR_" + crypto.createHash("sha256").update(issueNumbersExpr).digest("hex").slice(0, 8).toUpperCase();
+          const markerEnv = "GH_AW_EXPR_" + crypto.createHash("sha256").update(markerExpr).digest("hex").slice(0, 8).toUpperCase();
+          process.env[issueNumbersEnv] = "[]";
+          process.env[markerEnv] = "ordinary-string";
+          fs.writeFileSync(path.join(workflowsDir, "prompt.md"), "Issue numbers: `${{ needs.select.outputs.issue_numbers }}`\nMarker: `${{ needs.select.outputs.marker }}`");
+          try {
+            const result = await processRuntimeImports("{{#runtime-import prompt.md}}", tempDir);
+            expect(result).toBe("Issue numbers: `[]`\nMarker: `ordinary-string`");
+          } finally {
+            delete process.env[issueNumbersEnv];
+            delete process.env[markerEnv];
+          }
+        }),
+        it("should resolve hash env expressions through nested runtime imports", async () => {
+          const nestedExpr = "needs.select.outputs.nested_value";
+          const nestedEnv = "GH_AW_EXPR_" + crypto.createHash("sha256").update(nestedExpr).digest("hex").slice(0, 8).toUpperCase();
+          process.env[nestedEnv] = "nested-output";
+          fs.writeFileSync(path.join(workflowsDir, "outer.md"), "Outer\n{{#runtime-import nested.md}}");
+          fs.writeFileSync(path.join(workflowsDir, "nested.md"), "Nested: `${{ needs.select.outputs.nested_value }}`");
+          try {
+            const result = await processRuntimeImports("{{#runtime-import outer.md}}", tempDir);
+            expect(result).toBe("Outer\nNested: `nested-output`");
+          } finally {
+            delete process.env[nestedEnv];
+          }
+        }),
+        it("should resolve hash env expressions through legacy import macros", async () => {
+          const legacyExpr = "needs.select.outputs.legacy_value";
+          const legacyEnv = "GH_AW_EXPR_" + crypto.createHash("sha256").update(legacyExpr).digest("hex").slice(0, 8).toUpperCase();
+          process.env[legacyEnv] = "legacy-output";
+          fs.writeFileSync(path.join(workflowsDir, "legacy.md"), "Legacy: `${{ needs.select.outputs.legacy_value }}`");
+          try {
+            const result = await processRuntimeImports("{{#import legacy.md}}", tempDir);
+            expect(result).toBe("Legacy: `legacy-output`");
+          } finally {
+            delete process.env[legacyEnv];
+          }
         }),
         it("should process imports with files containing special characters", async () => {
           fs.writeFileSync(path.join(workflowsDir, "import.md"), "Content with $pecial ch@racters!");
@@ -1091,6 +1178,25 @@ describe("runtime_import", () => {
           fs.writeFileSync(path.join(workflowsDir, "test.txt"), "Line 1\nLine 2\nLine 3\nLine 4\nLine 5");
           const result = await processRuntimeImports("First: {{#runtime-import test.txt:1-2}} Second: {{#runtime-import test.txt:4-5}}", tempDir);
           expect(result).toBe("First: Line 1\nLine 2 Second: Line 4\nLine 5");
+        }),
+        it("should not let an unterminated inline skill block from one runtime import swallow a subsequent runtime import's content", async () => {
+          fs.writeFileSync(path.join(workflowsDir, "reporting.md"), "## skill: `reporting`\n\nFormatting guidelines.\n");
+          fs.writeFileSync(path.join(workflowsDir, "otlp.md"), "## Telemetry\n\nOTLP guidance.\n");
+          const result = await processRuntimeImports("{{#runtime-import reporting.md}}\n{{#runtime-import otlp.md}}\nMain body content.", tempDir);
+          expect(result).toContain("## end skill: `reporting`");
+          const { mainContent, skills } = extractInlineSkills(result);
+          expect(skills).toHaveLength(1);
+          expect(skills[0].name).toBe("reporting");
+          expect(skills[0].content).not.toContain("## Telemetry");
+          expect(mainContent).toContain("## Telemetry");
+          expect(result).toContain("## Telemetry");
+          expect(result).toContain("Main body content.");
+        }),
+        it("should not let an unterminated inline sub-agent block from a runtime import swallow the rest of the main workflow body", async () => {
+          fs.writeFileSync(path.join(workflowsDir, "helper-agent.md"), "## agent: `helper`\n\nHelper instructions.\n");
+          const result = await processRuntimeImports("{{#runtime-import helper-agent.md}}\n\nMain workflow instructions that must not be swallowed.", tempDir);
+          expect(result).toContain("## end agent: `helper`");
+          expect(result).toContain("Main workflow instructions that must not be swallowed.");
         }));
     }),
     describe("Expression Validation and Rendering", () => {
@@ -1151,6 +1257,17 @@ describe("runtime_import", () => {
         });
       });
 
+      describe("closeUnterminatedInlineMarkers", () => {
+        it("should close an unterminated skill before a following agent in the same import", () => {
+          const content = "## skill: `reporting`\nSkill content.\n## agent: `helper`\nAgent content.\n";
+          const result = closeUnterminatedInlineMarkers(content);
+
+          expect(result).toContain("## end skill: `reporting`");
+          expect(result).toContain("## end agent: `helper`");
+          expect(result.indexOf("## end skill: `reporting`")).toBeLessThan(result.indexOf("## agent: `helper`"));
+        });
+      });
+
       describe("evaluateExpression", () => {
         it("should evaluate simple GitHub context expressions", () => {
           expect(evaluateExpression("github.actor")).toBe("testuser");
@@ -1191,6 +1308,22 @@ describe("runtime_import", () => {
             expect(evaluateExpression("needs.build.outputs.version")).toBe("v1.2.3");
           } finally {
             delete process.env.GH_AW_NEEDS_BUILD_OUTPUTS_VERSION;
+          }
+        });
+
+        it("should return hash-based env var value for needs output expressions when set", () => {
+          const issueNumbersExpr = "needs.select.outputs.issue_numbers";
+          const markerExpr = "needs.select.outputs.marker";
+          const issueNumbersEnv = "GH_AW_EXPR_" + crypto.createHash("sha256").update(issueNumbersExpr).digest("hex").slice(0, 8).toUpperCase();
+          const markerEnv = "GH_AW_EXPR_" + crypto.createHash("sha256").update(markerExpr).digest("hex").slice(0, 8).toUpperCase();
+          process.env[issueNumbersEnv] = "[]";
+          process.env[markerEnv] = "ordinary-string";
+          try {
+            expect(evaluateExpression(issueNumbersExpr)).toBe("[]");
+            expect(evaluateExpression(markerExpr)).toBe("ordinary-string");
+          } finally {
+            delete process.env[issueNumbersEnv];
+            delete process.env[markerEnv];
           }
         });
 
@@ -1239,17 +1372,19 @@ describe("runtime_import", () => {
           }
         });
 
-        it("should not resolve hyphenated inputs.* when context.payload.inputs is empty", () => {
+        it("should resolve hyphenated inputs.* from hash-based env var when context.payload.inputs is empty", () => {
           // For workflow_call, context.payload.inputs is empty. Hyphenated input names
           // can't be resolved via the simple env var conversion (which produces
           // GH_AW_INPUTS_TASK-DESCRIPTION instead of the compiler's GH_AW_EXPR_<hash>).
-          // The compiler handles this via placeholder substitution in the heredoc-inlined
-          // prompt; runtime-import expressions rely on context.payload.inputs.
+          // Runtime-import expressions resolve through the same hash-based env var.
           global.context.payload.inputs = {};
+          const expr = "inputs.task-description";
+          const envVar = "GH_AW_EXPR_" + crypto.createHash("sha256").update(expr).digest("hex").slice(0, 8).toUpperCase();
+          process.env[envVar] = "workflow-call value";
           try {
-            const result = evaluateExpression("inputs.task-description");
-            expect(result).toContain("inputs.task-description");
+            expect(evaluateExpression(expr)).toBe("workflow-call value");
           } finally {
+            delete process.env[envVar];
             delete global.context.payload.inputs;
           }
         });
@@ -2218,6 +2353,71 @@ describe("runtime_import", () => {
       expect(children).toHaveLength(2);
       expect(children[0].rawContent).toBe("First");
       expect(children[1].rawContent).toBe("Second");
+    });
+  });
+
+  describe("fetchUrlContent", () => {
+    /** @type {import("http").Server} */
+    let server;
+    /** @type {string} */
+    let baseUrl;
+
+    afterEach(async () => {
+      if (server) {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+
+    it("should resolve with the body on a successful response", async () => {
+      server = http.createServer((_req, res) => {
+        res.writeHead(200);
+        res.end("hello world");
+      });
+      await new Promise(resolve => server.listen(0, resolve));
+      const { port } = server.address();
+      baseUrl = `http://127.0.0.1:${port}/file.txt`;
+
+      const content = await fetchUrlContent(baseUrl, tempDir);
+      expect(content).toBe("hello world");
+    });
+
+    it("should reject (not crash) when the response socket errors mid-transfer", async () => {
+      server = http.createServer((_req, res) => {
+        res.writeHead(200);
+        res.write("partial-data");
+        // Destroy the underlying socket mid-response to simulate a reset connection.
+        // With builtin fetch(), response.text() rejects when the socket is destroyed mid-transfer.
+        res.socket.destroy(new Error("simulated socket failure"));
+      });
+      await new Promise(resolve => server.listen(0, resolve));
+      const { port } = server.address();
+      baseUrl = `http://127.0.0.1:${port}/file.txt`;
+
+      await expect(fetchUrlContent(baseUrl, tempDir)).rejects.toThrow(/Failed to fetch URL/);
+    });
+
+    it("should reject when the HTTP status code is not 200", async () => {
+      server = http.createServer((_req, res) => {
+        res.writeHead(404);
+        res.end("not found");
+      });
+      await new Promise(resolve => server.listen(0, resolve));
+      const { port } = server.address();
+      baseUrl = `http://127.0.0.1:${port}/missing.txt`;
+
+      await expect(fetchUrlContent(baseUrl, tempDir)).rejects.toThrow(/ERR_API.*HTTP 404/);
+    });
+
+    it("should reject a redirect response instead of following it", async () => {
+      server = http.createServer((_req, res) => {
+        res.writeHead(302, { Location: "http://127.0.0.1:1/final.txt" });
+        res.end();
+      });
+      await new Promise(resolve => server.listen(0, resolve));
+      const { port } = server.address();
+      baseUrl = `http://127.0.0.1:${port}/redirect.txt`;
+
+      await expect(fetchUrlContent(baseUrl, tempDir)).rejects.toThrow(/ERR_API.*HTTP 302/);
     });
   });
 });

@@ -111,13 +111,6 @@ func getThreatDetectionAdditionalAllowedDomains(data *WorkflowData) []string {
 	return additional
 }
 
-func canReuseThreatDetectionEngineConfigForExternalDetector(data *WorkflowData, engineID string) bool {
-	return data.SafeOutputs != nil &&
-		data.SafeOutputs.ThreatDetection != nil &&
-		data.SafeOutputs.ThreatDetection.EngineConfig != nil &&
-		(data.SafeOutputs.ThreatDetection.EngineConfig.ID == "" || data.SafeOutputs.ThreatDetection.EngineConfig.ID == engineID)
-}
-
 // mergeThreatDetectionEngineEnv composes detection engine env vars from the main
 // engine env and detection-specific overrides.
 //
@@ -150,15 +143,61 @@ func buildExternalDetectorWorkflowData(data *WorkflowData, engineID string) *Wor
 	d.Tools = map[string]any{
 		"bash": []any{"*"},
 	}
-	d.EngineConfig = &EngineConfig{ID: engineID}
-	if canReuseThreatDetectionEngineConfigForExternalDetector(data, engineID) {
-		d.EngineConfig = cloneThreatDetectionEngineConfig(engineID, data.SafeOutputs.ThreatDetection.EngineConfig)
+	d.EngineConfig = resolveExternalDetectorEngineConfig(data, engineID)
+	if engineID == "codex" && NewCodexEngine().ResolveLLMProvider(d) != LLMProviderGitHub {
+		d.EngineConfig.LLMProvider = LLMProviderOpenAI
 	}
 	d.EngineConfig.Env = mergeThreatDetectionEngineEnv(data, d.EngineConfig.Env)
 	if d.EngineConfig.APITarget == "" && data.EngineConfig != nil {
 		d.EngineConfig.APITarget = data.EngineConfig.APITarget
 	}
+	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil && data.SafeOutputs.ThreatDetection.MaxAICredits != 0 {
+		d.EngineConfig.MaxAICredits = data.SafeOutputs.ThreatDetection.MaxAICredits
+	}
+	if d.EngineConfig.HarnessMaxRetries == "" {
+		d.EngineConfig.HarnessMaxRetries = "0"
+	}
 	return d
+}
+
+// resolveExternalDetectorEngineConfig determines the EngineConfig used to install and
+// execute the engine on the external detector path. Precedence:
+//  1. An explicit safe-outputs.threat-detection.engine override — cloned with its ID
+//     normalized to the resolved detection engine ID (handles cases like the pi->copilot
+//     detection normalization where the override's declared ID differs from the engine
+//     actually used).
+//  2. No override configured and the resolved detection engine matches the main
+//     engine — inherit Version/Config/Args/HarnessScript/Driver from the main engine
+//     config. This mirrors the inline detection path (buildDetectionEngineExecutionStep)
+//     and ensures behavior-defined engines (e.g. a pinned npm package version declared
+//     via a shared engine definition's default Version) install the same version in the
+//     detection job as in the main agent job, instead of silently falling back to the
+//     package's "latest" version.
+//  3. Otherwise, a minimal config containing only the resolved engine ID.
+func resolveExternalDetectorEngineConfig(data *WorkflowData, engineID string) *EngineConfig {
+	hasThreatDetectionEngineOverride := data.SafeOutputs != nil &&
+		data.SafeOutputs.ThreatDetection != nil &&
+		data.SafeOutputs.ThreatDetection.EngineConfig != nil
+	if hasThreatDetectionEngineOverride {
+		return cloneThreatDetectionEngineConfig(engineID, data.SafeOutputs.ThreatDetection.EngineConfig)
+	}
+	if data.EngineConfig != nil && (data.EngineConfig.ID == "" || data.EngineConfig.ID == engineID) {
+		return &EngineConfig{
+			ID:                       engineID,
+			Version:                  data.EngineConfig.Version,
+			LLMProvider:              data.EngineConfig.LLMProvider,
+			Config:                   data.EngineConfig.Config,
+			Args:                     data.EngineConfig.Args,
+			HarnessScript:            data.EngineConfig.HarnessScript,
+			Driver:                   data.EngineConfig.Driver,
+			HarnessMaxRetries:        data.EngineConfig.HarnessMaxRetries,
+			HarnessInitialDelayMs:    data.EngineConfig.HarnessInitialDelayMs,
+			HarnessBackoffMultiplier: data.EngineConfig.HarnessBackoffMultiplier,
+			HarnessMaxDelayMs:        data.EngineConfig.HarnessMaxDelayMs,
+			HarnessWatchdogTimeoutMs: data.EngineConfig.HarnessWatchdogTimeoutMs,
+		}
+	}
+	return &EngineConfig{ID: engineID}
 }
 
 // cloneThreatDetectionEngineConfig returns a shallow copy of source with engine ID
@@ -183,9 +222,9 @@ func engineCoreSecretVarNames(engineID string) []string {
 	case "claude":
 		return []string{"ANTHROPIC_API_KEY"}
 	case "codex":
-		return []string{"OPENAI_API_KEY", "CODEX_API_KEY"}
-	case "gemini", "antigravity":
-		return []string{"GEMINI_API_KEY", "ANTIGRAVITY_API_KEY"}
+		return []string{"OPENAI_API_KEY", "CODEX_API_KEY", "COPILOT_GITHUB_TOKEN"}
+	case "gemini":
+		return []string{"GEMINI_API_KEY"}
 	default:
 		return []string{}
 	}

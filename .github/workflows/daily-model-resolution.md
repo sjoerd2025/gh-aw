@@ -37,11 +37,12 @@ imports:
     with:
       toolsets: [default, actions]
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    id: awf
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -173,11 +174,6 @@ After all `run-analyzer` calls complete, build the report:
    declared alias, actual model observed, and a classification note.
 4. **Correct resolutions**: brief confirmation that all other sub-agents used the
    right model size.
-
-### Report Formatting
-
-Use `###` or lower for all headings inside the issue body.
-Wrap verbose tables in `<details><summary>…</summary>` blocks.
 
 ### Report Template
 

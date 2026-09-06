@@ -18,10 +18,10 @@ permissions:
 engine: copilot
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   playwright:
-    mode: cli
   bash:
     - "npm *"
     - "npx *"
@@ -34,7 +34,11 @@ network:
     - playwright
     - local
     - node
+jobs:
+  agent:
+    timeout-minutes: 15
 safe-outputs:
+  timeout-minutes: 10
   add-comment:
     max: 1
 timeout-minutes: 15
@@ -53,10 +57,12 @@ steps:
 
   - name: Install dependencies
     working-directory: ./docs
+    timeout-minutes: 5
     run: npm ci
 
   - name: Build documentation
     working-directory: ./docs
+    timeout-minutes: 5
     run: npm run build
 
   - name: Start docs server
@@ -68,9 +74,12 @@ steps:
       echo "Server PID: $PID"
 
   - name: Wait for server readiness
+    # runner-guard:ignore RGS-012 -- loopback-only port/readiness checks for the docs server started in this job; no external network or secrets are involved.
+    timeout-minutes: 2
     run: |
       MAX_WAIT=90
       WAITED=0
+      # runner-guard:ignore RGS-012 -- loopback-only port probe for the docs server started in this job; no external network or secret data is involved.
       until (echo > /dev/tcp/127.0.0.1/4321) > /dev/null 2>&1; do
         if [ -f /tmp/gh-aw/agent/server.pid ] && ! kill -0 "$(cat /tmp/gh-aw/agent/server.pid)" 2>/dev/null; then
           echo "Docs server process exited before opening port 4321" >&2
@@ -87,6 +96,7 @@ steps:
         sleep 3
       done
       WAITED=0
+      # runner-guard:ignore RGS-012 -- localhost readiness request to the docs server started above; response is discarded and no secrets are sent.
       until curl -sf http://localhost:4321/gh-aw/ > /dev/null 2>&1; do
         WAITED=$((WAITED + 3))
         if [ $WAITED -ge $MAX_WAIT ]; then
@@ -99,6 +109,9 @@ steps:
       done
       echo "Dev server is ready"
 
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Visual Regression Checker

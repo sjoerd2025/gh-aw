@@ -16,9 +16,9 @@ If no `network:` permission is specified, it defaults to `network: defaults`, wh
 
 Network permissions follow the principle of least privilege:
 
-- **Default** (`network: defaults`): Basic infrastructure only
-- **Selective** (`network: { allowed: [...] }`): Only listed domains/ecosystems
-- **No access** (`network: {}`): All network blocked
+- **Default** (`network: defaults`) allows basic infrastructure only.
+- **Selective** (`network: { allowed: [...] }`) allows only the listed domains or ecosystems.
+- **No access** (`network: {}`) blocks all network access.
 
 Listed domains automatically match all subdomains; wildcard patterns (`*.example.com`) are also supported — see [Wildcard Domain Patterns](#wildcard-domain-patterns).
 
@@ -88,11 +88,19 @@ Mix ecosystem identifiers with specific domains for fine-grained control:
 | `terraform` | HashiCorp registry, apt/yum releases |
 | `bazel` | Bazel build system (`releases.bazel.build`, `bcr.bazel.build`) |
 | `clojure` | Clojure packages (`clojars.org`) |
+| `copilot-vendor` | Plan-specific Copilot API hosts (`api.business.githubcopilot.com`, `api.enterprise.githubcopilot.com`, `api.individual.githubcopilot.com`) and Copilot telemetry (`telemetry.enterprise.githubcopilot.com`) — not enabled by default, since agents route inference through the firewall gateway |
+| `copilot` | Copilot engine transport (`api.githubcopilot.com`, GitHub API/web, `host.docker.internal`, `raw.githubusercontent.com`) |
+| `claude` | Claude engine transport (Anthropic APIs, GitHub transport, certificate/OCSP services, Ubuntu package metadata, Playwright downloads, `host.docker.internal`) |
+| `codex` | Codex engine transport (`api.openai.com`, `chatgpt.com`, GitHub API/web, `host.docker.internal`) |
+| `gemini` | Gemini engine transport (`generativelanguage.googleapis.com`, `*.googleapis.com`, GitHub web, `host.docker.internal`, `raw.githubusercontent.com`) |
+| `pi` | Pi engine transport (`api.githubcopilot.com`, GitHub web, `host.docker.internal`, `raw.githubusercontent.com`) |
+| `pi-base` | Pi provider-independent baseline (`github.com`, `host.docker.internal`, `raw.githubusercontent.com`) |
+| `threat-detection` | Compatibility alias for Copilot threat-detection network access (`api.githubcopilot.com`, Copilot plan APIs, telemetry, `api.github.com`, `github.com`, `host.docker.internal`, `registry.npmjs.org`) |
 | `dart` | Dart/Flutter packages (`pub.dev`, `storage.googleapis.com`) |
 | `deno` | Deno runtime (`deno.land`, `jsr.io`, `googleapis.deno.dev`) |
 | `dotnet` | NuGet packages and .NET SDK |
 | `elixir` | Elixir packages (`hex.pm`) |
-| `go` | Go modules (`proxy.golang.org`, `sum.golang.org`) |
+| `go` | Go modules and toolchain downloads (`proxy.golang.org`, `sum.golang.org`, `go.dev`) |
 | `haskell` | Haskell packages (`hackage.haskell.org`, GHCup) |
 | `java` | Maven Central, Gradle, Adoptium |
 | `julia` | Julia packages (`pkg.julialang.org`, `storage.julialang.net`) |
@@ -114,6 +122,24 @@ Mix ecosystem identifiers with specific domains for fine-grained control:
 | `scala` | Scala packages (`repo.scala-sbt.org`, `jitpack.io`) |
 | `swift` | Swift packages (`swift.org`, `cocoapods.org`) |
 | `zig` | Zig packages (`ziglang.org`) |
+
+## Engine Domain Sets
+
+Engine domain sets are named allow-list bundles for engine CLI authentication
+and direct provider transport. They are **not** added automatically. Add the
+matching identifier to `network.allowed` only when the agent needs direct
+egress to that engine's domains; agent inference normally runs through the AWF
+API proxy.
+
+| Engine set | Included domains |
+|---|---|
+| `copilot` | `api.github.com`, `api.githubcopilot.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com` |
+| `claude` | Anthropic APIs, GitHub transport, certificate/OCSP services, Ubuntu package metadata, Playwright downloads, and `host.docker.internal` |
+| `codex` | `172.30.0.1`, `api.github.com`, `api.openai.com`, `chatgpt.com`, `github.com`, `host.docker.internal`, `openai.com` |
+| `gemini` | `*.googleapis.com`, `generativelanguage.googleapis.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com` |
+| `pi` | `api.githubcopilot.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com`; provider-scoped models replace the API host with the selected provider endpoint |
+| `pi-base` | `github.com`, `host.docker.internal`, `raw.githubusercontent.com`; applied as the provider-independent baseline before a provider prefix is resolved |
+| `threat-detection` | Applied automatically only to Copilot threat-detection runs and available as a compatibility alias: Copilot API and telemetry hosts, `api.github.com`, `github.com`, `host.docker.internal`, and `registry.npmjs.org` for read-only lockfile validation. |
 
 ### Ecosystem Identifier Validation
 
@@ -181,7 +207,13 @@ network:
     - "api.example.com"   # Custom domain
 ```
 
-Each engine has a built-in default domain list for its CLI authentication. See [`domains.go`](https://github.com/github/gh-aw/blob/main/pkg/workflow/domains.go) for the full lists.
+Each engine has a named domain set for its CLI authentication and model API transport. These sets expand only when explicitly listed in `network.allowed` and **never include the `node` or `python` ecosystem registries**: selecting an engine does not grant the agent access to `registry.npmjs.org`, `pypi.org`, or `files.pythonhosted.org`. Engine CLIs and SDKs are installed by workflow steps that run on the runner before the sandboxed agent starts, and containerized `npx`/`uvx` MCP servers are launched by the MCP gateway outside the agent firewall, so registry access inside the sandbox is not required for them.
+
+This guarantee is scoped to the `node` and `python` ecosystems. Some engine domain sets still include unrelated infrastructure domains used by the CLI itself (e.g., `ghcr.io`, `packagecloud.io`, `packages.microsoft.com` for OS-level package/container installation) — those are not language package registries.
+
+To let the agent itself reach engine domains or the `node`/`python` registries, opt in explicitly with the matching domain set or ecosystem identifier (`copilot`, `node`, `python`, …) in `network.allowed`, or declare the corresponding entry under `runtimes:` for language ecosystems. With `network: {}` or `network: { allowed: [defaults, github] }`, those domains stay blocked.
+
+See [`domains.go`](https://github.com/github/gh-aw/blob/main/pkg/workflow/domains.go) for the full lists. This invariant is enforced by `TestEngineDefaultDomainsDoNotOverlapEcosystems` in [`domains_package_registry_test.go`](https://github.com/github/gh-aw/blob/main/pkg/workflow/domains_package_registry_test.go), which fails the build if any engine's static default domain list overlaps with the full `node` or `python` ecosystem domain sets — including registry entries added after this was written.
 
 ### Firewall Log Level
 
@@ -258,9 +290,9 @@ network:
 
 ## Troubleshooting
 
-If you encounter network access blocked errors, verify that required domains or ecosystems are in the `allowed` list. Start with `network: defaults` and add specific requirements incrementally. Network access violations are logged in workflow execution logs.
+If network access is blocked, confirm the required domains or ecosystems are in `allowed`. Start with `network: defaults`, then add only what the workflow needs. Violations appear in workflow logs.
 
-Use `gh aw logs --run-id <run-id>` to view firewall activity and identify blocked domains. For detailed diagnostics, use `gh aw audit <run-id>` — the **Firewall Analysis** section lists every domain request with its allow/deny status, request volume, and policy attribution. Pass two run IDs to compare firewall behavior between runs:
+Use `gh aw logs --run-id <run-id>` to identify blocked domains. For deeper analysis, run `gh aw audit <run-id>`; the **Firewall Analysis** section shows each domain request with its allow/deny status, request volume, and policy attribution. Pass two run IDs to compare runs:
 
 ```bash
 gh aw audit 12345678              # Single run
@@ -269,11 +301,6 @@ gh aw audit 12345678 12345679     # Compare two runs
 
 See the [Network Configuration Guide](/gh-aw/guides/network-configuration/#troubleshooting-firewall-blocking) and [Audit Commands](/gh-aw/reference/audit/) for more.
 
-## Related Documentation
+## Learn More
 
-- [Network Configuration Guide](/gh-aw/guides/network-configuration/) - Practical examples and common patterns
-- [Frontmatter](/gh-aw/reference/frontmatter/) - Complete frontmatter configuration guide
-- [Tools](/gh-aw/reference/tools/) - Tool-specific network access configuration
-- [Playwright](/gh-aw/reference/playwright/) - Browser automation and network requirements
-- [Audit Commands](/gh-aw/reference/audit/) - Firewall analysis and cross-run diff for understanding domain allow/block behavior
-- [Security Guide](/gh-aw/introduction/architecture/) - Comprehensive security guidance
+See also the [Network Configuration Guide](/gh-aw/guides/network-configuration/), [Frontmatter](/gh-aw/reference/frontmatter/), [Tools](/gh-aw/reference/tools/), [Playwright](/gh-aw/reference/playwright/), [Audit Commands](/gh-aw/reference/audit/), and the [Security Guide](/gh-aw/introduction/architecture/).

@@ -81,15 +81,6 @@ func NewPermissionsContentsReadIssuesWrite() *Permissions {
 	})
 }
 
-// NewPermissionsContentsReadIssuesWritePRWrite creates permissions with contents: read, issues: write, pull-requests: write
-func NewPermissionsContentsReadIssuesWritePRWrite() *Permissions {
-	return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
-		PermissionContents:     PermissionRead,
-		PermissionIssues:       PermissionWrite,
-		PermissionPullRequests: PermissionWrite,
-	})
-}
-
 // NewPermissionsActionsWrite creates permissions with actions: write
 // This is required for dispatching workflows via workflow_dispatch
 func NewPermissionsActionsWrite() *Permissions {
@@ -131,16 +122,6 @@ func NewPermissionsContentsReadDiscussionsWrite() *Permissions {
 	})
 }
 
-// NewPermissionsContentsReadIssuesWriteDiscussionsWrite creates permissions with contents: read, issues: write, discussions: write
-// This is used for create-discussion jobs that support fallback-to-issue when discussion creation fails
-func NewPermissionsContentsReadIssuesWriteDiscussionsWrite() *Permissions {
-	return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
-		PermissionContents:    PermissionRead,
-		PermissionIssues:      PermissionWrite,
-		PermissionDiscussions: PermissionWrite,
-	})
-}
-
 // NewPermissionsContentsReadPRWrite creates permissions with contents: read and pull-requests: write
 func NewPermissionsContentsReadPRWrite() *Permissions {
 	return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
@@ -166,20 +147,15 @@ func NewPermissionsContentsReadSecurityEventsWriteActionsRead() *Permissions {
 	})
 }
 
-// NewPermissionsContentsReadChecksWrite creates permissions with contents: read and checks: write
-func NewPermissionsContentsReadChecksWrite() *Permissions {
-	return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
-		PermissionContents: PermissionRead,
-		PermissionChecks:   PermissionWrite,
-	})
-}
-
-// NewPermissionsContentsReadChecksWritePRRead creates permissions with contents: read, checks: write, and pull-requests: read
-// Used when create-check-run has a target configured and must resolve the PR head SHA via the REST API
-func NewPermissionsContentsReadChecksWritePRRead() *Permissions {
+// NewPermissionsContentsReadCodeQualityWritePRRead creates permissions with contents: read,
+// code-quality: write, pull-requests: read. This is the permission set required by
+// actions/upload-code-coverage: code-quality: write to upload the report, and
+// pull-requests: read so the action can look up an open PR for push-triggered workflows
+// (per its documented requirements).
+func NewPermissionsContentsReadCodeQualityWritePRRead() *Permissions {
 	return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
 		PermissionContents:     PermissionRead,
-		PermissionChecks:       PermissionWrite,
+		PermissionCodeQuality:  PermissionWrite,
 		PermissionPullRequests: PermissionRead,
 	})
 }
@@ -202,14 +178,6 @@ func (p *Permissions) Clone() *Permissions {
 		maps.Copy(clone.permissions, p.permissions)
 	}
 	return clone
-}
-
-// Note: organization-projects is only valid for GitHub App tokens, not workflow permissions
-func NewPermissionsContentsReadProjectsWrite() *Permissions {
-	return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
-		PermissionContents:         PermissionRead,
-		PermissionOrganizationProj: PermissionWrite,
-	})
 }
 
 // NewPermissionsIssuesWrite creates permissions with issues: write only.
@@ -288,16 +256,6 @@ func NewPermissionsChecksWritePRRead() *Permissions {
 	return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
 		PermissionChecks:       PermissionWrite,
 		PermissionPullRequests: PermissionRead,
-	})
-}
-
-// NewPermissionsIssuesWriteDiscussionsWritePRWrite creates permissions with issues: write, discussions: write,
-// and pull-requests: write.
-func NewPermissionsIssuesWriteDiscussionsWritePRWrite() *Permissions {
-	return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
-		PermissionIssues:       PermissionWrite,
-		PermissionDiscussions:  PermissionWrite,
-		PermissionPullRequests: PermissionWrite,
 	})
 }
 

@@ -180,6 +180,45 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation(t *testing.T) {
 			wantErr:  false,
 		},
 		{
+			name: "valid secret scanning alerts permission",
+			frontmatter: map[string]any{
+				"on": "push",
+				"permissions": map[string]any{
+					"secret-scanning-alerts": "read",
+				},
+			},
+			filePath: "/test/workflow.md",
+			wantErr:  false,
+		},
+		{
+			name: "valid max-runs positive integer",
+			frontmatter: map[string]any{
+				"on":       "push",
+				"max-runs": 1,
+			},
+			filePath: "/test/workflow.md",
+			wantErr:  false,
+		},
+		{
+			name: "valid max-runs expression",
+			frontmatter: map[string]any{
+				"on":       "push",
+				"max-runs": "${{ inputs.max-runs }}",
+			},
+			filePath: "/test/workflow.md",
+			wantErr:  false,
+		},
+		{
+			name: "invalid max-runs zero",
+			frontmatter: map[string]any{
+				"on":       "push",
+				"max-runs": 0,
+			},
+			filePath:    "/test/workflow.md",
+			wantErr:     true,
+			errContains: "minimum",
+		},
+		{
 			name: "invalid workflow frontmatter with location",
 			frontmatter: map[string]any{
 				"on":      "push",
@@ -320,6 +359,16 @@ func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_AdditionalProperti
 			filePath:    "/test/workflow.md",
 			wantErr:     true,
 			errContains: "requird",
+		},
+		{
+			name: "top-level roles field is rejected pointing to on.roles",
+			frontmatter: map[string]any{
+				"on":    "push",
+				"roles": []string{"admin", "maintainer", "write"},
+			},
+			filePath:    "/test/workflow.md",
+			wantErr:     true,
+			errContains: "'roles' belongs under 'on'",
 		},
 		{
 			name: "dispatch-repository key is accepted by schema",
@@ -644,5 +693,203 @@ func TestValidateIncludedFileFrontmatterWithSchemaAndLocation_SkipsCustomAgentFi
 		if err != nil {
 			t.Errorf("expected custom agent file %q to pass validation without errors, got: %v", path, err)
 		}
+	}
+}
+
+func TestValidateIncludedFileFrontmatterWithSchemaAndLocation_DeclarativeEngineWithVersionAndPreAgentSteps(t *testing.T) {
+	frontmatter := map[string]any{
+		"runtimes": map[string]any{
+			"python": map[string]any{"version": "3.12"},
+		},
+		"pre-agent-steps": []any{
+			map[string]any{
+				"name": "Install engine",
+				"run":  "python3 -m pip install aider-chat",
+			},
+		},
+		"engine": map[string]any{
+			"id":           "aider",
+			"version":      "0.86.2",
+			"display-name": "Aider",
+			"description":  "Aider CLI",
+			"experimental": true,
+			"provider": map[string]any{
+				"name": "github",
+			},
+			"behaviors": map[string]any{
+				"execution": map[string]any{
+					"command-name": "aider",
+					"step-name":    "Execute Aider CLI",
+				},
+			},
+		},
+	}
+
+	err := ValidateIncludedFileFrontmatterWithSchemaAndLocation(frontmatter, "/repo/.github/workflows/shared/aider.md")
+	if err != nil {
+		t.Fatalf("expected declarative engine with version and pre-agent-steps to pass validation, got: %v", err)
+	}
+}
+
+func TestValidateIncludedFileFrontmatterWithSchemaAndLocation_ConcurrencyJobDiscriminator(t *testing.T) {
+	t.Run("allows job discriminator", func(t *testing.T) {
+		err := ValidateIncludedFileFrontmatterWithSchemaAndLocation(map[string]any{
+			"concurrency": map[string]any{
+				"job-discriminator": "${{ github.run_id }}",
+			},
+		}, "/repo/.github/workflows/shared/concurrency.md")
+		if err != nil {
+			t.Fatalf("expected concurrency.job-discriminator to be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("rejects unsupported workflow concurrency fields", func(t *testing.T) {
+		err := ValidateIncludedFileFrontmatterWithSchemaAndLocation(map[string]any{
+			"concurrency": map[string]any{
+				"group":              "shared-group",
+				"cancel-in-progress": true,
+			},
+		}, "/repo/.github/workflows/shared/concurrency.md")
+		if err == nil || !strings.Contains(err.Error(), "unsupported key: cancel-in-progress") {
+			t.Fatalf("expected unsupported concurrency field error, got: %v", err)
+		}
+	})
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_MaxStack(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxStack    any
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:     "max-stack: 1 is valid (default)",
+			maxStack: 1,
+			wantErr:  false,
+		},
+		{
+			name:     "max-stack: 2 is valid",
+			maxStack: 2,
+			wantErr:  false,
+		},
+		{
+			name:     "max-stack: 5 is valid (intermediate value)",
+			maxStack: 5,
+			wantErr:  false,
+		},
+		{
+			name:     "max-stack: -1 is valid (disable stack protection)",
+			maxStack: -1,
+			wantErr:  false,
+		},
+		{
+			name:        "max-stack: 0 is rejected",
+			maxStack:    0,
+			wantErr:     true,
+			errContains: "max-stack",
+		},
+		{
+			name:        "max-stack: -2 is rejected",
+			maxStack:    -2,
+			wantErr:     true,
+			errContains: "max-stack",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frontmatter := map[string]any{
+				"on": map[string]any{
+					"pull_request": map[string]any{
+						"types":     []any{"opened"},
+						"max-stack": tt.maxStack,
+					},
+				},
+			}
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+			if tt.wantErr && err == nil {
+				t.Errorf("expected validation error for max-stack: %v, got nil", tt.maxStack)
+				return
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected validation error for max-stack: %v: %v", tt.maxStack, err)
+				return
+			}
+			if tt.wantErr && err != nil && tt.errContains != "" {
+				if !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("expected error containing %q, got: %v", tt.errContains, err)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_PullRequestReviewMaxStack(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxStack    any
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:     "max-stack: 1 is valid (default)",
+			maxStack: 1,
+			wantErr:  false,
+		},
+		{
+			name:     "max-stack: 2 is valid",
+			maxStack: 2,
+			wantErr:  false,
+		},
+		{
+			name:     "max-stack: 5 is valid (intermediate value)",
+			maxStack: 5,
+			wantErr:  false,
+		},
+		{
+			name:     "max-stack: -1 is valid (disable stack protection)",
+			maxStack: -1,
+			wantErr:  false,
+		},
+		{
+			name:        "max-stack: 0 is rejected",
+			maxStack:    0,
+			wantErr:     true,
+			errContains: "max-stack",
+		},
+		{
+			name:        "max-stack: -2 is rejected",
+			maxStack:    -2,
+			wantErr:     true,
+			errContains: "max-stack",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frontmatter := map[string]any{
+				"on": map[string]any{
+					"pull_request_review": map[string]any{
+						"types":     []any{"submitted"},
+						"max-stack": tt.maxStack,
+					},
+				},
+			}
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/test/workflow.md")
+			if tt.wantErr && err == nil {
+				t.Errorf("expected validation error for max-stack: %v, got nil", tt.maxStack)
+				return
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected validation error for max-stack: %v: %v", tt.maxStack, err)
+				return
+			}
+			if tt.wantErr && err != nil && tt.errContains != "" {
+				if !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("expected error containing %q, got: %v", tt.errContains, err)
+				}
+			}
+		})
 	}
 }

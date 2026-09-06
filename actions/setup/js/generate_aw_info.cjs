@@ -9,7 +9,7 @@ const { validateContextVariables } = require("./validate_context_variables.cjs")
 const validateLockdownRequirements = require("./validate_lockdown_requirements.cjs");
 const { writeMergedModelsJSON } = require("./merge_frontmatter_models.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { ERR_CONFIG } = require("./error_codes.cjs");
+const { ERR_CONFIG, ERR_SYSTEM } = require("./error_codes.cjs");
 
 /**
  * Generate aw_info.json with workflow run metadata.
@@ -24,9 +24,10 @@ const { ERR_CONFIG } = require("./error_codes.cjs");
  *
  * @param {typeof import('@actions/core')} core - GitHub Actions core library
  * @param {any} ctx - GitHub Actions context object
+ * @param {any} [githubClient] - Authenticated GitHub client; falls back to global.github
  * @returns {Promise<void>}
  */
-async function main(core, ctx) {
+async function main(core, ctx, githubClient) {
   // Validate numeric context variables before processing run info.
   // This prevents malicious payloads from hiding special text or code in numeric fields.
   await validateContextVariables(core, ctx);
@@ -75,6 +76,7 @@ async function main(core, ctx) {
     workflow_name: process.env.GH_AW_INFO_WORKFLOW_NAME || "",
     experimental: process.env.GH_AW_INFO_EXPERIMENTAL === "true",
     supports_tools_allowlist: process.env.GH_AW_INFO_SUPPORTS_TOOLS_ALLOWLIST === "true",
+    cache_memory: process.env.GH_AW_INFO_CACHE_MEMORY === "true",
     run_id: ctx.runId,
     run_number: ctx.runNumber,
     run_attempt: process.env.GITHUB_RUN_ATTEMPT,
@@ -89,11 +91,29 @@ async function main(core, ctx) {
     firewall_enabled: process.env.GH_AW_INFO_FIREWALL_ENABLED === "true",
     awf_version: process.env.GH_AW_INFO_AWF_VERSION || "",
     awmg_version: process.env.GH_AW_INFO_AWMG_VERSION || "",
+    agent_runtime: process.env.GH_AW_INFO_AGENT_RUNTIME || "",
     steps: {
       firewall: process.env.GH_AW_INFO_FIREWALL_TYPE || "",
     },
     created_at: new Date().toISOString(),
   };
+
+  if (process.env.GH_AW_INFO_FETCH_RUN_CREATED_AT === "true") {
+    try {
+      // @ts-ignore - global.github is set by setupGlobals() from github-script context
+      const github = githubClient || global.github;
+      const response = await github.rest.actions.getWorkflowRun({
+        owner: ctx.repo.owner,
+        repo: ctx.repo.repo,
+        run_id: ctx.runId,
+      });
+      const runCreatedAt = response.data.created_at || "";
+      core.setOutput("run_created_at", runCreatedAt);
+    } catch (err) {
+      core.warning(`Unable to load workflow-run creation time: ${getErrorMessage(err)}`);
+      core.setOutput("run_created_at", "");
+    }
+  }
 
   const frontmatterSource = process.env.GH_AW_INFO_FRONTMATTER_SOURCE || "";
   if (frontmatterSource) {
@@ -181,14 +201,14 @@ async function main(core, ctx) {
   try {
     fs.mkdirSync(TMP_GH_AW_PATH, { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create directory ${TMP_GH_AW_PATH}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to create directory ${TMP_GH_AW_PATH}: ${getErrorMessage(err)}`, { cause: err });
   }
   writeMergedModelsJSON(core);
   const tmpPath = TMP_GH_AW_PATH + "/aw_info.json";
   try {
     fs.writeFileSync(tmpPath, JSON.stringify(awInfo, null, 2));
   } catch (err) {
-    throw new Error(`Failed to write file ${tmpPath}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to write file ${tmpPath}: ${getErrorMessage(err)}`, { cause: err });
   }
 
   if (awInfo.staged) {

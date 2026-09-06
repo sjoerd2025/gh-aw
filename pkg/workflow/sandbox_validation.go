@@ -11,20 +11,20 @@
 package workflow
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var sandboxValidationLog = logger.New("workflow:sandbox_validation")
 
-const minSandboxDisableJustificationLength = 20
-
 var githubActionsExpressionPattern = regexp.MustCompile(`\$\{\{[\s\S]*\}\}`)
+var mcpGatewayEnvNamePattern = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 
 // validateMountsSyntax validates that mount strings follow the correct syntax
 // Expected format: "source:destination:mode" where mode is either "ro" or "rw"
@@ -62,14 +62,19 @@ func validateMountsSyntax(mounts []string) error {
 				fmt.Sprintf("Provide a valid destination path.\n\nExample:\nsandbox:\n  mounts:\n    - \"/host/path:/container/path:ro\"\n\nSee: %s", constants.DocsSandboxURL),
 			)
 		default:
-			return fmt.Errorf("internal error: unsupported mount validation kind %d for sandbox mount %q", kind, mount)
+			return NewValidationError(
+				fmt.Sprintf("sandbox.mounts[%d]", i),
+				mount,
+				fmt.Sprintf("internal error: sandbox mount validation kind %d is not supported", kind),
+				fmt.Sprintf("Expected one of: invalid-format, too-few-parts, too-many-parts, empty-host-path, empty-destination.\n\nExample:\nsandbox:\n  mounts:\n    - \"/host/path:/container/path:ro\"\n\nSee: %s", constants.DocsSandboxURL),
+			)
 		}
 	})
 }
 
 // validateSandboxConfig validates the sandbox configuration
 // Returns an error if the configuration is invalid
-func validateSandboxConfig(workflowData *WorkflowData) error {
+func validateSandboxConfig(workflowData *WorkflowData) error { //nolint:largefunc // Existing sandbox validation remains centralized.
 	if workflowData == nil {
 		return nil
 	}
@@ -81,22 +86,31 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 	sandboxConfig := workflowData.SandboxConfig
 
 	// Check if sandbox.agent: false was specified
-	// This requires the "dangerously-disable-sandbox-agent" feature to include a
-	// justification string. Without a valid justification, disabling the sandbox
-	// is a validation error.
+	// This requires the "dangerously-disable-sandbox-agent" feature to be explicitly enabled.
 	if sandboxConfig.Agent != nil && sandboxConfig.Agent.Disabled {
-		justification, err := getSandboxDisableJustification(workflowData)
-		if err != nil {
-			flag := string(constants.DangerouslyDisableSandboxAgentFeatureFlag)
+		flag := string(constants.DangerouslyDisableSandboxAgentFeatureFlag)
+		value, found := getFeatureValueCaseInsensitive(workflowData.Features, flag)
+		enabled, isBoolean := value.(bool)
+		if !found || !isBoolean || !enabled {
 			return NewValidationError(
 				"sandbox.agent",
 				"false",
-				fmt.Sprintf("disabling the agent sandbox removes a trust boundary: '%s' must be a literal justification string (%d+ chars, no expressions): %v", flag, minSandboxDisableJustificationLength, err),
-				fmt.Sprintf("Add the feature value to your workflow frontmatter:\n\nfeatures:\n  %s: \"controlled environment with no internet access\"\nsandbox:\n  agent: false\n\nSee: %s", flag, constants.DocsSandboxURL),
+				fmt.Sprintf("disabling the agent sandbox removes a trust boundary and requires 'features.%s: true'", flag),
+				fmt.Sprintf("Explicitly enable the dangerous sandbox opt-out:\n\nfeatures:\n  %s: true\nsandbox:\n  agent: false\n\nSee: %s", flag, constants.DocsSandboxURL),
 			)
 		}
-		sandboxConfig.Agent.DisableReason = justification
-		sandboxValidationLog.Printf("sandbox.agent: false permitted by %s justification: %q", constants.DangerouslyDisableSandboxAgentFeatureFlag, justification)
+		sandboxValidationLog.Printf("sandbox.agent: false permitted by features.%s: true", flag)
+
+		if workflowData.EngineConfig != nil &&
+			workflowData.EngineConfig.ID == string(constants.CodexEngine) &&
+			NewCodexEngine().ResolveLLMProvider(workflowData) == LLMProviderGitHub {
+			return NewValidationError(
+				"sandbox.agent",
+				"false",
+				"Codex with a copilot/* model requires the agent sandbox for BYOK inference routing",
+				"Enable the agent sandbox or select a non-Copilot model.",
+			)
+		}
 	}
 
 	// Validate mounts syntax if specified in agent config
@@ -105,6 +119,29 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 		if err := validateMountsSyntax(agentConfig.Mounts); err != nil {
 			return err
 		}
+	}
+
+	// Validate memory format if specified in agent config
+	if agentConfig != nil && agentConfig.Memory != "" {
+		if err := validateAgentMemoryLimit(agentConfig.Memory); err != nil {
+			return err
+		}
+	}
+
+	if agentConfig != nil && len(agentConfig.AllowHostPorts) > 0 {
+		if err := validateAllowHostPorts(agentConfig.AllowHostPorts); err != nil {
+			return err
+		}
+	}
+
+	// Validate the digest-pinned AWF infrastructure image manifest if configured.
+	if err := validateSandboxAgentImages(workflowData); err != nil {
+		return err
+	}
+
+	// Validate the runtime profile and the properties that depend on it.
+	if err := validateSandboxRuntimeProfile(workflowData, agentConfig); err != nil {
+		return err
 	}
 
 	// Validate gVisor runtime compatibility
@@ -140,18 +177,6 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 			)
 		}
 
-		// docker-sbx install step requires root access; sudo: true is mandatory.
-		if !agentConfig.SudoExplicitlyEnabled {
-			return NewValidationError(
-				"sandbox.agent.runtime",
-				string(AgentRuntimeDockerSbx),
-				"docker-sbx requires sandbox.agent.sudo: true",
-				"The docker-sbx install step needs root access to install docker-sbx and fix KVM "+
-					"device permissions. Add 'sudo: true' to your sandbox.agent configuration:\n\n"+
-					"sandbox:\n  agent:\n    id: awf\n    runtime: docker-sbx\n    sudo: true",
-			)
-		}
-
 		firewallConfig := getFirewallConfig(workflowData)
 		var configuredVersion string
 		if firewallConfig != nil {
@@ -170,7 +195,65 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 			)
 		}
 
-		sandboxValidationLog.Print("docker-sbx runtime configured -- topology, sudo, and AWF version checks passed")
+		sandboxValidationLog.Print("docker-sbx runtime configured -- topology and AWF version checks passed")
+	}
+
+	// Validate cloud-hypervisor runtime compatibility
+	if agentConfig != nil && agentConfig.Runtime == AgentRuntimeCloudHypervisor {
+		if isArcDindTopology(workflowData) {
+			return NewValidationError(
+				"sandbox.agent.runtime",
+				string(AgentRuntimeCloudHypervisor),
+				"cloud-hypervisor is incompatible with runner.topology: arc-dind",
+				"cloud-hypervisor requires KVM and is only supported on GitHub-hosted Ubuntu x86_64 runners. "+
+					"ARC DinD runners do not provide that runtime environment. Remove sandbox.agent.runtime: cloud-hypervisor or change runner.topology.",
+			)
+		}
+
+		firewallConfig := getFirewallConfig(workflowData)
+		var configuredVersion string
+		if firewallConfig != nil {
+			configuredVersion = firewallConfig.Version
+		}
+		if !versionAtLeast(configuredVersion, string(constants.DefaultFirewallVersion), string(constants.AWFCloudHypervisorMinVersion)) {
+			effectiveVersion := configuredVersion
+			if effectiveVersion == "" {
+				effectiveVersion = string(constants.DefaultFirewallVersion)
+			}
+			return NewValidationError(
+				"sandbox.agent.runtime",
+				string(AgentRuntimeCloudHypervisor),
+				fmt.Sprintf("cloud-hypervisor requires AWF %s or newer", constants.AWFCloudHypervisorMinVersion),
+				fmt.Sprintf("cloud-hypervisor preview support is only available in AWF %s+.\n\nThe effective AWF version is %s. Set firewall.version or sandbox.agent.version to %s or newer.", constants.AWFCloudHypervisorMinVersion, effectiveVersion, constants.AWFCloudHypervisorMinVersion),
+			)
+		}
+
+		// cloud-hypervisor rejects --difc-proxy-host: the CLI proxy sidecar (awmg-cli-proxy)
+		// is intentionally not attached to the isolated topology, so gh-proxy mode
+		// (and integrity-reactions, which implicitly enables it) has no route to the host.
+		if isCliProxyNeeded(workflowData) {
+			return NewValidationError(
+				"sandbox.agent.runtime",
+				string(AgentRuntimeCloudHypervisor),
+				"cloud-hypervisor is incompatible with tools.github.mode: gh-proxy",
+				"cloud-hypervisor does not attach the CLI proxy sidecar, and the AWF runtime rejects "+
+					"--difc-proxy-host for this runtime. Remove tools.github.mode: gh-proxy and the "+
+					"integrity-reactions feature, or change sandbox.agent.runtime.",
+			)
+		}
+
+		// cloud-hypervisor rejects enclaves configuration outright.
+		if len(workflowData.Enclaves) > 0 {
+			return NewValidationError(
+				"sandbox.agent.runtime",
+				string(AgentRuntimeCloudHypervisor),
+				"cloud-hypervisor is incompatible with enclaves",
+				"cloud-hypervisor does not support the enclaves subsystem. Remove the enclaves "+
+					"configuration, or change sandbox.agent.runtime.",
+			)
+		}
+
+		sandboxValidationLog.Print("cloud-hypervisor runtime configured -- topology, AWF version, and feature compatibility checks passed")
 	}
 
 	// Validate config structure if provided (deprecated - was only for SRT)
@@ -192,6 +275,27 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 		sandboxValidationLog.Printf("Validated MCP gateway port: %d", sandboxConfig.MCP.Port)
 	}
 
+	if sandboxConfig.MCP != nil {
+		for _, name := range sliceutil.SortedKeys(sandboxConfig.MCP.Env) {
+			if isReservedMCPGatewayEnvVar(name) {
+				return NewValidationError(
+					"sandbox.mcp.env."+name,
+					name,
+					"environment variable names in the GH_AW_MCP_GATEWAY_ namespace are reserved for internal transport",
+					"Choose a different name that does not start with GH_AW_MCP_GATEWAY_. Example:\n\nsandbox:\n  mcp:\n    env:\n      API_TOKEN: value",
+				)
+			}
+			if !mcpGatewayEnvNamePattern.MatchString(name) {
+				return NewValidationError(
+					"sandbox.mcp.env."+name,
+					name,
+					fmt.Sprintf("environment variable names should match %s", mcpGatewayEnvNamePattern),
+					"Use uppercase letters, digits, and underscores, starting with a letter or underscore. Example:\n\nsandbox:\n  mcp:\n    env:\n      API_TOKEN: value",
+				)
+			}
+		}
+	}
+
 	// Validate that if agent sandbox is enabled, MCP gateway is always enabled.
 	// The MCP gateway is enabled when MCP servers are configured (tools that use MCP).
 	// Note: Even if agent sandbox is disabled (sandbox.agent: false), the MCP gateway
@@ -211,32 +315,102 @@ func validateSandboxConfig(workflowData *WorkflowData) error {
 	return nil
 }
 
-func getSandboxDisableJustification(workflowData *WorkflowData) (string, error) {
-	if workflowData == nil || workflowData.Features == nil {
-		return "", errors.New("dangerously-disable-sandbox-agent feature is missing")
+// memoryLimitPattern matches valid memory limit strings.
+// The value must start with a non-zero digit, optionally followed by more digits,
+// and end with one of: b, k, m, g (case-insensitive). Leading zeros and bare-zero
+// values (e.g. "0m") are rejected because AWF rejects them at startup.
+// Examples of valid values: "512m", "2g", "1024k", "1b", "128M".
+var memoryLimitPattern = regexp.MustCompile(`^[1-9][0-9]*[bkmgBKMG]$`)
+
+// validateAgentMemoryLimit checks that a sandbox.agent.memory string has the correct format.
+func validateAgentMemoryLimit(memory string) error {
+	if !memoryLimitPattern.MatchString(memory) {
+		return NewValidationError(
+			"sandbox.agent.memory",
+			memory,
+			"memory value is not a valid limit. Expected a positive integer without leading zeros followed by a unit: b, k, m, or g (e.g. \"4g\", \"512m\")",
+			fmt.Sprintf("Use a valid memory limit format:\n\nsandbox:\n  agent:\n    memory: 4g  # examples: 512m, 4g, 8g\n\nSee: %s", constants.DocsSandboxURL),
+		)
+	}
+	return nil
+}
+
+func validateAllowHostPorts(ports []int) error {
+	for _, port := range ports {
+		if port < minPort || port > maxPort {
+			return NewValidationError(
+				"sandbox.agent.allow-host-ports",
+				strconv.Itoa(port),
+				"allow-host-ports value "+strconv.Itoa(port)+" is out of range",
+				"Expected a TCP port between 1 and 65535.\n\nExample: allow-host-ports: [9000]",
+			)
+		}
+		if service, dangerous := awfDangerousHostPorts[port]; dangerous {
+			return NewValidationError(
+				"sandbox.agent.allow-host-ports",
+				strconv.Itoa(port),
+				"allow-host-ports value "+strconv.Itoa(port)+" maps to blocked service "+service,
+				fmt.Sprintf("Blocked service ports remain unreachable under allow-host-ports even with the %s runtime; expose the service via GitHub Actions services: with sandbox.agent.runtime: %s instead.\n\nExample:\n# Do not list blocked service ports under allow-host-ports\nsandbox:\n  agent:\n    runtime: %s\nservices:\n  db:\n    image: postgres\n    ports: [\"5432:5432\"]", AgentRuntimeDockerSudoIptables, AgentRuntimeDockerSudoIptables, AgentRuntimeDockerSudoIptables),
+			)
+		}
+	}
+	return nil
+}
+
+// validateSandboxRuntimeProfile validates sandbox.agent.runtime and the properties
+// whose behavior depends on the selected runtime profile.
+func validateSandboxRuntimeProfile(workflowData *WorkflowData, agentConfig *AgentSandboxConfig) error {
+	if agentConfig == nil || agentConfig.Disabled {
+		return nil
 	}
 
-	flagName := string(constants.DangerouslyDisableSandboxAgentFeatureFlag)
-	value, found := getFeatureValueCaseInsensitive(workflowData.Features, flagName)
-	if !found {
-		return "", errors.New("dangerously-disable-sandbox-agent feature is missing")
+	if !isSupportedAgentRuntime(agentConfig.Runtime) {
+		return NewValidationError(
+			"sandbox.agent.runtime",
+			string(agentConfig.Runtime),
+			"unsupported sandbox runtime: must be one of "+strings.Join(supportedAgentRuntimeNames(), ", "),
+			fmt.Sprintf("Choose one of the supported runtime profiles:\n\nsandbox:\n  agent:\n    runtime: %s\n\nSee: %s", AgentRuntimeDocker, constants.DocsSandboxURL),
+		)
 	}
 
-	justification, ok := value.(string)
-	if !ok {
-		return "", fmt.Errorf("feature must be a string, got %T", value)
+	profile := resolveSandboxRuntimeProfile(agentConfig)
+
+	// runtime-install controls runner provisioning and is only meaningful for the
+	// runtimes that the compiler provisions (gvisor and docker-sbx).
+	if agentConfig.RuntimeInstall != nil && !profile.SupportsRuntimeInstall {
+		return NewValidationError(
+			"sandbox.agent.runtime-install",
+			strconv.FormatBool(*agentConfig.RuntimeInstall),
+			fmt.Sprintf("sandbox.agent.runtime-install is only supported with sandbox.agent.runtime: %s or %s (current runtime: %s)", AgentRuntimeGVisor, AgentRuntimeDockerSbx, profile.Runtime),
+			fmt.Sprintf("Remove sandbox.agent.runtime-install, or select a runtime that the compiler provisions:\n\nsandbox:\n  agent:\n    runtime: %s\n    runtime-install: false\n\nSee: %s", AgentRuntimeGVisor, constants.DocsSandboxURL),
+		)
 	}
 
-	trimmed := strings.TrimSpace(justification)
-	if len(trimmed) < minSandboxDisableJustificationLength {
-		return "", fmt.Errorf("feature must be at least %d characters", minSandboxDisableJustificationLength)
+	// Host access (explicit host ports and automatic GitHub Actions services:
+	// connectivity) requires the privileged iptables profile.
+	if profile.SupportsHostAccess {
+		return nil
 	}
 
-	if githubActionsExpressionPattern.MatchString(trimmed) {
-		return "", errors.New("feature cannot use GitHub Actions expressions")
+	if len(agentConfig.AllowHostPorts) > 0 {
+		return NewValidationError(
+			"sandbox.agent.allow-host-ports",
+			joinPorts(agentConfig.AllowHostPorts),
+			fmt.Sprintf("sandbox.agent.allow-host-ports requires sandbox.agent.runtime: %s (current runtime: %s)", AgentRuntimeDockerSudoIptables, profile.Runtime),
+			fmt.Sprintf("Host access is only available in the %s runtime profile:\n\nsandbox:\n  agent:\n    runtime: %s\n    allow-host-ports: [9000]\n\nSee: %s", AgentRuntimeDockerSudoIptables, AgentRuntimeDockerSudoIptables, constants.DocsSandboxURL),
+		)
 	}
 
-	return trimmed, nil
+	if workflowData != nil && workflowData.ServicePortExpressions != "" {
+		return NewValidationError(
+			"services",
+			workflowData.ServicePortExpressions,
+			fmt.Sprintf("GitHub Actions services: with published ports require sandbox.agent.runtime: %s (current runtime: %s)", AgentRuntimeDockerSudoIptables, profile.Runtime),
+			fmt.Sprintf("The agent can only reach service containers in the %s runtime profile:\n\nsandbox:\n  agent:\n    runtime: %s\n\nOr remove the port mappings from services: if the agent does not need to reach them.\n\nSee: %s", AgentRuntimeDockerSudoIptables, AgentRuntimeDockerSudoIptables, constants.DocsSandboxURL),
+		)
+	}
+
+	return nil
 }
 
 func getFeatureValueCaseInsensitive(features map[string]any, flagName string) (any, bool) {

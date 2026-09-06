@@ -12,6 +12,10 @@ permissions:
   actions: read
 engine: claude
 timeout-minutes: 30
+tools:
+  github:
+    mode: local
+
 imports:
   - uses: shared/meta-analysis-base.md
     with:
@@ -23,12 +27,13 @@ imports:
 
 
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
 features:
   gh-aw-detection: true
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
+
 # Weekly Workflow Analysis
 
 Analyze GitHub Actions workflow runs from the past week and identify improvement opportunities.

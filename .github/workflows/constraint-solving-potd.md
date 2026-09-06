@@ -33,9 +33,6 @@ safe-outputs:
     expires: 7d
 features:
   gh-aw-detection: true
-sandbox:
-  agent:
-    sudo: false
 evals:
   - id: discussion-created
     question: Did the agent create a constraint solving problem of the day discussion?
@@ -43,6 +40,9 @@ evals:
     question: Does the agent output include a clear problem statement with constraints?
   - id: solution-provided
     question: Does the agent output include a solution or answer to the problem?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Constraint Solving — Problem of the Day

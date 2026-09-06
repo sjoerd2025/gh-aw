@@ -15,6 +15,8 @@ const {
   isMissingApiKeyError,
   isServerError,
   isInvalidModelError,
+  isUnsupportedModelToolsError,
+  isInvalidRequestError,
   isReconnectExhaustedError,
   countPermissionDeniedIssues,
   hasNumerousPermissionDeniedIssues,
@@ -23,11 +25,20 @@ const {
   buildCodexChildEnv,
   extractPortFromURL,
   extractOpenAIProxyBaseURLFromToml,
-  getConfiguredOpenAIPortFromReflect,
+  getConfiguredProviderPortFromReflect,
   validateCodexOpenAIBaseURLFromReflect,
   configureCodexProviderFromReflect,
   hasNoopInSafeOutputs,
   resolveRetryConfig,
+  resolveContextRebuildCircuitBreakerConfig,
+  evaluateContextRebuildCircuitBreaker,
+  evaluateContextRebuildCircuitBreakerForAttempt,
+  readWorkingSetFromTokenUsage,
+  TOKEN_USAGE_PATHS,
+  DEFAULT_CONTEXT_REBUILD_FACTOR_LIMIT,
+  DEFAULT_CONTEXT_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS,
+  DEFAULT_CONTEXT_REBUILD_POLL_INTERVAL_MS,
+  DEFAULT_CONTEXT_REBUILD_TERM_GRACE_MS,
   resolvePostResultWatchdogIdleTimeoutMs,
   DEFAULT_POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS,
   MIN_POST_RESULT_WATCHDOG_TIMEOUT_MS,
@@ -204,6 +215,177 @@ describe("codex_harness.cjs", () => {
     });
   });
 
+  describe("context rebuild circuit breaker", () => {
+    it("uses defaults when env overrides are absent or invalid", () => {
+      const cfg = resolveContextRebuildCircuitBreakerConfig({
+        GH_AW_CODEX_MAX_REBUILD_FACTOR: "nope",
+        GH_AW_CODEX_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS: "-1",
+        GH_AW_CODEX_REBUILD_GUARD_POLL_MS: "0",
+        GH_AW_CODEX_REBUILD_GUARD_TERM_GRACE_MS: "0",
+      });
+      expect(cfg.enabled).toBe(true);
+      expect(cfg.maxRebuildFactor).toBe(DEFAULT_CONTEXT_REBUILD_FACTOR_LIMIT);
+      expect(cfg.minCumulativeInputTokens).toBe(DEFAULT_CONTEXT_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS);
+      expect(cfg.pollIntervalMs).toBe(DEFAULT_CONTEXT_REBUILD_POLL_INTERVAL_MS);
+      expect(cfg.termGraceMs).toBe(DEFAULT_CONTEXT_REBUILD_TERM_GRACE_MS);
+    });
+
+    it("supports explicit disable via env", () => {
+      const cfg = resolveContextRebuildCircuitBreakerConfig({
+        GH_AW_CODEX_CONTEXT_REBUILD_CIRCUIT_BREAKER: "false",
+      });
+      expect(cfg.enabled).toBe(false);
+    });
+
+    it("trips only when both rebuild factor and cumulative input exceed thresholds", () => {
+      const config = { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 };
+      expect(
+        evaluateContextRebuildCircuitBreaker(
+          {
+            measurement_state: "measured",
+            rebuild_factor: 4.5,
+            cumulative_input_tokens: 1400,
+            peak_input_tokens: 311,
+            rebuild_excess_tokens: 1089,
+            invocations: 5,
+          },
+          config
+        ).terminate
+      ).toBe(true);
+      expect(
+        evaluateContextRebuildCircuitBreaker(
+          {
+            measurement_state: "measured",
+            rebuild_factor: 4.5,
+            cumulative_input_tokens: 999,
+            peak_input_tokens: 222,
+            rebuild_excess_tokens: 777,
+            invocations: 4,
+          },
+          config
+        ).terminate
+      ).toBe(false);
+    });
+
+    it("falls back to the default cumulative floor for fractional overrides below one token", () => {
+      const cfg = resolveContextRebuildCircuitBreakerConfig({
+        GH_AW_CODEX_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS: "0.5",
+      });
+      expect(cfg.minCumulativeInputTokens).toBe(DEFAULT_CONTEXT_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS);
+    });
+
+    it("does not trip when rebuild_factor is just below the threshold", () => {
+      const config = { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 };
+      expect(evaluateContextRebuildCircuitBreaker({ rebuild_factor: 3.99, cumulative_input_tokens: 2000 }, config).terminate).toBe(false);
+    });
+
+    it("trips when rebuild_factor is exactly at the threshold", () => {
+      const config = { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 };
+      expect(evaluateContextRebuildCircuitBreaker({ rebuild_factor: 4, cumulative_input_tokens: 2000 }, config).terminate).toBe(true);
+    });
+
+    it("does not trip after a terminal safe-output was produced in the current attempt", () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-rebuild-safe-output-"));
+      const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
+      fs.writeFileSync(safeOutputsPath, '{"type":"noop","message":"done"}\n', "utf8");
+      const logs = [];
+      try {
+        const decision = evaluateContextRebuildCircuitBreakerForAttempt(
+          { rebuild_factor: 4, cumulative_input_tokens: 2000 },
+          { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 },
+          { safeOutputsPath, safeOutputsByteOffset: 0, logger: msg => logs.push(msg) }
+        );
+        expect(decision.terminate).toBe(false);
+        expect(logs.some(line => line.includes("allowing Codex to exit normally"))).toBe(true);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not trip after a report_incomplete safe-output was produced in the current attempt", () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-rebuild-report-incomplete-"));
+      const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
+      fs.writeFileSync(safeOutputsPath, '{"type":"report_incomplete","reason":"blocked"}\n', "utf8");
+      try {
+        const decision = evaluateContextRebuildCircuitBreakerForAttempt({ rebuild_factor: 4, cumulative_input_tokens: 2000 }, { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 }, { safeOutputsPath, safeOutputsByteOffset: 0 });
+        expect(decision.terminate).toBe(false);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("still trips when terminal safe-output predates the current attempt", () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-rebuild-stale-safe-output-"));
+      const safeOutputsPath = path.join(dir, "safe-outputs.jsonl");
+      fs.writeFileSync(safeOutputsPath, '{"type":"noop","message":"old"}\n', "utf8");
+      const byteOffset = fs.statSync(safeOutputsPath).size;
+      try {
+        const decision = evaluateContextRebuildCircuitBreakerForAttempt({ rebuild_factor: 4, cumulative_input_tokens: 2000 }, { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 }, { safeOutputsPath, safeOutputsByteOffset: byteOffset });
+        expect(decision.terminate).toBe(true);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not trip for null, empty, or non-finite working sets", () => {
+      const config = { maxRebuildFactor: 4, minCumulativeInputTokens: 1000 };
+      expect(evaluateContextRebuildCircuitBreaker(null, config).terminate).toBe(false);
+      expect(evaluateContextRebuildCircuitBreaker({}, config).terminate).toBe(false);
+      expect(evaluateContextRebuildCircuitBreaker({ rebuild_factor: Number.NaN, cumulative_input_tokens: 5000 }, config).terminate).toBe(false);
+      expect(evaluateContextRebuildCircuitBreaker({ rebuild_factor: Number.POSITIVE_INFINITY, cumulative_input_tokens: 5000 }, config).terminate).toBe(false);
+      expect(evaluateContextRebuildCircuitBreaker({ rebuild_factor: 9, cumulative_input_tokens: Number.NaN }, config).terminate).toBe(false);
+    });
+
+    it("accepts a rebuild factor threshold of exactly 1", () => {
+      expect(resolveContextRebuildCircuitBreakerConfig({ GH_AW_CODEX_MAX_REBUILD_FACTOR: "1" }).maxRebuildFactor).toBe(1);
+    });
+
+    it("skips token-usage candidates whose measurements are unavailable", async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-token-usage-"));
+      const malformed = path.join(dir, "malformed.jsonl");
+      const valid = path.join(dir, "valid.jsonl");
+      fs.writeFileSync(malformed, "not json\n{oops\n");
+      fs.writeFileSync(valid, `${JSON.stringify({ input_tokens: 100 })}\n${JSON.stringify({ input_tokens: 900 })}\n`);
+      try {
+        const workingSet = await readWorkingSetFromTokenUsage([malformed, valid]);
+        expect(workingSet).not.toBeNull();
+        expect(workingSet.measurement_state).toBe("measured");
+        expect(workingSet.cumulative_input_tokens).toBe(1000);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("prefers the most recently written token-usage candidate", async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-token-usage-"));
+      const stale = path.join(dir, "stale.jsonl");
+      const fresh = path.join(dir, "fresh.jsonl");
+      fs.writeFileSync(stale, `${JSON.stringify({ input_tokens: 7 })}\n`);
+      fs.writeFileSync(fresh, `${JSON.stringify({ input_tokens: 500 })}\n${JSON.stringify({ input_tokens: 500 })}\n`);
+      const now = Date.now() / 1000;
+      fs.utimesSync(stale, now - 600, now - 600);
+      fs.utimesSync(fresh, now, now);
+      try {
+        // `stale` is listed first, but `fresh` has the newer mtime and must win.
+        const workingSet = await readWorkingSetFromTokenUsage([stale, fresh]);
+        expect(workingSet.cumulative_input_tokens).toBe(1000);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns null when no candidate yields usable measurements", async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-token-usage-"));
+      const malformed = path.join(dir, "malformed.jsonl");
+      fs.writeFileSync(malformed, "not json\n");
+      try {
+        expect(await readWorkingSetFromTokenUsage([malformed, path.join(dir, "missing.jsonl")])).toBeNull();
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("OpenAI base URL validation", () => {
     it("extracts port from URL", () => {
       expect(extractPortFromURL("http://172.30.0.30:10000")).toBe(10000);
@@ -245,21 +427,30 @@ env_key = "OPENAI_API_KEY"
       expect(extractOpenAIProxyBaseURLFromToml(toml)).toBe("http://172.30.0.30:10000");
     });
 
-    it("extracts configured OpenAI port from reflect payload", () => {
+    it("extracts configured provider port from reflect payload", () => {
       const reflect = {
         endpoints: [
           { provider: "anthropic", port: 10001, configured: true },
           { provider: "openai", port: 10000, configured: true },
+          { provider: "copilot", port: 10002, configured: true },
         ],
       };
-      expect(getConfiguredOpenAIPortFromReflect(reflect)).toBe(10000);
+      expect(getConfiguredProviderPortFromReflect(reflect)).toBe(10000);
+      expect(getConfiguredProviderPortFromReflect(reflect, "github")).toBe(10002);
     });
 
     it("returns null for malformed reflect endpoint ports", () => {
       const reflect = {
         endpoints: [{ provider: "openai", port: "not-a-number", configured: true }],
       };
-      expect(getConfiguredOpenAIPortFromReflect(reflect)).toBeNull();
+      expect(getConfiguredProviderPortFromReflect(reflect)).toBeNull();
+    });
+
+    it("returns null when the selected provider is not configured", () => {
+      const reflect = {
+        endpoints: [{ provider: "anthropic", port: 10001, configured: true }],
+      };
+      expect(getConfiguredProviderPortFromReflect(reflect, "github")).toBeNull();
     });
 
     it("fails validation when config and reflect OpenAI ports mismatch", () => {
@@ -300,6 +491,35 @@ env_key = "OPENAI_API_KEY"
         readFileSync,
       });
       expect(result.ok).toBe(true);
+    });
+
+    it("validates against the selected GitHub provider", () => {
+      const files = {
+        "/tmp/codex-config.toml": `[model_providers.openai-proxy]\nbase_url = "http://api-proxy:10002"\n`,
+        "/tmp/awf-reflect.json": JSON.stringify({ endpoints: [{ provider: "copilot", port: 10002, configured: true }] }),
+      };
+      const result = validateCodexOpenAIBaseURLFromReflect({
+        codexConfigPath: "/tmp/codex-config.toml",
+        reflectPath: "/tmp/awf-reflect.json",
+        provider: "github",
+        readFileSync: filePath => files[filePath],
+      });
+      expect(result.ok).toBe(true);
+    });
+
+    it("fails strictly when /reflect has configured endpoints but none for the selected provider", () => {
+      const files = {
+        "/tmp/codex-config.toml": `[model_providers.openai-proxy]\nbase_url = "http://172.30.0.30:10000"\n`,
+        "/tmp/awf-reflect.json": JSON.stringify({ endpoints: [{ provider: "anthropic", port: 10001, configured: true }] }),
+      };
+      const result = validateCodexOpenAIBaseURLFromReflect({
+        codexConfigPath: "/tmp/codex-config.toml",
+        reflectPath: "/tmp/awf-reflect.json",
+        provider: "github",
+        readFileSync: filePath => files[filePath],
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toContain("no configured endpoint for provider");
     });
 
     it("passes through when TOML lacks openai-proxy section", () => {
@@ -368,6 +588,58 @@ env_key = "OPENAI_API_KEY"
     it("returns false for unrelated errors", () => {
       expect(isServerError("Error: ENOENT: no such file")).toBe(false);
       expect(isServerError("")).toBe(false);
+    });
+  });
+
+  describe("isInvalidRequestError", () => {
+    it("returns true for a provider invalid_request_error payload", () => {
+      const output = String.raw`{"type":"turn.failed","error":{"message":"{\"error\":{\"message\":\"Provider returned error\",\"code\":400,\"metadata\":{\"raw\":\"{\\\"type\\\": \\\"invalid_request_error\\\",\\n    \\\"param\\\": \\\"messages[4].content\\\",\\n    \\\"code\\\": \\\"empty_array\\\"}\"}}}"}}`;
+      expect(isInvalidRequestError(output)).toBe(true);
+    });
+
+    it("returns true for an unescaped provider error field in a turn.failed event", () => {
+      expect(isInvalidRequestError('{"type":"turn.failed","error":{"type":"invalid_request_error"}}')).toBe(true);
+    });
+
+    it("returns false for unrelated errors and tool transcript content", () => {
+      expect(isInvalidRequestError("rate_limit_exceeded")).toBe(false);
+      expect(isInvalidRequestError("500 Internal Server Error")).toBe(false);
+      expect(isInvalidRequestError("GitHub API responded with 400 Bad Request")).toBe(false);
+      expect(isInvalidRequestError('{"type":"item.completed","item":{"type":"tool_call_output","output":"invalid_request_error"}}')).toBe(false);
+      expect(isInvalidRequestError("")).toBe(false);
+    });
+  });
+
+  describe("isUnsupportedModelToolsError", () => {
+    it("returns true for the observed 'tools' unknown_parameter turn.failed event", () => {
+      const output =
+        '{"type":"thread.started","thread_id":"01a0545e-6060-7472-9d50-d4a643611434"}\n' +
+        '{"type":"turn.started"}\n' +
+        String.raw`{"type":"error","message":"{\n  \"error\": {\n    \"message\": \"Invalid value: 'custom'\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"tools\",\n    \"code\": \"unknown_parameter\"\n  }\n}"}` +
+        "\n" +
+        String.raw`{"type":"turn.failed","error":{"message":"{\n  \"error\": {\n    \"message\": \"Invalid value: 'custom'\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"tools\",\n    \"code\": \"unknown_parameter\"\n  }\n}"}}`;
+      expect(isUnsupportedModelToolsError(output)).toBe(true);
+    });
+
+    it("returns true regardless of the order of param/code fields", () => {
+      const output = '{"type":"turn.failed","error":{"code":"unknown_parameter","param":"tools"}}';
+      expect(isUnsupportedModelToolsError(output)).toBe(true);
+    });
+
+    it("returns true for a provider metadata.raw envelope", () => {
+      const output = String.raw`{"type":"turn.failed","error":{"message":"{\"error\":{\"message\":\"Provider returned error\",\"code\":400,\"metadata\":{\"raw\":\"{\\\"type\\\": \\\"invalid_request_error\\\",\\n    \\\"param\\\": \\\"tools\\\",\\n    \\\"code\\\": \\\"unknown_parameter\\\"}\"}}}"}}`;
+      expect(isUnsupportedModelToolsError(output)).toBe(true);
+    });
+
+    it("returns false for an unrelated invalid_request_error (e.g. empty message array)", () => {
+      const output = String.raw`{"type":"turn.failed","error":{"message":"{\"error\":{\"message\":\"Provider returned error\",\"code\":400,\"metadata\":{\"raw\":\"{\\\"type\\\": \\\"invalid_request_error\\\",\\n    \\\"param\\\": \\\"messages[4].content\\\",\\n    \\\"code\\\": \\\"empty_array\\\"}\"}}}"}}`;
+      expect(isUnsupportedModelToolsError(output)).toBe(false);
+    });
+
+    it("returns false for unrelated errors and empty output", () => {
+      expect(isUnsupportedModelToolsError("rate_limit_exceeded")).toBe(false);
+      expect(isUnsupportedModelToolsError('{"type":"item.completed","item":{"type":"tool_call_output","output":"unknown_parameter tools"}}')).toBe(false);
+      expect(isUnsupportedModelToolsError("")).toBe(false);
     });
   });
 
@@ -474,6 +746,114 @@ env_key = "OPENAI_API_KEY"
       const isTransient = isRateLimit || isServerError(result.output);
       return attempt < MAX_RETRIES && (result.hasOutput || isTransient);
     }
+
+    it("does not retry a provider invalid_request_error failure", () => {
+      const tempDir = makeHarnessTempDir("codex-invalid-request-error-");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+fs.appendFileSync(process.env.CODEX_HARNESS_STUB_CALLS, "called\\n");
+process.stderr.write(JSON.stringify({ type: "turn.failed", error: { message: JSON.stringify({ error: { type: "invalid_request_error" } }) } }) + "\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          CODEX_API_KEY: "fake-key-for-test",
+          GH_AW_HARNESS_MAX_RETRIES: "1",
+          GH_AW_HARNESS_INITIAL_DELAY_MS: "1",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+
+      expect(fs.readFileSync(callsPath, "utf8").trim().split("\n")).toHaveLength(1);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("isInvalidRequestError=true");
+      expect(result.stderr).toContain("invalid_request_error (HTTP 400) — not retrying");
+    });
+
+    it("does not retry the observed unsupported-model 'tools' unknown_parameter failure", () => {
+      const tempDir = makeHarnessTempDir("codex-unsupported-model-tools-");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+fs.appendFileSync(process.env.CODEX_HARNESS_STUB_CALLS, "called\\n");
+process.stderr.write(JSON.stringify({ type: "thread.started", thread_id: "01a0545e-6060-7472-9d50-d4a643611434" }) + "\\n");
+process.stderr.write(JSON.stringify({ type: "turn.started" }) + "\\n");
+const errorMessage = JSON.stringify({ error: { message: "Invalid value: 'custom'", type: "invalid_request_error", param: "tools", code: "unknown_parameter" } });
+process.stderr.write(JSON.stringify({ type: "error", message: errorMessage }) + "\\n");
+process.stderr.write(JSON.stringify({ type: "turn.failed", error: { message: errorMessage } }) + "\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          CODEX_API_KEY: "fake-key-for-test",
+          GH_AW_HARNESS_MAX_RETRIES: "1",
+          GH_AW_HARNESS_INITIAL_DELAY_MS: "1",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+
+      expect(fs.readFileSync(callsPath, "utf8").trim().split("\n")).toHaveLength(1);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("isUnsupportedModelToolsError=true");
+      expect(result.stderr).toContain("configured model does not support Codex's required tool-calling schema");
+      expect(result.stderr).toContain("not retrying");
+    });
+
+    it("exits 0 when the AWF API proxy returns HTTP 403 max-AI-credits as an authentication failure", () => {
+      // Same proxy signature as the claude_harness.test.cjs regression, replayed against codex.
+      // CODEX_API_KEY is set so the `!isMissingApiKey` guard cannot suppress the budget path.
+      const tempDir = makeHarnessTempDir("codex-ai-credits-proxy-403-");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+fs.appendFileSync(process.env.CODEX_HARNESS_STUB_CALLS, "called\\n");
+process.stdout.write(JSON.stringify({ type: "error", error: "authentication_failed", message: "Failed to authenticate. API Error: 403 Maximum AI credits exceeded (302.111025 / 300)." }) + "\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          CODEX_API_KEY: "fake-key-for-test",
+          GH_AW_HARNESS_MAX_RETRIES: "0",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+
+      expect(fs.readFileSync(callsPath, "utf8").trim().split("\n")).toHaveLength(1);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("trusted budget-abort evidence");
+      expect(result.stderr).toContain("AI credits budget enforced");
+    });
 
     it("retries on rate limit error even without output", () => {
       const result = { exitCode: 1, hasOutput: false, output: "rate_limit_exceeded" };
@@ -675,6 +1055,40 @@ process.exit(1);`,
       expect(result.status).toBe(0);
       expect(result.stderr).toContain("noop message found in safe-outputs — not retrying");
     });
+
+    it("exits 0 without retrying when the LLM invocation cap is saturated but the expected safe-output was already produced", () => {
+      const tempDir = makeHarnessTempDir("codex-invocation-cap-suppression-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      // Stub writes an expected safe-output then fails with the pooled invocation-cap error.
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+fs.appendFileSync(safeOutputsPath, JSON.stringify({type:"add_comment",body:"ADR reviewed"}) + "\\n");
+process.stderr.write('{"error":{"type":"max_runs_exceeded","message":"Maximum LLM invocations exceeded (20 / 20)."}}\\n');
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "fix the bug", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: { ...process.env, CODEX_HARNESS_STUB_CALLS: callsPath, GH_AW_SAFE_OUTPUTS: safeOutputsPath, CODEX_API_KEY: "fake-key-for-test" },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
+      // Only one attempt — invocation cap exhaustion is never retried
+      expect(callCount).toBe(1);
+      // Harness exits 0 because the core work (add_comment) already succeeded
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("invocation cap saturated but safe-outputs already contain expected output");
+    });
   });
 
   describe("post-result watchdog suppression when terminal safe-output already produced", () => {
@@ -736,6 +1150,45 @@ const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS;
 fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
 fs.appendFileSync(safeOutputsPath, JSON.stringify({type:"noop",message:"nothing to do"}) + "\\n");
 process.stdout.write("Noop recorded. Waiting...\\n");
+process.on("SIGTERM", () => process.exit(1));
+setInterval(() => {}, 1000);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "moderate the issue", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+          CODEX_API_KEY: "fake-key-for-test",
+          GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS: "100",
+        },
+        encoding: "utf8",
+        timeout: 15000,
+      });
+      const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
+      expect(callCount).toBe(1);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("post-result watchdog fired after terminal safe-output was emitted");
+      expect(result.stderr).toContain("late-activity exit suppressed");
+    });
+
+    it("exits 0 without retrying when a report_incomplete safe-output was produced and the process hangs on exit", () => {
+      const tempDir = makeHarnessTempDir("codex-watchdog-report-incomplete-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+fs.appendFileSync(safeOutputsPath, JSON.stringify({type:"report_incomplete",reason:"infrastructure_error"}) + "\\n");
+process.stdout.write("report_incomplete recorded. Waiting...\\n");
 process.on("SIGTERM", () => process.exit(1));
 setInterval(() => {}, 1000);`,
         "utf8"
@@ -857,7 +1310,132 @@ process.exit(1);`,
     });
   });
 
+  describe("context rebuild circuit breaker termination", () => {
+    it("stops and fails the run when the guard fires even if the process exits 0 on SIGTERM", () => {
+      const tempDir = makeHarnessTempDir("codex-rebuild-breaker-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      const tokenUsagePath = TOKEN_USAGE_PATHS[0];
+      // Preserve any pre-existing token-usage log so the test never destroys real data,
+      // while still always executing its assertions.
+      const previousTokenUsage = fs.existsSync(tokenUsagePath) ? fs.readFileSync(tokenUsagePath) : null;
+      fs.mkdirSync(path.dirname(tokenUsagePath), { recursive: true });
+      fs.writeFileSync(tokenUsagePath, [100, 100, 100].map(t => JSON.stringify({ input_tokens: t })).join("\n") + "\n", "utf8");
+      // Stub stays alive until SIGTERM, then exits cleanly (exit code 0). Without the
+      // guard-fired normalization this would be misreported as a successful run.
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+process.stdout.write("rebuilding context...\\n");
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "do the work", "utf8");
+
+      try {
+        const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+          cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+          env: {
+            ...process.env,
+            CODEX_HARNESS_STUB_CALLS: callsPath,
+            GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+            CODEX_API_KEY: "fake-key-for-test",
+            GH_AW_HARNESS_MAX_RETRIES: "1",
+            GH_AW_HARNESS_INITIAL_DELAY_MS: "1",
+            GH_AW_CODEX_MAX_REBUILD_FACTOR: "2",
+            GH_AW_CODEX_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS: "10",
+            GH_AW_CODEX_REBUILD_GUARD_POLL_MS: "1000",
+            GH_AW_CODEX_REBUILD_GUARD_TERM_GRACE_MS: "250",
+          },
+          encoding: "utf8",
+          timeout: 20000,
+        });
+        const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
+        // The circuit breaker stops the retry loop after the first attempt.
+        expect(callCount).toBe(1);
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("runtime guard requested termination");
+        expect(result.stderr).toContain("normalizing exit code to 1");
+        expect(result.stderr).toContain("not retrying (circuit breaker)");
+      } finally {
+        if (previousTokenUsage === null) {
+          fs.rmSync(tokenUsagePath, { force: true });
+        } else {
+          fs.writeFileSync(tokenUsagePath, previousTokenUsage);
+        }
+      }
+    });
+
+    it("allows the post-result watchdog to report success when the breaker threshold is crossed after terminal output", () => {
+      const tempDir = makeHarnessTempDir("codex-rebuild-breaker-safe-output-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      const tokenUsagePath = TOKEN_USAGE_PATHS[0];
+      const previousTokenUsage = fs.existsSync(tokenUsagePath) ? fs.readFileSync(tokenUsagePath) : null;
+      fs.mkdirSync(path.dirname(tokenUsagePath), { recursive: true });
+      fs.writeFileSync(tokenUsagePath, [100, 100, 100].map(t => JSON.stringify({ input_tokens: t })).join("\n") + "\n", "utf8");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+fs.appendFileSync(safeOutputsPath, JSON.stringify({type:"noop",message:"Metrics collection complete"}) + "\\n");
+process.stdout.write("terminal safe-output written; waiting for slow shutdown\\n");
+process.on("SIGTERM", () => process.exit(1));
+setInterval(() => {}, 1000);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "collect metrics", "utf8");
+
+      try {
+        const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+          cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+          env: {
+            ...process.env,
+            CODEX_HARNESS_STUB_CALLS: callsPath,
+            GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+            CODEX_API_KEY: "fake-key-for-test",
+            GH_AW_HARNESS_MAX_RETRIES: "1",
+            GH_AW_HARNESS_INITIAL_DELAY_MS: "1",
+            GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS: "100",
+            GH_AW_CODEX_MAX_REBUILD_FACTOR: "2",
+            GH_AW_CODEX_REBUILD_MIN_CUMULATIVE_INPUT_TOKENS: "10",
+            GH_AW_CODEX_REBUILD_GUARD_POLL_MS: "1000",
+            GH_AW_CODEX_REBUILD_GUARD_TERM_GRACE_MS: "250",
+          },
+          encoding: "utf8",
+          timeout: 20000,
+        });
+        const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
+        expect(callCount).toBe(1);
+        expect(result.status).toBe(0);
+        expect(result.stderr).toContain("context-rebuild circuit breaker threshold exceeded after terminal safe-output was emitted");
+        expect(result.stderr).toContain("post-result watchdog fired after terminal safe-output was emitted");
+        expect(result.stderr).not.toContain("not retrying (circuit breaker)");
+        expect(result.stderr).not.toContain("report_incomplete emitted via safeoutputs CLI");
+      } finally {
+        if (previousTokenUsage === null) {
+          fs.rmSync(tokenUsagePath, { force: true });
+        } else {
+          fs.writeFileSync(tokenUsagePath, previousTokenUsage);
+        }
+      }
+    });
+  });
+
   describe("resolvePostResultWatchdogIdleTimeoutMs", () => {
+    it("uses a 2-minute shared default", () => {
+      expect(DEFAULT_POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS).toBe(120000);
+    });
+
     it("returns the default when no env var is set", () => {
       expect(resolvePostResultWatchdogIdleTimeoutMs({})).toBe(DEFAULT_POST_RESULT_WATCHDOG_IDLE_TIMEOUT_MS);
     });
@@ -943,6 +1521,166 @@ process.exit(1);`,
       );
       expect(retryConfig.maxDelayMs).toBe(30000);
       expect(logs.some(msg => msg.includes("clamping max delay"))).toBe(true);
+    });
+  });
+
+  describe("AI credits budget enforcement exits 0", () => {
+    /**
+     * @param {string} tempDir
+     * @returns {string}
+     */
+    function writeTrustedAICreditsExceededAudit(tempDir) {
+      const auditDir = path.join(tempDir, "sandbox", "firewall", "audit");
+      fs.mkdirSync(auditDir, { recursive: true });
+      fs.writeFileSync(path.join(auditDir, "log.jsonl"), `${JSON.stringify({ max_ai_credits_exceeded: true })}\n`, "utf8");
+      return path.join(tempDir, "agent-output.json");
+    }
+
+    it("exits 0 when the agent outputs max_ai_credits_exceeded and the CLI exits non-zero", () => {
+      const tempDir = makeHarnessTempDir("codex-ai-credits-exceeded-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      const agentOutputPath = writeTrustedAICreditsExceededAudit(tempDir);
+      // Stub emits the AI-credits-exceeded marker on stdout (as the AWF firewall would)
+      // then exits non-zero.  The harness must detect this, set lastExitCode=0, and exit 0.
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+process.stdout.write("error: max_ai_credits_exceeded=true\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "do some work", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+          GH_AW_AGENT_OUTPUT: agentOutputPath,
+          CODEX_API_KEY: "fake-key-for-test",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
+      // Only one attempt — credit limit is non-retryable
+      expect(callCount).toBe(1);
+      // Harness exits 0: budget enforcement is intentional, not a job failure
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("AI credits budget exceeded");
+      expect(result.stderr).toContain("AI credits budget enforced");
+    });
+
+    it("exits 0 when the agent outputs ai_credits_rate_limit_error and the CLI exits non-zero", () => {
+      const tempDir = makeHarnessTempDir("codex-ai-credits-rate-limit-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      const agentOutputPath = writeTrustedAICreditsExceededAudit(tempDir);
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+process.stdout.write("error: ai_credits_rate_limit_error=true\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "do some work", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+          GH_AW_AGENT_OUTPUT: agentOutputPath,
+          CODEX_API_KEY: "fake-key-for-test",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      const callCount = fs.readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).length;
+      expect(callCount).toBe(1);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain("AI credits budget enforced");
+    });
+
+    it("keeps non-zero exit for auth failure even when AI-credit markers and trusted audit are present", () => {
+      const tempDir = makeHarnessTempDir("codex-auth-failure-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      const agentOutputPath = writeTrustedAICreditsExceededAudit(tempDir);
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+process.stdout.write("error: max_ai_credits_exceeded=true\\n");
+process.stdout.write("Authentication failed (Request ID: 123)\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "do some work", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+          GH_AW_AGENT_OUTPUT: agentOutputPath,
+          CODEX_API_KEY: "fake-key-for-test",
+          GH_AW_HARNESS_MAX_RETRIES: "0",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      // Harness exits 1: normal non-credit failures still fail the job
+      expect(result.status).toBe(1);
+      expect(result.stderr).not.toContain("AI credits budget enforced");
+    });
+
+    it("keeps non-zero exit when AI-credit marker appears without trusted firewall audit evidence", () => {
+      const tempDir = makeHarnessTempDir("codex-ai-credits-untrusted-");
+      const safeOutputsPath = path.join(tempDir, "safe-outputs.jsonl");
+      const stubPath = path.join(tempDir, "stub.cjs");
+      const promptPath = path.join(tempDir, "prompt.txt");
+      const callsPath = path.join(tempDir, "calls.jsonl");
+      fs.writeFileSync(
+        stubPath,
+        `const fs = require("fs");
+const callsPath = process.env.CODEX_HARNESS_STUB_CALLS;
+fs.appendFileSync(callsPath, JSON.stringify({args: process.argv.slice(2)}) + "\\n");
+process.stdout.write("error: max_ai_credits_exceeded=true\\n");
+process.exit(1);`,
+        "utf8"
+      );
+      fs.writeFileSync(promptPath, "do some work", "utf8");
+
+      const result = spawnSync(process.execPath, ["codex_harness.cjs", process.execPath, stubPath, "exec", "--prompt-file", promptPath], {
+        cwd: path.dirname(require.resolve("./codex_harness.cjs")),
+        env: {
+          ...process.env,
+          CODEX_HARNESS_STUB_CALLS: callsPath,
+          GH_AW_SAFE_OUTPUTS: safeOutputsPath,
+          CODEX_API_KEY: "fake-key-for-test",
+          GH_AW_HARNESS_MAX_RETRIES: "0",
+        },
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("without trusted firewall audit confirmation");
     });
   });
 });

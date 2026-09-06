@@ -22,9 +22,6 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
 concurrency:
   group: dependabot-burner
@@ -49,6 +46,7 @@ safe-outputs:
     max: 1
 timeout-minutes: 20
 imports:
+  - shared/mcp-pagination.md
   - uses: shared/daily-pr-base.md
     with:
       title-prefix: "[dependabot-burner] "
@@ -56,11 +54,12 @@ imports:
       labels: [automation, dependencies, dependabot]
       reviewers: [copilot]
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   edit:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default, pull_requests]
   bash:
     - "make dependabot && make build"
@@ -281,6 +280,16 @@ steps:
         fs.mkdirSync(path.dirname(outPath), { recursive: true });
         fs.writeFileSync(outPath, JSON.stringify(payload, null, 2) + '\n', 'utf8');
         console.log(JSON.stringify(payload, null, 2));
+evals:
+  - id: dependabot_batch_analyzed
+    question: Did the agent analyze the selected grouped Dependabot remediation batch?
+  - id: remediation_reported
+    question: Did the agent create a remediation pull request or clearly report why no remediation was needed?
+features:
+  gh-aw-detection: true
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Dependabot Burner
@@ -492,3 +501,5 @@ If no safe bounded remediation is possible, do not create a PR. End with a conci
 ## Output
 
 End with a concise summary including the selected PR numbers, retry mode, dependency batch handled, source files updated, validation commands run, result file path, and whether a replacement PR was created.
+
+Follow the `reporting` skill: use `###` (h3) or lower for any headers in the comment, and wrap long lists (e.g. source files updated, validation commands) in `<details><summary><b>...</b></summary>...</details>`.

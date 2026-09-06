@@ -4,6 +4,7 @@ emoji: "🧪"
 name: Smoke Workflow Call
 description: Reusable workflow to validate checkout from fork works correctly in workflow_call context
 on:
+  schedule: every 2 days
   workflow_call:
     inputs:
       payload:
@@ -31,6 +32,7 @@ network:
     - defaults
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   bash:
     - "git status"
@@ -52,6 +54,10 @@ safe-outputs:
 timeout-minutes: 10
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
+    id: awf
 ---
 
 # Smoke Test: Workflow Call Checkout Validation

@@ -16,9 +16,10 @@ const { replaceTemporaryIdReferences, replaceTemporaryIdReferencesInPatch, getOr
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { addExpirationToFooter } = require("./ephemerals.cjs");
 const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
-const { parseBoolTemplatable } = require("./templatable.cjs");
+const { parseBoolTemplatable, parseIntTemplatable } = require("./templatable.cjs");
 const { assembleMarkdownBodyParts } = require("./markdown_body_helpers.cjs");
 const { getBodyHeader, getDisclosureHeader } = require("./messages_header.cjs");
+const { getBodyFooterMessage } = require("./messages_footer.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { normalizeBranchName } = require("./normalize_branch_name.cjs");
 const { pushExtraEmptyCommit } = require("./extra_empty_commit.cjs");
@@ -33,10 +34,11 @@ const { renderTemplateFromFile, renderFilesList, buildProtectedFileList, getProm
 const { withGitHubHostToken } = require("./git_auth_helpers.cjs");
 const { COPILOT_REVIEWER_BOT, FAQ_CREATE_PR_PERMISSIONS_URL } = require("./constants.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
-const { normalizeCommitSHA } = require("./commit_sha_helpers.cjs");
+const { extractPatchBaseCommit } = require("./commit_sha_helpers.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
+const { createOrUpdatePullRequest } = require("./create_or_update_pull_request.cjs");
 const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
-const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits, isShallowOrSparseCheckout, linearizeRangeAsCommit } = require("./git_helpers.cjs");
+const { ensureFullHistoryForBundle, extractBundlePrerequisiteCommits, getBundlePrerequisites, isShallowOrSparseCheckout, linearizeRangeAsCommit } = require("./git_helpers.cjs");
 const { parseDiffGitHeader: parseDiffGitHeaderPaths, extractDiffGitHeaderEntries } = require("./patch_path_helpers.cjs");
 const { resolveTransportPaths } = require("./resolve_transport_paths.cjs");
 const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
@@ -58,7 +60,12 @@ const {
   buildManifestProtectionCreatePrUrl,
   renderManifestProtectionFallbackBody,
   buildPushErrorSection,
+  buildManualBranchRecoveryCommands,
+  shellQuote,
 } = require("./create_pull_request_helpers.cjs");
+const { isStackedEnabled, parseStackMetadata, hasCircularStackDependency, buildStackMetadataLines, stackedDisabledError, circularStackError, verifyStackBaseBranchExists, createStackTracker } = require("./stacked_pull_requests.cjs");
+
+const MAX_GITHUB_BODY_LENGTH = 65536;
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -174,6 +181,40 @@ async function tryRecoverGitAmAddAddConflict(execApi) {
   } catch (recoveryError) {
     core.debug(`Add/add recovery threw: ${getErrorMessage(recoveryError)}`);
     return { recovered: false, attempted: true, errorMessage: getErrorMessage(recoveryError) };
+  }
+}
+
+/**
+ * Resolves auto-merge enablement and merge method from the handler config.
+ *
+ * Supported values:
+ *   - false / "false" / empty => disabled
+ *   - true / "true"  => enabled with SQUASH as the default merge strategy
+ *   - "squash" | "merge" | "rebase" => enabled with explicit strategy
+ *   - any other value => disabled with a warning (fail-closed)
+ *
+ * @param {any} value
+ * @returns {{ enabled: boolean, mergeMethod?: "SQUASH" | "MERGE" | "REBASE" }}
+ */
+function parseAutoMergeConfig(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (!normalized || normalized === "false") {
+    return { enabled: false };
+  }
+
+  switch (normalized) {
+    case "squash":
+    case "true":
+      return { enabled: true, mergeMethod: "SQUASH" };
+    case "merge":
+      return { enabled: true, mergeMethod: "MERGE" };
+    case "rebase":
+      return { enabled: true, mergeMethod: "REBASE" };
+    default:
+      core.warning(`Unrecognized auto-merge value "${value}". Expected true, false, "squash", "merge", or "rebase". Auto-merge will be disabled.`);
+      return { enabled: false };
   }
 }
 
@@ -322,15 +363,55 @@ async function applyBundleToBranch(bundleFilePath, branchName, originalAgentBran
 }
 
 /**
- * Rewrites the current branch to a single non-merge commit relative to origin/<baseBranch>.
- * This is used as a recovery path when signed commit replay rejects merge commit topology.
+ * Rewrites the current branch to a single non-merge commit relative to the bundle's
+ * actual base commit (the prerequisite SHA recorded in the bundle). Falls back to
+ * origin/<baseBranch> when the bundle prerequisite cannot be determined.
+ *
+ * Using the bundle's prerequisite SHA instead of the current origin/<baseBranch> tip
+ * ensures the linearized commit only contains the agent's actual changes and does not
+ * revert or absorb commits that were added to the base branch after the agent's checkout.
  *
  * @param {string} baseBranch
  * @param {{ exec: Function, getExecOutput: Function }} execApi
+ * @param {string} [bundleFilePath] - Optional path to the bundle file; used to extract the
+ *   precise base commit the agent worked from.
+ * @param {{ excludedFiles?: string[] }} [options]
  * @returns {Promise<void>}
  */
-async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi) {
-  const baseRef = `origin/${baseBranch}`;
+async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi, bundleFilePath, options = {}) {
+  const fallbackBaseRef = `origin/${baseBranch}`;
+  let baseRef = fallbackBaseRef;
+
+  if (bundleFilePath) {
+    try {
+      const prereqs = await getBundlePrerequisites(execApi, bundleFilePath);
+      if (prereqs.length === 1) {
+        // Guard: verify the prerequisite SHA is accessible in the local repository
+        // before using it as a linearization base. In a shallow clone the commit
+        // may not have been fetched, causing `git reset --soft <sha>` to fail.
+        // We check reachability here — before synthesizing any commit — so we can
+        // fall back cleanly rather than letting linearizeRangeAsCommit abort mid-run.
+        const prereqSha = prereqs[0];
+        try {
+          const { exitCode } = await execApi.getExecOutput("git", ["cat-file", "-e", `${prereqSha}^{commit}`], { ignoreReturnCode: true, silent: true });
+          if (exitCode === 0) {
+            baseRef = prereqSha;
+            core.info(`Using bundle prerequisite commit ${baseRef} as linearization base (avoids including base-branch drift)`);
+          } else {
+            core.info(`Bundle prerequisite ${prereqSha} not accessible locally; falling back to ${fallbackBaseRef} as linearization base`);
+          }
+        } catch {
+          core.info(`Could not verify bundle prerequisite accessibility; falling back to ${fallbackBaseRef} as linearization base`);
+        }
+      } else if (prereqs.length > 1) {
+        core.info(`Bundle has ${prereqs.length} prerequisite commits; falling back to ${fallbackBaseRef} as linearization base`);
+      } else {
+        core.info(`Bundle declares no prerequisites; falling back to ${fallbackBaseRef} as linearization base`);
+      }
+    } catch (prereqError) {
+      core.warning(`Could not extract bundle prerequisites: ${getErrorMessage(prereqError)}; falling back to ${fallbackBaseRef}`);
+    }
+  }
 
   let commitHeadline = "Apply bundled create_pull_request changes";
   try {
@@ -343,7 +424,10 @@ async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi) {
   }
 
   core.warning(`Rewriting bundled commits to a single linear commit for signed push compatibility (base: ${baseRef})`);
-  const newHead = await linearizeRangeAsCommit(baseRef, commitHeadline, execApi);
+  const newHead = await linearizeRangeAsCommit(baseRef, commitHeadline, execApi, {
+    excludedFiles: options.excludedFiles,
+    rebaseOnto: fallbackBaseRef,
+  });
   core.info(`Bundle rewrite completed (new HEAD: ${newHead})`);
 }
 
@@ -368,6 +452,10 @@ async function rewriteBundleBranchAsSingleCommit(baseBranch, execApi) {
  * @returns {Promise<{data: any, issueRepoParts: {owner: string, repo: string}}>}
  */
 async function createFallbackIssue(githubClient, repoParts, title, body, labels, assignees) {
+  if (body.length > MAX_GITHUB_BODY_LENGTH) {
+    throw new Error(`Fallback issue body exceeds GitHub's maximum length of ${MAX_GITHUB_BODY_LENGTH} characters`);
+  }
+
   const payload = {
     owner: repoParts.owner,
     repo: repoParts.repo,
@@ -637,7 +725,7 @@ async function handleRemoteBranchCollision(branchName, preserveBranchName, optio
         core.warning(`Remote branch "${branchName}" cannot be deleted due to branch protection rules (recreate-ref blocked). ` + `Falling back to rename with random suffix.`);
         deleteBlocked = true;
       } else {
-        throw new Error(`Failed to delete existing remote branch "${branchName}" for reuse with recreate-ref: ${message || String(err)}`, { cause: err });
+        throw new Error(`Failed to delete existing remote branch "${branchName}" for reuse with recreate-ref: ${message || getErrorMessage(err)}`, { cause: err });
       }
     }
     if (!deleteBlocked) {
@@ -684,7 +772,7 @@ async function main(config = {}) {
   const draftDefault = parseBoolTemplatable(config.draft, true);
   const ifNoChanges = config.if_no_changes || "warn";
   const allowEmpty = parseBoolTemplatable(config.allow_empty, false);
-  const autoMerge = parseBoolTemplatable(config.auto_merge, false);
+  const { enabled: autoMerge, mergeMethod: autoMergeMethod } = parseAutoMergeConfig(config.auto_merge);
   const preserveBranchName = config.preserve_branch_name === true;
   const recreateRef = config.recreate_ref === true;
   const signedCommits = config.signed_commits !== false;
@@ -694,7 +782,14 @@ async function main(config = {}) {
   const maxFiles = parsePositiveInteger(config.max_patch_files) ?? MAX_FILES;
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const allowedBaseBranches = parseAllowedBaseBranches(config.allowed_base_branches);
+  // Stacked pull requests (a pull request whose base branch is another pull request branch) are
+  // enabled by default. They can be disabled with `stacked: false` for GitHub Enterprise Server
+  // and other instances that do not support the feature.
+  const stackedPullRequestsEnabled = isStackedEnabled(config);
+  // Tracks the pull requests created so far in this run so later messages can stack on top of them.
+  const stackTracker = createStackTracker();
   const githubClient = await createAuthenticatedGitHubClient(config);
+  const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
   let allowedMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
     allowedMentionAliases = config.allowedMentionAliases;
@@ -812,6 +907,9 @@ async function main(config = {}) {
   }
   if (allowedBaseBranches.size > 0) {
     core.info(`Allowed base branches: ${Array.from(allowedBaseBranches).join(", ")}`);
+  }
+  if (!stackedPullRequestsEnabled) {
+    core.info("Stacked pull requests are disabled (stacked: false)");
   }
   if (envLabels.length > 0) {
     core.info(`Default labels: ${envLabels.join(", ")}`);
@@ -947,10 +1045,18 @@ async function main(config = {}) {
     // is not available in GitHub Actions expressions and requires an API call
     // NOTE: Must be resolved before checkout so cross-repo checkout uses the correct branch
     let baseBranch = configBaseBranch || (await getBaseBranch(repoParts));
+    const defaultBaseBranch = baseBranch;
+
+    // Stacked pull request metadata declared by the agent (position/root/dependencies).
+    const stackMetadata = parseStackMetadata(pullRequestItem);
+    // Pull request created earlier in this run that this pull request stacks on top of.
+    /** @type {import("./stacked_pull_requests.cjs").StackEntry | null} */
+    let stackBaseEntry = null;
 
     // Optional agent-provided base branch override.
     // The default base branch is always implicitly allowed even without allowed_base_branches.
-    // Overriding to a different branch requires allowed_base_branches to be configured.
+    // Overriding to a different branch requires allowed_base_branches to be configured, unless the
+    // base branch belongs to a pull request created earlier in this same run (a stacked pull request).
     if (typeof pullRequestItem.base === "string" && pullRequestItem.base.trim() !== "") {
       const requestedBaseBranchRaw = pullRequestItem.base.trim();
       const requestedBaseBranchForLog = JSON.stringify(requestedBaseBranchRaw);
@@ -960,42 +1066,63 @@ async function main(config = {}) {
         // this is a no-op, not a true override, so no allowlist check is needed.
         core.info(`Base branch ${requestedBaseBranchForLog} matches the default base branch, no override needed`);
       } else {
-        if (allowedBaseBranches.size === 0) {
+        // A base branch that differs from the default base branch creates a stacked pull request.
+        const isStackedRequest = requestedBaseBranchRaw !== defaultBaseBranch;
+        if (isStackedRequest && !stackedPullRequestsEnabled) {
+          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: stacked pull requests are disabled`);
+          return { success: false, error: stackedDisabledError(requestedBaseBranchRaw, defaultBaseBranch) };
+        }
+
+        // Branch created by an earlier pull request in this run: the branch name may have been
+        // salted/prefixed, so resolve it to the branch that was actually pushed. No allowlist check
+        // is required because the branch was created by this same run.
+        const previousStackEntry = stackTracker.get(requestedBaseBranchRaw, itemRepo);
+        if (isStackedRequest && previousStackEntry) {
+          stackBaseEntry = previousStackEntry;
+          baseBranch = previousStackEntry.branch;
+          core.info(`Stacking on pull request #${previousStackEntry.number} (base branch ${baseBranch})`);
+        } else if (allowedBaseBranches.size === 0) {
           core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: allowed-base-branches is not configured`);
           return {
             success: false,
             error: "Base branch override is not allowed. Configure safe-outputs.create-pull-request.allowed-base-branches to allow per-run base overrides.",
           };
-        }
+        } else {
+          const requestedBaseBranch = normalizeBranchName(requestedBaseBranchRaw);
+          if (!requestedBaseBranch) {
+            core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitization resulted in empty branch name`);
+            return {
+              success: false,
+              error: `Invalid base branch override: sanitization resulted in empty string (original: "${requestedBaseBranchRaw}")`,
+            };
+          }
+          if (requestedBaseBranchRaw !== requestedBaseBranch) {
+            core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitized value '${requestedBaseBranch}' does not match original`);
+            return {
+              success: false,
+              error: `Invalid base branch override: contains invalid characters (original: "${requestedBaseBranchRaw}", normalized: "${requestedBaseBranch}")`,
+            };
+          }
+          const requestedBaseBranchSafeForLog = JSON.stringify(requestedBaseBranch);
+          if (!isBaseBranchAllowed(requestedBaseBranch, allowedBaseBranches)) {
+            core.warning(`Rejecting base branch override ${requestedBaseBranchSafeForLog}: does not match allowed patterns (${Array.from(allowedBaseBranches).join(", ")})`);
+            return {
+              success: false,
+              error: `Base branch override '${requestedBaseBranch}' is not allowed. Allowed patterns: ${Array.from(allowedBaseBranches).join(", ")}`,
+            };
+          }
 
-        const requestedBaseBranch = normalizeBranchName(requestedBaseBranchRaw);
-        if (!requestedBaseBranch) {
-          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitization resulted in empty branch name`);
-          return {
-            success: false,
-            error: `Invalid base branch override: sanitization resulted in empty string (original: "${requestedBaseBranchRaw}")`,
-          };
+          core.info(`Base branch override accepted: ${requestedBaseBranchSafeForLog}`);
+          baseBranch = requestedBaseBranch;
+          core.info(`Using agent-provided base branch override: ${baseBranch}`);
         }
-        if (requestedBaseBranchRaw !== requestedBaseBranch) {
-          core.warning(`Rejecting base branch override ${requestedBaseBranchForLog}: sanitized value '${requestedBaseBranch}' does not match original`);
-          return {
-            success: false,
-            error: `Invalid base branch override: contains invalid characters (original: "${requestedBaseBranchRaw}", normalized: "${requestedBaseBranch}")`,
-          };
-        }
-        const requestedBaseBranchSafeForLog = JSON.stringify(requestedBaseBranch);
-        if (!isBaseBranchAllowed(requestedBaseBranch, allowedBaseBranches)) {
-          core.warning(`Rejecting base branch override ${requestedBaseBranchSafeForLog}: does not match allowed patterns (${Array.from(allowedBaseBranches).join(", ")})`);
-          return {
-            success: false,
-            error: `Base branch override '${requestedBaseBranch}' is not allowed. Allowed patterns: ${Array.from(allowedBaseBranches).join(", ")}`,
-          };
-        }
-
-        core.info(`Base branch override accepted: ${requestedBaseBranchSafeForLog}`);
-        baseBranch = requestedBaseBranch;
-        core.info(`Using agent-provided base branch override: ${baseBranch}`);
       }
+    }
+
+    // A pull request is stacked when its effective base branch is not the default base branch.
+    const isStackedPullRequest = baseBranch !== defaultBaseBranch;
+    if (isStackedPullRequest) {
+      core.info(`Stacked pull request detected: base branch ${baseBranch} differs from default base branch ${defaultBaseBranch}`);
     }
 
     // Multi-repo support: Switch to the correct working directory for the target repo.
@@ -1086,6 +1213,16 @@ async function main(config = {}) {
       }
       core.info(`Base branch for ${itemRepo}: ${baseBranch}`);
 
+      // Stacked pull requests target a branch that must already exist. Verify it before doing any
+      // work so the failure is reported with actionable guidance instead of an opaque API error.
+      // Branches created earlier in this run are known to exist and are not re-checked.
+      if (isStackedPullRequest && !stackBaseEntry) {
+        const baseBranchCheck = await verifyStackBaseBranchExists(githubClient, repoParts, baseBranch, itemRepo, defaultBaseBranch);
+        if (!baseBranchCheck.success) {
+          return baseBranchCheck;
+        }
+      }
+
       // Check if patch file exists and has valid content.
       // Always require patch content for policy enforcement, even when bundle transport
       // is used for apply-time commit transport.
@@ -1138,7 +1275,7 @@ async function main(config = {}) {
         try {
           patchContent = fs.readFileSync(patchFilePath, "utf8");
         } catch (err) {
-          throw new Error(`Failed to read file ${patchFilePath}: ${String(err)}`, { cause: err });
+          throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
         }
         isEmpty = !patchContent || !patchContent.trim();
       }
@@ -1341,7 +1478,7 @@ async function main(config = {}) {
           try {
             patchStats = fs.readFileSync(patchFilePath, "utf8");
           } catch (err) {
-            throw new Error(`Failed to read file ${patchFilePath}: ${String(err)}`, { cause: err });
+            throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
           }
           if (patchStats.trim()) {
             summaryContent += `**Changes:** Patch file exists with ${patchStats.split("\n").length} lines\n\n`;
@@ -1375,7 +1512,7 @@ async function main(config = {}) {
       processedBody = removeDuplicateTitleFromDescription(title, processedBody);
 
       // Sanitize body content to neutralize @mentions, URLs, and other security risks
-      processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases });
+      processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases, maxMentions });
 
       // Auto-add "Fixes #N" closing keyword if triggered from an issue and not already present.
       // This ensures the triggering issue is auto-closed when the PR is merged.
@@ -1484,6 +1621,26 @@ async function main(config = {}) {
         bodyLines.push(trackerIDComment);
       }
 
+      // Stacked pull request metadata: record the stack relationship in the body so reviewers can
+      // see how the pull requests relate. Metadata declared by the agent is preserved even when
+      // stacked pull requests are disabled (the pull request then simply targets the default base).
+      const stackDependencyBranches = [...stackMetadata.dependencies];
+      if (stackBaseEntry && !stackDependencyBranches.includes(stackBaseEntry.branch)) {
+        stackDependencyBranches.unshift(stackBaseEntry.branch);
+      }
+      const dependsOnPullRequests = stackTracker.resolveDependencies(stackDependencyBranches, itemRepo);
+      const stackMetadataLines = buildStackMetadataLines({
+        base: isStackedPullRequest ? baseBranch : null,
+        position: stackMetadata.position,
+        root: stackMetadata.root,
+        dependencies: stackDependencyBranches,
+        dependsOnPullRequests,
+      });
+      if (stackMetadataLines.length > 0) {
+        bodyLines.push("", ...stackMetadataLines);
+        core.info(`Added stacked pull request metadata to body: ${stackMetadataLines.join(" ")}`);
+      }
+
       // Snapshot the body content (without footer) for use in protected-files fallback ordering.
       // The protected-files section must appear before the footer (including guard notices such as
       // the integrity-filtering note) so that the footer always comes last in the issue body.
@@ -1519,8 +1676,15 @@ async function main(config = {}) {
         if (expiresHours > 0) {
           footer += "\n\n<!-- gh-aw-expires-type: pull-request -->";
         }
-        bodyLines.push(``, ``, footer);
+        bodyLines.push(``, footer);
         footerParts.push(footer);
+      }
+
+      const bodyFooter = getBodyFooterMessage(config.body_footer, { workflowName, runUrl });
+      if (bodyFooter) {
+        const renderedBodyFooter = bodyFooter.trimEnd();
+        bodyLines.push(``, renderedBodyFooter);
+        footerParts.push(renderedBodyFooter);
       }
 
       // Add standalone workflow-id marker for searchability (consistent with comments)
@@ -1551,6 +1715,9 @@ async function main(config = {}) {
       const issueSafeBody = neutralizeClosingKeywordsForIssueBody(body);
       // Footer section (footer + workflow-id marker) used when ordering protected-files notices
       const footerContent = footerParts.join("\n\n");
+      const issueSafeFooterContent = neutralizeClosingKeywordsForIssueBody(footerContent);
+      const hiddenFallbackMetadata = [callerWorkflowId && generateWorkflowCallIdMarker(callerWorkflowId), closeOlderKey && generateCloseKeyMarker(closeOlderKey)].filter(Boolean).join("\n");
+      const issueSafeFallbackFooter = [issueSafeFooterContent, hiddenFallbackMetadata].filter(Boolean).join("\n");
 
       // Build labels array - merge config labels with message labels
       let labels = [...envLabels];
@@ -1597,6 +1764,15 @@ async function main(config = {}) {
 
       core.info(`Generated branch name: ${branchName}`);
       core.info(`Base branch: ${baseBranch}`);
+
+      // Reject stacks that would depend on themselves: the requested base (or one of its ancestors
+      // in this run) is the branch of the pull request being created.
+      const stackBranchAliases = [branchName, originalAgentBranch];
+      if (hasCircularStackDependency(stackBranchAliases, baseBranch, stackTracker.parents) || stackMetadata.dependencies.some(dependency => stackBranchAliases.includes(dependency))) {
+        const error = circularStackError(branchName, baseBranch);
+        core.warning(error);
+        return { success: false, error };
+      }
 
       // Create a new branch using git CLI, ensuring it's based on the correct base branch
 
@@ -1678,7 +1854,9 @@ async function main(config = {}) {
             if (isSignedMergeReplayRefusal) {
               core.warning("Signed push rejected merge commit topology from bundle; rewriting branch and retrying signed push");
               try {
-                await rewriteBundleBranchAsSingleCommit(baseBranch, exec);
+                await rewriteBundleBranchAsSingleCommit(baseBranch, exec, bundleFilePath, {
+                  excludedFiles: Array.isArray(config.excluded_files) ? config.excluded_files : [],
+                });
                 const runRetryPush = async () =>
                   pushSignedCommits({
                     githubClient: pushGithubClient,
@@ -1730,13 +1908,19 @@ async function main(config = {}) {
                 const runId = context.runId;
 
                 const artifactFileName = bundleFilePath ? bundleFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.bundle";
-                const fallbackBundleSourceRef = `refs/heads/${originalAgentBranch || branchName}`;
-                const fallbackBundleTempRef = createBundleTempRef(branchName);
-                const pushFailureMessage = sanitizeContent(neutralizeClosingKeywordsForIssueBody(getErrorMessage(pushError)), { allowedAliases: allowedMentionAliases })
+                const recoveryInstructions = buildManualBranchRecoveryCommands({
+                  hasBundleFile: true,
+                  runId,
+                  artifactFileName,
+                  branchName,
+                  baseBranch,
+                  tempRef: createBundleTempRef(branchName),
+                });
+                const pushFailureMessage = sanitizeContent(neutralizeClosingKeywordsForIssueBody(getErrorMessage(pushError)), { allowedAliases: allowedMentionAliases, maxMentions })
                   .replace(/\s+/g, " ")
                   .trim();
                 const pushErrorSection = buildPushErrorSection(getErrorMessage(pushError), pushFailureMessage);
-                const fallbackBody = `${issueSafeBody}
+                const fallbackBody = `${issueSafeMainBodyContent}
 
 ---
 
@@ -1749,27 +1933,22 @@ ${pushErrorSection}
 >
 > The bundle file is available in the \`agent\` artifact in the workflow run linked above.
 
-To create a pull request with the changes:
+<details>
+<summary>Create the pull request manually</summary>
 
 \`\`\`sh
-# Download the artifact from the workflow run
-gh run download ${runId} -n agent -D /tmp/agent-${runId}
+${recoveryInstructions}
 
-# Fetch the bundle into a temporary ref, then update the local branch
-git fetch /tmp/agent-${runId}/${artifactFileName} ${fallbackBundleSourceRef}:${fallbackBundleTempRef}
-git update-ref refs/heads/${branchName} ${fallbackBundleTempRef}
-git checkout ${branchName}
-# Ensure the working tree matches the updated branch
-git reset --hard
-# Remove the temporary bundle ref
-git update-ref -d ${fallbackBundleTempRef}
-
-# Push the branch to origin
-git push ${pushRemoteUrl || "origin"} ${branchName}
+# Push the branch to the target remote
+git push ${shellQuote(pushRemoteUrl || "origin")} ${shellQuote(branchName)}
 
 # Create the pull request
-gh pr create --title '${title}' --base ${baseBranch} --head ${getPullRequestHeadRef(branchName)} --repo ${repoParts.owner}/${repoParts.repo}
-\`\`\``;
+gh pr create --title ${shellQuote(title)} --base ${shellQuote(baseBranch)} --head ${shellQuote(getPullRequestHeadRef(branchName))} --repo ${shellQuote(`${repoParts.owner}/${repoParts.repo}`)}
+\`\`\`
+
+</details>
+
+${issueSafeFallbackFooter}`;
 
                 try {
                   const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
@@ -1804,10 +1983,10 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${getPullRequestHead
 
         // Handle branch creation/checkout
         let branchBaseRef = baseBranch;
-        const recordedBaseCommit = normalizeCommitSHA(pullRequestItem.base_commit);
+        const recordedBaseCommit = extractPatchBaseCommit(patchContent);
         if (recordedBaseCommit) {
           core.info(`Patch route base_commit resolved: ${recordedBaseCommit}`);
-          core.info(`Using base_commit from safe output entry for patch apply: ${recordedBaseCommit}`);
+          core.info(`Using base_commit embedded in the patch for patch apply: ${recordedBaseCommit}`);
           try {
             try {
               await exec.exec("git", ["fetch", "origin", recordedBaseCommit, "--depth=1"]);
@@ -1823,8 +2002,6 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${getPullRequestHead
           } catch (baseCommitError) {
             core.warning(`Recorded base_commit ${recordedBaseCommit} is not available in this checkout (${getErrorMessage(baseCommitError)}); falling back to ${baseBranch}`);
           }
-        } else if (String(pullRequestItem.base_commit ?? "").trim()) {
-          core.warning(`Ignoring invalid base_commit value for patch apply: ${String(pullRequestItem.base_commit).trim()}`);
         }
         core.info(`Branch should not exist locally, creating new branch from base: ${branchName} (${branchBaseRef})`);
         await exec.exec("git", ["checkout", "-b", branchName, branchBaseRef]);
@@ -1853,7 +2030,7 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${getPullRequestHead
               try {
                 fs.writeFileSync(patchFilePath, patchContent, "utf8");
               } catch (err) {
-                throw new Error(`Failed to write file ${patchFilePath}: ${String(err)}`, { cause: err });
+                throw new Error(`Failed to write file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
               }
             }
           }
@@ -1919,9 +2096,9 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${getPullRequestHead
                 // Use the base commit recorded at patch generation time.
                 // The From <sha> header in format-patch output contains the agent's new commit SHA
                 // which does not exist in this checkout, so we cannot derive the base from it.
-                const originalBaseCommit = normalizeCommitSHA(pullRequestItem.base_commit);
+                const originalBaseCommit = extractPatchBaseCommit(patchContent);
                 if (!originalBaseCommit) {
-                  core.warning("No base_commit recorded in safe output entry - fallback not possible");
+                  core.warning("No base_commit embedded in patch - fallback not possible");
                 } else {
                   core.info(`Original base commit from patch generation: ${originalBaseCommit}`);
 
@@ -2097,17 +2274,24 @@ gh pr create --title '${title}' --base ${baseBranch} --head ${getPullRequestHead
                   try {
                     patchContent = fs.readFileSync(patchFilePath, "utf8");
                   } catch (err) {
-                    throw new Error(`Failed to read file ${patchFilePath}: ${String(err)}`, { cause: err });
+                    throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
                   }
                   patchPreview = generatePatchPreview(patchContent);
                 }
 
                 const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
-                const pushFailureMessage = sanitizeContent(neutralizeClosingKeywordsForIssueBody(getErrorMessage(pushError)), { allowedAliases: allowedMentionAliases })
+                const recoveryInstructions = buildManualBranchRecoveryCommands({
+                  hasBundleFile: false,
+                  runId,
+                  artifactFileName: patchFileName,
+                  branchName,
+                  baseBranch,
+                });
+                const pushFailureMessage = sanitizeContent(neutralizeClosingKeywordsForIssueBody(getErrorMessage(pushError)), { allowedAliases: allowedMentionAliases, maxMentions })
                   .replace(/\s+/g, " ")
                   .trim();
                 const pushErrorSection = buildPushErrorSection(getErrorMessage(pushError), pushFailureMessage);
-                const fallbackBody = `${issueSafeBody}
+                const fallbackBody = `${issueSafeMainBodyContent}
 
 ---
 
@@ -2120,25 +2304,23 @@ ${pushErrorSection}
 >
 > The patch file is available in the \`agent\` artifact in the workflow run linked above.
 
-To create a pull request with the changes:
+<details>
+<summary>Create the pull request manually</summary>
 
 \`\`\`sh
-# Download the artifact from the workflow run
-gh run download ${runId} -n agent -D /tmp/agent-${runId}
+${recoveryInstructions}
 
-# Create a new branch
-git checkout -b ${branchName}
-
-# Apply the patch (--3way handles cross-repo patches where files may already exist)
-git am --3way /tmp/agent-${runId}/${patchFileName}
-
-# Push the branch to origin
-git push ${pushRemoteUrl || "origin"} ${branchName}
+# Push the branch to the target remote
+git push ${shellQuote(pushRemoteUrl || "origin")} ${shellQuote(branchName)}
 
 # Create the pull request
-gh pr create --title '${title}' --base ${baseBranch} --head ${getPullRequestHeadRef(branchName)} --repo ${repoParts.owner}/${repoParts.repo}
+gh pr create --title ${shellQuote(title)} --base ${shellQuote(baseBranch)} --head ${shellQuote(getPullRequestHeadRef(branchName))} --repo ${shellQuote(`${repoParts.owner}/${repoParts.repo}`)}
 \`\`\`
-${patchPreview}`;
+
+</details>
+${patchPreview}
+
+${issueSafeFallbackFooter}`;
 
                 try {
                   const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
@@ -2286,25 +2468,33 @@ ${patchPreview}`;
         let fallbackBody;
         if (manifestProtectionPushFailedError) {
           // Push failed — branch not on remote, so compare URL is unavailable.
-          // Use the push-failed template with artifact download instructions.
+          // Use the push-failed template with artifact download instructions, matching
+          // whichever transport (bundle or format-patch) was actually used to encode the changes.
           const runId = context.runId;
-          const patchFileName = patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
+          const artifactFileName = hasBundleFile ? bundleFilePath.replace("/tmp/gh-aw/", "") : patchFilePath ? patchFilePath.replace("/tmp/gh-aw/", "") : "aw-unknown.patch";
+          const applyInstructions = buildManualBranchRecoveryCommands({
+            hasBundleFile,
+            runId,
+            artifactFileName,
+            branchName,
+            baseBranch,
+            tempRef: createBundleTempRef(branchName),
+          });
           const pushFailedTemplatePath = getPromptPath("manifest_protection_push_failed_fallback.md");
           fallbackBody = renderTemplateFromFile(pushFailedTemplatePath, {
             main_body: issueSafeMainBodyContent,
-            footer: footerContent,
+            footer: issueSafeFooterContent,
             files: fileList,
-            run_id: String(runId),
+            apply_instructions: applyInstructions,
             branch_name: branchName,
             base_branch: baseBranch,
-            patch_file: patchFileName,
             title,
             repo: `${repoParts.owner}/${repoParts.repo}`,
           });
         } else {
           // Normal case — push succeeded, provide compare URL.
           const createPrUrl = buildManifestProtectionCreatePrUrl(githubServer, repoParts, baseBranch, branchName, title, undefined, getPullRequestHeadRef(branchName));
-          fallbackBody = renderManifestProtectionFallbackBody(issueSafeMainBodyContent, footerContent, fileList, createPrUrl);
+          fallbackBody = renderManifestProtectionFallbackBody(issueSafeMainBodyContent, issueSafeFooterContent, fileList, createPrUrl);
         }
 
         try {
@@ -2315,7 +2505,7 @@ ${patchPreview}`;
           if (!manifestProtectionPushFailedError) {
             try {
               const createPrUrl = buildManifestProtectionCreatePrUrl(githubServer, repoParts, baseBranch, branchName, title, issue.number, getPullRequestHeadRef(branchName));
-              const fallbackBodyWithCloseKeyword = renderManifestProtectionFallbackBody(issueSafeMainBodyContent, footerContent, fileList, createPrUrl);
+              const fallbackBodyWithCloseKeyword = renderManifestProtectionFallbackBody(issueSafeMainBodyContent, issueSafeFooterContent, fileList, createPrUrl);
 
               await withRetry(
                 () =>
@@ -2355,22 +2545,24 @@ ${patchPreview}`;
 
       // Try to create the pull request, with fallback to issue creation
       try {
-        const { data: pullRequest } = await withRetry(
-          () =>
-            githubClient.rest.pulls.create({
-              owner: repoParts.owner,
-              repo: repoParts.repo,
-              title: title,
-              body: body,
-              head: getPullRequestHeadRef(branchName),
-              base: baseBranch,
-              draft: draft,
-            }),
-          RATE_LIMIT_RETRY_CONFIG,
-          `create pull request in ${repoParts.owner}/${repoParts.repo}`
-        );
+        if (body.length > MAX_GITHUB_BODY_LENGTH) {
+          throw new Error(`Pull request body exceeds GitHub's maximum length of ${MAX_GITHUB_BODY_LENGTH} characters`);
+        }
+        const { data: pullRequest } = await createOrUpdatePullRequest({
+          githubClient,
+          repoParts,
+          title,
+          body,
+          branchName: getPullRequestHeadRef(branchName),
+          baseBranch,
+          draft,
+        });
 
         core.info(`Created pull request #${pullRequest.number}: ${pullRequest.html_url}`);
+
+        // Record this pull request so later messages in the same run can stack on top of it.
+        // Both the agent-provided branch name and the effective (prefixed/salted) name are keys.
+        stackTracker.record({ branch: branchName, number: pullRequest.number, url: pullRequest.html_url, repo: itemRepo }, { agentBranch: originalAgentBranch, baseBranch });
 
         // Add labels if specified
         if (labels.length > 0) {
@@ -2517,8 +2709,8 @@ ${patchPreview}`;
         if (autoMerge) {
           try {
             await githubClient.graphql(
-              `mutation($prId: ID!) {
-              enablePullRequestAutoMerge(input: {pullRequestId: $prId}) {
+              `mutation($prId: ID!, $mergeMethod: PullRequestMergeMethod) {
+              enablePullRequestAutoMerge(input: {pullRequestId: $prId, mergeMethod: $mergeMethod}) {
                 pullRequest {
                   id
                 }
@@ -2526,6 +2718,7 @@ ${patchPreview}`;
             }`,
               {
                 prId: pullRequest.node_id,
+                mergeMethod: autoMergeMethod,
               }
             );
             core.info(`Enabled auto-merge for pull request #${pullRequest.number}`);
@@ -2619,14 +2812,15 @@ ${patchPreview}`;
             try {
               patchContent = fs.readFileSync(patchFilePath, "utf8");
             } catch (err) {
-              throw new Error(`Failed to read file ${patchFilePath}: ${String(err)}`, { cause: err });
+              throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
             }
             patchPreview = generatePatchPreview(patchContent);
           }
 
           const fallbackTemplatePath = getPromptPath("pr_permission_denied_fallback.md");
           const fallbackBody = renderTemplateFromFile(fallbackTemplatePath, {
-            body: issueSafeBody,
+            body: issueSafeMainBodyContent,
+            footer: issueSafeFallbackFooter,
             branch_name: branchName,
             create_pr_url: createPrUrl,
             faq_url: FAQ_CREATE_PR_PERMISSIONS_URL,
@@ -2684,12 +2878,12 @@ ${patchPreview}`;
           try {
             patchContent = fs.readFileSync(patchFilePath, "utf8");
           } catch (err) {
-            throw new Error(`Failed to read file ${patchFilePath}: ${String(err)}`, { cause: err });
+            throw new Error(`Failed to read file ${patchFilePath}: ${getErrorMessage(err)}`, { cause: err });
           }
           patchPreview = generatePatchPreview(patchContent);
         }
 
-        const fallbackBody = `${issueSafeBody}
+        const fallbackBody = `${issueSafeMainBodyContent}
 
 ---
 
@@ -2703,7 +2897,9 @@ To create the pull request manually:
 \`\`\`sh
 gh pr create --title "${title}" --base ${baseBranch} --head ${getPullRequestHeadRef(branchName)} --repo ${repoParts.owner}/${repoParts.repo}
 \`\`\`
-${patchPreview}`;
+${patchPreview}
+
+${issueSafeFallbackFooter}`;
 
         try {
           const { data: issue, issueRepoParts } = await createFallbackIssue(githubClient, repoParts, title, fallbackBody, mergeFallbackIssueLabels(effectiveFallbackLabels), configAssignees);
@@ -2744,4 +2940,12 @@ ${patchPreview}`;
   }; // End of handleCreatePullRequest
 } // End of main
 
-module.exports = { main, enforcePullRequestLimits, countUniquePatchFiles, parseDiffGitHeader, applyBundleToBranch };
+module.exports = {
+  main,
+  enforcePullRequestLimits,
+  countUniquePatchFiles,
+  parseDiffGitHeader,
+  applyBundleToBranch,
+  rewriteBundleBranchAsSingleCommit,
+  parseAutoMergeConfig,
+};

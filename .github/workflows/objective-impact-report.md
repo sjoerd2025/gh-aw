@@ -10,9 +10,6 @@ permissions:
   actions: read
   issues: read
 
-sandbox:
-  agent:
-    sudo: false
 
 cache:
   - key: objective-impact-report-cache-${{ github.run_id }}
@@ -223,14 +220,11 @@ safe-outputs:
   create-issue:
     title-prefix: "Impact Efficiency Report - "
     max: 1
+imports:
+  - shared/reporting.md
 ---
 
 ### Impact Efficiency Report
-
-**Report Formatting**: Use h3 (###) or lower for all headers in your report
-to maintain proper document hierarchy. Wrap long sections in
-`<details><summary>View Full Details</summary>` tags to improve readability.
-
 
 #### Required Inputs (already precomputed)
 
@@ -393,6 +387,12 @@ Create one issue titled:
 ```text
 Impact Efficiency Report - YYYY-MM-DD
 ```
+
+Format the report for progressive disclosure:
+
+- Begin with the compact `### Executive Summary` and keep the key takeaway, critical findings, and recommendations visible.
+- Use `###` headings for report sections and `####` headings for subsections.
+- Wrap verbose tables, long lists, or extended analysis in `<details><summary><b>View full findings</b></summary>` blocks.
 
 The report must include:
 

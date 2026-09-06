@@ -37,6 +37,7 @@ var runtimeFeaturesBuiltInJobNames = map[string]struct{}{
 	pushEvalsStateJobName:                       {},
 	pushRepoMemoryJobName:                       {},
 	updateCacheMemoryJobName:                    {},
+	updateDriveMemoryJobName:                    {},
 }
 
 // Job represents a GitHub Actions job with all its properties
@@ -201,11 +202,20 @@ func (jm *JobManager) WriteJobsYAML(b *strings.Builder) {
 
 	// jobOrder is kept sorted alphabetically by AddJob
 	for _, jobName := range jm.jobOrder {
-		jm.renderJobTo(b, jm.jobs[jobName])
+		job := jm.jobs[jobName]
+		if strings.TrimSpace(strings.TrimPrefix(job.RunsOn, "runs-on:")) == "windows-latest" {
+			var jobYAML strings.Builder
+			jm.renderJobTo(&jobYAML, job)
+			b.WriteString(renderStepForRunner(jobYAML.String(), job.RunsOn))
+			continue
+		}
+		jm.renderJobTo(b, job)
 	}
 }
 
 // renderJobTo writes a single job to b directly, with no intermediate string allocation.
+//
+//nolint:largefunc // The renderer preserves the generated workflow field order.
 func (jm *JobManager) renderJobTo(b *strings.Builder, job *Job) {
 	jobLog.Printf("Rendering job: %s (steps=%d, needs=%d, reusable=%t)", job.Name, len(job.Steps), len(job.Needs), job.Uses != "")
 

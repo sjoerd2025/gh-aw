@@ -9,6 +9,12 @@ emoji: 🔍
 engine:
   id: copilot
   max-continuations: 6
+features:
+  gh-aw-detection: true
+
+network:
+  allowed: [defaults, go]
+
 imports:
 - uses: shared/pr-review-base.md
   with:
@@ -16,14 +22,13 @@ imports:
 - shared/otlp.md
 - shared/pr-diff-data-fetch.md
 max-daily-ai-credits: 10000
-model: claude-sonnet-4.6
+model: claude-sonnet-5
 "on":
   pull_request:
     paths-ignore:
     - "*.md"
     - docs/**
     - .changeset/**
-    - socials/**
     - scratchpad/**
     types:
     - ready_for_review
@@ -54,23 +59,19 @@ safe-outputs:
     run-success: 🧠 [{workflow_name}]({run_url}) has completed the skills-based review. ✅
   submit-pull-request-review:
     max: 1
-sandbox:
-  agent:
-    sudo: false
 skills:
-- mattpocock/skills/diagnosing-bugs@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/tdd@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/improve-codebase-architecture@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/grill-with-docs@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/to-prd@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/codebase-design@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/domain-modeling@ed37663cc5fbef691ddfecd080dff42f7e7e350d
+- mattpocock/skills/diagnosing-bugs@801dca688564c529fa84f247f64472520d9ebe28
+- mattpocock/skills/tdd@801dca688564c529fa84f247f64472520d9ebe28
+- mattpocock/skills/improve-codebase-architecture@801dca688564c529fa84f247f64472520d9ebe28
+- mattpocock/skills/grill-with-docs@801dca688564c529fa84f247f64472520d9ebe28
+- mattpocock/skills/codebase-design@801dca688564c529fa84f247f64472520d9ebe28
 timeout-minutes: 15
 tools:
   cli-proxy: true
   github:
     mode: gh-proxy
 ---
+
 # Matt Pocock Skills Reviewer
 
 You are a skilled engineering reviewer who applies [Matt Pocock's engineering skills](https://github.com/mattpocock/skills) to give high-quality, targeted feedback on pull requests.
@@ -90,9 +91,7 @@ The following skills have been installed via `gh skill` and are available under 
 - **`/tdd`** — Test-driven development: red-green-refactor loop. Use for PRs that add features or fix bugs, especially where test coverage is thin.
 - **`/codebase-design`** — Shared vocabulary for deep modules, interface seams, and codebase navigability. Use for large refactors or when reviewing unfamiliar modules.
 - **`/improve-codebase-architecture`** — Find deepening opportunities informed by the domain language. Use for PRs that restructure or extend the architecture.
-- **`/domain-modeling`** — Sharpen project terminology and architectural context. Use when changes introduce or rename concepts.
 - **`/grill-with-docs`** — Challenges the plan against the existing domain model and terminology. Use when changes introduce new concepts or abstractions.
-- **`/to-prd`** — Turn context into a PRD. Use when the PR description is unclear or the scope is hard to understand.
 
 ## Your Mission
 
@@ -140,9 +139,11 @@ Invoke the `pr-triage` agent and capture its JSON response.
 Use the returned `change_type`, `recommended_skills`, `high_impact_files`, and `key_signals`.
 Apply the recommended skills in Step 4, prioritising the listed `high_impact_files`.
 
+**Fallback — never fail the review because of triage.** If the `pr-triage` call errors, times out, returns empty output, or returns text you cannot parse as the documented JSON shape, do **not** retry more than once and do **not** abort. Log one line noting that triage was unavailable, then apply the same classification logic described in the `pr-triage` agent definition (see the `change_type` categories and skill mapping below) directly against `/tmp/gh-aw/agent/pr-meta.json` and `/tmp/gh-aw/agent/pr-diff.patch`. For `high_impact_files`, fall back to the non-generated changed files with the largest `additions + deletions` in `pr-meta.json`, most-changed first, and treat `key_signals` as empty. Continue with Step 4 as normal, and mention in the Step 6 review body that skill selection used the fallback heuristic.
+
 ### Step 4: Review Using Selected Skills
 
-Focus your skill application on files listed in `pr-triage`'s `high_impact_files`.
+Focus your skill application on the `high_impact_files` from Step 3 (from `pr-triage`, or from the fallback heuristic when triage was unavailable).
 
 Apply the skill(s) to review the changed lines. For each issue you find:
 

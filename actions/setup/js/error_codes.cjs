@@ -45,6 +45,9 @@ const ERR_SYSTEM = "ERR_SYSTEM";
 /** @type {string} Safe output validation/input errors (legacy numeric taxonomy) */
 const SAFE_OUTPUT_E001 = "E001";
 
+/** @type {string} Safe output API/operation guard failures (legacy numeric taxonomy) */
+const SAFE_OUTPUT_E007 = "E007";
+
 /** @type {string} Safe output lock file frontmatter hash mismatch (legacy numeric taxonomy) */
 const SAFE_OUTPUT_E009 = "E009";
 
@@ -60,6 +63,14 @@ const CONFIG_HASH_MISMATCH = "CONFIG_HASH_MISMATCH";
 /** @type {string} Named code for rate limit retry exhaustion */
 const RATE_LIMIT_EXCEEDED = "RATE_LIMIT_EXCEEDED";
 
+/**
+ * Named code for handler results that are skipped because a policy-driven
+ * file-protection check (allowed-files allowlist or protected-files policy) denied
+ * the operation. Used by push_to_pull_request_branch.cjs and approve_workflow_run.cjs
+ * so that these declines are surfaced consistently as skips, not hard failures.
+ */
+const POLICY_FILE_PROTECTION_DENIED_REASON_CODE = "POLICY_FILE_PROTECTION_DENIED";
+
 module.exports = {
   ERR_VALIDATION,
   ERR_PERMISSION,
@@ -69,9 +80,11 @@ module.exports = {
   ERR_PARSE,
   ERR_SYSTEM,
   SAFE_OUTPUT_E001,
+  SAFE_OUTPUT_E007,
   SAFE_OUTPUT_E009,
   SAFE_OUTPUT_E010,
   SAFE_OUTPUT_E099,
   CONFIG_HASH_MISMATCH,
   RATE_LIMIT_EXCEEDED,
+  POLICY_FILE_PROTECTION_DENIED_REASON_CODE,
 };

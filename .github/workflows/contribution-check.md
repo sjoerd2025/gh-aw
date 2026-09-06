@@ -23,11 +23,9 @@ engine:
 
 imports:
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
 tools:
   cli-proxy: true
+  bash: ["cat", "ls", "find", "grep", "head", "tail", "wc", "git", "jq *"]
   github:
     mode: gh-proxy
     toolsets: [pull_requests, repos, issues]

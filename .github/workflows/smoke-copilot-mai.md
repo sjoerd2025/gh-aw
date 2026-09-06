@@ -3,6 +3,7 @@ private: true
 emoji: "⚡"
 description: "Smoke test for MAI-Code-1-Flash (mai-code-1-flash-picker) — pricing: $0.75/M input, $0.075/M cached, $4.50/M output"
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-copilot-mai
     strategy: centralized
@@ -23,6 +24,9 @@ model: mai-code-1-flash-picker
 engine:
   id: copilot
   bare: true
+imports:
+  - shared/smoke-test-brevity.md
+  - shared/reporting.md
 network:
   allowed:
     - defaults
@@ -46,11 +50,12 @@ safe-outputs:
 timeout-minutes: 10
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: MAI-Code-1-Flash Commit Summary
-
-**IMPORTANT: Keep all outputs extremely short and concise.**
 
 ## Task
 

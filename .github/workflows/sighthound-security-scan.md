@@ -10,6 +10,11 @@ permissions:
   contents: read
   issues: read
   actions: read
+  copilot-requests: write
+engine:
+  id: codex
+  model-provider: github
+model: copilot/gpt-5.3-codex
 strict: true
 if: needs.sighthound_scan.outputs.actionable_findings_detected == 'true'
 jobs:
@@ -144,6 +149,11 @@ safe-outputs:
     close-older-issues: true
     title-prefix: "[sighthound] "
   noop:
+imports:
+  - shared/reporting.md
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Sighthound Security Scan Triage

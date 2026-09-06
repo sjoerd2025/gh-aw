@@ -16,6 +16,7 @@ const { pipeline } = require("stream/promises");
 const { spawnSync } = require("child_process");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { getSetupTimeoutMs } = require("./child_process_timeouts.cjs");
 
 const DEFAULT_RETRY_ATTEMPTS = 5;
 const RETRY_DELAY_MS = 5000;
@@ -23,9 +24,37 @@ const RESULTS_SCOPE_PREFIX = "Actions.Results:";
 const TWIRP_ARTIFACT_SERVICE = "github.actions.results.api.v1.ArtifactService";
 const MAX_ARTIFACTS = 1000;
 const PAGE_SIZE = 100;
+const FETCH_TIMEOUT_MS = getSetupTimeoutMs("artifactFetch");
+const FETCH_TRANSFER_TIMEOUT_MS = getSetupTimeoutMs("artifactTransfer");
+const ARCHIVE_COMMAND_TIMEOUT_MS = getSetupTimeoutMs("artifactArchive");
+const ARCHIVE_PROBE_TIMEOUT_MS = getSetupTimeoutMs("artifactArchiveProbe");
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function readResponseText(response, context) {
+  try {
+    return await response.text();
+  } catch (error) {
+    throw new Error(`failed to read ${context} response body: ${getErrorMessage(error)}`, { cause: error });
+  }
+}
+
+async function readResponseJSON(response, context) {
+  try {
+    return await response.json();
+  } catch (error) {
+    throw new Error(`failed to parse ${context} response body: ${getErrorMessage(error)}`, { cause: error });
+  }
+}
+
+function makeTempDir(prefix) {
+  try {
+    return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  } catch (error) {
+    throw new Error(`failed to create temporary directory for ${prefix}: ${getErrorMessage(error)}`, { cause: error });
+  }
 }
 
 function parseURL(url, base, errorMessage) {
@@ -99,13 +128,14 @@ async function twirpRequest(method, body) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
 
       if (response.ok) {
-        return await response.json();
+        return await readResponseJSON(response, `artifact twirp ${method}`);
       }
 
-      const responseBody = await response.text();
+      const responseBody = await readResponseText(response, `artifact twirp ${method}`);
       const retryable = response.status >= 500 || response.status === 429;
       if (!retryable || attempt === DEFAULT_RETRY_ATTEMPTS) {
         throw new Error(`artifact twirp ${method} failed (${response.status}): ${responseBody || response.statusText}`);
@@ -169,7 +199,7 @@ async function streamToFile(response, filePath) {
 }
 
 function ensureZipAvailable() {
-  const result = spawnSync("zip", ["-v"], { stdio: "ignore" });
+  const result = spawnSync("zip", ["-v"], { stdio: "ignore", timeout: ARCHIVE_PROBE_TIMEOUT_MS });
   if (result.error) {
     throw result.error;
   }
@@ -179,7 +209,7 @@ function ensureZipAvailable() {
 }
 
 function ensureUnzipAvailable() {
-  const result = spawnSync("unzip", ["-v"], { stdio: "ignore" });
+  const result = spawnSync("unzip", ["-v"], { stdio: "ignore", timeout: ARCHIVE_PROBE_TIMEOUT_MS });
   if (result.error) {
     throw result.error;
   }
@@ -198,6 +228,7 @@ function createZipFromFiles(files, rootDirectory, outputPath) {
   const result = spawnSync("zip", ["-q", "-r", outputPath, ...relativeFiles], {
     cwd: rootDirectory,
     encoding: "utf8",
+    timeout: ARCHIVE_COMMAND_TIMEOUT_MS,
   });
   if (result.error) {
     throw result.error;
@@ -214,18 +245,24 @@ async function uploadFileToSignedURL(filePath, signedUploadURL, contentType) {
   } catch (err) {
     throw new Error(`Failed to read file metadata for ${filePath}: ${getErrorMessage(err)}`, { cause: err });
   }
-  const response = await fetch(signedUploadURL, {
-    method: "PUT",
-    headers: {
-      "Content-Type": contentType,
-      "Content-Length": String(stats.size),
-      "x-ms-blob-type": "BlockBlob",
-    },
-    body: fs.createReadStream(filePath),
-    duplex: "half",
-  });
+  let response;
+  try {
+    response = await fetch(signedUploadURL, {
+      method: "PUT",
+      headers: {
+        "Content-Type": contentType,
+        "Content-Length": String(stats.size),
+        "x-ms-blob-type": "BlockBlob",
+      },
+      body: fs.createReadStream(filePath),
+      duplex: "half",
+      signal: AbortSignal.timeout(FETCH_TRANSFER_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new Error(`artifact blob upload failed: ${getErrorMessage(err)}`, { cause: err });
+  }
   if (!response.ok) {
-    const body = await response.text();
+    const body = await readResponseText(response, "artifact blob upload");
     throw new Error(`artifact blob upload failed (${response.status}): ${body || response.statusText}`);
   }
   return stats.size;
@@ -266,18 +303,24 @@ class DefaultArtifactClient {
       const url = parseURL(`/repos/${findBy.repositoryOwner}/${findBy.repositoryName}/actions/runs/${findBy.workflowRunId}/artifacts`, serverUrl, `Failed to construct artifacts URL for run ${findBy.workflowRunId}`);
       url.searchParams.set("per_page", String(PAGE_SIZE));
       url.searchParams.set("page", String(page));
-      const response = await fetch(url.toString(), {
-        headers: {
-          Authorization: "Bearer " + findBy.token,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "gh-aw-artifact-client",
-        },
-      });
+      let response;
+      try {
+        response = await fetch(url.toString(), {
+          headers: {
+            Authorization: "Bearer " + findBy.token,
+            Accept: "application/vnd.github+json",
+            "User-Agent": "gh-aw-artifact-client",
+          },
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        });
+      } catch (err) {
+        throw new Error(`failed to list artifacts: ${getErrorMessage(err)}`, { cause: err });
+      }
       if (!response.ok) {
-        throw new Error(`failed to list artifacts (${response.status}): ${await response.text()}`);
+        throw new Error(`failed to list artifacts (${response.status}): ${await readResponseText(response, "list artifacts")}`);
       }
       /** @type {any} */
-      const payload = await response.json();
+      const payload = await readResponseJSON(response, "list artifacts");
       const pageArtifacts = Array.isArray(payload?.artifacts) ? payload.artifacts : [];
       for (const item of pageArtifacts) {
         artifacts.push({
@@ -308,7 +351,7 @@ class DefaultArtifactClient {
     try {
       fs.mkdirSync(destination, { recursive: true });
     } catch (err) {
-      throw new Error(`Failed to create directory ${destination}: ${String(err)}`, { cause: err });
+      throw new Error(`Failed to create directory ${destination}: ${getErrorMessage(err)}`, { cause: err });
     }
 
     const apiUrl = parseURL(
@@ -316,14 +359,20 @@ class DefaultArtifactClient {
       process.env.GITHUB_API_URL || "https://api.github.com",
       `Failed to construct download URL for artifact ${artifactId}`
     );
-    const redirectResponse = await fetch(apiUrl.toString(), {
-      headers: {
-        Authorization: "Bearer " + findBy.token,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "gh-aw-artifact-client",
-      },
-      redirect: "manual",
-    });
+    let redirectResponse;
+    try {
+      redirectResponse = await fetch(apiUrl.toString(), {
+        headers: {
+          Authorization: "Bearer " + findBy.token,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "gh-aw-artifact-client",
+        },
+        redirect: "manual",
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+    } catch (err) {
+      throw new Error(`unable to download artifact: ${getErrorMessage(err)}`, { cause: err });
+    }
     if (![301, 302, 303, 307, 308].includes(redirectResponse.status)) {
       throw new Error(`unable to download artifact: unexpected status ${redirectResponse.status}`);
     }
@@ -332,7 +381,12 @@ class DefaultArtifactClient {
       throw new Error("unable to download artifact: missing redirect location");
     }
 
-    const blobResponse = await fetch(location);
+    let blobResponse;
+    try {
+      blobResponse = await fetch(location, { signal: AbortSignal.timeout(FETCH_TRANSFER_TIMEOUT_MS) });
+    } catch (err) {
+      throw new Error(`artifact blob download failed: ${getErrorMessage(err)}`, { cause: err });
+    }
     if (!blobResponse.ok) {
       throw new Error(`artifact blob download failed (${blobResponse.status})`);
     }
@@ -342,14 +396,23 @@ class DefaultArtifactClient {
     const zipLike = isZipResponse(location, contentType);
     if (zipLike && !options.skipDecompress) {
       ensureUnzipAvailable();
-      const tempZip = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-artifact-download-")), "artifact.zip");
-      digest = await streamToFile(blobResponse, tempZip);
-      const unzipResult = spawnSync("unzip", ["-q", tempZip, "-d", destination], { encoding: "utf8" });
-      if (unzipResult.error) {
-        throw unzipResult.error;
-      }
-      if (unzipResult.status !== 0) {
-        throw new Error(`unzip failed: ${unzipResult.stderr || unzipResult.stdout || "unknown error"}`);
+      const tempDownloadDir = makeTempDir("gh-aw-artifact-download-");
+      const tempZip = path.join(tempDownloadDir, "artifact.zip");
+      try {
+        digest = await streamToFile(blobResponse, tempZip);
+        const unzipResult = spawnSync("unzip", ["-q", tempZip, "-d", destination], { encoding: "utf8", timeout: ARCHIVE_COMMAND_TIMEOUT_MS });
+        if (unzipResult.error) {
+          throw unzipResult.error;
+        }
+        if (unzipResult.status !== 0) {
+          throw new Error(`unzip failed: ${unzipResult.stderr || unzipResult.stdout || "unknown error"}`);
+        }
+      } finally {
+        try {
+          fs.rmSync(tempDownloadDir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup errors — best effort only.
+        }
       }
     } else {
       const fileName = parseFilenameFromContentDisposition(blobResponse.headers.get("content-disposition") || "");
@@ -372,6 +435,7 @@ class DefaultArtifactClient {
     let artifactName = String(name || "").trim();
     let uploadPath = "";
     let contentType = "application/zip";
+    let tmpDir = "";
 
     if (options.skipArchive) {
       if (files.length !== 1) {
@@ -380,52 +444,62 @@ class DefaultArtifactClient {
       uploadPath = files[0];
       contentType = "application/octet-stream";
     } else {
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-artifact-upload-"));
+      tmpDir = makeTempDir("gh-aw-artifact-upload-");
       uploadPath = path.join(tmpDir, `${artifactName || "artifact"}.zip`);
       createZipFromFiles(files, rootDirectory, uploadPath);
     }
 
-    const { workflowRunBackendId, workflowJobRunBackendId } = getBackendIdsFromRuntimeToken();
-    const createRequest = {
-      workflowRunBackendId,
-      workflowJobRunBackendId,
-      name: artifactName,
-      version: 7,
-      mimeType: contentType,
-    };
-    const expiresAt = formatRetentionTimestamp(options.retentionDays);
-    if (expiresAt) {
-      createRequest.expiresAt = expiresAt;
+    try {
+      const { workflowRunBackendId, workflowJobRunBackendId } = getBackendIdsFromRuntimeToken();
+      const createRequest = {
+        workflowRunBackendId,
+        workflowJobRunBackendId,
+        name: artifactName,
+        version: 7,
+        mimeType: contentType,
+      };
+      const expiresAt = formatRetentionTimestamp(options.retentionDays);
+      if (expiresAt) {
+        createRequest.expiresAt = expiresAt;
+      }
+
+      /** @type {any} */
+      const createResponse = await twirpRequest("CreateArtifact", createRequest);
+      const signedUploadUrl = createResponse?.signedUploadUrl || createResponse?.signed_upload_url;
+      if (!createResponse?.ok || !signedUploadUrl) {
+        throw new Error("CreateArtifact returned an invalid response");
+      }
+
+      const uploadSize = await uploadFileToSignedURL(uploadPath, signedUploadUrl, contentType);
+      const sha256 = await hashFile(uploadPath);
+
+      const finalizeRequest = {
+        workflowRunBackendId,
+        workflowJobRunBackendId,
+        name: artifactName,
+        size: String(uploadSize),
+        hash: `sha256:${sha256}`,
+      };
+      /** @type {any} */
+      const finalizeResponse = await twirpRequest("FinalizeArtifact", finalizeRequest);
+      if (!finalizeResponse?.ok) {
+        throw new Error("FinalizeArtifact returned an invalid response");
+      }
+
+      return {
+        id: Number(finalizeResponse.artifactId ?? finalizeResponse.artifact_id ?? 0) || undefined,
+        size: uploadSize,
+        digest: sha256,
+      };
+    } finally {
+      if (tmpDir) {
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        } catch {
+          // Ignore cleanup errors — best effort only.
+        }
+      }
     }
-
-    /** @type {any} */
-    const createResponse = await twirpRequest("CreateArtifact", createRequest);
-    const signedUploadUrl = createResponse?.signedUploadUrl || createResponse?.signed_upload_url;
-    if (!createResponse?.ok || !signedUploadUrl) {
-      throw new Error("CreateArtifact returned an invalid response");
-    }
-
-    const uploadSize = await uploadFileToSignedURL(uploadPath, signedUploadUrl, contentType);
-    const sha256 = await hashFile(uploadPath);
-
-    const finalizeRequest = {
-      workflowRunBackendId,
-      workflowJobRunBackendId,
-      name: artifactName,
-      size: String(uploadSize),
-      hash: `sha256:${sha256}`,
-    };
-    /** @type {any} */
-    const finalizeResponse = await twirpRequest("FinalizeArtifact", finalizeRequest);
-    if (!finalizeResponse?.ok) {
-      throw new Error("FinalizeArtifact returned an invalid response");
-    }
-
-    return {
-      id: Number(finalizeResponse.artifactId ?? finalizeResponse.artifact_id ?? 0) || undefined,
-      size: uploadSize,
-      digest: sha256,
-    };
   }
 }
 

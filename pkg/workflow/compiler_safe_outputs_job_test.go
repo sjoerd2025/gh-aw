@@ -230,6 +230,41 @@ func TestBuildConsolidatedSafeOutputsJobConcurrencyGroup(t *testing.T) {
 	}
 }
 
+func TestAddHandlerManagerOutputs(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			AssignToAgent:       &AssignToAgentConfig{},
+			CreateAgentSessions: &CreateAgentSessionConfig{},
+			UploadArtifact:      &UploadArtifactConfig{MaxUploads: 2},
+			CreateIssues:        &CreateIssuesConfig{},
+			CreatePullRequests:  &CreatePullRequestsConfig{},
+			AddComments:         &AddCommentsConfig{},
+		},
+	}
+	outputs := make(map[string]string)
+
+	addHandlerManagerOutputs(data, outputs)
+	addNamedSafeOutputHandlerOutputs(data, outputs)
+
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.processed_count }}", outputs["process_safe_outputs_processed_count"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_applied }}", outputs["process_safe_outputs_items_applied"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_skipped }}", outputs["process_safe_outputs_items_skipped"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_warnings }}", outputs["process_safe_outputs_items_warnings"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_cancelled }}", outputs["process_safe_outputs_items_cancelled"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_deferred }}", outputs["process_safe_outputs_items_deferred"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.assign_to_agent_assigned }}", outputs["assign_to_agent_assigned"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.assign_to_agent_assignment_errors }}", outputs["assign_to_agent_assignment_errors"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.assign_to_agent_assignment_error_count }}", outputs["assign_to_agent_assignment_error_count"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.session_number }}", outputs["create_agent_session_session_number"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.session_url }}", outputs["create_agent_session_session_url"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.upload_artifact_count }}", outputs["upload_artifact_count"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.slot_0_tmp_id }}", outputs["upload_artifact_slot_0_tmp_id"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.slot_1_tmp_id }}", outputs["upload_artifact_slot_1_tmp_id"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.created_issue_number }}", outputs["created_issue_number"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.created_pr_url }}", outputs["created_pr_url"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.comment_id }}", outputs["comment_id"])
+}
+
 func TestBuildConsolidatedSafeOutputsJobNeedsIncludesConfiguredDependencies(t *testing.T) {
 	compiler := NewCompiler()
 	compiler.jobManager = NewJobManager()
@@ -929,9 +964,25 @@ func TestJobOutputs(t *testing.T) {
 	// Handler manager outputs
 	assert.Contains(t, job.Outputs, "process_safe_outputs_temporary_id_map")
 	assert.Contains(t, job.Outputs, "process_safe_outputs_processed_count")
+	assert.Contains(t, job.Outputs, "process_safe_outputs_items_succeeded")
+	assert.Contains(t, job.Outputs, "process_safe_outputs_items_applied")
+	assert.Contains(t, job.Outputs, "process_safe_outputs_items_skipped")
+	assert.Contains(t, job.Outputs, "process_safe_outputs_items_warnings")
+	assert.Contains(t, job.Outputs, "process_safe_outputs_items_cancelled")
+	assert.Contains(t, job.Outputs, "process_safe_outputs_items_deferred")
+	assert.Contains(t, job.Outputs, "process_safe_outputs_items_failed")
+	assert.Contains(t, job.Outputs, "process_safe_outputs_status")
 
 	// Check output format
 	assert.Contains(t, job.Outputs["process_safe_outputs_temporary_id_map"], "steps.process_safe_outputs.outputs")
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_succeeded }}", job.Outputs["process_safe_outputs_items_succeeded"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_applied }}", job.Outputs["process_safe_outputs_items_applied"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_skipped }}", job.Outputs["process_safe_outputs_items_skipped"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_warnings }}", job.Outputs["process_safe_outputs_items_warnings"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_cancelled }}", job.Outputs["process_safe_outputs_items_cancelled"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_deferred }}", job.Outputs["process_safe_outputs_items_deferred"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.items_failed }}", job.Outputs["process_safe_outputs_items_failed"])
+	assert.Equal(t, "${{ steps.process_safe_outputs.outputs.status }}", job.Outputs["process_safe_outputs_status"])
 }
 
 // TestJobDependencies tests that job dependencies are correctly set
@@ -1623,7 +1674,7 @@ func TestCreateCodeScanningAlertUploadJob(t *testing.T) {
 				assert.Contains(t, uploadSteps, "sha: ${{ github.sha }}",
 					"Upload step must include sha input")
 				// sarif_file must be the local path from the downloaded artifact (not a job output reference)
-				localSarifPath := path.Join(constants.SarifArtifactDownloadPath, constants.SarifFileName)
+				localSarifPath := path.Join(constants.SarifArtifactDownloadPath.String(), constants.SarifFileName.String())
 				assert.Contains(t, uploadSteps, localSarifPath,
 					"Upload step must use the locally downloaded SARIF file path")
 				assert.NotContains(t, uploadSteps, "needs.safe_outputs.outputs.sarif_file",
@@ -1663,7 +1714,7 @@ func TestCreateCodeScanningAlertUploadJob(t *testing.T) {
 }
 
 // TestBuildSafeOutputItemsManifestUploadStep verifies that the upload step includes
-// the stdout/stderr log artifact paths so failures are pre-bundled in the artifact.
+// the manifest and temporary ID map but excludes process stdout/stderr logs.
 func TestBuildSafeOutputItemsManifestUploadStep(t *testing.T) {
 	steps := buildSafeOutputItemsManifestUploadStep("", func(action string) string {
 		return action + "@test-pin"
@@ -1674,6 +1725,6 @@ func TestBuildSafeOutputItemsManifestUploadStep(t *testing.T) {
 	assert.Contains(t, content, "Upload Safe Outputs Items")
 	assert.Contains(t, content, "if: always()")
 	assert.Contains(t, content, "/tmp/gh-aw/safe-output-items.jsonl")
-	assert.Contains(t, content, "/tmp/gh-aw/process-safe-outputs.stdout.log")
-	assert.Contains(t, content, "/tmp/gh-aw/process-safe-outputs.stderr.log")
+	assert.NotContains(t, content, "process-safe-outputs.stdout.log")
+	assert.NotContains(t, content, "process-safe-outputs.stderr.log")
 }

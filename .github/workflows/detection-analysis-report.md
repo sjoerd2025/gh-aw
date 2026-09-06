@@ -5,6 +5,7 @@ on:
   schedule:
     - cron: "05 23 * * *" # Offset from other nightly scheduled workflows
   workflow_dispatch:
+timeout-minutes: 45
 max-ai-credits: 1500
 max-daily-ai-credits: 10000
 permissions:
@@ -30,11 +31,18 @@ imports:
     with:
       title-prefix: "[detection-analysis] "
       expires: 3d
+  - uses: shared/aw-logs-24h-fetch-setup.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
+evals:
+  - id: detection_runs_analyzed
+    question: Did the agent analyze detection jobs for workflow misconfiguration and performance differences?
+  - id: detection_report_created
+    question: Did the agent create a report with evidence-backed detection findings or recommendations?
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 ---
 
 # Detection Analysis Report
@@ -50,7 +58,7 @@ You are the Detection Analysis Agent. Your goal is to analyze the last 24 hours 
 
 Generate a comparison chart showing how detection-enabled runs differ from regular runs:
 
-1. **Detection Feature Comparison**: A side-by-side grouped bar chart with two groups — "Regular Runs" (detection disabled or absent) and "Detection Runs" (`gh-aw-detection: true`) — plotting these metrics for each group:
+1. **Detection Feature Comparison**: A side-by-side grouped bar chart with two groups — "Regular Runs" (`gh-aw-detection: false`, i.e. the feature was explicitly opted out) and "Detection Runs" (`gh-aw-detection` enabled, which is the default when the flag is absent) — plotting these metrics for each group:
    - Total run count (left y-axis)
    - Success rate % (right y-axis, line overlay)
    - Average token usage (secondary chart or annotation)
@@ -63,29 +71,33 @@ Upload the chart using the `upload_asset` safe-output tool with the absolute pat
 
 ## Analysis Steps
 
-### Step 1 — Fetch Logs
+### Step 1 — Logs
 
-Call `agenticworkflows logs --start-date -1d` to download workflow run directories to `/tmp/gh-aw/aw-mcp/logs`. Each run's `aw_info.json` contains `features["gh-aw-detection"]` (boolean), `status`, `total_tokens`, and `engine_id`. Use `features.gh-aw-detection` directly — do not infer detection status from `.lock.yml` files.
+{{#runtime-import? shared/aw-logs-24h-fetch-prompt.md}}
+
+Each run's `aw_info.json` contains `features["gh-aw-detection"]` (boolean), `status`, `total_tokens`, and `engine_id`. Use `features.gh-aw-detection` directly — do not infer detection status from `.lock.yml` files. Note that the key is only present when the workflow sets it explicitly; when it is missing, detection is **enabled** (the default).
+
+Each run's `run_summary.json` contains `job_details`, an array of `{name, conclusion, steps: [{name, status, conclusion}]}` for every GitHub Actions job in the run (e.g. `agent`, `detection`, `activation`). Use this for step-level failure attribution in Rule 3 below.
 
 ### Analyze Runs
 
 In a single pass over the run directories at `/tmp/gh-aw/aw-mcp/logs`, classify and aggregate all runs:
 
-**Classify each run** using `features.gh-aw-detection` from `aw_info.json`:
-- **Detection-enabled**: value is `true`
-- **Regular**: value is `false`, absent, or unset
+**Classify each run** using `features.gh-aw-detection` from `aw_info.json`. The `gh-aw-detection` feature is **enabled by default**, so an absent or unset value means detection is enabled:
+- **Detection-enabled**: value is `true`, absent, or unset
+- **Regular**: value is explicitly `false`
 
-Collect per-run: `workflow_name`, `status`, `total_tokens`, `engine_id`, `detection_enabled`.
+Collect per-run: `workflow_name`, `status`, `total_tokens`, `engine_id`, `detection_enabled`, and (from `run_summary.json.job_details`) the `agent` job's `conclusion` and the `detection` job's `conclusion`.
 
 **Flag a workflow as misconfigured** when any of the following apply:
 1. `gh-aw-detection: false` on a workflow with >3 total runs in the last 7 days
-2. Workflow name contains `audit`, `analyzer`, `report`, `detector`, `monitor`, or `inspector` but lacks `gh-aw-detection: true`
-3. Run has `gh-aw-detection: true` but detection-related steps failed
-4. Workflow alternates between detection-enabled and detection-disabled within the 24h window
+2. Run has detection enabled **and** the `detection` job in `job_details` itself has a failing `conclusion` (e.g. `failure`) — i.e. the detection job actually ran and a detection-specific step errored. Use `job_details` to attribute the failure precisely:
+   - Look up the `agent` and `detection` jobs by name in `job_details`.
+   - If the `agent` job is absent from `job_details` or has `conclusion: "skipped"`/`"cancelled"` (consistent with `TokenUsage: 0` and `ErrorCount: 0` in the run summary), the agent job never executed — this is **not** a detection-step failure; do not flag under rule 2 (it may indicate a trigger/permission issue worth noting separately, but is out of scope for this rule).
+   - Only flag rule 2 when the `detection` job (or a step within it) itself shows a failing conclusion in `job_details`. This job-level conclusion is the sole signal for rule 2 — do not fall back to `TokenUsage`/`ErrorCount` heuristics, which cannot distinguish a detection-step failure from an agent job that never started.
+3. Workflow alternates between detection-enabled and detection-disabled within the 24h window
 
-Before flagging a name-based mismatch from rule 2, check whether the workflow has an explicitly documented repository-level opt-out. Current documented opt-out:
-
-- `Daily Agentic Workflow AIC Usage Audit` (`.github/workflows/agentic-token-audit.md`) is source-managed from `githubnext/agentic-ops` and should not be reported as misconfigured solely because this repository mirrors the upstream file without adding a local `gh-aw-detection: true` override.
+Do **not** flag a workflow merely because it lacks an explicit `gh-aw-detection: true` entry — that is the default configuration for most workflows and is not a misconfiguration.
 
 For each misconfigured workflow, record: `workflow_name`, `misconfiguration_type`, `run_count`, `example_run_id`, `recommended_fix`.
 
@@ -124,8 +136,6 @@ If `/tmp/gh-aw/python/charts/detection_trend.png` was generated, upload it with 
 ---
 
 ## Report Structure
-
-**Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
 Publish a discussion using the configured safe-output. Structure the body as:
 

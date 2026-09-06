@@ -28,6 +28,7 @@ safe-outputs:
     - documentation
     - automation
     title-prefix: "[doc-healer] "
+  steer: true
   create-pull-request:
     expires: 3d
     labels:
@@ -44,7 +45,7 @@ name: Daily Documentation Healer
 strict: true
 experiments:
   model_size:
-    variants: [claude-sonnet-4.6, claude-haiku-4.5]
+    variants: [claude-sonnet-5, claude-haiku-4.5]
     description: "Tests whether Claude Haiku detects and corrects documentation gaps with equivalent quality at lower token cost versus Claude Sonnet."
     hypothesis: "H0: no change in issue/PR creation rate or run success rate. H1: Claude Haiku reduces AI credit usage >=30% with equivalent run success rate (>=0.90)."
     metric: ai_credits_total
@@ -55,7 +56,9 @@ experiments:
       - name: empty_output_rate
         threshold: "<=0.10"
     min_samples: 20
-    weight: [50, 50]
+    continual:
+      seed: daily-doc-healer-model-size-v1
+      ramp: [10, 25, 50]
     start_date: "2026-06-04"
 timeout-minutes: 45
 tools:
@@ -70,7 +73,7 @@ tools:
   cli-proxy: true
   edit: null
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
     - default
 tracker-id: daily-doc-healer
@@ -78,7 +81,8 @@ features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 evals:
   - id: gaps-confirmed
     question: Did the workflow identify at least one confirmed documentation gap to fix, or correctly conclude that no actionable gap remained?
@@ -177,6 +181,14 @@ b. **Also check that the corresponding job builder is not a no-op stub**. If the
 c. If the constant exists but the artifact is **not** produced by any workflow (no match in lock.yml files or JS helpers, or the job builder is a no-op stub), **skip it** — it is a forward-declared constant for an unimplemented feature, not a documentation gap.
 
 d. Only if the artifact **is** produced, verify that the artifact name value is listed in `docs/src/content/docs/reference/artifacts.md`. If a confirmed-produced artifact is missing from the reference page, treat it as a documentation gap and add it.
+
+6. **Experimental engine exemption**: If the issue concerns a registered engine that is absent from `docs/src/content/docs/reference/engines.md`, verify whether that engine is experimental before treating it as a documentation gap:
+
+```bash
+grep -n "experimental\s*:" pkg/workflow/<engine>_engine.go
+```
+
+If the engine's Go source sets `experimental: true` (in its `BaseEngine` initializer) **and** the engine does not already appear in `engines.md`, the omission is **intentional** — experimental engines may be deliberately held back from the curated reference table until they reach GA. Do **not** create or re-file documentation drift issues for such engines; treat this as a resolved exemption and skip the issue.
 
 Only proceed with issues where you can confirm the documentation gap still exists.
 
@@ -317,5 +329,7 @@ Call `noop` with a summary:
 - **Exit cleanly**: Always call exactly one safe-output tool before finishing (`create_pull_request`, `create_issue`, or `noop`).
 
 ### Output Format
+
+Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body. Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks for progressive disclosure.
 
 Structure reports as: overview → key metrics/issues → collapsible detail → next actions.

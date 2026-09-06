@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: "Guard policy smoke test: repos=[github/gh-aw, github/*], min-integrity=approved (scoped patterns)"
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-agent-scoped-approved
     strategy: centralized
@@ -22,6 +23,8 @@ strict: true
 imports:
   - shared/github-guard-policy.md
   - shared/otlp.md
+  - shared/reporting.md
+  - shared/playwright-title-test.md
 tools:
   github:
     mode: local
@@ -42,10 +45,14 @@ safe-outputs:
     footer: "> 🤖 *Guard policy smoke test by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🔍 [{workflow_name}]({run_url}) testing guard policy: `repos=[github/gh-aw, github/*], min-integrity=approved`..."
     run-success: "✅ [{workflow_name}]({run_url}) completed guard policy test."
-    run-failure: "❌ [{workflow_name}]({run_url}) {status}. Check the logs for details."
+    run-failure: "❌ [{workflow_name}]({run_url}) {status} testing guard policy: `repos=[github/gh-aw, github/*], min-integrity=approved`. Check the logs for details."
 timeout-minutes: 10
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
+    id: awf
 ---
 
 # Guard Policy Smoke Test: scoped/approved (scoped patterns)

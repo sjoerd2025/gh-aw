@@ -91,6 +91,7 @@ func TestResetDockerPullState(t *testing.T) {
 }
 
 func TestDockerImageConstants(t *testing.T) {
+	t.Parallel()
 	// Verify constants are defined correctly
 	if ZizmorImage == "" {
 		t.Error("ZizmorImage constant should not be empty")
@@ -113,6 +114,9 @@ func TestDockerImageConstants(t *testing.T) {
 	if GrantImage == "" {
 		t.Error("GrantImage constant should not be empty")
 	}
+	if ShellcheckImage == "" {
+		t.Error("ShellcheckImage constant should not be empty")
+	}
 
 	// Verify they are docker image references
 	expectedImages := map[string]string{
@@ -123,6 +127,7 @@ func TestDockerImageConstants(t *testing.T) {
 		"syft":         SyftImage,
 		"grype":        GrypeImage,
 		"grant":        GrantImage,
+		"shellcheck":   ShellcheckImage,
 	}
 
 	for name, image := range expectedImages {
@@ -280,28 +285,6 @@ func TestMockImageAvailability(t *testing.T) {
 
 	// Clean up
 	ResetDockerPullState()
-}
-
-func TestNormalizeDockerContext_NilContextReturnsTODO(t *testing.T) {
-	//nolint:staticcheck // Intentionally validating nil context normalization behavior.
-	ctx := normalizeDockerContext(nil)
-
-	if ctx == nil {
-		t.Fatal("Expected nil context to be replaced")
-	}
-
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("Expected replacement context to be active, got err: %v", err)
-	}
-}
-
-func TestNormalizeDockerContext_PreservesNonNilContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	if normalizeDockerContext(ctx) != ctx {
-		t.Fatal("Expected non-nil context to be preserved")
-	}
 }
 
 func TestIsDockerAvailable_NilContext(t *testing.T) {

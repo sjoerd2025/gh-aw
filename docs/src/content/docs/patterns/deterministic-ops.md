@@ -18,6 +18,8 @@ This workflow generates release highlights for new tags. It uses deterministic s
 
 When using `steps:` or `jobs:`, files placed in `/tmp/gh-aw/agent/` are automatically uploaded as artifacts and available to the AI agent.
 
+Keep large dependency caches and virtual environments outside `/tmp/gh-aw/agent/`. That directory is part of the agent artifact upload path, so placing a Python venv there can bloat artifacts and make observability downloads time out. Prefer a sibling path such as `/tmp/gh-aw/python/venv` for reusable environments, and keep `/tmp/gh-aw/agent/` for the smaller files the agent should read later.
+
 ```mermaid
 flowchart TD
     det[Deterministic steps] -- artifacts --> agent[AI agent]
@@ -77,6 +79,9 @@ steps:
 
 Setting `path: /tmp/gh-aw/agent` means the cache is restored directly into the directory that gh-aw uploads as artifacts for the agent — no extra copy step needed. The `mkdir -p` guard ensures the directory exists on the first run before any cache is available.
 
+> [!CAUTION]
+> Avoid caching bulky toolchains or virtual environments into `/tmp/gh-aw/agent/`. If you need to cache a Python environment, cache `/tmp/gh-aw/python/venv` or another sibling path instead, then write only analysis inputs and outputs into `/tmp/gh-aw/agent/`.
+
 ## Deterministic Trigger Filtering
 
 Deterministic steps can also be used for [Custom Trigger Filtering](/gh-aw/reference/triggers/#filtering-by-custom-steps-onsteps), to control whether the agentic workflow should run based on complex conditions that are easier to express in code than in workflow expressions.
@@ -107,12 +112,11 @@ safe-outputs:
 Review the pull request and use format-and-notify to post your summary.
 ```
 
-## Related Documentation
+## Learn More
 
 - [Pre-Activation Steps](/gh-aw/reference/triggers/#pre-activation-steps-onsteps) — Inline step injection into the pre-activation job
 - [Pre-Activation Permissions](/gh-aw/reference/triggers/#pre-activation-permissions-onpermissions) — Grant additional scopes for `on.steps:` API calls
 - [Custom Safe Outputs](/gh-aw/reference/custom-safe-outputs/) — Custom post-processing jobs
-- [Frontmatter Reference](/gh-aw/reference/frontmatter/) — Configuration options
 - [Compilation Process](/gh-aw/reference/compilation-process/) — How jobs are orchestrated
 - [Imports](/gh-aw/reference/imports/) — Sharing configurations across workflows
 - [Templating](/gh-aw/reference/templating/) — Using GitHub Actions expressions

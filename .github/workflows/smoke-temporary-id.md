@@ -3,7 +3,8 @@ private: true
 emoji: "🧪"
 name: Smoke Temporary ID
 description: Test temporary ID functionality for issue chaining and cross-references
-on: 
+on:
+  schedule: every 2 days
   slash_command:
     name: smoke-temporary-id
     strategy: centralized
@@ -19,7 +20,8 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 strict: true
 network:
   allowed:
@@ -49,6 +51,7 @@ timeout-minutes: 10
 imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
 experiments:
@@ -74,6 +77,10 @@ evals:
   - id: sub_agent_strategy_goal_met
     question: Does the agent output show that the objective for experiment sub_agent_strategy was successfully completed?
 
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
+    id: awf
 ---
 
 # Smoke Test: Temporary ID Functionality

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/scanfindings"
 )
 
 // renderJSON outputs the audit data as JSON
@@ -120,6 +121,9 @@ func renderConsoleMetrics(metrics MetricsData) {
 	if metrics.AIC > 0 {
 		line += fmt.Sprintf(" aic=%.2f", metrics.AIC)
 	}
+	if metrics.WorkingSet != nil && metrics.WorkingSet.RebuildFactor != nil {
+		line += fmt.Sprintf(" working-set-rebuild=%.2f×", *metrics.WorkingSet.RebuildFactor)
+	}
 	if metrics.ActionMinutes > 0 {
 		line += fmt.Sprintf(" action_min=%.0f", metrics.ActionMinutes)
 	}
@@ -160,6 +164,12 @@ func renderConsoleTokenUsage(tokenUsage *TokenUsageSummary) {
 		tokenUsage.TotalRequests,
 		console.FormatNumber(tokenUsage.TotalSteeringEvents),
 	)
+	if len(tokenUsage.Warnings) > 0 {
+		fmt.Fprintln(os.Stderr, "  token_usage_warnings:")
+		for _, warning := range tokenUsage.Warnings {
+			fmt.Fprintf(os.Stderr, "    %s\n", warning)
+		}
+	}
 }
 
 func renderConsoleGitHubAPIUsage(rateLimit *GitHubRateLimitUsage) {
@@ -228,13 +238,13 @@ func renderConsoleActionableSections(data AuditData) {
 	renderConsoleWarnings(data.Warnings)
 }
 
-func renderConsoleFindings(findings []Finding) {
+func renderConsoleFindings(findings []AuditFinding) {
 	if len(findings) == 0 {
 		return
 	}
 	fmt.Fprintln(os.Stderr, "  findings:")
 	for _, finding := range findings {
-		fmt.Fprintf(os.Stderr, "    [%s] %s: %s\n", strings.ToUpper(finding.Severity), finding.Title, finding.Description)
+		fmt.Fprintf(os.Stderr, "    [%s] %s: %s\n", strings.ToUpper(finding.Severity.String()), finding.Title, finding.Description)
 	}
 }
 
@@ -276,7 +286,7 @@ func renderConsoleInsights(insights []ObservabilityInsight) {
 	}
 }
 
-func renderConsoleErrors(errors []ErrorInfo) {
+func renderConsoleErrors(errors []ValidationIssue) {
 	if len(errors) == 0 {
 		return
 	}
@@ -290,7 +300,7 @@ func renderConsoleErrors(errors []ErrorInfo) {
 	}
 }
 
-func renderConsoleWarnings(warnings []ErrorInfo) {
+func renderConsoleWarnings(warnings []ValidationIssue) {
 	if len(warnings) == 0 {
 		return
 	}
@@ -301,6 +311,7 @@ func renderConsoleWarnings(warnings []ErrorInfo) {
 }
 
 func renderConsoleOperationalSections(data AuditData) {
+	renderConsoleSkillActivations(data.SkillActivations)
 	renderConsoleMissingTools(data.MissingTools)
 	renderConsoleMCPFailures(data.MCPFailures)
 	renderCompactMCPHealth(data.MCPServerHealth)
@@ -310,6 +321,20 @@ func renderConsoleOperationalSections(data AuditData) {
 	renderConsoleMCPToolUsage(data.MCPToolUsage)
 	if data.FirewallAnalysis != nil && data.FirewallAnalysis.TotalRequests > 0 {
 		renderCompactFirewall(data.FirewallAnalysis)
+	}
+}
+
+func renderConsoleSkillActivations(activations []SkillActivation) {
+	if len(activations) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "  skill_activations:")
+	for _, act := range activations {
+		line := "    " + act.Name + ": " + act.Status
+		if act.Source != "" {
+			line += " (source: " + act.Source + ")"
+		}
+		fmt.Fprintln(os.Stderr, line)
 	}
 }
 
@@ -399,6 +424,37 @@ func renderConsolePolicyAndExperiments(data AuditData) {
 		fmt.Fprintf(os.Stderr, "  firewall_policy: %s\n", data.PolicyAnalysis.PolicySummary)
 	}
 	renderConsoleExperiments(data.Experiments)
+	renderConsoleGraders(data.Graders)
+}
+
+func renderConsoleGraders(graders *GradersData) {
+	if graders == nil || len(graders.Results) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  graders: pass=%d fail=%d error=%d unavailable=%d\n",
+		graders.Passed, graders.Failed, graders.ErrorCount, graders.UnavailableCount)
+	for _, result := range graders.Results {
+		line := fmt.Sprintf("    %s %s=%s", result.Status, result.ID, formatGraderValue(result))
+		if result.Threshold != nil {
+			line += fmt.Sprintf(" threshold=%g", *result.Threshold)
+		}
+		if result.Direction != "" {
+			line += " direction=" + result.Direction
+		}
+		if detail := graderDetailText(result); detail != "" {
+			line += " (" + detail + ")"
+		}
+		fmt.Fprintln(os.Stderr, line)
+	}
+}
+
+// graderDetailText returns the error text for failed graders, falling back to the
+// informational message when no error was recorded.
+func graderDetailText(result GraderResult) string {
+	if result.Error != "" {
+		return result.Error
+	}
+	return result.Message
 }
 
 func renderConsoleExperiments(experiments *ExperimentData) {
@@ -419,10 +475,10 @@ func renderConsoleLogsPath(logsPath string) {
 }
 
 // filterActionableFindings returns findings with severity > info/success
-func filterActionableFindings(findings []Finding) []Finding {
-	var result []Finding
+func filterActionableFindings(findings []AuditFinding) []AuditFinding {
+	var result []AuditFinding
 	for _, f := range findings {
-		if f.Severity == "critical" || f.Severity == "high" || f.Severity == "medium" || f.Severity == "low" {
+		if f.Severity.AtLeast(scanfindings.SeverityLow) {
 			result = append(result, f)
 		}
 	}

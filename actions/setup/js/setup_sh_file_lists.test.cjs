@@ -5,7 +5,30 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SETUP_SH = resolve(__dirname, "../setup.sh");
+const SETUP_ACTION_INDEX = resolve(__dirname, "../index.js");
+const INSTALL_COPILOT_CLI_SH = resolve(__dirname, "../sh/install_copilot_cli.sh");
 const setupShContent = readFileSync(SETUP_SH, "utf8");
+const setupActionIndexContent = readFileSync(SETUP_ACTION_INDEX, "utf8");
+const installCopilotCliContent = readFileSync(INSTALL_COPILOT_CLI_SH, "utf8");
+
+describe("setup action Windows support", () => {
+  it("runs setup.sh with Bash", () => {
+    expect(setupActionIndexContent).toContain('spawnSync("bash", [path.join(__dirname, "setup.sh")]');
+  });
+
+  it("converts Windows paths for Bash without changing RUNNER_TEMP", () => {
+    expect(setupShContent).toContain('RUNNER_TEMP_BASH="$(cygpath -u "${RUNNER_TEMP}")"');
+    expect(setupShContent).toContain('DESTINATION="$(cygpath -u "${DESTINATION}")"');
+  });
+
+  it("installs the Windows Copilot CLI without sudo", () => {
+    expect(installCopilotCliContent).toContain("MINGW*|MSYS*|CYGWIN*)");
+    expect(installCopilotCliContent).toContain('TARBALL_NAME="copilot-${PLATFORM}-${ARCH_NAME}.zip"');
+    expect(installCopilotCliContent).toContain("unzip or 7z is required for Windows installation");
+    expect(installCopilotCliContent).toContain('unzip -qo "${TEMP_DIR}/${TARBALL_NAME}" -d "${INSTALL_DIR}"');
+    expect(installCopilotCliContent).toContain('7z x -y "-o${INSTALL_DIR}" "${TEMP_DIR}/${TARBALL_NAME}"');
+  });
+});
 
 /**
  * Parse a bash array from setup.sh, e.g.:
@@ -55,6 +78,10 @@ function collectTransitiveDeps(rootFiles) {
   return visited;
 }
 
+function filesCallingCoreSetSecret(files) {
+  return files.filter(file => /\bcore\.setSecret\s*\(/.test(readFileSync(resolve(__dirname, file), "utf8")));
+}
+
 const mcpScriptsFiles = parseSetupShArray("MCP_SCRIPTS_FILES");
 const safeOutputsFiles = parseSetupShArray("SAFE_OUTPUTS_FILES");
 
@@ -74,6 +101,10 @@ describe("setup.sh MCP_SCRIPTS_FILES", () => {
     const missing = mcpScriptsFiles.filter(f => !existsSync(resolve(__dirname, f)));
     expect(missing).toEqual([]);
   });
+
+  it("does not deploy files that call core.setSecret", () => {
+    expect(filesCallingCoreSetSecret(mcpScriptsFiles)).toEqual([]);
+  });
 });
 
 describe("setup.sh SAFE_OUTPUTS_FILES", () => {
@@ -91,6 +122,10 @@ describe("setup.sh SAFE_OUTPUTS_FILES", () => {
   it("all listed files exist in js/", () => {
     const missing = safeOutputsFiles.filter(f => !existsSync(resolve(__dirname, f)));
     expect(missing).toEqual([]);
+  });
+
+  it("does not deploy files that call core.setSecret", () => {
+    expect(filesCallingCoreSetSecret(safeOutputsRoots)).toEqual([]);
   });
 
   it("copies safe_outputs_tools.json to both safe_outputs_tools.json and tools.json", () => {

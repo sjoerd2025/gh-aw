@@ -11,8 +11,8 @@
 //     JSONMCPConfigOptions, GitHubMCPDockerOptions, GitHubMCPRemoteOptions).
 //   - mcp_renderer_github.go  — GitHub MCP rendering: RenderGitHubMCP, renderGitHubTOML,
 //     RenderGitHubMCPDockerConfig, RenderGitHubMCPRemoteConfig.
-//   - mcp_renderer_builtin.go — Built-in MCP server renderers: Playwright,
-//     SafeOutputs, MCPScripts, AgenticWorkflows (JSON + TOML for each).
+//   - mcp_renderer_builtin.go — Built-in MCP server renderers: SafeOutputs,
+//     MCPScripts, AgenticWorkflows (JSON + TOML for each).
 //   - mcp_renderer_guard.go   — Guard / access-control policy rendering:
 //     renderGuardPoliciesJSON, renderGuardPoliciesToml.
 //
@@ -45,6 +45,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -124,7 +125,7 @@ func HandleCustomMCPToolInSwitch(
 //   - mcpTools: Ordered list of MCP tool names to render
 //   - workflowData: Workflow configuration data
 //   - options: JSON MCP config rendering options
-func RenderJSONMCPConfig(
+func RenderJSONMCPConfig( //nolint:largefunc // Existing renderer keeps MCP JSON emission order stable for golden tests.
 	yaml *strings.Builder,
 	tools map[string]any,
 	mcpTools []string,
@@ -162,9 +163,6 @@ func RenderJSONMCPConfig(
 		case "github":
 			githubTool, _ := tools["github"].(map[string]any)
 			options.Renderers.RenderGitHub(&configBuilder, githubTool, isLast, workflowData)
-		case "playwright":
-			playwrightTool := tools["playwright"]
-			options.Renderers.RenderPlaywright(&configBuilder, playwrightTool, isLast)
 		case "cache-memory":
 			options.Renderers.RenderCacheMemory(&configBuilder, isLast, workflowData)
 		case "agentic-workflows":
@@ -174,6 +172,10 @@ func RenderJSONMCPConfig(
 		case "mcp-scripts":
 			if options.Renderers.RenderMCPScripts != nil {
 				options.Renderers.RenderMCPScripts(&configBuilder, workflowData.MCPScripts, isLast)
+			}
+		case enclaveMCPServerName:
+			if options.Renderers.RenderEnclave != nil {
+				options.Renderers.RenderEnclave(&configBuilder, workflowData, isLast)
 			}
 		default:
 			// Handle custom MCP tools using shared helper
@@ -190,9 +192,31 @@ func RenderJSONMCPConfig(
 		// Port as unquoted variable - shell expands to integer (e.g., 8080) for valid JSON
 		fmt.Fprintf(&configBuilder, "              \"port\": $MCP_GATEWAY_PORT,\n")
 		fmt.Fprintf(&configBuilder, "              \"domain\": \"%s\",\n", options.GatewayConfig.Domain)
-		fmt.Fprintf(&configBuilder, "              \"apiKey\": \"%s\"", options.GatewayConfig.APIKey)
+		if len(options.GatewayConfig.AgentIDs) > 0 {
+			agentIDs, err := json.Marshal(options.GatewayConfig.AgentIDs)
+			if err != nil {
+				return fmt.Errorf("failed to marshal gateway agent IDs: %w", err)
+			}
+			fmt.Fprintf(&configBuilder, "              \"agentIds\": %s", agentIDs)
+			if len(options.GatewayConfig.AgentPolicies) > 0 {
+				agentPolicies, err := json.Marshal(options.GatewayConfig.AgentPolicies)
+				if err != nil {
+					return fmt.Errorf("failed to marshal gateway agent policies: %w", err)
+				}
+				fmt.Fprintf(&configBuilder, ",\n              \"agentPolicies\": %s", agentPolicies)
+			}
+		} else {
+			fmt.Fprintf(&configBuilder, "              \"agentId\": \"%s\"", options.GatewayConfig.AgentID)
+		}
+		if len(options.GatewayConfig.DelegationControllers) > 0 {
+			delegationControllers, err := json.Marshal(options.GatewayConfig.DelegationControllers)
+			if err != nil {
+				return fmt.Errorf("failed to marshal gateway delegation controllers: %w", err)
+			}
+			fmt.Fprintf(&configBuilder, ",\n              \"delegationControllers\": %s", delegationControllers)
+		}
 
-		// Add optional fields if specified (apiKey always precedes them without a trailing comma)
+		// Add optional fields if specified (agentId always precedes them without a trailing comma)
 		if options.GatewayConfig.PayloadDir != "" {
 			fmt.Fprintf(&configBuilder, ",\n              \"payloadDir\": \"%s\"", options.GatewayConfig.PayloadDir)
 		}
@@ -244,7 +268,7 @@ func RenderJSONMCPConfig(
 				// The config is rendered inside an unquoted bash heredoc; unvalidated IDs
 				// containing shell metacharacters (e.g. $(cmd), `cmd`) would be expanded.
 				if !isSafeMCPServerID(serverID) {
-					return fmt.Errorf("private-to-public-flows: server ID %q contains characters that are unsafe for shell heredoc emission; IDs must match [A-Za-z0-9_-]+", serverID)
+					return fmt.Errorf("private-to-public-flows: server ID %q contains characters that are unsafe for shell heredoc emission; IDs must match [A-Za-z0-9_-]+. Example:\n\nfirewall:\n  private-to-public-flows:\n    allowed-server-ids:\n      - my-safe-server", serverID)
 				}
 				fmt.Fprintf(&configBuilder, "%q", serverID)
 			}
@@ -281,7 +305,7 @@ func RenderJSONMCPConfig(
 	// against PATH modifications that may occur later in the workflow.
 	yaml.WriteString("          GH_AW_NODE=$(which node 2>/dev/null || command -v node 2>/dev/null || echo node)\n")
 	// Write the configuration to the YAML output
-	yaml.WriteString("          cat << " + delimiter + " | \"$GH_AW_NODE\" \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.cjs\"\n")
+	yaml.WriteString("          cat << " + delimiter + " | \"$GH_AW_NODE\" \"${RUNNER_TEMP}/gh-aw/actions/start_mcp_gateway.cjs\"\n") //nolint:generatedyamlheredoc // Gateway stdin rendering remains to be migrated.
 	yaml.WriteString(generatedConfig)
 	yaml.WriteString("          " + delimiter + "\n")
 

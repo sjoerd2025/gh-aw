@@ -9,41 +9,26 @@ import (
 	"go/token"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the strings-index-contains analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "stringsindexcontains",
-	Doc:      "reports strings.Index(s, substr) comparisons with -1 or 0 (e.g. != -1, >= 0, > -1, == -1, < 0, <= -1) and their yoda-order variants that should use strings.Contains(s, substr) or !strings.Contains(s, substr)",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/stringsindexcontains",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("stringsindexcontains", "reports strings.Index(s, substr) comparisons with -1 or 0 (e.g. != -1, >= 0, > -1, == -1, < 0, <= -1) and their yoda-order variants that should use strings.Contains(s, substr) or !strings.Contains(s, substr)", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.BinaryExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeIndexContains(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeIndexContains checks whether a binary expression is a strings.Index
@@ -79,7 +64,7 @@ func analyzeIndexContains(pass *analysis.Pass, n ast.Node, generatedFiles filech
 	} else {
 		msg = "use strings.Contains(" + sText + ", " + subText + ") instead of strings.Index comparison"
 	}
-	fix := astutil.BuildContainsFix(expr, pkgText, sText, subText, negated, "Replace strings.Index comparison with strings.Contains")
+	fix := astutil.BuildContainsFix(pass.Files, expr, pkgText, sText, subText, negated, "Replace strings.Index comparison with strings.Contains")
 	pass.Report(analysis.Diagnostic{
 		Pos:            expr.Pos(),
 		End:            expr.End(),
@@ -105,7 +90,7 @@ func analyzeIndexContains(pass *analysis.Pass, n ast.Node, generatedFiles filech
 //   - 0 > strings.Index(s, sub)
 func matchIndexComparison(pass *analysis.Pass, expr *ast.BinaryExpr) (call *ast.CallExpr, negated bool, matched bool) {
 	// Normalize so that the strings.Index call is on the left side.
-	left, right, flipped := normalizeOperands(pass, expr)
+	left, right, flipped := astutil.NormalizeComparisonOperands(pass, expr, "Index")
 
 	indexCall, ok := astutil.AsStringsMethodCall(pass, left, "Index")
 	if !ok {
@@ -157,13 +142,4 @@ func matchIndexComparison(pass *analysis.Pass, expr *ast.BinaryExpr) (call *ast.
 	}
 
 	return nil, false, false
-}
-
-// normalizeOperands returns (left, right) such that if the strings.Index call
-// is on the right side, the operands are swapped and flipped=true.
-func normalizeOperands(pass *analysis.Pass, expr *ast.BinaryExpr) (left, right ast.Expr, flipped bool) {
-	if _, ok := astutil.AsStringsMethodCall(pass, expr.X, "Index"); ok {
-		return expr.X, expr.Y, false
-	}
-	return expr.Y, expr.X, true
 }

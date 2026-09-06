@@ -85,8 +85,39 @@ Keywords expanding to curated domain lists:
 | `latex` | LaTeX / TeX | `ctan.org`, `mirror.ctan.org`, `miktex.org`, `tug.org` |
 | `lean` | Lean theorem prover | `lean-lang.org`, `elan.lean-lang.org`, `reservoir.lean-lang.org` |
 | `python-native` | Python native build deps | Native toolchain mirrors for building Python packages from source |
+| `copilot-vendor` | Copilot plan-specific APIs / telemetry | `api.business.githubcopilot.com`, `api.enterprise.githubcopilot.com`, `api.individual.githubcopilot.com`, `telemetry.enterprise.githubcopilot.com` |
+| `copilot` | Copilot engine transport | `api.githubcopilot.com`, GitHub API/web, `host.docker.internal`, `raw.githubusercontent.com` |
+| `claude` | Claude engine transport | Anthropic APIs, GitHub transport, certificate/OCSP services, Ubuntu package metadata, Playwright downloads |
+| `codex` | Codex engine transport | `api.openai.com`, `chatgpt.com`, GitHub API/web, `host.docker.internal` |
+| `gemini` | Gemini engine transport | `generativelanguage.googleapis.com`, `*.googleapis.com`, GitHub web, `host.docker.internal` |
+| `pi` | Pi engine transport | `api.githubcopilot.com`, GitHub web, `host.docker.internal`, `raw.githubusercontent.com` |
+| `pi-base` | Pi provider-independent baseline | `github.com`, `host.docker.internal`, `raw.githubusercontent.com` |
+| `threat-detection` | Compatibility alias for Copilot threat detection | Copilot API/telemetry hosts, GitHub API/web, `host.docker.internal`, `registry.npmjs.org` |
+
+## Engine Domain Sets
+
+Engine domain sets are named allow-list bundles for engine CLI authentication
+and direct provider transport. They are **not** added automatically. Add the
+matching identifier to `network.allowed` only when the agent needs direct
+egress to that engine's domains; agent inference normally runs through the AWF
+API proxy.
+
+| Engine set | Included domains |
+|---|---|
+| `copilot` | `api.github.com`, `api.githubcopilot.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com` |
+| `claude` | Anthropic APIs, GitHub transport, certificate/OCSP services, Ubuntu package metadata, Playwright downloads, and `host.docker.internal` |
+| `codex` | `172.30.0.1`, `api.github.com`, `api.openai.com`, `chatgpt.com`, `github.com`, `host.docker.internal`, `openai.com` |
+| `gemini` | `*.googleapis.com`, `generativelanguage.googleapis.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com` |
+| `pi` | `api.githubcopilot.com`, `github.com`, `host.docker.internal`, `raw.githubusercontent.com`; provider-scoped models replace the API host with the selected provider endpoint |
+| `pi-base` | `github.com`, `host.docker.internal`, `raw.githubusercontent.com`; applied as the provider-independent baseline before a provider prefix is resolved |
+| `threat-detection` | Applied automatically only to Copilot threat-detection runs and available as a compatibility alias: Copilot API and telemetry hosts, `api.github.com`, `github.com`, `host.docker.internal`, and `registry.npmjs.org` for read-only lockfile validation. |
 
 ## Invalid Shorthands
+
+Services started inside the agent's AWF sandbox are reachable at `localhost` and
+`127.0.0.1` without `local`: those addresses are on the default proxy bypass
+list. Add `local` only when a workflow needs the firewall allowlist to represent
+loopback access explicitly, such as a different runtime topology.
 
 These look like ecosystem identifiers but are **not recognised** — using them causes a **compile-time error**:
 
@@ -131,7 +162,7 @@ For workflows that build, test, or install packages, add the matching ecosystem 
 
 ## Common Patterns
 
-### Workflow that reads GitHub data only
+Reads GitHub data only:
 
 ```yaml
 network:
@@ -140,16 +171,7 @@ network:
     - github
 ```
 
-### Node.js CI workflow
-
-```yaml
-network:
-  allowed:
-    - defaults
-    - node
-```
-
-### Multi-language project
+Multi-language project:
 
 ```yaml
 network:
@@ -159,19 +181,4 @@ network:
     - python
 ```
 
-### Calling an external API
-
-```yaml
-network:
-  allowed:
-    - defaults
-    - api.myservice.com
-    - "*.myservice.com"
-```
-
-### No outbound network access
-
-```yaml
-network:
-  allowed: []
-```
+Single ecosystem, external APIs, and no-network forms are in [Quick Reference](#quick-reference).

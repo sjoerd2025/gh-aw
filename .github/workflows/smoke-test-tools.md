@@ -2,7 +2,8 @@
 private: true
 emoji: "🧪"
 description: Smoke test to validate common development tools are available in the agent container
-on: 
+on:
+  schedule: every 2 days
   slash_command:
     name: smoke-test-tools
     strategy: centralized
@@ -17,7 +18,8 @@ permissions:
   issues: read
   pull-requests: read
 name: Agent Container Smoke Test
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 strict: true
 runtimes:
   node:
@@ -52,8 +54,14 @@ timeout-minutes: 5
 imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
+  - shared/playwright-title-test.md
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
+    runtime: cloud-hypervisor
 ---
 
 # Smoke Test: Agent Container Tools

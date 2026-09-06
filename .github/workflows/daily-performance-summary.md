@@ -14,12 +14,11 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 engine:
-  id: copilot
-  copilot-sdk: true
-max-tool-denials: 3
+  id: pi
+  model-provider: openai
+model: openai/gpt-5.4
 strict: true
 tracker-id: daily-performance-summary
 tools:
@@ -33,12 +32,13 @@ safe-outputs:
     allowed-exts: [.png, .jpg, .jpeg, .svg]
   close-discussion:
     required-title-prefix: "[daily performance] "
-timeout-minutes: 30
+timeout-minutes: 40
 imports:
   - uses: shared/daily-audit-charts.md
     with:
       title-prefix: "[daily performance] "
   - shared/github-queries-mcp-script.md
+  - shared/reporting.md
 
 
   - shared/otlp.md
@@ -87,14 +87,20 @@ The following tools are available for querying GitHub data:
 
 ### 1.1 Query Pull Requests
 
+Calculate one UTC `window_start` timestamp exactly 90 days before the run and use the same value in every query and Python filter. Do not count closed or merged items only because their `updatedAt` is inside the window; the query tools use `updatedAt` for pagination, so lifecycle metrics must be filtered again by `mergedAt` or `closedAt`.
+
 **Use the `github-pr-query` mcp-script tool** to get PR data:
 
 ```
-github-pr-query with state: "all", limit: 1000, jq: "."
+github-pr-query with state: "all", since: "<window_start>", jq: "."
+github-pr-query with state: "open", limit: 1000, jq: "."
 ```
 
+Save the rolling-window candidate output to `/tmp/gh-aw/python/data/prs.json` and the current open backlog output to `/tmp/gh-aw/python/data/open_prs.json`.
+
 The tool provides:
-- PR count by state (open, closed, merged)
+- PRs updated since `window_start` for the activity candidate set; filter totals by `createdAt >= window_start` and merged throughput by `mergedAt >= window_start` in analysis
+- Current open PR backlog from the separate open query
 - Time to merge for merged PRs
 - Authors contributing PRs
 - Review decision distribution
@@ -104,11 +110,15 @@ The tool provides:
 **Use the `github-issue-query` mcp-script tool** to get issue data:
 
 ```
-github-issue-query with state: "all", limit: 1000, jq: "."
+github-issue-query with state: "all", since: "<window_start>", jq: "."
+github-issue-query with state: "open", limit: 1000, jq: "."
 ```
 
+Save the rolling-window candidate output to `/tmp/gh-aw/python/data/issues.json` and the current open backlog output to `/tmp/gh-aw/python/data/open_issues.json`.
+
 The tool provides:
-- Issue count by state (open, closed)
+- Issues updated since `window_start` for the activity candidate set; filter totals by `createdAt >= window_start` and resolved throughput by `closedAt >= window_start` in analysis
+- Current open issue backlog from the separate open query
 - Time to close for closed issues
 - Label distribution
 - Authors creating issues
@@ -118,7 +128,7 @@ The tool provides:
 **Use the `github-discussion-query` mcp-script tool** to get discussion data:
 
 ```
-github-discussion-query with limit: 1000, jq: "."
+github-discussion-query with since: "<UTC timestamp exactly 90 days before this run>", jq: "."
 ```
 
 The tool provides:
@@ -174,51 +184,57 @@ def load_json_data(filepath):
 
 # Load data
 prs = load_json_data(f'{DATA_DIR}/prs.json')
+open_prs = load_json_data(f'{DATA_DIR}/open_prs.json')
 issues = load_json_data(f'{DATA_DIR}/issues.json')
+open_issues = load_json_data(f'{DATA_DIR}/open_issues.json')
 discussions = load_json_data(f'{DATA_DIR}/discussions.json')
 
 # Calculate metrics
-now = datetime.now()
+now = pd.Timestamp.now(tz='UTC')
 ninety_days_ago = now - timedelta(days=90)
 
 # PR metrics
 pr_df = pd.DataFrame(prs) if prs else pd.DataFrame()
+open_pr_count = len(open_prs)
 if not pr_df.empty:
-    pr_df['createdAt'] = pd.to_datetime(pr_df['createdAt'])
-    pr_df['mergedAt'] = pd.to_datetime(pr_df['mergedAt'])
+    pr_df['createdAt'] = pd.to_datetime(pr_df['createdAt'], utc=True)
+    pr_df['mergedAt'] = pd.to_datetime(pr_df['mergedAt'], utc=True)
     
-    merged_prs = pr_df[pr_df['mergedAt'].notna()]
+    created_prs = pr_df[pr_df['createdAt'] >= ninety_days_ago].copy()
+    merged_prs = pr_df[pr_df['mergedAt'].notna() & (pr_df['mergedAt'] >= ninety_days_ago)].copy()
     merged_prs['time_to_merge'] = merged_prs['mergedAt'] - merged_prs['createdAt']
     avg_merge_time = merged_prs['time_to_merge'].mean() if len(merged_prs) > 0 else timedelta(0)
     
     pr_metrics = {
-        'total': len(pr_df),
+        'total': len(created_prs),
         'merged': len(merged_prs),
-        'open': len(pr_df[pr_df['state'] == 'OPEN']),
+        'open': open_pr_count,
         'avg_merge_time_hours': avg_merge_time.total_seconds() / 3600 if avg_merge_time else 0,
-        'unique_authors': pr_df['author'].apply(lambda x: x.get('login') if isinstance(x, dict) else x).nunique()
+        'unique_authors': created_prs['author'].apply(lambda x: x.get('login') if isinstance(x, dict) else x).nunique()
     }
 else:
-    pr_metrics = {'total': 0, 'merged': 0, 'open': 0, 'avg_merge_time_hours': 0, 'unique_authors': 0}
+    pr_metrics = {'total': 0, 'merged': 0, 'open': open_pr_count, 'avg_merge_time_hours': 0, 'unique_authors': 0}
 
 # Issue metrics
 issue_df = pd.DataFrame(issues) if issues else pd.DataFrame()
+open_issue_count = len(open_issues)
 if not issue_df.empty:
-    issue_df['createdAt'] = pd.to_datetime(issue_df['createdAt'])
-    issue_df['closedAt'] = pd.to_datetime(issue_df['closedAt'])
+    issue_df['createdAt'] = pd.to_datetime(issue_df['createdAt'], utc=True)
+    issue_df['closedAt'] = pd.to_datetime(issue_df['closedAt'], utc=True)
     
-    closed_issues = issue_df[issue_df['closedAt'].notna()]
+    created_issues = issue_df[issue_df['createdAt'] >= ninety_days_ago].copy()
+    closed_issues = issue_df[issue_df['closedAt'].notna() & (issue_df['closedAt'] >= ninety_days_ago)].copy()
     closed_issues['time_to_close'] = closed_issues['closedAt'] - closed_issues['createdAt']
     avg_close_time = closed_issues['time_to_close'].mean() if len(closed_issues) > 0 else timedelta(0)
     
     issue_metrics = {
-        'total': len(issue_df),
-        'open': len(issue_df[issue_df['state'] == 'OPEN']),
+        'total': len(created_issues),
+        'open': open_issue_count,
         'closed': len(closed_issues),
         'avg_close_time_hours': avg_close_time.total_seconds() / 3600 if avg_close_time else 0
     }
 else:
-    issue_metrics = {'total': 0, 'open': 0, 'closed': 0, 'avg_close_time_hours': 0}
+    issue_metrics = {'total': 0, 'open': open_issue_count, 'closed': 0, 'avg_close_time_hours': 0}
 
 # Discussion metrics
 discussion_df = pd.DataFrame(discussions) if discussions else pd.DataFrame()
@@ -407,8 +423,6 @@ Create a new discussion with the comprehensive performance report.
 
 ### Discussion Format
 
-- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
-
 **Title**: `[daily performance] Daily Performance Summary - YYYY-MM-DD`
 
 **Body**:
@@ -509,8 +523,11 @@ A successful run will:
 
 This workflow uses mcp-script tools imported from `shared/github-queries-mcp-script.md`:
 1. Tools are defined in the shared workflow with shell script implementations
-2. Each tool supports jq-based filtering for efficient data querying
-3. Tools are authenticated with `GITHUB_TOKEN` for GitHub API access
-4. Call tools with parameters like: `github-pr-query with state: "all", limit: 1000, jq: "."`
+2. Set `window_start` to the exact UTC timestamp 90 days before the run; the tools paginate by `updatedAt` through that boundary rather than using a record cap
+3. Use `createdAt >= window_start` for total PR/issue activity, `mergedAt >= window_start` for merged PR metrics, and `closedAt >= window_start` for resolved issue metrics; do not use `updatedAt` as the final metric date
+4. Query open PRs/issues separately without `since` and save them to `open_prs.json` / `open_issues.json` so backlog counts are current rather than update-window counts
+5. Each tool supports jq-based filtering for efficient data querying
+6. Tools are authenticated with `GITHUB_TOKEN` for GitHub API access
+7. Call tools with parameters like: `github-pr-query with state: "all", since: "YYYY-MM-DDT00:00:00Z", jq: "."`
 
 Begin your analysis now. **Use the mcp-script tools** to gather data, run Python analysis, generate charts, and create the discussion report.

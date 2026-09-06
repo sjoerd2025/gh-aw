@@ -7,7 +7,11 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
+const { getSetupTimeoutMs } = require("./child_process_timeouts.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+
+const GIT_COMMAND_TIMEOUT_MS = getSetupTimeoutMs("gitBranch");
+const GH_COMMAND_TIMEOUT_MS = getSetupTimeoutMs("outcomeGh");
 
 function parseManifestEntries(entriesJSON = process.env.GH_AW_CHECKOUT_MANIFEST_ENTRIES || "[]") {
   let parsed;
@@ -70,6 +74,7 @@ function resolveDefaultBranch(repository, checkoutPath, options = {}) {
     try {
       const output = runGit(["-C", repoPath, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], {
         stdio: ["ignore", "pipe", "pipe"],
+        timeout: GIT_COMMAND_TIMEOUT_MS,
       });
       defaultBranch = output.trim().replace(/^origin\//, "");
       core.debug(`build_checkout_manifest: git resolved default branch for ${repository}: ${defaultBranch}`);
@@ -83,6 +88,7 @@ function resolveDefaultBranch(repository, checkoutPath, options = {}) {
       const checkoutToken = options.checkoutToken || "";
       const ghExecOptions = {
         stdio: ["ignore", "pipe", "pipe"],
+        timeout: GH_COMMAND_TIMEOUT_MS,
       };
       if (checkoutToken !== "") {
         ghExecOptions.env = { GH_TOKEN: checkoutToken };
@@ -113,7 +119,7 @@ function buildCheckoutManifest(entries, options = {}) {
   try {
     fs.mkdirSync(manifestDir, { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create directory ${manifestDir}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to create directory ${manifestDir}: ${getErrorMessage(err)}`, { cause: err });
   }
   const manifestPath = path.join(manifestDir, "checkout-manifest.json");
   const manifest = {};
@@ -147,7 +153,7 @@ function buildCheckoutManifest(entries, options = {}) {
   try {
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
   } catch (err) {
-    throw new Error(`Failed to write file ${manifestPath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to write file ${manifestPath}: ${getErrorMessage(err)}`, { cause: err });
   }
   core.info(`checkout-manifest written to ${manifestPath}`);
   return { manifestPath, manifest };

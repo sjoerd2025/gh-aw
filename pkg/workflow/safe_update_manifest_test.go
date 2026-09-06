@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -179,7 +180,7 @@ func TestNewGHAWManifest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			m := NewGHAWManifest(tt.secretNames, tt.actionRefs, tt.resolutionFailures, tt.containers, tt.redirect, tt.skillSpecs, tt.onField)
+			m := NewGHAWManifest(tt.secretNames, tt.actionRefs, tt.resolutionFailures, tt.containers, tt.redirect, tt.skillSpecs, nil, tt.onField)
 			require.NotNil(t, m, "manifest should not be nil")
 			assert.Equal(t, tt.wantVersion, m.Version, "manifest version")
 			if tt.wantSecrets != nil {
@@ -210,6 +211,124 @@ func TestNewGHAWManifest(t *testing.T) {
 	}
 }
 
+func TestCollectMemoryValidationScripts(t *testing.T) {
+	data := &WorkflowData{
+		RepoMemoryConfig: &RepoMemoryConfig{Memories: []RepoMemoryEntry{
+			{ID: "repo", Validation: &MemoryValidationConfig{Script: "repo validation"}},
+		}},
+		CacheMemoryConfig: &CacheMemoryConfig{Caches: []CacheMemoryEntry{
+			{ID: "cache", Validation: &MemoryValidationConfig{Script: "cache validation"}},
+			{ID: "unvalidated"},
+		}},
+		DriveMemoryConfig: &DriveMemoryConfig{Drives: []DriveMemoryEntry{
+			{ID: "drive", Validation: &MemoryValidationConfig{Script: "drive validation"}},
+		}},
+	}
+
+	scripts := collectMemoryValidationScripts(data)
+
+	require.Len(t, scripts, 3)
+	assert.Equal(t, "cache-memory:cache", scripts[0].Memory)
+	assert.Equal(t, "drive-memory:drive", scripts[1].Memory)
+	assert.Equal(t, "repo-memory:repo", scripts[2].Memory)
+	assert.Len(t, scripts[0].SHA256, 64)
+	assert.Len(t, scripts[1].SHA256, 64)
+	assert.Len(t, scripts[2].SHA256, 64)
+	assert.NotEqual(t, scripts[0].SHA256, scripts[1].SHA256)
+	assert.NotEqual(t, scripts[1].SHA256, scripts[2].SHA256)
+}
+
+func TestCollectMCPServersForManifest(t *testing.T) {
+	data := &WorkflowData{
+		Tools: map[string]any{
+			"github": map[string]any{
+				"allowed": []any{"list_issues", "get_issue"},
+			},
+			"my-api": map[string]any{
+				"type":    "http",
+				"url":     "https://api.example.test/mcp",
+				"allowed": []any{"fetch_data", "list_items"},
+			},
+			"all-tools": map[string]any{
+				"command": "npx example-mcp",
+			},
+			"dispatch_workflow": map[string]any{
+				"type": "http",
+				"url":  "https://example.test/mcp",
+			},
+			"cache-memory": true,
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			CreateIssues: &CreateIssuesConfig{},
+			NoOp:         &NoOpConfig{},
+			Scripts: map[string]*SafeScriptConfig{
+				"triage-script": {},
+			},
+		},
+		MCPScripts: &MCPScriptsConfig{Tools: map[string]*MCPScriptToolConfig{
+			"lookup": {Name: "lookup"},
+		}},
+	}
+
+	servers := collectMCPServersForManifest(data)
+
+	assert.Equal(t, []GHAWManifestMCPServer{
+		{Name: "all-tools", Tools: []string{"*"}},
+		{Name: "github", Tools: []string{"get_issue", "list_issues"}},
+		{Name: "mcpscripts", Tools: []string{"lookup"}},
+		{Name: "my-api", Tools: []string{"fetch_data", "list_items"}},
+		{Name: "safeoutputs", Tools: []string{"create_issue", "noop", "triage_script"}},
+	}, servers)
+}
+
+func TestCollectMCPServersForManifestGitHubToolsets(t *testing.T) {
+	servers := collectMCPServersForManifest(&WorkflowData{
+		Tools: map[string]any{
+			"github": map[string]any{
+				"toolsets": []any{"repos", "issues"},
+			},
+		},
+	})
+
+	require.Len(t, servers, 1)
+	assert.Equal(t, "github", servers[0].Name)
+	assert.Contains(t, servers[0].Tools, "list_issues")
+	assert.NotContains(t, servers[0].Tools, "actions_list")
+	assert.NotContains(t, servers[0].Tools, "get_me")
+}
+
+func TestCollectMCPServersForManifestGitHubGHProxy(t *testing.T) {
+	servers := collectMCPServersForManifest(&WorkflowData{
+		Tools: map[string]any{
+			"github": map[string]any{
+				"mode": "gh-proxy",
+			},
+		},
+	})
+
+	assert.Empty(t, servers)
+}
+
+func TestStringsFromAnySlice(t *testing.T) {
+	assert.Equal(t, []string{"first", "second"}, stringsFromAnySlice([]any{"first", "second"}))
+	assert.Equal(t, []string{"first", "second"}, stringsFromAnySlice([]string{"first", "second"}))
+	assert.Equal(t, []string{"tool"}, stringsFromAnySlice("tool"))
+	assert.Equal(t, []string{"*"}, stringsFromAnySlice(""))
+	assert.Equal(t, []string{"*"}, stringsFromAnySlice(42))
+}
+
+func TestGHAWManifestMCPServersAlwaysSerialized(t *testing.T) {
+	json, err := (&GHAWManifest{
+		Version:    1,
+		Secrets:    []string{},
+		Actions:    []GHAWManifestAction{},
+		MCPServers: collectMCPServersForManifest(&WorkflowData{}),
+	}).ToJSON()
+
+	require.NoError(t, err)
+	assert.Contains(t, json, `"mcp_servers":[]`)
+}
+
 func TestNewGHAWManifestContainerDigest(t *testing.T) {
 	containers := []GHAWManifestContainer{
 		{
@@ -221,7 +340,7 @@ func TestNewGHAWManifestContainerDigest(t *testing.T) {
 			Image: "alpine:3.14", // no digest
 		},
 	}
-	m := NewGHAWManifest(nil, nil, nil, containers, "", nil, nil)
+	m := NewGHAWManifest(nil, nil, nil, containers, "", nil, nil, nil)
 	require.Len(t, m.Containers, 2, "should have two containers")
 
 	// Sorted: alpine before node
@@ -431,4 +550,23 @@ func TestParseActionRefs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewGHAWManifestPlugins(t *testing.T) {
+	m := NewGHAWManifest(nil, nil, nil, nil, "", nil, []string{
+		"octo-org/agent-plugin@" + strings.Repeat("a", 40),
+		"octo-org/agent-plugin@" + strings.Repeat("a", 40), // duplicate, deduplicated
+		"octo-org/other-plugin@" + strings.Repeat("b", 40),
+	}, nil)
+	require.NotNil(t, m, "manifest should not be nil")
+	assert.Equal(t, []string{
+		"octo-org/agent-plugin@" + strings.Repeat("a", 40),
+		"octo-org/other-plugin@" + strings.Repeat("b", 40),
+	}, m.Plugins, "manifest plugins should be deduplicated and sorted")
+}
+
+func TestNewGHAWManifestPluginsEmpty(t *testing.T) {
+	m := NewGHAWManifest(nil, nil, nil, nil, "", nil, nil, nil)
+	require.NotNil(t, m, "manifest should not be nil")
+	assert.Nil(t, m.Plugins, "manifest plugins should be nil when no plugins are provided")
 }

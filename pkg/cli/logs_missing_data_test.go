@@ -12,6 +12,7 @@ import (
 )
 
 func TestExtractMissingDataFromRun_IncludesExperimentProvenance(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-*")
 
 	testRun := WorkflowRun{
@@ -47,7 +48,7 @@ func TestExtractMissingDataFromRun_IncludesExperimentProvenance(t *testing.T) {
 		],
 		"errors": []
 	}`
-	if err := os.WriteFile(filepath.Join(tmpDir, constants.AgentOutputArtifactName), []byte(safeOutput), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, constants.AgentOutputArtifactName.String()), []byte(safeOutput), 0o644); err != nil {
 		t.Fatalf("Failed to create safe output file: %v", err)
 	}
 
@@ -72,6 +73,7 @@ func TestExtractMissingDataFromRun_IncludesExperimentProvenance(t *testing.T) {
 }
 
 func TestExtractMissingDataFromRun_NoExperimentProvenance(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-*")
 
 	testRun := WorkflowRun{
@@ -90,7 +92,7 @@ func TestExtractMissingDataFromRun_NoExperimentProvenance(t *testing.T) {
 		],
 		"errors": []
 	}`
-	if err := os.WriteFile(filepath.Join(tmpDir, constants.AgentOutputArtifactName), []byte(safeOutput), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, constants.AgentOutputArtifactName.String()), []byte(safeOutput), 0o644); err != nil {
 		t.Fatalf("Failed to create safe output file: %v", err)
 	}
 

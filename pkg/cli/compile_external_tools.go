@@ -27,11 +27,13 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var compileExternalToolsLog = logger.New("cli:compile_external_tools")
@@ -81,15 +83,40 @@ func RunYamllintOnFiles(lockFiles []string, verbose bool, strict bool) error {
 	return runBatchLockFileTool("yamllint", lockFiles, verbose, strict, runYamllintOnFiles)
 }
 
+// RunShellcheckOnLockFiles runs shellcheck on the run: step scripts extracted
+// from the provided lock files. Shellcheck must be installed as a system binary;
+// unlike other tools it does not use Docker. When shellcheck is not available
+// the function returns nil (callers are responsible for warning the user).
+func RunShellcheckOnLockFiles(ctx context.Context, lockFiles []string, verbose bool, strict bool) error {
+	return RunShellcheckOnLockFilesAndResources(ctx, lockFiles, nil, verbose, strict)
+}
+
+// RunShellcheckOnLockFilesAndResources runs shellcheck on run steps extracted
+// from lock files and shell script resources defined in workflow frontmatter.
+func RunShellcheckOnLockFilesAndResources(ctx context.Context, lockFiles []string, resources []workflow.ShellScriptResource, verbose bool, strict bool) error {
+	if len(lockFiles) == 0 && len(resources) == 0 {
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("Running shellcheck on run steps (0 lock files and 0 frontmatter resources found)"))
+		compileExternalToolsLog.Printf("No shell script resources to process with shellcheck")
+		return nil
+	}
+
+	compileExternalToolsLog.Printf("Running batch shellcheck on %d lock files and %d frontmatter resources", len(lockFiles), len(resources))
+	return handleBatchToolError("shellcheck", runShellcheckOnLockFilesAndResources(ctx, lockFiles, resources, verbose, strict), strict, verbose)
+}
+
 // RunSyftOnLockFiles runs the syft SBOM scanner on container images extracted
 // from the gh-aw-manifest headers in the provided lock files.
 func RunSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 	return runBatchLockFileTool("syft", lockFiles, verbose, strict, runSyftOnLockFiles)
 }
 
-// runBatchLockFileTool runs a batch tool on lock files with uniform error handling
+// runBatchLockFileTool runs a batch tool on lock files with uniform error handling.
+// Even when there are zero lock files to process, an explicit stderr marker is
+// emitted so downstream completeness checks (e.g. static-analysis-report.md) can
+// distinguish "tool ran with zero input" from "tool was never invoked".
 func runBatchLockFileTool(toolName string, lockFiles []string, verbose bool, strict bool, runner func([]string, bool, bool) error) error {
 	if len(lockFiles) == 0 {
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage(fmt.Sprintf("Running %s (0 lock files found)", toolName)))
 		compileExternalToolsLog.Printf("No lock files to process with %s", toolName)
 		return nil
 	}
@@ -112,12 +139,13 @@ func handleBatchToolError(toolName string, err error, strict, verbose bool) erro
 	if err == nil {
 		return nil
 	}
-	if strict {
+	var fatal *fatalFindingError
+	if strict || errors.As(err, &fatal) {
 		return fmt.Errorf("%s failed: %w", toolName, err)
 	}
 	// In non-strict mode, errors are warnings
 	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("%s warnings: %v", toolName, err)))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("%s warnings: %v", toolName, err)))
 	}
 	return nil
 }

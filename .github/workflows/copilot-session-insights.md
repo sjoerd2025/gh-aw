@@ -24,9 +24,6 @@ network:
     - github
     - python
 
-sandbox:
-  agent:
-    sudo: false
 tools:
   cli-proxy: true
   github:
@@ -44,6 +41,7 @@ tools:
   timeout: 300
 
 imports:
+  - shared/mcp-pagination.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[copilot-session-insights] "
@@ -56,6 +54,7 @@ imports:
   - shared/copilot-session-data-fetch.md
   - shared/session-analysis-charts.md
   - shared/session-analysis-strategies.md
+  - shared/reporting.md
 
   - shared/otlp.md
 timeout-minutes: 45
@@ -67,6 +66,7 @@ evals:
   - id: insights_report_produced
     question: Was a report produced with usage patterns, success rates, and performance metrics?
 ---
+
 # Copilot coding agent Session Analysis
 
 You are an AI analytics agent specializing in analyzing Copilot coding agent sessions to extract insights, identify behavioral patterns, and recommend improvements.
@@ -199,8 +199,8 @@ jq -n \
     . as $pr |
     ($gate_counts[$pr.head_branch] // 0) as $gates |
 
-    # Check agent assignment: look for copilot-swe-agent in assignees
-    ([$pr.assignees[] | select(. == "copilot-swe-agent")] | length == 0) as $no_agent |
+    # Check agent assignment: look for Copilot in assignees
+    ([$pr.assignees[] | select(. == "Copilot")] | length == 0) as $no_agent |
 
     # Only include PRs with >= 5 gates and no agent assigned
     select($gates >= 5 and $no_agent) |
@@ -244,13 +244,19 @@ Use this data to populate the **Orphaned Branch Escalation Alerts** section in t
 - **≥5 simultaneous gate firings** + **no agent assigned** + **1–2 hours wait** → warning — monitor closely
 
 **Historical Comparison**:
-- Compare today's orphaned rate against the historical baseline (~40%) stored in cache memory.
-- If today's rate exceeds 50%, flag as an elevated waste pattern.
-- Save orphan metrics to cache for trend tracking:
+- Do **not** assume a fixed baseline. Compute the historical baseline dynamically from the orphan-rate history stored in cache memory:
   ```bash
   mkdir -p /tmp/gh-aw/cache-memory/session-analysis/
-  # Append today's orphan stats to history.json (see cache memory management section)
+  # Mean orphaned rate (percent) over the last 30 recorded days; "null" when no history exists
+  jq -r '[.analyses[]? | select(.orphan_rate != null)] | sort_by(.date) | .[-30:]
+         | if length == 0 then "null"
+           else ((((map(.orphan_rate) | add) / length * 10) | round) / 10 | tostring) end' \
+    /tmp/gh-aw/cache-memory/session-analysis/history.json 2>/dev/null
   ```
+- Report the computed value (rounded to one decimal) as the **Historical Baseline**, together with the number of recorded days it covers.
+- If fewer than 3 days of history are available, report the baseline as `insufficient history` and use the absolute fallback threshold below.
+- Flag ⚠️ ELEVATED when today's rate exceeds the baseline by more than 20 percentage points; when no usable baseline exists, fall back to flagging rates above 50%.
+- Save today's orphan metrics (including `orphan_rate`) to `history.json` for trend tracking — see the cache memory management section.
 
 ### Phase 3: Insight Synthesis
 
@@ -272,12 +278,6 @@ Generate a human-readable Markdown report and create a discussion.
 ```
 Daily Copilot Agent Session Analysis — [YYYY-MM-DD]
 ```
-
-### Report Formatting
-
-- Use h3 (`###`) or lower for all headers in the discussion body. Never use h1 (`#`) or h2 (`##`) — these are reserved for the discussion title.
-- Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability and reduce scrolling.
-- Keep Executive Summary, Key Metrics, and Recommendations always visible; collapse verbose per-session data in `<details>` blocks.
 
 **Discussion Template**:
 
@@ -366,8 +366,8 @@ Common indicators of inefficiency or failure:
 ##### Summary
 
 - **Orphaned Branches Today**: [N] out of [TOTAL] active branches ([%])
-- **Historical Baseline**: ~40% orphaned rate
-- **Status**: [NORMAL / ⚠️ ELEVATED] (flag if today's rate > 50%)
+- **Historical Baseline**: [X.X]% orphaned rate (30-day mean over [N] recorded days, or `insufficient history`)
+- **Status**: [NORMAL / ⚠️ ELEVATED] (flag if today's rate exceeds the baseline by >20 percentage points, or >50% when no baseline is available)
 
 <details>
 <summary><b>Escalation Candidate Details</b></summary>

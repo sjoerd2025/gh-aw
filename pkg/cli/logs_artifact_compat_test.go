@@ -14,6 +14,7 @@ import (
 // TestArtifactNamingBackwardCompatibility tests that both old and new artifact
 // directory names are correctly flattened to the expected file names
 func TestArtifactNamingBackwardCompatibility(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name               string
 		artifactDirName    string
@@ -73,13 +74,13 @@ func TestArtifactNamingBackwardCompatibility(t *testing.T) {
 		// Detection artifact - renamed from threat-detection.log to detection
 		{
 			name:               "old threat-detection.log artifact (legacy)",
-			artifactDirName:    constants.LegacyDetectionArtifactName,
+			artifactDirName:    constants.LegacyDetectionArtifactName.String(),
 			fileNameInArtifact: "detection.log",
 			expectedFileName:   "detection.log",
 		},
 		{
 			name:               "new detection artifact",
-			artifactDirName:    constants.DetectionArtifactName,
+			artifactDirName:    constants.DetectionArtifactName.String(),
 			fileNameInArtifact: "detection.log",
 			expectedFileName:   "detection.log",
 		},
@@ -87,6 +88,7 @@ func TestArtifactNamingBackwardCompatibility(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmpDir := testutil.TempDir(t, "test-*")
 
 			// Create artifact directory structure as it would be downloaded by gh run download
@@ -131,6 +133,7 @@ func TestArtifactNamingBackwardCompatibility(t *testing.T) {
 // TestAuditCommandFindsNewArtifacts verifies that the audit command can find artifacts
 // with both old and new naming schemes after flattening
 func TestAuditCommandFindsNewArtifacts(t *testing.T) {
+	t.Parallel()
 	// Simulate downloading new artifacts with upload-artifact@v5 naming
 	tmpDir := testutil.TempDir(t, "test-*")
 

@@ -13,6 +13,10 @@ permissions:
 
 max-ai-credits: 50000
 tracker-id: ci-coach-daily
+network:
+  allowed:
+    - defaults
+    - node
 engine:
   id: copilot
   copilot-sdk: true
@@ -20,10 +24,11 @@ max-tool-denials: 3
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [issues, pull_requests]
   edit:
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[ci-coach] "
@@ -34,6 +39,7 @@ imports:
   - shared/ci-optimization-strategies.md
   - shared/reporting.md
   - shared/otlp.md
+  - shared/graders.md
 experiments:
   prompt_style:
     variants: [detailed, concise]
@@ -47,7 +53,9 @@ experiments:
       - name: empty_output_rate
         threshold: "<=0.05"
     min_samples: 20
-    weight: [50, 50]
+    continual:
+      seed: ci-coach-prompt-style-v1
+      ramp: [10, 25, 50]
     start_date: "2026-05-15"
     analysis_type: mann_whitney
     issue: 32335
@@ -55,12 +63,13 @@ features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 evals:
   - id: repair-or-optimization-path
     question: Did the workflow check validation-status first and then follow the correct repair or optimization path for this run?
   - id: pr-created-or-noop
     question: Was a focused CI improvement pull request created when actionable work was found, or was noop called when CI was already healthy?
+
 ---
 
 # CI Optimization Coach

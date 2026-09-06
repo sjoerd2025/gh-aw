@@ -13,29 +13,284 @@ const {
   AWF_MODELS_URL_MAX_ATTEMPTS,
   AWF_MODELS_URL_RETRY_BASE_MS,
   AWF_MODELS_URL_RETRY_MAX_MS,
+  AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS,
+  AWF_PROVIDER_LISTENER_READY_RETRY_MS,
+  AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS,
+  DEFAULT_API_PROXY_HOST_BRIDGE,
   GEMINI_MODEL_NAME_PREFIX,
+  deriveBaseUrlFromModelsURL,
   enrichReflectModels,
   extractModelIds,
   fetchAWFReflect,
   fetchModelsFromUrl,
+  waitForProviderListenerReady,
   getCatalogModelEntry,
+  hasAPIProxyLocalhostAlias,
   inferProviderTypeForModel,
   inferWireApiForModel,
+  parseReflectTimeoutMs,
+  resolveOpenAICompatibleEndpointFromReflect,
   resolveProviderEndpointFromReflect,
   resolveMultiProviderFromReflect,
+  rewriteAPIProxyURLForHostBridge,
 } = require("./awf_reflect.cjs");
 
 describe("awf_reflect.cjs", () => {
   describe("constants", () => {
     it("exports expected default values", () => {
       expect(AWF_API_PROXY_REFLECT_URL).toBe("http://api-proxy:10000/reflect");
-      expect(AWF_REFLECT_OUTPUT_PATH).toBe("/tmp/gh-aw/sandbox/firewall/awf-reflect.json");
+      expect(AWF_REFLECT_OUTPUT_PATH).toBe(path.join(process.env.RUNNER_TEMP || os.tmpdir(), "awf-reflect.json"));
       expect(AWF_REFLECT_TIMEOUT_MS).toBe(60000);
       expect(AWF_MODELS_URL_TIMEOUT_MS).toBe(3000);
       expect(AWF_MODELS_URL_MAX_ATTEMPTS).toBe(5);
       expect(AWF_MODELS_URL_RETRY_BASE_MS).toBe(250);
       expect(AWF_MODELS_URL_RETRY_MAX_MS).toBe(2000);
+      expect(AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS).toBe(15000);
+      expect(AWF_PROVIDER_LISTENER_READY_RETRY_MS).toBe(250);
+      expect(AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS).toBe(2000);
+      expect(DEFAULT_API_PROXY_HOST_BRIDGE).toBe("host.docker.internal");
       expect(GEMINI_MODEL_NAME_PREFIX).toBe("models/");
+    });
+
+    it("falls back to the default reflect timeout when the environment value is invalid", () => {
+      expect(parseReflectTimeoutMs("")).toBe(60000);
+      expect(parseReflectTimeoutMs("not-a-number")).toBe(60000);
+      expect(parseReflectTimeoutMs("12abc")).toBe(60000);
+      expect(parseReflectTimeoutMs("999999999999999999999999")).toBe(60000);
+      expect(parseReflectTimeoutMs("1234")).toBe(1234);
+    });
+  });
+
+  describe("waitForProviderListenerReady", () => {
+    it("returns ok when listener accepts a connection", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        queueMicrotask(() => listeners.connect && listeners.connect());
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          removeAllListeners() {
+            return this;
+          },
+          end() {},
+          destroy() {},
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "http://api-proxy:10002",
+        timeoutMs: 500,
+        retryDelayMs: 1,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result).toEqual({ ok: true });
+      expect(probingConnect).toHaveBeenCalled();
+    });
+
+    it("returns timeout when listener keeps refusing connections", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        queueMicrotask(() => listeners.error && listeners.error(new Error("connect ECONNREFUSED")));
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          end() {},
+          destroy() {},
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "http://api-proxy:10002",
+        timeoutMs: 20,
+        retryDelayMs: 1,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("timeout");
+      expect(result.error).toContain("ECONNREFUSED");
+    });
+
+    it("returns invalid_base_url for malformed baseUrl", async () => {
+      const result = await waitForProviderListenerReady({
+        baseUrl: "not a url",
+        logger: () => {},
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("invalid_base_url");
+    });
+
+    it("returns timeout when the per-attempt timer fires (hung connect)", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        // Never fire "connect" or "error" — simulates a hung connection attempt.
+        return {
+          once() {
+            return this;
+          },
+          end() {},
+          destroy() {},
+          removeAllListeners() {
+            return this;
+          },
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "http://api-proxy:10002",
+        timeoutMs: 50,
+        retryDelayMs: 1,
+        perAttemptTimeoutMs: 5,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("timeout");
+      expect(result.error).toContain("timed out after");
+    });
+
+    it("uses a TLS secureConnect handshake for https:// baseUrls", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        queueMicrotask(() => listeners.secureConnect && listeners.secureConnect());
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          removeAllListeners() {
+            return this;
+          },
+          end() {},
+          destroy() {},
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "https://api-proxy:10443",
+        timeoutMs: 500,
+        retryDelayMs: 1,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result).toEqual({ ok: true });
+    });
+
+    it("does not report ready on a bare TCP connect for https:// baseUrls", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        // Only fires "connect" (bare TCP), never "secureConnect" (TLS handshake complete).
+        queueMicrotask(() => listeners.connect && listeners.connect());
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          removeAllListeners() {
+            return this;
+          },
+          end() {},
+          destroy() {},
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "https://api-proxy:10443",
+        timeoutMs: 20,
+        retryDelayMs: 1,
+        perAttemptTimeoutMs: 5,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("timeout");
+    });
+
+    it("ignores a late error emitted after a successful connect", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        queueMicrotask(() => listeners.connect && listeners.connect());
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          removeAllListeners(event) {
+            delete listeners[event];
+            return this;
+          },
+          end() {},
+          destroy() {
+            // Simulate a trailing error emitted after destroy(). The "error" listener must
+            // still be installed (an EventEmitter without one would throw), and the handler
+            // must ignore it because the probe already settled as ready.
+            if (!listeners.error) throw new Error("error listener was removed before destroy()");
+            listeners.error(new Error("late ECONNRESET"));
+          },
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "http://api-proxy:10002",
+        timeoutMs: 500,
+        retryDelayMs: 1,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result).toEqual({ ok: true });
+    });
+  });
+
+  describe("rewriteAPIProxyURLForHostBridge", () => {
+    it("does not rewrite api-proxy URLs without a localhost HOSTALIASES mapping", () => {
+      const env = { HOSTALIASES: "/tmp/aliases" };
+      const readFileSync = () => "other-host localhost\n";
+
+      expect(hasAPIProxyLocalhostAlias(env, readFileSync)).toBe(false);
+      expect(rewriteAPIProxyURLForHostBridge("http://api-proxy:10002/models", env, readFileSync)).toBe("http://api-proxy:10002/models");
+    });
+
+    it("rewrites api-proxy URLs when HOSTALIASES maps api-proxy to localhost", () => {
+      const env = { HOSTALIASES: "/tmp/aliases" };
+      const readFileSync = () => "# generated by awf\napi-proxy localhost\n";
+
+      expect(hasAPIProxyLocalhostAlias(env, readFileSync)).toBe(true);
+      expect(rewriteAPIProxyURLForHostBridge("http://api-proxy:10002/models", env, readFileSync)).toBe("http://host.docker.internal:10002/models");
+    });
+
+    it("uses an override bridge host when provided", () => {
+      const env = { HOSTALIASES: "/tmp/aliases", GH_AW_API_PROXY_HOST_BRIDGE: "172.30.0.1" };
+      const readFileSync = () => "api-proxy 127.0.0.1\n";
+
+      expect(rewriteAPIProxyURLForHostBridge("http://api-proxy:10002", env, readFileSync)).toBe("http://172.30.0.1:10002");
+    });
+  });
+
+  describe("deriveBaseUrlFromModelsURL", () => {
+    it("strips a trailing /models segment and leaves non-bridged hosts untouched", () => {
+      const env = {};
+      const readFileSync = () => "";
+
+      expect(deriveBaseUrlFromModelsURL("http://api-proxy:10002/v1/models", env, readFileSync)).toBe("http://api-proxy:10002/v1");
+    });
+
+    it("rewrites the api-proxy host to the HOSTALIASES bridge host, matching resolveProviderEndpointFromReflect", () => {
+      // Regression test: the crush harness previously derived its chat-completions
+      // base URL from models_url without reapplying the api-proxy -> host bridge
+      // rewrite, so it sent requests to the unresolvable "api-proxy" hostname even
+      // though resolveProviderEndpointFromReflect's baseUrl was already rewritten.
+      const env = { HOSTALIASES: "/tmp/aliases" };
+      const readFileSync = () => "api-proxy localhost\n";
+
+      expect(deriveBaseUrlFromModelsURL("http://api-proxy:10002/v1/models", env, readFileSync)).toBe("http://host.docker.internal:10002/v1");
+    });
+
+    it("defaults to process.env and fs.readFileSync when not provided, with no path prefix before /models", () => {
+      expect(deriveBaseUrlFromModelsURL("http://example.test:10002/models")).toBe("http://example.test:10002");
     });
   });
 
@@ -133,6 +388,49 @@ describe("awf_reflect.cjs", () => {
           endpointProvider: "openai",
           port: 10000,
           baseUrl: "http://api-proxy:10000",
+        });
+      });
+    });
+
+    describe("resolveOpenAICompatibleEndpointFromReflect", () => {
+      const reflectData = {
+        endpoints: [
+          { provider: "openai", configured: true, models_url: "http://api-proxy:10000/v1/models" },
+          { provider: "copilot", configured: true, models_url: "http://api-proxy:10002/models" },
+        ],
+      };
+
+      it("derives the versionless Copilot chat endpoint for the github provider", () => {
+        expect(resolveOpenAICompatibleEndpointFromReflect({ provider: "github", reflectData, logger: () => {} })).toEqual({
+          provider: "github",
+          endpointProvider: "copilot",
+          host: "http://api-proxy:10002",
+          basePath: "chat/completions",
+        });
+      });
+
+      it("preserves the OpenAI v1 path", () => {
+        expect(resolveOpenAICompatibleEndpointFromReflect({ provider: "openai", reflectData, logger: () => {} })).toEqual({
+          provider: "openai",
+          endpointProvider: "openai",
+          host: "http://api-proxy:10000",
+          basePath: "v1/chat/completions",
+        });
+      });
+
+      it("does not fall back to a different configured provider", () => {
+        expect(resolveOpenAICompatibleEndpointFromReflect({ provider: "anthropic", reflectData, logger: () => {} })).toBeNull();
+      });
+
+      it("rewrites the host bridge for definition-based engine OpenAI-compatible endpoints", () => {
+        const env = { HOSTALIASES: "/tmp/aliases" };
+        const readFileSync = () => "api-proxy localhost\n";
+
+        expect(resolveOpenAICompatibleEndpointFromReflect({ provider: "github", reflectData, logger: () => {}, env, readFileSync })).toEqual({
+          provider: "github",
+          endpointProvider: "copilot",
+          host: "http://host.docker.internal:10002",
+          basePath: "chat/completions",
         });
       });
     });
@@ -261,6 +559,70 @@ describe("awf_reflect.cjs", () => {
       expect(logs.some(l => l.includes("models fetch returned 503"))).toBe(true);
     });
 
+    it("retries on 429 and eventually succeeds", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn()
+          .mockResolvedValueOnce({ ok: false, status: 429, headers: { get: () => null } })
+          .mockResolvedValueOnce({ ok: false, status: 429, headers: { get: () => null } })
+          .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-4o" }] }) })
+      );
+
+      const logs = [];
+      const result = await fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+      expect(result).toEqual(["gpt-4o"]);
+      expect(logs.filter(l => l.includes("retrying (attempt")).length).toBe(2);
+      expect(logs.some(l => l.includes("models fetch returned 429"))).toBe(true);
+      expect(logs.some(l => l.includes("fetched 1 model(s)"))).toBe(true);
+    });
+
+    it("stops retrying after max attempts on repeated 429 responses", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 429, headers: { get: () => null } }));
+
+      const logs = [];
+      const result = await fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+      expect(result).toBeNull();
+      expect(logs.filter(l => l.includes("retrying (attempt")).length).toBe(AWF_MODELS_URL_MAX_ATTEMPTS - 1);
+      expect(logs.some(l => l.includes("models fetch returned 429"))).toBe(true);
+    });
+
+    it("honors a valid Retry-After header when retrying a 429", async () => {
+      vi.useFakeTimers();
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: false, status: 429, headers: { get: name => (name === "retry-after" ? "3" : null) } })
+        .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-4o" }] }) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const logs = [];
+      const run = fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+
+      // Let the first attempt settle before advancing timers.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Retry-After: 3 requests a 3000ms wait, but it is capped to AWF_MODELS_URL_RETRY_MAX_MS (2000ms).
+      await vi.advanceTimersByTimeAsync(AWF_MODELS_URL_RETRY_MAX_MS - 1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await run;
+
+      expect(result).toEqual(["gpt-4o"]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([400, 401, 403])("does not retry a permanent %d response", async status => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status }));
+
+      const logs = [];
+      const result = await fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+      expect(result).toBeNull();
+      expect(logs.some(l => l.includes("retrying (attempt"))).toBe(false);
+      expect(logs.some(l => l.includes(`models fetch returned ${status}`))).toBe(true);
+    });
+
     it("delays initial probe for github-oidc auth when probing api-proxy", async () => {
       vi.useFakeTimers();
       process.env.AWF_AUTH_TYPE = "github-oidc";
@@ -286,6 +648,29 @@ describe("awf_reflect.cjs", () => {
   describe("fetchAWFReflect", () => {
     afterEach(() => {
       vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    });
+
+    it("skips network requests when reflection is disabled", async () => {
+      const fetchMock = vi.fn();
+      const logs = [];
+      vi.stubGlobal("fetch", fetchMock);
+      vi.stubEnv("GH_AW_SKIP_REFLECT", "true");
+
+      await expect(
+        fetchAWFReflect({
+          reflectUrl: "http://api-proxy:10000/reflect",
+          outputPath: "/tmp/gh-aw-test-noop.json",
+          logger: msg => logs.push(msg),
+        })
+      ).resolves.toEqual({
+        ok: false,
+        reflectUrl: "http://api-proxy:10000/reflect",
+        outputPath: "/tmp/gh-aw-test-noop.json",
+        reason: "disabled",
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(logs).toContain("awf-reflect: disabled by GH_AW_SKIP_REFLECT");
     });
 
     it("saves enriched reflect data when api-proxy returns null models for configured provider", async () => {
@@ -369,6 +754,30 @@ describe("awf_reflect.cjs", () => {
         status: 503,
       });
       expect(logs.some(l => l.includes("unexpected status 503"))).toBe(true);
+    });
+
+    it("returns reflect data even when persisting awf-reflect output fails", async () => {
+      const reflectPayload = { endpoints: [{ provider: "copilot", configured: true, models: ["copilot/claude-sonnet-4.6"] }] };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => reflectPayload }));
+      const logs = [];
+
+      await expect(
+        fetchAWFReflect({
+          reflectUrl: "http://api-proxy:10000/reflect",
+          outputPath: "/tmp/gh-aw-test-read-only/awf-reflect.json",
+          timeoutMs: 500,
+          logger: msg => logs.push(msg),
+          writeFileSync: () => {
+            throw new Error("EROFS: read-only file system");
+          },
+        })
+      ).resolves.toEqual({
+        ok: true,
+        reflectUrl: "http://api-proxy:10000/reflect",
+        outputPath: "/tmp/gh-aw-test-read-only/awf-reflect.json",
+        reflectData: reflectPayload,
+      });
+      expect(logs.some(l => l.includes("unable to persist reflect payload"))).toBe(true);
     });
 
     it("uses the caller-supplied logger for all messages", async () => {
@@ -539,6 +948,26 @@ describe("awf_reflect.cjs", () => {
       expect(result).not.toBeNull();
       expect(result.providers).toHaveLength(1);
       expect(result.model).toBe("gpt-5.4");
+    });
+
+    it("rewrites provider baseUrl to the host bridge in sbx HOSTALIASES mode", () => {
+      const originalHostAliases = process.env.HOSTALIASES;
+      const aliasesPath = path.join(os.tmpdir(), `awf-hostaliases-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      fs.writeFileSync(aliasesPath, "api-proxy localhost\n", "utf8");
+      process.env.HOSTALIASES = aliasesPath;
+      try {
+        const result = resolveMultiProviderFromReflect({
+          reflectData: { endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-5.4"] }] },
+        });
+        expect(result.providers[0].baseUrl).toBe("http://host.docker.internal:10002");
+      } finally {
+        if (originalHostAliases === undefined) {
+          delete process.env.HOSTALIASES;
+        } else {
+          process.env.HOSTALIASES = originalHostAliases;
+        }
+        fs.rmSync(aliasesPath, { force: true });
+      }
     });
 
     it("returns null when no configured endpoints exist", () => {

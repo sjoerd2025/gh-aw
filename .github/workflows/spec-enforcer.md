@@ -18,10 +18,12 @@ network:
   - defaults
   - github
   - go
+  - node
 imports:
 - shared/reporting.md
 - shared/otlp.md
 safe-outputs:
+  steer: true
   create-pull-request:
     draft: false
     expires: 3d
@@ -30,41 +32,25 @@ safe-outputs:
     - testing
     - automation
     title-prefix: "[spec-enforcer] "
+  upload-code-coverage:
 description: Generates and maintains specification-driven test suites for each Go package, relying on README.md specifications rather than source code
 emoji: 📋
 max-turns: 100
-model: copilot/gpt-5.4
+model: openai/gpt-5.4
 engine:
-  id: pi
+  id: codex
+  model-provider: openai
 name: Package Specification Enforcer
 strict: true
 timeout-minutes: 30
 tools:
   bash:
-  - cat pkg/*/README.md
-  - find pkg -maxdepth 1 -type d
-  - find pkg/* -maxdepth 0 -type d
-  - find pkg -name "*_test.go" -type f
-  - find pkg -name "README.md" -type f
-  - ls pkg/*/
-  - head -n * pkg/*/*.go
-  - cat pkg/*/*.go
-  - wc -l pkg/*/*.go
-  - grep -rn "func Test" pkg --include="*_test.go"
-  - grep -rn "func [A-Z]" pkg --include="*.go"
-  - grep -rn "type [A-Z]" pkg --include="*.go"
-  - grep -rn "package " pkg --include="*.go"
-  - "git log --oneline --since=\"7 days ago\" -- pkg/*/README.md"
-  - "git diff HEAD -- pkg/*"
-  - git status
-  - go test -v -run "TestSpec" ./pkg/...
-  - go test -v -list "TestSpec" ./pkg/...
-  - go build ./pkg/...
+  - "*"
   cache-memory: true
   cli-proxy: true
   edit: null
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
     - default
 tracker-id: spec-enforcer
@@ -73,6 +59,9 @@ evals:
     question: Did the agent process at least one Go package for specification-driven test generation?
   - id: pr_created_or_noop
     question: Was a pull request created with new or updated test suites, or was noop used when no packages required test generation?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Package Specification Enforcer
@@ -315,6 +304,18 @@ Then pass both outputs to the `test-output-classifier` agent. Use the returned J
 2. `flag_spec_ambiguity` → add `// SPEC_AMBIGUITY: <description>`
 3. `flag_spec_mismatch` → add `// SPEC_MISMATCH: <description>` and document it in the PR body
 4. `investigate` → re-read the spec section before deciding
+
+When one or more generated or updated spec tests pass validation, publish one experimental coverage report for the processed package set:
+
+```bash
+mkdir -p /tmp/gh-aw/spec-enforcer "$RUNNER_TEMP/gh-aw/safeoutputs/upload-code-coverage"
+go install github.com/boumenot/gocover-cobertura@4afa1205ab3b54ae098dd4724c1657aad10f7484
+go test ./pkg/<package>/... -run "TestSpec" -covermode=atomic -coverprofile=/tmp/gh-aw/spec-enforcer/coverage.out
+"$(go env GOPATH)/bin/gocover-cobertura" < /tmp/gh-aw/spec-enforcer/coverage.out > "$RUNNER_TEMP/gh-aw/safeoutputs/upload-code-coverage/cobertura.xml"
+```
+
+Only after verifying `cobertura.xml` exists and is non-empty, call `upload_code_coverage` with
+`file: "cobertura.xml"`, `language: "Go"`, and `label: "spec-enforcer/generated-tests"`.
 
 ## Phase 5: Save Cache and Create PR
 

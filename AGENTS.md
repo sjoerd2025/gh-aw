@@ -30,6 +30,8 @@ Everything else should be loaded **lazily** through skills only when needed.
 5. Do not add `.lock.yml` files to `.gitignore`.
 6. Never attempt to trigger a workflow run (e.g., `gh run`, `gh aw run`) as part of a Copilot cloud agent run. The token does not have the required access. Always fail with an error — do not task the user or ask them to run it manually.
 7. **Large-file guard**: before reading any file with `github-mcp-server-get_file_contents`, check its size. Files larger than 20 KB must be read with targeted tools (`grep`, `glob`, `bash`, or `view` with `view_range`) instead of full-file reads. See [token-optimization.md](.github/aw/token-optimization.md) for the full technique.
+8. Never ask the user to confirm the plan. Always execute the plan.
+9. **Autopilot mode**: Never ask for confirmation before taking action. Never prompt the user with "Should I proceed?", "Do you want me to…?", or any equivalent. Always act immediately and autonomously.
 
 ## Upstream-managed workflow sources (read-only in this repo)
 
@@ -46,19 +48,26 @@ Workflows that declare a `source:` frontmatter entry (for example `source: githu
 
 Use skills only when the task requires specialized guidance. Do not pre-load every skill.
 
-When the relevant skill is not obvious, first discover candidates and then load only the minimal guidance needed:
+All skills are local to this repository under `.github/skills/`. **NEVER** use GitHub Agent Finder (`agentfinder.github.com`) or any other remote skill discovery service to look for skills.
 
-- Query GitHub Agent Finder directly with the built-in REST API at `https://agentfinder.github.com/api/v1/search`.
-- Send an ARD search request with the user's task in `query.text`; do not ask the user for the endpoint.
+When the relevant skill is not obvious, first discover candidates locally and then load only the minimal guidance needed:
+
+- Discover skills by listing or searching `.github/skills/*/SKILL.md` in this repository.
 - Use **skill fusion** after discovery: read only the specific skill sections or fragments needed instead of loading full skills broadly.
 
 ### Use these skills by intent
 
 - Workflow create/update/debug/upgrade tasks → `.github/skills/agentic-workflows/SKILL.md`
 - Core engineering conventions, validation flow, and command playbooks → `.github/skills/developer/SKILL.md`
+- Code organization, file structure, WASM stubs, string patterns → `.github/skills/developer-code-organization/SKILL.md`
+- Security best practices, template injection, shell script safety, supply chain → `.github/skills/developer-security/SKILL.md`
+- Compiler internals, validation architecture, safe outputs, schema, MCP logs → `.github/skills/developer-internals/SKILL.md`
+- Adding or extending declarative agentic engines → `.github/skills/custom-engine-implementation/SKILL.md`
+- Release management, breaking CLI change rules, firewall log parsing → `.github/skills/developer-release/SKILL.md`
 - Error handling design/patterns → `.github/skills/error-recovery-patterns/SKILL.md`
 - GitHub MCP usage patterns → `.github/skills/github-mcp-server/SKILL.md`
 - Query helpers for issues/PRs/workflows/discussions/labels → matching `.github/skills/github-*-query/SKILL.md`
+- Security-focused reviews of agentic workflow changes (compile/scans/audit/optimization) → `.github/skills/review-agentic-workflows/SKILL.md`
 - Doc-writing conventions → `.github/skills/documentation/SKILL.md`
 - Reviewing or writing `git`/`gh`/remote operations against checkouts (per-checkout credentials, sparse/shallow monorepos, safe-outputs MCP runs without credentials) → `.github/skills/checkout-credential-review/SKILL.md`
 - Authoring, validating, or debugging canvas extensions (loopback servers, actions, iframe rendering, state model, theme tokens) → `.github/skills/create-canvas/SKILL.md`
@@ -99,6 +108,26 @@ DEBUG_COLORS=0 DEBUG=* gh aw compile workflow.md 2>debug.log
 | `*` | Everything |
 
 To discover the exact namespace for a package, look for `logger.New(...)` at the top of the relevant `.go` file (e.g. `var log = logger.New("cli:run_workflow_execution")`).
+
+### Adding debug logs
+
+When adding new debug instrumentation to Go code, use `pkg/logger` — **never** `fmt.Println`, `log.Printf`, or other ad-hoc output:
+
+```go
+import "github.com/github/gh-aw/pkg/logger"
+
+var log = logger.New("cli:my_package") // one per file/package, at package scope
+
+func doSomething() {
+    log.Debug("starting operation", "key", value)
+    // ...
+    log.Debug("operation complete", "result", result)
+}
+```
+
+- Pick a namespace that matches the existing hierarchy (e.g. `cli:`, `workflow:`, `mcp:`).
+- Pass structured key/value pairs after the message for queryable context.
+- All output is gated by `DEBUG` at runtime — no user-visible noise in normal operation.
 
 ### GitHub Actions debug runs
 

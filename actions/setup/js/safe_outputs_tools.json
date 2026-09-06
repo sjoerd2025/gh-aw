@@ -1,5 +1,71 @@
 [
   {
+    "name": "linear_create_issue",
+    "description": "Use this to create an issue in the Linear team fixed by safe-outputs.linear-create-issue.team-id or LINEAR_TEAM_ID and optional project fixed by project-id or LINEAR_PROJECT_ID. The Linear credential, team ID, and project ID are trusted workflow configuration and are not agent inputs.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["title", "body"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Final Linear issue title. Standard Safe Outputs title sanitization is applied.",
+          "x-safe-output-sanitization": "title"
+        },
+        "body": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 65000,
+          "description": "Linear issue description in Markdown. Standard Safe Outputs content sanitization is applied.",
+          "x-safe-output-sanitization": "content"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "linear_add_comment",
+    "description": "Add a comment to the Linear issue fixed by safe-outputs.linear-add-comment.target. The target and Linear credential are trusted workflow configuration and are not agent inputs.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["body"],
+      "properties": {
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65000,
+          "description": "Comment body in Markdown. Standard Safe Outputs content sanitization is applied.",
+          "x-safe-output-sanitization": "content"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "linear_update_issue",
+    "description": "Use this to update explicitly enabled fields on the Linear issue fixed by safe-outputs.linear-update-issue.target. The target and Linear credential are trusted workflow configuration and are not agent inputs. Provide at least one of title or body.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Replacement Linear issue title. Standard Safe Outputs title sanitization is applied.",
+          "x-safe-output-sanitization": "title"
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 65000,
+          "description": "Replacement Linear issue description in Markdown. Standard Safe Outputs content sanitization is applied.",
+          "x-safe-output-sanitization": "content"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "create_issue",
     "description": "WRITE-ONCE: do NOT call this tool with empty or placeholder arguments to probe or discover its schema \u2014 required fields (title, body) are listed in this schema; if you are not ready to open the real issue, call `noop` instead. Creates a new GitHub issue for tracking bugs, feature requests, or tasks. Use this for actionable work items that need assignment, labeling, and status tracking. For reports, announcements, or status updates that don't require task tracking, use create_discussion instead. Compatibility: labels may be passed as either an array of strings or a comma-separated string; string input is split, trimmed, and normalized to an array.",
     "inputSchema": {
@@ -32,18 +98,18 @@
         },
         "fields": {
           "type": "array",
-          "description": "Optional issue fields to set after creating the issue (e.g., Priority, Iteration, Start Date).",
+          "description": "Optional issue fields to set after creating the issue (e.g., Priority, Tags, Start Date).",
           "items": {
             "type": "object",
             "required": ["name", "value"],
             "properties": {
               "name": {
                 "type": "string",
-                "description": "Issue field name exactly as configured in the repository (e.g., \"Priority\", \"Iteration\")."
+                "description": "Issue field name exactly as configured in the repository (e.g., \"Priority\", \"Tags\")."
               },
               "value": {
                 "type": ["string", "number"],
-                "description": "Field value. Use string for text, single-select, iteration, and date (YYYY-MM-DD) fields; use number for numeric fields."
+                "description": "Field value. Use string for text, single-select, date (YYYY-MM-DD), and multi-select fields (comma-separated option names, e.g. \"Bug, Regression\"); use number for numeric fields."
               }
             },
             "additionalProperties": false
@@ -52,6 +118,14 @@
         "parent": {
           "type": ["number", "string"],
           "description": "Parent issue number for creating sub-issues. This is the numeric ID from the GitHub URL (e.g., 42 in github.com/owner/repo/issues/42). Can also be a temporary_id from a previously created issue in the same workflow run \u2014 use the '#aw_abc123' form (e.g., '#aw_Test123'); the bare 'aw_abc123' form is also accepted and normalised to '#aw_abc123'."
+        },
+        "blocked_by": {
+          "type": ["number", "string", "array"],
+          "items": {
+            "type": ["number", "string"]
+          },
+          "description": "Issue dependencies that block this issue. Provide one issue number, temporary_id, owner/repo#number reference, GitHub issue URL, or an array of these references. Temporary IDs are resolved before the dependency is created.",
+          "x-synonyms": ["blockedBy", "blocked-by"]
         },
         "temporary_id": {
           "type": "string",
@@ -66,6 +140,127 @@
         "integrity": {
           "type": "string",
           "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "jira_create_issue",
+    "description": "Jira create issue: Create a new issue in Jira. This writes to Jira, not GitHub. Provide ordinary text; description is converted to Atlassian Document Format internally.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["project_key", "issue_type", "summary"],
+      "properties": {
+        "project_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": ".*\\S.*",
+          "description": "Jira project key that owns the new issue, for example ENG."
+        },
+        "issue_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": ".*\\S.*",
+          "description": "Human-readable Jira issue type name, for example Task or Bug."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": ".*\\S.*",
+          "description": "Short Jira issue summary, for example Investigate parser failure."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32767,
+          "pattern": ".*\\S.*",
+          "description": "Optional plain-text Jira issue description. Converted to Atlassian Document Format internally."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "jira_update_issue",
+    "description": "Jira update issue: Update the summary or description of an existing Jira issue. This writes to Jira, not GitHub, and does not transition the issue or change its labels. Provide at least one field to update.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["issue_key"],
+      "properties": {
+        "issue_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": ".*\\S.*",
+          "description": "Key of an already-existing Jira issue, for example ENG-123. Issues created by `jira_create_issue` in this run cannot be referenced."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": ".*\\S.*",
+          "description": "Optional replacement Jira issue summary."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32767,
+          "pattern": ".*\\S.*",
+          "description": "Optional replacement plain-text Jira issue description. Converted to Atlassian Document Format internally."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "jira_add_comment",
+    "description": "Jira add comment: Add a comment to an existing Jira issue. This writes to Jira, not GitHub. Provide ordinary text; the body is converted to Atlassian Document Format internally.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["issue_key", "body"],
+      "properties": {
+        "issue_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": ".*\\S.*",
+          "description": "Key of an already-existing Jira issue, for example ENG-123. Issues created by `jira_create_issue` in this run cannot be referenced."
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32767,
+          "pattern": ".*\\S.*",
+          "description": "Plain-text comment body. Converted to Atlassian Document Format internally."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "jira_add_label",
+    "description": "Jira add label: Add one label to an existing Jira issue without replacing or removing its current labels. This writes to Jira, not GitHub.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["issue_key", "label"],
+      "properties": {
+        "issue_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": ".*\\S.*",
+          "description": "Key of an already-existing Jira issue, for example ENG-123. Issues created by `jira_create_issue` in this run cannot be referenced."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "One Jira label to add, for example needs-investigation. Use letters, numbers, periods, hyphens, and underscores. Existing labels are preserved."
         }
       },
       "additionalProperties": false
@@ -327,15 +522,15 @@
           "description": "Node ID of the discussion comment to reply to, enabling threaded discussion comments. When provided, the new comment is posted as a reply to the specified top-level discussion comment. If the given node ID belongs to a nested reply, the handler automatically resolves it to the top-level parent. Only applicable for discussion comments \u2014 ignored for issue and pull request comments.",
           "x-synonyms": ["replyToId"]
         },
-        "comment_id": {
-          "type": ["number", "string"],
-          "description": "Existing issue or pull request comment ID to update instead of creating a new comment.",
-          "x-synonyms": ["commentId"]
-        },
         "target": {
           "type": "string",
           "enum": ["status"],
           "description": "When set to 'status', updates the activation status comment for this run (if available) instead of creating a new comment."
+        },
+        "comment_id": {
+          "type": ["number", "string"],
+          "description": "Existing issue or pull request comment ID to update. Only valid when the workflow config sets safe-outputs.add-comment.target to '*' and the ID is present in safe-outputs.add-comment.allows-comment-ids. Use this only for comment IDs precomputed by trusted workflow steps.",
+          "x-synonyms": ["commentId", "comment-id"]
         },
         "secrecy": {
           "type": "string",
@@ -351,7 +546,7 @@
     "x-safe-outputs-target-requirements": {
       "*": {
         "primary": "item_number",
-        "anyOf": ["item_number", "pr_number", "pr"]
+        "anyOf": ["item_number", "pr_number", "pr", "comment_id"]
       }
     }
   },
@@ -377,7 +572,24 @@
         },
         "base": {
           "type": "string",
-          "description": "Target base branch for the pull request. This override is only allowed when workflow configuration sets safe-outputs.create-pull-request.allowed-base-branches and the value matches one of those patterns."
+          "description": "Target base branch for the pull request. This override is only allowed when workflow configuration sets safe-outputs.create-pull-request.allowed-base-branches and the value matches one of those patterns, or when it names the branch of a pull request created earlier in the same run (a stacked pull request). Stacked pull requests are rejected when safe-outputs.create-pull-request.stacked is false."
+        },
+        "stack_position": {
+          "type": ["number", "string"],
+          "description": "Optional 1-based position of this pull request within a stack of dependent pull requests. Recorded in the pull request body as stack metadata.",
+          "x-synonyms": ["stackPosition"]
+        },
+        "stack_root": {
+          "type": "string",
+          "description": "Optional branch name of the root of the pull request stack (the branch the first pull request in the stack targets). Recorded in the pull request body as stack metadata.",
+          "x-synonyms": ["stackRoot"]
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional list of branch names this pull request depends on (branches of earlier pull requests in the same stack). Used to detect circular stack dependencies and to record stack metadata."
         },
         "labels": {
           "type": "array",
@@ -471,7 +683,7 @@
   },
   {
     "name": "submit_pull_request_review",
-    "description": "Submit a pull request review with a status decision. By default this tool targets the pull request that triggered the workflow. When the workflow is configured with `target: \"*\"`, you must specify `pull_request_number` to indicate which PR to target. REQUIRED: every call must include either a non-empty body or be preceded by at least one create_pull_request_review_comment call; calling with no body and no prior comments is rejected with ERR_VALIDATION. All preceding create_pull_request_review_comment outputs are automatically attached as inline comments. If this tool is not called, buffered review comments are submitted as a COMMENT review at workflow end. Use COMMENT for non-blocking feedback; use REQUEST_CHANGES only for merge-blocking. Example (inline-only review): call create_pull_request_review_comment one or more times, then call this tool with event: COMMENT and no body.",
+    "description": "WRITE-ONCE: do NOT call this tool with empty or placeholder arguments to probe or discover its schema \u2014 this call must include a non-empty `body` for `REQUEST_CHANGES`, or for `APPROVE`/`COMMENT` be preceded by at least one create_pull_request_review_comment call when `body` is omitted; if you are not ready to submit the real review, call `noop` instead. A minimal valid call for the triggering PR looks like {\"body\": \"Looks good overall.\", \"event\": \"COMMENT\"} (add `pull_request_number` when `target: \"*\"`). Submit a pull request review with a status decision. By default this tool targets the pull request that triggered the workflow. When the workflow is configured with `target: \"*\"`, you must specify `pull_request_number` to indicate which PR to target. REQUIRED: every call must include either a non-empty body or be preceded by at least one create_pull_request_review_comment call; calling with no body and no prior comments is rejected with ERR_VALIDATION. All preceding create_pull_request_review_comment outputs are automatically attached as inline comments. If this tool is not called, buffered review comments are submitted as a COMMENT review at workflow end. Use COMMENT for non-blocking feedback; use REQUEST_CHANGES only for merge-blocking. Example (inline-only review): call create_pull_request_review_comment one or more times, then call this tool with event: COMMENT and no body. This tool records a real review-submission intent. Do not use it for placeholder reviews, auth checks, or probing. Call it only when the final review is ready; otherwise use noop or report_incomplete.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -788,6 +1000,43 @@
     }
   },
   {
+    "name": "replace_label",
+    "description": "Replace one label with another on an existing GitHub issue or pull request. Use this to transition labels atomically (for example, from 'triage' to 'in-progress').",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "label_to_remove": {
+          "type": "string",
+          "description": "Label name to remove from the issue or pull request, e.g. 'triage'."
+        },
+        "label_to_add": {
+          "type": "string",
+          "description": "Label name to add to the issue or pull request, e.g. 'in-progress'."
+        },
+        "item_number": {
+          "type": ["number", "string"],
+          "pattern": "^(\\d+|#?aw_[A-Za-z0-9_]{3,12})$",
+          "description": "Issue or PR number to update labels on. This is the numeric ID from the GitHub URL (e.g., 456 in github.com/owner/repo/issues/456). Can also be a temporary_id from a previously created issue in the same workflow run — use the '#aw_abc123' form; the bare 'aw_abc123' form is also accepted and normalised to '#aw_abc123'. If omitted, uses the issue or pull request that triggered this workflow.",
+          "x-synonyms": ["itemNumber"]
+        },
+        "repo": {
+          "type": "string",
+          "description": "Target repository in 'owner/repo' format. If omitted, uses the configured target repository. Must be in the allowed-repos list if specified."
+        },
+        "secrecy": {
+          "type": "string",
+          "description": "Confidentiality level of the message content (e.g., \"public\", \"internal\", \"private\")."
+        },
+        "integrity": {
+          "type": "string",
+          "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "required": ["label_to_remove", "label_to_add"],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "add_reviewer",
     "description": "Add reviewers (users or teams) to a GitHub pull request. Reviewers receive notifications and can approve or request changes. Use 'copilot' as a reviewer name to request the Copilot PR review bot. Provide at least one of 'reviewers' (user logins) or 'team_reviewers' (team slugs).",
     "inputSchema": {
@@ -1088,7 +1337,7 @@
   },
   {
     "name": "update_pull_request",
-    "description": "Update an existing GitHub pull request's title or body. Supports replacing, appending to, or prepending content to the body. Title is always replaced. Only the fields you specify will be updated; other fields remain unchanged. REQUIRED: You must provide at least one of: 'title' (a non-empty string), 'body' (a string), or 'update_branch' set to true (not false). Omitting all three, or passing only 'update_branch: false', will return a -32602 error.",
+    "description": "Update an existing GitHub pull request's title or body. Supports replacing, appending to, prepending, or replacing a run-specific section of the body. Title is always replaced. Only the fields you specify will be updated; other fields remain unchanged. REQUIRED: You must provide at least one of: 'title' (a non-empty string), 'body' (a string), or 'update_branch' set to true (not false). Omitting all three, or passing only 'update_branch: false', will return a -32602 error.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1098,13 +1347,13 @@
         },
         "body": {
           "type": "string",
-          "description": "Pull request body content in Markdown. For 'replace', this becomes the entire body. For 'append'/'prepend', this is added with a separator.",
+          "description": "Pull request body content in Markdown. For 'replace', this becomes the entire body. For 'append'/'prepend', this is added with a separator. For 'replace-island', only the run-specific section is updated.",
           "maxLength": 65536
         },
         "operation": {
           "type": "string",
-          "enum": ["replace", "append", "prepend"],
-          "description": "How to update the PR body: 'replace' (default - completely overwrite), 'append' (add to end with separator), or 'prepend' (add to start with separator). Title is always replaced."
+          "enum": ["replace", "append", "prepend", "replace-island"],
+          "description": "How to update the PR body: 'replace' (default - completely overwrite), 'append' (add to end with separator), 'prepend' (add to start with separator), or 'replace-island' (update a run-specific section). Title is always replaced."
         },
         "update_branch": {
           "type": "boolean",
@@ -1193,7 +1442,7 @@
   },
   {
     "name": "push_to_pull_request_branch",
-    "description": "Push committed changes to a pull request's branch. APPEND-ONLY: this tool adds new commits on top of the existing PR branch \u2014 force-push is NOT supported and will be rejected. Use this to add follow-up commits to an existing PR, such as addressing review feedback or fixing issues. This is a write-once declaration for a real intended PR branch update, not a sandbox or probe: do not call it with probe branches, placeholder commit messages, or auth experiments. If you are not ready to push the real update, use noop or report_incomplete instead. Changes must be committed locally before calling this tool. IMPORTANT: always supply the 'branch' argument with the local branch name you committed to. In batch workflows that process multiple PRs, this is required \u2014 if omitted, the branch is inferred from the current git HEAD, which will produce wrong results if the workspace has been checked out to a different branch between commit and tool-call time. IMPORTANT: do NOT use 'git merge' to update the branch against another branch \u2014 merge commits cannot be signed; the action will attempt to squash them into a single linear commit before pushing, but this rewrites history. Use 'git rebase' instead to avoid the rewrite. This tool auto-pins the PR branch HEAD before pushing, so it takes no concurrency-control / compare-and-swap parameter \u2014 do NOT pass expected_head_sha, head_sha, or base_sha; the only accepted fields are message, branch, and pull_request_number.",
+    "description": "Push committed changes to a pull request's branch. APPEND-ONLY: this tool adds new commits on top of the existing PR branch \u2014 force-push is NOT supported and will be rejected. Use this to add follow-up commits to an existing PR, such as addressing review feedback or fixing issues. This is a write-once declaration for a real intended PR branch update, not a sandbox or probe: do not call it with probe branches, placeholder commit messages, or auth experiments. If you are not ready to push the real update, use noop or report_incomplete instead. Changes must be committed locally before calling this tool. IMPORTANT: always supply the 'branch' argument with the local branch name you committed to. In batch workflows that process multiple PRs, this is required \u2014 if omitted, the branch is inferred from the current git HEAD, which will produce wrong results if the workspace has been checked out to a different branch between commit and tool-call time. IMPORTANT: do NOT use 'git merge' to update the branch against another branch \u2014 merge commits cannot be signed; the action will attempt to squash them into a single linear commit before pushing, but this rewrites history. Use 'git rebase' instead to avoid the rewrite. This tool auto-pins the PR branch HEAD before pushing, so it takes no concurrency-control / compare-and-swap parameter \u2014 do NOT pass expected_head_sha, head_sha, or base_sha; the only accepted fields are message, branch, pull_request_number, and repo.",
     "inputSchema": {
       "type": "object",
       "required": ["message"],
@@ -1210,8 +1459,12 @@
         },
         "pull_request_number": {
           "type": ["number", "string"],
-          "description": "Pull request number to push changes to. This is the numeric ID from the GitHub URL (e.g., 654 in github.com/owner/repo/pull/654). Required when the workflow target is '*' (any PR).",
+          "description": "Pull request number to push changes to. This is the numeric ID from the GitHub URL (e.g., 654 in github.com/owner/repo/pull/654). Required when the workflow target is '*' (any PR) — both pull_request_number and repo must be supplied together for wildcard targets.",
           "x-synonyms": ["pullRequestNumber"]
+        },
+        "repo": {
+          "type": "string",
+          "description": "Target repository in 'owner/repo' format. For multi-repo workflows where the pull request may live in a side checkout, provide this explicitly so the correct repository checkout is selected."
         },
         "secrecy": {
           "type": "string",
@@ -1226,8 +1479,9 @@
     },
     "x-safe-outputs-target-requirements": {
       "*": {
-        "primary": "pull_request_number",
-        "anyOf": ["pull_request_number"]
+        "primary": "repo",
+        "anyOf": ["repo"],
+        "allOf": ["pull_request_number"]
       }
     }
   },
@@ -1298,6 +1552,34 @@
         "integrity": {
           "type": "string",
           "description": "Trustworthiness level of the artifact source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "upload_code_coverage",
+    "description": "Experimental. Upload a code coverage report (e.g. a Cobertura XML file) to GitHub's code coverage API via actions/upload-code-coverage. Before calling this tool, write or copy the coverage report file into the upload-code-coverage staging directory at /tmp/gh-aw/safeoutputs/upload-code-coverage/ (or provide an absolute path / workspace-relative path, which will be auto-copied into staging). Shell variable syntax (for example, \"$VAR/...\") must NOT appear in file values because variables are not expanded in JSON strings. Only one coverage report can be uploaded per run.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["file", "language", "label"],
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "Path to the Cobertura XML coverage report. Three formats are accepted: (1) filename or relative path (e.g., \"cobertura.xml\" or \"coverage/cobertura.xml\") for files already in the upload staging directory at /tmp/gh-aw/safeoutputs/upload-code-coverage/; (2) absolute path (e.g., \"/tmp/gh-aw/coverage/cobertura.xml\") to auto-copy from disk into the staging directory; (3) workspace-relative path resolved from the workspace root. Do NOT use shell variable syntax like \"$VAR/...\" because shell variables are not expanded in JSON string values."
+        },
+        "language": {
+          "type": "string",
+          "description": "Linguist language name for the coverage report (e.g., \"Go\", \"Java\", \"Python\", \"JavaScript\", \"TypeScript\")."
+        },
+        "label": {
+          "type": "string",
+          "description": "Label identifying this coverage report (e.g., \"code-coverage/unit-tests\", \"code-coverage/jacoco\"). Distinguishes multiple coverage reports uploaded across different workflows or jobs."
+        },
+        "integrity": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "Trustworthiness level of the coverage report source. Must be one of \"low\", \"medium\", or \"high\"."
         }
       },
       "additionalProperties": false
@@ -1893,6 +2175,30 @@
     }
   },
   {
+    "name": "approve_workflow_run",
+    "description": "Approve a GitHub Actions workflow run awaiting required approval. Supply the positive run ID from the workflow run URL only when the run belongs to the triggering pull request or an explicitly allowed pull request. The handler approves only pull request runs that are still awaiting approval (the action-required state); runs that are no longer awaiting approval are skipped.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["run_id"],
+      "properties": {
+        "run_id": {
+          "type": ["number", "string"],
+          "description": "Positive integer workflow run ID to approve (for example, 123456789 from /actions/runs/123456789).",
+          "x-synonyms": ["runId", "workflow_run_id"]
+        },
+        "secrecy": {
+          "type": "string",
+          "description": "Confidentiality level of the message content (e.g., \"public\", \"internal\", \"private\")."
+        },
+        "integrity": {
+          "type": "string",
+          "description": "Trustworthiness level of the message source (e.g., \"low\", \"medium\", \"high\")."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "push_repo_memory",
     "description": "Validate repo-memory files are within configured size limits before the workflow completes. Call this after writing files to memory to check that the total size is within limits. Returns an error if files are too large, with guidance on how to reduce memory size so the memory can be saved successfully.",
     "inputSchema": {
@@ -1962,6 +2268,149 @@
         "primary": "pull_request_number",
         "anyOf": ["pull_request_number", "pr_number", "pr", "pull_number"]
       }
+    }
+  },
+  {
+    "name": "ado_create_work_item",
+    "description": "Experimental. Create an Azure DevOps work item and return a temporary #aw_ ID for later work-item tools in this run.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["title", "description"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 255,
+          "description": "Concise work-item title summarizing the problem or task in a few words."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 31,
+          "maxLength": 65000,
+          "description": "Detailed work-item description in Markdown, including context, repro steps, and acceptance criteria."
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "description": "Optional tags. Tags cannot contain semicolons and may be restricted by allowed-tags."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "ado_update_work_item",
+    "description": "Experimental. Update explicitly enabled fields (title, body, state, area path, iteration path, assignee, or tags) on an Azure DevOps work item to reflect the latest triage decision.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": ["number", "string"],
+          "description": "Positive work-item ID or a temporary #aw_ ID returned by ado_create_work_item."
+        },
+        "title": { "type": "string", "minLength": 1, "maxLength": 255, "description": "New work-item title to apply, replacing the existing title." },
+        "body": { "type": "string", "maxLength": 65000, "description": "New Markdown description to apply, replacing the existing description." },
+        "state": { "type": "string", "minLength": 1, "maxLength": 128, "description": "New work-item state, such as Active, Resolved, or Closed." },
+        "area_path": { "type": "string", "minLength": 1, "maxLength": 512, "description": "New area path, such as MyProject\\Platform, scoping the work item to a team." },
+        "iteration_path": { "type": "string", "minLength": 1, "maxLength": 512, "description": "New iteration path, such as MyProject\\Sprint 1, scoping the work item to a sprint." },
+        "assignee": { "type": "string", "minLength": 1, "maxLength": 256, "description": "New Azure DevOps identity, such as an email address or display name, to assign." },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "description": "New tags to apply. Tags cannot contain semicolons and may be restricted by allowed-tags."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "ado_comment_on_work_item",
+    "description": "Experimental. Add a Markdown comment to an explicitly scoped Azure DevOps work item, for example to record findings or link related context.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["work_item_id", "body"],
+      "properties": {
+        "work_item_id": {
+          "type": ["number", "string"],
+          "description": "Positive work-item ID or a temporary #aw_ ID returned by ado_create_work_item."
+        },
+        "body": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 65000,
+          "description": "Comment text in Markdown describing the update, decision, or question for the work item."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "ado_assign_work_item",
+    "description": "Experimental. Assign an allowed Azure DevOps identity, such as an email address or display name, to a work item to route ownership for follow-up.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["work_item_id", "assignee"],
+      "properties": {
+        "work_item_id": {
+          "type": ["number", "string"],
+          "description": "Positive work-item ID or a temporary #aw_ ID returned by ado_create_work_item."
+        },
+        "assignee": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Azure DevOps identity, such as an email address or display name."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "ado_link_work_items",
+    "description": "Experimental. Create a relationship, such as parent or related, between two explicitly scoped Azure DevOps work items to track dependencies.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["source_id", "target_id", "link_type"],
+      "properties": {
+        "source_id": {
+          "type": ["number", "string"],
+          "description": "Positive source work-item ID or a temporary #aw_ ID."
+        },
+        "target_id": {
+          "type": ["number", "string"],
+          "description": "Positive target work-item ID or a temporary #aw_ ID."
+        },
+        "link_type": {
+          "type": "string",
+          "enum": ["parent", "child", "related", "predecessor", "successor", "duplicate", "duplicate-of"],
+          "description": "Relationship type to create between the two work items, such as parent, child, or related."
+        },
+        "comment": { "type": "string", "minLength": 5, "maxLength": 1024, "description": "Optional Markdown comment describing why the link was created." }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "ado_upload_workitem_attachment",
+    "description": "Experimental. Upload one workspace file and attach it to an Azure DevOps work item, for example to include a screenshot or log file as evidence.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["work_item_id", "file_path"],
+      "properties": {
+        "work_item_id": {
+          "type": ["number", "string"],
+          "description": "Positive work-item ID or a temporary #aw_ ID returned by ado_create_work_item."
+        },
+        "file_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Workspace-relative file path, for example 'reports/screenshot.png'. Absolute paths, traversal, colons, and symbolic links are rejected."
+        },
+        "comment": { "type": "string", "minLength": 3, "maxLength": 1024, "description": "Optional Markdown comment describing the attached file." }
+      },
+      "additionalProperties": false
     }
   }
 ]

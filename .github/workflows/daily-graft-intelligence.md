@@ -20,7 +20,7 @@ tracker-id: daily-graft-intelligence
 timeout-minutes: 20
 sandbox:
   agent:
-    sudo: false
+    id: awf
 imports:
   - uses: shared/daily-issue-base.md
     with:

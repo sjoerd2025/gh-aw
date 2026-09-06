@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -16,9 +17,10 @@ func TestNewPiEngine(t *testing.T) {
 	require.NotNil(t, engine, "NewPiEngine should return a non-nil engine")
 	assert.Equal(t, "pi", engine.GetID(), "Engine ID should be 'pi'")
 	assert.Equal(t, "Pi", engine.GetDisplayName(), "Display name should be 'Pi'")
-	assert.True(t, engine.IsExperimental(), "Pi engine should be experimental")
+	assert.False(t, engine.IsExperimental(), "Pi engine should not be experimental")
 	capabilities := engine.GetCapabilities()
 	assert.True(t, capabilities.ToolsAllowlist, "Pi should support tools allowlist (needed for gh-proxy/cli-proxy settings)")
+	assert.False(t, capabilities.MCP, "Pi should not support MCP directly")
 	assert.True(t, capabilities.MaxTurns, "Pi should support max turns")
 }
 
@@ -154,6 +156,22 @@ func TestPiEngine_GetInstallationSteps_WithCustomCommand(t *testing.T) {
 	assert.Empty(t, steps, "Installation steps should be skipped when custom command is set")
 }
 
+func TestPiEngine_GetInstallationSteps_CustomCommandWithExtensions(t *testing.T) {
+	engine := NewPiEngine()
+	steps := engine.GetInstallationSteps(&WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID:         "pi",
+			Command:    "/custom/pi",
+			Extensions: []string{"@pi/web-search"},
+		},
+	})
+	stepContent := strings.Join(flattenSteps(steps), "\n")
+
+	assert.Contains(t, stepContent, "/custom/pi install @pi/web-search")
+	assert.NotContains(t, stepContent, "@earendil-works/pi-coding-agent")
+}
+
 func TestPiEngine_GetInstallationSteps_WithExtensions(t *testing.T) {
 	engine := NewPiEngine()
 	workflowData := &WorkflowData{
@@ -198,6 +216,8 @@ func TestPiEngine_GetExecutionSteps_Basic(t *testing.T) {
 	assert.Contains(t, stepText, "agentic_execution", "Step should have agentic_execution id")
 	assert.Contains(t, stepText, "pi_provider.cjs", "Step should load the provider extension")
 	assert.Contains(t, stepText, "pi_steering_extension.cjs", "Step should automatically load the steering extension")
+	assert.Contains(t, stepText, "shell_harness.cjs", "Step should run Pi through the shared shell harness")
+	assert.Contains(t, stepText, "GH_AW_TIMEOUT_MINUTES: 20", "Step should expose the timeout to the shared harness")
 }
 
 func TestPiEngine_GetExecutionSteps_WithModel(t *testing.T) {
@@ -333,6 +353,7 @@ func TestPiEngine_GetExecutionSteps_FirewallCopilotProvider(t *testing.T) {
 	stepText := strings.Join(steps[0], "\n")
 	// When firewall is enabled, Pi uses models.json to route through the api-proxy gateway.
 	assert.Contains(t, stepText, "PI_CODING_AGENT_DIR", "Firewall mode should set PI_CODING_AGENT_DIR for models.json config")
+	assert.Contains(t, stepText, "shell_harness.cjs", "Firewall mode should run Pi through the shared shell harness")
 	assert.Contains(t, stepText, "GH_AW_NODE_BIN=$(command -v node 2>/dev/null || true)", "Firewall mode should capture node path before AWF chroot execution")
 	assert.Contains(t, stepText, "export GH_AW_NODE_BIN", "Firewall mode should export GH_AW_NODE_BIN for AWF container")
 	assert.Contains(t, stepText, "PI_CODING_AGENT_DIR: /tmp/gh-aw/pi-agent-dir", "PI_CODING_AGENT_DIR should point to the models.json directory")
@@ -341,14 +362,14 @@ func TestPiEngine_GetExecutionSteps_FirewallCopilotProvider(t *testing.T) {
 	assert.Contains(t, stepText, "claude-sonnet-4-20250514", "Step should include the model ID in models.json")
 	// AWF config JSON embedded in step must enable the api-proxy sidecar.
 	assert.Contains(t, stepText, `\"enabled\":true`, "Firewall mode should enable the api-proxy in AWF config JSON")
-	// The models.json is embedded in the step as a printf argument. Verify the correct
-	// Copilot gateway port is present by re-building the expected JSON.
-	// models.json must use the "api-proxy" Docker service hostname, not host.docker.internal.
-	// host.docker.internal resolves to the runner host, NOT the api-proxy sidecar container.
-	expectedModelsJSON := buildPiModelsJSON(constants.CopilotLLMGatewayPort, "COPILOT_GITHUB_TOKEN", "claude-sonnet-4-20250514")
-	assert.Contains(t, expectedModelsJSON, "api-proxy:", "models.json baseUrl must use the api-proxy Docker hostname within the AWF network")
-	assert.NotContains(t, expectedModelsJSON, "host.docker.internal", "models.json baseUrl must not use host.docker.internal (not the api-proxy)")
-	assert.Contains(t, stepText, expectedModelsJSON, "Copilot provider should route through CopilotLLMGatewayPort via models.json")
+	// The models.json is generated at runtime by pi_models_json.cjs, which resolves the
+	// live api-proxy port via AWF's /reflect endpoint and falls back to the compile-time
+	// gatewayPort otherwise. Verify the setup command exports the expected inputs.
+	assert.Contains(t, stepText, "pi_models_json.cjs", "Firewall mode should invoke pi_models_json.cjs to generate models.json at runtime")
+	assert.Contains(t, stepText, "GH_AW_PI_MODEL_ID=claude-sonnet-4-20250514", "Should export the model ID for pi_models_json.cjs")
+	assert.Contains(t, stepText, "GH_AW_PI_GATEWAY_SECRET_ENV=COPILOT_GITHUB_TOKEN", "Should export the gateway secret env var name for pi_models_json.cjs")
+	assert.Contains(t, stepText, fmt.Sprintf("GH_AW_PI_GATEWAY_FALLBACK_PORT=%d", constants.CopilotLLMGatewayPort), "Should export the compile-time fallback port")
+	assert.Contains(t, stepText, "GH_AW_LLM_PROVIDER=github", "Should export the reflect provider name for pi_models_json.cjs")
 }
 
 func TestPiEngine_GetExecutionSteps_FirewallAnthropicProvider(t *testing.T) {
@@ -377,12 +398,13 @@ func TestPiEngine_GetExecutionSteps_FirewallAnthropicProvider(t *testing.T) {
 	assert.NotContains(t, stepText, " --model anthropic/claude-opus-4-20251101", "Firewall mode must not use native provider resolution")
 	assert.Contains(t, stepText, "claude-opus-4-20251101", "Step should include the model ID in models.json")
 	assert.Contains(t, stepText, `\"enabled\":true`, "Firewall mode should enable the api-proxy in AWF config JSON")
-	// Anthropic provider routes through the Claude LLM gateway port.
-	// models.json must use the "api-proxy" Docker service hostname, not host.docker.internal.
-	expectedModelsJSON := buildPiModelsJSON(constants.ClaudeLLMGatewayPort, "ANTHROPIC_API_KEY", "claude-opus-4-20251101")
-	assert.Contains(t, expectedModelsJSON, "api-proxy:", "models.json baseUrl must use the api-proxy Docker hostname within the AWF network")
-	assert.NotContains(t, expectedModelsJSON, "host.docker.internal", "models.json baseUrl must not use host.docker.internal (not the api-proxy)")
-	assert.Contains(t, stepText, expectedModelsJSON, "Anthropic provider should route through ClaudeLLMGatewayPort via models.json")
+	// Anthropic provider routes through the Claude LLM gateway port as a fallback; the live
+	// port is resolved at runtime via /reflect by pi_models_json.cjs.
+	assert.Contains(t, stepText, "pi_models_json.cjs", "Firewall mode should invoke pi_models_json.cjs to generate models.json at runtime")
+	assert.Contains(t, stepText, "GH_AW_PI_MODEL_ID=claude-opus-4-20251101", "Should export the model ID for pi_models_json.cjs")
+	assert.Contains(t, stepText, "GH_AW_PI_GATEWAY_SECRET_ENV=ANTHROPIC_API_KEY", "Should export the gateway secret env var name for pi_models_json.cjs")
+	assert.Contains(t, stepText, fmt.Sprintf("GH_AW_PI_GATEWAY_FALLBACK_PORT=%d", constants.ClaudeLLMGatewayPort), "Should export the compile-time fallback port")
+	assert.Contains(t, stepText, "GH_AW_LLM_PROVIDER=anthropic", "Should export the reflect provider name for pi_models_json.cjs")
 }
 
 func TestPiEngine_GetExecutionSteps_FirewallCodexProvider(t *testing.T) {
@@ -411,12 +433,13 @@ func TestPiEngine_GetExecutionSteps_FirewallCodexProvider(t *testing.T) {
 	assert.NotContains(t, stepText, " --model openai/gpt-4.1", "Firewall mode must not use native provider resolution")
 	assert.Contains(t, stepText, "gpt-4.1", "Step should include the model ID in models.json")
 	assert.Contains(t, stepText, `\"enabled\":true`, "Firewall mode should enable the api-proxy in AWF config JSON")
-	// Codex/OpenAI provider routes through the Codex LLM gateway port.
-	// models.json must use the "api-proxy" Docker service hostname, not host.docker.internal.
-	expectedModelsJSON := buildPiModelsJSON(constants.CodexLLMGatewayPort, "CODEX_API_KEY", "gpt-4.1")
-	assert.Contains(t, expectedModelsJSON, "api-proxy:", "models.json baseUrl must use the api-proxy Docker hostname within the AWF network")
-	assert.NotContains(t, expectedModelsJSON, "host.docker.internal", "models.json baseUrl must not use host.docker.internal (not the api-proxy)")
-	assert.Contains(t, stepText, expectedModelsJSON, "Codex provider should route through CodexLLMGatewayPort via models.json")
+	// Codex/OpenAI provider routes through the Codex LLM gateway port as a fallback; the live
+	// port is resolved at runtime via /reflect by pi_models_json.cjs.
+	assert.Contains(t, stepText, "pi_models_json.cjs", "Firewall mode should invoke pi_models_json.cjs to generate models.json at runtime")
+	assert.Contains(t, stepText, "GH_AW_PI_MODEL_ID=gpt-4.1", "Should export the model ID for pi_models_json.cjs")
+	assert.Contains(t, stepText, "GH_AW_PI_GATEWAY_SECRET_ENV=CODEX_API_KEY", "Should export the gateway secret env var name for pi_models_json.cjs")
+	assert.Contains(t, stepText, fmt.Sprintf("GH_AW_PI_GATEWAY_FALLBACK_PORT=%d", constants.CodexLLMGatewayPort), "Should export the compile-time fallback port")
+	assert.Contains(t, stepText, "GH_AW_LLM_PROVIDER=openai", "Should export the reflect provider name for pi_models_json.cjs")
 }
 
 // TestPiEngine_GetExecutionSteps_FirewallCopilotProvider_CopilotRequestsWrite verifies that
@@ -454,7 +477,11 @@ func TestPiEngine_GetExecutionSteps_FirewallCopilotProvider_CopilotRequestsWrite
 	assert.NotContains(t, stepText, "github-copilot/gpt-5.4", "Should not pass github-copilot provider directly to Pi CLI (would bypass firewall)")
 	assert.Contains(t, stepText, "aw-gateway/gpt-5.4", "Should use aw-gateway/gpt-5.4 model flag")
 	// The models.json must route through the Copilot gateway port using COPILOT_GITHUB_TOKEN
-	// (set to ${{ github.token }} in copilot-requests: write mode).
-	expectedModelsJSON := buildPiModelsJSON(constants.CopilotLLMGatewayPort, "COPILOT_GITHUB_TOKEN", "gpt-5.4")
-	assert.Contains(t, stepText, expectedModelsJSON, "Copilot provider (copilot-requests: write) should route through CopilotLLMGatewayPort via models.json")
+	// (set to ${{ github.token }} in copilot-requests: write mode); pi_models_json.cjs
+	// resolves the live port via /reflect at runtime and falls back to this compile-time port.
+	assert.Contains(t, stepText, "pi_models_json.cjs", "Firewall mode should invoke pi_models_json.cjs to generate models.json at runtime")
+	assert.Contains(t, stepText, "GH_AW_PI_MODEL_ID=gpt-5.4", "Should export the model ID for pi_models_json.cjs")
+	assert.Contains(t, stepText, "GH_AW_PI_GATEWAY_SECRET_ENV=COPILOT_GITHUB_TOKEN", "Should export the gateway secret env var name for pi_models_json.cjs")
+	assert.Contains(t, stepText, fmt.Sprintf("GH_AW_PI_GATEWAY_FALLBACK_PORT=%d", constants.CopilotLLMGatewayPort), "Should export the compile-time fallback port")
+	assert.Contains(t, stepText, "GH_AW_LLM_PROVIDER=github", "Should export the reflect provider name for pi_models_json.cjs")
 }

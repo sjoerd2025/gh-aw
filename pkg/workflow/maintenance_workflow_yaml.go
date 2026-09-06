@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -35,7 +36,7 @@ type buildMaintenanceWorkflowYAMLOptions struct {
 func buildMaintenanceWorkflowYAML(
 	ctx context.Context,
 	opts buildMaintenanceWorkflowYAMLOptions,
-) string {
+) (string, error) {
 	maintenanceWorkflowYAMLLog.Printf("Building maintenance workflow YAML: actionMode=%s minExpiresDays=%d cronSchedule=%q defaultBranch=%q disableLabelTrigger=%v createCompilePR=%v copilotOrgBilling=%v", opts.actionMode, opts.minExpiresDays, opts.cronSchedule, opts.defaultBranch, opts.disableLabelTrigger, opts.createCompilePR, opts.copilotOrgBilling)
 	labelDisableJobEnabled := !opts.disableLabelTrigger && !opts.maintenanceConfig.IsJobDisabled("label_disable_agentic_workflow")
 	labelApplySafeOutputsJobEnabled := !opts.disableLabelTrigger && !opts.maintenanceConfig.IsJobDisabled("label_apply_safe_outputs")
@@ -57,7 +58,11 @@ func buildMaintenanceWorkflowYAML(
 	yaml.WriteString(buildMaintenanceValidateWorkflowsJob(ctx, opts, setupActionRef))
 	yaml.WriteString(buildMaintenanceLabelTriggeredJobs(opts, setupActionRef))
 	yaml.WriteString(buildMaintenanceDevOnlyJobs(ctx, opts, setupActionRef))
-	return yaml.String()
+	finalYAML, err := finalizeRunnerTempSafety(yaml.String())
+	if err != nil {
+		return "", fmt.Errorf("runner temp safety: %w", err)
+	}
+	return finalYAML, nil
 }
 
 func buildMaintenanceAppliedRunURLOutput(opts buildMaintenanceWorkflowYAMLOptions) (string, string) {
@@ -115,15 +120,15 @@ func buildMaintenanceWorkflowTriggerYAML(
 
 // buildMaintenanceDispatchInputsYAML returns the workflow_dispatch trigger block.
 func buildMaintenanceDispatchInputsYAML() string {
-	return `  workflow_dispatch:
+	return fmt.Sprintf(`  workflow_dispatch:
     inputs:
       operation:
         description: 'Optional maintenance operation to run'
         required: false
         type: choice
-        default: ''
+        default: '%[1]s'
         options:
-          - ''
+          - '%[1]s'
           - 'disable'
           - 'enable'
           - 'update'
@@ -141,7 +146,7 @@ func buildMaintenanceDispatchInputsYAML() string {
         required: false
         type: string
         default: ''
-`
+`, maintenanceNoOperationValue)
 }
 
 // buildMaintenanceWorkflowCallYAML returns the workflow_call trigger block.

@@ -101,7 +101,7 @@ func generateSquidLogsUploadStep(workflowName string, workflowData *WorkflowData
 	artifactName := "firewall-logs-" + sanitizedName
 	// Firewall logs location: /tmp/gh-aw on standard runners, ${{ runner.temp }}/gh-aw on ARC/DinD.
 	// Use ${{ runner.temp }} (Actions expression) because `with:` blocks don't expand shell vars.
-	firewallLogsDir := constants.AWFProxyLogsDir + "/"
+	firewallLogsDir := constants.AWFProxyLogsDir.String() + "/"
 	if isArcDindTopology(workflowData) {
 		firewallLogsDir = constants.AWFProxyLogsDirExpr + "/"
 	}
@@ -110,7 +110,7 @@ func generateSquidLogsUploadStep(workflowName string, workflowData *WorkflowData
 		"      - name: Upload Firewall Logs",
 		"        if: always()",
 		"        continue-on-error: true",
-		"        uses: " + getActionPin("actions/upload-artifact"),
+		"        uses: " + getActionPinForData("actions/upload-artifact", workflowData),
 		"        with:",
 		"          name: " + artifactName,
 		"          path: " + firewallLogsDir,
@@ -125,18 +125,16 @@ func generateFirewallLogParsingStep(workflowName string, workflowData *WorkflowD
 	// Firewall logs are at a known location in the sandbox folder structure.
 	// On ARC/DinD, /tmp/gh-aw is not daemon-visible so logs land under runner.temp/gh-aw.
 	// For env: blocks, use ${{ runner.temp }} (Actions expression) since shell vars aren't expanded there.
-	firewallLogsDirEnv := constants.AWFProxyLogsDir
+	firewallLogsDirEnv := constants.AWFProxyLogsDir.String()
 	if isArcDindTopology(workflowData) {
 		firewallLogsDirEnv = constants.AWFProxyLogsDirExpr
 	}
 
-	// In network-isolation (rootless) mode, pass --rootless so the script uses
-	// non-interactive sudo (sudo -n) with a non-sudo chmod fallback. In non-network-isolation
-	// mode, and in legacy-security mode (where AWF ran with full sudo access), the script
-	// uses plain sudo.
+	// When the runtime profile runs AWF rootless, pass --rootless so the script uses
+	// non-interactive sudo (sudo -n) with a non-sudo chmod fallback. Profiles where AWF
+	// ran with host privileges (docker-sudo-iptables, cloud-hypervisor) use plain sudo.
 	scriptArg := ""
-	agentCfg := getAgentConfig(workflowData)
-	if isAWFNetworkIsolationEnabled(workflowData) && !agentCfg.LegacySecurity {
+	if isAWFNetworkIsolationEnabled(workflowData) && getSandboxRuntimeProfile(workflowData).Rootless {
 		scriptArg = " --rootless"
 	}
 

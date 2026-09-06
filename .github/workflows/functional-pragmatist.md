@@ -13,9 +13,6 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
 tracker-id: functional-pragmatist
 
@@ -24,12 +21,14 @@ network:
     - defaults
     - github
     - go
+    - node
 
 imports:
   - shared/reporting.md
 
   - shared/otlp.md
 safe-outputs:
+  steer: true
   create-pull-request:
     title-prefix: "[fp-enhancer] "
     labels: [refactoring, functional, immutability, code-quality]
@@ -45,9 +44,21 @@ tools:
     - "*"
 
 timeout-minutes: 45
+engine:
+  id: codex
+  model-provider: openai
+model: openai/gpt-5.4
 strict: true
 
 
+evals:
+  - id: functional_opportunities_analyzed
+    question: Did the agent analyze the codebase for pragmatic functional programming improvements?
+  - id: refactoring_pr_created_or_noop
+    question: Did the agent create a focused refactoring pull request, or report that no suitable change was found?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Functional and Immutability Enhancer 🔄

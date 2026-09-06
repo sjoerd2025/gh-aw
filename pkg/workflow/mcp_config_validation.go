@@ -31,15 +31,18 @@ var mcpValidationLog = logger.New("workflow:mcp_config_validation")
 // Custom MCP servers must be placed under mcp-servers: instead.
 var builtInToolNames = map[string]bool{
 	"github":            true,
+	"jira":              true,
 	"playwright":        true,
 	"agentic-workflows": true,
 	"cache-memory":      true,
+	"drive-memory":      true,
 	"comment-memory":    true,
 	"repo-memory":       true,
 	"bash":              true,
 	"edit":              true,
 	"web-fetch":         true,
 	"web-search":        true,
+	"linear":            true,
 	"safety-prompt":     true,
 	"timeout":           true,
 	"startup-timeout":   true,
@@ -66,7 +69,7 @@ func ValidateMCPConfigs(tools map[string]any) error {
 		toolConfig := tools[toolName]
 
 		// Skip built-in tools - they have their own schema validation
-		if builtInToolNames[toolName] {
+		if builtInToolNames[toolName] && toolName != "linear" {
 			mcpValidationLog.Printf("Skipping MCP validation for built-in tool: %s", toolName)
 			continue
 		}
@@ -173,6 +176,7 @@ func getRawMCPConfig(toolConfig map[string]any) (map[string]any, error) {
 		"description":    {}, // for cache-memory
 		"retention-days": {   // for cache-memory
 		},
+		"required": {}, // startup connectivity criticality for MCP servers
 	}
 
 	// Check new format: direct fields in tool config

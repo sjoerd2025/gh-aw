@@ -1,12 +1,16 @@
 // @ts-check
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import path from "path";
 import fs from "fs";
 import { createRequire } from "module";
 import {
+  main,
   loadConfig,
   loadHandlers,
   processMessages,
+  sortMessagesByTemporaryIdDependencies,
+  sortMessageIndicesByTemporaryIdDependencies,
   buildCommentMemoryMessagesFromFiles,
   rollbackReviewResults,
   rollbackReviewResultsForPR,
@@ -16,6 +20,9 @@ import {
   isFailedProcessingResult,
   isReportOnlyFailureResult,
   partitionFailureResults,
+  computeSafeOutputsStatus,
+  setSafeOutputsStatusOutputs,
+  processSyntheticUpdates,
 } from "./safe_output_handler_manager.cjs";
 
 const require = createRequire(import.meta.url);
@@ -35,12 +42,19 @@ describe("Safe Output Handler Manager", () => {
 
   afterEach(() => {
     // Clean up environment variables
+    delete process.env.GH_AW_AGENT_OUTPUT;
     delete process.env.GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG;
     delete process.env.GH_AW_TRACKER_LABEL;
     delete process.env.GH_AW_SAFE_OUTPUT_JOBS;
     delete process.env.GH_AW_SAFE_OUTPUT_SCRIPTS;
+    delete process.env.GH_AW_SAFE_OUTPUT_ACTIONS;
     delete process.env.GH_AW_DETECTION_CONCLUSION;
+    delete process.env.RUNNER_TEMP;
+    delete global.github;
+    delete global.context;
     fs.rmSync("/tmp/gh-aw/comment-memory", { recursive: true, force: true });
+    fs.rmSync("/tmp/gh-aw/safe-output-errors.json", { force: true });
+    fs.rmSync("/tmp/gh-aw/actions", { recursive: true, force: true });
   });
 
   describe("loadConfig", () => {
@@ -58,6 +72,171 @@ describe("Safe Output Handler Manager", () => {
       expect(result).toHaveProperty("add_comment");
       expect(result.create_issue).toEqual({ max: 5 });
       expect(result.add_comment).toEqual({ max: 1 });
+    });
+
+    describe("main failure diagnostics artifact", () => {
+      it("writes safe-output-errors.json when message processing has fatal failures", async () => {
+        process.env.GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG = "{}";
+        process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({ custom_fail: "custom_fail_handler.cjs" });
+        global.context = {};
+        global.github = {
+          rest: {
+            rateLimit: {
+              get: vi.fn().mockResolvedValue({
+                data: {
+                  resources: {
+                    core: {
+                      remaining: 5000,
+                      limit: 5000,
+                      reset: Math.floor(Date.now() / 1000) + 60,
+                    },
+                  },
+                },
+              }),
+            },
+          },
+          graphql: vi.fn(),
+        };
+
+        const scriptDir = "/tmp/gh-aw/actions";
+        fs.mkdirSync(scriptDir, { recursive: true });
+        fs.writeFileSync(`${scriptDir}/custom_fail_handler.cjs`, `module.exports = { main: async () => async () => ({ success: false, errorCode: "ERR_API", error: "script failure" }) };`);
+
+        const outputFile = "/tmp/gh-aw/custom-failure-agent-output.json";
+        fs.writeFileSync(outputFile, JSON.stringify({ items: [{ type: "custom_fail" }] }));
+        process.env.GH_AW_AGENT_OUTPUT = outputFile;
+
+        await main();
+
+        expect(global.core.setFailed).toHaveBeenCalledWith(expect.stringContaining("safe output(s) failed"));
+        expect(fs.existsSync("/tmp/gh-aw/safe-output-errors.json")).toBe(true);
+
+        const report = JSON.parse(fs.readFileSync("/tmp/gh-aw/safe-output-errors.json", "utf8"));
+        expect(report.errorCode).toBe("E099");
+        expect(report.message).toContain("custom_fail");
+        expect(report.failures).toEqual([{ type: "custom_fail", error: "script failure" }]);
+      });
+
+      it("writes safe-output-errors.json when main hits the catch path", async () => {
+        delete process.env.GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG;
+
+        await main();
+
+        expect(global.core.setFailed).toHaveBeenCalledWith(expect.stringContaining("ERR_VALIDATION: Handler manager failed"));
+        expect(fs.existsSync("/tmp/gh-aw/safe-output-errors.json")).toBe(true);
+
+        const report = JSON.parse(fs.readFileSync("/tmp/gh-aw/safe-output-errors.json", "utf8"));
+        expect(report.errorCode).toBe("ERR_VALIDATION");
+        expect(report.message).toContain("GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG environment variable is required but not set");
+        expect(report.failures).toEqual([]);
+      });
+    });
+
+    describe("temporary ID dependency ordering", () => {
+      it("orders a blocked_by temporary-ID producer before its dependent issue", () => {
+        const prerequisite = { type: "create_issue", temporary_id: "aw_prereq", title: "Prerequisite" };
+        const blocked = { type: "create_issue", temporary_id: "aw_blocked", blocked_by: "aw_prereq", title: "Blocked" };
+
+        expect(sortMessagesByTemporaryIdDependencies([blocked, prerequisite])).toEqual([prerequisite, blocked]);
+      });
+
+      it("keeps independent messages in their original relative order", () => {
+        const dependent = { type: "create_issue", temporary_id: "aw_blocked", blocked_by: "aw_prereq", title: "Blocked" };
+        const producer = { type: "create_issue", temporary_id: "aw_prereq", title: "Prerequisite" };
+        const unrelated = { type: "create_issue", temporary_id: "aw_other", title: "Unrelated" };
+
+        expect(sortMessagesByTemporaryIdDependencies([dependent, producer, unrelated])).toEqual([producer, dependent, unrelated]);
+      });
+
+      it("returns original message indices in processing order", () => {
+        const dependent = { type: "create_issue", temporary_id: "aw_blocked", blocked_by: "aw_prereq", title: "Blocked" };
+        const producer = { type: "create_issue", temporary_id: "aw_prereq", title: "Prerequisite" };
+        const unrelated = { type: "create_issue", temporary_id: "aw_other", title: "Unrelated" };
+
+        expect(sortMessageIndicesByTemporaryIdDependencies([dependent, producer, unrelated])).toEqual([1, 0, 2]);
+      });
+
+      it("tracks a comment emitted before its temporary-ID producer", async () => {
+        const callOrder = [];
+        const handlers = new Map([
+          [
+            "add_comment",
+            vi.fn(async (_message, resolvedTemporaryIds) => {
+              callOrder.push("add_comment");
+              expect(resolvedTemporaryIds).toEqual({});
+              return {
+                success: true,
+                commentId: 123,
+                itemNumber: 42,
+                repo: "owner/repo",
+                isDiscussion: false,
+                body: "Tracking issue: #aw_track1\n\nHandler footer marker",
+              };
+            }),
+          ],
+          [
+            "create_issue",
+            vi.fn(async () => {
+              callOrder.push("create_issue");
+              return { success: true, temporaryId: "aw_track1", repo: "owner/tracker", number: 99 };
+            }),
+          ],
+        ]);
+        const messages = [
+          { type: "add_comment", item_number: 42, body: "Tracking issue: #aw_track1" },
+          { type: "create_issue", temporary_id: "aw_track1", title: "Tracking issue" },
+        ];
+
+        const result = await processMessages(handlers, messages);
+
+        expect(callOrder).toEqual(["add_comment", "create_issue"]);
+        expect(result.temporaryIdMap.aw_track1).toEqual({ repo: "owner/tracker", number: 99 });
+        expect(result.outputsWithUnresolvedIds).toEqual([
+          {
+            type: "add_comment",
+            message: { type: "add_comment", item_number: 42, body: "Tracking issue: #aw_track1" },
+            result: {
+              success: true,
+              commentId: 123,
+              itemNumber: 42,
+              repo: "owner/repo",
+              isDiscussion: false,
+              body: "Tracking issue: #aw_track1\n\nHandler footer marker",
+            },
+            originalTempIdMapSize: 0,
+          },
+        ]);
+      });
+
+      it("updates the posted comment body while retaining handler metadata", async () => {
+        const updateComment = vi.fn().mockResolvedValue({});
+        const github = { rest: { issues: { updateComment } } };
+        const trackedOutputs = [
+          {
+            type: "add_comment",
+            message: { type: "add_comment", body: "Tracking issue: #aw_track1" },
+            result: {
+              success: true,
+              commentId: 123,
+              itemNumber: 42,
+              repo: "owner/repo",
+              isDiscussion: false,
+              body: "Tracking issue: #aw_track1\n\nHandler footer marker",
+            },
+            originalTempIdMapSize: 0,
+          },
+        ];
+
+        const updateCount = await processSyntheticUpdates(github, {}, trackedOutputs, new Map([["aw_track1", { repo: "owner/tracker", number: 99 }]]), new Map());
+
+        expect(updateCount).toBe(1);
+        expect(updateComment).toHaveBeenCalledWith({
+          owner: "owner",
+          repo: "repo",
+          comment_id: 123,
+          body: "Tracking issue: owner/tracker#99\n\nHandler footer marker",
+        });
+      });
     });
 
     describe("logCreatedItemFromResult", () => {
@@ -123,6 +302,24 @@ describe("Safe Output Handler Manager", () => {
       ).toBe(true);
     });
 
+    it("does not treat failed resolve_pull_request_review_thread results as report-only", () => {
+      expect(
+        isReportOnlyFailureResult({
+          type: "resolve_pull_request_review_thread",
+          success: false,
+        })
+      ).toBe(false);
+    });
+
+    it("does not treat failed dismiss_pull_request_review results as report-only", () => {
+      expect(
+        isReportOnlyFailureResult({
+          type: "dismiss_pull_request_review",
+          success: false,
+        })
+      ).toBe(false);
+    });
+
     it("does not treat skipped or cancelled assign_to_agent results as report-only", () => {
       expect(
         isReportOnlyFailureResult({
@@ -185,6 +382,130 @@ describe("Safe Output Handler Manager", () => {
 
       expect(reportOnlyFailures).toEqual([{ type: "upload_artifact", success: false, error: "artifact twirp CreateArtifact failed (400)" }]);
       expect(fatalFailures).toEqual([{ type: "create_issue", success: false, error: "Validation failed" }]);
+    });
+
+    it("computes partial success item status from mixed successful and failed results", () => {
+      const status = computeSafeOutputsStatus([
+        { type: "create_issue", success: true },
+        { type: "add_comment", success: true },
+        { type: "create_discussion", success: false, error: "Validation failed" },
+        { type: "noop", success: false, skipped: true },
+        { type: "link_sub_issue", success: false, deferred: true },
+        { type: "merge_pull_request", success: false, cancelled: true },
+      ]);
+
+      expect(status).toEqual({
+        itemsSucceeded: 2,
+        itemsApplied: 2,
+        itemsSkipped: 1,
+        itemsWarnings: 0,
+        itemsCancelled: 1,
+        itemsDeferred: 1,
+        itemsFailed: 1,
+        status: "partial_success",
+      });
+    });
+
+    it("computes skipped and warning counts without counting them as applied mutations", () => {
+      expect(
+        computeSafeOutputsStatus([
+          { type: "add_comment", success: true, result: { success: true, skipped: true, warning: "Target locked" } },
+          { type: "add_labels", success: false, skipped: true, result: { success: false, skipped: true, reasonCode: "REQUIRED_LABELS_MISMATCH" } },
+          { type: "create_issue", success: true },
+        ])
+      ).toEqual({
+        itemsSucceeded: 1,
+        itemsApplied: 1,
+        itemsSkipped: 2,
+        itemsWarnings: 0,
+        itemsCancelled: 0,
+        itemsDeferred: 0,
+        itemsFailed: 0,
+        status: "completed_with_skips",
+      });
+    });
+
+    it("omits only explicitly delegated skips from outcome counts", () => {
+      expect(
+        computeSafeOutputsStatus([
+          { type: "add_comment", success: false, skipped: true, reason: "Policy skipped this output" },
+          { type: "noop", success: false, skipped: true, delegated: true, reason: "Handled by standalone step" },
+        ])
+      ).toEqual({
+        itemsSucceeded: 0,
+        itemsApplied: 0,
+        itemsSkipped: 1,
+        itemsWarnings: 0,
+        itemsCancelled: 0,
+        itemsDeferred: 0,
+        itemsFailed: 0,
+        status: "completed_with_skips",
+      });
+    });
+
+    it("computes failure item status when all active results failed", () => {
+      expect(
+        computeSafeOutputsStatus([
+          { type: "create_issue", success: false, error: "Validation failed" },
+          { type: "add_comment", success: false, error: "Validation failed" },
+        ])
+      ).toEqual({
+        itemsSucceeded: 0,
+        itemsApplied: 0,
+        itemsSkipped: 0,
+        itemsWarnings: 0,
+        itemsCancelled: 0,
+        itemsDeferred: 0,
+        itemsFailed: 2,
+        status: "failure",
+      });
+    });
+
+    it("exports item status outputs", () => {
+      setSafeOutputsStatusOutputs({
+        itemsSucceeded: 10,
+        itemsFailed: 5,
+        status: "partial_success",
+      });
+
+      expect(core.setOutput).toHaveBeenCalledWith("items_succeeded", "10");
+      expect(core.setOutput).toHaveBeenCalledWith("items_applied", "10");
+      expect(core.setOutput).toHaveBeenCalledWith("items_skipped", "0");
+      expect(core.setOutput).toHaveBeenCalledWith("items_warnings", "0");
+      expect(core.setOutput).toHaveBeenCalledWith("items_cancelled", "0");
+      expect(core.setOutput).toHaveBeenCalledWith("items_deferred", "0");
+      expect(core.setOutput).toHaveBeenCalledWith("items_failed", "5");
+      expect(core.setOutput).toHaveBeenCalledWith("status", "partial_success");
+    });
+
+    it("keeps review cleanup failures fatal unless a handler marks them skipped", () => {
+      const { fatalFailures, reportOnlyFailures } = partitionFailureResults([
+        { type: "resolve_pull_request_review_thread", success: false, error: "wrong node type" },
+        { type: "dismiss_pull_request_review", success: false, error: "wrong actor" },
+      ]);
+
+      expect(reportOnlyFailures).toEqual([]);
+      expect(fatalFailures).toEqual([
+        { type: "resolve_pull_request_review_thread", success: false, error: "wrong node type" },
+        { type: "dismiss_pull_request_review", success: false, error: "wrong actor" },
+      ]);
+    });
+
+    it("does not treat a resolve_pull_request_review_thread result marked skipped as a fatal failure", () => {
+      const results = [
+        { type: "resolve_pull_request_review_thread", success: false, skipped: true, error: "Repository 'other-owner/other-repo' is not in the allowed-repos list. Allowed: github/gh-aw" },
+        { type: "create_issue", success: false, error: "Validation failed" },
+      ];
+      const { fatalFailures, reportOnlyFailures } = partitionFailureResults(results);
+
+      expect(reportOnlyFailures).toEqual([]);
+      expect(fatalFailures).toEqual([{ type: "create_issue", success: false, error: "Validation failed" }]);
+
+      // The skipped result is neither a fatal nor a report-only failure; it is counted
+      // as a skip in the overall item status instead of being silently dropped.
+      const status = computeSafeOutputsStatus(results);
+      expect(status.itemsSkipped).toBe(1);
+      expect(status.itemsFailed).toBe(1);
     });
   });
 
@@ -508,6 +829,21 @@ describe("Safe Output Handler Manager", () => {
       // Handler is absent only because the file doesn't exist in the test env (warning, not error)
       expect(handlers.has("my_script")).toBe(false);
     });
+
+    it("should surface the load failure reason when a message has no handler", async () => {
+      process.env.GH_AW_SAFE_OUTPUT_SCRIPTS = JSON.stringify({
+        my_script: "safe_output_script_my_script.cjs",
+      });
+
+      const handlers = await loadHandlers({}, {});
+      const result = await processMessages(handlers, [{ type: "my_script" }]);
+
+      expect(result.results[0].success).toBe(false);
+      expect(result.results[0].error).toContain("No handler loaded for type 'my_script'");
+      expect(result.results[0].error).toContain("Cannot find module");
+      expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("The handler was configured but failed to load"));
+      expect(core.warning).not.toHaveBeenCalledWith(expect.stringContaining("safe output type is not configured"));
+    });
   });
 
   describe("processMessages", () => {
@@ -539,6 +875,36 @@ describe("Safe Output Handler Manager", () => {
       expect(result.results[1].messageIndex).toBe(1);
     });
 
+    it("preserves summary-safe diagnostics from skipped handler results", async () => {
+      const messages = [{ type: "add_comment", item_number: 123 }];
+      const skippedResult = {
+        success: false,
+        skipped: true,
+        reasonCode: "REQUIRED_LABELS_MISMATCH",
+        reason: "Required labels missing",
+        error: "Item does not match required-labels filter",
+        target: { repo: "owner/repo", number: 123 },
+        safeDetails: {
+          requiredLabels: ["automation", "n-plus-1"],
+          missingLabels: ["automation"],
+        },
+      };
+      const handler = vi.fn().mockResolvedValue(skippedResult);
+
+      const result = await processMessages(new Map([["add_comment", handler]]), messages);
+
+      expect(result.success).toBe(true);
+      expect(result.results[0]).toMatchObject({
+        type: "add_comment",
+        messageIndex: 0,
+        success: false,
+        skipped: true,
+        reasonCode: "REQUIRED_LABELS_MISMATCH",
+        reason: "Required labels missing",
+        result: skippedResult,
+      });
+    });
+
     it("should abort non-reviewable outputs in detection warning mode", async () => {
       process.env.GH_AW_DETECTION_CONCLUSION = "warning";
       const messages = [{ type: "merge_pull_request" }, { type: "create_issue", title: "Review this", body: "Body" }];
@@ -563,23 +929,26 @@ describe("Safe Output Handler Manager", () => {
       expect(result.results[1].success).toBe(true);
     });
 
-    it.each(["set_issue_type", "set_issue_field", "dispatch_repository", "call_workflow", "upload_artifact"])("should abort %s in detection warning mode", async messageType => {
-      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
-      const handler = vi.fn().mockResolvedValue({ success: true });
-      const handlers = new Map([[messageType, handler]]);
-      const messages = [{ type: messageType }];
+    it.each(["set_issue_type", "set_issue_field", "jira_add_label", "add_labels", "remove_labels", "replace_label", "dispatch_repository", "call_workflow", "upload_artifact"])(
+      "should abort %s in detection warning mode",
+      async messageType => {
+        process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+        const handler = vi.fn().mockResolvedValue({ success: true });
+        const handlers = new Map([[messageType, handler]]);
+        const messages = [{ type: messageType }];
 
-      const result = await processMessages(handlers, messages);
+        const result = await processMessages(handlers, messages);
 
-      expect(handler).not.toHaveBeenCalled();
-      expect(result.results[0]).toMatchObject({
-        type: messageType,
-        success: false,
-        cancelled: true,
-        threatDetected: true,
-        errorCode: "threat_detected_abort_policy",
-      });
-    });
+        expect(handler).not.toHaveBeenCalled();
+        expect(result.results[0]).toMatchObject({
+          type: messageType,
+          success: false,
+          cancelled: true,
+          threatDetected: true,
+          errorCode: "threat_detected_abort_policy",
+        });
+      }
+    );
 
     it("should log conversion requirement for push_to_pull_request_branch in detection warning mode", async () => {
       process.env.GH_AW_DETECTION_CONCLUSION = "warning";
@@ -1174,6 +1543,47 @@ describe("Safe Output Handler Manager", () => {
       const linkResult = result.results.find(r => r.type === "link_sub_issue");
       expect(linkResult.success).toBe(true);
       expect(linkResult.deferred).toBe(false);
+    });
+
+    it.each([
+      ["returned failure", () => ({ success: false, error: "Retry failed" })],
+      ["thrown error", () => Promise.reject(new Error("Retry failed"))],
+    ])("should classify a deferred retry %s as failed", async (_name, retryResult) => {
+      const handler = vi.fn().mockResolvedValueOnce({ deferred: true, error: "Unresolved temporary ID" }).mockImplementationOnce(retryResult);
+      const result = await processMessages(new Map([["link_sub_issue", handler]]), [{ type: "link_sub_issue", parent_issue_number: "aw_parent12", sub_issue_number: 42 }]);
+
+      expect(result.results[0]).toMatchObject({
+        type: "link_sub_issue",
+        success: false,
+        deferred: false,
+        error: "Retry failed",
+        result: { success: false, deferred: false, error: "Retry failed" },
+      });
+      expect(isFailedProcessingResult(result.results[0])).toBe(true);
+    });
+
+    it("preserves summary-safe diagnostics when a deferred retry is skipped", async () => {
+      const skippedResult = {
+        success: false,
+        skipped: true,
+        reasonCode: "REQUIRED_LABELS_MISMATCH",
+        reason: "Required labels missing",
+        target: { repo: "owner/repo", number: 123 },
+        safeDetails: { missingLabels: ["automation"] },
+      };
+      const handler = vi.fn().mockResolvedValueOnce({ deferred: true, error: "Unresolved temporary ID" }).mockResolvedValueOnce(skippedResult);
+      const result = await processMessages(new Map([["link_sub_issue", handler]]), [{ type: "link_sub_issue", parent_issue_number: "aw_parent12", sub_issue_number: 42 }]);
+
+      expect(result.results[0]).toMatchObject({
+        type: "link_sub_issue",
+        messageIndex: 0,
+        success: false,
+        skipped: true,
+        reasonCode: "REQUIRED_LABELS_MISMATCH",
+        reason: "Required labels missing",
+        result: skippedResult,
+      });
+      expect(isFailedProcessingResult(result.results[0])).toBe(false);
     });
 
     it("should track outputs created during deferred retry with unresolved temp IDs", async () => {
@@ -1953,6 +2363,46 @@ describe("Safe Output Handler Manager", () => {
     });
   });
 
+  describe("handler module runtime dependencies", () => {
+    // Safe output handler modules are copied to the runner temp directory without a
+    // node_modules folder, so requiring an npm package makes the handler fail to load
+    // at runtime with "Cannot find module" and silently skips its messages.
+    it("does not require npm packages from any handler module in HANDLER_MAP", () => {
+      const jsDir = new URL(".", import.meta.url).pathname;
+      const managerSource = fs.readFileSync(`${jsDir}safe_output_handler_manager.cjs`, "utf8");
+      const handlerMapBlock = managerSource.match(/const HANDLER_MAP = \{([\s\S]*?)\n\};/);
+      expect(handlerMapBlock).not.toBeNull();
+
+      const handlerFiles = [...handlerMapBlock[1].matchAll(/["'](\.\/[^"']+\.cjs)["']/g)].map(match => match[1].slice(2));
+      expect(handlerFiles).toContain("approve_workflow_run.cjs");
+      expect(handlerFiles).toContain("replace_label.cjs");
+
+      const builtinModules = new Set(require("module").builtinModules);
+      const visited = new Set();
+      const queue = [...handlerFiles];
+      /** @type {string[]} */
+      const externalRequires = [];
+
+      while (queue.length > 0) {
+        const file = queue.shift();
+        if (visited.has(file) || !fs.existsSync(`${jsDir}${file}`)) continue;
+        visited.add(file);
+
+        const source = fs.readFileSync(`${jsDir}${file}`, "utf8");
+        for (const match of source.matchAll(/require\(["']([^"']+)["']\)/g)) {
+          const specifier = match[1];
+          if (specifier.startsWith("./")) {
+            queue.push(specifier.slice(2));
+          } else if (!specifier.startsWith("node:") && !builtinModules.has(specifier)) {
+            externalRequires.push(`${file}: ${specifier}`);
+          }
+        }
+      }
+
+      expect(externalRequires).toEqual([]);
+    });
+  });
+
   describe("call_workflow handler registration", () => {
     it("processes call_workflow messages without no-handler warnings when handler is registered", async () => {
       const messages = [{ type: "call_workflow", workflow_name: "worker-a" }];
@@ -1982,6 +2432,66 @@ describe("Safe Output Handler Manager", () => {
       expect(result.results).toHaveLength(1);
       expect(result.results[0].success).toBe(false);
       expect(result.results[0].error).toContain("No handler loaded for type 'call_workflow'");
+    });
+  });
+
+  describe("replace_label handler registration", () => {
+    // Regression test for the replace-label portion of
+    // https://github.com/github/gh-aw/issues/54811: replace_label had a
+    // dedicated handler module (replace_label.cjs) but was missing from
+    // HANDLER_MAP, so the collect job never loaded it and label
+    // transitions silently did nothing even though the sample/agent output
+    // was recorded successfully.
+    it("maps key 'replace_label' directly to './replace_label.cjs' in HANDLER_MAP", () => {
+      const managerPath = path.join(typeof __dirname !== "undefined" ? __dirname : path.dirname(new URL(import.meta.url).pathname), "safe_output_handler_manager.cjs");
+      const managerSource = fs.readFileSync(managerPath, "utf8");
+      const handlerMapBlock = managerSource.match(/const HANDLER_MAP = \{([\s\S]*?)\n\};/);
+      expect(handlerMapBlock).not.toBeNull();
+
+      const pairs = Object.fromEntries([...handlerMapBlock[1].matchAll(/(\w+):\s*["'](\.\/[^"']+\.cjs)["']/g)].map(m => [m[1], m[2]]));
+      expect(pairs["replace_label"]).toBe("./replace_label.cjs");
+    });
+
+    it("loads replace_label handler from HANDLER_MAP via loadHandlers when enabled in config", async () => {
+      global.github = {};
+      try {
+        const handlers = await loadHandlers({ replace_label: {} });
+        expect(handlers.has("replace_label")).toBe(true);
+        expect(typeof handlers.get("replace_label")).toBe("function");
+      } finally {
+        delete global.github;
+      }
+    });
+
+    it("processes replace_label messages without no-handler warnings when handler is registered", async () => {
+      const messages = [{ type: "replace_label", item_number: 1, label_to_remove: "old", label_to_add: "new" }];
+      const mockHandler = vi.fn().mockResolvedValue({
+        success: true,
+        item_number: 1,
+        label_to_remove: "old",
+        label_to_add: "new",
+      });
+      const handlers = new Map([["replace_label", mockHandler]]);
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.results).toHaveLength(1);
+      expect(result.results[0].type).toBe("replace_label");
+      // Handler was invoked, so no "no handler loaded" error
+      expect(result.results[0].error).toBeUndefined();
+      expect(mockHandler).toHaveBeenCalledTimes(1);
+    });
+
+    it("records no-handler error for replace_label when handler map is missing entry", async () => {
+      const messages = [{ type: "replace_label", item_number: 1, label_to_remove: "old", label_to_add: "new" }];
+      // Empty handler map - simulates the bug where replace_label was not in HANDLER_MAP
+      const handlers = new Map();
+
+      const result = await processMessages(handlers, messages);
+
+      expect(result.results).toHaveLength(1);
+      expect(result.results[0].success).toBe(false);
+      expect(result.results[0].error).toContain("No handler loaded for type 'replace_label'");
     });
   });
 

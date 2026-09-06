@@ -14,15 +14,16 @@ permissions:
   pull-requests: read
   discussions: read
 tracker-id: daily-cache-strategy-analyzer
-model: "${{ needs.activation.outputs.model_size }}"
+model: openai/gpt-5.3-codex
 engine:
   id: codex
+  model-provider: openai
 strict: true
 experiments:
   model_size:
-    variants: [gpt-5.4, gpt-5.4-mini]
+    variants: [gpt-5.3-codex, gpt-5.3-codex-spark]
     description: "Compares codex-compatible models for cache issue detection quality and efficiency."
-    hypothesis: "H0: no change in issue creation rate or run success rate. H1: gpt-5.4-mini reduces AI Credits while keeping run success rate >=0.90."
+    hypothesis: "H0: no change in issue creation rate or run success rate. H1: gpt-5.3-codex-spark reduces AI Credits while keeping run success rate >=0.90."
     metric: ai_credits_total
     secondary_metrics: [run_success_rate, run_duration_ms]
     guardrail_metrics:
@@ -39,12 +40,13 @@ network:
     - "api.github.com"
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   cache-memory: true
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
 safe-outputs:
   create-issue:
     expires: 7d
@@ -60,6 +62,7 @@ safe-outputs:
     close-older-discussions: true
 timeout-minutes: 60
 imports:
+  - uses: shared/aw-logs-24h-fetch-setup.md
   - uses: shared/meta-analysis-base.md
     with:
       toolsets: [default, actions]
@@ -132,19 +135,9 @@ fi
 
 ## Phase 1: Download Recent Workflow Logs
 
-Use the `agentic-workflows` MCP `logs` tool to fetch logs from the last 24 hours.
+{{#runtime-import? shared/aw-logs-24h-fetch-prompt.md}}
 
-**Tool**: `logs`
-**Parameters**:
-```json
-{
-  "count": 200,
-  "start_date": "-1d",
-  "parse": true
-}
-```
-
-Logs are saved to `/tmp/gh-aw/aw-mcp/logs/`. Each run directory contains:
+Logs are available in `/tmp/gh-aw/aw-mcp/logs/`. Each run directory contains:
 
 ```
 /tmp/gh-aw/aw-mcp/logs/run-<id>/
@@ -166,7 +159,7 @@ for run_dir in /tmp/gh-aw/aw-mcp/logs/run-*/; do
   info="$run_dir/aw_info.json"
   [ -f "$info" ] || continue
   workflow=$(jq -r '.workflow_name // .workflow // "unknown"' "$info")
-  uses_cache=$(jq -r 'if .tools.cache_memory or (.tools | to_entries[] | select(.key | test("cache.memory"; "i"))) then "yes" else "no" end' "$info" 2>/dev/null || echo "no")
+  uses_cache=$(jq -r 'if .cache_memory then "yes" else "no" end' "$info" 2>/dev/null || echo "no")
   [ "$uses_cache" = "yes" ] || continue
   # Scan for cache miss signals
   grep -ri --include="*.log" --include="*.txt" \
@@ -260,6 +253,76 @@ For each finding that meets the threshold AND for which no open issue already ex
 
 ### Issue Template
 
+Use the `cache-strategy-issue-template` skill for the issue title, body structure, and `known-issues.json` recording format. After creating each issue, record it in `known-issues.json` with the title as key and issue number as value.
+
+---
+
+## Phase 6: Generate Discussion Report
+
+Create a discussion summarizing today's analysis. Use the `create-discussion` safe-output tool.
+
+Use the `cache-strategy-discussion-template` skill for the discussion title and body format when generating the report.
+
+---
+
+## Important Guidelines
+
+### Cache Memory Best Practices to Look For
+
+When evaluating workflows, check for these common mistakes:
+
+1. **Volatile keys without restore-keys**: Cache key contains `run_id`, `run_number`, or current timestamp **and** no restore-keys are configured → guaranteed cold start every run. (A `run_id` key paired with a restore-key is the valid "last one wins" pattern and should not be flagged.)
+2. **No writes**: `cache-memory: true` declared but the agent never writes to `/tmp/gh-aw/cache-memory/` → tool does nothing useful
+3. **No reads**: Cache is written but the agent never reads previous data → cache is write-only, no benefit
+4. **Full overwrites**: Agent always writes a complete fresh file instead of merging with existing data → loses history
+5. **Too broad scope**: One giant JSON blob cached that is invalidated by any single change → low hit rate
+6. **No expiry awareness**: Stale data read without checking age → incorrect behavior silently
+
+### Report Formatting
+
+- Use h3 (###) or lower for all headers
+- Wrap long sections in `<details><summary>...</summary>` tags
+- Be specific: include workflow names, run IDs, and log excerpts as evidence
+- Be actionable: every finding must have a concrete recommended fix
+
+### Time Management
+
+- Spend no more than 5 minutes on each run's log analysis
+- If approaching the 60-minute timeout, save partial results to cache-memory and finish the report with what is available
+- Prioritize workflows that already have entries in `index.json` (continuing historical analysis) over brand-new workflows
+
+### Avoiding Duplicate Issues
+
+Always check `known-issues.json` before creating a new issue. If an issue title already exists in the map:
+- Skip issue creation for that workflow
+- Mention the existing issue number in the discussion report
+
+### When to Call `missing_data`
+
+Only call the `missing_data` tool when an **external** dependency is truly unavailable and prevents analysis from completing — for example, the `agentic-workflows` MCP server is unreachable and no workflow logs can be downloaded.
+
+**Do NOT call `missing_data` for**:
+- An absent or empty `cache-strategy/` directory at startup (this is normal for first runs or after cache resets — just initialize and proceed)
+- Having few or no historical runs to compare against yet
+
+---
+
+## Success Criteria
+
+A successful run:
+- ✅ Downloads and analyzes logs from the last 24 hours
+- ✅ Filters to workflows that use `cache-memory` only
+- ✅ Identifies cache misses and misconfigured caches using log pattern analysis
+- ✅ Updates `cache-memory` with today's run records
+- ✅ Creates up to 5 GitHub issues for Critical/High findings not already tracked
+- ✅ Creates a discussion summarizing all findings
+- ✅ Avoids duplicate issues by checking `known-issues.json`
+
+## skill: `cache-strategy-issue-template`
+---
+description: Issue title, body structure, and known-issues recording format for cache-strategy findings.
+---
+
 **Title**: `[cache-strategy] Fix cache miss in <workflow-name>`
 
 **Body**:
@@ -310,11 +373,10 @@ After creating each issue, record it in `known-issues.json`:
 }
 ```
 
+## skill: `cache-strategy-discussion-template`
 ---
-
-## Phase 6: Generate Discussion Report
-
-Create a discussion summarizing today's analysis. Use the `create-discussion` safe-output tool.
+description: Discussion title and body structure for the daily cache strategy analysis report.
+---
 
 **Title**: `[cache-strategy] Cache Strategy Analysis - YYYY-MM-DD`
 
@@ -395,58 +457,3 @@ These workflows use cache-memory correctly and had consistent cache hits:
 ---
 *Report generated by the [Daily Cache Strategy Analyzer](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
 ```
-
----
-
-## Important Guidelines
-
-### Cache Memory Best Practices to Look For
-
-When evaluating workflows, check for these common mistakes:
-
-1. **Volatile keys without restore-keys**: Cache key contains `run_id`, `run_number`, or current timestamp **and** no restore-keys are configured → guaranteed cold start every run. (A `run_id` key paired with a restore-key is the valid "last one wins" pattern and should not be flagged.)
-2. **No writes**: `cache-memory: true` declared but the agent never writes to `/tmp/gh-aw/cache-memory/` → tool does nothing useful
-3. **No reads**: Cache is written but the agent never reads previous data → cache is write-only, no benefit
-4. **Full overwrites**: Agent always writes a complete fresh file instead of merging with existing data → loses history
-5. **Too broad scope**: One giant JSON blob cached that is invalidated by any single change → low hit rate
-6. **No expiry awareness**: Stale data read without checking age → incorrect behavior silently
-
-### Report Formatting
-
-- Use h3 (###) or lower for all headers
-- Wrap long sections in `<details><summary>...</summary>` tags
-- Be specific: include workflow names, run IDs, and log excerpts as evidence
-- Be actionable: every finding must have a concrete recommended fix
-
-### Time Management
-
-- Spend no more than 5 minutes on each run's log analysis
-- If approaching the 60-minute timeout, save partial results to cache-memory and finish the report with what is available
-- Prioritize workflows that already have entries in `index.json` (continuing historical analysis) over brand-new workflows
-
-### Avoiding Duplicate Issues
-
-Always check `known-issues.json` before creating a new issue. If an issue title already exists in the map:
-- Skip issue creation for that workflow
-- Mention the existing issue number in the discussion report
-
-### When to Call `missing_data`
-
-Only call the `missing_data` tool when an **external** dependency is truly unavailable and prevents analysis from completing — for example, the `agentic-workflows` MCP server is unreachable and no workflow logs can be downloaded.
-
-**Do NOT call `missing_data` for**:
-- An absent or empty `cache-strategy/` directory at startup (this is normal for first runs or after cache resets — just initialize and proceed)
-- Having few or no historical runs to compare against yet
-
----
-
-## Success Criteria
-
-A successful run:
-- ✅ Downloads and analyzes logs from the last 24 hours
-- ✅ Filters to workflows that use `cache-memory` only
-- ✅ Identifies cache misses and misconfigured caches using log pattern analysis
-- ✅ Updates `cache-memory` with today's run records
-- ✅ Creates up to 5 GitHub issues for Critical/High findings not already tracked
-- ✅ Creates a discussion summarizing all findings
-- ✅ Avoids duplicate issues by checking `known-issues.json`

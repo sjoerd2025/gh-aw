@@ -41,6 +41,18 @@ const SAFEOUTPUTS_SERVER_NAME = "safeoutputs";
 const DEFAULT_HTTP_TIMEOUT_MS = 15000;
 
 /**
+ * Maximum number of times to retry tools/list when a server returns 0 tools.
+ * The gateway may report a backend as "running" before the backend has finished
+ * building its tool schema (a race condition more likely with large configs).
+ */
+const TOOLS_EMPTY_MAX_RETRIES = 5;
+
+/**
+ * Milliseconds to wait between tools/list retry attempts when the result is empty.
+ */
+const TOOLS_EMPTY_RETRY_DELAY_MS = 1000;
+
+/**
  * Parse a tools JSON file and return a validated tools array.
  *
  * @param {string} toolsPath
@@ -232,6 +244,7 @@ function httpPostJSON(urlStr, headers, body, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS
 
     const req = http.request(options, res => {
       let data = "";
+      res.on("error", reject);
       res.on("data", chunk => {
         data += chunk;
       });
@@ -317,12 +330,12 @@ function parseMCPResponseBody(body) {
  * Follows the standard MCP handshake: initialize → notifications/initialized → tools/list.
  *
  * @param {string} serverUrl - HTTP URL of the MCP server endpoint
- * @param {string} apiKey - Bearer token for gateway authentication
+ * @param {string} agentId - Bearer token for gateway authentication
  * @param {typeof import("@actions/core")} core - GitHub Actions core
- * @returns {Promise<Array<{name: string, description?: string, inputSchema?: unknown}>>}
+ * @returns {Promise<{tools: Array<{name: string, description?: string, inputSchema?: unknown}>, emptyWasSuccessful: boolean}>}
  */
-async function fetchMCPTools(serverUrl, apiKey, core) {
-  const authHeaders = { Authorization: apiKey };
+async function fetchMCPToolsResult(serverUrl, agentId, core) {
+  const authHeaders = { Authorization: agentId };
 
   // Step 1: initialize – establish the session and capture Mcp-Session-Id if present
   /** @type {any} */
@@ -349,7 +362,7 @@ async function fetchMCPTools(serverUrl, apiKey, core) {
     }
   } catch (err) {
     core.warning(`  initialize failed for ${serverUrl}: ${getErrorMessage(err)}`);
-    return [];
+    return { tools: [], emptyWasSuccessful: false };
   }
 
   // Step 2: notifications/initialized – required by MCP spec to complete the handshake.
@@ -367,14 +380,79 @@ async function fetchMCPTools(serverUrl, apiKey, core) {
     if (respBody && typeof respBody === "object" && "result" in respBody && respBody.result && typeof respBody.result === "object") {
       const result = respBody.result;
       if ("tools" in result && Array.isArray(result.tools)) {
-        return /** @type {Array<{name: string, description?: string, inputSchema?: unknown}>} */ result.tools;
+        return {
+          tools: /** @type {Array<{name: string, description?: string, inputSchema?: unknown}>} */ result.tools,
+          emptyWasSuccessful: true,
+        };
       }
     }
-    return [];
+    return { tools: [], emptyWasSuccessful: false };
   } catch (err) {
     core.warning(`  tools/list failed for ${serverUrl}: ${getErrorMessage(err)}`);
-    return [];
+    return { tools: [], emptyWasSuccessful: false };
   }
+}
+
+/**
+ * Query the tools list from an MCP server via JSON-RPC.
+ *
+ * @param {string} serverUrl - HTTP URL of the MCP server endpoint
+ * @param {string} agentId - ****** for gateway authentication
+ * @param {typeof import("@actions/core")} core - GitHub Actions core
+ * @returns {Promise<Array<{name: string, description?: string, inputSchema?: unknown}>>}
+ */
+async function fetchMCPTools(serverUrl, agentId, core) {
+  const result = await fetchMCPToolsResult(serverUrl, agentId, core);
+  return result.tools;
+}
+
+/**
+ * Fetch MCP tools with retry on empty result.
+ *
+ * The MCP gateway may report a backend as "running" before that backend has
+ * finished building its internal tool schema (a race between process-level
+ * readiness and schema construction). This is more likely with large
+ * dispatch-workflow configs where building tool definitions takes long enough
+ * that tools/list can still return 0 tools immediately after the health check
+ * passes. Retrying a handful of times with a short delay bridges that gap, but
+ * only for successful empty tools/list responses; transport/protocol failures
+ * stop immediately so unavailable backends still fail fast.
+ *
+ * @param {string} serverUrl
+ * @param {string} agentId
+ * @param {string} serverName - Server name, used only for log messages
+ * @param {typeof import("@actions/core")} core
+ * @param {object} [options]
+ * @param {(ms: number) => Promise<void>} [options.sleep] - Delay function (injectable for tests)
+ * @param {(url: string, key: string, c: typeof import("@actions/core")) => Promise<Array<{name: string, description?: string, inputSchema?: unknown}> | {tools: Array<{name: string, description?: string, inputSchema?: unknown}>, emptyWasSuccessful: boolean}>} [options.fetchFn] - Fetch function (injectable for tests)
+ * @returns {Promise<Array<{name: string, description?: string, inputSchema?: unknown}>>}
+ */
+async function fetchMCPToolsWithRetry(serverUrl, agentId, serverName, core, { sleep = undefined, fetchFn = undefined } = {}) {
+  const doSleep = sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const doFetchResult = async (url, key, c) => {
+    if (!fetchFn) {
+      return fetchMCPToolsResult(url, key, c);
+    }
+    const result = await fetchFn(url, key, c);
+    if (Array.isArray(result)) {
+      return { tools: result, emptyWasSuccessful: true };
+    }
+    return result;
+  };
+  let result = await doFetchResult(serverUrl, agentId, core);
+  for (let attempt = 1; attempt <= TOOLS_EMPTY_MAX_RETRIES && result.emptyWasSuccessful && result.tools.length === 0; attempt++) {
+    core.warning(`  tools/list returned 0 tools for '${serverName}', retrying in ${TOOLS_EMPTY_RETRY_DELAY_MS}ms (attempt ${attempt}/${TOOLS_EMPTY_MAX_RETRIES})...`);
+    await doSleep(TOOLS_EMPTY_RETRY_DELAY_MS);
+    result = await doFetchResult(serverUrl, agentId, core);
+    if (!result.emptyWasSuccessful) {
+      core.warning(`  stopping empty tools/list retries for '${serverName}' because tools/list did not complete successfully`);
+      break;
+    }
+  }
+  if (result.emptyWasSuccessful && result.tools.length === 0) {
+    core.warning(`  tools/list still returned 0 tools for '${serverName}' after ${TOOLS_EMPTY_MAX_RETRIES} retries; continuing with empty tool list`);
+  }
+  return result.tools;
 }
 
 /**
@@ -384,26 +462,26 @@ async function fetchMCPTools(serverUrl, apiKey, core) {
  * protocol (initialize → notifications/initialized → tools/call), help
  * display, argument parsing, console logging, and JSONL audit logging.
  *
- * The gateway API key is baked directly into the generated script at
- * generation time because MCP_GATEWAY_API_KEY is excluded from the AWF
- * sandbox environment (--exclude-env MCP_GATEWAY_API_KEY) and would not
+ * The gateway agent ID is baked directly into the generated script at
+ * generation time because MCP_GATEWAY_AGENT_ID is excluded from the AWF
+ * sandbox environment (--exclude-env MCP_GATEWAY_AGENT_ID) and would not
  * be accessible to the agent at runtime.
  *
  * @param {string} serverName - Name of the MCP server
  * @param {string} serverUrl - HTTP URL of the MCP server endpoint
  * @param {string} toolsFile - Path to the cached tools JSON file
- * @param {string} apiKey - Gateway API key, baked into the script at generation time
+ * @param {string} agentId - Gateway agent ID, baked into the script at generation time
  * @param {string} bridgeScript - Absolute path to mcp_cli_bridge.cjs
  * @returns {string} Content of the bash wrapper script
  */
-function generateCLIWrapperScript(serverName, serverUrl, toolsFile, apiKey, bridgeScript) {
+function generateCLIWrapperScript(serverName, serverUrl, toolsFile, agentId, bridgeScript) {
   // Sanitize all values that are embedded in the shell script to prevent injection.
   // Server names are pre-validated by isValidServerName(), but we still escape all
   // values for defense-in-depth.
   const safeName = shellEscapeDoubleQuoted(serverName);
   const safeUrl = shellEscapeDoubleQuoted(serverUrl);
   const safeToolsFile = shellEscapeDoubleQuoted(toolsFile);
-  const safeApiKey = shellEscapeDoubleQuoted(apiKey);
+  const safeAgentId = shellEscapeDoubleQuoted(agentId);
   const safeBridge = shellEscapeDoubleQuoted(bridgeScript);
 
   return `#!/usr/bin/env bash
@@ -424,7 +502,7 @@ exec node "${safeBridge}" \\
   --server-name "${safeName}" \\
   --server-url "${safeUrl}" \\
   --tools-file "${safeToolsFile}" \\
-  --api-key "${safeApiKey}" \\
+  --api-key "${safeAgentId}" \\
   "\$@"
 `;
 }
@@ -466,7 +544,7 @@ async function main() {
     fs.mkdirSync(CLI_BIN_DIR, { recursive: true });
     fs.mkdirSync(TOOLS_DIR, { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create MCP CLI directories: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to create MCP CLI directories: ${getErrorMessage(err)}`, { cause: err });
   }
 
   // The bridge script lives alongside mount_mcp_as_cli.cjs in the setup actions directory.
@@ -478,9 +556,9 @@ async function main() {
     core.info(`Bridge script: ${bridgeScript}`);
   }
 
-  const apiKey = process.env.MCP_GATEWAY_API_KEY || "";
-  if (!apiKey) {
-    core.warning("MCP_GATEWAY_API_KEY is not set; generated CLI wrappers will not be able to authenticate with the gateway");
+  const agentId = process.env.MCP_GATEWAY_AGENT_ID || "";
+  if (!agentId) {
+    core.warning("MCP_GATEWAY_AGENT_ID is not set; generated CLI wrappers will not be able to authenticate with the gateway");
   }
 
   const gatewayDomain = process.env.MCP_GATEWAY_DOMAIN || "";
@@ -521,15 +599,19 @@ async function main() {
 
     const toolsFile = path.join(TOOLS_DIR, `${name}.json`);
 
-    // Query tools from the server using the host-accessible URL (mount step runs on host)
-    let tools = await fetchMCPTools(url, apiKey, core);
+    // Query tools from the server using the host-accessible URL (mount step runs on host).
+    // Retries on empty to handle the race between gateway health-reporting and
+    // the backend finishing internal tool-schema construction (common with large configs).
+    let tools = await fetchMCPToolsWithRetry(url, agentId, name, core);
     const validate = SERVER_VALIDATORS[name];
     if (validate) {
       tools = validate(tools, core);
     }
     core.info(`  Found ${tools.length} tool(s)`);
 
-    // Cache the tool list
+    // Cache the tool list. This file only contains tool name/description/schema
+    // metadata returned by the gateway; it does not contain the agent ID or any
+    // other secret, so world-readable permissions (0o644) are acceptable here.
     try {
       fs.writeFileSync(toolsFile, JSON.stringify(tools, null, 2), { mode: 0o644 });
     } catch (err) {
@@ -538,13 +620,31 @@ async function main() {
 
     // Write the CLI wrapper script using the container-accessible URL
     const scriptPath = path.join(CLI_BIN_DIR, name);
+    let scriptFd;
     try {
-      fs.writeFileSync(scriptPath, generateCLIWrapperScript(name, containerUrl, toolsFile, apiKey, bridgeScript), { mode: 0o755 });
+      // Owner-only permissions: the wrapper script embeds the plaintext gateway agent ID,
+      // so it must not be world- or group-readable (matches chmod 600 used elsewhere for
+      // this same credential, e.g. convert_gateway_config_copilot.sh).
+      // Note: writeFileSync(mode) only applies when creating a new file; for existing files,
+      // force mode with fchmodSync so prior permissive modes (e.g., 0o755) are corrected.
+      scriptFd = fs.openSync(scriptPath, "w", 0o700);
+      fs.fchmodSync(scriptFd, 0o700);
+      fs.writeFileSync(scriptFd, generateCLIWrapperScript(name, containerUrl, toolsFile, agentId, bridgeScript), "utf8");
+      fs.closeSync(scriptFd);
+      scriptFd = undefined;
       mountedServers.push(name);
       mountedServerTools.push({ name, tools });
       core.info(`  ✓ Mounted as: ${scriptPath}`);
     } catch (err) {
       core.warning(`  Failed to write CLI wrapper for ${name}: ${getErrorMessage(err)}`);
+    } finally {
+      if (scriptFd !== undefined) {
+        try {
+          fs.closeSync(scriptFd);
+        } catch {
+          // Ignore close errors in cleanup path; main error already reported above.
+        }
+      }
     }
   }
 
@@ -582,6 +682,7 @@ module.exports = {
   AWF_GATEWAY_IP,
   main,
   fetchMCPTools,
+  fetchMCPToolsWithRetry,
   generateCLIWrapperScript,
   isValidServerName,
   shellEscapeDoubleQuoted,
@@ -593,4 +694,6 @@ module.exports = {
   writeSafeOutputsGatewayEmptyFlag,
   SERVER_VALIDATORS,
   buildMCPCLIServersPromptList,
+  TOOLS_EMPTY_MAX_RETRIES,
+  TOOLS_EMPTY_RETRY_DELAY_MS,
 };

@@ -1,7 +1,7 @@
 ---
 private: true
 emoji: "🔢"
-description: Monitors and updates agentic CLI tools (Claude Code, GitHub Copilot CLI, OpenAI Codex, GitHub MCP Server, Playwright MCP, Playwright CLI, Playwright Browser, MCP Gateway, Pi) and Docker images (actionlint, syft, grype, grant, zizmor, poutine, runner-guard, yamllint) for new versions
+description: Monitors and updates agentic CLI tools (Claude Code, GitHub Copilot CLI, OpenAI Codex, GitHub MCP Server, Playwright CLI, MCP Gateway, Pi, threat-detect) and Docker images (actionlint, syft, grype, grant, zizmor, poutine, runner-guard, yamllint) for new versions
 on:
   schedule: daily
   workflow_dispatch:
@@ -10,17 +10,21 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
+model: openai/gpt-5.3-codex
 strict: false
-engine: claude
+engine:
+  id: codex
+  model-provider: openai
 network: 
    allowed: [defaults, node, go, "api.github.com", containers]
 imports:
   - ../skills/jqschema/SKILL.md
   - shared/reporting.md
   - shared/otlp.md
+  - shared/graders.md
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   web-fetch:
@@ -44,11 +48,12 @@ evals:
     question: Did the agent check for new versions and digest changes of Docker images in pkg/cli/docker_images.go (actionlint, syft, grype, grant, zizmor, poutine, runner-guard, yamllint)?
   - id: updates_applied_or_noop
     question: Were version or digest updates applied and a PR created, or was noop used when all tools were already up to date?
+
 ---
 
 # CLI Version Checker
 
-Monitor and update agentic CLI tools: Claude Code, GitHub Copilot CLI, OpenAI Codex, GitHub MCP Server, Playwright MCP, Playwright CLI, Playwright Browser, MCP Gateway, and Pi.
+Monitor and update agentic CLI tools: Claude Code, GitHub Copilot CLI, OpenAI Codex, GitHub MCP Server, Playwright CLI, MCP Gateway, Pi, and threat-detect.
 
 **Repository**: ${{ github.repository }} | **Run**: ${{ github.run_id }}
 
@@ -57,13 +62,13 @@ Monitor and update agentic CLI tools: Claude Code, GitHub Copilot CLI, OpenAI Co
 **EFFICIENCY FIRST**: Before starting:
 1. Check cache-memory at `/tmp/gh-aw/cache-memory/` for previous version checks and help outputs
 2. If cached versions exist and are recent (< 24h), verify if updates are needed before proceeding
-3. If no CLI version, Docker image version, or Docker image digest changes are detected, exit early with success
+3. If no CLI version, Docker image version, or Docker image digest changes are detected, call `noop` as the terminal safe output and exit successfully
 
 **CRITICAL**: If ANY version or digest changes are detected, you MUST create an issue using safe-outputs.create-issue. Do not skip issue creation even for minor updates.
 
-For each CLI/MCP server:
+For each CLI/MCP server and threat-detect:
 1. Fetch latest version from NPM registry or GitHub releases (use npm view commands for package metadata)
-2. Compare with current version in `./pkg/constants/constants.go`
+2. Compare with the current version constant in `./pkg/constants/`
 3. If newer version exists, research changes and prepare update
 
 ### Version Sources
@@ -80,15 +85,9 @@ For each CLI/MCP server:
   - Release Notes: https://github.com/openai/codex/releases
 - **GitHub MCP Server**: `https://api.github.com/repos/github/github-mcp-server/releases/latest`
   - Release Notes: https://github.com/github/github-mcp-server/releases
-- **Playwright MCP**: Use `npm view @playwright/mcp version`
-  - Repository: https://github.com/microsoft/playwright
-  - Package: https://www.npmjs.com/package/@playwright/mcp
 - **Playwright CLI**: Use `npm view @playwright/cli version`
   - Repository: https://github.com/microsoft/playwright-cli
   - Package: https://www.npmjs.com/package/@playwright/cli
-- **Playwright Browser**: `https://api.github.com/repos/microsoft/playwright/releases/latest`
-  - Release Notes: https://github.com/microsoft/playwright/releases
-  - Docker Image: `mcr.microsoft.com/playwright:v{VERSION}`
 - **MCP Gateway**: `https://api.github.com/repos/github/gh-aw-mcpg/releases/latest`
   - Repository: https://github.com/github/gh-aw-mcpg
   - Release Notes: https://github.com/github/gh-aw-mcpg/releases
@@ -97,6 +96,10 @@ For each CLI/MCP server:
 - **Pi**: Use `npm view @earendil-works/pi-coding-agent version`
   - Package: https://www.npmjs.com/package/@earendil-works/pi-coding-agent
   - Constant: `DefaultPiVersion` in `pkg/constants/version_constants.go`
+- **Threat-detect**: Check `https://api.github.com/repos/github/gh-aw-threat-detection/releases/latest`
+  - Release notes: https://github.com/github/gh-aw-threat-detection/releases
+  - Constant: `DefaultThreatDetectVersion` in `pkg/constants/version_constants.go`
+  - Update the version with the `v` prefix used by GitHub release tags
 **Optimization**: Fetch all versions in parallel using multiple npm view or WebFetch calls in a single turn.
 
 ### Research & Analysis
@@ -114,9 +117,6 @@ For each update, analyze intermediate versions:
 - **GitHub MCP Server**: Fetch release notes from https://github.com/github/github-mcp-server/releases/tag/v{VERSION}
   - Parse release body for changelog entries
   - **CRITICAL**: Convert PR/issue references (e.g., `#1105`) to full URLs since they refer to external repositories (e.g., `https://github.com/github/github-mcp-server/pull/1105`)
-- **Playwright Browser**: Fetch release notes from https://github.com/microsoft/playwright/releases/tag/v{VERSION}
-  - Parse release body for changelog entries
-  - **CRITICAL**: Convert PR/issue references to full URLs (e.g., `https://github.com/microsoft/playwright/pull/12345`)
 - **Copilot CLI**: **ALWAYS attempt deep analysis** - Repository: https://github.com/github/copilot-cli
   - **CRITICAL**: Thoroughly read and analyze all available documentation:
     1. **Release Notes**: Fetch from https://github.com/github/copilot-cli/releases/tag/v{VERSION}
@@ -136,7 +136,6 @@ For each update, analyze intermediate versions:
     - Check for any publicly available release announcements or blog posts
   - **CRITICAL**: Convert PR/issue references to full URLs (e.g., `https://github.com/github/copilot-cli/pull/123`)
 - **Claude Code**: No public repository, rely on NPM metadata and CLI help output
-- **Playwright MCP**: Uses Playwright versioning, check NPM package metadata for changes
 - **Playwright CLI**: Check NPM package metadata and GitHub releases for changes
   - Fetch release notes from https://github.com/microsoft/playwright-cli/releases/tag/v{VERSION}
   - **CRITICAL**: Convert PR/issue references to full URLs (e.g., `https://github.com/microsoft/playwright-cli/pull/123`)
@@ -147,6 +146,7 @@ For each update, analyze intermediate versions:
 - **Pi**: No public GitHub repository; rely on NPM metadata and CLI help output
   - Use `npm view @earendil-works/pi-coding-agent --json` for package metadata
   - Compare CLI help output between versions
+- **Threat-detect**: Fetch release notes from https://github.com/github/gh-aw-threat-detection/releases
 **NPM Metadata Fallback**: When GitHub release notes are unavailable, use:
 - `npm view <package> --json` for package metadata
 - Compare CLI help outputs between versions
@@ -158,7 +158,7 @@ Check cache-memory first (`/tmp/gh-aw/cache-memory/`). Only install and run `--h
 For each CLI tool update, install (`npm install -g <package>@<version>`), run `--help` on the main command and key subcommands (Copilot: `config`, `environment`), and compare with the cached output to identify new flags, removed features, or behavior changes.
 
 ### Update Process
-1. Edit `./pkg/constants/constants.go` with new CLI version(s)
+1. Edit the appropriate version constant in `./pkg/constants/` with new CLI version(s)
 2. Edit `./pkg/cli/docker_images.go` with new Docker image version(s) and digest(s), including digest-only changes where the tag is unchanged
 3. Run `make fmt` after editing any Go files
 4. **REQUIRED**: Run `make recompile` in the **foreground** — do NOT background it with `&` or follow it with `sleep`. Wait for it to finish completely before proceeding. Example: `make recompile && echo "done"`.
@@ -180,14 +180,12 @@ For each updated CLI, include: version old → new, release timeline, changes ca
 - **USE NPM COMMANDS**: Use `npm view` instead of web-fetch for package metadata queries
 - **CHECK CACHE FIRST**: Before re-analyzing versions, check cache-memory for recent results
 - **PARALLEL FETCHING**: Fetch all versions in parallel using multiple npm/WebFetch calls in one turn
-- **EARLY EXIT**: If no version changes detected, save check timestamp to cache and exit successfully
+- **EARLY EXIT**: If no version changes are detected, save the check timestamp to cache, call `noop` as the terminal safe output, and exit successfully
 - **FETCH GITHUB RELEASE NOTES**: For tools with public GitHub repositories, fetch release notes to get detailed changelog information
   - Codex: Always fetch from https://github.com/openai/codex/releases
   - GitHub MCP Server: Always fetch from https://github.com/github/github-mcp-server/releases
-  - Playwright Browser: Always fetch from https://github.com/microsoft/playwright/releases
   - MCP Gateway: Always fetch from https://github.com/github/gh-aw-mcpg/releases
   - Copilot CLI: Try to fetch, but may be inaccessible (private repo)
-  - Playwright MCP: Check NPM metadata, uses Playwright versioning
   - Playwright CLI: Fetch from https://github.com/microsoft/playwright-cli/releases
   - Pi: No public GitHub repository; rely on NPM metadata (`npm view @earendil-works/pi-coding-agent --json`)
 - **EXPLORE SUBCOMMANDS**: Install and test CLI tools to discover new features via `--help` and explore each subcommand

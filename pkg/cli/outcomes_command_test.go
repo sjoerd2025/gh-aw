@@ -11,6 +11,7 @@ import (
 )
 
 func TestNewOutcomesCommand_DoesNotShadowGlobalVerboseFlag(t *testing.T) {
+	t.Parallel()
 	cmd := NewOutcomesCommand()
 	require.NotNil(t, cmd)
 
@@ -23,4 +24,15 @@ func TestNewOutcomesCommand_DoesNotShadowGlobalVerboseFlag(t *testing.T) {
 	inherited := cmd.InheritedFlags().Lookup("verbose")
 	require.NotNil(t, inherited, "outcomes should inherit global --verbose flag")
 	assert.Equal(t, "Enable verbose output showing detailed information", inherited.Usage)
+}
+
+func TestNewOutcomesCommand_OutputFlagShowsDefault(t *testing.T) {
+	t.Parallel()
+	cmd := NewOutcomesCommand()
+	require.NotNil(t, cmd)
+
+	outputFlag := cmd.Flags().Lookup("output")
+	require.NotNil(t, outputFlag)
+	assert.Equal(t, defaultLogsOutputDir, outputFlag.DefValue)
+	assert.Contains(t, cmd.UsageString(), `Output directory for generated files (default ".github/aw/logs")`)
 }

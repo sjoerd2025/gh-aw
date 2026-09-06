@@ -16,6 +16,7 @@ import (
 )
 
 func TestIsNotFoundError(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -39,13 +40,37 @@ func TestIsNotFoundError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := errorutil.IsNotFoundError(tt.err)
 			assert.Equal(t, tt.want, got)
 		})
 	}
 }
 
+func TestIsNotFoundOutput(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "empty output", output: "", want: false},
+		{name: "404 numeric literal", output: "HTTP 404: Not Found", want: true},
+		{name: "title case not found", output: "GraphQL: Not Found", want: true},
+		{name: "uppercase not found", output: "RESOURCE NOT FOUND", want: true},
+		{name: "generic output", output: "something went wrong", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, errorutil.IsNotFoundOutput(tt.output))
+		})
+	}
+}
+
 func TestIsForbiddenError(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -66,6 +91,7 @@ func TestIsForbiddenError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := errorutil.IsForbiddenError(tt.err)
 			assert.Equal(t, tt.want, got)
 		})
@@ -73,6 +99,7 @@ func TestIsForbiddenError(t *testing.T) {
 }
 
 func TestIsGoneError(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -93,7 +120,107 @@ func TestIsGoneError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := errorutil.IsGoneError(tt.err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestIsRateLimitError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "api rate limit exceeded", output: "API rate limit exceeded", want: true},
+		{name: "rate limit exceeded", output: "rate limit exceeded", want: true},
+		{name: "secondary rate limit", output: "secondary rate limit triggered", want: true},
+		{name: "case-insensitive", output: "API RATE LIMIT EXCEEDED", want: true},
+		{name: "non-rate-limit error", output: "HTTP 404: Not Found", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, errorutil.IsRateLimitError(tt.output))
+		})
+	}
+}
+
+func TestIsAuthError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{name: "gh_token", output: "GH_TOKEN is not set", want: true},
+		{name: "github_token", output: "GITHUB_TOKEN is invalid", want: true},
+		{name: "authentication", output: "authentication required", want: true},
+		{name: "not logged into", output: "not logged into any GitHub hosts", want: true},
+		{name: "unauthorized", output: "HTTP 401: Unauthorized", want: true},
+		{name: "forbidden is not inherently an auth failure", output: "HTTP 403: Forbidden", want: false},
+		{name: "permission denied", output: "permission denied: insufficient scope", want: true},
+		{name: "saml enforcement", output: "Resource protected by organization SAML enforcement", want: true},
+		{name: "non-auth error", output: "API rate limit exceeded for installation", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, errorutil.IsAuthError(tt.output))
+		})
+	}
+}
+
+func TestIsInsufficientScopesError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{name: "graphql insufficient scopes", err: errors.New("GraphQL: Your token has not been granted the required scopes (INSUFFICIENT_SCOPES)"), want: true},
+		{name: "case-insensitive lowercase", err: errors.New("insufficient_scopes"), want: true},
+		{name: "wrapped insufficient scopes", err: fmt.Errorf("mutation failed: %w", errors.New("INSUFFICIENT_SCOPES")), want: true},
+		{name: "unrelated error", err: errors.New("something went wrong"), want: false},
+		{name: "generic forbidden", err: errors.New("HTTP 403: Forbidden"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := errorutil.IsInsufficientScopesError(tt.err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestIsAlreadyMergedError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{name: "already merged phrase", err: errors.New("GraphQL: Pull request is already merged (mergePullRequest)"), want: true},
+		{name: "MERGED state literal", err: errors.New("pull request state is MERGED"), want: true},
+		{name: "case-insensitive merged", err: errors.New("pull request already merged"), want: true},
+		{name: "wrapped already merged", err: fmt.Errorf("merge failed: %w", errors.New("already merged")), want: true},
+		{name: "unrelated error", err: errors.New("network timeout"), want: false},
+		{name: "could not be merged", err: errors.New("GraphQL: Pull request could not be merged (mergePullRequest)"), want: false},
+		{name: "not merged", err: errors.New("pull request is not merged"), want: false},
+		{name: "lowercase merged word", err: errors.New("failed to merge: branch was merged upstream"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := errorutil.IsAlreadyMergedError(tt.err)
 			assert.Equal(t, tt.want, got)
 		})
 	}

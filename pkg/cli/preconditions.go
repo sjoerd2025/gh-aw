@@ -9,6 +9,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/repoutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
@@ -164,11 +165,10 @@ func parseJSON(data []byte, v any) error {
 func checkUserPermissionsShared(repoSlug string, verbose bool) (bool, error) {
 	preconditionsLog.Print("Checking user permissions")
 
-	parts := strings.Split(repoSlug, "/")
-	if len(parts) != 2 {
+	owner, repo, err := repoutil.SplitRepoSlug(repoSlug)
+	if err != nil {
 		return false, fmt.Errorf("invalid repository format: %s", repoSlug)
 	}
-	owner, repo := parts[0], parts[1]
 
 	hasAccess, err := checkRepositoryAccess(owner, repo)
 	if err != nil {
@@ -192,20 +192,17 @@ func checkUserPermissionsShared(repoSlug string, verbose bool) (bool, error) {
 	return hasAccess, nil
 }
 
-// checkRepoVisibilityShared checks if the repository is public or private
-func checkRepoVisibilityShared(repoSlug string) bool {
+func getRepoVisibilityShared(repoSlug string) string {
 	preconditionsLog.Print("Checking repository visibility")
 
 	// Use gh api to check repository visibility
 	output, err := workflow.RunGH("Checking repository visibility...", "api", "/repos/"+repoSlug, "--jq", ".visibility")
 	if err != nil {
 		preconditionsLog.Printf("Could not check repository visibility: %v", err)
-		// Default to public if we can't determine
-		return true
+		return "unknown"
 	}
 
 	visibility := strings.TrimSpace(string(output))
-	isPublic := visibility == "public"
-	preconditionsLog.Printf("Repository visibility: %s (isPublic=%v)", visibility, isPublic)
-	return isPublic
+	preconditionsLog.Printf("Repository visibility: %s", visibility)
+	return visibility
 }

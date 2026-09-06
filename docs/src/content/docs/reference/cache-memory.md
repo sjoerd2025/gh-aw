@@ -5,7 +5,7 @@ sidebar:
   order: 1500
 ---
 
-Cache memory provides persistent file storage across workflow runs via GitHub Actions cache with 7-day retention. The compiler automatically configures the cache directory, restore/save operations, and progressive fallback keys at `/tmp/gh-aw/cache-memory/` (default) or `/tmp/gh-aw/cache-memory-{id}/` (additional caches).
+Cache memory provides persistent file storage across workflow runs via GitHub Actions cache. GitHub Actions evicts unused caches after 7 days. The compiler automatically configures the cache directory, restore/save operations, and progressive fallback keys at `/tmp/gh-aw/cache-memory/` (default) or `/tmp/gh-aw/cache-memory-{id}/` (additional caches).
 
 ## Enabling Cache Memory
 
@@ -25,8 +25,13 @@ Stores files at `/tmp/gh-aw/cache-memory/` using a workflow-scoped cache key. Us
 tools:
   cache-memory:
     key: custom-memory-${{ github.repository_owner }}
-    retention-days: 30  # 1-90 days, extends access beyond cache expiration
-    allowed-extensions: [".json", ".txt", ".md"]  # Restrict file types (default: empty/all files allowed)
+    retention-days: 30  # 1-90 days; controls uploaded artifact retention only
+    allowed-extensions: [".json", ".txt", ".md"]  # Restrict file types (default: .json, .jsonl, .txt, .md, .csv)
+    validation:
+      timeout-minutes: 1
+      script: |
+        const index = JSON.parse(fs.readFileSync(path.join(memoryRoot, "index.json"), "utf8"));
+        if (!Array.isArray(index.entries)) throw new Error("index.json entries must be an array");
 ---
 ```
 
@@ -35,7 +40,7 @@ tools:
 
 ### File Type Restrictions
 
-The `allowed-extensions` field restricts which file types can be written to cache-memory. By default, all file types are allowed (empty array). When specified, only files with listed extensions can be stored.
+The `allowed-extensions` field restricts which file types can be written to cache-memory. By default, only `.json`, `.jsonl`, `.txt`, `.md`, and `.csv` files are allowed. When specified, only files with listed extensions can be stored.
 
 ```aw wrap
 ---
@@ -48,6 +53,14 @@ tools:
 If files with disallowed extensions are found, the workflow will report validation failures.
 
 When a cache is restored for agent execution, gh-aw also strips execute bits from restored working-tree files and removes disallowed file types before the agent can read them. See [ADR-26587](https://github.com/github/gh-aw/blob/main/docs/adr/26587-pre-agent-cache-memory-working-tree-sanitization.md) for the pre-agent sanitization contract behind `allowed-extensions`.
+
+### Custom validation
+
+Use `validation.script` for domain-specific constraints such as schema checks, cross-file uniqueness, or timestamp policies. The script is a JavaScript body executed with Node.js over the complete configured cache-memory directory after agent execution and before the cache is saved. When threat detection is enabled, the validator also runs again in the `update_cache_memory` job before `actions/cache/save`.
+
+Available globals are Node.js `fs` and `path`, plus `memoryRoot`/`memoryDir`, `memoryId`, and `memoryKind` (`"cache"`). The working directory is the cache root. Environment variables available to the validator are intentionally limited to basic runner paths plus `GH_AW_MEMORY_ROOT`, `GH_AW_MEMORY_DIR`, `GH_AW_MEMORY_ID`, and `GH_AW_MEMORY_KIND`; GitHub tokens and write credentials are not passed to the validator subprocess. Network access follows the workflow runner's normal network policy. The default timeout is 1 minute and may be set with `validation.timeout-minutes` (1-5 minutes).
+
+Throw an exception, return `false`, time out, exit nonzero, or modify a memory file to reject persistence. Validator stdout and stderr are reported separately from built-in storage validation output.
 
 ## Multiple Configurations
 
@@ -66,23 +79,20 @@ tools:
 
 Mounts at `/tmp/gh-aw/cache-memory/` (default) or `/tmp/gh-aw/cache-memory-{id}/`. The `id` determines the folder name; `key` defaults to a workflow-scoped prefix derived from the sanitized workflow name.
 
-## Merging from Shared Workflows
+## Using with MCP Servers
 
 ```aw wrap
 ---
-imports:
-  - shared/mcp/server-memory.md
-
 tools:
   cache-memory: true
 ---
 ```
 
-Merge rules: **Single→Single** (local overrides), **Single→Multiple** (local converts to array), **Multiple→Multiple** (merge by `id`, local wins).
+MCP servers can persist temporary state by reading and writing files under `/tmp/gh-aw/cache-memory/` when `tools.cache-memory` is enabled. Configure the server directly in the workflow and point it at a subdirectory such as `/tmp/gh-aw/cache-memory/<server-name>/`.
 
 ## Behavior
 
-GitHub Actions cache provides 7-day retention, a 10GB per-repository limit, and LRU eviction. Add `retention-days` to upload artifacts (1-90 days) when you need access beyond normal cache expiration.
+GitHub Actions cache evicts unused entries after 7 days and provides a 10GB per-repository limit with LRU eviction. `retention-days` controls the retention of the uploaded artifact (1-90 days); it does not extend the cache lifetime.
 
 Cache memory is branch-scoped. Runs restore from caches on the same branch and can also fall back to the default branch. On a non-default branch, the first restore often comes from the default branch; later saves then create a branch-local cache lineage.
 
@@ -143,7 +153,7 @@ Do not store sensitive data in cache memory. It follows repository permissions, 
 
 See [Grumpy Code Reviewer](https://github.com/github/gh-aw/blob/main/.github/workflows/grumpy-reviewer.md) for tracking PR review history.
 
-## Related Documentation
+## Learn More
 
 - [Repo Memory](/gh-aw/reference/repo-memory/) - Git branch-based persistent storage with unlimited retention
 - [Frontmatter](/gh-aw/reference/frontmatter/) - Complete frontmatter configuration guide

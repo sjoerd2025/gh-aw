@@ -33,7 +33,10 @@ const { MAX_LABELS } = require("./constants.cjs");
 const { createCountGatedHandler } = require("./handler_scaffold.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
-const { normalizeIssueIntentLabelInputs } = require("./issue_intents.cjs");
+const { normalizeIssueIntentLabelInputs, buildIssueIntentLabelUpdates } = require("./issue_intents.cjs");
+const { fetchAllRepoLabels } = require("./github_api_helpers.cjs");
+const { SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
+const { deterministicLabelColor } = require("./create_labels.cjs");
 
 /**
  * @param {{ rationale?: string, confidence?: string, suggest?: boolean } | null | undefined} spec
@@ -41,6 +44,163 @@ const { normalizeIssueIntentLabelInputs } = require("./issue_intents.cjs");
  */
 function hasLabelIntentMetadata(spec) {
   return Boolean(spec && (spec.rationale || spec.confidence || spec.suggest));
+}
+
+/**
+ * Detect whether an item fetched via the REST issues endpoint is a pull request.
+ * The endpoint returns a `pull_request` field for PRs, and PR node IDs start with "PR_".
+ * @param {{ pull_request?: unknown } | null | undefined} issueData
+ * @param {string} nodeId
+ * @returns {boolean}
+ */
+function isPullRequestItem(issueData, nodeId) {
+  return Boolean(issueData?.pull_request) || nodeId.startsWith("PR_");
+}
+
+/**
+ * @param  {...Array<string|{ name?: string }>} labelGroups
+ * @returns {string[]}
+ */
+function mergeLabelNames(...labelGroups) {
+  const merged = [];
+  const seenLower = new Set();
+  for (const label of labelGroups.flatMap(group => normalizeLabelNames(group))) {
+    const key = label.toLowerCase();
+    if (!seenLower.has(key)) {
+      seenLower.add(key);
+      merged.push(label);
+    }
+  }
+  return merged;
+}
+
+/**
+ * Ensures the given label names exist in the target repository, creating any that are
+ * missing. A 422 response from createLabel means the label already exists (e.g. a
+ * concurrent creation) and is treated as success. Other creation errors are non-fatal
+ * and logged as warnings, since the caller will surface a clear "label not found" error
+ * later if the label is still required and missing.
+ * @param {any} githubClient - GitHub API client
+ * @param {{ owner: string, repo: string }} repoParts
+ * @param {string[]} labelNames - Requested label names to ensure exist
+ * @param {any} core - Actions core logging object
+ * @returns {Promise<void>}
+ */
+async function ensureLabelsExist(githubClient, repoParts, labelNames, core) {
+  if (labelNames.length === 0) {
+    return;
+  }
+
+  const repoLabels = await fetchAllRepoLabels(githubClient, repoParts.owner, repoParts.repo);
+  const existingNamesLower = new Set(repoLabels.map(label => label.name.toLowerCase()));
+  const missingLabelNames = labelNames.filter(name => !existingNamesLower.has(name.toLowerCase()));
+
+  if (missingLabelNames.length === 0) {
+    return;
+  }
+
+  core.info(`Creating ${missingLabelNames.length} missing label(s) in ${repoParts.owner}/${repoParts.repo}: ${JSON.stringify(missingLabelNames)}`);
+  for (const name of missingLabelNames) {
+    try {
+      await withRetry(
+        () =>
+          githubClient.rest.issues.createLabel({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            name,
+            color: deterministicLabelColor(name),
+            description: "",
+          }),
+        RATE_LIMIT_RETRY_CONFIG,
+        `create label ${JSON.stringify(name)} in ${repoParts.owner}/${repoParts.repo}`
+      );
+      core.info(`Created missing label ${JSON.stringify(name)} in ${repoParts.owner}/${repoParts.repo}`);
+    } catch (error) {
+      if (error !== null && typeof error === "object" && /** @type {any} */ error.status === 422) {
+        core.info(`Label ${JSON.stringify(name)} already exists in ${repoParts.owner}/${repoParts.repo}`);
+      } else {
+        core.warning(`Failed to create label ${JSON.stringify(name)} in ${repoParts.owner}/${repoParts.repo}: ${getErrorMessage(error)}`);
+      }
+    }
+  }
+}
+
+/**
+ * Apply labels with issue-intent metadata through the GraphQL updateIssue mutation.
+ * That mutation replaces the issue's label set, so the requested specs are merged with the
+ * issue's existing labels to preserve add-only semantics. Existing labels are sent without
+ * intent metadata; newly requested labels carry their metadata.
+ * @param {{
+ *   githubClient: any,
+ *   core: any,
+ *   repoParts: { owner: string, repo: string },
+ *   itemNumber: number,
+ *   itemRepo: string,
+ *   contextType: string,
+ *   issueData: any,
+ *   issueNodeId: string,
+ *   labelSpecs: Array<{ name: string }>,
+ * }} params
+ * @returns {Promise<string[]>} The label names on the issue after the mutation and any recovery
+ */
+async function applyIssueIntentLabels({ githubClient, core, repoParts, itemNumber, itemRepo, contextType, issueData, issueNodeId, labelSpecs }) {
+  const repoLabels = await fetchAllRepoLabels(githubClient, repoParts.owner, repoParts.repo);
+  const labelIdByName = new Map(repoLabels.map(label => [label.name.toLowerCase(), label.id]));
+
+  const existingLabelNames = normalizeLabelNames(issueData.labels || []);
+  const labelSpecNamesLower = new Set(labelSpecs.map(spec => spec.name.toLowerCase()));
+  const mergedSpecs = [...labelSpecs, ...existingLabelNames.filter(name => !labelSpecNamesLower.has(name.toLowerCase())).map(name => ({ name }))];
+
+  const labelIntentUpdates = buildIssueIntentLabelUpdates(mergedSpecs, labelIdByName);
+
+  core.info(`Adding ${labelSpecs.length} labels to ${contextType} #${itemNumber} in ${itemRepo} via GraphQL intent mutation`);
+  // updateIssue accepts LabelUpdateInput (rationale/confidence/suggest), which is gated
+  // by the "update_issue_suggestions" GraphQL feature flag.
+  const intentHeaders = { "GraphQL-Features": "update_issue_suggestions" };
+  const result = await withRetry(
+    () =>
+      githubClient.graphql(
+        `mutation($issueId: ID!, $labels: [LabelUpdateInput!]!) {
+          updateIssue(input: { id: $issueId, labels: $labels }) {
+            issue {
+              id
+              labels(first: 100) {
+                nodes {
+                  name
+                }
+              }
+            }
+          }
+        }`,
+        { issueId: issueNodeId, labels: labelIntentUpdates, headers: intentHeaders }
+      ),
+    RATE_LIMIT_RETRY_CONFIG,
+    `add_labels to ${contextType} #${itemNumber} in ${itemRepo}`
+  );
+
+  let afterLabels = normalizeLabelNames(result?.updateIssue?.issue?.labels?.nodes || []);
+  const afterNamesLower = new Set(afterLabels.map(name => name.toLowerCase()));
+  const missingExistingLabels = existingLabelNames.filter(name => !afterNamesLower.has(name.toLowerCase()));
+
+  if (missingExistingLabels.length > 0) {
+    core.warning(
+      `The GraphQL intent mutation removed ${missingExistingLabels.length} pre-existing label(s) from ${contextType} #${itemNumber} in ${itemRepo}; restoring them via the REST add-labels endpoint: ${JSON.stringify(missingExistingLabels)}`
+    );
+    const { data: restoredLabels } = await withRetry(
+      () =>
+        githubClient.rest.issues.addLabels({
+          owner: repoParts.owner,
+          repo: repoParts.repo,
+          issue_number: itemNumber,
+          labels: missingExistingLabels,
+        }),
+      RATE_LIMIT_RETRY_CONFIG,
+      `restore labels on ${contextType} #${itemNumber} in ${itemRepo}`
+    );
+    afterLabels = mergeLabelNames(existingLabelNames, afterLabels, restoredLabels);
+  }
+
+  return afterLabels;
 }
 
 /**
@@ -54,6 +214,7 @@ const main = createCountGatedHandler({
     const { allowed: allowedLabels = [], blocked: blockedPatterns = [] } = config;
     const issueIntentEnabled = config.issue_intent !== false;
     const issueIntentStrict = config.issue_intent === true; // strict mode: plain-string labels rejected, metadata required
+    const createIfMissing = config.create_if_missing === true;
     const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
     const requiredTitlePrefix = config.required_title_prefix || "";
     const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
@@ -64,6 +225,7 @@ const main = createCountGatedHandler({
     if (blockedPatterns.length > 0) core.info(`Blocked patterns: ${blockedPatterns.join(", ")}`);
     if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
     if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
+    core.info(`Create missing labels: ${createIfMissing}`);
     core.info(`Default target repo: ${defaultTargetRepo}`);
     if (allowedRepos.size > 0) core.info(`Allowed repos: ${[...allowedRepos].join(", ")}`);
 
@@ -161,14 +323,31 @@ const main = createCountGatedHandler({
         });
         if (requiredLabels.length > 0) {
           const itemLabels = (item.labels || []).map(/** @param {any} l */ l => (typeof l === "string" ? l : l.name || ""));
-          if (!requiredLabels.every(r => itemLabels.includes(r))) {
+          const missingLabels = requiredLabels.filter(r => !itemLabels.includes(r));
+          if (missingLabels.length > 0) {
             core.info(`Skipping add_labels for ${contextType} #${itemNumber}: does not match required-labels filter (${requiredLabels.join(", ")})`);
-            return { success: false, skipped: true, error: `Item does not match required-labels filter` };
+            return {
+              success: false,
+              skipped: true,
+              reasonCode: "REQUIRED_LABELS_MISMATCH",
+              reason: "Required labels missing",
+              error: "Item does not match required-labels filter",
+              target: { repo: itemRepo, number: itemNumber },
+              safeDetails: { requiredLabels, missingLabels },
+            };
           }
         }
         if (requiredTitlePrefix && !item.title?.startsWith(requiredTitlePrefix)) {
           core.info(`Skipping add_labels for ${contextType} #${itemNumber}: title does not start with required prefix "${requiredTitlePrefix}"`);
-          return { success: false, skipped: true, error: `Item title does not start with required prefix` };
+          return {
+            success: false,
+            skipped: true,
+            reasonCode: "REQUIRED_TITLE_PREFIX_MISMATCH",
+            reason: "Required title prefix missing",
+            error: "Item title does not start with required prefix",
+            target: { repo: itemRepo, number: itemNumber },
+            safeDetails: { requiredTitlePrefix },
+          };
         }
       }
 
@@ -223,11 +402,18 @@ const main = createCountGatedHandler({
         };
       }
 
-      const labelsRequestPayload = uniqueLabels.map(name => {
-        const labelSpec = requestedLabelSpecByLowerName.get(name.toLowerCase()) ?? { name };
-        const hasIntentMetadata = hasLabelIntentMetadata(labelSpec);
-        return issueIntentEnabled && hasIntentMetadata ? labelSpec : labelSpec.name;
-      });
+      // Build the resolved label specs (name + optional intent metadata) for the validated
+      // unique labels, preserving the order returned by validation.
+      const uniqueLabelSpecs = uniqueLabels.map(name => requestedLabelSpecByLowerName.get(name.toLowerCase()) ?? { name });
+      const intentLabelSpecs = uniqueLabelSpecs.filter(spec => hasLabelIntentMetadata(spec));
+      const useIssueIntentPath = issueIntentEnabled && intentLabelSpecs.length > 0;
+
+      // The REST issues.addLabels endpoint only accepts label name strings; it does not
+      // support issue-intent metadata (rationale/confidence/suggest). Passing objects with
+      // those extra keys causes GitHub to return success while silently applying no labels.
+      // When intent metadata is present, route through the GraphQL updateIssue/LabelUpdateInput
+      // mutation instead (see update_issue.cjs), which does support intent metadata.
+      const labelsRequestPayload = uniqueLabels;
 
       core.info(`Adding ${uniqueLabels.length} labels to ${contextType} #${itemNumber} in ${itemRepo}: ${JSON.stringify(labelsRequestPayload)}`);
 
@@ -248,6 +434,101 @@ const main = createCountGatedHandler({
 
       try {
         const beforeState = await fetchIssueState(githubClient, repoParts, itemNumber);
+
+        if (createIfMissing) {
+          await ensureLabelsExist(githubClient, repoParts, uniqueLabels, core);
+        }
+
+        if (useIssueIntentPath) {
+          // Intent metadata is only supported via the GraphQL updateIssue mutation.
+          const { data: issueData } = await withRetry(
+            () =>
+              githubClient.rest.issues.get({
+                owner: repoParts.owner,
+                repo: repoParts.repo,
+                issue_number: itemNumber,
+              }),
+            RATE_LIMIT_RETRY_CONFIG,
+            `get ${contextType} #${itemNumber} in ${itemRepo}`
+          );
+
+          const issueNodeId = issueData?.node_id;
+          if (!issueNodeId) {
+            throw new Error(`${SAFE_OUTPUT_E099}: Failed to resolve GraphQL node ID for ${contextType} #${itemNumber}`);
+          }
+
+          // The GraphQL updateIssue mutation only accepts Issue node IDs, and
+          // UpdatePullRequestInput does not accept a `labels` field, so there is no
+          // intent-aware mutation for PRs. Fall back to the REST add-labels endpoint
+          // (add-only, without intent metadata).
+          if (isPullRequestItem(issueData, issueNodeId)) {
+            core.info(`Issue-intent label metadata is not supported for pull requests; falling back to the REST add-labels endpoint for ${contextType} #${itemNumber} in ${itemRepo}`);
+          } else {
+            const existingLabels = normalizeLabelNames(issueData.labels || []);
+            const existingNamesLower = new Set(existingLabels.map(name => name.toLowerCase()));
+            const newLabelSpecs = uniqueLabelSpecs.filter(spec => !existingNamesLower.has(spec.name.toLowerCase()));
+            let afterLabels =
+              newLabelSpecs.length > 0
+                ? await applyIssueIntentLabels({
+                    githubClient,
+                    core,
+                    repoParts,
+                    itemNumber,
+                    itemRepo,
+                    contextType,
+                    issueData,
+                    issueNodeId,
+                    labelSpecs: newLabelSpecs,
+                  })
+                : existingLabels;
+            let afterNamesLower = new Set(afterLabels.map(name => name.toLowerCase()));
+            const plainLabelsNotApplied = newLabelSpecs.filter(spec => !hasLabelIntentMetadata(spec) && !afterNamesLower.has(spec.name.toLowerCase())).map(spec => spec.name);
+
+            if (plainLabelsNotApplied.length > 0) {
+              core.info(`Adding ${plainLabelsNotApplied.length} metadata-free label(s) not applied by the intent mutation via the REST add-labels endpoint: ${JSON.stringify(plainLabelsNotApplied)}`);
+              const { data: labels } = await withRetry(
+                () =>
+                  githubClient.rest.issues.addLabels({
+                    owner: repoParts.owner,
+                    repo: repoParts.repo,
+                    issue_number: itemNumber,
+                    labels: plainLabelsNotApplied,
+                  }),
+                RATE_LIMIT_RETRY_CONFIG,
+                `add metadata-free labels to ${contextType} #${itemNumber} in ${itemRepo}`
+              );
+              afterLabels = mergeLabelNames(afterLabels, labels);
+              afterNamesLower = new Set(afterLabels.map(name => name.toLowerCase()));
+            }
+
+            const labelsAdded = newLabelSpecs.filter(spec => afterNamesLower.has(spec.name.toLowerCase())).map(spec => spec.name);
+            const labelsSuggested = newLabelSpecs.filter(spec => hasLabelIntentMetadata(spec) && !afterNamesLower.has(spec.name.toLowerCase())).map(spec => spec.name);
+
+            if (newLabelSpecs.length === 0) {
+              core.info(`No new labels to add to ${contextType} #${itemNumber} in ${itemRepo}`);
+            }
+            core.info(`Successfully added ${labelsAdded.length} labels to ${contextType} #${itemNumber} in ${itemRepo}`);
+            if (labelsSuggested.length > 0) {
+              core.info(`Suggested ${labelsSuggested.length} labels for ${contextType} #${itemNumber} in ${itemRepo}: ${JSON.stringify(labelsSuggested)}`);
+            }
+            return attachExecutionState(
+              {
+                success: true,
+                number: itemNumber,
+                repo: itemRepo,
+                labelsAdded,
+                labelsSuggested,
+                contextType,
+              },
+              beforeState,
+              {
+                ...beforeState,
+                labels: afterLabels,
+              }
+            );
+          }
+        }
+
         const { data: labels } = await withRetry(
           () =>
             githubClient.rest.issues.addLabels({

@@ -2,27 +2,14 @@
 /// <reference types="@actions/github-script" />
 
 const { getRunStartedMessage } = require("./messages_run_status.cjs");
-const { getErrorMessage, isLockedError } = require("./error_helpers.cjs");
+const { getErrorMessage, isLockedError, isRateLimitError } = require("./error_helpers.cjs");
 const { generateWorkflowIdMarker } = require("./generate_footer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
-const { ERR_API, ERR_NOT_FOUND, ERR_VALIDATION } = require("./error_codes.cjs");
-const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
-const { createDiscussionComment, resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
+const { ERR_API, ERR_NOT_FOUND, ERR_VALIDATION, ERR_PARSE } = require("./error_codes.cjs");
+const { buildWorkflowRunUrl, EVENT_TYPE_DESCRIPTIONS } = require("./workflow_metadata_helpers.cjs");
+const { createDiscussionComment, isRestEndpoint, resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
 const { addReaction, addDiscussionReaction, getDiscussionNodeId, REACTION_MAP } = require("./add_reaction.cjs");
-
-/**
- * Event type descriptions for comment messages
- * @type {Record<string, string>}
- */
-const EVENT_TYPE_DESCRIPTIONS = {
-  issues: "issue",
-  pull_request: "pull request",
-  issue_comment: "issue comment",
-  pull_request_review_comment: "pull request review comment",
-  discussion: "discussion",
-  discussion_comment: "discussion comment",
-};
 
 /** Valid GitHub reaction types */
 const VALID_REACTIONS = Object.freeze(Object.keys(REACTION_MAP));
@@ -32,11 +19,18 @@ const VALID_REACTIONS = Object.freeze(Object.keys(REACTION_MAP));
  */
 
 /**
- * @param {unknown} endpoint
- * @returns {endpoint is RestEndpoint}
+ * Validate a required field extracted from an event payload, calling setFailed if missing.
+ * @param {unknown} value - The extracted value
+ * @param {string} fieldName - Human-readable field name for the error message
+ * @param {string} errorCode - Error code prefix (ERR_NOT_FOUND or ERR_VALIDATION)
+ * @returns {boolean} true if valid, false if missing (setFailed already called)
  */
-function isRestEndpoint(endpoint) {
-  return typeof endpoint === "object" && endpoint !== null && "route" in endpoint && "params" in endpoint;
+function requireEventField(value, fieldName, errorCode) {
+  if (value == null) {
+    core.setFailed(`${errorCode}: ${fieldName} not found in event payload`);
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -49,7 +43,22 @@ function expectRestEndpoint(endpoint, endpointName, eventName) {
   if (!isRestEndpoint(endpoint)) {
     throw new Error(`${ERR_VALIDATION}: Unexpected ${endpointName} endpoint shape for event: ${eventName}`);
   }
+
   return endpoint;
+}
+
+/**
+ * @param {string} endpoint
+ * @param {"discussion"|"discussion_comment"} eventName
+ * @returns {number}
+ */
+function parseDiscussionEndpoint(endpoint, eventName) {
+  const match = endpoint.match(eventName === "discussion" ? /^discussion:([1-9]\d*)$/ : /^discussion_comment:([1-9]\d*):[1-9]\d*$/);
+  const discussionNumber = Number(match?.[1]);
+  if (!Number.isSafeInteger(discussionNumber)) {
+    throw new Error(`${ERR_VALIDATION}: Invalid discussion endpoint: ${endpoint}`);
+  }
+  return discussionNumber;
 }
 
 /**
@@ -65,10 +74,7 @@ async function resolveEventEndpoints(eventName, owner, repo, payload) {
   switch (eventName) {
     case "issues": {
       const issueNumber = payload?.issue?.number;
-      if (!issueNumber) {
-        core.setFailed(`${ERR_NOT_FOUND}: Issue number not found in event payload`);
-        return null;
-      }
+      if (!requireEventField(issueNumber, "Issue number", ERR_NOT_FOUND)) return null;
       return {
         reactionEndpoint: { route: "POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", params: { owner, repo, issue_number: issueNumber } },
         commentUpdateEndpoint: { route: "POST /repos/{owner}/{repo}/issues/{issue_number}/comments", params: { owner, repo, issue_number: issueNumber } },
@@ -78,14 +84,8 @@ async function resolveEventEndpoints(eventName, owner, repo, payload) {
     case "issue_comment": {
       const commentId = payload?.comment?.id;
       const issueNumber = payload?.issue?.number;
-      if (!commentId) {
-        core.setFailed(`${ERR_VALIDATION}: Comment ID not found in event payload`);
-        return null;
-      }
-      if (!issueNumber) {
-        core.setFailed(`${ERR_NOT_FOUND}: Issue number not found in event payload`);
-        return null;
-      }
+      if (!requireEventField(commentId, "Comment ID", ERR_VALIDATION)) return null;
+      if (!requireEventField(issueNumber, "Issue number", ERR_NOT_FOUND)) return null;
       return {
         reactionEndpoint: { route: "POST /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions", params: { owner, repo, comment_id: commentId } },
         // Create new comment on the issue itself, not on the comment
@@ -95,10 +95,7 @@ async function resolveEventEndpoints(eventName, owner, repo, payload) {
 
     case "pull_request": {
       const prNumber = payload?.pull_request?.number;
-      if (!prNumber) {
-        core.setFailed(`${ERR_NOT_FOUND}: Pull request number not found in event payload`);
-        return null;
-      }
+      if (!requireEventField(prNumber, "Pull request number", ERR_NOT_FOUND)) return null;
       // PRs are "issues" for the reactions endpoint
       return {
         reactionEndpoint: { route: "POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", params: { owner, repo, issue_number: prNumber } },
@@ -109,14 +106,8 @@ async function resolveEventEndpoints(eventName, owner, repo, payload) {
     case "pull_request_review_comment": {
       const reviewCommentId = payload?.comment?.id;
       const prNumber = payload?.pull_request?.number;
-      if (!reviewCommentId) {
-        core.setFailed(`${ERR_VALIDATION}: Review comment ID not found in event payload`);
-        return null;
-      }
-      if (!prNumber) {
-        core.setFailed(`${ERR_NOT_FOUND}: Pull request number not found in event payload`);
-        return null;
-      }
+      if (!requireEventField(reviewCommentId, "Review comment ID", ERR_VALIDATION)) return null;
+      if (!requireEventField(prNumber, "Pull request number", ERR_NOT_FOUND)) return null;
       return {
         reactionEndpoint: { route: "POST /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions", params: { owner, repo, comment_id: reviewCommentId } },
         // Create new comment on the PR itself (using issues endpoint since PRs are issues)
@@ -126,10 +117,7 @@ async function resolveEventEndpoints(eventName, owner, repo, payload) {
 
     case "discussion": {
       const discussionNumber = payload?.discussion?.number;
-      if (!discussionNumber) {
-        core.setFailed(`${ERR_NOT_FOUND}: Discussion number not found in event payload`);
-        return null;
-      }
+      if (!requireEventField(discussionNumber, "Discussion number", ERR_NOT_FOUND)) return null;
       // Discussions use GraphQL API - get the node ID
       const discussionNodeId = await getDiscussionNodeId(owner, repo, discussionNumber);
       return {
@@ -146,10 +134,7 @@ async function resolveEventEndpoints(eventName, owner, repo, payload) {
         return null;
       }
       const commentNodeId = payload?.comment?.node_id;
-      if (!commentNodeId) {
-        core.setFailed(`${ERR_NOT_FOUND}: Discussion comment node ID not found in event payload`);
-        return null;
-      }
+      if (!requireEventField(commentNodeId, "Discussion comment node ID", ERR_NOT_FOUND)) return null;
       return {
         reactionEndpoint: commentNodeId, // Store node ID for GraphQL
         commentUpdateEndpoint: `discussion_comment:${discussionNumber}:${commentId}`, // Special format
@@ -170,7 +155,7 @@ async function main() {
     try {
       command = JSON.parse(commandsJSON)[0] ?? null;
     } catch (err) {
-      throw new Error("Failed to parse GH_AW_COMMANDS: " + getErrorMessage(err), { cause: err });
+      throw new Error(`${ERR_PARSE}: ` + "Failed to parse GH_AW_COMMANDS: " + getErrorMessage(err), { cause: err });
     }
   }
   const invocationContext = resolveInvocationContext(context);
@@ -217,7 +202,10 @@ async function main() {
       return;
     }
     const errorMessage = getErrorMessage(error);
-    core.error(`Failed to process reaction and comment creation: ${errorMessage}`);
+    if (isRateLimitError(error)) {
+      core.warning(`Cannot add reaction due to GitHub API rate limiting: ${errorMessage}`);
+      return;
+    }
     core.setFailed(`${ERR_API}: Failed to process reaction and comment creation: ${errorMessage}`);
   }
 }
@@ -263,6 +251,7 @@ async function addCommentWithWorkflowLink(endpoint, runUrl, eventName, invocatio
       workflowName,
       runUrl,
       eventType: eventTypeDescription,
+      emoji: process.env.GH_AW_WORKFLOW_EMOJI,
     });
 
     const lockForAgent = process.env.GH_AW_LOCK_FOR_AGENT === "true";
@@ -283,8 +272,7 @@ async function addCommentWithWorkflowLink(endpoint, runUrl, eventName, invocatio
       if (typeof endpoint !== "string") {
         throw new Error(`${ERR_VALIDATION}: Unexpected comment endpoint shape for event: ${eventName}`);
       }
-      // Parse discussion number from special format: "discussion:NUMBER" or "discussion_comment:NUMBER:COMMENT_ID"
-      const discussionNumber = parseInt(endpoint.split(":")[1], 10);
+      const discussionNumber = parseDiscussionEndpoint(endpoint, eventName);
       const discussionId = await getDiscussionNodeId(eventRepo.owner, eventRepo.repo, discussionNumber);
       // For discussion_comment events, thread the reply under the triggering comment.
       // GitHub Discussions only supports two nesting levels, so resolve the top-level parent node ID.
@@ -312,4 +300,4 @@ async function addCommentWithWorkflowLink(endpoint, runUrl, eventName, invocatio
   }
 }
 
-module.exports = { main, addCommentWithWorkflowLink, resolveEventEndpoints, VALID_REACTIONS, addReaction, addDiscussionReaction, expectRestEndpoint };
+module.exports = { main, addCommentWithWorkflowLink, resolveEventEndpoints, VALID_REACTIONS, addReaction, addDiscussionReaction, expectRestEndpoint, parseDiscussionEndpoint, requireEventField };

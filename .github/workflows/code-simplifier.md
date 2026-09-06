@@ -17,6 +17,7 @@ permissions:
 tracker-id: code-simplifier
 
 imports:
+  - shared/mcp-pagination.md
   - uses: shared/skip-if-issue-open.md
     with:
       title-prefix: "[code-simplifier]"
@@ -32,17 +33,18 @@ imports:
           - .github/extensions/
 
   - shared/otlp.md
+  - shared/graders.md
 network:
   allowed:
     - go
 
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   bash: ["*"]
 
@@ -139,6 +141,7 @@ evals:
     question: Did the agent analyze recently modified code for simplification opportunities?
   - id: pr_created_or_noop
     question: Was a pull request created with simplifications, or was noop used when no improvements were needed?
+
 ---
 
 # Code Simplifier Agent

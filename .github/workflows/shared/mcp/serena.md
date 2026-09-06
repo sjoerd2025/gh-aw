@@ -28,19 +28,22 @@ import-schema:
 
 mcp-servers:
   serena:
-    container: "ghcr.io/github/serena-mcp-server:latest"
+    container: "ghcr.io/oraios/serena:1.7.0"
     args:
       - "--network"
       - "host"
-    entrypoint: "serena"
+    entrypoint: "/workspaces/serena/.venv/bin/serena"
     entrypointArgs:
       - "start-mcp-server"
       - "--context"
       - "codex"
       - "--project"
       - \${GITHUB_WORKSPACE}
+    env:
+      PATH: \${PATH}
     mounts:
       - \${GITHUB_WORKSPACE}:\${GITHUB_WORKSPACE}:rw
+      - \${RUNNER_TOOL_CACHE}:\${RUNNER_TOOL_CACHE}:ro
 ---
 
 ## Serena Code Analysis

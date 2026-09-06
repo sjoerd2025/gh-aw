@@ -55,6 +55,7 @@ const UNKNOWN_PARAMETER_LIST_PREVIEW_MAX = 10;
  * @property {string} [handlerPath] - Optional file path to handler module (original path from config)
  * @property {number} [timeout] - Timeout in seconds for tool execution (default: 60)
  * @property {string[]} [dependencies] - Runtime dependencies to install before first invocation
+ * @property {string} [_rawName] - Original (pre-normalization) tool name, used internally for collision detection
  */
 
 /**
@@ -487,9 +488,14 @@ function loadToolHandlers(server, tools, basePath) {
  */
 function registerTool(server, tool) {
   const normalizedName = normalizeTool(tool.name);
+  const existing = server.tools[normalizedName];
+  if (existing && existing._rawName !== tool.name) {
+    throw new Error(`${ERR_VALIDATION}: Tool name collision: '${existing._rawName}' and '${tool.name}' both normalize to '${normalizedName}'`);
+  }
   server.tools[normalizedName] = {
     ...tool,
     name: normalizedName,
+    _rawName: tool.name,
   };
   server.debug(`Registered tool: ${normalizedName}`);
 }
@@ -999,8 +1005,10 @@ async function handleMessage(server, req, defaultHandler) {
     // Use the error code only if it's a valid JSON-RPC error code (must be a negative integer).
     // Subprocess exit codes (positive integers like 1, 2, etc.) must not be used as JSON-RPC
     // error codes, as that would produce non-conformant responses (e.g. "code=1").
-    const code = e && typeof e === "object" && Number.isInteger(e.code) && e.code < 0 ? e.code : -32603;
-    server.replyError(id, code, e && e.message ? String(e.message) : "Internal error");
+    const code = typeof e === "object" && e !== null && "code" in e && Number.isInteger(e.code) && e.code < 0 ? e.code : -32603;
+    const hasMessage = typeof e === "object" && e !== null && "message" in e && Boolean(e.message);
+    const message = hasMessage ? getErrorMessage(e) : "Internal error";
+    server.replyError(id, code, message);
   }
 }
 
@@ -1043,13 +1051,19 @@ function start(server, options = {}) {
     throw new Error(`${ERR_VALIDATION}: No tools registered`);
   }
 
-  const onData = async chunk => {
+  let processingChain = Promise.resolve();
+  const onData = chunk => {
     server.readBuffer.append(chunk);
-    await processReadBuffer(server, defaultHandler);
+    processingChain = processingChain
+      .then(() => processReadBuffer(server, defaultHandler))
+      .catch(error => {
+        server.debug(`processReadBuffer error: ${getErrorMessage(error)}`);
+      });
+    return processingChain;
   };
 
   process.stdin.on("data", onData);
-  process.stdin.on("error", err => server.debug(`stdin error: ${err}`));
+  process.stdin.on("error", err => server.debug(`stdin error: ${getErrorMessage(err)}`));
   process.stdin.resume();
   server.debug(`listening...`);
 }

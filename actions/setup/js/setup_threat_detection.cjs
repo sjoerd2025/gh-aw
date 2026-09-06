@@ -16,15 +16,47 @@ const fs = require("fs");
 const path = require("path");
 const { checkFileExists } = require("./file_helpers.cjs");
 const { AGENT_OUTPUT_FILENAME } = require("./constants.cjs");
-const { ERR_VALIDATION } = require("./error_codes.cjs");
+const { ERR_VALIDATION, ERR_SYSTEM } = require("./error_codes.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { getPromptPath } = require("./messages_core.cjs");
+
+/**
+ * Marker written in place of the framework-generated `<system>` block that is removed
+ * from the analyzed workflow prompt before threat detection reads it.
+ */
+const SYSTEM_BLOCK_REMOVED_MARKER = "[gh-aw framework system prompt block removed before analysis]";
+
+/**
+ * Removes the leading framework-generated `<system>...</system>` block from an agent prompt.
+ *
+ * The block is trusted only because of its position: gh-aw always emits it as the very first
+ * element of the generated prompt file. Any `<system>` markup appearing later in the file is
+ * left untouched so that attacker-supplied lookalike blocks remain visible to the analysis.
+ *
+ * @param {string} content Prompt file content
+ * @returns {string|null} The content without the leading system block, or null if there is none
+ */
+function stripFrameworkSystemBlock(content) {
+  const openMatch = /^\s*<system(?:\s[^>]*)?>/i.exec(content);
+  if (!openMatch) {
+    return null;
+  }
+  const afterOpen = openMatch[0].length;
+  const closeMatch = /<\/\s*system\s*>/i.exec(content.slice(afterOpen));
+  if (!closeMatch) {
+    return null;
+  }
+  const endIndex = afterOpen + closeMatch.index + closeMatch[0].length;
+  return `${SYSTEM_BLOCK_REMOVED_MARKER}\n${content.slice(endIndex).replace(/^\s*\n/, "")}`;
+}
 
 /**
  * Main entry point for setting up threat detection
  * @returns {Promise<void>}
  */
 async function main() {
+  const continueOnError = (process.env.GH_AW_DETECTION_CONTINUE_ON_ERROR || "true").toLowerCase() !== "false";
+
   // Read the threat detection template from file
   const templatePath = getPromptPath("threat_detection.md");
   if (!fs.existsSync(templatePath)) {
@@ -35,7 +67,7 @@ async function main() {
   try {
     templateContent = fs.readFileSync(templatePath, "utf-8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
   // Check if prompt file exists (soft check; detection can continue with fallback context)
   // The agent artifact is downloaded to /tmp/gh-aw/threat-detection/
@@ -63,8 +95,23 @@ async function main() {
       promptFileInfo = `${promptPath} (unavailable)`;
       core.warning(`${ERR_VALIDATION}: Workflow prompt context is empty at ${promptPath}. ` + "Threat detection will continue with fallback workflow context.");
     } else {
-      core.info(`Prompt file found: ${promptPath} (${promptStats.size} bytes)`);
-      promptFileInfo = `${promptPath} (${promptStats.size} bytes)`;
+      // Remove gh-aw's own leading <system> block so the detection agent never sees the
+      // framework scaffolding (immutable security policy, safe-output instructions) as if it
+      // were content produced by the analyzed workflow.
+      let promptSize = promptStats.size;
+      try {
+        const rawPrompt = fs.readFileSync(promptPath, "utf-8");
+        const strippedPrompt = stripFrameworkSystemBlock(rawPrompt);
+        if (strippedPrompt !== null) {
+          fs.writeFileSync(promptPath, strippedPrompt);
+          promptSize = Buffer.byteLength(strippedPrompt);
+          core.info(`Removed framework system prompt block from ${promptPath}`);
+        }
+      } catch (err) {
+        core.warning(`${ERR_VALIDATION}: Failed to remove framework system prompt block from ${promptPath}: ${getErrorMessage(err)}. Continuing with the original prompt context.`);
+      }
+      core.info(`Prompt file found: ${promptPath} (${promptSize} bytes)`);
+      promptFileInfo = `${promptPath} (${promptSize} bytes)`;
     }
   }
 
@@ -72,7 +119,7 @@ async function main() {
   // The agent-output artifact is also downloaded to /tmp/gh-aw/threat-detection/
   // The artifact contains /tmp/gh-aw/agent_output.json which becomes /tmp/gh-aw/threat-detection/agent_output.json
   const agentOutputPath = path.join(threatDetectionDir, AGENT_OUTPUT_FILENAME);
-  if (!checkFileExists(agentOutputPath, threatDetectionDir, "Agent output file", true)) {
+  if (!checkFileExists(agentOutputPath, threatDetectionDir, "Agent output file", true, continueOnError)) {
     return;
   }
 
@@ -90,11 +137,15 @@ async function main() {
       }
     }
   } catch {
-    // Directory may not exist or be readable
+    // Directory may not exist or be readable — ignored, no patch files.
   }
 
   if (patchFiles.length === 0 && hasPatch) {
-    core.setFailed(`${ERR_VALIDATION}: Patch/bundle file(s) expected but not found in: ${threatDetectionDir}`);
+    if (continueOnError) {
+      core.warning(`${ERR_VALIDATION}: Patch/bundle file(s) expected but not found in: ${threatDetectionDir}. Continuing because GH_AW_DETECTION_CONTINUE_ON_ERROR=true`);
+    } else {
+      core.setFailed(`${ERR_VALIDATION}: Patch/bundle file(s) expected but not found in: ${threatDetectionDir}`);
+    }
     return;
   }
 
@@ -167,16 +218,24 @@ async function main() {
     fs.mkdirSync("/tmp/gh-aw/aw-prompts", { recursive: true });
     fs.writeFileSync("/tmp/gh-aw/aw-prompts/prompt.txt", promptContent);
   } catch (err) {
-    throw new Error(`Failed to prepare threat detection prompt file: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to prepare threat detection prompt file: ${getErrorMessage(err)}`, { cause: err });
   }
   core.exportVariable("GH_AW_PROMPT", "/tmp/gh-aw/aw-prompts/prompt.txt");
 
   // Note: creation of /tmp/gh-aw/threat-detection and detection.log is handled by a separate shell step
 
-  // Write rendered prompt to step summary using HTML details/summary
-  await core.summary.addRaw("<details>\n<summary>Threat Detection Prompt</summary>\n\n" + "``````markdown\n" + promptContent + "\n" + "``````\n\n</details>\n").write();
+  // Write rendered prompt to step summary using HTML details/summary.
+  // On the external detector path this prompt is never used (threat-detect renders its own
+  // template and writes it to the step summary), so the write is suppressed to avoid showing
+  // two different prompts for a single detection run.
+  const skipPromptSummary = (process.env.GH_AW_DETECTION_SKIP_PROMPT_SUMMARY || "").toLowerCase() === "true";
+  if (skipPromptSummary) {
+    core.info("Skipping threat detection prompt step summary (external detector renders its own prompt)");
+  } else {
+    await core.summary.addRaw("<details>\n<summary>Threat Detection Prompt</summary>\n\n" + "``````markdown\n" + promptContent + "\n" + "``````\n\n</details>\n").write();
+  }
 
   core.info("Threat detection setup completed");
 }
 
-module.exports = { main };
+module.exports = { main, stripFrameworkSystemBlock };

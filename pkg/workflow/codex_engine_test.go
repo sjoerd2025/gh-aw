@@ -21,6 +21,139 @@ func TestCodexEngine_ResolveLLMProvider_DefaultOpenAI(t *testing.T) {
 	}
 }
 
+func TestCodexEngine_ResolveLLMProviderFromModel(t *testing.T) {
+	engine := NewCodexEngine()
+
+	tests := []struct {
+		name     string
+		data     *WorkflowData
+		expected LLMProvider
+	}{
+		{
+			name:     "copilot prefix selects GitHub",
+			data:     &WorkflowData{Model: "copilot/auto", EngineConfig: &EngineConfig{ID: "codex"}},
+			expected: LLMProviderGitHub,
+		},
+		{
+			name:     "concrete copilot model selects GitHub",
+			data:     &WorkflowData{Model: "copilot/gpt-5.4", EngineConfig: &EngineConfig{ID: "codex"}},
+			expected: LLMProviderGitHub,
+		},
+		{
+			name:     "model matching is case insensitive",
+			data:     &WorkflowData{Model: " COPILOT/AUTO ", EngineConfig: &EngineConfig{ID: "codex"}},
+			expected: LLMProviderGitHub,
+		},
+		{
+			name:     "other model keeps OpenAI default",
+			data:     &WorkflowData{Model: "gpt-5-codex", EngineConfig: &EngineConfig{ID: "codex"}},
+			expected: LLMProviderOpenAI,
+		},
+		{
+			name: "explicit provider overrides model",
+			data: &WorkflowData{
+				Model:        "copilot/auto",
+				EngineConfig: &EngineConfig{ID: "codex", LLMProvider: LLMProviderOpenAI},
+			},
+			expected: LLMProviderOpenAI,
+		},
+		{
+			name:     "unprefixed model keeps OpenAI default",
+			data:     &WorkflowData{Model: "copilot-large", EngineConfig: &EngineConfig{ID: "codex"}},
+			expected: LLMProviderOpenAI,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if actual := engine.ResolveLLMProvider(tt.data); actual != tt.expected {
+				t.Fatalf("expected provider %q, got %q", tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestCodexModelID(t *testing.T) {
+	tests := map[string]string{
+		"copilot/auto":    "auto",
+		"copilot/gpt-5.4": "gpt-5.4",
+		"gpt-5-codex":     "gpt-5-codex",
+	}
+
+	for model, expected := range tests {
+		t.Run(model, func(t *testing.T) {
+			if actual := codexModelID(model); actual != expected {
+				t.Fatalf("expected model ID %q, got %q", expected, actual)
+			}
+		})
+	}
+}
+
+func TestCodexEngineCopilotModelUsesGitHubInference(t *testing.T) {
+	engine := NewCodexEngine()
+	workflowData := &WorkflowData{
+		Name:         "test-workflow",
+		Model:        "copilot/auto",
+		EngineConfig: &EngineConfig{ID: "codex"},
+		SafeOutputs:  &SafeOutputsConfig{},
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true},
+		},
+	}
+
+	stepContent := strings.Join([]string(engine.GetExecutionSteps(workflowData, "test-log")[0]), "\n")
+	expected := []string{
+		`GH_AW_LLM_PROVIDER: github`,
+		`AWF_REFLECT_ENABLED: 1`,
+		`COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}`,
+		constants.CopilotBYOKDummyAPIKeyEnvVar + `: ` + constants.CopilotBYOKDummyAPIKey,
+		`export CODEX_API_KEY="$` + constants.CopilotBYOKDummyAPIKeyEnvVar + `"`,
+		`GH_AW_MODEL_AGENT_CODEX: auto`,
+		`${GH_AW_MODEL_AGENT_CODEX:+ --model "$GH_AW_MODEL_AGENT_CODEX"}`,
+	}
+	for _, value := range expected {
+		if !strings.Contains(stepContent, value) {
+			t.Errorf("expected execution step to contain %q, got:\n%s", value, stepContent)
+		}
+	}
+	if strings.Contains(stepContent, "secrets.CODEX_API_KEY") || strings.Contains(stepContent, "secrets.OPENAI_API_KEY") || strings.Contains(stepContent, `OPENAI_API_KEY:`) {
+		t.Errorf("GitHub inference must not use OpenAI credentials, got:\n%s", stepContent)
+	}
+
+	secrets := engine.GetRequiredSecretNames(workflowData)
+	if len(secrets) != 1 || secrets[0] != "COPILOT_GITHUB_TOKEN" {
+		t.Fatalf("expected only COPILOT_GITHUB_TOKEN, got %v", secrets)
+	}
+}
+
+func TestCodexEngineCopilotModelUsesGitHubActionsToken(t *testing.T) {
+	engine := NewCodexEngine()
+	workflowData := &WorkflowData{
+		Name:         "test-workflow",
+		Model:        "copilot/auto",
+		EngineConfig: &EngineConfig{ID: "codex"},
+		Permissions:  "permissions:\n  copilot-requests: write",
+		SafeOutputs:  &SafeOutputsConfig{},
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true},
+		},
+	}
+
+	stepContent := strings.Join([]string(engine.GetExecutionSteps(workflowData, "test-log")[0]), "\n")
+	if !strings.Contains(stepContent, `COPILOT_GITHUB_TOKEN: ${{ github.token }}`) {
+		t.Errorf("expected GitHub Actions token for the Copilot provider, got:\n%s", stepContent)
+	}
+	if !strings.Contains(stepContent, `export CODEX_API_KEY="$`+constants.CopilotBYOKDummyAPIKeyEnvVar+`"`) {
+		t.Errorf("expected Codex to use the BYOK sentinel, got:\n%s", stepContent)
+	}
+	if secrets := engine.GetRequiredSecretNames(workflowData); len(secrets) != 0 {
+		t.Fatalf("expected no inference secret with copilot-requests permission, got %v", secrets)
+	}
+	if step := engine.GetSecretValidationStep(workflowData); len(step) != 0 {
+		t.Fatalf("expected secret validation to be skipped, got:\n%s", strings.Join(step, "\n"))
+	}
+}
+
 func TestCodexEngine(t *testing.T) {
 	engine := NewCodexEngine()
 
@@ -216,6 +349,54 @@ func TestCodexEngineExecutionUsesWritableCodexHome(t *testing.T) {
 	}
 }
 
+func TestCodexEngineExecutionDumpsInternalLogsOnFailure(t *testing.T) {
+	engine := NewCodexEngine()
+
+	if got, want := engine.GetInternalLogsDir(), constants.TmpMcpConfigDir+"/logs"; got != want {
+		t.Errorf("Expected GetInternalLogsDir() to return %q, got %q", want, got)
+	}
+
+	t.Run("without firewall", func(t *testing.T) {
+		steps := engine.GetExecutionSteps(&WorkflowData{Name: "test-workflow"}, "/tmp/gh-aw/test.log")
+		if len(steps) != 1 {
+			t.Fatalf("Expected a single execution step (internal log rendering is handled by the shared detect-agent-errors step), got %d steps", len(steps))
+		}
+	})
+
+	t.Run("with firewall", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:               "test-workflow",
+			NetworkPermissions: &NetworkPermissions{Firewall: &FirewallConfig{Enabled: true}},
+		}
+		steps := engine.GetExecutionSteps(workflowData, "/tmp/gh-aw/test.log")
+		if len(steps) != 1 {
+			t.Fatalf("Expected a single execution step (internal log rendering is handled by the shared detect-agent-errors step), got %d steps", len(steps))
+		}
+	})
+}
+
+func TestCodexEngineErrorDetectionUsesGitHubScript(t *testing.T) {
+	var yaml strings.Builder
+	compiler := &Compiler{}
+
+	compiler.generateDetectAgentErrorsStep(&yaml, &WorkflowData{}, NewCodexEngine())
+
+	step := yaml.String()
+	for _, expected := range []string{
+		"uses: actions/github-script@",
+		"setupGlobals(core, github, context, exec, io, getOctokit);",
+		"const { main } = require('${{ runner.temp }}/gh-aw/actions/detect_agent_errors.cjs');",
+		"await main();",
+	} {
+		if !strings.Contains(step, expected) {
+			t.Errorf("Expected Detect agent errors step to contain %q, got:\n%s", expected, step)
+		}
+	}
+	if strings.Contains(step, "run: node") {
+		t.Errorf("Expected Detect agent errors step not to invoke node directly, got:\n%s", step)
+	}
+}
+
 func TestCodexEngineRenderMCPConfig(t *testing.T) {
 	engine := NewCodexEngine()
 
@@ -235,6 +416,8 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 				`cat > "${RUNNER_TEMP}/gh-aw/mcp-config/config.toml" << GH_AW_MCP_CONFIG_NORM_EOF`,
 				"[history]",
 				"persistence = \"none\"",
+				"[otel]",
+				"metrics_exporter = \"none\"",
 				"",
 				"[shell_environment_policy]",
 				"inherit = \"core\"",
@@ -274,7 +457,7 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 				"\"gateway\": {",
 				"\"port\": $MCP_GATEWAY_PORT,",
 				"\"domain\": \"${MCP_GATEWAY_DOMAIN}\",",
-				"\"apiKey\": \"${MCP_GATEWAY_API_KEY}\",",
+				"\"agentId\": \"${MCP_GATEWAY_AGENT_ID}\",",
 				"\"payloadDir\": \"${MCP_GATEWAY_PAYLOAD_DIR}\",",
 				"\"startupTimeout\": 120",
 				"}",
@@ -284,6 +467,8 @@ func TestCodexEngineRenderMCPConfig(t *testing.T) {
 				"# Sync converter output to writable CODEX_HOME for Codex",
 				"mkdir -p /tmp/gh-aw/mcp-config",
 				"cat > \"/tmp/gh-aw/mcp-config/config.toml\" << GH_AW_CODEX_SHELL_POLICY_NORM_EOF",
+				"[features]",
+				"plugins = false",
 				"[shell_environment_policy]",
 				"inherit = \"core\"",
 				"include_only = [\"^CODEX_API_KEY$\", \"^GITHUB_PERSONAL_ACCESS_TOKEN$\", \"^HOME$\", \"^OPENAI_API_KEY$\", \"^PATH$\"]",
@@ -363,8 +548,10 @@ func TestCodexEngineRenderMCPConfigOpenAIProxyProvider(t *testing.T) {
 			"model_provider = \"openai-proxy\"",
 			"[model_providers.openai-proxy]",
 			"name = \"OpenAI AWF proxy\"",
-			fmt.Sprintf("base_url = \"http://%s:%d\"", constants.AWFAPIProxyContainerIP, constants.ClaudeLLMGatewayPort),
-			"env_key = \"OPENAI_API_KEY\"",
+			fmt.Sprintf("base_url = \"http://%s:%d\"", constants.AWFAPIProxyContainerIP, constants.CodexLLMGatewayPort),
+			"env_key = \"CODEX_API_KEY\"",
+			"wire_api = \"responses\"",
+			"requires_openai_auth = false",
 			"supports_websockets = false",
 		}
 
@@ -405,6 +592,26 @@ func TestCodexEngineRenderMCPConfigOpenAIProxyProvider(t *testing.T) {
 		}
 	})
 
+	t.Run("routes copilot models through the Copilot gateway port", func(t *testing.T) {
+		var yaml strings.Builder
+		workflowData := &WorkflowData{
+			Name:  "test-workflow",
+			Model: "copilot/mai-code-1-flash-picker",
+			NetworkPermissions: &NetworkPermissions{
+				Firewall: &FirewallConfig{Enabled: true},
+			},
+		}
+
+		if err := engine.RenderMCPConfig(&yaml, map[string]any{}, []string{}, workflowData); err != nil {
+			t.Fatalf("RenderMCPConfig returned unexpected error: %v", err)
+		}
+
+		expected := fmt.Sprintf("base_url = \"http://%s:%d\"", constants.AWFAPIProxyContainerIP, constants.CopilotLLMGatewayPort)
+		if result := yaml.String(); !strings.Contains(result, expected) {
+			t.Errorf("Expected MCP config to contain %q, got:\n%s", expected, result)
+		}
+	})
+
 	t.Run("does not inject openai-proxy provider when firewall is disabled", func(t *testing.T) {
 		tools := map[string]any{}
 		mcpTools := []string{}
@@ -427,10 +634,42 @@ func TestCodexEngineRenderMCPConfigOpenAIProxyProvider(t *testing.T) {
 
 func TestCodexEngineOpenAIProxyProviderBaseURL(t *testing.T) {
 	engine := NewCodexEngine()
-	expected := "http://" + net.JoinHostPort(constants.AWFAPIProxyContainerIP, strconv.Itoa(constants.ClaudeLLMGatewayPort))
 
-	if actual := engine.getOpenAIProxyProviderBaseURL(); actual != expected {
-		t.Errorf("Expected OpenAI proxy provider base URL %q, got %q", expected, actual)
+	t.Run("defaults to the OpenAI gateway port", func(t *testing.T) {
+		expected := "http://" + net.JoinHostPort(constants.AWFAPIProxyContainerIP, strconv.Itoa(constants.CodexLLMGatewayPort))
+		workflowData := &WorkflowData{EngineConfig: &EngineConfig{ID: "codex"}}
+
+		if actual := engine.getOpenAIProxyProviderBaseURL(workflowData); actual != expected {
+			t.Errorf("Expected OpenAI proxy provider base URL %q, got %q", expected, actual)
+		}
+	})
+
+	t.Run("uses the Copilot gateway port for copilot models", func(t *testing.T) {
+		expected := "http://" + net.JoinHostPort(constants.AWFAPIProxyContainerIP, strconv.Itoa(constants.CopilotLLMGatewayPort))
+		workflowData := &WorkflowData{EngineConfig: &EngineConfig{ID: "codex"}, Model: "copilot/mai-code-1-flash-picker"}
+
+		if actual := engine.getOpenAIProxyProviderBaseURL(workflowData); actual != expected {
+			t.Errorf("Expected Copilot proxy provider base URL %q, got %q", expected, actual)
+		}
+	})
+}
+
+func TestValidateCodexCopilotAwfVersion(t *testing.T) {
+	workflowData := &WorkflowData{
+		EngineConfig: &EngineConfig{ID: "codex"},
+		Model:        "copilot/auto",
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true, Version: "v0.25.2"},
+		},
+	}
+
+	if err := validateCodexCopilotAwfVersion(workflowData); err == nil || !strings.Contains(err.Error(), "requires AWF v0.25.3 or newer") {
+		t.Fatalf("Expected legacy AWF version error, got %v", err)
+	}
+
+	workflowData.NetworkPermissions.Firewall.Version = "v0.25.3"
+	if err := validateCodexCopilotAwfVersion(workflowData); err != nil {
+		t.Fatalf("Expected minimum supported AWF version to pass, got %v", err)
 	}
 }
 
@@ -1141,6 +1380,95 @@ func TestCodexEngineWebSearch(t *testing.T) {
 	})
 }
 
+func TestCodexEngineBashDisabled(t *testing.T) {
+	engine := NewCodexEngine()
+
+	t.Run("shell_tool not disabled by default when bash is not fully disabled", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+		}
+		steps := engine.GetExecutionSteps(workflowData, "test-log")
+		if len(steps) != 1 {
+			t.Fatalf("Expected 1 step, got %d", len(steps))
+		}
+		stepContent := strings.Join([]string(steps[0]), "\n")
+		if strings.Contains(stepContent, "features.shell_tool=false") {
+			t.Errorf("Expected no features.shell_tool=false config when bash is not disabled, got:\n%s", stepContent)
+		}
+	})
+
+	t.Run("adds features.shell_tool=false when BashDisabled is set", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:         "test-workflow",
+			BashDisabled: true,
+		}
+		steps := engine.GetExecutionSteps(workflowData, "test-log")
+		if len(steps) != 1 {
+			t.Fatalf("Expected 1 step, got %d", len(steps))
+		}
+		stepContent := strings.Join([]string(steps[0]), "\n")
+		if !strings.Contains(stepContent, `-c features.shell_tool=false`) {
+			t.Errorf(`Expected -c features.shell_tool=false config when bash is fully disabled, got:\n%s`, stepContent)
+		}
+	})
+}
+
+func TestCodexEnginePluginConfig(t *testing.T) {
+	engine := NewCodexEngine()
+
+	t.Run("disables plugins when none are declared", func(t *testing.T) {
+		workflowData := &WorkflowData{Name: "test-workflow"}
+		var yaml strings.Builder
+		if err := engine.RenderMCPConfig(&yaml, map[string]any{}, nil, workflowData); err != nil {
+			t.Fatalf("RenderMCPConfig returned unexpected error: %v", err)
+		}
+		if config := yaml.String(); !strings.Contains(config, "[features]") || !strings.Contains(config, "plugins = false") {
+			t.Errorf("Expected generated Codex TOML to disable plugins when none are declared, got:\n%s", config)
+		}
+	})
+
+	t.Run("keeps plugins enabled when one is declared", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:    "test-workflow",
+			Plugins: []string{"octo-org/example@main"},
+		}
+		var yaml strings.Builder
+		if err := engine.RenderMCPConfig(&yaml, map[string]any{}, nil, workflowData); err != nil {
+			t.Fatalf("RenderMCPConfig returned unexpected error: %v", err)
+		}
+		if config := yaml.String(); strings.Contains(config, "plugins = false") {
+			t.Errorf("Expected generated Codex TOML to keep plugins enabled when one is declared, got:\n%s", config)
+		}
+	})
+
+	t.Run("merges plugin setting into a custom features table", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+			EngineConfig: &EngineConfig{
+				Config: "[features]\n shell_tool = false\n",
+			},
+		}
+		var yaml strings.Builder
+		if err := engine.RenderMCPConfig(&yaml, map[string]any{}, nil, workflowData); err != nil {
+			t.Fatalf("RenderMCPConfig returned unexpected error: %v", err)
+		}
+		config := yaml.String()
+		shellPolicyStart := strings.Index(config, "# Sync converter output")
+		shellPolicyEnd := strings.Index(config, "# Append engine-level custom Codex config")
+		shellPolicy := config[shellPolicyStart:shellPolicyEnd]
+		if strings.Contains(shellPolicy, "[features]") || !strings.Contains(config, "[features]\nplugins = false\n shell_tool = false") {
+			t.Errorf("Expected plugin setting to be merged into custom Codex features table, got:\n%s", config)
+		}
+	})
+
+	t.Run("accepts nil workflow data", func(t *testing.T) {
+		var yaml strings.Builder
+		if err := engine.RenderMCPConfig(&yaml, map[string]any{}, nil, nil); err != nil {
+			t.Fatalf("RenderMCPConfig returned unexpected error: %v", err)
+		}
+	})
+}
+
 func TestCodexEngineWebFetch(t *testing.T) {
 	engine := NewCodexEngine()
 
@@ -1327,5 +1655,47 @@ func TestCodexEngineForwardsSafeOutputsInputEnvVars(t *testing.T) {
 	}
 	if !strings.Contains(stepContent, "GH_AW_INPUT_REPO: ${{ inputs.repo }}") {
 		t.Errorf("Expected GH_AW_INPUT_REPO in step env for TOML env_vars forwarding, got:\n%s", stepContent)
+	}
+}
+
+// TestCodexEngineHttpMCPHeaderSecretsUseEnvVars verifies that secret and env expressions
+// in HTTP MCP headers are rendered as shell environment variable references in the TOML
+// config instead of being interpolated directly into the run block (RGS-008).
+func TestCodexEngineHttpMCPHeaderSecretsUseEnvVars(t *testing.T) {
+	engine := NewCodexEngine()
+
+	tools := map[string]any{
+		"datadog": map[string]any{
+			"type": "http",
+			"url":  "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp",
+			"headers": map[string]any{
+				"DD_API_KEY":         "${{ secrets.DD_API_KEY }}",
+				"DD_APPLICATION_KEY": "${{ secrets.DD_APPLICATION_KEY || secrets.DD_APP_KEY }}",
+				"DD_SITE":            "${{ secrets.DD_SITE || 'datadoghq.com' }}",
+			},
+		},
+	}
+
+	var yaml strings.Builder
+	workflowData := &WorkflowData{Name: "test-workflow"}
+	if err := engine.RenderMCPConfig(&yaml, tools, []string{"datadog"}, workflowData); err != nil {
+		t.Fatalf("RenderMCPConfig returned unexpected error: %v", err)
+	}
+
+	result := yaml.String()
+
+	if strings.Contains(result, "${{ secrets.") {
+		t.Errorf("Expected no secret expressions in MCP config, got:\n%s", result)
+	}
+
+	expected := []string{
+		`"DD_API_KEY" = "${DD_API_KEY}"`,
+		`"DD_APPLICATION_KEY" = "${DD_APPLICATION_KEY}"`,
+		`"DD_SITE" = "${DD_SITE}"`,
+	}
+	for _, want := range expected {
+		if !strings.Contains(result, want) {
+			t.Errorf("Expected MCP config to contain %q, got:\n%s", want, result)
+		}
 	}
 }

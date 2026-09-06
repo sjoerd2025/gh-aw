@@ -245,6 +245,84 @@ imports:
 	assert.Equal(t, "shared/target.md", importsResult.MergedEnvSources["SHARED_VAR"], "MergedEnvSources should track the import path for SHARED_VAR")
 }
 
+func TestGradersFieldExtractedFromMdImport(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	sharedContent := `---
+graders:
+  custom-score:
+    script: |
+      return trace.toolCalls.length
+    unit: count
+    direction: lower_is_better
+---
+
+# Shared workflow with grader
+`
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755), "Failed to create shared dir")
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "grader.md"), []byte(sharedContent), 0644), "Failed to write shared file")
+
+	mainContent := `---
+on: workflow_dispatch
+imports:
+  - shared/grader.md
+---
+
+# Main Workflow
+`
+	result, err := ExtractFrontmatterFromContent(mainContent)
+	require.NoError(t, err, "ExtractFrontmatterFromContent should succeed")
+
+	importsResult, err := ProcessImportsFromFrontmatterWithSource(result.Frontmatter, tmpDir, nil, "", "")
+	require.NoError(t, err, "ProcessImportsFromFrontmatterWithSource should succeed")
+
+	assert.NotEmpty(t, importsResult.MergedGraders, "MergedGraders should be populated from shared .md import")
+	assert.Contains(t, importsResult.MergedGraders, "custom-score", "MergedGraders should contain the imported grader")
+	assert.Contains(t, importsResult.MergedGraders, "lower_is_better", "MergedGraders should contain grader metadata")
+}
+
+func TestAmbientFoldersExtractedFromMdImport(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755), "Failed to create shared dir")
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "first.md"), []byte(`---
+ambient-folders:
+  - .squad
+  - .github/agents
+---
+
+# First shared workflow
+`), 0644), "Failed to write first shared file")
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "second.md"), []byte(`---
+ambient-folders:
+  - .squad
+  - .config/agents
+---
+
+# Second shared workflow
+`), 0644), "Failed to write second shared file")
+
+	mainContent := `---
+name: Main Workflow
+on: issue_comment
+imports:
+  - shared/first.md
+  - shared/second.md
+---
+
+# Main Workflow
+`
+	result, err := ExtractFrontmatterFromContent(mainContent)
+	require.NoError(t, err, "ExtractFrontmatterFromContent should succeed")
+
+	importsResult, err := ProcessImportsFromFrontmatterWithSource(result.Frontmatter, tmpDir, nil, "", "")
+	require.NoError(t, err, "ProcessImportsFromFrontmatterWithSource should succeed")
+
+	assert.Equal(t, []string{".squad", ".github/agents", ".config/agents"}, importsResult.MergedAmbientFolders)
+}
+
 // TestEnvFieldConflictBetweenImports verifies that defining the same env var in two different
 // imports produces a compilation error.
 func TestEnvFieldConflictBetweenImports(t *testing.T) {
@@ -911,4 +989,188 @@ func TestToImportsResult_MergedExcludedEnv(t *testing.T) {
 	acc.mergeExcludedEnv(fm)
 	result := acc.toImportsResult(nil)
 	assert.Equal(t, []string{"MY_TOKEN"}, result.MergedExcludedEnv)
+}
+
+func TestExtractConcurrencyJobDiscriminator_FirstImportWins(t *testing.T) {
+	acc := newImportAccumulator()
+	acc.extractConcurrencyJobDiscriminator(map[string]any{
+		"concurrency": map[string]any{"job-discriminator": "${{ inputs.first_id }}"},
+	}, "first.md")
+	acc.extractConcurrencyJobDiscriminator(map[string]any{
+		"concurrency": map[string]any{"job-discriminator": "${{ inputs.second_id }}"},
+	}, "second.md")
+
+	result := acc.toImportsResult(nil)
+	assert.Equal(t, "${{ inputs.first_id }}", result.MergedJobDiscriminator)
+}
+
+// TestValidateGitHubAppJSON verifies that validateGitHubAppJSON accepts well-formed
+// GitHub App configuration JSON with the required identity and key fields, and
+// rejects empty, malformed, or incomplete input.
+func TestValidateGitHubAppJSON(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		appJSON string
+		want    string
+	}{
+		{
+			name:    "empty string",
+			appJSON: "",
+			want:    "",
+		},
+		{
+			name:    "literal null",
+			appJSON: "null",
+			want:    "",
+		},
+		{
+			name:    "invalid JSON",
+			appJSON: "{not valid json",
+			want:    "",
+		},
+		{
+			name:    "JSON array instead of object",
+			appJSON: `["client-id", "private-key"]`,
+			want:    "",
+		},
+		{
+			name:    "valid with client-id and private-key",
+			appJSON: `{"client-id":"abc123","private-key":"-----BEGIN KEY-----"}`,
+			want:    `{"client-id":"abc123","private-key":"-----BEGIN KEY-----"}`,
+		},
+		{
+			name:    "valid with app-id and private-key",
+			appJSON: `{"app-id":"123456","private-key":"-----BEGIN KEY-----"}`,
+			want:    `{"app-id":"123456","private-key":"-----BEGIN KEY-----"}`,
+		},
+		{
+			name:    "valid with both client-id and app-id",
+			appJSON: `{"client-id":"abc","app-id":"123","private-key":"key"}`,
+			want:    `{"client-id":"abc","app-id":"123","private-key":"key"}`,
+		},
+		{
+			name:    "missing client-id and app-id",
+			appJSON: `{"private-key":"-----BEGIN KEY-----"}`,
+			want:    "",
+		},
+		{
+			name:    "missing private-key",
+			appJSON: `{"client-id":"abc123"}`,
+			want:    "",
+		},
+		{
+			name:    "empty object",
+			appJSON: `{}`,
+			want:    "",
+		},
+		{
+			name:    "client-id null is not a valid credential",
+			appJSON: `{"client-id":null,"private-key":"key"}`,
+			want:    "",
+		},
+		{
+			name:    "non-string private-key is rejected",
+			appJSON: `{"client-id":"abc","private-key":123}`,
+			want:    "",
+		},
+		{
+			name:    "unicode values preserved",
+			appJSON: `{"client-id":"客户端","private-key":"密钥"}`,
+			want:    `{"client-id":"客户端","private-key":"密钥"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := validateGitHubAppJSON(tt.appJSON)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestHasNodeRuntimeRunInstallScripts verifies that hasNodeRuntimeRunInstallScripts
+// correctly navigates the nested runtimes.node.run-install-scripts frontmatter path
+// and safely handles missing keys or unexpected value types at every level.
+func TestHasNodeRuntimeRunInstallScripts(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		fm   map[string]any
+		want bool
+	}{
+		{
+			name: "nil frontmatter",
+			fm:   nil,
+			want: false,
+		},
+		{
+			name: "empty frontmatter",
+			fm:   map[string]any{},
+			want: false,
+		},
+		{
+			name: "missing runtimes key",
+			fm:   map[string]any{"other": "value"},
+			want: false,
+		},
+		{
+			name: "runtimes not a map",
+			fm:   map[string]any{"runtimes": "not-a-map"},
+			want: false,
+		},
+		{
+			name: "runtimes missing node key",
+			fm:   map[string]any{"runtimes": map[string]any{"python": map[string]any{}}},
+			want: false,
+		},
+		{
+			name: "node not a map",
+			fm:   map[string]any{"runtimes": map[string]any{"node": "not-a-map"}},
+			want: false,
+		},
+		{
+			name: "node missing run-install-scripts key",
+			fm:   map[string]any{"runtimes": map[string]any{"node": map[string]any{}}},
+			want: false,
+		},
+		{
+			name: "run-install-scripts not a bool",
+			fm: map[string]any{"runtimes": map[string]any{"node": map[string]any{
+				"run-install-scripts": "true",
+			}}},
+			want: false,
+		},
+		{
+			name: "run-install-scripts false",
+			fm: map[string]any{"runtimes": map[string]any{"node": map[string]any{
+				"run-install-scripts": false,
+			}}},
+			want: false,
+		},
+		{
+			name: "run-install-scripts true",
+			fm: map[string]any{"runtimes": map[string]any{"node": map[string]any{
+				"run-install-scripts": true,
+			}}},
+			want: true,
+		},
+		{
+			name: "run-install-scripts true with sibling runtimes",
+			fm: map[string]any{"runtimes": map[string]any{
+				"python": map[string]any{"run-install-scripts": true},
+				"node":   map[string]any{"run-install-scripts": true},
+			}},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := hasNodeRuntimeRunInstallScripts(tt.fm)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

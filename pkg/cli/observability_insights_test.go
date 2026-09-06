@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 )
 
 func TestBuildAuditObservabilityInsights(t *testing.T) {
+	t.Parallel()
 	processedRun := ProcessedRun{
 		Run: WorkflowRun{
 			Turns:          11,
@@ -58,6 +60,7 @@ func TestBuildAuditObservabilityInsights(t *testing.T) {
 }
 
 func TestBuildLogsObservabilityInsights(t *testing.T) {
+	t.Parallel()
 	processedRuns := []ProcessedRun{
 		{
 			Run:              WorkflowRun{WorkflowName: "triage", Conclusion: "failure", Turns: 3, SafeItemsCount: 0},
@@ -75,8 +78,8 @@ func TestBuildLogsObservabilityInsights(t *testing.T) {
 	}
 
 	toolUsage := []ToolUsageSummary{
-		{Name: "bash", TotalCalls: 14},
-		{Name: "github_issue_read", TotalCalls: 6},
+		{ToolUsageStatsBase: ToolUsageStatsBase{ToolName: "bash", CallCount: 14}},
+		{ToolUsageStatsBase: ToolUsageStatsBase{ToolName: "github_issue_read", CallCount: 6}},
 	}
 
 	insights := buildLogsObservabilityInsights(processedRuns, toolUsage)
@@ -97,6 +100,7 @@ func TestBuildLogsObservabilityInsights(t *testing.T) {
 }
 
 func TestBuildAuditObservabilityInsightsSuppressesHighSeverityAtFirewallCap(t *testing.T) {
+	t.Parallel()
 	// blocked == firewallBlockedRequestCap: the absolute-count trigger (>=10) should
 	// not elevate to "high" because the proxy may have truncated the real count.
 	processedRun := ProcessedRun{
@@ -124,6 +128,7 @@ func TestBuildAuditObservabilityInsightsSuppressesHighSeverityAtFirewallCap(t *t
 }
 
 func TestBuildAuditObservabilityInsightsHighSeverityWhenHighBlockRate(t *testing.T) {
+	t.Parallel()
 	// Even at cap, a >=50% block rate should still produce high severity.
 	processedRun := ProcessedRun{
 		Run: WorkflowRun{Turns: 3},
@@ -150,6 +155,7 @@ func TestBuildAuditObservabilityInsightsHighSeverityWhenHighBlockRate(t *testing
 }
 
 func TestBuildLogsObservabilityInsightsSuppressesHighSeverityAtFirewallCap(t *testing.T) {
+	t.Parallel()
 	// A workflow with blocked == firewallBlockedRequestCap and a low block rate
 	// should produce a "medium" network hotspot, not "high".
 	processedRuns := []ProcessedRun{
@@ -179,6 +185,7 @@ func TestBuildLogsObservabilityInsightsSuppressesHighSeverityAtFirewallCap(t *te
 }
 
 func TestBuildAuditDataIncludesObservabilityInsights(t *testing.T) {
+	t.Parallel()
 	processedRun := ProcessedRun{
 		Run: WorkflowRun{
 			DatabaseID:     42,
@@ -201,12 +208,13 @@ func TestBuildAuditDataIncludesObservabilityInsights(t *testing.T) {
 		},
 	}
 
-	auditData := buildAuditData(processedRun, metrics, nil)
+	auditData := buildAuditData(context.Background(), processedRun, metrics, nil)
 	require.NotEmpty(t, auditData.ObservabilityInsights, "audit data should expose observability insights")
 	assert.Equal(t, "execution", auditData.ObservabilityInsights[0].Category)
 }
 
 func TestRenderObservabilityInsightsUsesConsoleFormatting(t *testing.T) {
+	t.Parallel()
 	var output bytes.Buffer
 
 	renderObservabilityInsightsTo(&output, []ObservabilityInsight{

@@ -10,6 +10,7 @@ import (
 )
 
 func TestFormatNumber(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    int
@@ -42,6 +43,7 @@ func TestFormatNumber(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := console.FormatNumber(tt.input)
 			assert.Equal(t, tt.expected, result, "FormatNumber(%d)", tt.input)
 		})
@@ -49,6 +51,7 @@ func TestFormatNumber(t *testing.T) {
 }
 
 func TestFormatFileSize(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		size     int64
@@ -66,6 +69,7 @@ func TestFormatFileSize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := console.FormatFileSize(tt.size)
 			assert.Equal(t, tt.expected, result, "FormatFileSize(%d)", tt.size)
 		})

@@ -18,7 +18,8 @@ permissions:
   issues: read
   copilot-requests: write
 engine:
-  id: copilot
+  id: codex
+model: copilot/gpt-5.3-codex
 imports:
   - uses: shared/pr-review-base.md
     with:
@@ -50,7 +51,7 @@ jobs:
     steps:
       - name: Match requested skill
         id: match_skill
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           script: |
             const fs = require('fs');
@@ -162,9 +163,6 @@ jobs:
       available_skills: ${{ steps.match_skill.outputs.available_skills }}
       request_text: ${{ steps.match_skill.outputs.request_text }}
       skip_reason: ${{ steps.match_skill.outputs.skip_reason }}
-sandbox:
-  agent:
-    sudo: false
 ---
 
 # Skillet 🍳

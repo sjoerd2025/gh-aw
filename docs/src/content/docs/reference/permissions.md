@@ -32,13 +32,14 @@ Key read permission scopes include:
 - `packages` (package management)
 - `pages` (GitHub Pages management)
 - `statuses` (commit status management)
+- `attestations` (artifact attestations)
 
 See [GitHub's permissions reference](https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs) for the complete list.
 
 **Shorthand Options:**
 
 - **`read-all`**: Read access to all scopes (useful for inspection workflows)
-- **`{}`**: No permissions (for computation-only workflows)
+- **`{}`** or **`none`**: No permissions (for computation-only workflows)
 
 ### GitHub App-Only Permissions
 
@@ -48,7 +49,7 @@ Certain permission scopes require [additional authentication](/gh-aw/reference/g
 
 **Repository-level** (repository configuration and access):
 `administration`, `environments`, `git-signing`, `workflows`, `repository-hooks`,
-`single-file`, `codespaces`, `repository-custom-properties`
+`single-file`, `codespaces`, `repository-custom-properties`, `secret-scanning-alerts`
 
 **Organization-level** (organization membership and settings):
 `organization-projects`, `members`, `organization-administration`, `team-discussions`,
@@ -93,7 +94,7 @@ When `copilot-requests: write` is set, gh-aw uses the GitHub Actions token for a
 
 The only valid value is `write`. See [Authentication → `copilot-requests: write` permission](/gh-aw/reference/auth/#copilot-requests-write-permission) for setup details and prerequisites.
 
-## Related Documentation
+## Learn More
 
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Secure write operations with content sanitization
 - [Security Guide](/gh-aw/introduction/architecture/) - Security best practices and permission strategies

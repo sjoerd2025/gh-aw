@@ -42,11 +42,14 @@ func NewCopilotEngine() *CopilotEngine {
 			experimental:     false,
 			ghSkillAgentName: "github-copilot",
 			capabilities: EngineCapabilities{
-				ToolsAllowlist:   true,
-				MaxTurns:         true,  // AWF max-turns is supported for Copilot runs
-				MaxContinuations: true,  // Copilot CLI supports --autopilot with --max-autopilot-continues
-				WebSearch:        false, // Copilot CLI does not have built-in web-search support
-				BareMode:         true,  // Copilot CLI supports --no-custom-instructions
+				ToolsAllowlist:       true,
+				MCP:                  true,
+				MaxTurns:             true,  // AWF max-turns is supported for Copilot runs
+				MaxContinuations:     true,  // Copilot CLI supports --autopilot with --max-autopilot-continues
+				WebSearch:            false, // Copilot CLI does not have built-in web-search support
+				BareMode:             true,  // Copilot CLI supports --no-custom-instructions
+				BashCommandAllowlist: true,  // Copilot enforces tools.bash allowlist via --allow-tool shell(cmd)
+				Plugins:              true,  // Copilot CLI supports Agent Plugins
 			},
 			dedicatedLLMGatewayPort: constants.CopilotLLMGatewayPort,
 		},
@@ -71,7 +74,7 @@ func (e *CopilotEngine) ResolveLLMProvider(workflowData *WorkflowData) LLMProvid
 }
 
 // GetRequiredSecretNames returns the list of secrets required by the Copilot engine.
-// This includes COPILOT_GITHUB_TOKEN and optionally MCP_GATEWAY_API_KEY.
+// This includes COPILOT_GITHUB_TOKEN and optionally MCP_GATEWAY_AGENT_ID.
 // It also includes COPILOT_PROVIDER_* env var keys that may carry secrets when BYOK mode
 // is configured — allowing them to pass through strict-mode validation and the secret filter.
 func (e *CopilotEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
@@ -86,10 +89,10 @@ func (e *CopilotEngine) GetRequiredSecretNames(workflowData *WorkflowData) []str
 		constants.CopilotProviderBearerToken,
 	)
 
-	// Add MCP gateway API key if MCP servers are present (gateway is always started with MCP servers)
+	// Add MCP gateway agent ID if MCP servers are present (gateway is always started with MCP servers)
 	if HasMCPServers(workflowData) {
-		copilotLog.Print("Adding MCP_GATEWAY_API_KEY secret")
-		secrets = append(secrets, "MCP_GATEWAY_API_KEY")
+		copilotLog.Print("Adding MCP_GATEWAY_AGENT_ID secret")
+		secrets = append(secrets, "MCP_GATEWAY_AGENT_ID")
 	}
 
 	// Add GitHub token for GitHub MCP server if present
@@ -135,6 +138,18 @@ func (e *CopilotEngine) GetSupportedEnvVarKeys() []string {
 	}
 }
 
+// GetPluginInstallationSteps installs pinned Agent Plugins through the Copilot CLI.
+func (e *CopilotEngine) GetPluginInstallationSteps(workflowData *WorkflowData) []GitHubActionStep {
+	commandName := "copilot"
+	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
+		commandName = workflowData.EngineConfig.Command
+	}
+	return generatePluginInstallationSteps(workflowData, pluginInstallSpec{
+		Command:     commandName,
+		InstallArgs: []string{"plugin", "install"},
+	})
+}
+
 // GetInstallationSteps is implemented in copilot_engine_installation.go
 
 func (e *CopilotEngine) GetDeclaredOutputFiles() []string {
@@ -144,11 +159,9 @@ func (e *CopilotEngine) GetDeclaredOutputFiles() []string {
 
 // GetAgentManifestFiles returns instruction files that should be treated as
 // security-sensitive manifests to protect against injection attacks in fork PRs.
-// AGENTS.md is the cross-engine convention read by Copilot; CLAUDE.md and GEMINI.md
-// are also protected so that multi-engine repositories cannot be poisoned via
-// whichever instruction file a given fork PR happens to target.
+// AGENTS.md is the cross-engine convention read by Copilot.
 func (e *CopilotEngine) GetAgentManifestFiles() []string {
-	return []string{"AGENTS.md", "CLAUDE.md", "GEMINI.md"}
+	return []string{"AGENTS.md"}
 }
 
 // GetAgentManifestPathPrefixes returns Copilot-specific config directory prefixes
@@ -212,24 +225,5 @@ func (e *CopilotEngine) GetCleanupStep(workflowData *WorkflowData) GitHubActionS
 
 // generateAWFInstallationStep is implemented in copilot_engine_installation.go
 
-// GenerateCopilotInstallerSteps creates GitHub Actions steps for installing Copilot CLI using the official installer script
-// Parameters:
-//   - version: The Copilot CLI version to install (e.g., "0.0.369" or "v0.0.369")
-//   - stepName: The name to display for the install step (e.g., "Install GitHub Copilot CLI")
-//
-// Returns steps for installing Copilot CLI using the official install.sh script from the Copilot CLI repository.
-// The script is downloaded from https://raw.githubusercontent.com/github/copilot-cli/main/install.sh
-// and executed with the VERSION environment variable set.
-//
-// Security Implementation:
-//  1. Downloads the official installer script from the Copilot CLI repository
-//  2. Saves script to a temporary file before execution (not piped directly to bash)
-//  3. Uses the official script which includes platform detection and error handling
-//
-// Version Handling:
-// The VERSION environment variable is used by the install.sh script.
-// The script automatically adds 'v' prefix if not present.
-// Examples:
-//   - VERSION=0.0.369 → downloads and installs v0.0.369
-//   - VERSION=v0.0.369 → downloads and installs v0.0.369
-//   - VERSION=1.2.3 → downloads and installs v1.2.3
+// GenerateCopilotInstallerSteps is implemented in copilot_installer.go.
+// See that file for the full signature and priority documentation.

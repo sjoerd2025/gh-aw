@@ -18,6 +18,7 @@ imports:
 - shared/ai-coding-dictionary.md
 - shared/otlp.md
 safe-outputs:
+  steer: true
   create-pull-request:
     auto-merge: true
     draft: false
@@ -26,20 +27,24 @@ safe-outputs:
     - documentation
     - automation
     protected-files: fallback-to-issue
+    excluded-files:
+    - README.md
+    - docs/src/content/docs/index.mdx
     reviewers:
     - copilot
     title-prefix: "[docs] "
   noop: null
 description: Automatically reviews and updates documentation to ensure accuracy and completeness
 emoji: 📝
-model: copilot/gpt-5.4
+model: openai/gpt-5.4
 engine:
-  id: pi
+  id: codex
+  model-provider: openai
 name: Daily Documentation Updater
 strict: true
 experiments:
   model_size:
-    variants: [claude-sonnet-4.6, claude-haiku-4.5]
+    variants: [claude-sonnet-5, claude-haiku-4.5]
     description: "Tests whether Claude Haiku achieves similar documentation update quality at lower token cost compared to Claude Sonnet."
     hypothesis: "H0: no change in PR creation rate or run success rate. H1: Claude Haiku reduces AI credit usage >=30% with equivalent run success rate (>=0.90)."
     metric: ai_credits_total
@@ -55,22 +60,17 @@ experiments:
 timeout-minutes: 45
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   bash:
-  - find docs -name "*.md" -o -name "*.mdx"
-  - find docs -maxdepth 1 -ls
-  - find docs -name "*.md" -exec cat {} +
-  - grep -r "*" docs
-  - git
-  - find pkg/parser/schemas -name "*.json"
-  - cat pkg/parser/schemas/*.json
+  - "*"
   cache-memory: true
   cli-proxy: true
   edit: null
   github:
+    mode: local
     min-integrity: approved
-    mode: gh-proxy
     toolsets:
     - default
 tracker-id: daily-doc-updater
@@ -92,6 +92,8 @@ You are an AI documentation agent that automatically updates the project documen
 ## Your Mission
 
 Scan the repository for merged pull requests and code changes from the last 24 hours, identify new features or changes that should be documented, and update the documentation accordingly.
+
+Do not modify the top-level `README.md` or `docs/src/content/docs/index.mdx`. These files contain primary project messaging that must only be changed by maintainers. If a discovered documentation gap appears to require either file, skip that edit and record it in the PR description's **Skipped Issues** or **Notes** section for maintainer follow-up.
 
 ## Tool Reference
 
@@ -374,6 +376,7 @@ When calling `noop`, use this format:
 - **Validate Examples**: YAML frontmatter examples in docs must be structurally valid. When in doubt, test with `gh aw compile`.
 - **Default-value awareness for engine examples**: `engine: copilot` is the default and is redundant when `copilot` is the intended engine (omitting it produces identical behaviour). When normalizing engine examples, prefer *removing* the redundant `engine: copilot` line over duplicating workflow blocks with alternative engine values. This keeps examples engine-agnostic by default, reduces unnecessary doc size, and aligns with the `unbloat-docs` effort.
 - **`unbloat-docs` guardrail**: Example-coverage fixes **must not** duplicate large workflow blocks. Prefer `<Tabs>` for multi-engine illustration only where the engine choice is genuinely instructive to the reader; otherwise omit the redundant `engine:` line rather than adding parallel copies.
+- **Experimental engine exemption for `engines.md`**: The `docs/src/content/docs/reference/engines.md` table is a curated GA reference. An engine registered in `pkg/workflow/` (e.g., `NewXxxEngine()` wired into `NewEngineRegistry()`) but absent from `engines.md` is **not automatically a documentation gap** if that engine has `experimental: true` in its `BaseEngine` initializer. Before creating a PR to add an engine to `engines.md`, verify with `grep -n "experimental" pkg/workflow/<engine>_engine.go`. If the engine is experimental and not yet listed, omit it — the absence is intentional. Only add an engine to `engines.md` if it is explicitly GA (non-experimental) or if a maintainer has requested its inclusion.
 
 ## Important Notes
 

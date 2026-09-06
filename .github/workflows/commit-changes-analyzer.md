@@ -16,16 +16,14 @@ permissions:
   issues: read
   pull-requests: read
 max-turns: 100
-model: copilot/gpt-5.4
+model: openai/gpt-5.4
 engine:
-  id: pi
-sandbox:
-  agent:
-    sudo: false
+  id: codex
+  model-provider: openai
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   bash:
     - "*"
@@ -48,6 +46,9 @@ evals:
     question: Did the agent analyze all repository changes since the specified commit and produce a comprehensive report?
   - id: discussion_created
     question: Was a discussion or report created summarizing the changes since the specified commit?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Commit Changes Analyzer

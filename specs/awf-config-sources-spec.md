@@ -15,6 +15,15 @@ sidebar:
 
 ---
 
+## Contents
+
+- [6. Conformance Requirements](#6-conformance-requirements)
+  - [Norms](#norms)
+- [7. Drift Detection Procedure](#7-drift-detection-procedure)
+  - [Approach](#approach)
+- [8. REASONS Canvas](#8-reasons-canvas)
+  - [Safeguards](#safeguards)
+
 ## 1. Purpose
 
 This document defines the canonical AWF configuration references in `github/gh-aw-firewall` that gh-aw agents and schema reconciliation workflows MUST use when generating or validating AWF config behavior.
@@ -40,9 +49,20 @@ The following documents are authoritative and MUST be consulted together:
 - `docs/authentication-architecture.md` — credential isolation architecture
 - `schemas/README.md` — schema directory overview
 
+## Structure
+
+This specification, the [conformance fixture index](awf-config-sources-compliance/README.md), and
+[`pkg/workflow/awf_config_drift_test.go`](../pkg/workflow/awf_config_drift_test.go) form one
+conformance unit. The specification defines `DriftRecord` requirements, the fixture index maps
+them to `T-DR-*` IDs, and the Go test file implements those IDs. Changes to any member of this
+unit **MUST** keep the other two members synchronized.
+
 ## 3. Data Model
 
-This section defines the canonical data entities used in the drift detection procedure. The `DriftRecord` entity is the primary structured output of drift detection.
+This section defines the canonical data entities used in the drift detection procedure. The
+repository relationships that maintain its conformance coverage are defined in
+[Structure](#structure). The `DriftRecord` entity is the primary structured output of drift
+detection.
 
 ### 3.1 DriftRecord
 
@@ -92,6 +112,16 @@ A `DriftRecord` represents a single detected schema drift item. All automation a
 | `suggested_action` | `string` | **MUST** | Actionable remediation text; **MUST NOT** be empty | `pkg/workflow/awf_config_drift_formal_test.go` (`FormalDriftRecord.SuggestedAction`, `formalDriftRecordStructuralValidity`); production emission target: `pkg/workflow/` drift detection logic |
 | `detected_at` | `string` (ISO 8601) | **MUST** | UTC timestamp of detection; filesystem-safe format **SHOULD** use `YYYY-MM-DDTHH:MM:SSZ` | `pkg/workflow/awf_config_drift_formal_test.go` (`FormalDriftRecord.DetectedAt`); production emission target: `pkg/workflow/` drift detection logic |
 
+Decision: `suggested_action` remains free-form remediation text rather than an enum. Drift remediation can require different downstream actions depending on the affected property, source repository, and owning implementation path, so constraining the field to a fixed enum would either lose actionable detail or require frequent schema churn. Conformance therefore requires the field to be present and non-empty (T-DR-004), while producers SHOULD write a concrete action such as adding coverage, opening a corrective PR, updating a spec, or recording a waiver rationale.
+
+The conformance fixture index assigns the following test IDs to the `DriftRecord` schema requirements:
+
+- Required fields: T-DR-001
+- `drift_category` enum: T-DR-002
+- `detected_at` format: T-DR-003
+- `suggested_action` non-empty: T-DR-004
+- No additional properties: T-DR-005
+
 ## 4. Required coverage checks
 
 When updating AWF config generation, schema sync, or validation in gh-aw, agents MUST verify:
@@ -104,21 +134,23 @@ When updating AWF config generation, schema sync, or validation in gh-aw, agents
 
 The following fields previously existed in schema but were missed in spec CLI mapping checks:
 
-| Config path | CLI flag |
-|---|---|
-| `apiProxy.anthropicAutoCache` | `--anthropic-auto-cache` |
-| `apiProxy.anthropicCacheTailTtl` | `--anthropic-cache-tail-ttl` |
-| `apiProxy.models` | config-only (model alias rewriting) |
-| `apiProxy.modelMultipliers` | config-only (effective-token accounting) |
-| `apiProxy.modelFallback` | config-only (model fallback policy; set `sandbox.agent.model-fallback: false` to prevent deployment-name rewriting for BYOK Azure) |
-| `apiProxy.maxRuns` | config-only (LLM invocation hard cap) |
-| `apiProxy.auth.*` | config-only (maps to `AWF_AUTH_*` env vars) |
-| `apiProxy.targets.openai.authHeader` | `--openai-api-auth-header` (frontmatter: `sandbox.agent.targets.openai.authHeader`) |
-| `apiProxy.targets.anthropic.authHeader` | `--anthropic-api-auth-header` (frontmatter: `sandbox.agent.targets.anthropic.authHeader`) |
-| `apiProxy.targets.copilot.extraHeaders` | config-only (frontmatter: `sandbox.agent.targets.copilot.extraHeaders`; maps to `AWF_BYOK_EXTRA_HEADERS`) |
-| `apiProxy.targets.copilot.extraBodyFields` | config-only (frontmatter: `sandbox.agent.targets.copilot.extraBodyFields`; maps to `AWF_BYOK_EXTRA_BODY_FIELDS`) |
-| `apiProxy.targets.copilot.sessionId` | config-only (frontmatter: `sandbox.agent.targets.copilot.sessionId`; maps to `AWF_PROVIDER_SESSION_ID`) |
-| `container.dockerHostPathPrefix` | `--docker-host-path-prefix` |
+| Config path | CLI flag | Test reference |
+|---|---|---|
+| `apiProxy.anthropicAutoCache` | `--anthropic-auto-cache` | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.anthropicCacheTailTtl` | `--anthropic-cache-tail-ttl` | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.models` | config-only (model alias rewriting) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.modelMultipliers` | config-only (effective-token accounting) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.modelFallback` | config-only (model fallback policy; set `sandbox.agent.model-fallback: false` to prevent deployment-name rewriting for BYOK Azure) | `pkg/workflow/awf_config_test.go` (`TestAWFConfig_ModelFallback*`) |
+| `apiProxy.enableTokenSteering` | config-only (set `sandbox.agent.token-steering: false` to preserve the explicitly configured provider and model) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.maxRuns` | config-only (LLM invocation hard cap) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.auth.*` | config-only (maps to `AWF_AUTH_*` env vars) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.targets.openai.authHeader` | `--openai-api-auth-header` (frontmatter: `sandbox.agent.targets.openai.authHeader`) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.targets.anthropic.authHeader` | `--anthropic-api-auth-header` (frontmatter: `sandbox.agent.targets.anthropic.authHeader`) | `pkg/workflow/awf_config_test.go` |
+| `apiProxy.targets.copilot.extraHeaders` | config-only (frontmatter: `sandbox.agent.targets.copilot.extraHeaders`; maps to `AWF_BYOK_EXTRA_HEADERS`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
+| `apiProxy.targets.copilot.extraBodyFields` | config-only (frontmatter: `sandbox.agent.targets.copilot.extraBodyFields`; maps to `AWF_BYOK_EXTRA_BODY_FIELDS`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
+| `apiProxy.targets.copilot.sessionId` | config-only (frontmatter: `sandbox.agent.targets.copilot.sessionId`; maps to `AWF_PROVIDER_SESSION_ID`) | `pkg/workflow/copilot_byok_extra_fields_compilation_test.go` (`TestCopilotBYOKExtraFieldsInCompiledWorkflow`) |
+| `apiProxy.caCert` | config-only (frontmatter: `sandbox.agent.ca-cert`; gated to AWF v0.28.10+ via `AWFAPIProxyCACertMinVersion`) | `pkg/workflow/awf_config_test.go` |
+| `container.dockerHostPathPrefix` | `--docker-host-path-prefix` | `pkg/workflow/awf_config_test.go` |
 
 Agents SHOULD treat this class of mismatch as a regression signal and open a corrective PR when detected.
 
@@ -127,6 +159,10 @@ Agents SHOULD treat this class of mismatch as a regression signal and open a cor
 ## 6. Conformance Requirements
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** in this section are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
+
+### Norms
+
+This subsection identifies the normative behavior that conforming AWF config source checks must satisfy. The `CR-*` requirements below bind the canonical-source lookup rules, drift classification semantics, and remediation expectations to the `DriftRecord` entity in [Section 3.1](#31-driftrecord) and the drift detection procedure in [Section 7](#7-drift-detection-procedure).
 
 **CR-01**: Agents and schema reconciliation workflows MUST consult **both** the normative specification (`docs/awf-config-spec.md`) and the published JSON schema (`docs/awf-config.schema.json`) before generating or validating AWF config behavior. Consulting only one source is insufficient.
 
@@ -140,13 +176,23 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** in this section ar
 
 **CR-06**: Drift categorized as "missing in gh-aw" or "spec mismatch" MUST be remediated (merged or explicitly waived with rationale) within **5 business days** of detection. For this requirement, business days are Monday-Friday in UTC, excluding weekends. If this SLA is missed, maintainers MUST open (or update) an escalation tracking issue within 1 business day. The escalation issue MUST include an owner, unblock plan, and revised ETA.
 
-**CR-06a (Escalation Owner Assignment)**: When opening or updating an escalation tracking issue under CR-06, the assignee **SHOULD** be determined as follows: (a) the maintainer who merged the last change to the drifted property's corresponding implementation file in `pkg/workflow/` or `actions/setup/` is the **default escalation owner** (implementation guidance: this can be determined via `git log` on the relevant file, or through PR merge history); (b) if no such maintainer is identifiable (e.g., the property has never been implemented), the escalation owner **SHOULD** default to the on-call maintainer for the `github/gh-aw` repository at the time of escalation; (c) the assigned owner **MUST** be recorded in the `Owner` field of the escalation issue template and **MUST** acknowledge the assignment by commenting on the issue within 1 business day of assignment. The escalation issue **MUST NOT** be left unassigned.
+**CR-06a (Escalation Owner Assignment)**: When opening or updating an escalation tracking issue under CR-06, the assignee **SHOULD** be determined as follows: (a) the maintainer who merged the last change to the drifted property's corresponding implementation file in `pkg/workflow/` or `actions/setup/` is the **default escalation owner** (implementation guidance: this can be determined via `git log` on the relevant file, or through PR merge history); (b) if no such maintainer is identifiable (e.g., the property has never been implemented), the escalation owner **SHOULD** default to the on-call maintainer for the `github/gh-aw` repository at the time of escalation; (c) the assigned owner **MUST** be recorded in the `Owner` field of the escalation issue template and **MUST** acknowledge the assignment by commenting on the issue within 1 business day of assignment. The escalation issue **MUST NOT** be left unassigned. The formal conformance fixture is [T-DR-011](awf-config-sources-compliance/README.md#driftrecord-conformance-tests), implemented in `pkg/workflow/awf_config_safeguards_formal_test.go`; production issue assignment and comment-based acknowledgement enforcement are not yet automated. Until a dedicated production tracker exists, that enforcement is explicitly out of scope for T-DR-011 because the current fixture only validates the normative owner-selection and acknowledgement-window contract, not GitHub issue mutation side effects.
 
 ---
 
 ## 7. Drift Detection Procedure
 
 This section describes the concrete steps for detecting schema drift between `gh-aw-firewall` and `gh-aw`.
+
+### Approach
+
+Drift detection uses a fetch-compare-report loop (Section 7.2) rather than a schema-diff bot for three reasons:
+
+1. **Two independent canonical sources must agree, not just diff cleanly.** A schema-diff bot would only compare `docs/awf-config.schema.json` against `src/awf-config-schema.json` (or a prior snapshot) for structural changes. This spec also requires reconciling the CLI mapping table in `docs/awf-config-spec.md` (CR-01, CR-02) against schema properties — a semantic comparison a generic diff tool cannot express, since a field can be structurally unchanged in the schema while its CLI mapping documentation still drifts from `gh-aw` implementation behavior.
+2. **Drift classification requires implementation-aware context.** Categorizing a drift item as `missing_in_ghaw`, `missing_in_schema`, or `spec_mismatch` (Section 7.2, Step 4) requires cross-referencing `pkg/workflow/` and `actions/setup/` implementation references, not just the two schema/spec artifacts. A schema-diff bot operating only on `github/gh-aw-firewall` content has no visibility into `github/gh-aw` implementation state.
+3. **Safeguards require explicit degraded-mode handling.** Section 8's safeguards (snapshot freshness, skip-destructive-actions-when-stale) depend on the fetch step's success/failure being observable and actionable within the same procedure. A separate schema-diff bot would need its own redundant fetch-and-cache logic to support these safeguards, duplicating state rather than sharing one fetch-compare-report loop.
+
+This rationale is why Section 7.2 is written as an explicit numbered procedure (fetch, extract, compare, classify, report, remediate) instead of delegating to an off-the-shelf schema-diff tool.
 
 ### 7.1 When to Run
 
@@ -177,7 +223,7 @@ Drift detection MUST be triggered when:
    - **Missing in schema**: `gh-aw` generates a field not present in either schema.
    - **Spec mismatch**: CLI mapping in `gh-aw` disagrees with the normative spec description.
 
-5. **Produce a drift report** listing:
+5. **Produce a drift report** (T-DR-010) listing:
    - Each drifted property path (e.g., `apiProxy.anthropicAutoCache`).
    - Drift category (missing in gh-aw / missing in schema / spec mismatch).
    - Suggested corrective action (add coverage, open PR, update spec).
@@ -220,7 +266,7 @@ diff -u /tmp/schema-keys.txt /tmp/ghaw-refs.txt || true
 
 A scheduled GitHub Actions workflow in `github/gh-aw` SHOULD automate this procedure. The workflow SHOULD:
 
-- Run on a weekly schedule and on pull requests that touch AWF config handling.
+- Run on a daily schedule and on pull requests that touch AWF config handling.
 - Fail the check (non-zero exit) when any "missing in gh-aw" drift is found.
 - Post a summary comment on PRs with the drift report.
 - Create a tracking issue when drift is detected on the scheduled run.
@@ -256,7 +302,7 @@ A `DriftRecord` represents a single detected schema drift item produced by the d
 
 #### 7.5.1 Usage
 
-The drift detection procedure (Section 7.2, Step 5) **MUST** produce a list of zero or more `DriftRecord` objects (schema: Section 3.1). When any record has `drift_category` of `missing_in_ghaw` or `spec_mismatch`, the detecting automation **MUST** open a corrective PR (CR-05) and, if the SLA window is exceeded, an escalation issue (CR-06). The corrective PR description **MUST** embed the full `DriftRecord` list as JSON.
+The drift detection procedure (Section 7.2, Step 5) **MUST** produce a list of zero or more `DriftRecord` objects (schema: Section 3.1; T-DR-009). When any record has `drift_category` of `missing_in_ghaw` or `spec_mismatch`, the detecting automation **MUST** open a corrective PR (CR-05; T-DR-006) and, if the SLA window is exceeded, an escalation issue (CR-06; T-DR-007). The corrective PR description **MUST** embed the full `DriftRecord` list as JSON (T-DR-008).
 
 **Example output (Step 5 of the drift detection procedure):**
 
@@ -271,11 +317,13 @@ The drift detection procedure (Section 7.2, Step 5) **MUST** produce a list of z
 ]
 ```
 
-## 8. Safeguards
+## 8. REASONS Canvas
 
-When canonical sources in `github/gh-aw-firewall` are unavailable (GitHub outage, auth failure, transient fetch errors), agents and automation MUST apply the following safeguards:
+### Safeguards
 
-1. The workflow **MUST** attempt to use the last-known validated local snapshot (for example cached schema/spec artifacts from the previous successful run) to keep checks deterministic.
-2. The workflow **SHOULD** emit a warning that canonical source retrieval failed, including the failing source path(s) and timestamp.
-3. The workflow **MUST** skip destructive validation actions (for example failing required checks, auto-opening corrective PRs, or auto-creating drift issues from stale snapshots) when canonical data cannot be refreshed, and mark the run as degraded instead of silently passing.
-4. The workflow **SHOULD** open or update a tracking issue when canonical source unavailability persists for more than one consecutive scheduled run.
+Every invocation (scheduled, manual, or ad hoc) **MUST** attempt to refresh the canonical sources and evaluate snapshot freshness. When canonical sources in `github/gh-aw-firewall` are unavailable (GitHub outage, auth failure, transient fetch errors), agents and automation MUST apply the following safeguards:
+
+1. The workflow **MUST** attempt to use the last-known validated local snapshot (for example cached schema/spec artifacts from the previous successful run) to keep checks deterministic. The snapshot **MUST** be stored at a stable, well-known path: `~/.cache/gh-aw/schema-consistency/last-known-snapshot/` on self-hosted runners or `/tmp/gh-aw/agent/schema-consistency/last-known-snapshot/` when the runner is ephemeral. The workflow **MUST** record the UTC refresh time when, and only when, all canonical sources refresh successfully. Snapshots older than **7 days** (168 hours from that recorded successful refresh) **MUST** be treated as expired and **MUST NOT** be used to suppress drift warnings; when a snapshot is expired, the run **MUST** be marked degraded even if the snapshot files are physically present. Implementations **SHOULD** delete snapshots older than 14 days to prevent unbounded disk use. (T-DR-SAFE-001; see the [fixture index](awf-config-sources-compliance/README.md#safeguards-conformance-tests))
+2. The workflow **SHOULD** emit a warning that canonical source retrieval failed, including the failing source path(s) and timestamp. (T-DR-SAFE-002; see the [fixture index](awf-config-sources-compliance/README.md#safeguards-conformance-tests))
+3. The workflow **MUST** skip destructive validation actions (for example failing required checks, auto-opening corrective PRs, or auto-creating drift issues from stale snapshots) when canonical data cannot be refreshed, and mark the run as degraded instead of silently passing. (T-DR-SAFE-003; see the [fixture index](awf-config-sources-compliance/README.md#safeguards-conformance-tests))
+4. The workflow **SHOULD** open or update a tracking issue when canonical source unavailability persists from one daily scheduled cron invocation through the next. Manual reruns and ad hoc invocations still perform the refresh and freshness checks above, but do not advance this consecutive-scheduled-run threshold. This persistence threshold applies only to unavailable-source reporting; the daily cadence in §7.4 applies to the full drift check. (T-DR-SAFE-004; see the [fixture index](awf-config-sources-compliance/README.md#safeguards-conformance-tests))

@@ -60,6 +60,125 @@ jobs:
 	assert.Equal(t, ".lock.yml", workflowFiles["ci"], "ci should map to .lock.yml")
 }
 
+// TestGenerateSafeOutputsConfigNeutralizesUnresolvableNeedsExpression verifies that a
+// templated expression referencing a job listed in safe-outputs.needs is neutralized in the
+// agent job's copy of the safe-outputs config, since that job is only ever wired as a
+// dependency of the safe_outputs handler job (see buildSafeOutputsJobNeeds), never of the
+// agent job itself. Leaving the raw needs.<job> expression in the agent job's config would
+// produce an actionlint "undefined property" error (see github/gh-aw#53909 /
+// pr-sous-chef.lock.yml:837).
+func TestGenerateSafeOutputsConfigNeutralizesUnresolvableNeedsExpression(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			Needs: []string{"approval_allowlist"},
+			ApproveWorkflowRun: &ApproveWorkflowRunConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("8")},
+				AllowedPullRequests:  []string{"${{ needs.approval_allowlist.outputs.eligible_pull_request_numbers }}"},
+			},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err, "generateSafeOutputsConfig should not return an error")
+	require.NotEmpty(t, result, "Expected non-empty config")
+	assert.NotContains(t, result, "needs.approval_allowlist",
+		"agent job's safe-outputs config must not reference a job it does not depend on")
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed), "Result must be valid JSON")
+
+	approveConfig, ok := parsed["approve_workflow_run"].(map[string]any)
+	require.True(t, ok, "Expected approve_workflow_run key in config")
+	assert.Equal(t, []any{}, approveConfig["allowed_pull_requests"],
+		"allowed_pull_requests should be neutralized to an empty array in the agent job's config")
+}
+
+func TestGenerateSafeOutputsConfigNeutralizesAllUnresolvableNeedsForms(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			Needs: []string{"approval_allowlist"},
+			ApproveWorkflowRun: &ApproveWorkflowRunConfig{
+				AllowedPullRequests: []string{`${{ needs['approval_allowlist'].outputs.eligible_pull_request_numbers }}`},
+			},
+			AddComments: &AddCommentsConfig{
+				AllowedCommentIDs: []string{"literal", "${{ needs.approval_allowlist.outputs.comment_ids }}"},
+			},
+			DataEnabled:          true,
+			DataSchemaExpression: "${{ fromJSON(needs.approval_allowlist.outputs.data_schema) }}",
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed))
+
+	approveConfig := parsed["approve_workflow_run"].(map[string]any)
+	assert.Equal(t, []any{}, approveConfig["allowed_pull_requests"])
+	addCommentConfig := parsed["add_comment"].(map[string]any)
+	assert.Equal(t, []any{}, addCommentConfig["allows_comment_ids"])
+	assert.Empty(t, addCommentConfig["data_schema"])
+}
+
+func TestGenerateSafeOutputsConfigPreservesResolvableNeedsExpressions(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			Needs: []string{"approval_allowlist"},
+			AddComments: &AddCommentsConfig{
+				AllowedCommentIDs: []string{"${{ needs.prepare.outputs.comment_ids }}"},
+			},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err)
+	assert.Contains(t, result, "needs.prepare.outputs.comment_ids")
+}
+
+func TestSanitizeAgentSafeOutputsConfigNoOp(t *testing.T) {
+	config := map[string]any{
+		"add_comment": map[string]any{
+			"allowed_comment_ids": []string{"${{ needs.prepare.outputs.comment_ids }}"},
+		},
+	}
+
+	sanitizeAgentSafeOutputsConfig(config, nil)
+
+	assert.Equal(t, []string{"${{ needs.prepare.outputs.comment_ids }}"},
+		config["add_comment"].(map[string]any)["allowed_comment_ids"])
+}
+
+func TestSanitizeAgentSafeOutputsConfigStringExpression(t *testing.T) {
+	config := map[string]any{
+		"safe_output": map[string]any{
+			"data_schema": "${{ fromJSON(needs.approval_allowlist.outputs.data_schema) }}",
+		},
+	}
+
+	sanitizeAgentSafeOutputsConfig(config, []string{"approval_allowlist"})
+
+	assert.Empty(t, config["safe_output"].(map[string]any)["data_schema"])
+}
+
+func TestGenerateSafeOutputsConfigCommentMemoryToolsOnly(t *testing.T) {
+	data := &WorkflowData{
+		CommentMemoryConfig: &CommentMemoryConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+			MemoryID:             "default",
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err)
+	require.NotEmpty(t, result)
+	require.NotNil(t, data.SafeOutputs)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed))
+	assert.Contains(t, parsed, commentMemoryHandlerKey)
+}
+
 // TestGenerateSafeOutputsConfigActions tests that generateSafeOutputsConfig includes custom
 // action tool names as enabled keys so both MCP server implementations register them.
 func TestGenerateSafeOutputsConfigActions(t *testing.T) {
@@ -161,7 +280,7 @@ func TestGenerateSafeOutputsConfigMissingToolWithIssue(t *testing.T) {
 func TestGenerateSafeOutputsConfigMentions(t *testing.T) {
 	enabled := true
 	allowedCollaborators := false
-	max := 5
+	max := "5"
 
 	data := &WorkflowData{
 		SafeOutputs: &SafeOutputsConfig{
@@ -186,6 +305,24 @@ func TestGenerateSafeOutputsConfigMentions(t *testing.T) {
 	assert.True(t, mentions["enabled"].(bool), "enabled should be true")
 	assert.False(t, mentions["allowedCollaborators"].(bool), "allowedCollaborators should be false")
 	assert.InDelta(t, float64(5), mentions["max"], 0.0001, "max should be 5")
+}
+
+func TestGenerateSafeOutputsConfigMentionsTemplatableMax(t *testing.T) {
+	max := "${{ inputs.max-mentions }}"
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			Mentions: &MentionsConfig{Max: &max},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed))
+	mentions, ok := parsed["mentions"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, max, mentions["max"])
 }
 
 func TestGenerateSafeOutputsConfigNormalizeClosingKeywordsPerType(t *testing.T) {
@@ -236,6 +373,26 @@ func TestGenerateSafeOutputsConfigAddsDataFlagsForBodyHandlers(t *testing.T) {
 	addComment, ok := parsed["add_comment"].(map[string]any)
 	require.True(t, ok)
 	assert.Equal(t, true, addComment["data_enabled"])
+}
+
+func TestGenerateSafeOutputsConfigForwardsAllowedCommentIDs(t *testing.T) {
+	cfg := &SafeOutputsConfig{
+		AddComments: &AddCommentsConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+			Target:               "*",
+			AllowedCommentIDs:    []string{"${{ needs.prepare.outputs.comment_ids }}"},
+		},
+	}
+	data := &WorkflowData{SafeOutputs: cfg}
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed))
+	addComment, ok := parsed["add_comment"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "*", addComment["target"])
+	assert.Equal(t, "${{ needs.prepare.outputs.comment_ids }}", addComment["allows_comment_ids"])
 }
 
 func TestGenerateSafeOutputsConfigAddsRuntimeDataSchemaExpression(t *testing.T) {
@@ -502,6 +659,52 @@ func TestGenerateSafeOutputsConfigAddLabelsBlocked(t *testing.T) {
 	assert.Equal(t, "triage-needed", blockedSlice[3], "Fourth blocked pattern should match")
 }
 
+// TestGenerateSafeOutputsConfigAddLabelsCreateIfMissing tests that the create-if-missing
+// field is included in config.json for add_labels when set, and omitted when nil.
+func TestGenerateSafeOutputsConfigAddLabelsCreateIfMissing(t *testing.T) {
+	trueVal := true
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			AddLabels: &AddLabelsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("5")},
+				CreateIfMissing:      &trueVal,
+			},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err, "generateSafeOutputsConfig should not return an error")
+	require.NotEmpty(t, result, "Expected non-empty config")
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed), "Result must be valid JSON")
+
+	addLabelsConfig, ok := parsed["add_labels"].(map[string]any)
+	require.True(t, ok, "Expected add_labels key in config")
+
+	createIfMissing, ok := addLabelsConfig["create_if_missing"]
+	require.True(t, ok, "Expected create_if_missing field in add_labels config")
+	assert.Equal(t, true, createIfMissing, "create_if_missing should be true")
+
+	// When CreateIfMissing is nil (default), the field should be omitted entirely.
+	dataDefault := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			AddLabels: &AddLabelsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("5")},
+			},
+		},
+	}
+	resultDefault, err := generateSafeOutputsConfig(dataDefault)
+	require.NoError(t, err, "generateSafeOutputsConfig should not return an error")
+
+	var parsedDefault map[string]any
+	require.NoError(t, json.Unmarshal([]byte(resultDefault), &parsedDefault), "Result must be valid JSON")
+	addLabelsConfigDefault, ok := parsedDefault["add_labels"].(map[string]any)
+	require.True(t, ok, "Expected add_labels key in config")
+	_, ok = addLabelsConfigDefault["create_if_missing"]
+	assert.False(t, ok, "create_if_missing should be omitted when not configured")
+}
+
 // TestGenerateSafeOutputsConfigSafeJobMax tests that the max field is emitted in config.json
 // for custom safe-jobs so the output collector can enforce it.
 func TestGenerateSafeOutputsConfigSafeJobMax(t *testing.T) {
@@ -602,11 +805,11 @@ func TestGenerateSafeOutputsConfigCreatePullRequestBackwardCompat(t *testing.T) 
 	data := &WorkflowData{
 		SafeOutputs: &SafeOutputsConfig{
 			CreatePullRequests: &CreatePullRequestsConfig{
-				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("2")},
-				AllowedLabels:        []string{"bug"},
-				AllowEmpty:           strPtr("true"),
-				AutoMerge:            strPtr("true"),
-				Expires:              24,
+				BaseSafeOutputConfig:          BaseSafeOutputConfig{Max: strPtr("2")},
+				SafeOutputAllowedLabelsConfig: SafeOutputAllowedLabelsConfig{AllowedLabels: []string{"bug"}},
+				AllowEmpty:                    strPtr("true"),
+				AutoMerge:                     strPtr("true"),
+				Expires:                       24,
 			},
 		},
 	}
@@ -631,6 +834,27 @@ func TestGenerateSafeOutputsConfigCreatePullRequestBackwardCompat(t *testing.T) 
 	assert.False(t, hasTargetRepo, "target-repo should not be present when not configured")
 	_, hasAllowedRepos := prConfig["allowed_repos"]
 	assert.False(t, hasAllowedRepos, "allowed_repos should not be present when not configured")
+}
+
+func TestGenerateSafeOutputsConfigCreatePullRequestAutoMergeMethod(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			CreatePullRequests: &CreatePullRequestsConfig{
+				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+				AutoMerge:            strPtr("rebase"),
+			},
+		},
+	}
+
+	result, err := generateSafeOutputsConfig(data)
+	require.NoError(t, err, "generateSafeOutputsConfig should not return an error")
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(result), &parsed), "Result must be valid JSON")
+
+	prConfig, ok := parsed["create_pull_request"].(map[string]any)
+	require.True(t, ok, "Expected create_pull_request key in config")
+	assert.Equal(t, "rebase", prConfig["auto_merge"], "auto_merge should preserve explicit merge method")
 }
 
 func TestGenerateSafeOutputsConfigInjectsCurrentCheckoutPatchWorkspacePath(t *testing.T) {
@@ -977,13 +1201,15 @@ func TestGenerateSafeOutputsConfigReplyToPullRequestReviewCommentWithTarget(t *t
 	data := &WorkflowData{
 		SafeOutputs: &SafeOutputsConfig{
 			ReplyToPullRequestReviewComment: &ReplyToPullRequestReviewCommentConfig{
-				BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("10")},
+				BaseSafeOutputConfig: BaseSafeOutputConfig{
+					Max:    strPtr("10"),
+					Footer: &footerTrue,
+				},
 				SafeOutputTargetConfig: SafeOutputTargetConfig{
 					Target:         "pull_request",
 					TargetRepoSlug: "org/other-repo",
 					AllowedRepos:   []string{"org/other-repo"},
 				},
-				Footer: &footerTrue,
 			},
 		},
 	}

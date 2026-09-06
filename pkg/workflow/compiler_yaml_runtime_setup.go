@@ -60,10 +60,18 @@ func (c *Compiler) generateRuntimeAndWorkspaceSetupSteps(yaml *strings.Builder, 
 	compilerYamlLog.Printf("Generating cache-memory steps for workflow")
 	generateCacheMemorySteps(yaml, data)
 
+	// Mount experimental drive-memory stores before custom steps.
+	compilerYamlLog.Printf("Generating drive-memory steps for workflow")
+	generateDriveMemorySteps(yaml, data, c.getActionPin)
+
 	// Add repo-memory clone steps before custom steps so that user steps: code can read
 	// /tmp/gh-aw/repo-memory/<name>/ without an LLM turn.
 	compilerYamlLog.Printf("Generating repo-memory steps for workflow")
 	generateRepoMemorySteps(yaml, data)
+
+	if !customStepsContainCheckout {
+		generateSharedLogsCacheRestoreSteps(yaml, data)
+	}
 
 	c.emitCustomSteps(yaml, data, customStepsContainCheckout, runtimeSetupSteps)
 
@@ -195,13 +203,20 @@ func (c *Compiler) emitCustomSteps(yaml *strings.Builder, data *WorkflowData, cu
 	if hasDIFCProxyNeeded(data) {
 		customStepsToEmit = injectProxyEnvIntoCustomSteps(customStepsToEmit)
 	}
-	if customStepsContainCheckout && len(runtimeSetupSteps) > 0 {
-		// Custom steps contain checkout and we have runtime steps to insert
-		// Insert runtime steps after the first checkout step
-		compilerYamlLog.Printf("Calling addCustomStepsWithRuntimeInsertion: %d runtime steps to insert after checkout", len(runtimeSetupSteps))
-		c.addCustomStepsWithRuntimeInsertion(yaml, customStepsToEmit, runtimeSetupSteps, data.ParsedTools, isArcDindTopology(data))
+	postLastCheckoutSteps := sharedLogsCacheRestoreSteps(data)
+	if ambientRestoreStep := restoreAmbientFoldersSteps(data); len(ambientRestoreStep) > 0 {
+		postLastCheckoutSteps = append(postLastCheckoutSteps, ambientRestoreStep)
+	}
+	if customStepsContainCheckout && (len(runtimeSetupSteps) > 0 || len(postLastCheckoutSteps) > 0) {
+		// Custom steps contain checkout: insert runtime steps after the first checkout and
+		// workspace restore steps after the last checkout. Inserting restore steps after the
+		// last checkout ensures that a multi-checkout custom steps block (where a later root
+		// checkout would wipe .github/aw/logs or ambient folders) leaves restored content in
+		// place for later custom steps and the agent.
+		compilerYamlLog.Printf("Calling addCustomStepsWithRuntimeInsertion: %d runtime steps after first checkout, %d post-checkout steps after last checkout", len(runtimeSetupSteps), len(postLastCheckoutSteps))
+		c.addCustomStepsWithRuntimeInsertion(yaml, customStepsToEmit, runtimeSetupSteps, postLastCheckoutSteps, data.ParsedTools, isArcDindTopology(data))
 	} else {
-		// No checkout in custom steps or no runtime steps, just add custom steps as-is
+		// No checkout in custom steps or no steps to insert, just add custom steps as-is
 		compilerYamlLog.Printf("Calling addCustomStepsAsIs (customStepsContainCheckout=%t, runtimeStepsCount=%d)", customStepsContainCheckout, len(runtimeSetupSteps))
 		c.addCustomStepsAsIs(yaml, customStepsToEmit)
 	}
@@ -222,18 +237,19 @@ func (c *Compiler) generateActivationArtifactAndCommentMemorySteps(yaml *strings
 	// Must happen before comment-memory preparation (needs prompt.txt for injection) and
 	// before the base-branch restore in generateEngineInstallAndPreAgentSteps.
 	compilerYamlLog.Print("Adding activation artifact download step")
-	activationArtifactName := artifactPrefixExprForDownstreamJob(data) + constants.ActivationArtifactName
+	activationArtifactName := artifactPrefixExprForDownstreamJob(data) + constants.ActivationArtifactName.String()
 	yaml.WriteString("      - name: Download activation artifact\n")
 	fmt.Fprintf(yaml, "        uses: %s\n", c.getActionPin("actions/download-artifact"))
 	yaml.WriteString("        with:\n")
 	fmt.Fprintf(yaml, "          name: %s\n", activationArtifactName)
 	yaml.WriteString("          path: /tmp/gh-aw\n")
+	generateRestoreAmbientFoldersStep(yaml, data)
 
-	// Materialize comment-memory safe outputs as editable markdown files BEFORE user steps.
+	// Materialize tools.comment-memory state as editable markdown files BEFORE user steps.
 	// This prepares /tmp/gh-aw/comment-memory/*.md from prior comment history and injects
 	// prompt guidance so the agent can update files directly and persist them via the
 	// comment_memory safe output.
-	if data.SafeOutputs == nil || data.SafeOutputs.CommentMemory == nil {
+	if data.CommentMemoryConfig == nil {
 		return
 	}
 
@@ -247,7 +263,7 @@ func (c *Compiler) generateActivationArtifactAndCommentMemorySteps(yaml *strings
 	yaml.WriteString("      - name: Prepare comment memory files\n")
 	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
 	yaml.WriteString("        with:\n")
-	fmt.Fprintf(yaml, "          github-token: %s\n", getEffectiveSafeOutputGitHubToken(data.SafeOutputs.CommentMemory.GitHubToken))
+	fmt.Fprintf(yaml, "          github-token: %s\n", getEffectiveSafeOutputGitHubToken(data.CommentMemoryConfig.GitHubToken))
 	yaml.WriteString("          script: |\n")
 	yaml.WriteString("            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');\n")
 	yaml.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
@@ -277,12 +293,11 @@ func (c *Compiler) generateCommentMemoryEarlyConfigStep(yaml *strings.Builder, d
 // jobs, and pre-activation memory restore so all deterministic paths can prepare
 // comment-memory files before the full safe-outputs config exists.
 func (c *Compiler) generateCommentMemoryEarlyConfigLines(data *WorkflowData) ([]string, bool) {
-	builder := handlerRegistry[commentMemoryHandlerKey]
-	if builder == nil {
-		compilerYamlLog.Printf("Warning: %s handler not found in registry; skipping early config write", commentMemoryHandlerKey)
-		return nil, false
+	var globalFooter *bool
+	if data.SafeOutputs != nil {
+		globalFooter = data.SafeOutputs.Footer
 	}
-	cfg := builder(data.SafeOutputs)
+	cfg := buildCommentMemoryHandlerConfig(data.CommentMemoryConfig, globalFooter)
 	if cfg == nil {
 		return nil, false
 	}
@@ -311,7 +326,7 @@ func (c *Compiler) generateCommentMemoryEarlyConfigLines(data *WorkflowData) ([]
 	lines = append(lines, "      - name: Write comment-memory configuration\n")
 	lines = append(lines, "        run: |\n")
 	lines = append(lines, "          mkdir -p \"${RUNNER_TEMP}/gh-aw/safeoutputs\"\n")
-	lines = append(lines, fmt.Sprintf("          cat > \"${RUNNER_TEMP}/gh-aw/safeoutputs/config.json\" << '%s'\n", delimiter))
+	lines = append(lines, fmt.Sprintf("          cat > \"${RUNNER_TEMP}/gh-aw/safeoutputs/config.json\" << '%s'\n", delimiter)) //nolint:generatedyamlheredoc // Early config rendering runs before the reusable JavaScript step is available.
 	// The 10-space YAML block-scalar indentation is stripped by the YAML parser before the
 	// shell script is executed, so the JSON content lands at column 0 inside the heredoc.
 	// This matches the pattern used by mcp_setup_generator.go for the full config write.
@@ -337,11 +352,18 @@ func (c *Compiler) addCustomStepsAsIs(yaml *strings.Builder, customSteps string)
 	}
 }
 
-// addCustomStepsWithRuntimeInsertion adds custom steps and inserts runtime steps after the first checkout.
+// addCustomStepsWithRuntimeInsertion adds custom steps and inserts runtime steps after the first
+// checkout and postLastCheckoutSteps (e.g. cache restore) after the last checkout. In the common
+// single-checkout case both insertions happen at the same point. For multi-checkout workflows
+// (where a later root checkout would wipe a previously restored path such as .github/aw/logs)
+// the post-last-checkout steps are deferred until after the final checkout so the path remains
+// intact when the subsequent command runs.
 // Like addCustomStepsAsIs it sanitizes any ${{ ... }} expressions found in run: fields before writing.
-func (c *Compiler) addCustomStepsWithRuntimeInsertion(yaml *strings.Builder, customSteps string, runtimeSetupSteps []GitHubActionStep, tools *ToolsConfig, ensureArcDindNodePath bool) {
+func (c *Compiler) addCustomStepsWithRuntimeInsertion(yaml *strings.Builder, customSteps string, runtimeSetupSteps []GitHubActionStep, postLastCheckoutSteps []GitHubActionStep, tools *ToolsConfig, ensureArcDindNodePath bool) {
 	customSteps = c.sanitizeAndWarnCustomSteps(customSteps)
-	checkoutStepIndex, hasCheckoutStep := findFirstCheckoutStepIndex(customSteps)
+	firstCheckoutIndex, hasCheckoutStep := findFirstCheckoutStepIndex(customSteps)
+	lastCheckoutIndex, _ := findLastCheckoutStepIndex(customSteps)
+	hasPostLastSteps := len(postLastCheckoutSteps) > 0
 	// Remove "steps:" line and adjust indentation
 	lines := strings.Split(customSteps, "\n")
 	if len(lines) <= 1 {
@@ -349,6 +371,7 @@ func (c *Compiler) addCustomStepsWithRuntimeInsertion(yaml *strings.Builder, cus
 	}
 
 	insertedRuntime := false
+	insertedPostLast := false
 	i := 1 // Start from index 1 to skip "steps:" line
 	currentStepIndex := -1
 	stepIndent := -1
@@ -379,12 +402,13 @@ func (c *Compiler) addCustomStepsWithRuntimeInsertion(yaml *strings.Builder, cus
 			isStepStart = indent == stepIndent
 		}
 
-		if isStepStart && !insertedRuntime {
+		if isStepStart {
 			currentStepIndex++
-			isCheckoutStep := hasCheckoutStep && currentStepIndex == checkoutStepIndex
+			isFirstCheckout := hasCheckoutStep && currentStepIndex == firstCheckoutIndex && !insertedRuntime
+			isLastCheckout := hasPostLastSteps && hasCheckoutStep && currentStepIndex == lastCheckoutIndex && !insertedPostLast
 
-			if isCheckoutStep {
-				// This is a checkout step, copy all its lines until the next step
+			if isFirstCheckout || isLastCheckout {
+				// This is a checkout step (first, last, or both): copy all its lines until the next step
 				i++
 				for i < len(lines) {
 					nextLine := lines[i]
@@ -404,11 +428,25 @@ func (c *Compiler) addCustomStepsWithRuntimeInsertion(yaml *strings.Builder, cus
 					i++
 				}
 
-				// Now insert runtime steps after the checkout step
-				compilerYamlLog.Printf("Inserting %d runtime setup steps after checkout in custom steps", len(runtimeSetupSteps))
-				c.emitRuntimeSetupSteps(yaml, runtimeSetupSteps, ensureArcDindNodePath)
+				if isFirstCheckout {
+					// Insert runtime steps after the first checkout step
+					compilerYamlLog.Printf("Inserting %d runtime setup steps after first checkout in custom steps", len(runtimeSetupSteps))
+					c.emitRuntimeSetupSteps(yaml, runtimeSetupSteps, ensureArcDindNodePath)
+					insertedRuntime = true
+				}
+				if isLastCheckout || (isFirstCheckout && firstCheckoutIndex == lastCheckoutIndex) {
+					// Insert post-last-checkout steps (e.g. cache restore) after the last checkout.
+					// When first == last (single-checkout), this runs immediately after runtime insertion above.
+					compilerYamlLog.Printf("Inserting %d post-last-checkout steps after last checkout in custom steps", len(postLastCheckoutSteps))
+					for _, step := range postLastCheckoutSteps {
+						for _, stepLine := range step {
+							yaml.WriteString(stepLine)
+							yaml.WriteByte('\n')
+						}
+					}
+					insertedPostLast = true
+				}
 
-				insertedRuntime = true
 				continue // Continue with the next iteration (i is already advanced)
 			}
 		}

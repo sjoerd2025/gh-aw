@@ -15,7 +15,8 @@ permissions:
   issues: read
   pull-requests: read
 
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 
 network:
   allowed:
@@ -24,8 +25,8 @@ network:
 
 sandbox:
   agent:
+    runtime: cloud-hypervisor
     id: awf
-    sudo: false
 imports:
   - shared/mcp/tavily.md
   - shared/reporting.md

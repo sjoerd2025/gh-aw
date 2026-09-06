@@ -12,22 +12,19 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:httpnoctx")
+
 // Analyzer is the http-no-ctx analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "httpnoctx",
-	Doc:      "reports context-free net/http request paths: http.Client/http package helpers without context, http.NewRequest in context-aware functions, and http.DefaultClient.Do",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/httpnoctx",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("httpnoctx", "reports context-free net/http request paths: http.Client/http package helpers without context, http.NewRequest in context-aware functions, and http.DefaultClient.Do", run)
 
 // contextFreeMethods is the set of http.Client (and package-level) HTTP
 // methods that accept no context.Context argument.
@@ -43,11 +40,9 @@ func run(pass *analysis.Pass) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +73,7 @@ func checkHTTPCall(pass *analysis.Pass, cursor inspector.Cursor, generatedFiles 
 	}
 	if contextFreeMethods[sel.Sel.Name] {
 		if isHTTPClientReceiver(pass, sel.X) {
+			pkgLog.Printf("flagging (*http.Client).%s without context at %s", sel.Sel.Name, pos)
 			pass.ReportRangef(call,
 				"(*http.Client).%s does not accept a context; use http.NewRequestWithContext + client.Do to propagate cancellation",
 				sel.Sel.Name,
@@ -85,6 +81,7 @@ func checkHTTPCall(pass *analysis.Pass, cursor inspector.Cursor, generatedFiles 
 			return
 		}
 		if isHTTPPackage(pass, sel.X) {
+			pkgLog.Printf("flagging http.%s without context at %s", sel.Sel.Name, pos)
 			pass.ReportRangef(call,
 				"http.%s does not accept a context; use http.NewRequestWithContext + http.DefaultClient.Do to propagate cancellation",
 				sel.Sel.Name,
@@ -93,12 +90,14 @@ func checkHTTPCall(pass *analysis.Pass, cursor inspector.Cursor, generatedFiles 
 		}
 	}
 	if sel.Sel.Name == "NewRequest" && isHTTPPackage(pass, sel.X) && hasContextInEnclosingFunc(pass, cursor) {
+		pkgLog.Printf("flagging http.NewRequest in context-aware func at %s", pos)
 		pass.ReportRangef(call,
 			"http.NewRequest does not propagate context; use http.NewRequestWithContext when context.Context is in scope",
 		)
 		return
 	}
 	if sel.Sel.Name == "Do" && isHTTPDefaultClient(pass, sel.X) {
+		pkgLog.Printf("flagging http.DefaultClient.Do at %s", pos)
 		pass.ReportRangef(call,
 			"http.DefaultClient.Do uses a timeout-less client; use a dedicated *http.Client with Timeout set",
 		)
@@ -143,11 +142,16 @@ func isHTTPPackage(pass *analysis.Pass, expr ast.Expr) bool {
 func hasContextInEnclosingFunc(pass *analysis.Pass, cursor inspector.Cursor) bool {
 	for enclosing := range cursor.Enclosing((*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)) {
 		fnType := astutil.EnclosingFuncType(enclosing.Node())
-		if fnType == nil || fnType.Params == nil {
+		if fnType == nil {
 			continue
 		}
 		if _, ok := astutil.ContextParamName(pass, fnType); ok {
 			return true
+		}
+		// Stop at a plain closure boundary: a context from an outer scope does
+		// not apply to code running inside a callback closure.
+		if _, isFuncLit := enclosing.Node().(*ast.FuncLit); isFuncLit && !astutil.IsGoOrDeferClosure(enclosing) {
+			return false
 		}
 	}
 

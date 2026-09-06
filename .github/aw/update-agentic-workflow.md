@@ -14,6 +14,7 @@ Update existing workflow files in `.github/workflows/`.
 - [workflow-constraints.md](workflow-constraints.md)
 - [safe-outputs.md](safe-outputs.md)
 - [syntax.md](syntax.md)
+- [intent.md](intent.md) for preserving the outcome and re-deriving evals or operational value when it changes
 
 Load these additional files only when relevant:
 
@@ -22,6 +23,8 @@ Load these additional files only when relevant:
 - [visual-regression.md](visual-regression.md)
 - [serena-tool.md](serena-tool.md)
 - [linter-workflows.md](linter-workflows.md)
+- [agent-runtime-instructions.md](agent-runtime-instructions.md) for changes involving Docker, gVisor, Docker sbx, ARC DinD, self-hosted runners, or `sandbox.agent.runtime-install`
+- [skills.md](skills.md) when the user asks to add specific skills or agent plugins
 
 ## Scope
 
@@ -31,24 +34,25 @@ This prompt is for **updating existing workflows only**. For new workflows, use 
 
 1. Ask which workflow to update.
 2. Ask what change is needed.
-3. Then inspect the existing file before proposing edits.
+3. Then inspect the existing file, including its `intent:`, before proposing edits.
 
 ## First Decision: Frontmatter or Prompt Body?
 
-Use [workflow-editing.md](workflow-editing.md) as the source of truth.
-
-- frontmatter change → recompilation required
-- markdown-body-only change → no recompilation required for runtime behavior, but always compile to keep `.lock.yml` in sync
+Use [workflow-editing.md](workflow-editing.md) as the source of truth for when recompilation is required. Always compile after any edit to keep `.lock.yml` in sync, even for body-only changes.
 
 ## Update Rules
 
 - make the smallest possible change
 - preserve existing style and structure unless reorganization is required
 - do not rewrite unrelated frontmatter sections
-- keep the agent job read-only
+- preserve the existing `intent:` for implementation-only changes, including trigger or output-channel redesigns
+- when the requested outcome materially expands, contracts, or changes, update `intent:` and re-derive its applicability, required effects, no-op conditions, architecture, and evals using [intent.md](intent.md)
+- when an implementation-only change selects a different architecture, revalidate activation conditions, evidence window, deduplication or previous-result strategy, no-op behavior, and evals so event-specific rules do not survive an incompatible redesign
 - when targeting the Copilot coding agent, recommend `permissions: { copilot-requests: write }` for Copilot authentication
-- use `safe-outputs:` for writes
 - prefer `toolsets:` for GitHub tools
+- when the user asks for specific skills or agent plugins, add them to the top-level `skills:` / `plugins:` frontmatter fields; never add on-the-fly install steps or prompt instructions to install them at run time (see [skills.md](skills.md))
+
+See [workflow-constraints.md](workflow-constraints.md) for the read-only security posture (keep the agent job read-only, route writes through `safe-outputs:`).
 
 ## Common Update Categories
 
@@ -96,9 +100,19 @@ network:
     - node
 ```
 
+### Add a skill or agent plugin
+
+```yaml
+skills:
+  - mattpocock/skills/tdd@801dca688564c529fa84f247f64472520d9ebe28
+plugins:
+  - octo-org/agent-plugin@v1
+```
+
 ## Validation Flow
 
 - always inspect the workflow before editing
+- explicitly determine whether the existing intent is preserved or changed
 - always compile after any change to keep `.lock.yml` in sync
 - keep the workflow valid at every step
 - summarize what changed and whether recompilation was needed

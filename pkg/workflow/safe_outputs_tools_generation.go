@@ -3,6 +3,9 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"slices"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
@@ -88,7 +91,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 			fileResult, err := findWorkflowFile(workflowName, markdownPath)
 			if err != nil {
 				safeOutputsConfigLog.Printf("Warning: error finding workflow %s: %v", workflowName, err)
-				dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, make(map[string]any)))
+				dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, make(map[string]any), data.SafeOutputs.DispatchWorkflow.AllowedRefs))
 				continue
 			}
 
@@ -100,14 +103,14 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 				extension = ".lock.yml"
 			} else if fileResult.ymlExists {
 				workflowPath = fileResult.ymlPath
-				extension = ".yml"
+				extension = filepath.Ext(fileResult.ymlPath)
 			} else if fileResult.mdExists {
 				workflowPath = fileResult.mdPath
 				extension = ".lock.yml"
 				useMD = true
 			} else {
 				safeOutputsConfigLog.Printf("Warning: no workflow file found for %s (checked .lock.yml, .yml, .md)", workflowName)
-				dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, make(map[string]any)))
+				dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, make(map[string]any), data.SafeOutputs.DispatchWorkflow.AllowedRefs))
 				continue
 			}
 
@@ -125,7 +128,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 				workflowInputs = make(map[string]any)
 			}
 
-			dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, workflowInputs))
+			dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, workflowInputs, data.SafeOutputs.DispatchWorkflow.AllowedRefs))
 		}
 	}
 
@@ -166,7 +169,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 				extension = ".lock.yml"
 			} else if fileResult.ymlExists {
 				workflowPath = fileResult.ymlPath
-				extension = ".yml"
+				extension = filepath.Ext(fileResult.ymlPath)
 			} else if fileResult.mdExists {
 				workflowPath = fileResult.mdPath
 				extension = ".lock.yml"
@@ -276,6 +279,11 @@ func computeRequiredFieldAdditions(safeOutputs *SafeOutputsConfig) map[string][]
 	if safeOutputs.AssignToAgent != nil && issueIntentRequired(safeOutputs.AssignToAgent.IssueIntent) {
 		additions["assign_to_agent"] = issueIntentRequiredFields
 	}
+	if safeOutputs.SubmitPullRequestReview != nil && len(safeOutputs.SubmitPullRequestReview.AllowedEvents) > 0 {
+		if !slices.Contains(safeOutputs.SubmitPullRequestReview.AllowedEvents, "COMMENT") {
+			additions["submit_pull_request_review"] = []string{"event"}
+		}
+	}
 	return additions
 }
 
@@ -340,6 +348,22 @@ func computePropertyInjections(safeOutputs *SafeOutputsConfig) map[string]map[st
 		}
 	}
 
+	// submit_pull_request_review event: when allowed-events restricts the set of review
+	// decisions, narrow the tool schema's event enum to match so the agent cannot select
+	// an event that runtime policy will reject. This retains runtime enforcement as
+	// defense in depth while preventing the doomed call in the first place.
+	if safeOutputs.SubmitPullRequestReview != nil && len(safeOutputs.SubmitPullRequestReview.AllowedEvents) > 0 {
+		allowedEvents := safeOutputs.SubmitPullRequestReview.AllowedEvents
+		injections["submit_pull_request_review"] = map[string]any{
+			"event": map[string]any{
+				"type":        "string",
+				"enum":        allowedEvents,
+				"description": "Review decision. Restricted by allowed-events configuration to: " + strings.Join(allowedEvents, ", ") + ".",
+				"x-synonyms":  []string{"action"},
+			},
+		}
+	}
+
 	if safeOutputs.DataEnabled {
 		dataProperty := map[string]any{"$ref": "#/0/inputSchema/$defs/structured_data"}
 		if safeOutputs.NormalizedDataSchema != nil {
@@ -373,7 +397,7 @@ func generateToolsMetaJSON(data *WorkflowData, markdownPath string) (string, err
 		}
 		result, err := json.Marshal(empty)
 		if err != nil {
-			return "", fmt.Errorf("failed to marshal empty tools meta: %w", err)
+			return "", fmt.Errorf("unable to marshal empty tools meta to JSON; expected the empty ToolsMeta struct (with empty maps/slices) to be serializable: %w", err)
 		}
 		return string(result), nil
 	}
@@ -429,8 +453,8 @@ func generateToolsMetaJSON(data *WorkflowData, markdownPath string) (string, err
 
 	result, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		safeOutputsConfigLog.Printf("Failed to marshal tools meta: %v", err)
-		return "", fmt.Errorf("failed to marshal tools meta: %w", err)
+		safeOutputsConfigLog.Printf("Error marshaling tools meta: %v", err)
+		return "", fmt.Errorf("unable to marshal tools meta to JSON; expected all computed fields (description suffixes, repo params, dynamic tools) to be serializable: %w", err)
 	}
 
 	safeOutputsConfigLog.Printf("Successfully generated tools meta JSON: %d description suffixes, %d repo params, %d dynamic tools",

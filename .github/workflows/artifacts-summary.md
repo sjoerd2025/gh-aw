@@ -11,9 +11,9 @@ permissions:
   actions: read
   copilot-requests: write
 engine:
-  id: copilot
-  copilot-sdk: true
-max-tool-denials: 3
+  id: codex
+  model-provider: openai
+model: openai/gpt-5.4
 network:
   allowed:
     - defaults
@@ -21,13 +21,13 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   edit:
   bash: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [actions, repos]
 safe-outputs:
   create-discussion:
@@ -41,6 +41,7 @@ imports:
   - shared/reporting.md
   - shared/safe-output-app.md
   - shared/otlp.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
 evals:
@@ -48,6 +49,7 @@ evals:
     question: Did the agent analyze GitHub Actions artifacts usage across all workflows in the repository?
   - id: summary_produced
     question: Was a comprehensive summary report of artifacts usage produced?
+
 ---
 
 ### Artifacts Summary

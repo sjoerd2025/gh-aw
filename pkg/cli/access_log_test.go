@@ -15,6 +15,7 @@ import (
 )
 
 func TestAccessLogParsing(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for the test
 	tempDir := testutil.TempDir(t, "test-*")
 
@@ -45,6 +46,7 @@ func TestAccessLogParsing(t *testing.T) {
 }
 
 func TestMultipleAccessLogAnalysis(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for the test
 	tempDir := testutil.TempDir(t, "test-*")
 	accessLogsDir := filepath.Join(tempDir, "access.log")
@@ -87,10 +89,12 @@ func TestMultipleAccessLogAnalysis(t *testing.T) {
 }
 
 func TestAnalyzeAccessLogsDirectory(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory structure
 	tempDir := testutil.TempDir(t, "test-*")
 
 	t.Run("multiple access logs in subdirectory", func(t *testing.T) {
+		t.Parallel()
 		// Test case 1: Multiple access logs in access-logs subdirectory
 		accessLogsDir := filepath.Join(tempDir, "run1", "access.log")
 		err := os.MkdirAll(accessLogsDir, 0755)
@@ -108,6 +112,7 @@ func TestAnalyzeAccessLogsDirectory(t *testing.T) {
 	})
 
 	t.Run("no access logs - returns nil", func(t *testing.T) {
+		t.Parallel()
 		// Test case 2: No access logs
 		run2Dir := filepath.Join(tempDir, "run2")
 		err := os.MkdirAll(run2Dir, 0755)
@@ -119,6 +124,7 @@ func TestAnalyzeAccessLogsDirectory(t *testing.T) {
 	})
 
 	t.Run("access logs in sandbox/firewall/logs/ (new path)", func(t *testing.T) {
+		t.Parallel()
 		// Test case 3: Access logs in sandbox/firewall/logs/ directory after artifact download
 		sandboxLogsDir := filepath.Join(tempDir, "run3", "sandbox", "firewall", "logs")
 		err := os.MkdirAll(sandboxLogsDir, 0755)
@@ -138,6 +144,7 @@ func TestAnalyzeAccessLogsDirectory(t *testing.T) {
 }
 
 func TestExtractDomainFromURL(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		url      string
 		expected string
@@ -151,6 +158,7 @@ func TestExtractDomainFromURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.url, func(t *testing.T) {
+			t.Parallel()
 			result := stringutil.ExtractDomainFromURL(tt.url)
 			assert.Equal(t, tt.expected, result, "should extract correct domain from URL")
 		})
@@ -158,6 +166,7 @@ func TestExtractDomainFromURL(t *testing.T) {
 }
 
 func TestParseSquidLogLine(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		line      string
@@ -217,6 +226,7 @@ func TestParseSquidLogLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result, err := parseSquidLogLine(tt.line)
 
 			if tt.shouldErr {
@@ -241,6 +251,7 @@ func TestParseSquidLogLine(t *testing.T) {
 }
 
 func TestAddMetrics(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		base     *DomainAnalysis
@@ -287,6 +298,7 @@ func TestAddMetrics(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tt.base.AddMetrics(tt.toAdd)
 			assert.Equal(t, tt.expected.TotalRequests, tt.base.TotalRequests, "total requests should match")
 			assert.Equal(t, tt.expected.AllowedRequests, tt.base.AllowedRequests, "allowed requests should match")
@@ -299,6 +311,7 @@ func TestAddMetrics(t *testing.T) {
 // original "allowed_count"/"blocked_count" JSON keys (not "allowed_requests"/
 // "blocked_requests") so that cached access-analysis JSON remains backward-compatible.
 func TestDomainAnalysisJSONWireNames(t *testing.T) {
+	t.Parallel()
 	d := DomainAnalysis{
 		AnalysisBase: AnalysisBase{
 			TotalRequests:   10,

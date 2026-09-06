@@ -13,6 +13,7 @@ import (
 )
 
 func TestDomainMatchesRule(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		host     string
@@ -130,6 +131,7 @@ func TestDomainMatchesRule(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := domainMatchesRule(tt.host, tt.rule)
 			assert.Equal(t, tt.expected, result, "domainMatchesRule(%q) should return %v", tt.host, tt.expected)
 		})
@@ -137,6 +139,7 @@ func TestDomainMatchesRule(t *testing.T) {
 }
 
 func TestFindMatchingRule(t *testing.T) {
+	t.Parallel()
 	rules := []FirewallPolicyRule{
 		{
 			ID:       "allow-github",
@@ -165,6 +168,7 @@ func TestFindMatchingRule(t *testing.T) {
 	}
 
 	t.Run("matches first rule - allowed HTTPS", func(t *testing.T) {
+		t.Parallel()
 		entry := AuditLogEntry{Host: "api.github.com:443", Method: "CONNECT", Status: 200, Decision: "TCP_TUNNEL"}
 		rule := findMatchingRule(entry, rules)
 		require.NotNil(t, rule, "Should find a matching rule")
@@ -172,6 +176,7 @@ func TestFindMatchingRule(t *testing.T) {
 	})
 
 	t.Run("matches second rule", func(t *testing.T) {
+		t.Parallel()
 		entry := AuditLogEntry{Host: "registry.npmjs.org:443", Method: "CONNECT", Status: 200, Decision: "TCP_TUNNEL"}
 		rule := findMatchingRule(entry, rules)
 		require.NotNil(t, rule, "Should find a matching rule")
@@ -179,6 +184,7 @@ func TestFindMatchingRule(t *testing.T) {
 	})
 
 	t.Run("aclName all catches unmatched denied traffic", func(t *testing.T) {
+		t.Parallel()
 		entry := AuditLogEntry{Host: "evil.com:443", Method: "CONNECT", Status: 403, Decision: "NONE_NONE"}
 		rule := findMatchingRule(entry, rules)
 		require.NotNil(t, rule, "Should find the catch-all deny rule")
@@ -186,6 +192,7 @@ func TestFindMatchingRule(t *testing.T) {
 	})
 
 	t.Run("aclName all skipped for allowed traffic", func(t *testing.T) {
+		t.Parallel()
 		// If a domain doesn't match specific rules but traffic was allowed,
 		// the deny-all rule should NOT match (action mismatch)
 		entry := AuditLogEntry{Host: "unknown.com:443", Method: "CONNECT", Status: 200, Decision: "TCP_TUNNEL"}
@@ -194,6 +201,7 @@ func TestFindMatchingRule(t *testing.T) {
 	})
 
 	t.Run("first matching rule wins", func(t *testing.T) {
+		t.Parallel()
 		entry := AuditLogEntry{Host: "github.com:443", Method: "CONNECT", Status: 200, Decision: "TCP_TUNNEL"}
 		rule := findMatchingRule(entry, rules)
 		require.NotNil(t, rule, "Should find a matching rule")
@@ -201,6 +209,7 @@ func TestFindMatchingRule(t *testing.T) {
 	})
 
 	t.Run("observed-decision validation - allow rule skipped for denied traffic", func(t *testing.T) {
+		t.Parallel()
 		// Domain matches allow-github, but traffic was denied — allow rule shouldn't be credited
 		entry := AuditLogEntry{Host: "api.github.com:443", Method: "CONNECT", Status: 403, Decision: "NONE_NONE"}
 		rule := findMatchingRule(entry, rules)
@@ -211,6 +220,7 @@ func TestFindMatchingRule(t *testing.T) {
 }
 
 func TestProtocolMatching(t *testing.T) {
+	t.Parallel()
 	rules := []FirewallPolicyRule{
 		{
 			ID:       "allow-https-only",
@@ -231,6 +241,7 @@ func TestProtocolMatching(t *testing.T) {
 	}
 
 	t.Run("HTTPS rule matches CONNECT request", func(t *testing.T) {
+		t.Parallel()
 		entry := AuditLogEntry{Host: "api.github.com:443", Method: "CONNECT", Status: 200, Decision: "TCP_TUNNEL"}
 		rule := findMatchingRule(entry, rules)
 		require.NotNil(t, rule, "Should match HTTPS rule")
@@ -238,6 +249,7 @@ func TestProtocolMatching(t *testing.T) {
 	})
 
 	t.Run("HTTPS rule skipped for HTTP request", func(t *testing.T) {
+		t.Parallel()
 		entry := AuditLogEntry{Host: "api.github.com:80", Method: "GET", Status: 403, Decision: "NONE_NONE"}
 		rule := findMatchingRule(entry, rules)
 		// HTTPS-only rule skipped for GET → falls through to deny-all
@@ -247,6 +259,7 @@ func TestProtocolMatching(t *testing.T) {
 }
 
 func TestIsEntryHTTPS(t *testing.T) {
+	t.Parallel()
 	assert.True(t, isEntryHTTPS(AuditLogEntry{Method: "CONNECT"}), "CONNECT should be HTTPS")
 	assert.True(t, isEntryHTTPS(AuditLogEntry{Method: "connect"}), "connect (lowercase) should be HTTPS")
 	assert.False(t, isEntryHTTPS(AuditLogEntry{Method: "GET"}), "GET should not be HTTPS")
@@ -254,6 +267,7 @@ func TestIsEntryHTTPS(t *testing.T) {
 }
 
 func TestIsEntryAllowed(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		entry    AuditLogEntry
@@ -270,12 +284,14 @@ func TestIsEntryAllowed(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.expected, isEntryAllowed(tt.entry), "isEntryAllowed should return %v", tt.expected)
 		})
 	}
 }
 
 func TestContainsRegexMeta(t *testing.T) {
+	t.Parallel()
 	assert.True(t, containsRegexMeta(`^192\.168`), "Should detect caret")
 	assert.True(t, containsRegexMeta(`foo.*bar`), "Should detect asterisk")
 	assert.True(t, containsRegexMeta(`[0-9]+`), "Should detect brackets")
@@ -284,7 +300,9 @@ func TestContainsRegexMeta(t *testing.T) {
 }
 
 func TestLoadPolicyManifest(t *testing.T) {
+	t.Parallel()
 	t.Run("valid manifest", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		manifestPath := filepath.Join(dir, "policy-manifest.json")
 
@@ -315,6 +333,7 @@ func TestLoadPolicyManifest(t *testing.T) {
 	})
 
 	t.Run("manifest with hostAccessEnabled and allowHostPorts", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		manifestPath := filepath.Join(dir, "policy-manifest.json")
 
@@ -338,11 +357,13 @@ func TestLoadPolicyManifest(t *testing.T) {
 	})
 
 	t.Run("missing file", func(t *testing.T) {
+		t.Parallel()
 		_, err := loadPolicyManifest("/nonexistent/path/policy-manifest.json")
 		assert.Error(t, err, "Should return error for missing file")
 	})
 
 	t.Run("invalid JSON", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		manifestPath := filepath.Join(dir, "policy-manifest.json")
 		require.NoError(t, os.WriteFile(manifestPath, []byte("not json"), 0644))
@@ -353,7 +374,9 @@ func TestLoadPolicyManifest(t *testing.T) {
 }
 
 func TestParseAuditJSONL(t *testing.T) {
+	t.Parallel()
 	t.Run("valid JSONL", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		jsonlPath := filepath.Join(dir, "audit.jsonl")
 
@@ -378,6 +401,7 @@ func TestParseAuditJSONL(t *testing.T) {
 	})
 
 	t.Run("empty lines skipped", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		jsonlPath := filepath.Join(dir, "audit.jsonl")
 
@@ -393,6 +417,7 @@ func TestParseAuditJSONL(t *testing.T) {
 	})
 
 	t.Run("malformed lines skipped", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		jsonlPath := filepath.Join(dir, "audit.jsonl")
 
@@ -408,12 +433,14 @@ not valid json
 	})
 
 	t.Run("missing file", func(t *testing.T) {
+		t.Parallel()
 		_, err := parseAuditJSONL("/nonexistent/path/audit.jsonl")
 		assert.Error(t, err, "Should return error for missing file")
 	})
 }
 
 func TestEnrichWithPolicyRules(t *testing.T) {
+	t.Parallel()
 	manifest := &PolicyManifest{
 		Version:     1,
 		GeneratedAt: "2026-01-01T00:00:00Z",
@@ -461,6 +488,7 @@ func TestEnrichWithPolicyRules(t *testing.T) {
 	require.NotNil(t, analysis, "Analysis should not be nil")
 
 	t.Run("summary statistics", func(t *testing.T) {
+		t.Parallel()
 		assert.Equal(t, 4, analysis.TotalRequests, "Should have 4 total requests")
 		assert.Equal(t, 3, analysis.AllowedCount, "Should have 3 allowed requests")
 		assert.Equal(t, 1, analysis.DeniedCount, "Should have 1 denied request")
@@ -468,12 +496,14 @@ func TestEnrichWithPolicyRules(t *testing.T) {
 	})
 
 	t.Run("policy summary", func(t *testing.T) {
+		t.Parallel()
 		assert.Contains(t, analysis.PolicySummary, "3 rules", "Policy summary should mention 3 rules")
 		assert.Contains(t, analysis.PolicySummary, "SSL Bump disabled", "Should mention SSL Bump status")
 		assert.Contains(t, analysis.PolicySummary, "DLP disabled", "Should mention DLP status")
 	})
 
 	t.Run("rule hits", func(t *testing.T) {
+		t.Parallel()
 		require.Len(t, analysis.RuleHits, 3, "Should have 3 rule hit entries")
 		// Rules should be in order
 		assert.Equal(t, "allow-github", analysis.RuleHits[0].Rule.ID, "First rule should be allow-github")
@@ -485,6 +515,7 @@ func TestEnrichWithPolicyRules(t *testing.T) {
 	})
 
 	t.Run("denied requests attributed to deny-all rule", func(t *testing.T) {
+		t.Parallel()
 		require.Len(t, analysis.DeniedRequests, 1, "Should have 1 denied request")
 		assert.Equal(t, "evil.com:443", analysis.DeniedRequests[0].Host, "Denied request host should match")
 		assert.Equal(t, "deny", analysis.DeniedRequests[0].Action, "Action should be deny")
@@ -492,6 +523,7 @@ func TestEnrichWithPolicyRules(t *testing.T) {
 	})
 
 	t.Run("entries with empty host skipped", func(t *testing.T) {
+		t.Parallel()
 		emptyEntries := []AuditLogEntry{
 			{Timestamp: 1.0, Host: "", Status: 200},
 			{Timestamp: 2.0, Host: "-", Status: 200},
@@ -505,6 +537,7 @@ func TestEnrichWithPolicyRules(t *testing.T) {
 	})
 
 	t.Run("error:transaction-end-before-headers entries filtered", func(t *testing.T) {
+		t.Parallel()
 		squidEntries := []AuditLogEntry{
 			{Timestamp: 1.0, Host: "api.github.com:443", Method: "CONNECT", Status: 200, Decision: "TCP_TUNNEL", URL: "api.github.com:443"},
 			{Timestamp: 2.0, Host: "api.github.com:443", Method: "CONNECT", Status: 0, Decision: "NONE_NONE", URL: "error:transaction-end-before-headers"},
@@ -514,6 +547,7 @@ func TestEnrichWithPolicyRules(t *testing.T) {
 	})
 
 	t.Run("unattributed-allow for allowed traffic with no matching rule", func(t *testing.T) {
+		t.Parallel()
 		// Manifest without a catch-all rule — allowed traffic that doesn't match
 		// any allow rule should be classified as (unattributed-allow), not (implicit-deny)
 		limitedManifest := &PolicyManifest{
@@ -540,6 +574,7 @@ func TestEnrichWithPolicyRules(t *testing.T) {
 	})
 
 	t.Run("unique domains case normalized", func(t *testing.T) {
+		t.Parallel()
 		caseEntries := []AuditLogEntry{
 			{Timestamp: 1.0, Host: "API.GITHUB.COM:443", Method: "CONNECT", Status: 200, Decision: "TCP_TUNNEL"},
 			{Timestamp: 2.0, Host: "api.github.com:443", Method: "CONNECT", Status: 200, Decision: "TCP_TUNNEL"},
@@ -551,7 +586,9 @@ func TestEnrichWithPolicyRules(t *testing.T) {
 }
 
 func TestDetectFirewallAuditArtifacts(t *testing.T) {
+	t.Parallel()
 	t.Run("sandbox/firewall/audit path", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		auditDir := filepath.Join(dir, "sandbox", "firewall", "audit")
 		require.NoError(t, os.MkdirAll(auditDir, 0755))
@@ -568,6 +605,7 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 	})
 
 	t.Run("agent artifact new structure (not yet flattened)", func(t *testing.T) {
+		t.Parallel()
 		// Simulates a directory populated by `gh run download` before flattenUnifiedArtifact
 		// is called. actions/upload-artifact v4+ strips the /tmp/gh-aw/ common prefix, so
 		// files land at agent/sandbox/firewall/audit/ inside the downloaded artifact dir.
@@ -587,6 +625,7 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 	})
 
 	t.Run("agent artifact old structure with tmp/gh-aw prefix (not yet flattened)", func(t *testing.T) {
+		t.Parallel()
 		// Simulates older artifact structure where the full /tmp/gh-aw/ path was preserved
 		// inside the agent artifact directory before the v4+ prefix-stripping behavior.
 		dir := t.TempDir()
@@ -605,6 +644,7 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 	})
 
 	t.Run("agent-artifacts legacy artifact name (not yet flattened)", func(t *testing.T) {
+		t.Parallel()
 		// Simulates the legacy "agent-artifacts" artifact name used before the rename to "agent".
 		dir := t.TempDir()
 		auditDir := filepath.Join(dir, "agent-artifacts", "sandbox", "firewall", "audit")
@@ -622,6 +662,7 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 	})
 
 	t.Run("workflow_call prefixed agent artifact (not yet flattened)", func(t *testing.T) {
+		t.Parallel()
 		// Simulates the workflow_call artifact naming where a hash prefix is added:
 		// e.g., "abc123-agent" instead of "agent".
 		dir := t.TempDir()
@@ -640,6 +681,7 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 	})
 
 	t.Run("firewall-audit-logs directory", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		auditDir := filepath.Join(dir, "firewall-audit-logs")
 		require.NoError(t, os.MkdirAll(auditDir, 0755))
@@ -656,6 +698,7 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 	})
 
 	t.Run("no artifacts", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		foundManifest, foundAudit, err := detectFirewallAuditArtifacts(dir)
 		require.NoError(t, err, "Should not error with empty run dir")
@@ -664,6 +707,7 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 	})
 
 	t.Run("file named 'agent' does not panic or falsely match", func(t *testing.T) {
+		t.Parallel()
 		// If a plain file happens to be named "agent" in the run directory (e.g., a flattened
 		// single-file artifact from a different upload), the lookup must skip it gracefully.
 		dir := t.TempDir()
@@ -676,6 +720,7 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 	})
 
 	t.Run("unreadable run directory returns error", func(t *testing.T) {
+		t.Parallel()
 		if os.Getuid() == 0 {
 			t.Skip("root can read any directory; skipping permission test")
 		}
@@ -690,7 +735,9 @@ func TestDetectFirewallAuditArtifacts(t *testing.T) {
 }
 
 func TestAnalyzeFirewallPolicy(t *testing.T) {
+	t.Parallel()
 	t.Run("full enrichment", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		auditDir := filepath.Join(dir, "sandbox", "firewall", "audit")
 		require.NoError(t, os.MkdirAll(auditDir, 0755))
@@ -726,6 +773,7 @@ func TestAnalyzeFirewallPolicy(t *testing.T) {
 	})
 
 	t.Run("manifest only - no audit.jsonl", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		auditDir := filepath.Join(dir, "sandbox", "firewall", "audit")
 		require.NoError(t, os.MkdirAll(auditDir, 0755))
@@ -746,9 +794,71 @@ func TestAnalyzeFirewallPolicy(t *testing.T) {
 	})
 
 	t.Run("no artifacts returns nil", func(t *testing.T) {
+		t.Parallel()
 		dir := t.TempDir()
 		analysis, err := analyzeFirewallPolicy(dir, false)
 		require.NoError(t, err, "Should not error when no artifacts found")
 		assert.Nil(t, analysis, "Should return nil when no artifacts found")
 	})
+}
+
+func TestDomainMatchesRegex(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		domain   string
+		patterns []string
+		expected bool
+	}{
+		{
+			name:     "valid pattern that matches",
+			domain:   "api.github.com",
+			patterns: []string{`^api\.github\.com$`},
+			expected: true,
+		},
+		{
+			name:     "valid pattern that does not match",
+			domain:   "evil.com",
+			patterns: []string{`^api\.github\.com$`},
+			expected: false,
+		},
+		{
+			name:     "invalid pattern is skipped and returns false",
+			domain:   "github.com",
+			patterns: []string{`[invalid`},
+			expected: false,
+		},
+		{
+			name:     "invalid pattern skipped, valid second pattern matches",
+			domain:   "github.com",
+			patterns: []string{`[invalid`, `^github\.com$`},
+			expected: true,
+		},
+		{
+			name:     "invalid pattern skipped, no other pattern matches",
+			domain:   "github.com",
+			patterns: []string{`[invalid`, `^other\.com$`},
+			expected: false,
+		},
+		{
+			name:     "empty patterns list returns false",
+			domain:   "github.com",
+			patterns: []string{},
+			expected: false,
+		},
+		{
+			name:     "wildcard regex pattern",
+			domain:   "anything.example.com",
+			patterns: []string{`^.*\.example\.com$`},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := domainMatchesRegex(tt.domain, tt.patterns)
+			assert.Equal(t, tt.expected, result, "domainMatchesRegex(%q, %v) should return %v", tt.domain, tt.patterns, tt.expected)
+		})
+	}
 }

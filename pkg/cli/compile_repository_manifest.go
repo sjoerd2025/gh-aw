@@ -52,20 +52,22 @@ func validateRepositoryManifestForCompilation(config CompileConfig, stats *Compi
 	if len(warnings) > 0 {
 		stats.Warnings += len(warnings)
 	}
-
 	result := ValidationResult{
 		Workflow: filepath.Base(manifestPath),
 		Valid:    parseErr == nil,
 	}
 	for _, warning := range warnings {
-		result.Warnings = append(result.Warnings, CompileValidationError{
+		result.Warnings = append(result.Warnings, ValidationIssue{
 			Type:    "manifest_warning",
 			Message: warning,
 		})
 	}
+	return reportRepositoryManifestValidation(config, validationResults, warnings, parseErr, result)
+}
 
+func reportRepositoryManifestValidation(config CompileConfig, validationResults *[]ValidationResult, warnings []string, parseErr error, result ValidationResult) error {
 	if parseErr != nil {
-		result.Errors = append(result.Errors, CompileValidationError{
+		result.Errors = append(result.Errors, ValidationIssue{
 			Type:    "manifest_error",
 			Message: parseErr.Error(),
 		})
@@ -76,16 +78,14 @@ func validateRepositoryManifestForCompilation(config CompileConfig, stats *Compi
 		}
 		return parseErr
 	}
-
 	if len(result.Warnings) > 0 {
 		*validationResults = append(*validationResults, result)
 		if !config.JSONOutput {
 			for _, warning := range warnings {
-				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warning))
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(warning))
 			}
 		}
 	}
-
 	return nil
 }
 
@@ -111,19 +111,31 @@ func validateLocalRepositoryPackageContents(manifestPath string) error {
 		if err != nil {
 			return err
 		}
-
-		includeInstallablePaths, _, _ := splitManifestIncludePaths(manifest.Includes)
-		includeInstallablePaths = append(includeInstallablePaths, manifest.Files...)
-		installationSources := normalizePackageInstallablePaths(includeInstallablePaths, "")
-		if len(installationSources) == 0 {
-			installationSources, err = scanLocalRepositoryPackageInstallablePaths(filepath.Dir(manifestPath))
+		packageDir := filepath.Dir(manifestPath)
+		nodes, _, err := resolveRepositoryPackageManifestGraph(manifestPath, manifest, func(importPath string) ([]byte, error) {
+			return readLocalImportedManifest(importPath, packageDir)
+		})
+		if err != nil {
+			return err
+		}
+		assets, err := resolveLocalRepositoryPackageManifestNodes(nodes, packageDir)
+		if err != nil {
+			return err
+		}
+		if err := validateUniqueResolvedPackageFiles(assets.installationSources, assets.resourceFiles, assets.extensionFiles.skillFiles, assets.extensionFiles.agentFiles, manifestPath); err != nil {
+			return err
+		}
+		privacyInstallables := make([]resolvedPackageInstallable, 0, len(assets.installationSources))
+		for _, installable := range assets.installationSources {
+			relativeSource, err := filepath.Rel(packageDir, installable.SourcePath)
 			if err != nil {
 				return err
 			}
+			installable.SourcePath = filepath.ToSlash(relativeSource)
+			privacyInstallables = append(privacyInstallables, installable)
 		}
-
-		return validateManifestInstallableWorkflowPrivacy(manifestPath, installationSources, func(sourcePath string) ([]byte, error) {
-			content, err := os.ReadFile(filepath.Join(filepath.Dir(manifestPath), filepath.FromSlash(sourcePath)))
+		return validateManifestInstallableWorkflowPrivacy(manifestPath, privacyInstallables, func(sourcePath string) ([]byte, error) {
+			content, err := os.ReadFile(filepath.Join(packageDir, filepath.FromSlash(sourcePath)))
 			if err != nil {
 				return nil, fmt.Errorf("failed to read workflow %q: %w", sourcePath, err)
 			}

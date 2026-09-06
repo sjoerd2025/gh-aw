@@ -7,33 +7,28 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:nilctxpassed")
+
 // Analyzer is the nil-context-passed analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "nilctxpassed",
-	Doc:      "reports function calls where nil is passed as a context.Context argument",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/nilctxpassed",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("nilctxpassed", "reports function calls where nil is passed as a context.Context argument", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	insp, err := astutil.Inspector(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -86,6 +81,7 @@ func checkCallForNilContext(pass *analysis.Pass, cur inspector.Cursor, generated
 		if nolint.HasDirectiveForLinter(argPos, noLintIndex, "nilctxpassed") {
 			continue
 		}
+		pkgLog.Printf("flagging nil context.Context argument at %s", argPos)
 		pass.Report(analysis.Diagnostic{
 			Pos:     arg.Pos(),
 			End:     arg.End(),

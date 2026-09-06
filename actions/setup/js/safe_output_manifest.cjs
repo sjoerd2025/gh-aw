@@ -4,7 +4,41 @@ const fs = require("fs");
 const nodePath = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
-const { MANIFEST_FILE_PATH, TEMPORARY_ID_MAP_FILE_PATH } = require("./constants.cjs");
+const { MANIFEST_FILE_PATH, TEMPORARY_ID_MAP_FILE_PATH, SAFE_OUTPUT_ERRORS_FILE_PATH } = require("./constants.cjs");
+const { redactBuiltInPatterns, redactSecrets, extractMCPGatewayTokens, MCP_GATEWAY_CONFIG_PATHS } = require("./redact_secrets.cjs");
+
+/**
+ * Collect custom secret values for artifact redaction.
+ *
+ * Mirrors the redaction inputs used by redact_secrets.cjs:
+ * - workflow-configured secrets from GH_AW_SECRET_NAMES / SECRET_*
+ * - dynamically minted MCP gateway bearer tokens discovered from config files
+ *
+ * @returns {string[]} Unique secret values suitable for redactSecrets()
+ */
+function collectArtifactSecretValues() {
+  /** @type {Set<string>} */
+  const secretValues = new Set();
+
+  const secretNames = (process.env.GH_AW_SECRET_NAMES || "")
+    .split(",")
+    .map(name => name.trim())
+    .filter(Boolean);
+  for (const secretName of secretNames) {
+    const secretValue = process.env[`SECRET_${secretName}`];
+    if (typeof secretValue === "string" && secretValue.trim() !== "") {
+      secretValues.add(secretValue.trim());
+    }
+  }
+
+  for (const gatewayToken of extractMCPGatewayTokens(MCP_GATEWAY_CONFIG_PATHS)) {
+    if (typeof gatewayToken === "string" && gatewayToken.trim() !== "") {
+      secretValues.add(gatewayToken.trim());
+    }
+  }
+
+  return [...secretValues];
+}
 
 /**
  * Safe output types that create new items in GitHub (these typically return a URL,
@@ -51,6 +85,7 @@ const NOT_LOGGED_TYPES = new Set(["noop", "missing_tool", "missing_data", "repor
  * @property {Object} [before_state] - Execution-time state snapshot captured before mutation
  * @property {Object} [after_state] - Execution-time state snapshot captured after mutation
  * @property {string[]} [labelsAdded] - Labels added by add_labels handler
+ * @property {string[]} [labelsSuggested] - Labels suggested but not applied by add_labels handler
  * @property {string} timestamp - ISO 8601 timestamp of creation
  */
 
@@ -61,7 +96,7 @@ const NOT_LOGGED_TYPES = new Set(["noop", "missing_tool", "missing_data", "repor
  * It is designed to be easily testable by accepting the file path as a parameter.
  *
  * @param {string} [manifestFile] - Path to the manifest file (defaults to MANIFEST_FILE_PATH)
- * @returns {(item: {type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsBefore?: string[]}) => void} Logger function
+ * @returns {(item: {type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}) => void} Logger function
  */
 function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
   // Touch the file immediately so it exists for artifact upload
@@ -71,7 +106,7 @@ function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
   /**
    * Log an executed safe output item to the manifest file.
    *
-   * @param {{type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsBefore?: string[]}} item - Executed item details
+   * @param {{type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}} item - Executed item details
    */
   return function logCreatedItem(item) {
     if (!item) return;
@@ -87,6 +122,7 @@ function createManifestLogger(manifestFile = MANIFEST_FILE_PATH) {
       ...(item.before_state ? { before_state: item.before_state } : {}),
       ...(item.after_state ? { after_state: item.after_state } : {}),
       ...(Array.isArray(item.labelsAdded) ? { labelsAdded: item.labelsAdded } : {}),
+      ...(Array.isArray(item.labelsSuggested) ? { labelsSuggested: item.labelsSuggested } : {}),
       ...(Array.isArray(item.labelsBefore) ? { labelsBefore: item.labelsBefore } : {}),
       timestamp: new Date().toISOString(),
     };
@@ -129,7 +165,7 @@ function ensureManifestExists(manifestFile = MANIFEST_FILE_PATH) {
  *
  * @param {string} type - The handler type (e.g., "create_issue")
  * @param {any} result - The handler result object
- * @returns {{type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsBefore?: string[]}|null}
+ * @returns {{type: string, url?: string, number?: number, repo?: string, temporaryId?: string, metadata?: Record<string, any>, before_state?: Object, after_state?: Object, labelsAdded?: string[], labelsSuggested?: string[], labelsBefore?: string[]}|null}
  */
 function extractCreatedItemFromResult(type, result) {
   if (!result || NOT_LOGGED_TYPES.has(type)) return null;
@@ -157,6 +193,7 @@ function extractCreatedItemFromResult(type, result) {
     ...(result.before_state ? { before_state: result.before_state } : {}),
     ...(result.after_state ? { after_state: result.after_state } : {}),
     ...(Array.isArray(result.labelsAdded) ? { labelsAdded: result.labelsAdded } : {}),
+    ...(Array.isArray(result.labelsSuggested) ? { labelsSuggested: result.labelsSuggested } : {}),
     ...(Array.isArray(result.labelsBefore) ? { labelsBefore: result.labelsBefore } : {}),
   };
 }
@@ -182,13 +219,69 @@ function writeTemporaryIdMapFile(temporaryIdMap, filePath = TEMPORARY_ID_MAP_FIL
   }
 }
 
+/**
+ * Write a structured safe-output error report for artifact upload.
+ *
+ * The report captures *structured* failure metadata only (error code, error
+ * message produced by gh-aw itself, and the list of failing safe-output types).
+ * Raw handler stdout/stderr is never captured. Built-in credential patterns are
+ * redacted from the serialized report before it is written to disk.
+ *
+ * The file is uploaded with the safe-outputs-items artifact (which is uploaded
+ * with `if: always()`), so failures of the "Process Safe Outputs" step remain
+ * diagnosable after the job logs expire.
+ *
+ * @param {{status?: string, errorCode?: string, message?: string, failures?: Array<{type?: string, errorCode?: string, error?: string}>}} report - Failure diagnostics
+ * @param {string} [filePath] - Path to the output file (defaults to SAFE_OUTPUT_ERRORS_FILE_PATH)
+ */
+function writeSafeOutputErrorReport(report, filePath = SAFE_OUTPUT_ERRORS_FILE_PATH) {
+  /** @type {Record<string, any>} */
+  const entry = {
+    timestamp: new Date().toISOString(),
+    status: report?.status || "failure",
+    ...(report?.errorCode ? { errorCode: report.errorCode } : {}),
+    ...(report?.message ? { message: report.message } : {}),
+    ...(process.env.GITHUB_WORKFLOW ? { workflow: process.env.GITHUB_WORKFLOW } : {}),
+    ...(process.env.GITHUB_RUN_ID ? { run_id: process.env.GITHUB_RUN_ID } : {}),
+    failures: Array.isArray(report?.failures)
+      ? report.failures.map(f => ({
+          ...(f?.type ? { type: f.type } : {}),
+          ...(f?.errorCode ? { errorCode: f.errorCode } : {}),
+          ...(f?.error ? { error: f.error } : {}),
+        }))
+      : [],
+  };
+
+  let content = JSON.stringify(entry, null, 2) + "\n";
+  try {
+    content = redactBuiltInPatterns(content).content;
+    content = redactSecrets(content, collectArtifactSecretValues()).content;
+  } catch {
+    // Redaction is a safety net; if it fails, drop the free-form text rather
+    // than risk writing an unredacted credential into an artifact.
+    content = JSON.stringify({ timestamp: entry.timestamp, status: entry.status, message: "<redaction unavailable: diagnostics omitted>" }, null, 2) + "\n";
+  }
+
+  try {
+    const dir = nodePath.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(filePath, content);
+  } catch (error) {
+    throw new Error(`${ERR_SYSTEM}: Failed to write safe output error report: ${getErrorMessage(error)}`, { cause: error });
+  }
+}
+
 module.exports = {
   MANIFEST_FILE_PATH,
   TEMPORARY_ID_MAP_FILE_PATH,
+  SAFE_OUTPUT_ERRORS_FILE_PATH,
   CREATE_ITEM_TYPES,
   NOT_LOGGED_TYPES,
   createManifestLogger,
   ensureManifestExists,
   extractCreatedItemFromResult,
   writeTemporaryIdMapFile,
+  writeSafeOutputErrorReport,
 };

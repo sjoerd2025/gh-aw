@@ -14,24 +14,25 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 )
 
-func TestStatusWorkflows_JSONOutput(t *testing.T) {
-
-	// Save current directory
+// chdirToRepoRoot changes the working directory to the repository root for
+// the duration of the test, so that StatusWorkflows can find the local
+// .github/workflows directory regardless of the test binary's cwd. The
+// original directory is automatically restored when the test completes.
+func chdirToRepoRoot(t *testing.T) {
+	t.Helper()
 	originalDir, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Failed to get current directory: %v", err)
 	}
+	t.Chdir(filepath.Join(originalDir, "..", ".."))
+}
 
-	// Change to repository root
-	repoRoot := filepath.Join(originalDir, "..", "..")
-	if err := os.Chdir(repoRoot); err != nil {
-		t.Fatalf("Failed to change to repository root: %v", err)
-	}
-	defer os.Chdir(originalDir)
+func TestStatusWorkflows_JSONOutput(t *testing.T) {
+	chdirToRepoRoot(t)
 
 	// Test JSON output without pattern
 	t.Run("JSON output without pattern", func(t *testing.T) {
-		err := StatusWorkflows("", false, true, "", "", "")
+		err := StatusWorkflows(t.Context(), "", false, true, "", "", "")
 		if err != nil {
 			t.Errorf("StatusWorkflows with JSON flag failed: %v", err)
 		}
@@ -41,7 +42,7 @@ func TestStatusWorkflows_JSONOutput(t *testing.T) {
 
 	// Test JSON output with pattern
 	t.Run("JSON output with pattern", func(t *testing.T) {
-		err := StatusWorkflows("smoke", false, true, "", "", "")
+		err := StatusWorkflows(t.Context(), "smoke", false, true, "", "", "")
 		if err != nil {
 			t.Errorf("StatusWorkflows with JSON flag and pattern failed: %v", err)
 		}
@@ -49,6 +50,7 @@ func TestStatusWorkflows_JSONOutput(t *testing.T) {
 }
 
 func TestWorkflowStatus_JSONMarshaling(t *testing.T) {
+	t.Parallel()
 	// Test that WorkflowStatus can be marshaled to JSON
 	status := WorkflowStatus{
 		WorkflowListItem: WorkflowListItem{
@@ -296,6 +298,7 @@ func TestStatusCommand_JSONOutputIncludesOnField(t *testing.T) {
 
 // TestWorkflowStatus_ConsoleRendering tests that WorkflowStatus uses console.RenderStruct correctly
 func TestWorkflowStatus_ConsoleRendering(t *testing.T) {
+	t.Parallel()
 	// Create test data
 	statuses := []WorkflowStatus{
 		{
@@ -356,6 +359,7 @@ func TestWorkflowStatus_ConsoleRendering(t *testing.T) {
 
 // TestWorkflowStatus_JSONMarshalingWithRunStatus tests that RunStatus and RunConclusion are included in JSON output
 func TestWorkflowStatus_JSONMarshalingWithRunStatus(t *testing.T) {
+	t.Parallel()
 	// Test that WorkflowStatus with run status can be marshaled to JSON
 	status := WorkflowStatus{
 		WorkflowListItem: WorkflowListItem{
@@ -390,6 +394,7 @@ func TestWorkflowStatus_JSONMarshalingWithRunStatus(t *testing.T) {
 
 // TestWorkflowStatus_JSONMarshalingWithEmptyRunStatus tests that empty RunStatus and RunConclusion are omitted
 func TestWorkflowStatus_JSONMarshalingWithEmptyRunStatus(t *testing.T) {
+	t.Parallel()
 	// Test that WorkflowStatus without run status omits those fields
 	status := WorkflowStatus{
 		WorkflowListItem: WorkflowListItem{
@@ -423,6 +428,7 @@ func TestWorkflowStatus_JSONMarshalingWithEmptyRunStatus(t *testing.T) {
 
 // TestWorkflowStatus_JSONMarshalingWithLabels tests that labels are included in JSON output
 func TestWorkflowStatus_JSONMarshalingWithLabels(t *testing.T) {
+	t.Parallel()
 	// Test that WorkflowStatus with labels can be marshaled to JSON
 	status := WorkflowStatus{
 		WorkflowListItem: WorkflowListItem{
@@ -465,6 +471,7 @@ func TestWorkflowStatus_JSONMarshalingWithLabels(t *testing.T) {
 
 // TestWorkflowStatus_JSONMarshalingWithEmptyLabels tests that empty labels are omitted
 func TestWorkflowStatus_JSONMarshalingWithEmptyLabels(t *testing.T) {
+	t.Parallel()
 	// Test that WorkflowStatus without labels omits the field
 	status := WorkflowStatus{
 		WorkflowListItem: WorkflowListItem{
@@ -495,6 +502,7 @@ func TestWorkflowStatus_JSONMarshalingWithEmptyLabels(t *testing.T) {
 
 // TestWorkflowStatus_ConsoleRenderingWithRunStatus tests that RunStatus and RunConclusion are rendered when present
 func TestWorkflowStatus_ConsoleRenderingWithRunStatus(t *testing.T) {
+	t.Parallel()
 	// Create test data with run status
 	statuses := []WorkflowStatus{
 		{
@@ -547,14 +555,16 @@ func TestWorkflowStatus_ConsoleRenderingWithRunStatus(t *testing.T) {
 func TestStatusWorkflows_WithRepoOverride(t *testing.T) {
 	// This test verifies that the function accepts the repoOverride parameter
 	// and doesn't error out. It should work in the current repository context.
-	err := StatusWorkflows("", false, true, "", "", "")
+	chdirToRepoRoot(t)
+
+	err := StatusWorkflows(t.Context(), "", false, true, "", "", "")
 	if err != nil {
 		t.Errorf("StatusWorkflows with empty repoOverride should not error: %v", err)
 	}
 
 	// Test with a non-empty repo override (will fail gracefully if repo doesn't exist)
 	// We expect this to either succeed or fail gracefully without panicking
-	_ = StatusWorkflows("", false, true, "", "", "nonexistent/repo")
+	_ = StatusWorkflows(t.Context(), "", false, true, "", "", "nonexistent/repo")
 	// Note: We don't check error here because it's expected to fail for a nonexistent repo
 	// The important part is that the parameter is accepted and used
 }

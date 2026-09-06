@@ -11,11 +11,9 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 
 tools:
   cli-proxy: true
@@ -36,6 +34,9 @@ imports:
 
 
   - shared/otlp.md
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Repository Tree Map Generator

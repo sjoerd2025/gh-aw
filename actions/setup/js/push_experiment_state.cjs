@@ -16,7 +16,7 @@
  *   GH_AW_STATE_LABEL           - Human-readable label used in logs/messages
  *
  * Backward-compatible experiment aliases:
- *   GH_AW_EXPERIMENT_STATE_DIR  - Directory containing state.json / assignments.json
+ *   GH_AW_EXPERIMENT_STATE_DIR  - Directory containing state.jsonl/state.json and assignments.json
  *   GH_AW_EXPERIMENT_BRANCH     - Target git branch for experiment state
  *   GH_TOKEN / GITHUB_TOKEN     - GitHub token for API access and git operations
  *   GITHUB_RUN_ID               - Run ID used in commit messages
@@ -28,31 +28,344 @@ const fs = require("fs");
 const path = require("path");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { execGitSync, getGitAuthEnv } = require("./git_helpers.cjs");
+const { getGitAuthEnv } = require("./git_auth_helpers.cjs");
+const { execGitSync, withGitRetry } = require("./git_helpers.cjs");
 const { pushSignedCommits } = require("./push_signed_commits.cjs");
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function stableJSONStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJSONStringify).join(",")}]`;
+  }
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${stableJSONStringify(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Maximum number of run-ledger records to retain per state.jsonl file. Keeps the file well under the load limit. */
+const MAX_LEDGER_RECORDS = 512;
+
+function sortRunsByTimestamp(runs) {
+  return runs.slice().sort((a, b) => {
+    const ta = isPlainObject(a) && typeof a.timestamp === "string" ? a.timestamp : "";
+    const tb = isPlainObject(b) && typeof b.timestamp === "string" ? b.timestamp : "";
+    if (ta < tb) return -1;
+    if (ta > tb) return 1;
+    const ra = isPlainObject(a) && typeof a.run_id === "string" ? a.run_id : "";
+    const rb = isPlainObject(b) && typeof b.run_id === "string" ? b.run_id : "";
+    return ra < rb ? -1 : ra > rb ? 1 : 0;
+  });
+}
+
+function mergeExperimentRuns(remoteRuns, localRuns) {
+  const merged = [];
+  const seen = new Set();
+  for (const run of [...remoteRuns, ...localRuns]) {
+    const key =
+      isPlainObject(run) && typeof run.run_id === "string" && typeof run.timestamp === "string" && isPlainObject(run.assignments)
+        ? `${run.run_id}\u0000${run.timestamp}\u0000${stableJSONStringify(run.assignments)}`
+        : stableJSONStringify(run);
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(run);
+    }
+  }
+  return sortRunsByTimestamp(merged);
+}
+
+function mergeExperimentStateValue(baseValue, remoteValue, localValue) {
+  if (Number.isFinite(baseValue) && Number.isFinite(remoteValue) && Number.isFinite(localValue)) {
+    return remoteValue + localValue - baseValue;
+  }
+  if (stableJSONStringify(baseValue) === stableJSONStringify(remoteValue)) {
+    return localValue;
+  }
+  if (stableJSONStringify(baseValue) === stableJSONStringify(localValue)) {
+    return remoteValue;
+  }
+  if (Array.isArray(remoteValue) && Array.isArray(localValue)) {
+    return mergeExperimentRuns(remoteValue, localValue);
+  }
+  if (isPlainObject(remoteValue) && isPlainObject(localValue)) {
+    const result = {};
+    for (const key of new Set([...Object.keys(baseValue || {}), ...Object.keys(remoteValue), ...Object.keys(localValue)])) {
+      result[key] = mergeExperimentStateValue(baseValue?.[key], remoteValue[key], localValue[key]);
+    }
+    return result;
+  }
+  if (stableJSONStringify(remoteValue) === stableJSONStringify(localValue)) {
+    return localValue;
+  }
+  return localValue;
+}
+
+function mergeExperimentStateJSON(baseState, remoteState, localState) {
+  if (!isPlainObject(baseState) || !isPlainObject(remoteState) || !isPlainObject(localState)) {
+    throw new Error("Experiment state merge requires JSON objects");
+  }
+  const merged = mergeExperimentStateValue(baseState, remoteState, localState);
+  if (!isPlainObject(merged) || !isPlainObject(merged.counts)) {
+    throw new Error("Merged experiment state is invalid");
+  }
+  if (merged.runs !== undefined && !Array.isArray(merged.runs)) {
+    throw new Error("Merged experiment state runs must be an array when present");
+  }
+  /** @type {Record<string, {current_stage: number}>} */
+  const continual = {};
+  for (const state of [baseState, remoteState, localState]) {
+    if (state.continual === undefined) continue;
+    if (!isPlainObject(state.continual)) {
+      throw new Error("Continual experiment state must be a plain object");
+    }
+    for (const [name, value] of Object.entries(state.continual)) {
+      if (!isPlainObject(value) || !Number.isInteger(value.current_stage) || value.current_stage < 0) {
+        throw new Error("Merged continual experiment stage must be a non-negative integer");
+      }
+      continual[name] = {
+        current_stage: Math.max(continual[name]?.current_stage ?? 0, value.current_stage),
+      };
+    }
+  }
+  if (Object.keys(continual).length > 0) {
+    merged.continual = continual;
+  }
+  return merged;
+}
+
+function mergeExperimentStateJSONL(remoteContent, localContent) {
+  const merged = [];
+  const seen = new Set();
+  for (const content of [remoteContent, localContent]) {
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      let entry;
+      try {
+        entry = JSON.parse(trimmed);
+      } catch {
+        // Skip lines that cannot be parsed as JSON. This makes the merge resilient
+        // to partial writes or corruption in either side of the conflict.
+        core.warning(`mergeExperimentStateJSONL: skipping unparseable line during conflict merge`);
+        continue;
+      }
+      const key = stableJSONStringify(entry);
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(entry);
+      }
+    }
+  }
+
+  // Sort entries chronologically so the ledger is always in timestamp order.
+  merged.sort((a, b) => {
+    const ta = isPlainObject(a) && typeof a.timestamp === "string" ? a.timestamp : "";
+    const tb = isPlainObject(b) && typeof b.timestamp === "string" ? b.timestamp : "";
+    if (ta < tb) return -1;
+    if (ta > tb) return 1;
+    const ra = isPlainObject(a) && typeof a.run_id === "string" ? a.run_id : "";
+    const rb = isPlainObject(b) && typeof b.run_id === "string" ? b.run_id : "";
+    return ra < rb ? -1 : ra > rb ? 1 : 0;
+  });
+
+  // Compact the ledger to avoid exceeding the loader file-size limit.
+  // Counts from pruned records are folded into the first remaining entry's baseline_counts
+  // so cumulative totals are preserved across compaction boundaries.
+  if (merged.length > MAX_LEDGER_RECORDS) {
+    const pruned = merged.splice(0, merged.length - MAX_LEDGER_RECORDS);
+    if (merged.length > 0) {
+      /** @type {Record<string, Record<string, number>>} */
+      const baseline = {};
+      for (const entry of pruned) {
+        if (!isPlainObject(entry)) continue;
+        if (isPlainObject(entry.baseline_counts)) {
+          for (const [name, variants] of Object.entries(entry.baseline_counts)) {
+            if (!baseline[name]) baseline[name] = {};
+            for (const [variant, count] of Object.entries(/** @type {Record<string,unknown>} */ variants)) {
+              baseline[name][variant] = (baseline[name][variant] || 0) + (typeof count === "number" ? count : 0);
+            }
+          }
+        }
+        if (isPlainObject(entry.assignments)) {
+          for (const [name, variant] of Object.entries(entry.assignments)) {
+            if (typeof variant !== "string") continue;
+            if (!baseline[name]) baseline[name] = {};
+            baseline[name][variant] = (baseline[name][variant] || 0) + 1;
+          }
+        }
+      }
+      if (Object.keys(baseline).length > 0) {
+        const first = merged[0];
+        const existing = isPlainObject(first) && isPlainObject(first.baseline_counts) ? first.baseline_counts : {};
+        /** @type {Record<string, Record<string, number>>} */
+        const mergedBaseline = Object.assign({}, /** @type {Record<string, Record<string, number>>} */ existing);
+        for (const [name, variants] of Object.entries(baseline)) {
+          if (!mergedBaseline[name]) mergedBaseline[name] = {};
+          for (const [variant, count] of Object.entries(variants)) {
+            mergedBaseline[name][variant] = (mergedBaseline[name][variant] || 0) + count;
+          }
+        }
+        merged[0] = Object.assign({}, first, { baseline_counts: mergedBaseline });
+      }
+    }
+  }
+
+  return merged.length > 0 ? `${merged.map(entry => JSON.stringify(entry)).join("\n")}\n` : "";
+}
+
+function mergeAppendOnlyJSONL(remoteContent, localContent) {
+  const merged = [];
+  const seen = new Set();
+  for (const content of [remoteContent, localContent]) {
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      let outputLine;
+      let key;
+      try {
+        const entry = JSON.parse(trimmed);
+        outputLine = JSON.stringify(entry);
+        key = `json:${stableJSONStringify(entry)}`;
+      } catch {
+        core.warning(`mergeAppendOnlyJSONL: preserving unparseable line during merge`);
+        outputLine = trimmed;
+        key = `raw:${trimmed}`;
+      }
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(outputLine);
+      }
+    }
+  }
+  return merged.length > 0 ? `${merged.join("\n")}\n` : "";
+}
+
+function readGitStageFile(workspaceDir, stage, filePath) {
+  return execGitSync(["show", `:${stage}:${filePath}`], {
+    cwd: workspaceDir,
+    stdio: "pipe",
+    suppressLogs: true,
+  });
+}
+
+function resolveExperimentStateRebaseConflict({ cwd }) {
+  const conflictedFiles = execGitSync(["diff", "--name-only", "--diff-filter=U"], {
+    cwd,
+    stdio: "pipe",
+    suppressLogs: true,
+  })
+    .trim()
+    .split("\n")
+    .map(file => file.trim())
+    .filter(Boolean);
+
+  const appendFiles = new Set(
+    (process.env.GH_AW_STATE_FILES || "")
+      .split(",")
+      .map(name => name.trim())
+      .filter(name => Boolean(name) && name.endsWith(".jsonl") && name !== "state.jsonl")
+  );
+  const hasMergeableConflict = conflictedFiles.some(file => file === "state.json" || file === "state.jsonl" || appendFiles.has(file));
+  if (conflictedFiles.length === 0 || !hasMergeableConflict) {
+    return false;
+  }
+
+  const allowedConflicts = new Set(["state.json", "state.jsonl", "assignments.json", ...appendFiles]);
+  for (const file of conflictedFiles) {
+    if (!allowedConflicts.has(file)) {
+      return false;
+    }
+  }
+
+  if (conflictedFiles.includes("state.json")) {
+    try {
+      const baseState = JSON.parse(readGitStageFile(cwd, 1, "state.json"));
+      const remoteState = JSON.parse(readGitStageFile(cwd, 2, "state.json"));
+      const localState = JSON.parse(readGitStageFile(cwd, 3, "state.json"));
+      const mergedState = mergeExperimentStateJSON(baseState, remoteState, localState);
+      fs.writeFileSync(path.join(cwd, "state.json"), JSON.stringify(mergedState, null, 2) + "\n", "utf8");
+    } catch (err) {
+      throw new Error(`Failed to resolve state.json rebase conflict: ${getErrorMessage(err)}`, { cause: err });
+    }
+  }
+
+  if (conflictedFiles.includes("state.jsonl")) {
+    try {
+      const remoteState = readGitStageFile(cwd, 2, "state.jsonl");
+      const localState = readGitStageFile(cwd, 3, "state.jsonl");
+      const mergedState = mergeExperimentStateJSONL(remoteState, localState);
+      fs.writeFileSync(path.join(cwd, "state.jsonl"), mergedState, "utf8");
+    } catch (err) {
+      throw new Error(`Failed to resolve state.jsonl rebase conflict: ${getErrorMessage(err)}`, { cause: err });
+    }
+  }
+
+  for (const file of conflictedFiles.filter(name => appendFiles.has(name))) {
+    try {
+      const remoteState = readGitStageFile(cwd, 2, file);
+      const localState = readGitStageFile(cwd, 3, file);
+      fs.writeFileSync(path.join(cwd, file), mergeAppendOnlyJSONL(remoteState, localState), "utf8");
+    } catch (err) {
+      throw new Error(`Failed to resolve ${file} rebase conflict: ${getErrorMessage(err)}`, { cause: err });
+    }
+  }
+
+  if (conflictedFiles.includes("assignments.json")) {
+    try {
+      const localAssignments = readGitStageFile(cwd, 3, "assignments.json");
+      fs.writeFileSync(path.join(cwd, "assignments.json"), localAssignments, "utf8");
+    } catch (err) {
+      throw new Error(`Failed to resolve assignments.json rebase conflict: ${getErrorMessage(err)}`, { cause: err });
+    }
+  }
+
+  execGitSync(["add", "--", ...conflictedFiles], { stdio: "inherit", cwd });
+  return true;
+}
 
 /**
  * Checkout or create an orphan git branch for experiment state.
  * Returns the remote HEAD SHA (empty string for a new branch).
  *
+ * Only the network `git fetch` is retried (via withGitRetry), and only for
+ * transient transport failures. Everything after it — the local checkout, the
+ * missing-ref classification, and the non-idempotent orphan-branch path
+ * (`checkout --orphan`, `read-tree --empty`, working-tree cleanup) — runs
+ * exactly once, so a partial failure can never be replayed against a
+ * half-mutated workspace.
+ *
  * @param {string} branchName - Target branch name (e.g. "experiments/myworkflow")
  * @param {string} repoUrl    - Authenticated HTTPS URL of the target repo
  * @param {string} workspaceDir - Local git workspace directory
- * @returns {string} baseRef (empty string when branch is brand new)
+ * @param {{maxRetries?: number, baseDelayMs?: number, fetchFn?: () => void}} [options]
+ * @returns {Promise<string>} baseRef (empty string when branch is brand new)
  */
-function checkoutOrCreateBranch(branchName, repoUrl, workspaceDir) {
+async function checkoutOrCreateBranch(branchName, repoUrl, workspaceDir, options = {}) {
+  const { maxRetries, baseDelayMs, fetchFn = () => execGitSync(["fetch", repoUrl, `${branchName}:${branchName}`], { stdio: "pipe", cwd: workspaceDir, suppressLogs: true }) } = options;
+
   try {
-    execGitSync(["fetch", repoUrl, `${branchName}:${branchName}`], { stdio: "pipe", cwd: workspaceDir, suppressLogs: true });
-    execGitSync(["checkout", branchName], { stdio: "inherit", cwd: workspaceDir });
-    const baseRef = execGitSync(["rev-parse", "HEAD"], { cwd: workspaceDir }).trim();
-    core.info(`Checked out existing branch ${branchName}, baseRef=${baseRef}`);
-    return baseRef;
+    await withGitRetry(fetchFn, {
+      maxRetries,
+      baseDelayMs,
+      operationName: `Fetch of branch "${branchName}"`,
+    });
   } catch (fetchErr) {
     const msg = getErrorMessage(fetchErr);
     const isMissing = /couldn't find remote ref/i.test(msg) || /remote branch .* not found/i.test(msg);
     if (!isMissing) throw fetchErr;
 
-    // Branch does not exist yet – create an orphan branch.
+    // Branch does not exist yet – create an orphan branch. This path performs
+    // non-idempotent local mutations and is deliberately never retried.
     core.info(`Branch ${branchName} does not exist, creating orphan branch...`);
     execGitSync(["checkout", "--orphan", branchName], { stdio: "inherit", cwd: workspaceDir });
     execGitSync(["read-tree", "--empty"], { stdio: "pipe", cwd: workspaceDir });
@@ -65,11 +378,20 @@ function checkoutOrCreateBranch(branchName, repoUrl, workspaceDir) {
     }
     for (const entry of entries) {
       if (entry !== ".git") {
-        fs.rmSync(path.join(workspaceDir, entry), { recursive: true, force: true });
+        try {
+          fs.rmSync(path.join(workspaceDir, entry), { recursive: true, force: true });
+        } catch (err) {
+          throw new Error(`Failed to remove workspace entry ${entry}: ${getErrorMessage(err)}`, { cause: err });
+        }
       }
     }
     return "";
   }
+
+  execGitSync(["checkout", branchName], { stdio: "inherit", cwd: workspaceDir });
+  const baseRef = execGitSync(["rev-parse", "HEAD"], { cwd: workspaceDir }).trim();
+  core.info(`Checked out existing branch ${branchName}, baseRef=${baseRef}`);
+  return baseRef;
 }
 
 /**
@@ -79,11 +401,12 @@ async function main() {
   const stateDir = process.env.GH_AW_STATE_DIR || process.env.GH_AW_EXPERIMENT_STATE_DIR || "/tmp/gh-aw/experiments";
   const branchName = process.env.GH_AW_STATE_BRANCH || process.env.GH_AW_EXPERIMENT_BRANCH || "";
   const stateLabel = process.env.GH_AW_STATE_LABEL || "experiment state";
-  const filesEnv = process.env.GH_AW_STATE_FILES || "state.json,assignments.json";
+  const filesEnv = process.env.GH_AW_STATE_FILES || "state.jsonl,state.json,assignments.json";
   const candidateFiles = filesEnv
     .split(",")
     .map(name => name.trim())
     .filter(Boolean);
+  const appendFiles = new Set(candidateFiles.filter(name => name.endsWith(".jsonl") && name !== "state.jsonl"));
   const ghToken = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
   const githubRunId = process.env.GITHUB_RUN_ID || "unknown";
   const githubServerUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/$/, "");
@@ -151,11 +474,14 @@ async function main() {
   const repoUrl = `https://x-access-token:${ghToken}@${serverHost}/${targetRepo}.git`;
 
   // Checkout the target branch (or create it as an orphan on first run).
+  // Retries with exponential backoff since the initial `git fetch` can hit
+  // transient network failures (e.g. HTTP 502s or timeouts against the git
+  // remote) that are unrelated to genuine push conflicts.
   let baseRef;
   try {
-    baseRef = checkoutOrCreateBranch(branchName, repoUrl, workspaceDir);
+    baseRef = await checkoutOrCreateBranch(branchName, repoUrl, workspaceDir);
   } catch (err) {
-    core.setFailed(`Failed to checkout branch "${branchName}": ${getErrorMessage(err)}`);
+    core.setFailed(`Failed to checkout branch "${branchName}" after retries: ${getErrorMessage(err)}`);
     return;
   }
 
@@ -164,7 +490,13 @@ async function main() {
     const src = path.join(stateDir, name);
     const dest = path.join(workspaceDir, name);
     try {
-      fs.copyFileSync(src, dest);
+      if (appendFiles.has(name) && fs.existsSync(dest)) {
+        const existingContent = fs.readFileSync(dest, "utf8");
+        const newContent = fs.readFileSync(src, "utf8");
+        fs.writeFileSync(dest, mergeAppendOnlyJSONL(existingContent, newContent), "utf8");
+      } else {
+        fs.copyFileSync(src, dest);
+      }
       core.info(`Copied ${name}`);
     } catch (err) {
       core.setFailed(`Failed to copy ${name}: ${getErrorMessage(err)}`);
@@ -214,6 +546,7 @@ async function main() {
         baseRef: currentBaseRef,
         cwd: workspaceDir,
         gitAuthEnv: getGitAuthEnv(ghToken),
+        resolveRebaseConflict: resolveExperimentStateRebaseConflict,
       });
       core.info(`Successfully pushed ${stateLabel} to ${branchName}`);
       return;
@@ -241,7 +574,7 @@ async function main() {
             }
           }
         } catch {
-          // ls-remote failed; keep existing baseRef
+          // ls-remote failed — ignored, keep existing baseRef.
         }
       } else {
         core.setFailed(`Failed to push ${stateLabel} after ${MAX_RETRIES + 1} attempts: ${errMsg}`);
@@ -251,4 +584,12 @@ async function main() {
   }
 }
 
-module.exports = { main, checkoutOrCreateBranch };
+module.exports = {
+  main,
+  checkoutOrCreateBranch,
+  mergeExperimentStateJSON,
+  mergeExperimentStateJSONL,
+  mergeAppendOnlyJSONL,
+  mergeExperimentRuns,
+  resolveExperimentStateRebaseConflict,
+};

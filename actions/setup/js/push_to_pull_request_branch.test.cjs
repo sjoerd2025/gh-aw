@@ -5,6 +5,7 @@ import * as os from "os";
 
 const { getPatchPathForBranch, getPatchPathForBranchInRepo } = require("./git_patch_utils.cjs");
 const { getBundlePathForBranch, getBundlePathForBranchInRepo } = require("./generate_git_bundle.cjs");
+const promptsSourceDir = path.resolve(__dirname, "../md");
 
 // The privileged handler derives patch/bundle paths from `branch` (and `repo`)
 // via resolveTransportPaths, so tests must write transport files at the
@@ -38,6 +39,7 @@ function cleanupCanonicalTransports() {
 
 beforeEach(() => {
   cleanupCanonicalTransports();
+  process.env.GH_AW_PROMPTS_DIR = promptsSourceDir;
 });
 afterEach(() => {
   cleanupCanonicalTransports();
@@ -253,12 +255,63 @@ describe("push_to_pull_request_branch.cjs", () => {
     return module;
   }
 
+  async function runFallbackPullRequestScenario(branch, detectionReason = "unknown") {
+    createPatchFile(branch);
+    process.env.GH_AW_DETECTION_REASON = detectionReason;
+
+    mockExec.exec.mockResolvedValueOnce(0); // fetch
+    mockExec.exec.mockResolvedValueOnce(0); // rev-parse
+    mockExec.exec.mockResolvedValueOnce(0); // checkout
+
+    mockExec.getExecOutput.mockResolvedValueOnce({ exitCode: 0, stdout: "before-sha\n", stderr: "" }); // git rev-parse HEAD (before patch)
+
+    mockExec.exec.mockResolvedValueOnce(0); // git am
+
+    const originalGetExecOutput = mockExec.getExecOutput;
+    mockExec.getExecOutput = vi.fn().mockImplementation(async (cmd, args) => {
+      const argList = Array.isArray(args) ? args : [];
+      if (argList[0] === "rev-parse" && argList[1] === "origin/feature-branch^{commit}") {
+        return { exitCode: 0, stdout: "1111111111111111111111111111111111111111\n", stderr: "" };
+      }
+      if (argList[0] === "rev-list" && argList[1] === "--merges") {
+        return { exitCode: 0, stdout: "0\n", stderr: "" };
+      }
+      if (argList[0] === "rev-list" && argList[1] === "--parents") {
+        return {
+          exitCode: 0,
+          stdout: "2222222222222222222222222222222222222222 1111111111111111111111111111111111111111\n",
+          stderr: "",
+        };
+      }
+      if (argList[0] === "ls-remote" && argList[2] === "refs/heads/feature-branch") {
+        return { exitCode: 0, stdout: "1111111111111111111111111111111111111111\trefs/heads/feature-branch\n", stderr: "" };
+      }
+      if (argList[0] === "log") {
+        if (argList.includes(".github/workflows/")) {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "Test commit\n", stderr: "" };
+      }
+      if (argList[0] === "diff-tree") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return originalGetExecOutput(cmd, args);
+    });
+
+    mockGithub.graphql.mockRejectedValueOnce(new Error("GraphQL error: branch protection"));
+    mockExec.exec.mockRejectedValueOnce(new Error("! [rejected] feature-branch -> feature-branch (non-fast-forward)"));
+
+    const module = await loadModule();
+    const handler = await module.main({});
+    return handler({ branch }, {});
+  }
+
   /**
    * Helper to create a valid patch file at the canonical path derived from the
    * message branch. The privileged handler always re-derives the patch path
    * from the validated branch, so tests must write at that canonical location.
    */
-  function createPatchFile(branch, content = null) {
+  function createPatchFile(branch, content = null, baseCommit = "") {
     const patchPath = canonicalPatchPath(branch);
     const defaultPatch = `From abc123 Mon Sep 17 00:00:00 2001
 From: Test Author <test@example.com>
@@ -277,7 +330,12 @@ index 0000000..abc1234
 --
 2.34.1
 `;
-    fs.writeFileSync(patchPath, content !== null ? content : defaultPatch);
+    let patchContent = content !== null ? content : defaultPatch;
+    if (baseCommit) {
+      const firstNewline = patchContent.indexOf("\n");
+      patchContent = `${patchContent.slice(0, firstNewline + 1)}X-GH-AW-Base-Commit: ${baseCommit}\n${patchContent.slice(firstNewline + 1)}`;
+    }
+    fs.writeFileSync(patchPath, patchContent);
     return patchPath;
   }
 
@@ -546,11 +604,15 @@ index 0000000..abc1234
 
       const patchPath = createPatchFile("should-detect-fork-pr-via-different-repository-names-and-fai");
 
+      global.getOctokit = vi.fn().mockReturnValue(mockGithub);
       const module = await loadModule();
-      const handler = await module.main({ target: "triggering" });
+      const handler = await module.main({
+        target: "triggering",
+        "github-token": "pat-that-may-have-fork-access",
+      });
       const result = await handler({ branch: "should-detect-fork-pr-via-different-repository-names-and-fai" }, {});
 
-      // Fork PRs should fail early with a clear error
+      // A PAT does not bypass the explicit head-repo destination policy.
       expect(result.success).toBe(false);
       expect(result.error).toContain("fork");
       expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Cannot push to fork PR"));
@@ -852,9 +914,9 @@ index 0000000..abc1234
       expect(result.after_state).toEqual({ head_sha: "abc123" });
     });
 
-    it("should reset to message.base_commit before applying patch transport", async () => {
-      const patchPath = createPatchFile("should-reset-to-message-base-commit-before-applying-patch-tr");
+    it("should reset to the patch-embedded base commit before applying patch transport", async () => {
       const recordedBaseCommit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+      const patchPath = createPatchFile("should-reset-to-message-base-commit-before-applying-patch-tr", null, recordedBaseCommit);
       mockExec.getExecOutput.mockResolvedValue({ exitCode: 0, stdout: "abc123\n", stderr: "" });
       const pushSignedCommitsModule = require("./push_signed_commits.cjs");
       const pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue("abc123");
@@ -862,7 +924,7 @@ index 0000000..abc1234
       try {
         const module = await loadModule();
         const handler = await module.main({});
-        const result = await handler({ base_commit: recordedBaseCommit, branch: "should-reset-to-message-base-commit-before-applying-patch-tr" }, {});
+        const result = await handler({ branch: "should-reset-to-message-base-commit-before-applying-patch-tr" }, {});
 
         expect(result.success).toBe(true);
         expect(mockExec.exec).toHaveBeenCalledWith("git", ["cat-file", "-e", recordedBaseCommit], expect.any(Object));
@@ -873,9 +935,9 @@ index 0000000..abc1234
       }
     });
 
-    it("should fall back to current HEAD when base_commit is unavailable for patch transport", async () => {
-      const patchPath = createPatchFile("should-fall-back-to-current-head-when-base-commit-is-unavail");
+    it("should fall back to current HEAD when the patch-embedded base commit is unavailable", async () => {
       const recordedBaseCommit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+      const patchPath = createPatchFile("should-fall-back-to-current-head-when-base-commit-is-unavail", null, recordedBaseCommit);
       mockExec.getExecOutput.mockResolvedValue({ exitCode: 0, stdout: "abc123\n", stderr: "" });
       mockExec.exec.mockImplementation(async (cmd, args) => {
         if (cmd === "git" && Array.isArray(args) && args[0] === "cat-file" && args[1] === "-e" && args[2] === recordedBaseCommit) {
@@ -890,7 +952,7 @@ index 0000000..abc1234
       try {
         const module = await loadModule();
         const handler = await module.main({});
-        const result = await handler({ base_commit: recordedBaseCommit, branch: "should-fall-back-to-current-head-when-base-commit-is-unavail" }, {});
+        const result = await handler({ branch: "should-fall-back-to-current-head-when-base-commit-is-unavail" }, {});
 
         expect(result.success).toBe(true);
         expect(mockExec.exec).not.toHaveBeenCalledWith("git", ["reset", "--hard", recordedBaseCommit], expect.any(Object));
@@ -900,7 +962,7 @@ index 0000000..abc1234
       }
     });
 
-    it("should ignore invalid message.base_commit for patch transport", async () => {
+    it("should ignore agent-supplied base_commit for patch transport", async () => {
       const patchPath = createPatchFile("should-ignore-invalid-message-base-commit-for-patch-transpor");
       mockExec.getExecOutput.mockResolvedValue({ exitCode: 0, stdout: "abc123\n", stderr: "" });
 
@@ -911,7 +973,7 @@ index 0000000..abc1234
       expect(result.success).toBe(true);
       expect(mockExec.exec).not.toHaveBeenCalledWith("git", ["cat-file", "-e", "not-a-sha --bad"], expect.any(Object));
       expect(mockExec.exec).not.toHaveBeenCalledWith("git", ["reset", "--hard", "not-a-sha --bad"], expect.any(Object));
-      expect(mockCore.warning).toHaveBeenCalledWith("Ignoring invalid base_commit value for patch apply: not-a-sha --bad");
+      expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining("base_commit"));
     });
 
     it("should use pushed commit SHA returned by pushSignedCommits for activation comment commit link", async () => {
@@ -1171,59 +1233,7 @@ index 0000000..abc1234
     });
 
     it("should create fallback pull request on non-fast-forward push rejection by default", async () => {
-      const patchPath = createPatchFile("should-create-fallback-pull-request-on-non-fast-forward-push");
-
-      // Set up successful operations until push
-      mockExec.exec.mockResolvedValueOnce(0); // fetch
-      mockExec.exec.mockResolvedValueOnce(0); // rev-parse
-      mockExec.exec.mockResolvedValueOnce(0); // checkout
-
-      mockExec.getExecOutput.mockResolvedValueOnce({ exitCode: 0, stdout: "before-sha\n", stderr: "" }); // git rev-parse HEAD (before patch)
-
-      mockExec.exec.mockResolvedValueOnce(0); // git am
-
-      const originalGetExecOutput = mockExec.getExecOutput;
-      mockExec.getExecOutput = vi.fn().mockImplementation(async (cmd, args) => {
-        const argList = Array.isArray(args) ? args : [];
-        if (argList[0] === "rev-parse" && argList[1] === "origin/feature-branch^{commit}") {
-          return { exitCode: 0, stdout: "1111111111111111111111111111111111111111\n", stderr: "" };
-        }
-        if (argList[0] === "rev-list" && argList[1] === "--merges") {
-          return { exitCode: 0, stdout: "0\n", stderr: "" };
-        }
-        if (argList[0] === "rev-list" && argList[1] === "--parents") {
-          return {
-            exitCode: 0,
-            stdout: "2222222222222222222222222222222222222222 1111111111111111111111111111111111111111\n",
-            stderr: "",
-          };
-        }
-        if (argList[0] === "ls-remote" && argList[2] === "refs/heads/feature-branch") {
-          return { exitCode: 0, stdout: "1111111111111111111111111111111111111111\trefs/heads/feature-branch\n", stderr: "" };
-        }
-        if (argList[0] === "log") {
-          // Pre-flight workflow check targets .github/workflows/; return empty to avoid
-          // short-circuiting the fallback path with a workflows_scope_required error.
-          if (argList.includes(".github/workflows/")) {
-            return { exitCode: 0, stdout: "", stderr: "" };
-          }
-          return { exitCode: 0, stdout: "Test commit\n", stderr: "" };
-        }
-        if (argList[0] === "diff-tree") {
-          return { exitCode: 0, stdout: "", stderr: "" };
-        }
-        return originalGetExecOutput(cmd, args);
-      });
-
-      // GraphQL call fails, triggering fallback to git push
-      mockGithub.graphql.mockRejectedValueOnce(new Error("GraphQL error: branch protection"));
-
-      // Fallback git push also fails with non-fast-forward
-      mockExec.exec.mockRejectedValueOnce(new Error("! [rejected] feature-branch -> feature-branch (non-fast-forward)"));
-
-      const module = await loadModule();
-      const handler = await module.main({});
-      const result = await handler({ branch: "should-create-fallback-pull-request-on-non-fast-forward-push" }, {});
+      const result = await runFallbackPullRequestScenario("should-create-fallback-pull-request-on-non-fast-forward-push");
 
       expect(result.success).toBe(true);
       expect(result.fallback_used).toBe(true);
@@ -1464,6 +1474,27 @@ index 0000000..abc1234
 
     afterEach(() => {
       mockExec.getExecOutput = savedGetExecOutput;
+    });
+
+    it.each([
+      ["agent_failure", "> [!WARNING]", "> threat detection engine error", "<!-- gh-aw-threat-engine-error -->", "<!-- gh-aw-threat-detected -->"],
+      ["threat_detected", "> [!CAUTION]", "> agentic threat detected", "<!-- gh-aw-threat-detected -->", "<!-- gh-aw-threat-engine-error -->"],
+    ])("should create a review PR body for %s with the correct admonition and marker", async (reason, admonition, title, expectedMarker, unexpectedMarker) => {
+      process.env.GH_AW_DETECTION_CONCLUSION = "warning";
+      process.env.GH_AW_DETECTION_REASON = reason;
+      mockContext.runId = 12345;
+      createPatchFile(`review-branch-body-${reason}`);
+
+      const module = await loadModule();
+      const handler = await module.main({});
+      const result = await handler({ branch: `review-branch-body-${reason}` }, {});
+
+      expect(result.success).toBe(true);
+      const [params] = mockGithub.rest.pulls.create.mock.calls.at(-1);
+      expect(params.body).toContain(admonition);
+      expect(params.body).toContain(title);
+      expect(params.body).toContain(expectedMarker);
+      expect(params.body).not.toContain(unexpectedMarker);
     });
 
     it("should skip non-fatally when review branch is rejected for workflows scope (timeout variant, agent has none)", async () => {
@@ -2039,11 +2070,7 @@ index 0000000..abc1234
       expect(mockCore.info).toHaveBeenCalledWith("Patch size validation passed");
     });
 
-    it("should prefer message.diff_size (incremental net diff) over patch file size", async () => {
-      // Simulate the long-running branch case: a large format-patch file
-      // (e.g. 2 MB of cumulative commit metadata + per-commit diffs) but a
-      // tiny incremental net diff (e.g. 5 KB of actual changes since
-      // origin/<branch>). The size check must use diff_size and accept the push.
+    it("should ignore message.diff_size and enforce the patch file size", async () => {
       const largePatch = "x".repeat(2 * 1024 * 1024); // 2 MB format-patch file
       const patchPath = createPatchFile("should-prefer-message-diff-size-incremental-net-diff-over-pa", largePatch);
 
@@ -2053,25 +2080,19 @@ index 0000000..abc1234
       const handler = await module.main({ max_patch_size: 1024 }); // 1 MB max
       const result = await handler({ diff_size: 5 * 1024, branch: "should-prefer-message-diff-size-incremental-net-diff-over-pa" }, {});
 
-      expect(result.success).toBe(true);
-      expect(mockCore.info).toHaveBeenCalledWith("Patch size validation passed");
-      // Verify the size check used the incremental (diff_size) value, not the
-      // 2 MB file size.
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Incremental diff size: 5 KB"));
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Patch size");
     });
 
-    it("should reject when message.diff_size exceeds max size even if file size is small", async () => {
-      // Inverse case: small file (defensive — shouldn't happen in practice)
-      // but a recorded large diff_size should still cause rejection. This
-      // proves diff_size is the source of truth for the size check.
+    it("should ignore an oversized message.diff_size when the patch is within limits", async () => {
       const patchPath = createPatchFile("should-reject-when-message-diff-size-exceeds-max-size-even-i"); // small valid patch
 
       const module = await loadModule();
       const handler = await module.main({ max_patch_size: 1024 }); // 1 MB max
       const result = await handler({ diff_size: 2 * 1024 * 1024, branch: "should-reject-when-message-diff-size-exceeds-max-size-even-i" }, {});
 
-      expect(result.success).toBe(false);
-      expect(result.error).toContain("exceeds maximum");
+      expect(result.success).toBe(true);
+      expect(mockCore.info).toHaveBeenCalledWith("Patch size validation passed");
     });
 
     it("should fall back to patch file size when message.diff_size is not provided", async () => {
@@ -2089,9 +2110,7 @@ index 0000000..abc1234
       expect(result.error).toContain("exceeds maximum");
     });
 
-    it("should enforce max_patch_size against bundle size when bundle transport is used", async () => {
-      // Bundle transport still includes a patch for policy checks, but the size
-      // guard falls back to bundle size when diff_size is not provided.
+    it("should enforce max_patch_size against the uncompressed patch for bundle transport", async () => {
       const bundlePath = canonicalBundlePath("should-enforce-max-patch-size-against-bundle-size-when-bundl");
       const patchPath = createPatchFile("should-enforce-max-patch-size-against-bundle-size-when-bundl", "small patch content");
       // 2 MB dummy bundle file (contents don't matter; only size is checked)
@@ -2101,15 +2120,11 @@ index 0000000..abc1234
       const handler = await module.main({ max_patch_size: 1024 }); // 1 MB max
       const result = await handler({ branch: "should-enforce-max-patch-size-against-bundle-size-when-bundl" }, {});
 
-      expect(result.success).toBe(false);
-      expect(result.error).toContain("exceeds maximum");
-      expect(result.error).toMatch(/Bundle size|Incremental diff size/);
+      expect(result.success).toBe(true);
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Patch size: 1 KB"));
     });
 
-    it("should prefer diff_size over bundle file size for the limit check", async () => {
-      // Bundle is 2 MB on disk, but the incremental net diff is only 5 KB:
-      // the check must accept the push (limit reflects the real change, not the
-      // compressed transport size).
+    it("should ignore diff_size for bundle size checks", async () => {
       const bundlePath = canonicalBundlePath("should-prefer-diff-size-over-bundle-file-size-for-the-limit-");
       const patchPath = createPatchFile("should-prefer-diff-size-over-bundle-file-size-for-the-limit-", "small patch content");
       fs.writeFileSync(bundlePath, Buffer.alloc(2 * 1024 * 1024));
@@ -2122,7 +2137,32 @@ index 0000000..abc1234
 
       expect(result.success).toBe(true);
       expect(mockCore.info).toHaveBeenCalledWith("Patch size validation passed");
-      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Incremental diff size: 5 KB"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Patch size: 1 KB"));
+    });
+
+    it("should enforce max_patch_size against expanded post-apply content", async () => {
+      const branch = "should-reject-expanded-post-apply-content";
+      const patchPath = createPatchFile(branch, "small git binary patch");
+      const changedFilePath = path.join(process.cwd(), "test.txt");
+      fs.writeFileSync(changedFilePath, Buffer.alloc(2 * 1024 * 1024));
+      mockExec.getExecOutput.mockImplementation(async (cmd, args) => {
+        const argList = Array.isArray(args) ? args : [];
+        if (cmd === "git" && argList[0] === "diff" && argList[1] === "--name-only") {
+          return { exitCode: 0, stdout: "test.txt\0", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "abc123\n", stderr: "" };
+      });
+
+      try {
+        const module = await loadModule();
+        const handler = await module.main({ max_patch_size: 1024 }); // 1 MB max
+        const result = await handler({ branch }, {});
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Changed content size");
+      } finally {
+        fs.rmSync(changedFilePath, { force: true });
+      }
     });
   });
 
@@ -2237,7 +2277,7 @@ index 0000000..abc1234
             return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
           }
           if (cmd === "git" && args[0] === "diff" && args[1] === "--name-only" && args[2] === "--no-renames") {
-            return Promise.resolve({ exitCode: 0, stdout: `${actualFiles.join("\n")}\n`, stderr: "" });
+            return Promise.resolve({ exitCode: 0, stdout: `${actualFiles.join("\0")}\0`, stderr: "" });
           }
           if (cmd === "git" && args[0] === "rev-list") {
             return Promise.resolve({ exitCode: 0, stdout: "2\n", stderr: "" });
@@ -2253,8 +2293,8 @@ index 0000000..abc1234
         expect(mockCore.info).toHaveBeenCalledWith("Pre-apply bundle verification: 4 file(s) detected from bundle transport");
 
         const diffCalls = mockExec.getExecOutput.mock.calls.filter(([, args]) => Array.isArray(args) && args[0] === "diff" && args[1] === "--name-only" && args[2] === "--no-renames");
-        expect(diffCalls.map(([, args]) => args[3])).toContain("remote-head..refs/bundles/push-feature-branch");
-        expect(diffCalls.map(([, args]) => args[3])).toContain("remote-head..HEAD");
+        expect(diffCalls.map(([, args]) => args[4])).toContain("remote-head..refs/bundles/push-feature-branch");
+        expect(diffCalls.map(([, args]) => args[4])).toContain("remote-head..HEAD");
       } finally {
         pushSignedSpy.mockRestore();
       }
@@ -2301,6 +2341,192 @@ index 0000000..abc1234
         expect(bundleFetchCall[1][2]).toMatch(/^refs\/heads\/feature-branch:/);
         expect(bundleFetchCall[1][2]).not.toContain(";");
         expect(bundleFetchCall[1][2]).not.toContain("rm");
+      } finally {
+        pushSignedSpy.mockRestore();
+      }
+    });
+
+    it("should fetch a HEAD-only filtered bundle when the named branch ref is absent", async () => {
+      const bundlePath = canonicalBundlePath("feature-branch");
+      const patchPath = createPatchFile("feature-branch", "small patch content");
+      fs.writeFileSync(bundlePath, "bundle content");
+      const bundleHead = "4f80191700da9afc6d0b20b9ec6c81fb376f8714";
+      const prerequisiteSha = "e226f0c6c0f3e37d601fb64cf101fe11de68f7b9";
+
+      const pushSignedCommitsModule = require("./push_signed_commits.cjs");
+      const pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue(bundleHead);
+
+      try {
+        mockExec.getExecOutput.mockImplementation((cmd, args, options) => {
+          if (cmd === "git" && args[0] === "ls-remote") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\trefs/heads/feature-branch\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+            return Promise.resolve({ exitCode: 0, stdout: "true\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("refs/heads/") && options && options.ignoreReturnCode) {
+            return Promise.resolve({ exitCode: 128, stdout: "", stderr: "fatal: couldn't find remote ref refs/heads/feature-branch" });
+          }
+          if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads") {
+            return Promise.resolve({ exitCode: 0, stdout: `${bundleHead} HEAD\n`, stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("HEAD:") && options && options.ignoreReturnCode) {
+            return Promise.resolve({ exitCode: 1, stdout: "", stderr: `error: Repository lacks these prerequisite commits:\nerror: ${prerequisiteSha}` });
+          }
+          if (cmd === "git" && args[0] === "rev-list") {
+            return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+          }
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        });
+
+        const module = await loadModule();
+        const handler = await module.main({});
+        const result = await handler({ branch: "feature-branch", diff_size: 5 * 1024 }, {});
+
+        expect(result.success).toBe(true);
+        expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["bundle", "list-heads", bundlePath], expect.any(Object));
+        expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["fetch", bundlePath, "HEAD:refs/bundles/push-feature-branch"], expect.objectContaining({ ignoreReturnCode: true }));
+        expect(mockExec.exec).toHaveBeenCalledWith("git", ["fetch", "--filter=blob:none", "origin", prerequisiteSha], expect.any(Object));
+        expect(mockExec.exec).toHaveBeenCalledWith("git", ["fetch", bundlePath, "HEAD:refs/bundles/push-feature-branch"], expect.any(Object));
+      } finally {
+        pushSignedSpy.mockRestore();
+      }
+    });
+
+    it("should accept a valid bundle branch ref that contains a plus sign", async () => {
+      const bundlePath = canonicalBundlePath("feature-branch");
+      createPatchFile("feature-branch", "small patch content");
+      fs.writeFileSync(bundlePath, "bundle content");
+      const bundleHead = "4f80191700da9afc6d0b20b9ec6c81fb376f8714";
+      const bundleSourceRef = "refs/heads/feature+fix";
+
+      const pushSignedCommitsModule = require("./push_signed_commits.cjs");
+      const pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue(bundleHead);
+
+      try {
+        mockExec.getExecOutput.mockImplementation((cmd, args, options) => {
+          if (cmd === "git" && args[0] === "ls-remote") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\trefs/heads/feature-branch\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+            return Promise.resolve({ exitCode: 0, stdout: "false\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("refs/heads/feature-branch:") && options?.ignoreReturnCode) {
+            return Promise.resolve({ exitCode: 128, stdout: "", stderr: "fatal: couldn't find remote ref refs/heads/feature-branch" });
+          }
+          if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads") {
+            return Promise.resolve({ exitCode: 0, stdout: `${bundleHead} ${bundleSourceRef}\n`, stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "check-ref-format") {
+            return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-list") {
+            return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+          }
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        });
+
+        const module = await loadModule();
+        const handler = await module.main({});
+        const result = await handler({ branch: "feature-branch", diff_size: 5 * 1024 }, {});
+
+        expect(result.success).toBe(true);
+        expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["check-ref-format", bundleSourceRef], expect.objectContaining({ ignoreReturnCode: true }));
+        expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["fetch", bundlePath, `${bundleSourceRef}:refs/bundles/push-feature-branch`], expect.objectContaining({ ignoreReturnCode: true }));
+      } finally {
+        pushSignedSpy.mockRestore();
+      }
+    });
+
+    it("should ignore an invalid bundle branch ref when resolving a HEAD-only bundle", async () => {
+      const bundlePath = canonicalBundlePath("feature-branch");
+      createPatchFile("feature-branch", "small patch content");
+      fs.writeFileSync(bundlePath, "bundle content");
+      const bundleHead = "4f80191700da9afc6d0b20b9ec6c81fb376f8714";
+      const invalidBranchRef = "refs/heads/foo..bar";
+
+      const pushSignedCommitsModule = require("./push_signed_commits.cjs");
+      const pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue(bundleHead);
+
+      try {
+        mockExec.getExecOutput.mockImplementation((cmd, args, options) => {
+          if (cmd === "git" && args[0] === "ls-remote") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\trefs/heads/feature-branch\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "--is-shallow-repository") {
+            return Promise.resolve({ exitCode: 0, stdout: "false\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("refs/heads/feature-branch:") && options?.ignoreReturnCode) {
+            return Promise.resolve({ exitCode: 128, stdout: "", stderr: "fatal: couldn't find remote ref refs/heads/feature-branch" });
+          }
+          if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads") {
+            return Promise.resolve({ exitCode: 0, stdout: `${bundleHead} ${invalidBranchRef}\n${bundleHead} HEAD\n`, stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "check-ref-format") {
+            return Promise.resolve({ exitCode: 1, stdout: "", stderr: "invalid ref" });
+          }
+          if (cmd === "git" && args[0] === "rev-list") {
+            return Promise.resolve({ exitCode: 0, stdout: "1\n", stderr: "" });
+          }
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        });
+
+        const module = await loadModule();
+        const handler = await module.main({});
+        const result = await handler({ branch: "feature-branch", diff_size: 5 * 1024 }, {});
+
+        expect(result.success).toBe(true);
+        expect(mockExec.getExecOutput).toHaveBeenCalledWith("git", ["fetch", bundlePath, "HEAD:refs/bundles/push-feature-branch"], expect.objectContaining({ ignoreReturnCode: true }));
+      } finally {
+        pushSignedSpy.mockRestore();
+      }
+    });
+
+    it("should reject ambiguous valid bundle branch refs", async () => {
+      const bundlePath = canonicalBundlePath("feature-branch");
+      createPatchFile("feature-branch", "small patch content");
+      fs.writeFileSync(bundlePath, "bundle content");
+      const bundleHead = "4f80191700da9afc6d0b20b9ec6c81fb376f8714";
+      const bundleSourceRefs = ["refs/heads/feature-one", "refs/heads/feature-two"];
+
+      const pushSignedCommitsModule = require("./push_signed_commits.cjs");
+      const pushSignedSpy = vi.spyOn(pushSignedCommitsModule, "pushSignedCommits").mockResolvedValue(bundleHead);
+
+      try {
+        mockExec.getExecOutput.mockImplementation((cmd, args, options) => {
+          if (cmd === "git" && args[0] === "ls-remote") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\trefs/heads/feature-branch\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+            return Promise.resolve({ exitCode: 0, stdout: "remote-head\n", stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "fetch" && args[1] === bundlePath && args[2].startsWith("refs/heads/feature-branch:") && options?.ignoreReturnCode) {
+            return Promise.resolve({ exitCode: 128, stdout: "", stderr: "fatal: couldn't find remote ref refs/heads/feature-branch" });
+          }
+          if (cmd === "git" && args[0] === "bundle" && args[1] === "list-heads") {
+            return Promise.resolve({ exitCode: 0, stdout: bundleSourceRefs.map(ref => `${bundleHead} ${ref}`).join("\n"), stderr: "" });
+          }
+          if (cmd === "git" && args[0] === "check-ref-format") {
+            return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+          }
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+        });
+
+        const module = await loadModule();
+        const handler = await module.main({});
+        const result = await handler({ branch: "feature-branch", diff_size: 5 * 1024 }, {});
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("expected exactly 1 refs/heads entry, found 2");
       } finally {
         pushSignedSpy.mockRestore();
       }
@@ -2935,6 +3161,8 @@ ${diffs}
       const result = await handler({ branch: "should-reject-files-outside-the-allowed-files-allowlist" }, {});
 
       expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.reasonCode).toBe("POLICY_FILE_PROTECTION_DENIED");
       expect(result.error).toContain("outside the allowed-files list");
       expect(result.error).toContain("src/index.js");
     });
@@ -2943,7 +3171,7 @@ ${diffs}
       const patchPath = createPatchFile("should-accept-files-that-match-the-allowed-files-pattern", createPatchWithFiles(".changeset/my-feature-fix.md"));
       mockExec.getExecOutput.mockImplementation(async (cmd, args) => {
         if (cmd === "git" && Array.isArray(args) && args[0] === "diff" && args[1] === "--name-only" && args[2] === "--no-renames") {
-          return { exitCode: 0, stdout: ".changeset/my-feature-fix.md\n", stderr: "" };
+          return { exitCode: 0, stdout: ".changeset/my-feature-fix.md\0", stderr: "" };
         }
         return { exitCode: 0, stdout: "abc123\n", stderr: "" };
       });
@@ -2969,6 +3197,8 @@ ${diffs}
       const result = await handler({ branch: "should-still-block-a-protected-file-when-it-is-in-the-allowl" }, {});
 
       expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.reasonCode).toBe("POLICY_FILE_PROTECTION_DENIED");
       expect(result.error).toContain("protected files");
       expect(result.error).toContain("package.json");
     });
@@ -2978,7 +3208,7 @@ ${diffs}
       const patchPath = createPatchFile("should-allow-a-protected-file-when-both-allowed-files-matche", createPatchWithFiles("package.json"));
       mockExec.getExecOutput.mockImplementation(async (cmd, args) => {
         if (cmd === "git" && Array.isArray(args) && args[0] === "diff" && args[1] === "--name-only" && args[2] === "--no-renames") {
-          return { exitCode: 0, stdout: "package.json\n", stderr: "" };
+          return { exitCode: 0, stdout: "package.json\0", stderr: "" };
         }
         return { exitCode: 0, stdout: "abc123\n", stderr: "" };
       });
@@ -3034,6 +3264,97 @@ ${diffs}
       }
     });
 
+    it("should give patch-based manual apply instructions for protected-files fallback (patch transport)", async () => {
+      createPatchFile("should-give-patch-based-manual-apply-instructions", createPatchWithFiles("package.json"));
+
+      const module = await loadModule();
+      const handler = await module.main({
+        protected_files: ["package.json"],
+        protected_files_policy: "fallback-to-issue",
+      });
+      const result = await handler({ branch: "should-give-patch-based-manual-apply-instructions" }, {});
+
+      expect(result.success).toBe(true);
+      expect(result.fallback_used).toBe(true);
+
+      const issueBody = mockGithub.rest.issues.create.mock.calls[0][0].body;
+      expect(issueBody).toContain("gh run download");
+      expect(issueBody).toContain("git am --3way");
+      expect(issueBody).not.toContain("refs/bundles/");
+    });
+
+    it("should give bundle-based manual apply instructions for protected-files fallback (bundle transport)", async () => {
+      createPatchFile("should-give-bundle-based-manual-apply-instructions", createPatchWithFiles("package.json"));
+      const bundlePath = canonicalBundlePath("should-give-bundle-based-manual-apply-instructions");
+      fs.writeFileSync(bundlePath, "bundle content");
+
+      const module = await loadModule();
+      const handler = await module.main({
+        protected_files: ["package.json"],
+        protected_files_policy: "fallback-to-issue",
+      });
+      const result = await handler({ branch: "should-give-bundle-based-manual-apply-instructions" }, {});
+
+      expect(result.success).toBe(true);
+      expect(result.fallback_used).toBe(true);
+
+      const issueBody = mockGithub.rest.issues.create.mock.calls[0][0].body;
+      expect(issueBody).toContain("gh run download");
+      // Bundle transport: instructions should fetch the bundle and reset --hard,
+      // not use git am (which fails on bundle files - see issue #55509)
+      expect(issueBody).toContain("refs/bundles/manual-apply");
+      expect(issueBody).toContain("git reset --hard refs/bundles/manual-apply");
+      expect(issueBody).not.toContain("git am --3way");
+    });
+
+    it("should use configured fork remote in protected-files manual apply instructions", async () => {
+      const branch = "should-use-configured-fork-remote-in-manual-apply-instr";
+      createPatchFile(branch, createPatchWithFiles("package.json"));
+      const bundlePath = canonicalBundlePath(branch);
+      fs.writeFileSync(bundlePath, "bundle content");
+      mockContext.payload.pull_request.head.repo = {
+        full_name: "fork-owner/test-repo",
+        fork: true,
+        owner: { login: "fork-owner" },
+      };
+      mockGithub.rest.pulls.get.mockResolvedValue({
+        data: {
+          head: {
+            ref: "feature-branch",
+            repo: {
+              full_name: "fork-owner/test-repo",
+              fork: true,
+            },
+          },
+          base: {
+            repo: {
+              full_name: "test-owner/test-repo",
+            },
+          },
+          title: "Test PR",
+          labels: [],
+        },
+      });
+
+      const module = await loadModule();
+      const handler = await module.main({
+        protected_files: ["package.json"],
+        protected_files_policy: "fallback-to-issue",
+        "head-repo": "fork-owner/test-repo",
+        allowed_repos: ["test-owner/test-repo", "fork-owner/test-repo"],
+      });
+      const result = await handler({ branch }, {});
+
+      expect(result.success).toBe(true);
+      expect(result.fallback_used).toBe(true);
+
+      const issueBody = mockGithub.rest.issues.create.mock.calls[0][0].body;
+      expect(issueBody).toContain("git fetch 'https://github.com/fork-owner/test-repo.git'");
+      expect(issueBody).toContain("git push 'https://github.com/fork-owner/test-repo.git'");
+      expect(issueBody).not.toContain("git fetch origin");
+      expect(issueBody).not.toContain("git push origin");
+    });
+
     it("should block a protected file when no allowed-files list is configured", async () => {
       const patchPath = createPatchFile("should-block-a-protected-file-when-no-allowed-files-list-is-", createPatchWithFiles("package.json"));
 
@@ -3045,6 +3366,8 @@ ${diffs}
       const result = await handler({ branch: "should-block-a-protected-file-when-no-allowed-files-list-is-" }, {});
 
       expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.reasonCode).toBe("POLICY_FILE_PROTECTION_DENIED");
       expect(result.error).toContain("protected files");
       expect(result.error).toContain("package.json");
     });
@@ -3057,6 +3380,8 @@ ${diffs}
       const result = await handler({ branch: "should-reject-a-mixed-patch-where-at-least-one-file-is-outsi" }, {});
 
       expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.reasonCode).toBe("POLICY_FILE_PROTECTION_DENIED");
       expect(result.error).toContain("outside the allowed-files list");
       expect(result.error).toContain("src/index.js");
       expect(result.error).not.toContain(".changeset/my-fix.md");
@@ -3121,6 +3446,8 @@ ${diffs}
       const result = await handler({ branch: "should-still-block-non-ignored-files-that-violate-the-allowe" }, {});
 
       expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.reasonCode).toBe("POLICY_FILE_PROTECTION_DENIED");
       expect(result.error).toContain("outside the allowed-files list");
       expect(result.error).toContain("other/file.txt");
       expect(result.error).not.toContain("src/index.js");

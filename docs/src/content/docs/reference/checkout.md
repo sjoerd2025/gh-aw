@@ -110,6 +110,10 @@ The generated checkout step uses `persist-credentials: false`, so the git creden
 
 Fetch everything the workflow needs at checkout time using `fetch-depth` and [`fetch:`](#fetching-additional-refs), and write changes through safe-output tools such as [`push-to-pull-request-branch`](/gh-aw/reference/safe-outputs-pull-requests/) rather than a direct `git push`. The agent is instructed not to configure credential helpers or run `git credential fill`, because authentication cannot succeed; credential errors are reported as a limitation instead of worked around.
 
+:::note[Shallow checkout and push-to-pull-request-branch]
+`push-to-pull-request-branch` inspects the commit range `origin/<branch>..<branch>` in the agent's workspace to detect merge commits and select the appropriate transport. With the default shallow clone (`fetch-depth: 1`), `origin/<branch>` has no traversable ancestry, so `git rev-list` reports the entire local history as the range. On large monorepos (thousands of commits) this can falsely trigger bundle or rewrite paths. When the range is implausibly large in a shallow checkout, merge-commit detection returns false (with a warning) to avoid incorrect transport selection; if the range later reaches the signed-push linearization step, that step is refused with a clear error. Set `fetch-depth: 0` to ensure the correct range is visible.
+:::
+
 ## Disabling Checkout (`checkout: false`)
 
 Set `checkout: false` to suppress both the default `actions/checkout` step and the PR-specific "Checkout PR branch" step entirely. Use this for workflows that access repositories through MCP servers or other mechanisms that do not require a local clone:
@@ -119,6 +123,26 @@ checkout: false
 ```
 
 This is equivalent to omitting the checkout step from the agent job. Custom dev-mode steps (such as "Checkout actions folder") are unaffected.
+
+## Target-Only Checkout (`permissions.contents: none`)
+
+Sidecar (MultiRepoOps) workflows often need to operate on a target repository without checking out the repository that hosts the workflow itself. Setting `permissions.contents: none` suppresses only the default workflow-repository checkout and the "Checkout PR branch" step; any other explicitly configured `checkout:` entries (such as a target repository) are still checked out normally:
+
+```yaml wrap
+permissions:
+  contents: none
+checkout:
+  - repository: octo-org/target-repository
+    path: target
+    github-app:
+      client-id: ${{ vars.TARGET_APP_CLIENT_ID }}
+      private-key: ${{ secrets.TARGET_APP_PRIVATE_KEY }}
+      owner: octo-org
+      repositories:
+        - target-repository
+```
+
+This differs from `checkout: false`, which disables checkout entirely (including any additional configured repositories). With `permissions.contents: none`, only the workflow's own repository is skipped.
 
 ## `pull_request_target` Checkout
 
@@ -218,9 +242,9 @@ When multiple `checkout:` entries target the same repository and path, their con
 - **Submodules**: First non-empty value wins for each `(repository, path)`; once set, later values are ignored
 - **Ref/Token/App**: First-seen wins
 
-## Related Documentation
+## Learn More
 
 - [Cross-Repository Operations](/gh-aw/reference/cross-repository/) - Reading and writing across multiple repositories
 - [Authentication Reference](/gh-aw/reference/auth/) - PAT and GitHub App setup
-- [Multi-Repository Examples](/gh-aw/examples/multi-repo/) - Complete working examples
+- [Multi-Repository Examples](/gh-aw/gallery/multi-repo/) - Complete working examples
 - [Checkout Behavior Specification](/gh-aw/specs/checkout-behavior-specification/) - Formal checkout semantics across activation, agent, and safe_outputs jobs

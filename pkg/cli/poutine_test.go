@@ -322,6 +322,9 @@ func TestEnsurePoutineConfig(t *testing.T) {
 			"pr_runs_on_self_hosted:",
 			"allowed_runners:",
 			"- ubuntu-slim",
+			"skip:",
+			"- rule: untrusted_checkout_exec",
+			"job: activation",
 		}
 
 		for _, expected := range expectedStrings {
@@ -359,4 +362,30 @@ func TestEnsurePoutineConfig(t *testing.T) {
 			t.Errorf("Existing config file was overwritten. Expected:\n%s\nGot:\n%s", customContent, string(content))
 		}
 	})
+}
+
+func TestPoutineImageIsPinnedByDigest(t *testing.T) {
+	if _, err := validateDockerImageRef(PoutineImage); err != nil {
+		t.Fatalf("PoutineImage %q failed docker image reference validation: %v", PoutineImage, err)
+	}
+	if !strings.Contains(PoutineImage, "@sha256:") {
+		t.Errorf("PoutineImage must be pinned by digest, got %q", PoutineImage)
+	}
+}
+
+func TestPoutineFindingsToSharedUsesFindingPath(t *testing.T) {
+	finding := poutineFinding{RuleID: "injection"}
+	finding.Meta.Path = "nested/workflow.lock.yml"
+	finding.Meta.Line = 2
+
+	findings := poutineFindingsToShared([]poutineFinding{finding}, poutineRules{
+		"injection": {Level: "error", Title: "Injection"},
+	}, "workflow.lock.yml", []string{"one", "two", "three"})
+
+	if len(findings) != 1 {
+		t.Fatalf("got %d findings, want 1", len(findings))
+	}
+	if findings[0].File != "nested/workflow.lock.yml" {
+		t.Errorf("File = %q, want finding path", findings[0].File)
+	}
 }

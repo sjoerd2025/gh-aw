@@ -3,8 +3,11 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -24,6 +27,18 @@ func TestExtractAgentSandboxConfigVersion(t *testing.T) {
 	})
 }
 
+func TestExtractMCPGatewayConfigAgentID(t *testing.T) {
+	compiler := &Compiler{}
+
+	config := compiler.extractMCPGatewayConfig(map[string]any{
+		"container": "ghcr.io/github/gh-aw-mcpg",
+		"agent-id":  "configured-agent-id",
+	})
+
+	require.NotNil(t, config, "Should extract MCP gateway config")
+	assert.Equal(t, "configured-agent-id", config.AgentID, "Should extract sandbox.mcp.agent-id")
+}
+
 func TestExtractAgentSandboxConfigPlatform(t *testing.T) {
 	compiler := &Compiler{}
 
@@ -39,79 +54,80 @@ func TestExtractAgentSandboxConfigPlatform(t *testing.T) {
 	})
 }
 
-func TestExtractAgentSandboxConfigSudo(t *testing.T) {
+func TestExtractAgentSandboxConfigRuntimeInstall(t *testing.T) {
 	compiler := &Compiler{}
 
-	t.Run("extracts sandbox.agent.sudo: false as network isolation mode", func(t *testing.T) {
-		agentObj := map[string]any{
-			"id":   "awf",
-			"sudo": false,
-		}
+	t.Run("extracts sandbox.agent.runtime-install from object format", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{
+			"id":              "awf",
+			"runtime-install": false,
+		})
 
-		config := compiler.extractAgentSandboxConfig(agentObj)
 		require.NotNil(t, config, "Should extract agent sandbox config")
-		assert.True(t, config.NetworkIsolation, "sudo: false should enable network isolation (NetworkIsolation=true)")
-		assert.False(t, config.SudoExplicitlyEnabled, "sudo: false should not set SudoExplicitlyEnabled")
+		require.NotNil(t, config.RuntimeInstall, "Should extract sandbox.agent.runtime-install")
+		assert.False(t, *config.RuntimeInstall, "Should preserve sandbox.agent.runtime-install value")
 	})
 
-	t.Run("extracts sandbox.agent.sudo: true as normal mode with SudoExplicitlyEnabled", func(t *testing.T) {
-		agentObj := map[string]any{
-			"id":   "awf",
-			"sudo": true,
-		}
+	t.Run("runtime-install is nil when absent", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{"id": "awf"})
 
-		config := compiler.extractAgentSandboxConfig(agentObj)
 		require.NotNil(t, config, "Should extract agent sandbox config")
-		assert.False(t, config.NetworkIsolation, "sudo: true should disable network isolation (NetworkIsolation=false)")
-		assert.True(t, config.SudoExplicitlyEnabled, "sudo: true should set SudoExplicitlyEnabled")
-	})
-
-	t.Run("sudo omitted defaults to network isolation mode", func(t *testing.T) {
-		agentObj := map[string]any{
-			"id": "awf",
-		}
-
-		config := compiler.extractAgentSandboxConfig(agentObj)
-		require.NotNil(t, config, "Should extract agent sandbox config")
-		assert.True(t, config.NetworkIsolation, "omitting sudo should default to network isolation (NetworkIsolation=true)")
-		assert.False(t, config.SudoExplicitlyEnabled, "omitting sudo should not set SudoExplicitlyEnabled")
+		assert.Nil(t, config.RuntimeInstall, "RuntimeInstall should be nil when not configured")
 	})
 }
 
-func TestExtractAgentSandboxConfigLegacySecurity(t *testing.T) {
+func TestExtractAgentSandboxConfigRuntimeProfile(t *testing.T) {
 	compiler := &Compiler{}
 
-	t.Run("extracts sandbox.agent.legacy-security: enable", func(t *testing.T) {
-		agentObj := map[string]any{
+	t.Run("omitted runtime resolves to the secure docker profile", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{"id": "awf"})
+		require.NotNil(t, config, "Should extract agent sandbox config")
+		assert.Equal(t, AgentRuntime(""), config.Runtime, "Runtime should stay unset when omitted")
+
+		profile := resolveSandboxRuntimeProfile(config)
+		assert.Equal(t, AgentRuntimeDocker, profile.Runtime, "Omitted runtime should resolve to the docker profile")
+		assert.True(t, profile.NetworkIsolation, "Default profile must keep network isolation")
+		assert.True(t, profile.Rootless, "Default profile must run AWF rootless")
+		assert.False(t, profile.LegacySecurity, "Default profile must not enable legacy security")
+	})
+
+	t.Run("extracts sandbox.agent.runtime: docker-sudo-iptables", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{
+			"id":      "awf",
+			"runtime": string(AgentRuntimeDockerSudoIptables),
+		})
+		require.NotNil(t, config, "Should extract agent sandbox config")
+		assert.Equal(t, AgentRuntimeDockerSudoIptables, config.Runtime)
+
+		profile := resolveSandboxRuntimeProfile(config)
+		assert.True(t, profile.LegacySecurity, "docker-sudo-iptables must enable legacy security")
+		assert.True(t, profile.SupportsHostAccess, "docker-sudo-iptables must allow host access")
+		assert.False(t, profile.Rootless, "docker-sudo-iptables runs AWF with sudo")
+	})
+
+	t.Run("removed sudo and legacy-security fields are ignored", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{
 			"id":              "awf",
+			"sudo":            true,
 			"legacy-security": "enable",
-		}
-
-		config := compiler.extractAgentSandboxConfig(agentObj)
+		})
 		require.NotNil(t, config, "Should extract agent sandbox config")
-		assert.True(t, config.LegacySecurity, "legacy-security: enable should set LegacySecurity=true")
+		assert.Equal(t, AgentRuntime(""), config.Runtime, "Removed fields must not change the runtime profile")
+		assert.False(t, resolveSandboxRuntimeProfile(config).LegacySecurity,
+			"Removed fields must not re-enable legacy security")
+	})
+}
+
+func TestExtractAgentSandboxConfigAllowHostPorts(t *testing.T) {
+	compiler := &Compiler{}
+
+	config := compiler.extractAgentSandboxConfig(map[string]any{
+		"id":               "awf",
+		"allow-host-ports": []any{8080, 9090},
 	})
 
-	t.Run("ignores invalid legacy-security value", func(t *testing.T) {
-		agentObj := map[string]any{
-			"id":              "awf",
-			"legacy-security": "disable",
-		}
-
-		config := compiler.extractAgentSandboxConfig(agentObj)
-		require.NotNil(t, config, "Should extract agent sandbox config")
-		assert.False(t, config.LegacySecurity, "legacy-security: disable should not set LegacySecurity")
-	})
-
-	t.Run("legacy-security omitted defaults to false (strict mode)", func(t *testing.T) {
-		agentObj := map[string]any{
-			"id": "awf",
-		}
-
-		config := compiler.extractAgentSandboxConfig(agentObj)
-		require.NotNil(t, config, "Should extract agent sandbox config")
-		assert.False(t, config.LegacySecurity, "omitting legacy-security should default to strict mode (LegacySecurity=false)")
-	})
+	require.NotNil(t, config, "Should extract agent sandbox config")
+	assert.Equal(t, []int{8080, 9090}, config.AllowHostPorts)
 }
 
 func TestExtractAgentSandboxConfigModelFallback(t *testing.T) {
@@ -185,6 +201,126 @@ func TestExtractAgentSandboxConfigModelFallback(t *testing.T) {
 		require.NotNil(t, config, "Should extract agent sandbox config")
 		assert.Nil(t, config.ModelFallback, "ModelFallback should be nil for object value")
 	})
+}
+
+func TestExtractAgentSandboxConfigTokenSteering(t *testing.T) {
+	compiler := &Compiler{}
+
+	t.Run("extracts sandbox.agent.token-steering false", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{
+			"id":             "awf",
+			"token-steering": false,
+		})
+
+		require.NotNil(t, config)
+		require.NotNil(t, config.TokenSteering)
+		assert.False(t, *config.TokenSteering)
+	})
+
+	t.Run("token-steering is nil when absent", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{"id": "awf"})
+
+		require.NotNil(t, config)
+		assert.Nil(t, config.TokenSteering)
+	})
+}
+
+func TestExtractAgentSandboxConfigCACert(t *testing.T) {
+	compiler := &Compiler{}
+
+	t.Run("extracts sandbox.agent.ca-cert", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{
+			"id":      "awf",
+			"ca-cert": "/etc/ssl/certs/internal-ca.pem",
+		})
+
+		require.NotNil(t, config)
+		assert.Equal(t, "/etc/ssl/certs/internal-ca.pem", config.CACert)
+	})
+
+	t.Run("ca-cert is empty when absent", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{"id": "awf"})
+
+		require.NotNil(t, config)
+		assert.Empty(t, config.CACert)
+	})
+
+	t.Run("ca-cert is empty when value is not a string", func(t *testing.T) {
+		config := compiler.extractAgentSandboxConfig(map[string]any{
+			"id":      "awf",
+			"ca-cert": 42,
+		})
+
+		require.NotNil(t, config)
+		assert.Empty(t, config.CACert)
+	})
+}
+
+func TestExtractAgentSandboxConfigMemory(t *testing.T) {
+	compiler := &Compiler{}
+
+	t.Run("extracts sandbox.agent.memory string", func(t *testing.T) {
+		agentObj := map[string]any{
+			"id":     "awf",
+			"memory": "48g",
+		}
+
+		config := compiler.extractAgentSandboxConfig(agentObj)
+		require.NotNil(t, config, "Should extract agent sandbox config")
+		assert.Equal(t, "48g", config.Memory, "Should extract sandbox.agent.memory")
+	})
+
+	t.Run("memory is empty when absent", func(t *testing.T) {
+		agentObj := map[string]any{
+			"id": "awf",
+		}
+
+		config := compiler.extractAgentSandboxConfig(agentObj)
+		require.NotNil(t, config, "Should extract agent sandbox config")
+		assert.Empty(t, config.Memory, "Memory should be empty when not configured")
+	})
+
+	t.Run("ignores non-string memory value", func(t *testing.T) {
+		agentObj := map[string]any{
+			"id":     "awf",
+			"memory": 48,
+		}
+
+		config := compiler.extractAgentSandboxConfig(agentObj)
+		require.NotNil(t, config, "Should extract agent sandbox config")
+		assert.Empty(t, config.Memory, "Memory should be empty for non-string value")
+	})
+}
+
+func TestCompileWorkflowPassesSandboxAgentMemoryToAWF(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "sandbox-agent-memory-*")
+	workflowPath := filepath.Join(tmpDir, "memory-limit.md")
+
+	workflowContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+sandbox:
+  agent:
+    memory: 48g
+---
+
+# Memory limit
+`
+
+	require.NoError(t, os.WriteFile(workflowPath, []byte(workflowContent), 0o644))
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(workflowPath))
+
+	lockPath := filepath.Join(tmpDir, "memory-limit.lock.yml")
+	lockContent, err := os.ReadFile(lockPath)
+	require.NoError(t, err, "expected compiled lock file to be generated")
+
+	lockYAML := string(lockContent)
+	assert.Contains(t, lockYAML, "--memory-limit", "compiled lock file should include --memory-limit flag")
+	assert.Regexp(t, `--memory-limit\s+48g`, lockYAML, "compiled lock file should pass --memory-limit 48g to AWF")
 }
 
 func TestExtractDefaultAiCreditsPricingFromModels(t *testing.T) {

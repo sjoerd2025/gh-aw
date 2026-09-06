@@ -4,6 +4,7 @@ import (
 	"slices"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var permissionsLog = logger.New("workflow:permissions")
@@ -12,7 +13,7 @@ var validPermissionScopes = func() map[string]struct{} {
 	scopes := GetAllPermissionScopes()
 	appOnlyScopes := GetAllGitHubAppOnlyScopes()
 
-	m := make(map[string]struct{}, safeAllocationCapacity(len(scopes), len(appOnlyScopes), 1))
+	m := make(map[string]struct{}, typeutil.SafeAllocationCapacity(len(scopes), len(appOnlyScopes), 1))
 	for _, scope := range scopes {
 		m[string(scope)] = struct{}{}
 	}
@@ -61,9 +62,11 @@ const (
 	PermissionActions             PermissionScope = "actions"
 	PermissionAttestations        PermissionScope = "attestations"
 	PermissionChecks              PermissionScope = "checks"
+	PermissionCodeQuality         PermissionScope = "code-quality"
 	PermissionContents            PermissionScope = "contents"
 	PermissionDeployments         PermissionScope = "deployments"
 	PermissionDiscussions         PermissionScope = "discussions"
+	PermissionDrives              PermissionScope = "drives"
 	PermissionIdToken             PermissionScope = "id-token"
 	PermissionIssues              PermissionScope = "issues"
 	PermissionMetadata            PermissionScope = "metadata"
@@ -98,6 +101,7 @@ const (
 	PermissionSingleFile                 PermissionScope = "single-file"
 	PermissionCodespaces                 PermissionScope = "codespaces"
 	PermissionRepositoryCustomProperties PermissionScope = "repository-custom-properties"
+	PermissionSecretScanningAlerts       PermissionScope = "secret-scanning-alerts"
 
 	// Organization-level GitHub App permissions
 	PermissionMembers                             PermissionScope = "members"
@@ -133,9 +137,11 @@ func GetAllPermissionScopes() []PermissionScope {
 		PermissionActions,
 		PermissionAttestations,
 		PermissionChecks,
+		PermissionCodeQuality,
 		PermissionContents,
 		PermissionDeployments,
 		PermissionDiscussions,
+		PermissionDrives,
 		PermissionIdToken,
 		PermissionIssues,
 		PermissionMetadata,
@@ -164,6 +170,7 @@ func GetAllGitHubAppOnlyScopes() []PermissionScope {
 		PermissionSingleFile,
 		PermissionCodespaces,
 		PermissionRepositoryCustomProperties,
+		PermissionSecretScanningAlerts,
 		// Organization-level GitHub App permissions
 		PermissionOrganizationProj,
 		PermissionMembers,

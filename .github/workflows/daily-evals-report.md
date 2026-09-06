@@ -11,16 +11,22 @@ permissions:
   issues: read
   pull-requests: read
 max-daily-ai-credits: 3000
-model: gpt-5.4
+model: copilot/gpt-5.3-codex
 engine:
   id: codex
 tracker-id: daily-evals-report
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
+    memory: 4g
 features:
   gh-aw-detection: true
 timeout-minutes: 45
+tools:
+  github:
+    mode: local
+
 imports:
   - uses: shared/meta-analysis-base.md
     with:
@@ -95,9 +101,12 @@ For each downloaded run directory at `/tmp/gh-aw/aw-mcp/logs/run-<id>/`:
    - `workflow_name` (or `workflow.name`)
    - `conclusion` (success / failure / cancelled)
    - Whether evals were declared (check for an `evals` key or the presence of the evals job in the run)
-3. Note runs where the workflow declares evals but `evals.jsonl` is absent — these are **evals job failures**.
+3. Detect **evals job failures** by scanning job conclusions:
+   - runs where the workflow declares evals but `evals.jsonl` is absent
+   - runs where job `push_evals_state` exists and has a failed conclusion (`failure`, `timed_out`, or `cancelled`)
+   - if both conditions happen in the same run, count it once
 
-Cap analysis at **40 runs total**. Apply prioritization before capping: first include all runs that produced `evals.jsonl` (up to 40), then fill any remaining capacity with evals-failure runs (declared evals but no results). If there are more than 40 runs with evals results, use the most recent 40 and note in the report that analysis was capped. Evals failures are still recorded even if the 40-run cap is reached from results-only runs — count them but do not analyze their artifacts.
+Cap analysis at **40 runs total**. Apply prioritization before capping: first include all runs that produced `evals.jsonl` (up to 40), then fill any remaining capacity with evals-failure runs. If there are more than 40 runs with evals results, use the most recent 40 and note in the report that analysis was capped. Evals failures are still recorded even if the 40-run cap is reached from results-only runs — count them but do not analyze their artifacts.
 
 ## Phase 3: Parse Evals JSONL
 
@@ -118,7 +127,7 @@ Extract per-run:
 
 For each unique workflow:
 - `runs_with_evals_results` — runs that produced `evals.jsonl`
-- `runs_evals_job_failed` — runs that declared evals but produced no `evals.jsonl`
+- `runs_evals_job_failed` — runs that either declared evals but produced no `evals.jsonl`, or had a failed `push_evals_state` job
 - `evals_job_success_rate` = `runs_with_evals_results / (runs_with_evals_results + runs_evals_job_failed) * 100`
 - `run_pass_rate` = runs where all questions are YES / `runs_with_evals_results * 100`
 - Per-question: `yes_rate` = YES count / `runs_with_evals_results * 100`
@@ -129,7 +138,7 @@ For each unique workflow:
 - `total_workflows_with_evals` — unique workflow count
 - `total_runs_analyzed` — total runs checked
 - `total_evals_results` — runs with `evals.jsonl`
-- `total_evals_failures` — runs with evals declared but no results
+- `total_evals_failures` — runs with evals job failure conditions (missing results and/or failed `push_evals_state`)
 - `overall_evals_job_success_rate` = `total_evals_results / (total_evals_results + total_evals_failures) * 100`
 - `overall_yes_rate` — YES answers / total answers across all runs
 - `most_failing_questions` — top 3 questions (by NO rate) across all workflows

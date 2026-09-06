@@ -9,11 +9,32 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_API, ERR_CONFIG, ERR_PARSE, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
 const { isTruthy } = require("./is_truthy.cjs");
+const { closeUnterminatedSkillMarkers } = require("./extract_inline_skills.cjs");
+const { closeUnterminatedSubAgentMarkers } = require("./extract_inline_sub_agents.cjs");
 
 const fs = require("fs");
 const path = require("path");
-const https = require("https");
-const http = require("http");
+const crypto = require("crypto");
+
+/**
+ * Makes any "## skill:"/"## agent:" block in a runtime-imported chunk of
+ * content self-terminating before it is spliced into the larger prompt.
+ *
+ * Runtime imports are resolved and spliced into the surrounding document
+ * before inline skill/sub-agent extraction runs (see interpolate_prompt.cjs).
+ * If an imported file relies on implicit closing (next H2 heading or EOF)
+ * for a skill/agent block, that block would expand past the imported file's
+ * own boundary once spliced in and swallow whatever follows it — content
+ * from the importing workflow's main body or from subsequent imports.
+ * Making the end marker explicit here keeps every runtime import
+ * self-contained regardless of where it ends up in the assembled document.
+ *
+ * @param {string} content - Resolved content of a single runtime import (file or URL).
+ * @returns {string} Content with implicit skill/agent end markers made explicit.
+ */
+function closeUnterminatedInlineMarkers(content) {
+  return closeUnterminatedSubAgentMarkers(closeUnterminatedSkillMarkers(content));
+}
 
 /**
  * Checks if a file starts with front matter (---\n)
@@ -381,6 +402,15 @@ function isSafeExpression(expr) {
 }
 
 /**
+ * Generates the compiler's hash-based environment variable name for a GitHub expression.
+ * @param {string} expr - The GitHub expression content without ${{ }}.
+ * @returns {string}
+ */
+function generateHashedExpressionEnvVarName(expr) {
+  return "GH_AW_EXPR_" + crypto.createHash("sha256").update(expr).digest("hex").slice(0, 8).toUpperCase();
+}
+
+/**
  * Evaluates a safe GitHub Actions expression at runtime
  * @param {string} expr - The expression to evaluate (without ${{ }})
  * @returns {string} - The evaluated value or original expression if cannot evaluate
@@ -434,6 +464,12 @@ function evaluateExpression(expr) {
     const envValue = process.env[envVarName];
     if (envValue !== undefined && envValue !== null) {
       return envValue;
+    }
+
+    const hashedEnvVarName = generateHashedExpressionEnvVarName(trimmed);
+    const hashedEnvValue = process.env[hashedEnvVarName];
+    if (hashedEnvValue !== undefined && hashedEnvValue !== null) {
+      return hashedEnvValue;
     }
     // If not found in environment, continue to try other evaluation methods below
   }
@@ -655,6 +691,9 @@ function hasGitHubActionsMacros(content) {
   return /\$\{\{[\s\S]*?\}\}/.test(content);
 }
 
+/** @type {number} Timeout in milliseconds for fetching URL content in {@link fetchUrlContent} */
+const FETCH_URL_TIMEOUT_MS = 30_000;
+
 /**
  * Fetches content from a URL with caching
  * @param {string} url - The URL to fetch
@@ -668,7 +707,7 @@ async function fetchUrlContent(url, cacheDir) {
     try {
       fs.mkdirSync(cacheDir, { recursive: true });
     } catch (err) {
-      throw new Error(`Failed to create directory ${cacheDir}: ${String(err)}`, { cause: err });
+      throw new Error(`${ERR_SYSTEM}: Failed to create directory ${cacheDir}: ${getErrorMessage(err)}`, { cause: err });
     }
   }
 
@@ -695,7 +734,7 @@ async function fetchUrlContent(url, cacheDir) {
         try {
           return fs.readFileSync(cacheFile, "utf8");
         } catch (err) {
-          throw new Error(`Failed to read file ${cacheFile}: ${String(err)}`, { cause: err });
+          throw new Error(`${ERR_SYSTEM}: Failed to read file ${cacheFile}: ${getErrorMessage(err)}`, { cause: err });
         }
       }
     }
@@ -704,36 +743,40 @@ async function fetchUrlContent(url, cacheDir) {
   // Fetch URL content
   core.info(`Fetching content from URL: ${url}`);
 
-  return new Promise((resolve, reject) => {
-    const protocol = url.startsWith("https") ? https : http;
+  // Share a single abort signal across both the connection/headers phase and the body-reading
+  // phase, since fetch()'s own timeout signal is only honored until the promise resolves.
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => timeoutController.abort(new Error(`Timed out after ${FETCH_URL_TIMEOUT_MS}ms`)), FETCH_URL_TIMEOUT_MS);
 
-    protocol
-      .get(url, res => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`Failed to fetch URL ${url}: HTTP ${res.statusCode}`));
-          return;
-        }
+  let response;
+  let data;
+  try {
+    // Do not follow redirects automatically: a redirect landing on a 200 response would
+    // silently broaden the fetched origin and bypass the non-200 status check below.
+    response = await fetch(url, { signal: timeoutController.signal, redirect: "manual" });
 
-        let data = "";
-        res.on("data", chunk => {
-          data += chunk;
-        });
+    if (!response.ok) {
+      throw new Error(`${ERR_API}: Failed to fetch URL ${url}: HTTP ${response.status}`);
+    }
 
-        res.on("end", () => {
-          // Cache the content
-          try {
-            fs.writeFileSync(cacheFile, data, "utf8");
-          } catch (err) {
-            reject(new Error(`Failed to write file ${cacheFile}: ${String(err)}`, { cause: err }));
-            return;
-          }
-          resolve(data);
-        });
-      })
-      .on("error", err => {
-        reject(new Error(`Failed to fetch URL ${url}: ${err.message}`));
-      });
-  });
+    data = await response.text();
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith(ERR_API)) {
+      throw err;
+    }
+    throw new Error(`${ERR_API}: Failed to fetch URL ${url}: ${getErrorMessage(err)}`, { cause: err });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  // Cache the content
+  try {
+    fs.writeFileSync(cacheFile, data, "utf8");
+  } catch (err) {
+    throw new Error(`${ERR_SYSTEM}: Failed to write file ${cacheFile}: ${getErrorMessage(err)}`, { cause: err });
+  }
+
+  return data;
 }
 
 /**
@@ -818,6 +861,11 @@ async function processUrlImport(url, optional, startLine, endLine) {
   if (hasGitHubActionsMacros(content)) {
     content = processExpressions(content, `URL ${url}`);
   }
+
+  // Close any unterminated "## skill:"/"## agent:" block so this import
+  // cannot swallow content that gets spliced in after it (see
+  // closeUnterminatedInlineMarkers above).
+  content = closeUnterminatedInlineMarkers(content);
 
   return content;
 }
@@ -940,7 +988,7 @@ function generatePlaceholderName(expr) {
  * Resolves a runtime-import file path to its normalized absolute path.
  * @param {string} filepathOrUrl - File path (not URL)
  * @param {string} workspaceDir - The GITHUB_WORKSPACE directory path
- * @returns {{filepath: string, normalizedPath: string}}
+ * @returns {{filepath: string, normalizedPath: string, normalizedBaseFolder: string}}
  */
 function resolveRuntimeImportFilePath(filepathOrUrl, workspaceDir) {
   if (/^https?:\/\//i.test(filepathOrUrl)) {
@@ -999,11 +1047,11 @@ function resolveRuntimeImportFilePath(filepathOrUrl, workspaceDir) {
     baseFolder = workspaceDir;
     absolutePath = path.resolve(workspaceDir, filepath);
     normalizedPath = path.normalize(absolutePath);
-    normalizedBaseFolder = path.normalize(baseFolder);
+    normalizedBaseFolder = path.normalize(path.join(workspaceDir, ".agents"));
 
     // Security check: ensure the resolved path is within the workspace
-    const relativePath = path.relative(normalizedBaseFolder, normalizedPath);
-    if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+    const relativePath = path.relative(path.normalize(baseFolder), normalizedPath);
+    if (relativePath === ".." || relativePath.startsWith(".." + path.sep) || path.isAbsolute(relativePath)) {
       throw new Error(`${ERR_CONFIG}: Security: Path ${filepathOrUrl} must be within workspace (resolves to: ${relativePath})`);
     }
     // Additional check: ensure path stays within .agents folder
@@ -1025,7 +1073,29 @@ function resolveRuntimeImportFilePath(filepathOrUrl, workspaceDir) {
     }
   }
 
-  return { filepath, normalizedPath };
+  return { filepath, normalizedPath, normalizedBaseFolder };
+}
+
+/**
+ * Verifies the resolved runtime-import target remains inside the allowed base
+ * after following symlinks.
+ * @param {string} normalizedPath
+ * @param {string} normalizedBaseFolder
+ * @param {string} filepathOrUrl
+ */
+function assertRuntimeImportRealPathWithinBase(normalizedPath, normalizedBaseFolder, filepathOrUrl) {
+  let realPath;
+  let realBase;
+  try {
+    realPath = fs.realpathSync(normalizedPath);
+    realBase = fs.realpathSync(normalizedBaseFolder);
+  } catch (err) {
+    throw new Error(`${ERR_SYSTEM}: Failed to resolve runtime import path ${filepathOrUrl}: ${getErrorMessage(err)}`, { cause: err });
+  }
+  const relativePath = path.relative(realBase, realPath);
+  if (relativePath === ".." || relativePath.startsWith(".." + path.sep) || path.isAbsolute(relativePath)) {
+    throw new Error(`${ERR_VALIDATION}: Security: Path ${filepathOrUrl} must remain within its allowed folder after resolving symlinks`);
+  }
 }
 
 /**
@@ -1045,7 +1115,7 @@ async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, start
   }
 
   // Otherwise, process as a file
-  const { filepath, normalizedPath } = resolveRuntimeImportFilePath(filepathOrUrl, workspaceDir);
+  const { filepath, normalizedPath, normalizedBaseFolder } = resolveRuntimeImportFilePath(filepathOrUrl, workspaceDir);
 
   // Check if file exists
   if (!fs.existsSync(normalizedPath)) {
@@ -1055,13 +1125,14 @@ async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, start
     }
     throw new Error(`${ERR_SYSTEM}: Runtime import file not found: ${normalizedPath}`);
   }
+  assertRuntimeImportRealPathWithinBase(normalizedPath, normalizedBaseFolder, filepathOrUrl);
 
   // Read the file
   let content;
   try {
     content = fs.readFileSync(normalizedPath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${normalizedPath}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to read file ${normalizedPath}: ${getErrorMessage(err)}`, { cause: err });
   }
 
   // If line range is specified, extract those lines first (before other processing)
@@ -1136,6 +1207,11 @@ async function processRuntimeImport(filepathOrUrl, optional, workspaceDir, start
   if (hasGitHubActionsMacros(content)) {
     content = processExpressions(content, `File ${filepath}`);
   }
+
+  // Close any unterminated "## skill:"/"## agent:" block so this import
+  // cannot swallow content that gets spliced in after it (see
+  // closeUnterminatedInlineMarkers above).
+  content = closeUnterminatedInlineMarkers(content);
 
   return content;
 }
@@ -1374,6 +1450,8 @@ async function processRuntimeImports(content, workspaceDir, importedFiles = new 
 module.exports = {
   processRuntimeImports,
   processRuntimeImport,
+  fetchUrlContent,
+  closeUnterminatedInlineMarkers,
   hasFrontMatter,
   removeXMLComments,
   neutralizeSystemTags,

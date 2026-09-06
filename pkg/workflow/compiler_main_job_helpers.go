@@ -40,6 +40,15 @@ func (c *Compiler) buildMainJobCondition(data *WorkflowData, activationJobCreate
 			jobCondition = RenderCondition(BuildAnd(&ExpressionNode{Expression: stripExpressionWrapper(jobCondition)}, guard))
 		}
 	}
+	if activationJobCreated && isDockerSbxRuntime(data) {
+		compilerMainJobLog.Print("Applying docker-sbx secret guardrail to main job condition")
+		guard := &ExpressionNode{Expression: fmt.Sprintf("needs.%s.outputs.docker_sbx_secrets_result != 'failed'", constants.ActivationJobName)}
+		if jobCondition == "" {
+			jobCondition = RenderCondition(guard)
+		} else {
+			jobCondition = RenderCondition(BuildAnd(&ExpressionNode{Expression: stripExpressionWrapper(jobCondition)}, guard))
+		}
+	}
 	compilerMainJobLog.Printf("Built main job condition: activationJobCreated=%v, hasCondition=%v", activationJobCreated, jobCondition != "")
 	return jobCondition
 }
@@ -172,8 +181,8 @@ func buildMainJobCoreOutputs() map[string]string {
 // configured engine provides an error-detection script ID.
 func (c *Compiler) addMainJobEngineErrorOutputs(outputs map[string]string, data *WorkflowData) {
 	// Add inference_access_error, mcp_policy_error, agentic_engine_timeout,
-	// model_not_supported_error, http_400_response_error, and
-	// invocation_cap_exceeded outputs for engines
+	// model_not_supported_error, http_400_response_error, invocation_cap_exceeded,
+	// and shell_expansion_guard_rejected outputs for engines
 	// that provide an error detection step.
 	// These outputs are written by the host-runner detect-agent-errors step (via the
 	// engine's GetErrorDetectionScriptId script) rather than from inside the AWF container,
@@ -198,10 +207,14 @@ func (c *Compiler) addMainJobEngineErrorOutputs(outputs map[string]string, data 
 	compilerMainJobLog.Printf("Added http_400_response_error output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
 	outputs["invocation_cap_exceeded"] = fmt.Sprintf("${{ %s.invocation_cap_exceeded || 'false' }}", stepRef)
 	compilerMainJobLog.Printf("Added invocation_cap_exceeded output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
+	outputs["max_cache_misses_exceeded"] = fmt.Sprintf("${{ %s.max_cache_misses_exceeded || 'false' }}", stepRef)
+	compilerMainJobLog.Printf("Added max_cache_misses_exceeded output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
 	outputs["missing_model_pricing_error"] = fmt.Sprintf("${{ %s.missing_model_pricing_error || 'false' }}", stepRef)
 	compilerMainJobLog.Printf("Added missing_model_pricing_error output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
 	outputs["missing_model_pricing_model_name"] = fmt.Sprintf("${{ %s.missing_model_pricing_model_name || '' }}", stepRef)
 	compilerMainJobLog.Printf("Added missing_model_pricing_model_name output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
+	outputs["shell_expansion_guard_rejected"] = fmt.Sprintf("${{ %s.shell_expansion_guard_rejected || 'false' }}", stepRef)
+	compilerMainJobLog.Printf("Added shell_expansion_guard_rejected output (engine=%s, step=%s)", engine.GetID(), constants.DetectAgentErrorsStepID)
 }
 
 // buildMainJobOutputs builds the complete outputs map for the main agent job.
@@ -254,6 +267,10 @@ func (c *Compiler) buildMainJobOutputs(data *WorkflowData) map[string]string {
 // buildMainJobEnv builds the job-level environment variable map for the main agent job.
 func (c *Compiler) buildMainJobEnv(data *WorkflowData) map[string]string {
 	var env map[string]string
+	if data != nil && data.EngineConfig != nil && data.EngineConfig.Version != "" {
+		env = make(map[string]string)
+		env["GH_AW_ENGINE_VERSION"] = fmt.Sprintf("%q", data.EngineConfig.Version)
+	}
 
 	// Disable the Chromium process sandbox for playwright CLI mode.
 	// GitHub Actions runners are containerised environments where kernel namespace
@@ -296,6 +313,19 @@ func (c *Compiler) buildMainJobEnv(data *WorkflowData) map[string]string {
 		// DEFAULT_BRANCH is used by safeoutputs MCP server
 		// Use repository default branch from GitHub context
 		env["DEFAULT_BRANCH"] = "${{ github.event.repository.default_branch }}"
+
+		// Add PR head baseline environment variables used for incremental patches.
+		// These are only populated (via GITHUB_ENV) by the "Checkout PR branch" step,
+		// which is skipped for non-PR events (e.g. schedule, workflow_dispatch without
+		// a PR context). They must still be declared here (even empty) because the
+		// MCP gateway validates every ${VAR} reference in its config and fails with
+		// "undefined environment variable referenced" if the variable is entirely unset.
+		env["GH_AW_PR_HEAD_BASE_BRANCH"] = `""`
+		env["GH_AW_PR_HEAD_BASE_SHA"] = `""`
+		env["GH_AW_PR_HEAD_BASE_REPO"] = `""`
+		env["GH_AW_PR_HEAD_BASE_PR_NUMBER"] = `""`
+		env["GH_AW_PR_HEAD_BASE_REF"] = `""`
+		env["GH_AW_PR_HEAD_REPO"] = `""`
 	}
 
 	// Set GH_AW_WORKFLOW_ID_SANITIZED for cache-memory keys
@@ -361,6 +391,14 @@ func (c *Compiler) buildMainJobPermissions(data *WorkflowData) (string, error) {
 	}
 
 	return permissions, nil
+}
+
+func operationalValueGraderEnabled(data *WorkflowData) bool {
+	if data == nil || data.Graders == nil {
+		return false
+	}
+	grader, ok := data.Graders.Graders["operational-value"]
+	return ok && (grader.Enabled == nil || *grader.Enabled)
 }
 
 // augmentPermissionsForDevMode adds contents: read to permissions when the compiler is in

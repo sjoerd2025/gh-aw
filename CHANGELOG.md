@@ -438,6 +438,12 @@ Run `gh aw fix --write` to apply automatic updates across your repository.
 
 ### Breaking Changes
 
+#### Removed the experimental `opencode` engine
+
+Workflows using `engine: opencode` must migrate to `copilot`, `claude`, `codex`,
+`gemini`, `antigravity`, or `pi`. The runner no longer restores
+`opencode.jsonc` or `.opencode/` configuration.
+
 #### `gh aw add` errors for packages with `aw.yml` config
 
 Running `gh aw add <package>` on a package that declares interactive config
@@ -529,6 +535,18 @@ MCP Gateway v0.1.5 introduces stricter MCP server validation:
 - Run `gh aw compile` to detect and fix invalid configurations before upgrading
 
 ### Bug Fixes
+
+#### Order nested imported steps by dependency and detect subdirectory cycles
+
+Imported `steps`, `pre-agent-steps`, and `post-steps` now place prerequisites
+before the files that import them, regardless of traversal order. Import cycles
+in subdirectories now fail compilation instead of producing a lock file.
+
+#### Create organization and enterprise defaults with explicit variable visibility
+
+`gh aw env update` now sends the required visibility when creating organization
+or enterprise variables. Use `--visibility all|private|selected`; existing
+variables keep their current visibility.
 
 #### Bump the default gh-aw-firewall version to v0.27.7 and sync the embedded AWF config schema.
 

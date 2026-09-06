@@ -13,9 +13,10 @@ The YAML frontmatter supports these fields:
   - Object: Complex trigger configuration
   - Special: `slash_command:` for /mention triggers
   - **`forks:`** - Fork allowlist for `pull_request` triggers (array or string). By default, workflows block all forks and only allow same-repo PRs. Use `["*"]` to allow all forks, or specify patterns like `["org/*", "user/repo"]`
-  - **`stop-after:`** - Can be included in the `on:` object to set a deadline for workflow execution. Supports absolute timestamps ("YYYY-MM-DD HH:MM:SS") or relative time deltas (+25h, +3d, +1d12h). The minimum unit for relative deltas is hours (h). Uses precise date calculations that account for varying month lengths.
+  - **`stop-after:`** - Can be included in the `on:` object to set a deadline for workflow execution. Supports absolute timestamps ("YYYY-MM-DD HH:MM:SS"), relative time deltas (+25h, +3d, +1d12h), or a GitHub Actions expression (e.g. `${{ inputs.stop-after }}`) resolved at runtime instead of compile time. The minimum unit for relative/literal deltas is hours (h). Literal values use precise date calculations that account for varying month lengths; recompile with `gh aw compile --refresh-stop-time` to reset a literal deadline.
+  - **`cooldown:`** - Can be included in the `on:` object to block the `agent` job from starting again shortly after the most recent completed run. Value must be a literal Go duration string of at least 5 minutes (e.g. `"30m"`, `"2h"`); GitHub Actions expressions are rejected. Fails open (allows activation) if run history cannot be queried.
   - **`reaction:`** - Add emoji reactions to triggering items
-  - **`status-comment:`** - Post status comments when workflow starts/completes (boolean). Defaults to `true` for `slash_command` and `label_command` triggers; defaults to `false` for all other triggers. Must be explicitly enabled for non-command triggers with `status-comment: true`.
+  - **`status-comment:`** - Post status comments when workflow starts/completes on the triggering issue, pull request, or discussion (boolean, or object with `issues`/`pull-requests`/`discussions` booleans to control trigger groups independently). Defaults to `true` for `slash_command` and `label_command` triggers; defaults to `false` for all other triggers. Must be explicitly enabled for non-command triggers with `status-comment: true`.
   - **`manual-approval:`** - Require manual approval using environment protection rules
   - **`skip-roles:`** - Skip workflow execution for users with specific repository roles (array)
     - Available roles: `admin`, `maintainer`/`maintain`, `write`, `triage`, `read`
@@ -23,6 +24,8 @@ The YAML frontmatter supports these fields:
   - **`skip-bots:`** - Skip workflow execution when triggered by specific GitHub actors (array)
     - Bot name matching is flexible (handles with/without `[bot]` suffix)
     - Example: `skip-bots: [dependabot, renovate]` - Skip for Dependabot and Renovate
+  - **`skip-author-associations:`** - Skip workflow execution per-event based on the triggering payload's `author_association` (object keyed by event name, e.g. `issue_comment`, `issues`, `pull_request`; each value a string or array of associations like `CONTRIBUTOR`, case-insensitive)
+    - Example: `skip-author-associations: { issue_comment: [first_time_contributor, contributor] }`
   - **`labels:`** - Filter label-triggered events to only fire when the triggering label matches one of these names (string or array)
     - String format: `labels: "my-label"` (single label name)
     - Array format: `labels: [label-a, label-b]` (any matching label fires the workflow)
@@ -98,6 +101,8 @@ The YAML frontmatter supports these fields:
     - When `false`, disables the hash check step; useful when workflow files are managed outside the default repository context (e.g., cross-repo org rulesets)
     - When `"full"`, checks both the frontmatter hash and body hash; use when prompt-body edits should also trigger recompilation detection
 
+- **`github-app:`** - Top-level GitHub App credentials, used as a fallback for every nested `github-app` token-minting operation (`on.github-app`, `safe-outputs.github-app`, `checkout.github-app`, `tools.github.github-app`, `dependencies.github-app`) that does not define its own. Same fields as `on.github-app` above (`client-id`/`app-id`, `private-key`, `owner`, `repositories`).
+
 - **`permissions:`** - GitHub token permissions
   - Object with permission levels: `read`, `none` (and limited `write` for specific scopes)
   - Common permission scopes (not exhaustive; standard GitHub Actions scopes plus `models`, `copilot-requests`): `contents`, `issues`, `pull-requests`, `discussions`, `actions`, `checks`, `statuses`, `models`, `deployments`, `security-events`, `packages`, `pages`, `attestations`, `copilot-requests`
@@ -111,7 +116,7 @@ The YAML frontmatter supports these fields:
   runner:
     topology: arc-dind
   ```
-- **`timeout-minutes:`** - Agent execution step timeout in minutes (integer or GitHub Actions expression, defaults to 20 minutes; custom and safe-output jobs use the GitHub Actions platform default of 360 minutes unless explicitly set). Expressions are useful in compiled workflows that define `workflow_call` inputs, for example `timeout-minutes: ${{ inputs.timeout }}`. This setting applies to the workflow being compiled, not to plain GitHub Actions caller jobs that use job-level `uses:` (GitHub does not allow `timeout-minutes` on those caller jobs).
+- **`timeout-minutes:`** - Agent execution step timeout in minutes (integer or GitHub Actions expression, defaults to `${{ vars.GH_AW_DEFAULT_TIMEOUT_MINUTES }}` or 20 minutes; custom and safe-output jobs use the GitHub Actions platform default of 360 minutes unless explicitly set). It bounds the `agentic_execution` step only; the generated `agent` and `detection` jobs have their own timeouts (see [jobs.md](jobs.md)). Expressions are useful in compiled workflows that define `workflow_call` inputs, for example `timeout-minutes: ${{ inputs.timeout }}`. This setting applies to the workflow being compiled, not to plain GitHub Actions caller jobs that use job-level `uses:` (GitHub does not allow `timeout-minutes` on those caller jobs).
 - **`concurrency:`** - Concurrency control (string or object)
   - **`queue:`** - Pending run queue behavior for the concurrency group (`single` or `max`, defaults to `single`). `single` keeps one pending run and replaces older pending runs; `max` allows up to 100 pending runs in FIFO order (useful for conclusion jobs that must not be dropped).
 

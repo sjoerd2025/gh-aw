@@ -12,9 +12,6 @@ permissions:
   actions: read
   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 tracker-id: eslint-miner
 engine:
@@ -45,6 +42,7 @@ tools:
     - "*"
   edit:
 safe-outputs:
+  steer: true
   create-pull-request:
     title-prefix: "[eslint-miner] "
     labels: [automation, eslint, cookie]
@@ -58,6 +56,13 @@ safe-outputs:
   noop:
 timeout-minutes: 120
 max-turns: 1000
+evals:
+  - id: eslint_patterns_mined
+    question: Did the agent analyze JavaScript or TypeScript patterns to identify a useful ESLint rule?
+  - id: rule_pr_created_or_noop
+    question: Did the agent create a pull request for a new ESLint rule, or use noop when no suitable rule was found?
+imports:
+  - shared/reporting.md
 ---
 
 # ESLint Miner

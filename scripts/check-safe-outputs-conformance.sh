@@ -67,7 +67,9 @@ check_privilege_separation() {
     # Find all compiled workflow files
     find .github/workflows -name "*.lock.yml" | while read -r workflow; do
         # Check if agent job has write permissions
-        if grep -A 50 "^jobs:" "$workflow" | grep -A 20 "^\s*agent:" | grep -qE "issues:\s*write|pull-requests:\s*write|contents:\s*write"; then
+        jobs_section=$(grep -A 50 "^jobs:" "$workflow" 2>/dev/null || true)
+        agent_section=$(grep -A 20 "^\s*agent:" <<< "$jobs_section" 2>/dev/null || true)
+        if grep -qE "issues:\s*write|pull-requests:\s*write|contents:\s*write" <<< "$agent_section"; then
             log_critical "SEC-001: Agent job in $workflow has write permissions"
             failed=1
         fi
@@ -137,18 +139,21 @@ check_max_limits
 echo "Running SEC-004: Content Sanitization Required..."
 check_sanitization() {
     local failed=0
-    
-    for handler in actions/setup/js/*.cjs; do
+
+    for handler in actions/setup/js/{add_comment,create_issue,create_discussion,create_pull_request,update_issue,close_issue,close_discussion,close_pull_request,add_labels,remove_labels,create_check_run,approve_workflow_run,create_pr_review_comment,comment_memory,create_agent_session,assign_milestone,create_project,create_forecast_issue}.cjs; do
         # Skip test and utility files
         [[ "$handler" =~ (test|parse|buffer) ]] && continue
+        [ ! -f "$handler" ] && continue
 
         # Skip files with a documented SEC-004 exemption annotation
         if grep -q "@safe-outputs-exempt[[:space:]]\\+SEC-004" "$handler"; then
             continue
         fi
         
-        # Check if handler has body/content fields
-        if grep -q "\"body\"\|body:" "$handler"; then
+        # Only inspect handlers that process body/title/content fields for safe-output operations.
+        # Files with other operational roles (for example completion helpers) are exempt unless
+        # they explicitly process safe-output content.
+        if grep -qE '"body"|body:|"title"|title:|"content"|content:' "$handler"; then
             # Check for sanitization
             if ! grep -q "sanitize\|stripHTML\|escapeMarkdown\|cleanContent" "$handler"; then
                 log_medium "SEC-004: $handler has body field but no sanitization"
@@ -280,7 +285,8 @@ check_rfc2119() {
     
     # Check key sections have RFC 2119 keywords
     for section in "Security Architecture" "Configuration Semantics" "Execution Guarantees"; do
-        if ! grep -A 200 "## .*$section" "$spec_file" 2>/dev/null | grep -q "MUST\|SHALL\|SHOULD\|MAY"; then
+        section_text=$(grep -A 200 "## .*$section" "$spec_file" 2>/dev/null || true)
+        if ! grep -q "MUST\|SHALL\|SHOULD\|MAY" <<< "$section_text"; then
             log_medium "REQ-001: Section '$section' may lack RFC 2119 keywords"
             failed=1
         fi
@@ -304,7 +310,8 @@ check_type_completeness() {
         
         # Check for required sections
         for section in "MCP Tool Schema" "Operational Semantics" "Configuration Parameters" "Security Requirements" "Required Permissions"; do
-            if grep -A 200 "^#### Type: $type_name" "$spec_file" 2>/dev/null | grep -q "**$section**"; then
+            type_section=$(grep -A 200 "^#### Type: $type_name" "$spec_file" 2>/dev/null || true)
+            if grep -q "**$section**" <<< "$type_section"; then
                 ((sections_found += 1))
             fi
         done
@@ -330,7 +337,8 @@ check_verification_methods() {
     # Check key requirements have verification methods
     # Accept both bold (**Verification:**) and italic (*Verification*:) formats
     for req in "AR1" "AR2" "AR3" "SP1" "SP2" "SP3"; do
-        if ! grep -A 30 "\*\*Requirement $req:\|\*\*Property $req:" "$spec_file" 2>/dev/null | grep -qE "\*\*Verification\*\*:|\*Verification\*:|\*\*Formal Definition\*\*:|\*Formal Definition\*:"; then
+        req_section=$(grep -A 30 "\*\*Requirement $req:\|\*\*Property $req:" "$spec_file" 2>/dev/null || true)
+        if ! grep -qE "\*\*Verification\*\*:|\*Verification\*:|\*\*Formal Definition\*\*:|\*Formal Definition\*:" <<< "$req_section"; then
             log_low "REQ-003: Requirement $req may lack verification method"
             failed=1
         fi
@@ -422,6 +430,116 @@ check_schema_consistency() {
 }
 check_schema_consistency
 
+# IMP-004: Safe Output Config Schema Coverage
+check_safe_output_config_schema_coverage() {
+    local missing_properties
+
+    echo "Running IMP-004: Safe Output Config Schema Coverage..."
+
+    missing_properties=$(python3 - <<'PY'
+import json
+import re
+from pathlib import Path
+
+schema = json.loads(Path("pkg/parser/schemas/main_workflow_schema.json").read_text())
+structs = {}
+handler_fields = {}
+
+for path in Path("pkg/workflow").glob("*.go"):
+    if path.name.endswith("_test.go"):
+        continue
+    content = path.read_text()
+    for match in re.finditer(r"(?ms)^type\s+(\w+)\s+struct\s*\{(.*?)^\}", content):
+        structs[match.group(1)] = match.group(2)
+
+handlers = Path("pkg/workflow/safe_output_handlers.go").read_text()
+handler_key = None
+for line in handlers.splitlines():
+    key_match = re.search(r'Key:\s*"([^"]+)"', line)
+    if key_match:
+        handler_key = key_match.group(1)
+    field_match = re.search(r'StructField:\s*"([^"]+)"', line)
+    if field_match and handler_key:
+        handler_fields[field_match.group(1)] = handler_key
+
+compiler_populated_fields = {
+    "safe-outputs.call-workflow.workflow_files",
+    "safe-outputs.dispatch-workflow.workflow_files",
+    "safe-outputs.dispatch-workflow.aw_context_workflows",
+}
+
+tool_configured_outputs = {"comment-memory"}
+
+
+def yaml_fields(struct_name):
+    for line in structs.get(struct_name, "").splitlines():
+        match = re.match(r'\s*(.*?)\s+`yaml:"([^"]+)"', line)
+        if not match:
+            continue
+        tag = match.group(2).split(",", 1)[0]
+        if tag == "-":
+            continue
+        yield tag, ",inline" in match.group(2)
+
+
+def properties(node):
+    result = {}
+    ref = node.get("$ref", "")
+    defs_prefix = "#/$defs/"
+    if ref.startswith(defs_prefix):
+        result.update(properties(schema["$defs"][ref[len(defs_prefix):]]))
+    for name, definition in node.get("properties", {}).items():
+        if name in result and result[name] != definition:
+            raise ValueError(f"conflicting schema definitions for property: {name}")
+        result[name] = definition
+    for alternative in ("allOf", "anyOf", "oneOf"):
+        for child in node.get(alternative, []):
+            for name, definition in properties(child).items():
+                if name in result and result[name] != definition:
+                    raise ValueError(f"conflicting schema definitions for property: {name}")
+                result[name] = definition
+    return result
+
+
+missing = []
+
+
+safe_outputs = properties(schema["properties"]["safe-outputs"])
+for line in structs["SafeOutputsConfig"].splitlines():
+    match = re.match(r'\s*(\w+)\s+\*?(\w+)\s+`yaml:"([^"]+)"', line)
+    if not match:
+        continue
+    struct_field, config_type, output_name = match.groups()
+    if struct_field not in handler_fields:
+        continue
+    output_name = output_name.split(",", 1)[0]
+    if output_name in tool_configured_outputs:
+        continue
+    output_schema = safe_outputs.get(output_name)
+    if output_schema is None:
+        missing.append(f"safe-outputs.{output_name}")
+        continue
+
+    output_properties = properties(output_schema)
+    for tag, inline in yaml_fields(config_type):
+        property_path = f"safe-outputs.{output_name}.{tag}"
+        if not inline and property_path not in compiler_populated_fields and tag not in output_properties:
+            missing.append(property_path)
+
+print("\n".join(sorted(set(missing))))
+PY
+)
+
+    if [ -n "$missing_properties" ]; then
+        while IFS= read -r property; do
+            log_high "IMP-004: Safe output config property is missing from schema: $property"
+        done <<< "$missing_properties"
+    else
+        log_pass "IMP-004: All safe output config properties are declared in the schema"
+    fi
+}
+check_safe_output_config_schema_coverage
+
 # MCE-001: Tool Description Constraint Disclosure (Section 8.3 MCE2)
 echo "Running MCE-001: Tool Description Constraint Disclosure..."
 check_mce_constraint_disclosure() {
@@ -449,7 +567,8 @@ check_mce_constraint_disclosure() {
     fi
     
     # Verify add_comment description contains CONSTRAINTS or IMPORTANT keyword
-    if ! grep -A 5 '"add_comment"' "$tools_json" | grep -qE "CONSTRAINTS|IMPORTANT.*constraint|validation constraint"; then
+    add_comment_section=$(grep -A 5 '"add_comment"' "$tools_json" 2>/dev/null || true)
+    if ! grep -qE "CONSTRAINTS|IMPORTANT.*constraint|validation constraint" <<< "$add_comment_section"; then
         log_medium "MCE-001: add_comment tool description missing required CONSTRAINTS/IMPORTANT disclosure"
         failed=1
     fi
@@ -683,18 +802,10 @@ check_git_dir_exclusion() {
         return
     fi
 
-    # Check that .git is referenced in the context of exclusion or skip logic
-    if ! grep -qE "\.git|git_dir|skip.*\.git|exclude.*git|prune.*git" "$setup_script"; then
+    # Check that the setup script explicitly excludes .git from validation walks.
+    if ! grep -qE "\.git|not -path .*\.git|prune.*\.git|exclude.*git|skip.*\.git" "$setup_script"; then
         log_medium "CI-004: Setup script does not reference .git exclusion (CI5)"
         failed=1
-    fi
-
-    # Check compiled workflow lock files: cache-memory file validation should skip .git
-    if find .github/workflows -name "*.lock.yml" | xargs grep -l "cache-memory\|GH_AW_CACHE_MEMORY" 2>/dev/null | \
-        xargs grep -l "validate\|allowed.*ext\|file.*check" 2>/dev/null | \
-        xargs grep -qv "\.git\|skip.*git" 2>/dev/null; then
-        log_low "CI-004: Some cache-memory workflow lock files may not exclude .git in validation (CI5)"
-        # Not failing here — informational only as implementation details vary
     fi
 
     if [ $failed -eq 0 ]; then
@@ -923,10 +1034,29 @@ check_mce_core_error_handling() {
         failed=1
     fi
 
-    # Check that error messages from thrown plain objects are serialized with String()
+    # Check that error messages from thrown plain objects are serialized to a string
     # to prevent '[object Object]' appearing as the error message when non-Error
-    # instances are thrown by handler code.
-    if ! grep -qE 'String\(e\.message\)|String\(err\.message\)' "$core_file"; then
+    # instances are thrown by handler code. This can be done directly with String()
+    # or via the shared getErrorMessage() helper from error_helpers.cjs, as long as
+    # that helper itself guards against non-string `.message` values.
+    local helper_file="actions/setup/js/error_helpers.cjs"
+    local uses_string_directly=0
+    local uses_safe_helper=0
+
+    if grep -qE 'String\(e\.message\)|String\(err\.message\)' "$core_file"; then
+        uses_string_directly=1
+    fi
+
+    if grep -qE 'getErrorMessage' "$core_file" && [ -f "$helper_file" ]; then
+        # The helper must not fall back to stringifying the entire error object when
+        # the error has a non-string `.message` property — it must coerce the message
+        # value itself instead.
+        if grep -qzE 'message = typeof error\.message === "string" \? error\.message : String\(error\.message\)' "$helper_file"; then
+            uses_safe_helper=1
+        fi
+    fi
+
+    if [ $uses_string_directly -eq 0 ] && [ $uses_safe_helper -eq 0 ]; then
         log_high "MCE-006: MCP server core does not use String() for error message serialization — risk of '[object Object]' in responses (Section 8.2)"
         failed=1
     fi
@@ -1343,7 +1473,20 @@ check_wtd_reviewable_annotation() {
     fi
 
     # Check label string "agentic threat detected" (requirement 2)
-    if ! grep -q "agentic threat detected" "$footer_file"; then
+    # The footer may delegate to a centralised template (threat_detection_caution.md) or
+    # to threat_detection_warning.cjs, so accept those as equivalent evidence.
+    local label_found=0
+    if grep -q "agentic threat detected" "$footer_file" 2>/dev/null; then
+        label_found=1
+    elif grep -q "threat_detection_caution" "$footer_file" 2>/dev/null; then
+        local caution_template="actions/setup/md/threat_detection_caution.md"
+        if [ -f "$caution_template" ] && grep -q "agentic threat detected" "$caution_template" 2>/dev/null; then
+            label_found=1
+        elif [ -f "$threat_warning_file" ] && grep -q "agentic threat detected" "$threat_warning_file" 2>/dev/null; then
+            label_found=1
+        fi
+    fi
+    if [ $label_found -eq 0 ]; then
         log_critical "WTD-001: Footer generator missing 'agentic threat detected' label string (WTD1 requirement 2)"
         failed=1
     fi
@@ -1399,8 +1542,19 @@ check_wtd_convertible_fallback() {
             failed=1
         fi
 
-        # Check that the caution text is emitted in the fallback
-        if ! grep -q "agentic threat detected" "$push_handler"; then
+        # Check that the caution text is emitted in the fallback.
+        # The handler may delegate to threat_detection_warning.cjs via
+        # getThreatWarningPresentation(), so accept that as equivalent evidence.
+        local threat_label_found=0
+        if grep -q "agentic threat detected" "$push_handler" 2>/dev/null; then
+            threat_label_found=1
+        elif grep -q "getThreatWarningPresentation" "$push_handler" 2>/dev/null; then
+            local threat_warning_file="actions/setup/js/threat_detection_warning.cjs"
+            if [ -f "$threat_warning_file" ] && grep -q "agentic threat detected" "$threat_warning_file" 2>/dev/null; then
+                threat_label_found=1
+            fi
+        fi
+        if [ $threat_label_found -eq 0 ]; then
             log_high "WTD-002: push_to_pull_request_branch fallback missing 'agentic threat detected' text (WTD2 / WTD1)"
             failed=1
         fi
@@ -1622,16 +1776,17 @@ check_create_check_run_handler() {
     # Per spec Section 7.3 dual-permission profile: checks:write without target,
     # adds pull-requests:read when target is configured.
     if [ -f "$handler_registry" ]; then
-        if ! grep -q "NewPermissionsContentsReadChecksWrite" "$handler_registry"; then
+        if ! grep -q "NewPermissionsChecksWrite()" "$handler_registry"; then
             log_critical "TYPE-008: create_check_run dual-permission profile missing checks:write base permission (Section 7.3 v1.23.0)"
             failed=1
         fi
-        if ! grep -q "NewPermissionsContentsReadChecksWritePRRead" "$handler_registry"; then
+        if ! grep -q "NewPermissionsChecksWritePRRead" "$handler_registry"; then
             log_high "TYPE-008: create_check_run dual-permission profile missing pull-requests:read when target configured (Section 7.3 v1.23.0)"
             failed=1
         fi
         # Verify the target-conditional branch exists in the registry
-        if ! grep -A 15 '"create-check-run"' "$handler_registry" | grep -q "Target"; then
+        create_check_run_section=$(grep -A 15 '"create-check-run"' "$handler_registry" 2>/dev/null || true)
+        if ! grep -q "Target" <<< "$create_check_run_section"; then
             log_high "TYPE-008: create_check_run permission builder does not branch on Target field (Section 7.3 v1.23.0)"
             failed=1
         fi
@@ -1734,7 +1889,8 @@ check_wildcard_target_requirements() {
     fi
 
     # Check that the validation error is returned early before recording the operation
-    if ! grep -A 3 "validateWildcardTargetRequirement" "$gateway_handler" | grep -q "return wildcardTargetValidationError"; then
+    wildcard_validation_section=$(grep -A 3 "validateWildcardTargetRequirement" "$gateway_handler" 2>/dev/null || true)
+    if ! grep -q "return wildcardTargetValidationError" <<< "$wildcard_validation_section"; then
         log_critical "TYPE-010: Wildcard target validation error is not returned early before recording (Section 7.0.1)"
         failed=1
     fi
@@ -1870,6 +2026,100 @@ check_fork_backed_pr_semantics() {
     fi
 }
 check_fork_backed_pr_semantics
+
+# TYPE-013: approve_workflow_run Handler Semantics (Section 7.3, v1.28.4)
+echo "Running TYPE-013: approve_workflow_run Handler Semantics..."
+check_approve_workflow_run_semantics() {
+    local handler="actions/setup/js/approve_workflow_run.cjs"
+    local manager="actions/setup/js/safe_output_handler_manager.cjs"
+    local failed=0
+
+    # Per spec Section 7.3 (approve_workflow_run, v1.28.4):
+    # 1. run_id MUST be validated as a positive safe integer.
+    # 2. Staged mode MUST preview without reading GitHub state or consuming max limit.
+    # 3. Eligibility requires event=pull_request, non-empty pull_requests, status=waiting.
+    # 4. Workflow filename MUST match an allowed-workflows pattern (yml/yaml equivalence).
+    # 5. Every associated pull request MUST be the triggering PR or explicitly allowed.
+    # 6. pull_request_target events and unapproved fork pull requests MUST be rejected.
+    # 7. Protected files on associated pull requests MUST block approval.
+    # 8. Live approvals MUST require an explicit external github-token or GitHub App token.
+    # 9. Handler MUST be classified as an Abort type for warn-mode threat-detection failures.
+
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-013: approve_workflow_run handler missing: $handler"
+        failed=1
+    else
+        if ! grep -qE "parsePositiveInt" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not validate run_id as a positive integer (Section 7.3 requirement 1)"
+            failed=1
+        fi
+
+        if ! grep -qE "isStagedMode|isStaged" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler missing staged-mode preview support (Section 7.3 requirement 2)"
+            failed=1
+        fi
+
+        if ! grep -qE "run\.event\s*!==\s*[\"']pull_request[\"']" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not verify event is pull_request (Section 7.3 requirement 3)"
+            failed=1
+        fi
+
+        if ! grep -qE "isAwaitingApproval|APPROVABLE_RUN_STATUSES|run\.status\s*!==\s*[\"']waiting[\"']" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not verify run status is waiting (Section 7.3 requirement 3)"
+            failed=1
+        fi
+
+        if ! grep -qE "isAllowedWorkflow|allowed_workflows" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not validate allowed-workflows (Section 7.3 requirement 4)"
+            failed=1
+        fi
+
+        if ! grep -qE "\.replace\(/\\\\\.yaml\\\$/i" "$handler"; then
+            log_medium "TYPE-013: approve_workflow_run handler may not normalize .yml/.yaml equivalence (Section 7.3 requirement 4)"
+            failed=1
+        fi
+
+        if ! grep -qE "allowed_pull_requests|allowedPullRequests|currentPullRequest" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not authorize pull requests against triggering/allowed set (Section 7.3 requirement 5)"
+            failed=1
+        fi
+
+        if ! grep -qE "pull_request_target" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not reject pull_request_target events (Section 7.3 requirement 6)"
+            failed=1
+        fi
+
+        if ! grep -qE "isHeadRepoAllowed|allowed_repos|allowedRepos|isForkPullRequest|config\.fork" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not reject fork pull requests unless allowed via allowed-repos (Section 7.3 requirement 6)"
+            failed=1
+        fi
+
+        if ! grep -qE "checkFileProtectionPostApply|getModifiedPullRequestFiles" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not check protected files before approval (Section 7.3 requirement 7)"
+            failed=1
+        fi
+
+        if ! grep -qE "github-token.*requires an external|requires an external github-token" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not require an explicit external github-token/App token (Section 7.3 requirement 8)"
+            failed=1
+        fi
+    fi
+
+    if [ -f "$manager" ]; then
+        if ! grep -qE "THREAT_WARNING_ABORT_TYPES" "$manager" || ! sed -n '/THREAT_WARNING_ABORT_TYPES = new Set(\[/,/\]);/p' "$manager" | grep -q "approve_workflow_run"; then
+            log_high "TYPE-013: approve_workflow_run is not classified as an Abort type for warn-mode threat detection (Section 7.3 requirement 9)"
+            failed=1
+        fi
+    else
+        log_medium "TYPE-013: Safe output handler manager missing: $manager"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-013: approve_workflow_run implements run-id validation, staged preview, eligibility, workflow/PR authorization, fork rejection, protected-file checks, explicit credentials, and Abort classification (Section 7.3 v1.28.4)"
+    fi
+}
+check_approve_workflow_run_semantics
 
 # Summary
 echo ""

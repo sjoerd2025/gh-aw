@@ -81,7 +81,7 @@ jobs:
   super_linter:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run Super-Linter
         uses: super-linter/super-linter@v7
         env:
@@ -123,7 +123,7 @@ jobs:
       group: my-runner-group
       labels: [self-hosted, linux]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 ```
 
 When imports define the same `jobs.<job-id>.setup-steps` or `jobs.<job-id>.pre-steps`, gh-aw merges that field deterministically: imported steps run first, then main-workflow steps. The two fields stay separate; `setup-steps` are never folded into `pre-steps` or vice versa.
@@ -156,6 +156,25 @@ Set `jobs.<job-id>.restore-memory: true` to restore any configured `cache-memory
 | `detection` | `jobs.detection.setup-steps` → compiler setup checkout/setup → `jobs.detection.pre-steps` → built-in detection steps |
 | `unlock` | `jobs.unlock.setup-steps` → compiler setup checkout/setup → `jobs.unlock.pre-steps` → built-in unlock steps |
 
+Built-in job sections also support additive `needs` and `if` overrides. For example, use `jobs.agent.needs` and `jobs.agent.if` to gate the generated agent job on a custom setup job without relying on `on.needs` plus a top-level workflow `if`:
+
+```yaml wrap
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      outcome: ${{ steps.result.outputs.outcome }}
+    steps:
+      - id: result
+        run: echo "outcome=failure" >> "$GITHUB_OUTPUT"
+
+  agent:
+    needs: [build]
+    if: needs.build.outputs.outcome == 'failure'
+```
+
+`jobs.<built-in>.needs` is merged with compiler-generated dependencies, and `jobs.<built-in>.if` is combined with compiler-generated conditions using logical `&&`. `jobs.<built-in>.timeout-minutes` is accepted for the `agent` and `detection` jobs only; see [Agent and Detection Job Timeouts](#agent-and-detection-job-timeouts).
+
 Example using `timeout-minutes` and `env`:
 
 ```yaml wrap
@@ -166,9 +185,41 @@ jobs:
     env:
       NODE_ENV: production
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: npm ci && npm run build
 ```
+
+### Agent and Detection Job Timeouts
+
+The generated `agent` and `detection` jobs are bounded by their own
+`timeout-minutes` values, independently from the top-level `timeout-minutes`
+that bounds the `agentic_execution` step:
+
+| Timeout | Default | GitHub Actions variable |
+| --- | --- | --- |
+| `agent` job | 60 minutes | `GH_AW_DEFAULT_AGENT_JOB_TIMEOUT_MINUTES` |
+| `detection` job and its execution step | 10 minutes | `GH_AW_DEFAULT_DETECTION_JOB_TIMEOUT_MINUTES` |
+| `agentic_execution` step (top-level `timeout-minutes`) | 20 minutes | `GH_AW_DEFAULT_TIMEOUT_MINUTES` |
+
+Set those variables at the repository, organization, or enterprise level to
+change the defaults without editing frontmatter. When top-level
+`timeout-minutes` requests a longer agentic step than the default agent job
+budget, the default agent job budget is raised to match it.
+
+Override either generated job independently when setup or post-processing needs
+a different budget:
+
+```yaml wrap
+jobs:
+  agent:
+    timeout-minutes: 90
+  detection:
+    timeout-minutes: 30
+```
+
+When a job reaches its timeout, GitHub Actions cancels all remaining steps in
+that job; the workflow conclusion reports the job as `timed_out`. A job-level
+timeout therefore covers setup steps as well as the agentic execution step.
 
 ### Job Outputs
 
@@ -183,14 +234,15 @@ jobs:
     steps:
       - id: get_release
         run: echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
----
+```
 
+```markdown
 Generate highlights for release ${{ needs.release.outputs.version }}.
 ```
 
 Job outputs must be string values.
 
-## Related Documentation
+## Learn More
 
 - [DeterministicOps](/gh-aw/patterns/deterministic-ops/) — Patterns combining deterministic steps with AI reasoning
 - [Frontmatter Reference](/gh-aw/reference/frontmatter/) — Complete frontmatter field reference

@@ -43,6 +43,7 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 | [Create PR](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-creation-create-pull-request) | `create-pull-request` | Create pull requests with code changes (default max: 1, configurable) |
 | [Update PR](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-updates-update-pull-request) | `update-pull-request` | Update PR title or body (max: 1) |
 | [Close PR](/gh-aw/reference/safe-outputs-pull-requests/#close-pull-request-close-pull-request) | `close-pull-request` | Close pull requests without merging (max: 10) |
+| [Approve Workflow Run](/gh-aw/reference/safe-outputs-pull-requests/#approve-workflow-run-approve-workflow-run) | `approve-workflow-run` | Approve a pending workflow run in the "action required" state (max: 1, experimental) |
 | [Merge PR](/gh-aw/reference/safe-outputs-pull-requests/#merge-pull-request-merge-pull-request) | `merge-pull-request` | Merge pull requests after policy gates pass (max: 1, experimental) |
 | [PR Review Comments](/gh-aw/reference/safe-outputs-pull-requests/#pr-review-comments-create-pull-request-review-comment) | `create-pull-request-review-comment` | Create review comments on code lines (max: 10) |
 | [Reply to PR Review Comment](/gh-aw/reference/safe-outputs-pull-requests/#reply-to-pr-review-comment-reply-to-pull-request-review-comment) | `reply-to-pull-request-review-comment` | Reply to existing review comments (max: 10) |
@@ -65,6 +66,15 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 | [Set Issue Type](#set-issue-type-set-issue-type) | `set-issue-type` | Set or clear the type of GitHub issues (max: 5) |
 | [Set Issue Field](#set-issue-field-set-issue-field) | `set-issue-field` | Set one issue field value by name/value (max: 5) |
 
+### External Integrations
+
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Jira Create Issue](#jira-safe-outputs) | `jira-create-issue` | Create a Jira issue (max: 1) |
+| [Jira Update Issue](#jira-safe-outputs) | `jira-update-issue` | Update a Jira issue summary or description (max: 1) |
+| [Jira Add Comment](#jira-safe-outputs) | `jira-add-comment` | Add a comment to a Jira issue (max: 1) |
+| [Jira Add Label](#jira-safe-outputs) | `jira-add-label` | Add one label to a Jira issue (max: 1) |
+
 ### Projects, Releases & Assets
 
 | Output | Key | Description |
@@ -75,6 +85,17 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 | [Update Release](#release-updates-update-release) | `update-release` | Update GitHub release descriptions (max: 1) |
 | [Upload Artifact](#artifact-uploads-upload-artifact) | `upload-artifact` | Upload files as run-scoped GitHub Actions artifacts (max: 1 by default) |
 | [Upload Assets](#asset-uploads-upload-asset) | `upload-asset` | Upload files to orphaned git branch (max: 10, same-repo only). **Prefer `upload-artifact` with `skip-archive` instead.** |
+
+### Azure DevOps Work Items
+
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Create Work Item](#azure-devops-work-items) | `ado-create-work-item` | Create an Azure DevOps work item (max: 1, experimental) |
+| [Update Work Item](#azure-devops-work-items) | `ado-update-work-item` | Update explicitly enabled fields on a scoped work item (max: 1, experimental) |
+| [Comment on Work Item](#azure-devops-work-items) | `ado-comment-on-work-item` | Add a comment to a scoped work item (max: 1, experimental) |
+| [Assign Work Item](#azure-devops-work-items) | `ado-assign-work-item` | Assign an allowed identity to a scoped work item (max: 1, experimental) |
+| [Link Work Items](#azure-devops-work-items) | `ado-link-work-items` | Link two scoped work items (max: 5, experimental) |
+| [Upload Work Item Attachment](#azure-devops-work-items) | `ado-upload-workitem-attachment` | Attach a staged workspace file to a work item (max: 1, experimental) |
 
 ### Security & Agent Tasks
 
@@ -87,6 +108,39 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 | [Autofix Code Scanning Alerts](#autofix-code-scanning-alerts-autofix-code-scanning-alert) | `autofix-code-scanning-alert` | Create automated fixes for code scanning alerts (max: 10, same-repo only) |
 | [Create Check Run](#check-run-creation-create-check-run) | `create-check-run` | Create GitHub Check Runs to surface analysis results in the PR checks UI (default max: 1, same-repo only) |
 | [Create Agent Session](/gh-aw/reference/copilot-cloud-agent/#create-agent-session) | `create-agent-session` | Create Copilot coding agent sessions (max: 1) |
+
+### Linear
+
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Create Linear Issue](#linear-safe-outputs) | `linear-create-issue` | Create an issue in a configured Linear team (max: 1, experimental) |
+| [Add Linear Comment](#linear-safe-outputs) | `linear-add-comment` | Comment on a configured Linear issue (max: 1, experimental) |
+| [Update Linear Issue](#linear-safe-outputs) | `linear-update-issue` | Update enabled fields on a configured Linear issue (max: 1, experimental) |
+
+#### Linear Safe Outputs
+
+:::caution[Experimental]
+Linear Safe Outputs are experimental. Compiling a workflow that enables any Linear Safe Output emits `Using experimental feature: Linear safe outputs`.
+:::
+
+Linear Safe Outputs use Linear's public GraphQL API from the isolated `safe_outputs` job. Configure a personal Linear API key through a secret expression. The credential is not available to the agent.
+
+```yaml wrap
+safe-outputs:
+  linear-token: ${{ secrets.LINEAR_API_KEY }}
+  linear-create-issue:
+    team-id: ${{ vars.LINEAR_TEAM_ID }}
+    project-id: "810f57a7e383"
+    max: 1
+  linear-add-comment:
+    target: "ENG-123"
+  linear-update-issue:
+    target: "ENG-123"
+    title: true
+    body: true
+```
+
+`team-id` accepts a Linear team model UUID, available through Linear's model UUID tooling or API, or a GitHub Actions expression such as `${{ vars.LINEAR_TEAM_ID }}`. Optional `project-id` fixes new issues to a trusted project and accepts either the 12-character identifier from a Linear project URL or its model UUID. When omitted, the compiler loads `LINEAR_TEAM_ID` and `LINEAR_PROJECT_ID` from same-named repository or organization variables. Values in `safe-outputs.env` can override those defaults; explicit `team-id` and `project-id` values take precedence over environment fallbacks. Comment and update targets are fixed trusted configuration and accept either a Linear issue model UUID or shorthand identifier such as `ENG-123`. Updates replace only the enabled `title` and `body` fields. All agent-provided titles, descriptions, and comments use standard Safe Outputs sanitization.
 
 ### System Types (Auto-Enabled)
 
@@ -104,6 +158,75 @@ Create custom post-processing jobs registered as Model Context Protocol (MCP) to
 ### GitHub Action Wrappers (`actions:`)
 
 Mount any public GitHub Action as a once-callable MCP tool. The compiler pins the action reference to a SHA at compile time and derives the tool's input schema from the action's `action.yml`. See [GitHub Action Wrappers](/gh-aw/reference/custom-safe-outputs/#github-action-wrappers-safe-outputsactions).
+
+## Jira Safe Outputs
+
+Jira safe outputs call Jira Cloud REST API v3 from the privileged safe-output job. Jira credentials are not exposed to the agent or included in `agent_output`.
+
+```aw wrap
+---
+on:
+  workflow_dispatch:
+safe-outputs:
+  env:
+    JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+    JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+    JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+  jira-create-issue:
+    max: 1
+  jira-update-issue:
+    max: 1
+  jira-add-comment:
+    max: 1
+  jira-add-label:
+    max: 3
+---
+
+# Jira maintenance
+
+Use Jira safe outputs for Jira mutations.
+```
+
+`JIRA_BASE_URL` is the Jira API base without `/rest/api/3`. For unscoped API tokens, use the site URL, such as `https://example.atlassian.net`. For scoped API tokens, use the Atlassian gateway URL, such as `https://api.atlassian.com/ex/jira/<cloudId>`. The initial authentication mechanism uses an Atlassian account email and API token with HTTP Basic authentication.
+
+Each output accepts `max` and `staged`. In staged mode, the handler writes a Jira-specific preview without requiring credentials or sending an HTTP request.
+
+| Frontmatter key | Agent tool | Inputs |
+|---|---|---|
+| `jira-create-issue` | `jira_create_issue` | Required: `project_key`, `issue_type`, `summary`; optional: `description` |
+| `jira-update-issue` | `jira_update_issue` | Required: `issue_key`; at least one of `summary` or `description` |
+| `jira-add-comment` | `jira_add_comment` | Required: `issue_key`, `body` |
+| `jira-add-label` | `jira_add_label` | Required: `issue_key`, `label` |
+
+Descriptions and comment bodies remain plain strings at the agent boundary. The runtime converts them deterministically to Atlassian Document Format version 1, preserving paragraphs and line breaks. `jira_add_label` uses Jira's additive field-update operation and does not replace existing labels.
+
+> [!IMPORTANT]
+> Unprefixed tools such as `create_issue`, `update_issue`, `add_comment`, and `add_labels` operate on GitHub. Jira operations always use the `jira_` prefix.
+
+This initial integration does not support transitions, assignment, custom fields, priorities, components, attachments, issue links, subtasks, label removal, JQL, bulk operations, arbitrary Jira REST calls, or OAuth installation flows. Update, comment, and label operations require a known Jira issue key; they cannot reference a Jira issue created earlier in the same run.
+
+## Steering Issues (`steer:`)
+
+:::caution[Experimental]
+`steer` is an experimental option. `gh aw compile` emits an experimental feature warning when a workflow uses it.
+:::
+
+Set `steer: true` to create a run-scoped issue during the activation job, before the agent starts. Users can add comments containing the keyword `steer` while the run is in progress. The injected prompt identifies the exact issue and instructs the agent to read relevant user-authored comments with the GitHub MCP `issue_read` tool.
+
+Steering enables the GitHub MCP issues toolset for comment reads and requires top-level `issues: read` permission. The compiler reports an error instead of adding that permission automatically.
+
+```yaml
+permissions:
+  contents: read
+  issues: read
+
+safe-outputs:
+  steer: true
+```
+
+The activation and conclusion jobs require `issues: write` through the global [`github-token`](#custom-github-token-github-token) or [`github-app`](#using-a-github-app-for-authentication-github-app) safe-output credential. On success, the conclusion job closes the steering issue and links a created pull request when available. On failure, the same issue is retitled and updated with the agent failure report instead of creating a second issue. Because reuse requires a workflow-repository issue, `steer` cannot be combined with `safe-outputs.failure-issue-repo`.
+
+In [staged mode](#staged-mode), no steering issue is created because staged runs must not perform API side effects.
 
 ### Issue Creation (`create-issue:`)
 
@@ -140,7 +263,7 @@ See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for compre
 |-----------|------|----------|-------------|---------|
 | `fields` | `array<object>` | No | Optional issue field updates to apply immediately after issue creation. | `[{"name":"Priority","value":"P1"}]` |
 | `fields[].name` | `string` | Yes (when item exists) | Issue field display name. Match the repository field label (case-insensitive matching is supported). | `"Priority"` |
-| `fields[].value` | `string \| number` | Yes (when item exists) | Field value. Use a number for numeric fields; otherwise use a string (single select, iteration title, date `YYYY-MM-DD`, text). | `"Sprint 42"` |
+| `fields[].value` | `string \| number` | Yes (when item exists) | Field value. Use a number for numeric fields; otherwise use a string (single select, date `YYYY-MM-DD`, text). For multi-select fields, pass a comma-separated list of option names to select multiple options. | `"Sprint 42"` |
 
 ```json
 {
@@ -149,7 +272,7 @@ See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for compre
   "body": "Intermittent failure detected in CI.",
   "fields": [
     { "name": "Priority", "value": "High" },
-    { "name": "Iteration", "value": "Sprint 42" },
+    { "name": "Tags", "value": "Bug, Regression" },
     { "name": "Story Points", "value": 3 }
   ]
 }
@@ -283,6 +406,7 @@ safe-outputs:
   add-comment:
     max: 3                       # max comments (default: 1)
     target: "*"                  # "triggering" (default), "*", or number
+    allows-comment-ids: ${{ needs.prepare.outputs.comment_ids }} # comment IDs the agent may update when target is "*"
     discussions: true            # request discussions:write permission (default: false)
     target-repo: "owner/repo"    # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
@@ -296,6 +420,8 @@ safe-outputs:
 
 > [!TIP]
 > Use `footer: false` to suppress the "Generated by..." attribution line in posted comments. See [Footer Control](/gh-aw/reference/footers/) for global and per-handler options.
+
+When `target: "*"` is configured, the agent may update an existing issue or pull request comment by passing `comment_id` only if that ID appears in `allows-comment-ids`. Populate `allows-comment-ids` from trusted workflow state (for example, an earlier step output) rather than agent output.
 
 #### Normalize closing keywords
 
@@ -344,6 +470,7 @@ safe-outputs:
   hide-comment:
     max: 5                    # max comments (default: 5)
     target-repo: "owner/repo" # cross-repository
+    discussions: true         # request discussions:write permission (default: false)
 ```
 
 ### Add Labels (`add-labels:`)
@@ -351,6 +478,8 @@ safe-outputs:
 Adds labels to issues or PRs. Specify `allowed` to restrict to specific labels or glob patterns, or `blocked` to deny specific label patterns regardless of the allow list.
 
 Use `required-labels` to only add labels to issues/PRs that already have **all** of the specified labels. Use `required-title-prefix` to only add labels to issues/PRs whose title starts with the given prefix.
+
+By default, labels that don't already exist in the target repository are rejected with an error. Set `create-if-missing: true` to automatically create any missing labels before they are applied.
 
 ```yaml wrap
 safe-outputs:
@@ -363,6 +492,7 @@ safe-outputs:
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     required-labels: [automated, bot]  # only operate if item has ALL of these labels
     required-title-prefix: "[bot] "    # only operate if item title starts with this prefix
+    create-if-missing: true            # auto-create labels that don't already exist (default: false)
 ```
 
 #### Blocked Label Patterns
@@ -400,6 +530,8 @@ safe-outputs:
   remove-labels:
     allowed: [automated, team-*] # restrict to specific labels or glob patterns (optional)
     blocked: ["~*"]              # deny removal of labels matching these glob patterns
+    issues: true                 # include issues: write permission (default: true)
+    pull-requests: false         # exclude pull-requests: write permission (default: true)
     max: 3                       # max operations (default: 3)
     target: "*"                  # "triggering" (default), "*", or number
     target-repo: "owner/repo"    # cross-repository
@@ -409,6 +541,8 @@ safe-outputs:
 ```
 
 **Target**: `"triggering"` (requires issue/PR event), `"*"` (any issue/PR), or number (specific issue/PR).
+
+Set `issues: false` or `pull-requests: false` to omit the corresponding write permission. Both default to `true` when omitted, and at least one must be enabled.
 
 When `allowed` is omitted or set to `null`, any labels can be removed. Use `allowed` to restrict removal to specific labels or glob patterns, providing control over which labels agents can manipulate. The `blocked` field takes precedence over `allowed`.
 
@@ -1073,6 +1207,48 @@ git checkout --orphan my-custom-branch && git rm -rf . && git commit --allow-emp
 
 **Outputs**: `published_count`, `branch_name`. **Limits**: Same-repo only, max 50MB/file, 100 assets/run.
 
+### Azure DevOps Work Items
+
+Azure DevOps work-item safe outputs use the same public tool names as [`ado-aw`](https://githubnext.github.io/ado-aw/reference/safe-outputs/). The agent remains read-only; the safe-output job performs trusted Azure DevOps REST requests.
+
+Provide the organization, project, and credential only to the safe-output job:
+
+> These safe outputs are experimental. Compiling a workflow emits an experimental feature warning for each configured Azure DevOps work-item output.
+
+```yaml wrap
+safe-outputs:
+  env:
+    AZURE_DEVOPS_ORG_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+    SYSTEM_TEAMPROJECT: ${{ vars.AZURE_DEVOPS_PROJECT }}
+    AZURE_DEVOPS_EXT_PAT: ${{ secrets.AZURE_DEVOPS_EXT_PAT }}
+  ado-create-work-item:
+    work-item-type: Task
+    area-path: MyProject\Platform
+    allowed-tags: [agent-*]
+  ado-update-work-item:
+    target: MyProject\Platform
+    title: true
+    status: true
+  ado-comment-on-work-item:
+    target: MyProject\Platform
+  ado-assign-work-item:
+    target: "*"
+    allowed: [owner@example.com]
+  ado-link-work-items:
+    target: MyProject\Platform
+    allowed-link-types: [parent, child, related]
+  ado-upload-workitem-attachment:
+    target: MyProject\Platform
+    allowed-extensions: [.txt, .log, .pdf]
+    max-file-size: 5242880
+```
+
+Authentication uses `SYSTEM_ACCESSTOKEN` when present, otherwise `AZURE_DEVOPS_EXT_PAT`. `AZURE_DEVOPS_ORG_URL` must use `https://dev.azure.com/{organization}` or `https://{organization}.visualstudio.com`; redirects and embedded credentials are rejected.
+
+`ado_create_work_item` returns a run-scoped `#aw_...` temporary ID. The other work-item tools accept that ID, and same-run IDs bypass their consuming `target` policy because creation was already scoped by trusted configuration. Numeric IDs are checked against `target`, which accepts `"*"`, a single ID, a list of IDs, or an area-path prefix.
+
+For `ado-update-work-item`, each mutable field must be explicitly enabled. Assignment always rejects the reserved `Agency` and `GitHub Copilot` identities. Attachments must be regular workspace files and are checked for traversal, symbolic links, size, extension, and Azure Pipelines command sequences before upload.
+
 ### No-Op Logging (`noop:`)
 
 :::danger[Required when no action is taken]
@@ -1217,6 +1393,7 @@ safe-outputs:
 - **`target-repo`** (optional) - Target repository in `owner/repo` format for cross-repository dispatch.
 - **`allowed-repos`** (optional) - Allowlist of cross-repository dispatch targets. Required when `target-repo` points to a different repository. Supports repository slugs and wildcards such as `org/*`, or a GitHub Actions expression string (e.g. `"${{ inputs['allowed-repos'] }}"`) for dynamic allowlists.
 - **`target-ref`** (optional) - Git ref to dispatch on. In `workflow_call` relay scenarios, the compiler injects this automatically so the dispatch uses the target repository's branch or tag instead of the caller's `GITHUB_REF`.
+- **`allowed-refs`** (optional) - List of ref glob patterns that the agent is allowed to supply via `message.ref` at runtime. Supports arrays and GitHub Actions expressions resolving to a comma-separated list (e.g. `"${{ inputs['allowed-refs'] }}"`). When omitted, the repository default branch is allowed. Branch shorthand (`feature/*`) is automatically expanded to `refs/heads/feature/*`; `tags/v*` is expanded to `refs/tags/v*`; full `refs/…` patterns are used as-is.
 
 #### Validation Rules
 
@@ -1229,6 +1406,28 @@ At runtime, when exactly one workflow is configured, the agent may omit `workflo
 ```
 
 With `dispatch-workflow: [workflow-handler]`, that item is normalized to target `workflow-handler` automatically before validation.
+
+#### Per-call Ref Override
+
+When an agent needs to dispatch CI against a branch it just created, it can supply `ref` directly in the output payload:
+
+```json
+{
+  "type": "dispatch_workflow",
+  "workflow_name": "ci",
+  "ref": "feature/my-branch",
+  "inputs": { "reason": "validate new branch" }
+}
+```
+
+The repository default branch is allowed when `allowed-refs` is omitted. The ref is normalized before matching: bare branch names are expanded to `refs/heads/<name>`, `tags/…` to `refs/tags/…`, and full `refs/…` values are used as-is. Dispatches with a `message.ref` that does not match any configured pattern are rejected at runtime.
+
+Ref resolution priority:
+1. `message.ref` (highest — per-call override, restricted by configured or implicit `allowed-refs`)
+2. `target-ref` from configuration
+3. `GITHUB_HEAD_REF` (PR head branch)
+4. `GITHUB_REF` or `context.ref` (push/default branch)
+5. target repository default branch
 
 #### Defining Workflow Inputs
 
@@ -1645,17 +1844,51 @@ safe-outputs:
 - `needs.<job>.outputs.<name>`
 - `steps.<id>.outputs.<name>`
 
-The `steps.*.outputs.*` form is useful when the safe-outputs job mints a short-lived token in `pre-steps:` or `setup-steps:` and then reuses that token for `Process Safe Outputs` in the same job.
+The `steps.*.outputs.*` form is useful when a short-lived token is minted inside the job that uses it, for example with a keyless OIDC token-minting action. Step outputs are only readable inside the job that produced them, so the minting step must be injected into **every** job that consumes the token: the `agent` job (top-level `pre-steps:`), the `safe_outputs` job and the `conclusion` job (`jobs.<job>.pre-steps:` or `jobs.<job>.setup-steps:`).
+
+`pre-steps:` run before the job's checkout, git-credential and token-consuming steps, so the minted token is available everywhere it is needed. `safe-outputs.steps:` is not a valid place to mint such a token because it runs *after* the `safe_outputs` job checkout.
 
 ```yaml wrap
-pre-steps:
-  - id: fetch_token
-    run: echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
+permissions:
+  contents: read
+  id-token: write
+
+pre-steps:                        # agent job
+  - name: Mint token
+    id: mint_token
+    uses: octo-sts/action@v1.1.1
+    with:
+      scope: ${{ github.repository }}
+      identity: my-policy
 
 safe-outputs:
-  github-token: ${{ steps.fetch_token.outputs.token }}
-  create-pull-request:
+  github-token: ${{ steps.mint_token.outputs.token }}
+  push-to-pull-request-branch:
+
+jobs:
+  safe_outputs:
+    permissions:
+      id-token: write
+    pre-steps:
+      - name: Mint token
+        id: mint_token
+        uses: octo-sts/action@v1.1.1
+        with:
+          scope: ${{ github.repository }}
+          identity: my-policy
+  conclusion:
+    permissions:
+      id-token: write
+    pre-steps:
+      - name: Mint token
+        id: mint_token
+        uses: octo-sts/action@v1.1.1
+        with:
+          scope: ${{ github.repository }}
+          identity: my-policy
 ```
+
+The compiler fails compilation when a job consumes `${{ steps.<id>.outputs.* }}` but never declares a step with that id, or declares it after the first consumer, rather than emitting a lock file with an unresolvable reference.
 
 ### Using a GitHub App for Authentication (`github-app:`)
 
@@ -1804,16 +2037,18 @@ safe-outputs:
 ```yaml wrap
 safe-outputs:
   mentions:
-    allow-team-members: true    # Allow repo collaborators (default: true)
-    allow-context: true         # Allow event context participants (default: true)
-    allowed:                    # Individual users/bots always allowed
+    allowed-collaborators: true  # Allow repo collaborators (default: true)
+    allow-context: true          # Allow event context participants (default: true)
+    allowed:                     # Individual users/bots always allowed
       - trusted-bot
-    allowed-teams:              # Team members always allowed
-      - myorg/eng               # org/team-slug format
-      - reviewers               # team-slug only (uses current org)
-    max: 50                     # Max mentions per message (default: 50)
+    allowed-teams:               # Team members always allowed
+      - myorg/eng                # org/team-slug format
+      - reviewers                # team-slug only (uses current org)
+    max: 50                      # Max mentions per message (default: 50)
   add-comment: {}
 ```
+
+`allow-team-members` is a deprecated alias for `allowed-collaborators`. Run `gh aw fix` to migrate existing workflows.
 
 **`allowed-teams`** lets organizations allow all members of specific GitHub teams to be mentioned without listing individual usernames. Team members are fetched from the GitHub API at runtime using `GET /orgs/{org}/teams/{team_slug}/members`. Bot accounts within the team are excluded. Use `org/team-slug` for cross-org teams or just `team-slug` to resolve against the current repository's organization.
 
@@ -1866,6 +2101,24 @@ safe-outputs:
 
 `safe-outputs.runs-on` overrides `runs-on-slim:` for safe-output jobs specifically. To override the runner for all framework jobs at once, use the top-level [`runs-on-slim:`](/gh-aw/reference/self-hosted-runners/#configuring-the-framework-job-runner) field instead.
 
+Custom safe-jobs can select their own runner with `safe-outputs.jobs.<job>.runs-on`. This field supports runner labels, label arrays, and runner-group objects:
+
+```aw
+---
+safe-outputs:
+  jobs:
+    notify:
+      runs-on:
+        group: safe-job-runners
+        labels: [linux]
+      inputs:
+        message:
+          description: Notification message
+      steps:
+        - run: echo "Notify"
+---
+```
+
 ### Safe Outputs Job Concurrency (`concurrency-group:`)
 
 Control concurrency for the compiled `safe_outputs` job. When set, the job uses this group with `cancel-in-progress: false` (queuing semantics — in-progress runs are never cancelled).
@@ -1899,9 +2152,9 @@ safe-outputs:
 
 The `footer-install` template renders the install instructions that follow the footer attribution line. When a workflow source is available and no custom template is set, the default renders as a collapsed `<details>` disclosure with the summary `Add this agentic workflows to your repo`; the expanded block contains the `gh aw add {workflow_source}` command. Custom `footer-install` overrides bypass the disclosure wrapper, so include `<details>` markup explicitly if you want the same collapsed UX. Supported placeholders: `{workflow_source}`, `{workflow_source_url}`.
 
-**Variables**: `{workflow_name}`, `{run_url}`, `{agentic_workflow_url}`, `{triggering_number}`, `{triggering_type}`, `{workflow_source}`, `{workflow_source_url}`, `{event_type}`, `{status}`, `{operation}`, `{effective_tokens}`, `{effective_tokens_formatted}`, `{ai_credits_suffix}`, `{effective_tokens_suffix}`
+**Variables**: `{workflow_name}`, `{run_url}`, `{agentic_workflow_url}`, `{triggering_number}`, `{triggering_type}`, `{workflow_source}`, `{workflow_source_url}`, `{event_type}`, `{status}`, `{operation}`, `{effective_tokens}`, `{effective_tokens_formatted}`, `{ai_credits_suffix}`, `{effective_tokens_suffix}`, `{ai_credits}`, `{ai_credits_formatted}`, `{ai_model}`, `{ai_model_short}`, `{ai_credits_unit}`, `{detection_conclusion}`, `{detection_reason}`, `{agent_ai_credits_formatted}`, `{evals_ai_credits_formatted}`, `{threat_detection_ai_credits_formatted}`, `{history_link}`
 
-`{ai_credits_suffix}` is the preferred pre-formatted, always-safe suffix for run cost (for example, `" · sonnet46 12.4 AIC"` or `""`) and can be inserted directly into footer templates alongside `{history_link}`. `{effective_tokens}` and `{effective_tokens_formatted}` remain available as legacy ET compatibility fields. `{effective_tokens_suffix}` is also preserved as a legacy alias for older templates. When the run's engine model is known, the suffix is prefixed with a deterministic compact model identifier — `sonnetNN` for Sonnet, `gptNN` for GPT, `opusNN` for Opus, `haikuNN` for Haiku, `gemNN` for Gemini, with a stable fallback for other models. Direct short aliases like `opus`, `sonnet`, and `haiku` are preserved. The default footer uses AI Credits formatting; use these variables to customize output as needed. See [AI Credits Specification](/gh-aw/specs/ai-credits-specification/) for AIC details and [Effective Tokens Specification](/gh-aw/specs/effective-tokens-specification/) for legacy ET computation.
+`{ai_credits_suffix}` is the preferred pre-formatted, always-safe suffix for run cost (for example, `" · sonnet46 12.4 AIC"` or `""`) and can be inserted directly into footer templates alongside `{history_link}`. `{effective_tokens}` and `{effective_tokens_formatted}` remain available as legacy ET compatibility fields. `{effective_tokens_suffix}` is also preserved as a legacy alias for older templates. When the run's engine model is known, the suffix is prefixed with a deterministic compact model identifier — `sonnetNN` for Sonnet, `gptNN` for GPT, `opusNN` for Opus, `haikuNN` for Haiku, `gemNN` for Gemini, with a stable fallback for other models. Direct short aliases like `opus`, `sonnet`, and `haiku` are preserved. The default footer uses AI Credits formatting; use these variables to customize output as needed. Individual components are also available: `{ai_model}` is the full model name (e.g. `claude-sonnet-4.6`), `{ai_model_short}` is the compact identifier (e.g. `sonnet46`), `{ai_credits_unit}` is always `AIC`, `{detection_conclusion}` and `{detection_reason}` expose the threat detection result. See [AI Credits Specification](/gh-aw/specs/ai-credits-specification/) for AIC details and [Effective Tokens Specification](/gh-aw/specs/effective-tokens-specification/) for legacy ET computation.
 
 ## Staged Mode
 
@@ -1953,7 +2206,7 @@ The `apply_safe_outputs` job downloads the `agent_output.json` artifact from the
 > [!TIP]
 > Find the run URL by opening the failed or cancelled run in the **Actions** tab — the URL in your browser's address bar is the run URL.
 
-## Related Documentation
+## Learn More
 
 - [Staged Mode](/gh-aw/reference/staged-mode/) - Preview safe output operations without making changes
 - [Threat Detection Guide](/gh-aw/reference/threat-detection/) - Complete threat detection documentation and examples

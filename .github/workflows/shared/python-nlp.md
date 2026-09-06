@@ -12,24 +12,29 @@ network:
 
 steps:
   - name: Setup Python NLP environment
+    env:
+      UV_PYTHON_INSTALL_DIR: /tmp/gh-aw/python/uv-python
     run: |
       mkdir -p /tmp/gh-aw/python/{data,charts,artifacts}
       # Create a virtual environment for proper package isolation (avoids --break-system-packages)
-      if [ ! -d /tmp/gh-aw/agent/venv ]; then
-        python3 -m venv /tmp/gh-aw/agent/venv
+      # Use /tmp/gh-aw/python/venv to avoid polluting the agent artifact upload path (/tmp/gh-aw/agent/)
+      # Use uv-managed CPython so the interpreter works inside the agent sandbox (runner CPython needs a newer GLIBC).
+      # This must match shared/python-dataviz.md so either import can create the shared environment first.
+      if [ ! -d /tmp/gh-aw/python/venv ]; then
+        uv venv --python 3.12 --python-preference only-managed --seed /tmp/gh-aw/python/venv
       fi
-      echo "/tmp/gh-aw/agent/venv/bin" >> "$GITHUB_PATH"
-      /tmp/gh-aw/agent/venv/bin/pip install --quiet nltk scikit-learn textblob wordcloud
+      echo "/tmp/gh-aw/python/venv/bin" >> "$GITHUB_PATH"
+      /tmp/gh-aw/python/venv/bin/pip install --quiet nltk scikit-learn textblob wordcloud
 
       # Download required NLTK corpora
-      /tmp/gh-aw/agent/venv/bin/python3 -c "
+      /tmp/gh-aw/python/venv/bin/python3 -c "
       import nltk
       for corpus in ['punkt_tab', 'stopwords', 'vader_lexicon', 'averaged_perceptron_tagger_eng']:
           nltk.download(corpus, quiet=True)
       print('NLTK corpora ready')
       "
 
-      /tmp/gh-aw/agent/venv/bin/python3 -c "import sklearn; print(f'scikit-learn {sklearn.__version__}')"
+      /tmp/gh-aw/python/venv/bin/python3 -c "import sklearn; print(f'scikit-learn {sklearn.__version__}')"
 ---
 
 ## Python NLP Environment Ready

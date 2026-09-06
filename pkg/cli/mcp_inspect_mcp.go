@@ -3,11 +3,13 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,7 +27,7 @@ var mcpInspectServerLog = logger.New("cli:mcp_inspect_server")
 // MCP timeout constants
 const (
 	MCPConnectTimeout    = 10 * time.Second // Timeout for establishing MCP server connections
-	MCPOperationTimeout  = 5 * time.Second  // Timeout for MCP operations (ListTools, ListResources)
+	MCPOperationTimeout  = 5 * time.Second  // Timeout for MCP operations (ListTools, ListResources, ListPrompts)
 	MCPServerHTTPTimeout = 30 * time.Minute // Timeout for HTTP server session
 )
 
@@ -186,46 +188,7 @@ func connectStdioMCPServer(ctx context.Context, config parser.RegistryMCPServerC
 		console.PrintSuccessMessage("Successfully connected to MCP server")
 	}
 
-	// Query server capabilities
-	info := &parser.MCPServerInfo{
-		Config:    config,
-		Connected: true,
-		Tools:     []*mcp.Tool{},
-		Resources: []*mcp.Resource{},
-		Roots:     []*mcp.Root{},
-	}
-
-	// List tools
-	listToolsCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
-	defer cancel()
-	toolsResult, err := session.ListTools(listToolsCtx, &mcp.ListToolsParams{})
-	cancel()
-	if err != nil {
-		if verbose {
-			console.PrintWarningMessage(fmt.Sprintf("Failed to list tools: %v", err))
-		}
-	} else {
-		info.Tools = append(info.Tools, toolsResult.Tools...)
-	}
-
-	// List resources
-	listResourcesCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
-	defer cancel()
-	resourcesResult, err := session.ListResources(listResourcesCtx, &mcp.ListResourcesParams{})
-	cancel()
-	if err != nil {
-		if verbose {
-			console.PrintWarningMessage(fmt.Sprintf("Failed to list resources: %v", err))
-		}
-	} else {
-		info.Resources = append(info.Resources, resourcesResult.Resources...)
-	}
-
-	// Note: Roots are not directly available via MCP protocol in the current spec,
-	// so we'll keep an empty list or try to infer from resources
-	info.Roots = extractRootsFromResources(info.Resources)
-
-	return info, nil
+	return queryServerCapabilities(ctx, config, session, verbose), nil
 }
 
 // connectHTTPMCPServer connects to an HTTP-based MCP server using the Go SDK
@@ -277,51 +240,90 @@ func connectHTTPMCPServer(ctx context.Context, config parser.RegistryMCPServerCo
 		console.PrintSuccessMessage("Successfully connected to HTTP MCP server")
 	}
 
-	// Query server capabilities
+	return queryServerCapabilities(ctx, config, session, verbose), nil
+}
+
+// queryServerCapabilities queries an established MCP client session for its
+// tools, resources, and prompts, using the SDK's iterator-based pagination
+// helpers so that servers returning multiple pages of results are not
+// silently truncated. It is shared by connectStdioMCPServer and
+// connectHTTPMCPServer, which only differ in how they establish the
+// underlying transport/session.
+func queryServerCapabilities(ctx context.Context, config parser.RegistryMCPServerConfig, session *mcp.ClientSession, verbose bool) *parser.MCPServerInfo {
 	info := &parser.MCPServerInfo{
 		Config:    config,
 		Connected: true,
 		Tools:     []*mcp.Tool{},
 		Resources: []*mcp.Resource{},
-		Roots:     []*mcp.Root{},
+		Prompts:   []*mcp.Prompt{},
+		Roots:     []*parser.MCPRootInfo{},
 	}
 
-	// List tools
-	listToolsCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
-	defer cancel()
-	toolsResult, err := session.ListTools(listToolsCtx, &mcp.ListToolsParams{})
-	cancel()
-	if err != nil {
-		if verbose {
-			console.PrintWarningMessage(fmt.Sprintf("Failed to list tools: %v", err))
+	recordPartialResultError := func(listName string, err error) {
+		if err == nil {
+			return
 		}
-	} else {
-		info.Tools = append(info.Tools, toolsResult.Tools...)
-	}
-
-	// List resources
-	listResourcesCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
-	defer cancel()
-	resourcesResult, err := session.ListResources(listResourcesCtx, &mcp.ListResourcesParams{})
-	cancel()
-	if err != nil {
-		if verbose {
-			console.PrintWarningMessage(fmt.Sprintf("Failed to list resources: %v", err))
+		wrappedErr := fmt.Errorf("listing %s: %w", listName, err)
+		if info.Error == nil {
+			info.Error = wrappedErr
+		} else {
+			info.Error = errors.Join(info.Error, wrappedErr)
 		}
-	} else {
-		info.Resources = append(info.Resources, resourcesResult.Resources...)
+		if verbose {
+			console.PrintWarningMessage(fmt.Sprintf("Failed to list %s: %v", listName, err))
+		}
 	}
 
-	// Extract root URIs from resources (simple heuristic)
+	// List tools (paginated automatically by the SDK iterator)
+	func() {
+		listToolsCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
+		defer cancel()
+		for tool, err := range session.Tools(listToolsCtx, &mcp.ListToolsParams{}) {
+			if err != nil {
+				recordPartialResultError("tools", err)
+				break
+			}
+			info.Tools = append(info.Tools, tool)
+		}
+	}()
+
+	// List resources (paginated automatically by the SDK iterator)
+	func() {
+		listResourcesCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
+		defer cancel()
+		for resource, err := range session.Resources(listResourcesCtx, &mcp.ListResourcesParams{}) {
+			if err != nil {
+				recordPartialResultError("resources", err)
+				break
+			}
+			info.Resources = append(info.Resources, resource)
+		}
+	}()
+
+	// List prompts (paginated automatically by the SDK iterator)
+	func() {
+		listPromptsCtx, cancel := context.WithTimeout(ctx, MCPOperationTimeout)
+		defer cancel()
+		for prompt, err := range session.Prompts(listPromptsCtx, &mcp.ListPromptsParams{}) {
+			if err != nil {
+				recordPartialResultError("prompts", err)
+				break
+			}
+			info.Prompts = append(info.Prompts, prompt)
+		}
+	}()
+
+	// Note: Roots are not directly available via MCP protocol in the current spec,
+	// so we infer them from resources.
 	info.Roots = extractRootsFromResources(info.Resources)
 
-	return info, nil
+	return info
 }
 
 // extractRootsFromResources infers root URIs from a list of resources by extracting
 // the scheme portion (e.g. "file://") of each resource URI.
-func extractRootsFromResources(resources []*mcp.Resource) []*mcp.Root {
-	var roots []*mcp.Root
+func extractRootsFromResources(resources []*mcp.Resource) []*parser.MCPRootInfo {
+	var roots []*parser.MCPRootInfo
 	for _, resource := range resources {
 		if strings.Contains(resource.URI, "://") {
 			parts := strings.SplitN(resource.URI, "://", 2)
@@ -336,7 +338,7 @@ func extractRootsFromResources(resources []*mcp.Resource) []*mcp.Root {
 					}
 				}
 				if !found {
-					roots = append(roots, &mcp.Root{
+					roots = append(roots, &parser.MCPRootInfo{
 						URI:  rootURI,
 						Name: parts[0],
 					})
@@ -356,7 +358,11 @@ func mcpInspectClientImplementation() *mcp.Implementation {
 
 // displayServerCapabilities shows the server's tools, resources, and roots in formatted tables
 func displayServerCapabilities(info *parser.MCPServerInfo, toolFilter string) {
-	mcpInspectServerLog.Printf("Displaying server capabilities: tools=%d, resources=%d, toolFilter=%q", len(info.Tools), len(info.Resources), toolFilter)
+	mcpInspectServerLog.Printf("Displaying server capabilities: tools=%d, resources=%d, prompts=%d, toolFilter=%q", len(info.Tools), len(info.Resources), len(info.Prompts), toolFilter)
+	if info.Error != nil {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("MCP inspection returned partial results: %v", info.Error)))
+	}
 	// Display tools with allowed/not allowed status
 	if len(info.Tools) > 0 {
 		// If a specific tool is requested, show detailed information
@@ -417,6 +423,37 @@ func displayServerCapabilities(info *parser.MCPServerInfo, toolFilter string) {
 	} else if toolFilter == "" {
 		fmt.Fprintln(os.Stderr)
 		console.PrintWarningMessage("No resources available")
+	}
+
+	// Display prompts (skip if showing specific tool details)
+	if toolFilter == "" && len(info.Prompts) > 0 {
+		fmt.Fprintln(os.Stderr)
+		console.PrintSectionHeader("💬 Available Prompts")
+
+		headers := []string{"Name", "Title", "Description", "Arguments"}
+		rows := make([][]string, 0, len(info.Prompts))
+
+		for _, prompt := range info.Prompts {
+			title := prompt.Title
+			if title == "" {
+				title = "N/A"
+			}
+
+			rows = append(rows, []string{
+				prompt.Name,
+				title,
+				stringutil.Truncate(prompt.Description, 40),
+				strconv.Itoa(len(prompt.Arguments)),
+			})
+		}
+
+		fmt.Fprint(os.Stdout, console.RenderTable(console.TableConfig{
+			Headers: headers,
+			Rows:    rows,
+		}))
+	} else if toolFilter == "" {
+		fmt.Fprintln(os.Stderr)
+		console.PrintWarningMessage("No prompts available")
 	}
 
 	// Display roots (skip if showing specific tool details)

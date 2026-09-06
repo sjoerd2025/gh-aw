@@ -75,6 +75,9 @@ const BUILT_IN_PATTERNS = [
 
   // Anthropic tokens
   { name: "Anthropic API Key", pattern: /sk-ant-api03-[a-zA-Z0-9_-]{95}/g },
+
+  // Linear tokens
+  { name: "Linear API Key", pattern: /lin_api_[0-9A-Za-z]{40}/g },
 ];
 
 /**
@@ -82,7 +85,27 @@ const BUILT_IN_PATTERNS = [
  * These are the canonical paths produced by the gateway setup scripts.
  * The list is defined as a module-level constant so tests can replace entries.
  */
-const MCP_GATEWAY_CONFIG_PATHS = [path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/gateway-output.json"), path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/mcp-servers.json")];
+// Shell setup scripts write under /tmp, while CJS converters use RUNNER_TEMP.
+const MCP_GATEWAY_CONFIG_PATHS = [
+  ...new Set(
+    [
+      path.join("/tmp", "gh-aw/mcp-config/gateway-output.json"),
+      path.join("/tmp", "gh-aw/mcp-config/mcp-servers.json"),
+      path.join("/tmp", "gh-aw/mcp-config/config.toml"),
+      path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/gateway-output.json"),
+      path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/mcp-servers.json"),
+      path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/config.toml"),
+      process.env.HOME ? path.join(process.env.HOME, ".copilot/mcp-config.json") : "",
+      process.env.GITHUB_WORKSPACE ? path.join(process.env.GITHUB_WORKSPACE, ".gemini/settings.json") : "",
+    ].filter(Boolean)
+  ),
+];
+
+/**
+ * Minimum credential length required before an Authorization value is treated
+ * as a gateway token. Guards against redacting short placeholder values.
+ */
+const MIN_GATEWAY_TOKEN_LENGTH = 6;
 
 /**
  * Extracts MCP gateway bearer tokens from known configuration files.
@@ -96,29 +119,45 @@ const MCP_GATEWAY_CONFIG_PATHS = [path.join(process.env.RUNNER_TEMP || "/tmp", "
 function extractMCPGatewayTokens(configPaths) {
   /** @type {Set<string>} */
   const tokens = new Set();
+
+  /**
+   * Records an Authorization header value plus, for a bearer header, the bare
+   * credential so the token is redacted even when logged without the prefix.
+   * @param {unknown} value - Raw Authorization header value
+   */
+  const addAuthorizationValue = value => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    const bearerMatch = /^[Bb]earer\s+(.+)$/.exec(trimmed);
+    // The minimum-length guard applies to the credential itself, never to the
+    // bearer prefix, so short values cannot slip through by being prefixed.
+    const credential = bearerMatch ? bearerMatch[1].trim() : trimmed;
+    if (credential.length < MIN_GATEWAY_TOKEN_LENGTH) return;
+    tokens.add(trimmed);
+    tokens.add(credential);
+  };
+
   for (const configPath of configPaths) {
     try {
       if (!fs.existsSync(configPath)) continue;
       const raw = fs.readFileSync(configPath, "utf8");
-      const config = /** @type {Record<string, any>} */ JSON.parse(raw);
+      let config;
+      try {
+        config = /** @type {Record<string, any>} */ JSON.parse(raw);
+      } catch {
+        // Codex writes TOML (`http_headers = { Authorization = "..." }`); the key
+        // is matched case-insensitively to tolerate formatting differences.
+        for (const match of raw.matchAll(/\bAuthorization\s*=\s*"([^"]+)"/gi)) {
+          addAuthorizationValue(match[1]);
+        }
+        continue;
+      }
       const servers = /** @type {Record<string, any>} */ config.mcpServers || {};
       for (const server of Object.values(servers)) {
-        const auth = /** @type {string|undefined} */ server?.headers?.Authorization;
-        if (typeof auth === "string" && auth.trim().length >= 6) {
-          const trimmed = auth.trim();
-          tokens.add(trimmed);
-          // Also add just the credential portion when the value is a "Bearer <token>" header
-          // so the bare token is redacted even when it appears without the "Bearer " prefix.
-          if (/^[Bb]earer /.test(trimmed)) {
-            const tokenPart = trimmed.slice(7).trim();
-            if (tokenPart.length >= 6) {
-              tokens.add(tokenPart);
-            }
-          }
-        }
+        addAuthorizationValue(server?.headers?.Authorization);
       }
     } catch {
-      // Silently skip unreadable or malformed files — absence of the gateway
+      // Unreadable or malformed files are ignored — absence of the gateway
       // config is normal when the MCP gateway is not used by a workflow.
     }
   }
@@ -182,6 +221,31 @@ function redactSecrets(content, secretValues) {
     }
   }
   return { content: redacted, redactionCount };
+}
+
+/**
+ * Redacts credential-shaped strings from content destined for the GitHub Actions
+ * step summary.
+ *
+ * Step summaries reproduce agent-controlled data (tool inputs, tool outputs, agent
+ * text, safe-output titles), and `::add-mask::` processing does not scrub
+ * `$GITHUB_STEP_SUMMARY`, so the built-in credential patterns used for artifact
+ * redaction are applied before the summary is written. Redaction failures are
+ * non-fatal because the summary is best-effort output.
+ *
+ * @param {string} content - Markdown destined for the step summary
+ * @returns {string} Content with credential-shaped strings replaced
+ */
+function redactStepSummaryContent(content) {
+  if (typeof content !== "string" || content.length === 0) {
+    return content;
+  }
+  try {
+    return redactBuiltInPatterns(content).content;
+  } catch (error) {
+    core.warning(`Failed to redact step summary content: ${getErrorMessage(error)}`);
+    return content;
+  }
 }
 
 /**
@@ -257,7 +321,7 @@ async function main() {
     core.info("Scanning for built-in credential patterns and custom secrets");
 
     // Find all target files in /tmp/gh-aw and ${RUNNER_TEMP}/gh-aw directories
-    const targetExtensions = [".txt", ".json", ".log", ".md", ".mdx", ".yml", ".jsonl"];
+    const targetExtensions = [".txt", ".json", ".log", ".md", ".mdx", ".yml", ".jsonl", ".patch"];
     const tmpFiles = findFiles("/tmp/gh-aw", targetExtensions);
     const optFiles = findFiles(`${process.env.RUNNER_TEMP}/gh-aw`, targetExtensions);
     const files = [...tmpFiles, ...optFiles];
@@ -282,4 +346,40 @@ async function main() {
   }
 }
 
-module.exports = { main, redactSecrets, redactBuiltInPatterns, extractMCPGatewayTokens, BUILT_IN_PATTERNS, MCP_GATEWAY_CONFIG_PATHS };
+/**
+ * Targeted redaction pass for files in a specific directory. Used by the
+ * post-graders redaction step to scan grader output files that were written
+ * after the initial full-workspace redaction pass.
+ *
+ * @param {string} dir - Absolute directory path to scan
+ */
+async function redactFilesInDir(dir) {
+  try {
+    const secretNames = (process.env.GH_AW_SECRET_NAMES || "").split(",").filter(n => n.trim());
+    /** @type {string[]} */
+    const secretValues = [];
+    for (const secretName of secretNames) {
+      const value = process.env[`SECRET_${secretName.trim()}`];
+      if (typeof value === "string" && value.trim() !== "") {
+        secretValues.push(value.trim());
+      }
+    }
+    secretValues.push(...extractMCPGatewayTokens(MCP_GATEWAY_CONFIG_PATHS));
+
+    const targetExtensions = [".json"];
+    const files = findFiles(dir, targetExtensions);
+    if (files.length === 0) return;
+
+    let totalRedactions = 0;
+    for (const file of files) {
+      totalRedactions += processFile(file, secretValues);
+    }
+    if (totalRedactions > 0) {
+      core.info(`Grader output redaction: ${totalRedactions} redaction(s) in ${dir}`);
+    }
+  } catch (error) {
+    core.warning(`Grader output redaction failed: ${getErrorMessage(error)}`);
+  }
+}
+
+module.exports = { main, redactFilesInDir, redactSecrets, redactBuiltInPatterns, redactStepSummaryContent, extractMCPGatewayTokens, BUILT_IN_PATTERNS, MCP_GATEWAY_CONFIG_PATHS };

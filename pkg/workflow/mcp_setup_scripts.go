@@ -20,6 +20,7 @@ func generateMCPScriptsSetup(yaml *strings.Builder, workflowData *WorkflowData) 
 
 	mcpSetupScriptsLog.Printf("Generating MCP scripts setup: tools=%d", len(workflowData.MCPScripts.Tools))
 	yaml.WriteString("      - name: Write MCP Scripts Config\n")
+	yaml.WriteString("        # runner-guard:ignore RGS-018 -- writes first-party mcp-scripts tools.json manifest and mcp-server.cjs shim generated verbatim from the gh-aw compiler template, not an attacker-controlled dropper.\n")
 	yaml.WriteString("        run: |\n")
 	yaml.WriteString("          mkdir -p \"${RUNNER_TEMP}/gh-aw/mcp-scripts/logs\"\n")
 
@@ -28,7 +29,7 @@ func generateMCPScriptsSetup(yaml *strings.Builder, workflowData *WorkflowData) 
 	if err := ValidateHeredocContent(toolsJSON, toolsDelimiter); err != nil {
 		return fmt.Errorf("mcp-scripts tools.json: %w", err)
 	}
-	yaml.WriteString("          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/tools.json\" << '" + toolsDelimiter + "'\n")
+	yaml.WriteString("          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/tools.json\" << '" + toolsDelimiter + "'\n") //nolint:generatedyamlheredoc // Legacy MCP script config rendering remains to be migrated.
 	for line := range strings.SplitSeq(toolsJSON, "\n") {
 		yaml.WriteString("          " + line + "\n")
 	}
@@ -39,7 +40,7 @@ func generateMCPScriptsSetup(yaml *strings.Builder, workflowData *WorkflowData) 
 	if err := ValidateHeredocContent(mcpScriptsMCPServer, serverDelimiter); err != nil {
 		return fmt.Errorf("mcp-scripts mcp-server.cjs: %w", err)
 	}
-	yaml.WriteString("          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/mcp-server.cjs\" << '" + serverDelimiter + "'\n")
+	yaml.WriteString("          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/mcp-server.cjs\" << '" + serverDelimiter + "'\n") //nolint:generatedyamlheredoc // Legacy MCP server rendering remains to be migrated.
 	for _, line := range FormatJavaScriptForYAML(mcpScriptsMCPServer) {
 		yaml.WriteString(line)
 	}
@@ -111,7 +112,7 @@ func appendMCPScriptToolFile(yaml *strings.Builder, workflowData *WorkflowData, 
 		if err := ValidateHeredocContent(toolScript, jsDelimiter); err != nil {
 			return fmt.Errorf("mcp-scripts tool %q (js): %w", toolName, err)
 		}
-		fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.cjs\" << '%s'\n", toolName, jsDelimiter)
+		fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.cjs\" << '%s'\n", toolName, jsDelimiter) //nolint:generatedyamlheredoc // Legacy MCP tool rendering remains to be migrated.
 		for _, line := range FormatJavaScriptForYAML(toolScript) {
 			yaml.WriteString(line)
 		}
@@ -125,7 +126,7 @@ func appendMCPScriptToolFile(yaml *strings.Builder, workflowData *WorkflowData, 
 		if err := ValidateHeredocContent(toolScript, shDelimiter); err != nil {
 			return fmt.Errorf("mcp-scripts tool %q (sh): %w", toolName, err)
 		}
-		fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.sh\" << '%s'\n", toolName, shDelimiter)
+		fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.sh\" << '%s'\n", toolName, shDelimiter) //nolint:generatedyamlheredoc // Legacy MCP tool rendering remains to be migrated.
 		for line := range strings.SplitSeq(toolScript, "\n") {
 			yaml.WriteString("          " + line + "\n")
 		}
@@ -140,7 +141,7 @@ func appendMCPScriptToolFile(yaml *strings.Builder, workflowData *WorkflowData, 
 		if err := ValidateHeredocContent(toolScript, pyDelimiter); err != nil {
 			return fmt.Errorf("mcp-scripts tool %q (py): %w", toolName, err)
 		}
-		fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.py\" << '%s'\n", toolName, pyDelimiter)
+		fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.py\" << '%s'\n", toolName, pyDelimiter) //nolint:generatedyamlheredoc // Legacy MCP tool rendering remains to be migrated.
 		for line := range strings.SplitSeq(toolScript, "\n") {
 			yaml.WriteString("          " + line + "\n")
 		}
@@ -155,7 +156,7 @@ func appendMCPScriptToolFile(yaml *strings.Builder, workflowData *WorkflowData, 
 		if err := ValidateHeredocContent(toolScript, goDelimiter); err != nil {
 			return fmt.Errorf("mcp-scripts tool %q (go): %w", toolName, err)
 		}
-		fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.go\" << '%s'\n", toolName, goDelimiter)
+		fmt.Fprintf(yaml, "          cat > \"${RUNNER_TEMP}/gh-aw/mcp-scripts/%s.go\" << '%s'\n", toolName, goDelimiter) //nolint:generatedyamlheredoc // Legacy MCP tool rendering remains to be migrated.
 		for line := range strings.SplitSeq(toolScript, "\n") {
 			yaml.WriteString("          " + line + "\n")
 		}

@@ -69,15 +69,17 @@ func TestRunSummaryCachingBehavior(t *testing.T) {
 		CLIVersion:  GetVersion(),
 		RunID:       99999,
 		ProcessedAt: time.Now(),
-		Run:         testRun,
-		Metrics:     testMetrics,
+		RunAnalysis: RunAnalysis{
+			Run:          testRun,
+			Metrics:      testMetrics,
+			MissingTools: []MissingToolReport{},
+			MCPFailures:  []MCPFailureReport{},
+		},
 		ArtifactsList: []string{
 			"aw_info.json",
 			"agent-stdio.log",
 			"safe_output.jsonl",
 		},
-		MissingTools: []MissingToolReport{},
-		MCPFailures:  []MCPFailureReport{},
 	}
 
 	// Save the summary
@@ -178,11 +180,13 @@ func TestRunSummaryPreventsReprocessing(t *testing.T) {
 	// Simulate first processing: create summary
 	firstProcessTime := time.Now()
 	summary := &RunSummary{
-		CLIVersion:    GetVersion(),
-		RunID:         88888,
-		ProcessedAt:   firstProcessTime,
-		Run:           WorkflowRun{DatabaseID: 88888},
-		Metrics:       workflow.LogMetrics{TokenUsage: 1000},
+		CLIVersion:  GetVersion(),
+		RunID:       88888,
+		ProcessedAt: firstProcessTime,
+		RunAnalysis: RunAnalysis{
+			Run:     WorkflowRun{DatabaseID: 88888},
+			Metrics: workflow.LogMetrics{TokenUsage: 1000},
+		},
 		ArtifactsList: []string{"aw_info.json"},
 	}
 
@@ -224,6 +228,7 @@ func TestListArtifactsExcludesSummary(t *testing.T) {
 		"aw_info.json",
 		"agent-stdio.log",
 		runSummaryFileName, // This should be excluded from the list
+		jobsAPIResponseFileName,
 	}
 
 	for _, filename := range testFiles {
@@ -239,15 +244,15 @@ func TestListArtifactsExcludesSummary(t *testing.T) {
 		t.Fatalf("Failed to list artifacts: %v", err)
 	}
 
-	// Should have 2 artifacts (excluding the summary)
+	// Should have 2 artifacts (excluding synthesized cache/summary files)
 	if len(artifacts) != 2 {
-		t.Errorf("Expected 2 artifacts (excluding summary), got %d: %v", len(artifacts), artifacts)
+		t.Errorf("Expected 2 artifacts (excluding synthesized files), got %d: %v", len(artifacts), artifacts)
 	}
 
-	// Verify summary is not in the list
+	// Verify synthesized files are not in the list
 	for _, artifact := range artifacts {
-		if artifact == runSummaryFileName {
-			t.Errorf("Summary file %s should not be in artifacts list", runSummaryFileName)
+		if artifact == runSummaryFileName || artifact == jobsAPIResponseFileName {
+			t.Errorf("Synthesized file %s should not be in artifacts list", artifact)
 		}
 	}
 

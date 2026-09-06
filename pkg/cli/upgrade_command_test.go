@@ -4,6 +4,8 @@ package cli
 
 import (
 	"context"
+	"io"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,6 +16,8 @@ import (
 func upgradeValidateEngineStub(engine string) error { return nil }
 
 func TestUpgradeCommandHelpTextConsistency(t *testing.T) {
+	t.Parallel()
+
 	cmd := NewUpgradeCommand(upgradeValidateEngineStub)
 	require.NotNil(t, cmd, "upgrade command should be created")
 
@@ -36,6 +40,8 @@ func TestUpgradeCommandHelpTextConsistency(t *testing.T) {
 }
 
 func TestUpgradeCommandNewFlags(t *testing.T) {
+	t.Parallel()
+
 	cmd := NewUpgradeCommand(upgradeValidateEngineStub)
 	require.NotNil(t, cmd, "upgrade command should be created")
 
@@ -55,6 +61,8 @@ func TestUpgradeCommandNewFlags(t *testing.T) {
 }
 
 func TestUpgradeCommandEngineValidationRunsEarly(t *testing.T) {
+	t.Parallel()
+
 	validated := false
 	validate := func(engine string) error {
 		validated = true
@@ -69,6 +77,8 @@ func TestUpgradeCommandEngineValidationRunsEarly(t *testing.T) {
 }
 
 func TestUpgradeCommandRepoOrgMutualExclusion(t *testing.T) {
+	t.Parallel()
+
 	cmd := NewUpgradeCommand(upgradeValidateEngineStub)
 	cmd.SetArgs([]string{"--repo", "owner/repo", "--org", "my-org"})
 	err := cmd.Execute()
@@ -78,6 +88,8 @@ func TestUpgradeCommandRepoOrgMutualExclusion(t *testing.T) {
 }
 
 func TestUpgradeCommandFlagRegistration(t *testing.T) {
+	t.Parallel()
+
 	cmd := NewUpgradeCommand(upgradeValidateEngineStub)
 	require.NotNil(t, cmd, "upgrade command should be created")
 
@@ -140,7 +152,60 @@ func TestUpgradeCommandRepoDispatchWithPR(t *testing.T) {
 }
 
 func TestRelaunchWithSameArgsRejectsRelativeExecutableOverride(t *testing.T) {
-	err := relaunchWithSameArgs("--post-upgrade", "relative/gh-aw")
+	err := relaunchWithSameArgs("--skip-extension-upgrade", "relative/gh-aw")
 	require.Error(t, err)
 	require.ErrorContains(t, err, "invalid executable path")
+}
+
+func TestRelaunchWithSameArgsRejectsNullByteArgument(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"gh-aw", "compile", "bad\x00arg"}
+
+	err := relaunchWithSameArgs("--skip-extension-upgrade", "/bin/echo")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "argument contains invalid control characters")
+}
+
+func TestRelaunchWithSameArgsAllowsEmptyForwardedArgument(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"gh-aw", "compile", ""}
+
+	err := relaunchWithSameArgs("--skip-extension-upgrade", "/bin/echo")
+	require.NoError(t, err)
+}
+
+func TestRelaunchWithSameArgsPassesShellMetacharactersLiterally(t *testing.T) {
+	origArgs := os.Args
+	origStdout := os.Stdout
+	t.Cleanup(func() {
+		os.Args = origArgs
+		os.Stdout = origStdout
+	})
+	os.Args = []string{"gh-aw", "upgrade", ";", "$(whoami)"}
+
+	readOutput, writeOutput, err := os.Pipe()
+	require.NoError(t, err)
+	writeOutputClosed := false
+	t.Cleanup(func() {
+		_ = readOutput.Close()
+		if !writeOutputClosed {
+			_ = writeOutput.Close()
+		}
+	})
+	os.Stdout = writeOutput
+
+	require.NoError(t, relaunchWithSameArgs("--skip-extension-upgrade", "/bin/echo"))
+	require.NoError(t, writeOutput.Close())
+	writeOutputClosed = true
+	output, err := io.ReadAll(readOutput)
+	require.NoError(t, err)
+	require.Equal(t, "upgrade ; $(whoami) --skip-extension-upgrade\n", string(output))
+}
+
+func TestRelaunchWithSameArgsRejectsUnknownExtraFlag(t *testing.T) {
+	err := relaunchWithSameArgs("--unknown-flag", "/bin/echo")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid relaunch flag")
 }

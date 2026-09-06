@@ -25,11 +25,12 @@ network:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [issues]
   repo-memory:
     wiki: true
@@ -53,6 +54,7 @@ tools:
   edit:
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 1d
     title-prefix: "[community] "
@@ -611,4 +613,6 @@ If you encounter a genuine error that prevents completion (e.g., data fetch fail
 
 ### Output Format
 
-Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks to reduce scrolling.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.

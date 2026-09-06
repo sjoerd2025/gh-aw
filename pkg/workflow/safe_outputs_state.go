@@ -29,7 +29,7 @@ var safeOutputFieldMapping = buildSafeOutputFieldMapping()
 //
 // NOTE: keep this function in sync with safeOutputFieldMapping above and
 // hasNonBuiltinSafeOutputsEnabled below when adding new safe output types.
-func hasAnySafeOutputEnabled(safeOutputs *SafeOutputsConfig) bool {
+func hasAnySafeOutputEnabled(safeOutputs *SafeOutputsConfig) bool { //nolint:largefunc // Existing explicit checks avoid reflection on the compilation hot path.
 	if safeOutputs == nil {
 		return false
 	}
@@ -39,9 +39,15 @@ func hasAnySafeOutputEnabled(safeOutputs *SafeOutputsConfig) bool {
 		return true
 	}
 
-	// Direct nil checks — no reflection, no heap allocation (43 fields matching safeOutputFieldMapping
-	// plus CommentMemory which is attached via tools.comment-memory and not in safeOutputFieldMapping).
+	// Direct nil checks — no reflection, no heap allocation.
 	return safeOutputs.CreateIssues != nil ||
+		safeOutputs.CreateWorkItems != nil ||
+		safeOutputs.UpdateWorkItems != nil ||
+		safeOutputs.CommentOnWorkItems != nil ||
+		safeOutputs.AssignWorkItems != nil ||
+		safeOutputs.LinkWorkItems != nil ||
+		safeOutputs.UploadWorkItemAttachments != nil ||
+		hasAnyJiraSafeOutputEnabled(safeOutputs) ||
 		safeOutputs.CreateAgentSessions != nil ||
 		safeOutputs.CreateDiscussions != nil ||
 		safeOutputs.UpdateDiscussions != nil ||
@@ -49,9 +55,9 @@ func hasAnySafeOutputEnabled(safeOutputs *SafeOutputsConfig) bool {
 		safeOutputs.CloseIssues != nil ||
 		safeOutputs.ClosePullRequests != nil ||
 		safeOutputs.MarkPullRequestAsReadyForReview != nil ||
+		safeOutputs.ApproveWorkflowRun != nil ||
 		safeOutputs.DismissPullRequestReview != nil ||
 		safeOutputs.AddComments != nil ||
-		safeOutputs.CommentMemory != nil ||
 		safeOutputs.CreatePullRequests != nil ||
 		safeOutputs.CreatePullRequestReviewComments != nil ||
 		safeOutputs.SubmitPullRequestReview != nil ||
@@ -74,6 +80,7 @@ func hasAnySafeOutputEnabled(safeOutputs *SafeOutputsConfig) bool {
 		safeOutputs.PushToPullRequestBranch != nil ||
 		safeOutputs.UploadAssets != nil ||
 		safeOutputs.UploadArtifact != nil ||
+		safeOutputs.UploadCodeCoverage != nil ||
 		safeOutputs.UpdateRelease != nil ||
 		safeOutputs.UpdateProjects != nil ||
 		safeOutputs.CreateProjects != nil ||
@@ -87,7 +94,8 @@ func hasAnySafeOutputEnabled(safeOutputs *SafeOutputsConfig) bool {
 		safeOutputs.MissingData != nil ||
 		safeOutputs.SetIssueType != nil ||
 		safeOutputs.SetIssueField != nil ||
-		safeOutputs.NoOp != nil
+		safeOutputs.NoOp != nil ||
+		hasLinearSafeOutputs(safeOutputs)
 }
 
 // The builtin types (noop, missing-data, missing-tool) are excluded from this check
@@ -95,7 +103,7 @@ func hasAnySafeOutputEnabled(safeOutputs *SafeOutputsConfig) bool {
 //
 // NOTE: keep this function in sync with safeOutputFieldMapping above and
 // hasAnySafeOutputEnabled above when adding new safe output types.
-func hasNonBuiltinSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool {
+func hasNonBuiltinSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool { //nolint:largefunc // Existing explicit checks avoid reflection on the compilation hot path.
 	if safeOutputs == nil {
 		return false
 	}
@@ -105,10 +113,15 @@ func hasNonBuiltinSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool {
 		return true
 	}
 
-	// Direct nil checks for non-builtin pointer fields (40 fields = 43 total minus 3 builtins:
-	// NoOp, MissingData, MissingTool). Includes CommentMemory which is attached via
-	// tools.comment-memory and is not in safeOutputFieldMapping.
+	// Direct nil checks for non-builtin pointer fields.
 	return safeOutputs.CreateIssues != nil ||
+		safeOutputs.CreateWorkItems != nil ||
+		safeOutputs.UpdateWorkItems != nil ||
+		safeOutputs.CommentOnWorkItems != nil ||
+		safeOutputs.AssignWorkItems != nil ||
+		safeOutputs.LinkWorkItems != nil ||
+		safeOutputs.UploadWorkItemAttachments != nil ||
+		hasAnyJiraSafeOutputEnabled(safeOutputs) ||
 		safeOutputs.CreateAgentSessions != nil ||
 		safeOutputs.CreateDiscussions != nil ||
 		safeOutputs.UpdateDiscussions != nil ||
@@ -116,9 +129,9 @@ func hasNonBuiltinSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool {
 		safeOutputs.CloseIssues != nil ||
 		safeOutputs.ClosePullRequests != nil ||
 		safeOutputs.MarkPullRequestAsReadyForReview != nil ||
+		safeOutputs.ApproveWorkflowRun != nil ||
 		safeOutputs.DismissPullRequestReview != nil ||
 		safeOutputs.AddComments != nil ||
-		safeOutputs.CommentMemory != nil ||
 		safeOutputs.CreatePullRequests != nil ||
 		safeOutputs.CreatePullRequestReviewComments != nil ||
 		safeOutputs.SubmitPullRequestReview != nil ||
@@ -141,6 +154,7 @@ func hasNonBuiltinSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool {
 		safeOutputs.PushToPullRequestBranch != nil ||
 		safeOutputs.UploadAssets != nil ||
 		safeOutputs.UploadArtifact != nil ||
+		safeOutputs.UploadCodeCoverage != nil ||
 		safeOutputs.UpdateRelease != nil ||
 		safeOutputs.UpdateProjects != nil ||
 		safeOutputs.CreateProjects != nil ||
@@ -151,7 +165,15 @@ func hasNonBuiltinSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool {
 		safeOutputs.DispatchRepository != nil ||
 		safeOutputs.CallWorkflow != nil ||
 		safeOutputs.SetIssueType != nil ||
-		safeOutputs.SetIssueField != nil // non-builtin safe output field
+		safeOutputs.SetIssueField != nil || // non-builtin safe output field
+		hasLinearSafeOutputs(safeOutputs)
+}
+
+func hasLinearSafeOutputs(safeOutputs *SafeOutputsConfig) bool {
+	return safeOutputs != nil &&
+		(safeOutputs.LinearCreateIssue != nil ||
+			safeOutputs.LinearAddComment != nil ||
+			safeOutputs.LinearUpdateIssue != nil)
 }
 
 // HasSafeOutputsEnabled checks if any safe-outputs are enabled
@@ -172,7 +194,7 @@ func HasSafeOutputsEnabled(safeOutputs *SafeOutputsConfig) bool {
 // instruction for the agent. This aligns create-issue with the other builtin safe outputs
 // (noop, missing-tool, missing-data) that are always available.
 func applyDefaultCreateIssue(workflowData *WorkflowData) {
-	if hasNonBuiltinSafeOutputsEnabled(workflowData.SafeOutputs) {
+	if workflowData.CommentMemoryConfig != nil || hasNonBuiltinSafeOutputsEnabled(workflowData.SafeOutputs) {
 		return
 	}
 	if workflowData.SafeOutputs == nil {

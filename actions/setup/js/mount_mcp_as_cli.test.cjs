@@ -1,10 +1,21 @@
 // @ts-check
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "fs";
+import http from "http";
 import os from "os";
 import path from "path";
 
-import { AWF_GATEWAY_IP, buildMCPCLIServersPromptList, getSafeOutputsGatewayEmptyFlagPath, parseMCPResponseBody, recoverSafeOutputsToolsIfNeeded, toContainerUrl } from "./mount_mcp_as_cli.cjs";
+import {
+  AWF_GATEWAY_IP,
+  buildMCPCLIServersPromptList,
+  fetchMCPToolsWithRetry,
+  getSafeOutputsGatewayEmptyFlagPath,
+  parseMCPResponseBody,
+  recoverSafeOutputsToolsIfNeeded,
+  toContainerUrl,
+  TOOLS_EMPTY_MAX_RETRIES,
+  TOOLS_EMPTY_RETRY_DELAY_MS,
+} from "./mount_mcp_as_cli.cjs";
 
 describe("mount_mcp_as_cli.cjs", () => {
   it("parses JSON object responses unchanged", () => {
@@ -169,5 +180,242 @@ describe("mount_mcp_as_cli.cjs", () => {
     expect(docs).toContain("[--rationale <reason, max 280 characters>]");
     expect(docs).toContain('--confidence \"HIGH\"');
     expect(docs).toContain("`mcpscripts` — run `mcpscripts --help`");
+  });
+
+  it("exports retry constants with expected values", () => {
+    expect(TOOLS_EMPTY_MAX_RETRIES).toBeGreaterThan(0);
+    expect(TOOLS_EMPTY_RETRY_DELAY_MS).toBeGreaterThan(0);
+  });
+
+  it("returns tools immediately when fetchFn succeeds on first attempt", async () => {
+    const tools = [{ name: "push_to_pull_request_branch" }];
+    let callCount = 0;
+    const fakeFetch = async () => {
+      callCount++;
+      return tools;
+    };
+    const result = await fetchMCPToolsWithRetry(
+      "http://localhost/mcp/safeoutputs",
+      "key",
+      "safeoutputs",
+      { warning: () => {} },
+      {
+        fetchFn: fakeFetch,
+        sleep: async () => {},
+      }
+    );
+    expect(result).toEqual(tools);
+    expect(callCount).toBe(1);
+  });
+
+  it("retries when fetchFn returns empty and succeeds on a later attempt", async () => {
+    const tools = [{ name: "push_to_pull_request_branch" }];
+    let callCount = 0;
+    const fakeFetch = async () => {
+      callCount++;
+      return callCount < 3 ? [] : tools;
+    };
+    const warnings = [];
+    const result = await fetchMCPToolsWithRetry(
+      "http://localhost/mcp/safeoutputs",
+      "key",
+      "safeoutputs",
+      { warning: msg => warnings.push(msg) },
+      {
+        fetchFn: fakeFetch,
+        sleep: async () => {},
+      }
+    );
+    expect(result).toEqual(tools);
+    expect(callCount).toBe(3);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain("tools/list returned 0 tools");
+    expect(warnings[0]).toContain("safeoutputs");
+  });
+
+  it("stops retrying after TOOLS_EMPTY_MAX_RETRIES, emits final warning, and returns empty when always empty", async () => {
+    let callCount = 0;
+    const fakeFetch = async () => {
+      callCount++;
+      return [];
+    };
+    const warnings = [];
+    const result = await fetchMCPToolsWithRetry(
+      "http://localhost/mcp/safeoutputs",
+      "key",
+      "safeoutputs",
+      { warning: msg => warnings.push(msg) },
+      {
+        fetchFn: fakeFetch,
+        sleep: async () => {},
+      }
+    );
+    expect(result).toEqual([]);
+    // 1 initial attempt + TOOLS_EMPTY_MAX_RETRIES retries
+    expect(callCount).toBe(1 + TOOLS_EMPTY_MAX_RETRIES);
+    expect(warnings).toHaveLength(TOOLS_EMPTY_MAX_RETRIES + 1);
+    expect(warnings[warnings.length - 1]).toContain("still returned 0 tools");
+    expect(warnings[warnings.length - 1]).toContain("after");
+  });
+
+  it("invokes sleep between retry attempts", async () => {
+    let callCount = 0;
+    const sleepDelays = [];
+    const fakeFetch = async () => {
+      callCount++;
+      return callCount < 2 ? [] : [{ name: "tool" }];
+    };
+    await fetchMCPToolsWithRetry(
+      "http://localhost/mcp/safeoutputs",
+      "key",
+      "safeoutputs",
+      { warning: () => {} },
+      {
+        fetchFn: fakeFetch,
+        sleep: async ms => {
+          sleepDelays.push(ms);
+        },
+      }
+    );
+    expect(sleepDelays).toEqual([TOOLS_EMPTY_RETRY_DELAY_MS]);
+  });
+
+  it("does not retry when fetchFn reports a non-successful tools/list fetch", async () => {
+    let callCount = 0;
+    const warnings = [];
+    const fakeFetch = async () => {
+      callCount++;
+      return { tools: [], emptyWasSuccessful: false };
+    };
+    const result = await fetchMCPToolsWithRetry(
+      "http://localhost/mcp/safeoutputs",
+      "key",
+      "safeoutputs",
+      { warning: msg => warnings.push(msg) },
+      {
+        fetchFn: fakeFetch,
+        sleep: async () => {},
+      }
+    );
+    expect(result).toEqual([]);
+    expect(callCount).toBe(1);
+    expect(warnings).toHaveLength(0);
+  });
+
+  it("stops further retries if a later fetchFn call is non-successful", async () => {
+    let callCount = 0;
+    const warnings = [];
+    const fakeFetch = async () => {
+      callCount++;
+      if (callCount === 1) {
+        return [];
+      }
+      return { tools: [], emptyWasSuccessful: false };
+    };
+    const result = await fetchMCPToolsWithRetry(
+      "http://localhost/mcp/safeoutputs",
+      "key",
+      "safeoutputs",
+      { warning: msg => warnings.push(msg) },
+      {
+        fetchFn: fakeFetch,
+        sleep: async () => {},
+      }
+    );
+    expect(result).toEqual([]);
+    expect(callCount).toBe(2);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain("retrying");
+    expect(warnings[1]).toContain("stopping empty tools/list retries");
+  });
+});
+
+describe("mount_mcp_as_cli.cjs main() file permissions", () => {
+  /** @type {string | undefined} */
+  let tempDir;
+  /** @type {http.Server | undefined} */
+  let server;
+
+  afterEach(async () => {
+    if (server) {
+      await new Promise(resolve => server.close(resolve));
+      server = undefined;
+    }
+    if (tempDir) {
+      // The bin directory is locked to 0o555 by main(); restore write permissions
+      // so the temp directory can be removed during cleanup.
+      const binDir = path.join(tempDir, "gh-aw/mcp-cli/bin");
+      if (fs.existsSync(binDir)) {
+        fs.chmodSync(binDir, 0o755);
+      }
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      tempDir = undefined;
+    }
+    delete process.env.RUNNER_TEMP;
+    delete process.env.MCP_GATEWAY_AGENT_ID;
+    delete process.env.MCP_GATEWAY_DOMAIN;
+    delete process.env.MCP_GATEWAY_PORT;
+    delete global.core;
+    vi.resetModules();
+  });
+
+  it("rewrites an existing 0o755 CLI wrapper script to owner-only permissions (0o700)", async () => {
+    // Minimal fake MCP server that answers initialize / notifications/initialized / tools/list
+    server = http.createServer((req, res) => {
+      let data = "";
+      req.on("data", chunk => (data += chunk));
+      req.on("end", () => {
+        const parsed = JSON.parse(data);
+        if (parsed.method === "tools/list") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { tools: [{ name: "echo" }] } }));
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: {} }));
+        }
+      });
+    });
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-cli-mount-test-"));
+    process.env.RUNNER_TEMP = tempDir;
+    process.env.MCP_GATEWAY_AGENT_ID = "super-secret-gateway-agent";
+    delete process.env.MCP_GATEWAY_DOMAIN;
+    delete process.env.MCP_GATEWAY_PORT;
+
+    const manifestDir = path.join(tempDir, "gh-aw/mcp-cli");
+    fs.mkdirSync(manifestDir, { recursive: true });
+    fs.writeFileSync(path.join(manifestDir, "manifest.json"), JSON.stringify({ servers: [{ name: "testserver", url: `http://127.0.0.1:${port}/mcp` }] }), "utf8");
+
+    const binDir = path.join(tempDir, "gh-aw/mcp-cli/bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const scriptPath = path.join(binDir, "testserver");
+    fs.writeFileSync(scriptPath, "#!/usr/bin/env bash\necho preexisting\n", { mode: 0o755 });
+    fs.chmodSync(scriptPath, 0o755);
+
+    const infos = [];
+    const warnings = [];
+    global.core = {
+      info: msg => infos.push(msg),
+      warning: msg => warnings.push(msg),
+      addPath: () => {},
+      setOutput: () => {},
+    };
+
+    vi.resetModules();
+    const mod = await import("./mount_mcp_as_cli.cjs?t=" + Date.now());
+
+    await mod.main();
+
+    expect(fs.existsSync(scriptPath)).toBe(true);
+
+    const mode = fs.statSync(scriptPath).mode & 0o777;
+    expect(mode).toBe(0o700);
+    expect(mode).not.toBe(0o755);
+
+    const scriptContent = fs.readFileSync(scriptPath, "utf8");
+    expect(scriptContent).toContain("super-secret-gateway-agent");
   });
 });

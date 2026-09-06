@@ -38,6 +38,17 @@ func (c *Compiler) generateLogParsing(yaml *strings.Builder, data *WorkflowData,
 		return
 	}
 
+	// Behavior-defined engines write their log-parser script at runtime via
+	// GetExecutionSteps. In samples mode GetExecutionSteps is skipped, so the
+	// script is never materialized; suppress the parse step to avoid
+	// MODULE_NOT_FOUND failures.
+	if data.UseSamples {
+		if _, ok := engine.(*BehaviorDefinedEngine); ok {
+			compilerYamlLog.Printf("Skipping log parsing for behavior-defined engine %s in samples mode (script not materialized)", engine.GetID())
+			return
+		}
+	}
+
 	compilerYamlLog.Printf("Generating log parsing step for engine: %s (parser=%s)", engine.GetID(), parserScriptName)
 
 	logParserScript := GetLogParserScript(parserScriptName)
@@ -144,7 +155,7 @@ func isOTLPEnabled(data *WorkflowData) bool {
 }
 
 // generateStopMCPGateway generates a step that stops the MCP gateway process using its PID from step output
-// It passes the gateway port and API key to enable graceful shutdown via /close endpoint
+// It passes the gateway port and agent ID to enable graceful shutdown via /close endpoint
 func (c *Compiler) generateStopMCPGateway(yaml *strings.Builder, data *WorkflowData) {
 	compilerYamlLog.Print("Generating MCP gateway stop step")
 
@@ -153,11 +164,14 @@ func (c *Compiler) generateStopMCPGateway(yaml *strings.Builder, data *WorkflowD
 	yaml.WriteString("        continue-on-error: true\n")
 
 	// Add environment variables for graceful shutdown via /close endpoint
-	// These values come from the Start MCP Gateway step outputs
+	// These values normally come from Start MCP Gateway step outputs. Enclave workflows
+	// inherit the masked agent ID from the compiler-owned GITHUB_ENV handoff instead.
 	// Security: Pass all step outputs through environment variables to prevent template injection
 	yaml.WriteString("        env:\n")
 	yaml.WriteString("          MCP_GATEWAY_PORT: ${{ steps.start-mcp-gateway.outputs.gateway-port }}\n")
-	yaml.WriteString("          MCP_GATEWAY_API_KEY: ${{ steps.start-mcp-gateway.outputs.gateway-api-key }}\n")
+	if !enclavesEnabled(data) {
+		yaml.WriteString("          MCP_GATEWAY_AGENT_ID: ${{ steps.start-mcp-gateway.outputs.gateway-agent-id }}\n")
+	}
 	yaml.WriteString("          GATEWAY_PID: ${{ steps.start-mcp-gateway.outputs.gateway-pid }}\n")
 
 	yaml.WriteString("        run: |\n")
@@ -250,7 +264,26 @@ func (c *Compiler) generateDetectAgentErrorsStep(yaml *strings.Builder, data *Wo
 	yaml.WriteString("        if: always()\n")
 	fmt.Fprintf(yaml, "        id: %s\n", constants.DetectAgentErrorsStepID)
 	yaml.WriteString("        continue-on-error: true\n")
-	fmt.Fprintf(yaml, "        run: node \"${RUNNER_TEMP}/gh-aw/actions/%s.cjs\"\n", scriptId)
+	// The engine step outcome and its timeout-minutes budget allow the detection script to
+	// recognize a GitHub Actions step-level timeout ("The action '...' has timed out after N
+	// minutes."), which kills the engine without leaving a timeout signature in the agent log.
+	yaml.WriteString("        env:\n")
+	yaml.WriteString("          GH_AW_AGENTIC_EXECUTION_OUTCOME: ${{ steps.agentic_execution.outcome }}\n")
+	fmt.Fprintf(yaml, "          GH_AW_ENGINE_STEP_TIMEOUT_MINUTES: %s\n", resolveStepTimeoutValue(data))
+	// Engines that write their own internal tracing/diagnostic logs to files (rather than
+	// stdout/stderr) can surface a directory here; the detection script tails the most recently
+	// modified log file under it into the step log when the execution step failed, so a bare
+	// non-zero exit with no console output still has diagnosable content.
+	if internalLogsDir := engine.GetInternalLogsDir(); internalLogsDir != "" {
+		fmt.Fprintf(yaml, "          GH_AW_ENGINE_INTERNAL_LOGS_DIR: %s\n", internalLogsDir)
+	}
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	yaml.WriteString("        with:\n")
+	yaml.WriteString("          script: |\n")
+	yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
+	yaml.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
+	fmt.Fprintf(yaml, "            const { main } = require('%s/%s.cjs');\n", SetupActionDestination, scriptId)
+	yaml.WriteString("            await main();\n")
 }
 
 // generateEngineInstallAndPreAgentSteps emits git credential configuration, the PR-ready-for-review
@@ -261,7 +294,7 @@ func (c *Compiler) generateDetectAgentErrorsStep(yaml *strings.Builder, data *Wo
 // generateActivationArtifactAndCommentMemorySteps) so that user steps: can access prior
 // comment-memory state.
 // It returns the resolved CodingAgentEngine for use in subsequent phases.
-func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, data *WorkflowData, needsGitConfig bool) (CodingAgentEngine, error) {
+func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, data *WorkflowData, needsGitConfig bool) (CodingAgentEngine, error) { //nolint:largefunc // Existing workflow step orchestration preserves generated step order.
 	// Configure git credentials for agentic workflows.
 	// Git credential configuration requires a .git directory in the workspace, which is only
 	// present when the repository was checked out. Skip these steps when checkout is disabled
@@ -269,7 +302,7 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 	// with "fatal: not a git repository" otherwise.
 	compilerYamlLog.Printf("Git credential configuration needed: %t", needsGitConfig)
 	if needsGitConfig {
-		gitConfigSteps := c.generateGitConfigurationSteps()
+		gitConfigSteps := c.generateGitConfigurationStepsForData(data)
 		for _, line := range gitConfigSteps {
 			yaml.WriteString(line)
 		}
@@ -281,13 +314,20 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 	// Add Node.js setup if the engine requires it and it's not already set up in custom steps
 	engine, err := c.getAgenticEngine(data.AI)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve agentic engine from AI configuration: %w", err)
+		return nil, fmt.Errorf("agentic engine could not be resolved from the 'engine' field, expected a supported engine id such as 'copilot' or 'claude': %w", err)
 	}
 
 	// Ensure MCP gateway defaults are set before generating aw_info.json
 	// This is needed so that awmg_version is populated correctly
 	if HasMCPServers(data) {
 		ensureDefaultMCPGatewayConfig(data)
+	}
+
+	// Propagate the compiler version so engine installation steps can embed it as
+	// GH_AW_COMPILED_VERSION, enabling compat.json-based toolcache resolution at runtime.
+	// Non-release builds intentionally normalize this to "dev" to avoid lock-file churn.
+	if data.CompiledVersion == "" {
+		data.CompiledVersion = GetCompiledVersionForEmission(c.version)
 	}
 
 	// Add engine-specific installation steps (includes Node.js setup and secret validation for npm-based engines)
@@ -297,6 +337,26 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 		for _, line := range step {
 			yaml.WriteString(line)
 			yaml.WriteByte('\n')
+		}
+	}
+
+	if pluginInstaller, ok := engine.(PluginInstallationProvider); ok {
+		pluginAuthSteps := c.generatePluginAuthTokenSteps(data)
+		compilerYamlLog.Printf("Adding %d plugin auth token steps for %s", len(pluginAuthSteps), engine.GetID())
+		for _, step := range pluginAuthSteps {
+			for _, line := range step {
+				yaml.WriteString(line)
+				yaml.WriteByte('\n')
+			}
+		}
+
+		pluginInstallSteps := pluginInstaller.GetPluginInstallationSteps(data)
+		compilerYamlLog.Printf("Adding %d plugin installation steps for %s", len(pluginInstallSteps), engine.GetID())
+		for _, step := range pluginInstallSteps {
+			for _, line := range step {
+				yaml.WriteString(line)
+				yaml.WriteByte('\n')
+			}
 		}
 	}
 
@@ -343,23 +403,24 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 	// IMPORTANT: This must run BEFORE pre-agent-steps (below) so that APM-restored skills
 	// placed in .github/skills/ by pre-agent-steps are not clobbered by this restore.
 	if ShouldGeneratePRCheckoutStep(data) {
-		registry := GetGlobalEngineRegistry()
+		folders, files := resolveAgentManifestPaths(c.engineRegistry, data)
 		generateRestoreBaseGitHubFoldersStep(yaml,
-			registry.GetAllAgentManifestFolders(),
-			registry.GetAllAgentManifestFiles(),
+			folders,
+			files,
 		)
+		generateRestoreAmbientFoldersStep(yaml, data)
 	}
 
 	// Restore inline sub-agents written during the activation job.
 	// This step runs AFTER the base-branch restore so the engine-specific agent directory
 	// is not clobbered. Inline sub-agents are enabled by default.
 	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), data) {
-		generateRestoreInlineSubAgentsStep(yaml, data)
+		generateRestoreInlineSubAgentsStep(yaml, data, c.engineRegistry)
 	}
 	// Restore the engine-specific skills directory when inline skills are enabled or when
 	// explicit frontmatter skills were installed during activation.
 	if isFeatureEnabled(constants.FeatureFlag("inline-agents"), data) || len(data.Skills) > 0 {
-		generateRestoreInlineSkillsStep(yaml, data)
+		generateRestoreInlineSkillsStep(yaml, data, c.engineRegistry)
 	}
 
 	// Add pre-agent-steps (if any) after base-branch restore but before MCP setup.
@@ -371,7 +432,7 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 
 	// Add MCP setup
 	if err := c.generateMCPSetup(yaml, data.Tools, engine, data); err != nil {
-		return nil, fmt.Errorf("failed to generate MCP setup: %w", err)
+		return nil, fmt.Errorf("MCP setup could not be generated, expected valid tool configuration in the 'tools' section: %w", err)
 	}
 
 	// Mount MCP servers as CLI tools (runs after gateway is started)
@@ -386,7 +447,7 @@ func (c *Compiler) generateEngineInstallAndPreAgentSteps(yaml *strings.Builder, 
 // MCP gateway stop, secret redaction, agent step summary append, and output collection.
 // It returns the initial set of artifact paths (to be extended by the caller) and the
 // agent stdio log path constant.
-func (c *Compiler) generateAgentRunSteps(yaml *strings.Builder, data *WorkflowData, engine CodingAgentEngine, needsGitConfig bool) ([]string, string, error) {
+func (c *Compiler) generateAgentRunSteps(yaml *strings.Builder, data *WorkflowData, engine CodingAgentEngine, needsGitConfig bool) ([]string, string, error) { //nolint:largefunc // Existing workflow step orchestration preserves generated step order.
 	// Collect artifact paths for unified upload at the end
 	var artifactPaths []string
 	artifactPaths = append(artifactPaths, constants.AwPromptsFile)
@@ -415,7 +476,7 @@ func (c *Compiler) generateAgentRunSteps(yaml *strings.Builder, data *WorkflowDa
 		for _, step := range data.EngineConfigSteps {
 			stepYAML, err := ConvertStepToYAML(step)
 			if err != nil {
-				return nil, "", fmt.Errorf("failed to render engine config step: %w", err)
+				return nil, "", fmt.Errorf("engine config step could not be rendered to YAML, expected a step with valid fields: %w", err)
 			}
 			yaml.WriteString(stepYAML)
 		}
@@ -458,8 +519,10 @@ func (c *Compiler) generateAgentRunSteps(yaml *strings.Builder, data *WorkflowDa
 	// This allows safe-outputs operations (like create_pull_request) to work properly
 	// We regenerate the credentials rather than restoring from backup.
 	// Only emit these steps when a checkout was performed (requires a .git directory).
+	// When current: true targets a subdirectory, target that path so the step succeeds
+	// even if a pre-agent step removed the workspace-root git repository.
 	if needsGitConfig {
-		gitConfigStepsAfterAgent := c.generateGitConfigurationSteps()
+		gitConfigStepsAfterAgent := c.generateGitConfigurationStepsForData(data)
 		for _, line := range gitConfigStepsAfterAgent {
 			yaml.WriteString(line)
 		}

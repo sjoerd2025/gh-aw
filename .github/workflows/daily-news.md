@@ -16,10 +16,10 @@ permissions:
 
   copilot-requests: write
 tracker-id: daily-news-weekday
-model: copilot/gpt-5.4
+model: openai/gpt-5.4
 engine:
   id: pi
-  bare: true
+  model-provider: openai
 
 timeout-minutes: 30  # Reduced from 45 since pre-fetching data is faster
 experiments:
@@ -57,7 +57,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 safe-outputs:
   upload-artifact:
     max-uploads: 3
@@ -325,6 +324,7 @@ imports:
       expires: 3d
   - shared/trends.md
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 evals:
@@ -547,16 +547,6 @@ Create a GitHub discussion titled "Daily Status - <today's date>".
   * Summary statistics: number of issues/PRs/commits/discussions analyzed
   * Date range of data analyzed
   * Any data limitations encountered
-
-Use h3 (`###`) or lower for all headers in the discussion. Never use h1 (`#`) or h2 (`##`) inside discussion bodies — these are reserved for the discussion title.
-
-Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability and reduce scrolling.
-
-Suggested structure:
-- Brief summary (always visible)
-- Key metrics or highlights (always visible)
-- Detailed analysis (in `<details>` tags)
-- Recommendations (always visible)
 
 Create a new GitHub discussion with a title containing today's date (e.g., "Daily Status - 2024-10-10") containing a markdown report with your findings. Use links where appropriate.
 

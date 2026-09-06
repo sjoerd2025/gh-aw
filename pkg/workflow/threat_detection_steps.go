@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 // buildDetectionJobSteps builds the threat detection steps to be run in the separate detection job.
@@ -57,6 +58,13 @@ func (c *Compiler) buildDetectionJobSteps(data *WorkflowData) []string {
 	}
 
 	// Step 6: Setup threat detection (github-script)
+	//
+	// On the external detector path this step is still emitted because it exports GH_AW_PROMPT,
+	// GH_AW_DETECTION_CONTINUE_ON_ERROR, HAS_PATCH and the workflow-context vars, and performs
+	// artifact validation. Its prompt is unused by threat-detect, so only its step-summary write
+	// is suppressed (see GH_AW_DETECTION_SKIP_PROMPT_SUMMARY in buildThreatDetectionAnalysisStep).
+	// Decision: retiring the step entirely on the external path is deferred until the remaining
+	// responsibilities move to the execution step and the detector's own validation.
 	steps = append(steps, c.buildThreatDetectionAnalysisStep(data)...)
 
 	if isFeatureEnabled(constants.GHAWDetectionFeatureFlag, data) {
@@ -72,17 +80,24 @@ func (c *Compiler) buildDetectionJobSteps(data *WorkflowData) []string {
 		steps = append(steps, c.buildPrepareDetectionEngineConfigForExternalDetectorStep(data)...)
 
 		// Step 10: Install the threat-detect binary from GitHub Releases
-		steps = append(steps, c.buildInstallThreatDetectStep()...)
+		steps = append(steps, c.buildInstallThreatDetectStep(data)...)
 
 		// Step 11: Run threat-detect under AWF with a read-write mount for the result file
 		steps = append(steps, c.buildExternalDetectorExecutionStep(data)...)
+
+		// Step 11a: Render detection.log to the Actions log wrapped in group/stop-commands macros.
+		steps = append(steps, c.buildRenderDetectionLogStep(data)...)
+
+		// Step 11b: Copy the detection AWF run's own firewall proxy/audit logs into the
+		// threat-detection working directory so they can be bundled in the detection artifact.
+		steps = append(steps, c.buildCopyDetectionFirewallLogsStep(data)...)
 
 		// Step 12: Custom post-steps if configured (run after detection execution)
 		if len(data.SafeOutputs.ThreatDetection.PostSteps) > 0 {
 			steps = append(steps, c.buildCustomThreatDetectionSteps(data.SafeOutputs.ThreatDetection.PostSteps)...)
 		}
 
-		// Step 13: Upload detection_result.json + detection.log as the detection artifact
+		// Step 13: Upload detection_result.json as the detection artifact
 		steps = append(steps, c.buildUploadDetectionArtifactStep(data)...)
 
 		// Step 14: Parse threat-detection token usage for step summary and downstream footer rendering.
@@ -95,6 +110,19 @@ func (c *Compiler) buildDetectionJobSteps(data *WorkflowData) []string {
 
 		// Step 7: Engine execution (AWF, no network)
 		steps = append(steps, c.buildDetectionEngineExecutionStep(data)...)
+
+		// Step 7a: Echo detection step summary so the GitHub runner can mask any secrets.
+		// The AWF execution step writes the detection agent's step-summary content to
+		// ThreatDetectionStepSummaryPath (overriding $GITHUB_STEP_SUMMARY at the step level).
+		// Echoing the file content here lets the runner apply its secret-masking pass.
+		steps = append(steps, c.buildDetectionStepSummaryEchoStep()...)
+
+		// Step 7b: Render detection.log to the Actions log wrapped in group/stop-commands macros.
+		steps = append(steps, c.buildRenderDetectionLogStep(data)...)
+
+		// Step 7c: Copy the detection AWF run's own firewall proxy/audit logs into the
+		// threat-detection working directory so they can be bundled in the detection artifact.
+		steps = append(steps, c.buildCopyDetectionFirewallLogsStep(data)...)
 
 		// Step 8: Custom post-steps if configured (run after engine execution)
 		if len(data.SafeOutputs.ThreatDetection.PostSteps) > 0 {
@@ -168,30 +196,67 @@ func (c *Compiler) buildCleanFirewallDirsStep() []string {
 	}
 }
 
-// buildPrepareDetectionFilesStep creates a step that copies agent output files
-// to the /tmp/gh-aw/threat-detection/ directory expected by the detection JS scripts.
-// In the separate detection job, files are available after downloading the agent artifact.
+// detectionFirewallLogsDir is the directory (relative to ThreatDetectionDir) where the
+// detection job's own AWF firewall proxy/audit logs are copied before upload. Namespacing
+// them under threat-detection/ (rather than uploading the raw AWFProxyLogsDir/AWFAuditDir
+// paths directly) avoids colliding with the agent job's identically-named firewall log
+// files when both artifacts are extracted into the same /tmp/gh-aw/ root in the conclusion
+// job — and matches the layout collect_usage_artifact_files.sh expects for detection usage.
+const detectionFirewallLogsDir = constants.ThreatDetectionDir + "/sandbox/firewall"
+
+// buildCopyDetectionFirewallLogsStep creates a step that copies the detection AWF run's
+// own proxy/audit logs (written to the same well-known AWFProxyLogsDir/AWFAuditDir paths
+// the agent job uses) into the threat-detection working directory. Without this, the
+// detection job's firewall/api-proxy token-usage data never leaves its ephemeral runner:
+// it is not part of any uploaded artifact, so the usage artifact and the AI-credits budget
+// cap have nothing to observe for the detection phase (see gh-aw#54047/#54046).
+func (c *Compiler) buildCopyDetectionFirewallLogsStep(data *WorkflowData) []string {
+	if !isFirewallEnabled(data) {
+		return nil
+	}
+
+	proxyLogsDir := constants.AWFProxyLogsDir.String()
+	auditDir := constants.AWFAuditDir.String()
+	if isArcDindTopology(data) {
+		proxyLogsDir = rewriteArcDindPath(proxyLogsDir)
+		auditDir = rewriteArcDindPath(auditDir)
+	}
+
+	return []string{
+		"      - name: Copy detection firewall logs\n",
+		fmt.Sprintf("        if: %s\n", detectionStepCondition),
+		"        continue-on-error: true\n",
+		"        run: |\n",
+		fmt.Sprintf("          mkdir -p %s\n", detectionFirewallLogsDir),
+		fmt.Sprintf("          if [ -d %s ]; then mkdir -p %s/logs && cp -r %s/. %s/logs/; fi\n", proxyLogsDir, detectionFirewallLogsDir, proxyLogsDir, detectionFirewallLogsDir),
+		fmt.Sprintf("          if [ -d %s ]; then mkdir -p %s/audit && cp -r %s/. %s/audit/; fi\n", auditDir, detectionFirewallLogsDir, auditDir, detectionFirewallLogsDir),
+	}
+}
+
+// buildPrepareDetectionFilesStep creates a step that stages agent output files
+// for the threat-detect binary. In the separate detection job, files are
+// available after downloading the agent artifact.
 func (c *Compiler) buildPrepareDetectionFilesStep() []string {
 	return []string{
 		"      - name: Prepare threat detection files\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
 		"        run: |\n",
-		"          mkdir -p /tmp/gh-aw/threat-detection/aw-prompts\n",
-		"          rm -f /tmp/gh-aw/agent_usage.json\n",
-		"          cp /tmp/gh-aw/aw-prompts/prompt.txt /tmp/gh-aw/threat-detection/aw-prompts/prompt.txt 2>/dev/null || true\n",
-		"          if [ ! -s /tmp/gh-aw/threat-detection/aw-prompts/prompt.txt ]; then\n",
-		"            echo \"::warning::ERR_VALIDATION: Missing or empty detection context prompt at /tmp/gh-aw/threat-detection/aw-prompts/prompt.txt. Ensure the agent artifact includes /tmp/gh-aw/aw-prompts/prompt.txt. Detection will continue with fallback workflow context.\"\n",
-		"          fi\n",
-		"          cp /tmp/gh-aw/agent_output.json /tmp/gh-aw/threat-detection/agent_output.json 2>/dev/null || true\n",
-		"          for f in /tmp/gh-aw/aw-*.patch; do\n",
-		"            [ -f \"$f\" ] && cp \"$f\" /tmp/gh-aw/threat-detection/ 2>/dev/null || true\n",
-		"          done\n",
-		"          for f in /tmp/gh-aw/aw-*.bundle; do\n",
-		"            [ -f \"$f\" ] && cp \"$f\" /tmp/gh-aw/threat-detection/ 2>/dev/null || true\n",
-		"          done\n",
-		"          echo \"Prepared threat detection files:\"\n",
-		"          ls -la /tmp/gh-aw/threat-detection/ 2>/dev/null || true\n",
+		"          bash \"${RUNNER_TEMP}/gh-aw/actions/prepare_threat_detection_files.sh\"\n",
 	}
+}
+
+// resolveThreatDetectionContinueOnError determines the continue-on-error mode for
+// threat-detection steps (default: true — detection failures produce warnings). When
+// ContinueOnErrorExpr is set the value is resolved at runtime; compile-time we use true as
+// a safe default so the step-level continue-on-error is included (permissive).
+func resolveThreatDetectionContinueOnError(data *WorkflowData) (bool, *string) {
+	continueOnError := true
+	var continueOnErrorExpr *string
+	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
+		continueOnError = data.SafeOutputs.ThreatDetection.IsContinueOnError()
+		continueOnErrorExpr = data.SafeOutputs.ThreatDetection.ContinueOnErrorExpr
+	}
+	return continueOnError, continueOnErrorExpr
 }
 
 // buildDetectionConclusionStep creates the combined parse-and-conclude step for threat detection.
@@ -206,12 +271,7 @@ func (c *Compiler) buildDetectionConclusionStep(data *WorkflowData) []string {
 	// Determine continue-on-error mode (default: true — detection failures produce warnings).
 	// When ContinueOnErrorExpr is set the value is resolved at runtime; compile-time we use
 	// true as a safe default so the step-level continue-on-error is included (permissive).
-	continueOnError := true
-	var continueOnErrorExpr *string
-	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
-		continueOnError = data.SafeOutputs.ThreatDetection.IsContinueOnError()
-		continueOnErrorExpr = data.SafeOutputs.ThreatDetection.ContinueOnErrorExpr
-	}
+	continueOnError, continueOnErrorExpr := resolveThreatDetectionContinueOnError(data)
 
 	steps := []string{
 		"      - name: Parse and conclude threat detection\n",
@@ -235,21 +295,12 @@ func (c *Compiler) buildDetectionConclusionStep(data *WorkflowData) []string {
 		steps = append(steps, "        continue-on-error: true\n")
 	}
 
-	// Build the GH_AW_DETECTION_CONTINUE_ON_ERROR env var.
-	var coeEnvLine string
-	if continueOnErrorExpr != nil {
-		// Pass the expression unquoted so GitHub Actions evaluates it at runtime.
-		coeEnvLine = fmt.Sprintf("          GH_AW_DETECTION_CONTINUE_ON_ERROR: %s\n", *continueOnErrorExpr)
-	} else {
-		coeEnvLine = fmt.Sprintf("          GH_AW_DETECTION_CONTINUE_ON_ERROR: %q\n", strconv.FormatBool(continueOnError))
-	}
-
 	steps = append(steps, []string{
 		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
 		"        env:\n",
 		"          RUN_DETECTION: ${{ steps.detection_guard.outputs.run_detection }}\n",
 		"          DETECTION_AGENTIC_EXECUTION_OUTCOME: ${{ steps.detection_agentic_execution.outcome }}\n",
-		coeEnvLine,
+		buildThreatDetectionContinueOnErrorEnvLine(continueOnError, continueOnErrorExpr),
 		"        with:\n",
 		"          script: |\n",
 	}...)
@@ -286,6 +337,9 @@ func (c *Compiler) buildDetectionTokenUsageSummaryStep(data *WorkflowData) []str
 func (c *Compiler) buildThreatDetectionAnalysisStep(data *WorkflowData) []string {
 	var steps []string
 
+	// Determine continue-on-error mode (same logic as buildDetectionConclusionStep).
+	continueOnError, continueOnErrorExpr := resolveThreatDetectionContinueOnError(data)
+
 	// Setup step
 	steps = append(steps, []string{
 		"      - name: Setup threat detection\n",
@@ -293,18 +347,13 @@ func (c *Compiler) buildThreatDetectionAnalysisStep(data *WorkflowData) []string
 		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
 		"        env:\n",
 	}...)
-	steps = append(steps, c.buildWorkflowContextEnvVars(data)...)
+	steps = append(steps, c.buildThreatDetectionContextEnvVars(data, continueOnError, continueOnErrorExpr)...)
 
-	// Add HAS_PATCH environment variable from the agent job output (detection runs in a separate job)
-	steps = append(steps, "          HAS_PATCH: ${{ needs.agent.outputs.has_patch }}\n")
-
-	// Add custom prompt instructions if configured
-	customPrompt := ""
-	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil {
-		customPrompt = data.SafeOutputs.ThreatDetection.Prompt
-	}
-	if customPrompt != "" {
-		steps = append(steps, fmt.Sprintf("          CUSTOM_PROMPT: %q\n", customPrompt))
+	// On the external detector path the prompt rendered by this step is never used: threat-detect
+	// renders its own embedded template and appends it to the step summary. Suppress the setup
+	// step's summary write so a single detection run does not display two different prompts.
+	if isFeatureEnabled(constants.GHAWDetectionFeatureFlag, data) {
+		steps = append(steps, "          GH_AW_DETECTION_SKIP_PROMPT_SUMMARY: \"true\"\n")
 	}
 
 	steps = append(steps, []string{
@@ -317,14 +366,26 @@ func (c *Compiler) buildThreatDetectionAnalysisStep(data *WorkflowData) []string
 	formattedSetupScript := FormatJavaScriptForYAML(setupScript)
 	steps = append(steps, formattedSetupScript...)
 
-	// Add a small shell step in YAML to ensure the output directory and log file exist
-	steps = append(steps, []string{
+	// Add a small shell step in YAML to ensure the output directory and log file exist.
+	// The step-summary reset/touch is only needed on the inline path: the inline engine
+	// execution step overrides GITHUB_STEP_SUMMARY to this path so the AWF sandbox can
+	// write to it. The external threat-detect binary (v0.4.5+) no longer writes any
+	// step-summary output (github/gh-aw-threat-detection#792), so resetting the file
+	// there would be dead code.
+	ensureSteps := []string{
 		"      - name: Ensure threat-detection directory and log\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
 		"        run: |\n",
 		"          mkdir -p /tmp/gh-aw/threat-detection\n",
 		"          touch /tmp/gh-aw/threat-detection/detection.log\n",
-	}...)
+	}
+	if !isFeatureEnabled(constants.GHAWDetectionFeatureFlag, data) {
+		ensureSteps = append(ensureSteps,
+			fmt.Sprintf("          rm -f %s\n", constants.ThreatDetectionStepSummaryPath),
+			fmt.Sprintf("          touch %s\n", constants.ThreatDetectionStepSummaryPath),
+		)
+	}
+	steps = append(steps, ensureSteps...)
 
 	return steps
 }
@@ -357,6 +418,27 @@ func (c *Compiler) buildWorkflowContextEnvVars(data *WorkflowData) []string {
 		fmt.Sprintf("          WORKFLOW_NAME: %q\n", workflowName),
 		fmt.Sprintf("          WORKFLOW_DESCRIPTION: %q\n", workflowDescription),
 	}
+}
+
+func (c *Compiler) buildThreatDetectionContextEnvVars(data *WorkflowData, continueOnError bool, continueOnErrorExpr *string) []string {
+	envVars := c.buildWorkflowContextEnvVars(data)
+	envVars = append(envVars,
+		"          HAS_PATCH: ${{ needs.agent.outputs.has_patch }}\n",
+		buildThreatDetectionContinueOnErrorEnvLine(continueOnError, continueOnErrorExpr),
+	)
+
+	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil && data.SafeOutputs.ThreatDetection.Prompt != "" {
+		envVars = append(envVars, fmt.Sprintf("          CUSTOM_PROMPT: %q\n", data.SafeOutputs.ThreatDetection.Prompt))
+	}
+
+	return envVars
+}
+
+func buildThreatDetectionContinueOnErrorEnvLine(continueOnError bool, continueOnErrorExpr *string) string {
+	if continueOnErrorExpr != nil {
+		return fmt.Sprintf("          GH_AW_DETECTION_CONTINUE_ON_ERROR: %s\n", *continueOnErrorExpr)
+	}
+	return fmt.Sprintf("          GH_AW_DETECTION_CONTINUE_ON_ERROR: %q\n", strconv.FormatBool(continueOnError))
 }
 
 // buildResultsParsingScriptRequire creates the parsing script that requires the .cjs module.
@@ -402,7 +484,7 @@ func (c *Compiler) buildCustomThreatDetectionSteps(steps []any) []string {
 			// Inject the detection guard condition unless the user already provided an if: condition.
 			if _, hasIf := stepMap["if"]; !hasIf {
 				// Clone the map to avoid mutating the original config.
-				injected := make(map[string]any, safeAllocationCapacity(len(stepMap), 1))
+				injected := make(map[string]any, typeutil.SafeAllocationCapacity(len(stepMap), 1))
 				maps.Copy(injected, stepMap)
 				injected["if"] = detectionStepCondition
 				stepMap = injected
@@ -420,27 +502,99 @@ func (c *Compiler) buildCustomThreatDetectionSteps(steps []any) []string {
 // same reusable workflow is called multiple times within a single workflow run.
 // The prefix comes from the agent job output since the detection job depends on the agent job.
 func (c *Compiler) buildUploadDetectionLogStep(data *WorkflowData) []string {
-	detectionArtifactName := artifactPrefixExprForAgentDownstreamJob(data) + constants.DetectionArtifactName
-	return []string{
+	detectionArtifactName := artifactPrefixExprForAgentDownstreamJob(data) + constants.DetectionArtifactName.String()
+	steps := []string{
 		"      - name: Upload threat detection log\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
 		fmt.Sprintf("        uses: %s\n", c.getActionPin("actions/upload-artifact")),
 		"        with:\n",
 		"          name: " + detectionArtifactName + "\n",
-		"          path: /tmp/gh-aw/threat-detection/detection.log\n",
-		"          if-no-files-found: ignore\n",
+		"          path: |\n",
+		"            /tmp/gh-aw/threat-detection/detection.log\n",
 	}
+	if isFirewallEnabled(data) {
+		steps = append(steps,
+			"            "+detectionFirewallLogsDir+"/logs/\n",
+			"            "+detectionFirewallLogsDir+"/audit/\n",
+		)
+	}
+	steps = append(steps, "          if-no-files-found: ignore\n")
+	return steps
+}
+
+// buildDetectionStepSummaryEchoStep creates a step that echoes the detection engine's
+// step-summary file content so the GitHub runner can mask any sensitive values it contains.
+//
+// The detection engine execution step overrides $GITHUB_STEP_SUMMARY at the step level
+// to ThreatDetectionStepSummaryPath so the AWF chroot can write to a reachable path.
+// This step then echoes the file content; the runner will apply secret masking to the output.
+func (c *Compiler) buildDetectionStepSummaryEchoStep() []string {
+	summaryPath := constants.ThreatDetectionStepSummaryPath
+	return []string{
+		"      - name: Echo detection step summary\n",
+		fmt.Sprintf("        if: %s\n", detectionStepCondition),
+		"        continue-on-error: true\n",
+		"        run: |\n",
+		fmt.Sprintf("          if [ -s %s ]; then\n", shellEscapeArg(summaryPath)),
+		fmt.Sprintf("            cat %s\n", shellEscapeArg(summaryPath)),
+		"          fi\n",
+	}
+}
+
+// buildRenderDetectionLogStep creates a step that reads detection.log and pipes
+// it to stdout wrapped in GitHub Actions group and stop-commands macros so that:
+//   - the output is folded into a collapsible section in the Actions log UI, and
+//   - any workflow-command-shaped lines in the log are not interpreted by the runner.
+//
+// Secret redaction (built-in patterns + MCP gateway tokens) is applied before
+// the content is written, providing a defence-in-depth layer on top of the
+// file-level redaction performed by redact_secrets.cjs.
+func (c *Compiler) buildRenderDetectionLogStep(data *WorkflowData) []string {
+	steps := []string{
+		"      - name: Render detection log\n",
+		fmt.Sprintf("        if: %s\n", detectionStepCondition),
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
+		"        with:\n",
+		"          script: |\n",
+		"            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n",
+		"            setupGlobals(core, github, context, exec, io, getOctokit);\n",
+		"            const { main } = require('" + SetupActionDestination + "/render_detection_log.cjs');\n",
+		"            await main();\n",
+	}
+	return steps
 }
 
 // buildInstallThreatDetectStep creates a step that installs the threat-detect binary
 // from GitHub Releases at the pinned version. This is used when the gh-aw-detection
 // feature flag is set, replacing the inline engine installation steps.
-func (c *Compiler) buildInstallThreatDetectStep() []string {
+//
+// The detection job already tolerates a missing threat-detect binary when continue-on-error
+// (warn mode) is in effect: buildDetectionConclusionStep and buildThreatDetectionAnalysisStep
+// treat a failed/absent binary as a non-fatal detection failure via
+// GH_AW_DETECTION_CONTINUE_ON_ERROR. Without continue-on-error on this install step, a
+// transient download failure (e.g. a GitHub Releases CDN blip) would still mark this step —
+// and therefore the whole detection job — as `failure`, even though the workflow logic
+// already treats a missing binary as non-fatal. Marking the step itself continue-on-error
+// in warn mode keeps the job conclusion consistent with that tolerance.
+func (c *Compiler) buildInstallThreatDetectStep(data *WorkflowData) []string {
 	version := string(constants.DefaultThreatDetectVersion)
-	return []string{
+
+	// Determine continue-on-error mode (same logic as buildDetectionConclusionStep).
+	continueOnError, continueOnErrorExpr := resolveThreatDetectionContinueOnError(data)
+
+	steps := []string{
 		"      - name: Install threat-detect binary\n",
 		fmt.Sprintf("        if: %s\n", detectionStepCondition),
+	}
+	if continueOnErrorExpr != nil {
+		steps = append(steps, fmt.Sprintf("        continue-on-error: %s\n", *continueOnErrorExpr))
+	} else if continueOnError {
+		steps = append(steps, "        continue-on-error: true\n")
+	}
+	steps = append(steps,
 		"        run: |\n",
 		fmt.Sprintf("          bash \"${RUNNER_TEMP}/gh-aw/actions/install_threat_detect_binary.sh\" %s\n", version),
-	}
+	)
+	return steps
 }

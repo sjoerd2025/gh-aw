@@ -4,6 +4,7 @@
 **Version**: 1.0.0  
 **Status**: Candidate Recommendation  
 **Date**: January 29, 2026
+**Last validated**: v1.0.0 / 2026-07-15
 
 ## Overview
 
@@ -264,6 +265,17 @@ Step-by-step checklist for verifying that a compiled `.lock.yml` file meets all 
 ### Appendix H: Security Best Practices
 Six key best practices with "Don't" and "Do" examples.
 
+**Safeguards — compile-time vs. runtime enforcement**:
+
+| Practice | Enforcement | Mechanism |
+|---|---|---|
+| BP-01 Sanitized context | Compile-time | Compiler rewrites `${{ github.event.* }}` expressions in `prompt:` to `${{ steps.sanitized.outputs.text }}` during compilation; unsanitized expressions never reach the generated `.lock.yml` |
+| BP-02 Strict mode for production | Compile-time | `strict: true` causes the compiler to reject workflows with write permissions on the `agent` job or missing `safe-outputs:`; violations fail `gh aw compile` |
+| BP-03 Specific domain allowlists | Runtime | The AWF network proxy/firewall enforces the configured `network.allowed` domain list against outbound requests during workflow execution; a wildcard (`"*"`) is accepted at compile time but only its effect is observed at runtime |
+| BP-04 Pin actions to SHAs | Compile-time (advisory) / CI-time (enforced) | The compiler itself does not reject unpinned `uses:` references; SHA-pinning is enforced by CI tooling (`actionlint`, `poutine`, `zizmor`) run against compiled `.lock.yml` files, not by the compiler at `gh aw compile` time (see Appendix G.1 coverage gap) |
+| BP-05 Enable threat detection | Compile-time (job generation) / Runtime (detection execution) | The compiler generates a `detection` job when `threat-detection.enabled` is not explicitly `false`; the actual AI-based/TruffleHog scan and the `needs.detection.outputs.success` gate on `safe_outputs` are evaluated at runtime |
+| BP-06 Role-based access control | Runtime | `roles:` configures the `GH_AW_REQUIRED_ROLES` environment variable consumed by the `pre_activation` job's `check_membership.cjs` step, which queries GitHub's API for the triggering actor's role at workflow run time; the compiler does not verify roles ahead of time |
+
 ## Target Audience
 
 - **Security Engineers**: Audit and verify security controls
@@ -302,15 +314,17 @@ The specification documents the **current implementation** in gh-aw version 1.0.
 
 Key implementation files referenced in the specification:
 
-- `pkg/workflow/safe_inputs_parser.go` - Input sanitization
-- `pkg/workflow/safe_outputs_config.go` - Output isolation
+- `pkg/workflow/safe_outputs_parser.go` - Safe-output frontmatter parsing
+- `pkg/workflow/safe_outputs_config_base.go` - Shared safe-output configuration
+- `pkg/workflow/safe_outputs_config_types.go` - Safe-output type configuration
 - `pkg/workflow/engine.go` - Network permissions
 - `pkg/workflow/compiler_safe_outputs.go` - Safe output compilation
 - `pkg/workflow/safe_jobs.go` - Threat detection
 - `pkg/workflow/compiler_types.go` - Core types
-- Actions in `actions/setup/js/*.cjs` and `actions/setup/sh/*.sh`
 
 ### Spec-to-Lock Sync (v1.0.0)
+
+Summary version **1.0.0** was last validated on **2026-07-15**, matching the validation marker in `specs/security-architecture-spec-validation.md`.
 
 Summary version **1.0.0** corresponds to the minimum validated `.lock.yml` compiler behaviors recorded in `specs/security-architecture-spec-validation.md`:
 
@@ -359,6 +373,7 @@ Summary version **1.0.0** corresponds to the minimum validated `.lock.yml` compi
 | Add formal model and test suite for SG-01 through SG-07 | ✅ Done (2026-07-09) | Added "Formal Model" (TLA+/F*/Z3 invariants), "Behavioral Coverage Map" (15 predicates), and "Generated Test Suite" sections; 15 tests in `pkg/workflow/security_architecture_sg_formal_test.go` |
 | Sync PM-11 formal coverage into behavioral coverage map | ✅ Done (2026-07-15) | Added `TestFormalPM11_PreActivationContainsMembershipStep` to the behavioral coverage map and generated suite notes; formal suite now tracks 16 tests in `pkg/workflow/security_architecture_sg_formal_test.go` |
 | Sync §12 CS/RS coverage update from daily SPDD queue | ✅ Done (2026-07-28) | Added formal coverage map/test-suite entries for T-CS-001/002 and T-RS-003..008; synced to `specs/security-architecture-spec-validation.md` §12 matrix |
+| Add RS-05a for workflow_dispatch + aw_context PR checkout | ✅ Done (2026-08-01) | Security threat review cleared; added RS-05a to §11.3 (repository scope, actor trust, parse resilience, ref isolation); validation §7a added with 9-test unit evidence; §12 matrix updated; spec bumped to v1.0.1 |
 
 ## Versioning
 
@@ -368,7 +383,7 @@ The specification follows **semantic versioning**:
 - **Minor**: New features, backward-compatible additions
 - **Patch**: Bug fixes, clarifications, editorial changes
 
-Current version: **1.0.0** (Candidate Recommendation)
+Current version: **1.0.1** (Candidate Recommendation)
 
 ## Feedback
 

@@ -9,9 +9,11 @@ const {
   main,
   getReadableTokenUsagePaths,
   extractRequestId,
+  extractTokenUsageDedupeKey,
   readDedupedTokenUsage,
   getSummaryTitle,
   buildStepSummarySection,
+  buildWorkingSetDetailsSection,
   renderTokenTableAsPlainText,
   TOKEN_USAGE_AUDIT_PATH,
   TOKEN_USAGE_PATH,
@@ -196,7 +198,7 @@ describe("parse_token_usage", () => {
 
       await main();
 
-      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("### Token Usage"), true);
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("<summary>Token Usage</summary>"), true);
       expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("| Alias |"), true);
       expect(mockCore.summary.write).toHaveBeenCalled();
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Token usage summary appended"));
@@ -205,8 +207,19 @@ describe("parse_token_usage", () => {
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Alias"));
     });
 
-    test("uses custom summary title when configured", async () => {
+    test("keeps threat-detection title and rows with AWF-reported credits", async () => {
       process.env.GH_AW_TOKEN_USAGE_SUMMARY_TITLE = "Threat Detection Token Usage";
+      const reportedEntry = JSON.stringify({
+        model: "gpt-4o-mini-2024-07-18",
+        provider: "copilot",
+        input_tokens: 19288,
+        output_tokens: 35,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        duration_ms: 2242,
+        ai_credits_this_response: 0.29142,
+        ai_credits_total: 0.29142,
+      });
 
       fs.existsSync = vi.fn(p => {
         if (p === TOKEN_USAGE_PATH) return true;
@@ -214,19 +227,21 @@ describe("parse_token_usage", () => {
         return originalExistsSync(p);
       });
       fs.statSync = vi.fn(p => {
-        if (p === TOKEN_USAGE_PATH) return { size: singleEntry.length };
+        if (p === TOKEN_USAGE_PATH) return { size: reportedEntry.length };
         if (p === TOKEN_USAGE_AUDIT_PATH) return { size: 0 };
         return originalStatSync(p);
       });
       fs.readFileSync = vi.fn((p, enc) => {
-        if (p === TOKEN_USAGE_PATH) return singleEntry;
+        if (p === TOKEN_USAGE_PATH) return reportedEntry;
         if (p === TOKEN_USAGE_AUDIT_PATH) return "";
         return originalReadFileSync(p, enc);
       });
 
       await main();
 
-      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("### Threat Detection Token Usage"), true);
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("<summary>Threat Detection Token Usage</summary>"), true);
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("gpt40mini"), true);
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("0.29142"), true);
     });
 
     test("appends token usage section to GITHUB_STEP_SUMMARY when configured", async () => {
@@ -253,8 +268,10 @@ describe("parse_token_usage", () => {
       await main();
 
       const stepSummary = originalReadFileSync(stepSummaryPath, "utf8");
-      expect(stepSummary).toContain("### Token Usage");
-      expect(stepSummary).toContain("<summary>Per-request AI credits and token totals</summary>");
+      expect(stepSummary).toContain("<summary>Token Usage</summary>");
+      expect(stepSummary).toContain("Per-request AI credits and token totals");
+      expect(stepSummary).toContain("Working-Set Rebuild Factor (WSRF): 1.00× (measured)");
+      expect(stepSummary).toContain("- Cumulative input tokens: 100");
       expect(stepSummary).toContain("| ΔAI Credits | AI Credits |");
       expect(fs.appendFileSync).toHaveBeenCalledWith(stepSummaryPath, expect.any(String), "utf8");
       expect(mockCore.summary.addRaw).not.toHaveBeenCalled();
@@ -304,6 +321,118 @@ describe("parse_token_usage", () => {
       expect(mockCore.setOutput).toHaveBeenCalledWith("primary_model", "claude-sonnet-4-6");
     });
 
+    test("writes the exact AWF-reported AIC total without repricing", async () => {
+      const agentUsageFile = path.join(tmpDir, "agent_usage.json");
+      const fixtureContent = originalReadFileSync(path.join(__dirname, "fixtures", "awf-v0.28.7-aic-token-usage.jsonl"), "utf8");
+
+      fs.existsSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return true;
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return false;
+        return originalExistsSync(p);
+      });
+      fs.statSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return { size: fixtureContent.length };
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return { size: 0 };
+        return originalStatSync(p);
+      });
+      fs.readFileSync = vi.fn((p, enc) => {
+        if (p === TOKEN_USAGE_PATH) return fixtureContent;
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return "";
+        return originalReadFileSync(p, enc);
+      });
+      fs.writeFileSync = vi.fn((p, data) => {
+        if (p === AGENT_USAGE_PATH) {
+          originalWriteFileSync(agentUsageFile, data);
+        } else {
+          originalWriteFileSync(p, data);
+        }
+      });
+
+      await main();
+
+      const agentUsage = JSON.parse(originalReadFileSync(agentUsageFile, "utf8"));
+      expect(agentUsage.ai_credits).toBe(1.03602);
+      expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_AIC", "1.03602");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("aic", "1.03602");
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("1.03602"));
+    });
+
+    test("exports AWF-reported zero AIC instead of treating it as missing", async () => {
+      const agentUsageFile = path.join(tmpDir, "agent_usage.json");
+      const zeroEntry = JSON.stringify({
+        model: "gpt-4o-mini-2024-07-18",
+        provider: "copilot",
+        input_tokens: 1000,
+        output_tokens: 100,
+        ai_credits_this_response: 0,
+        ai_credits_total: 0,
+      });
+
+      fs.existsSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return true;
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return false;
+        return originalExistsSync(p);
+      });
+      fs.statSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return { size: zeroEntry.length };
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return { size: 0 };
+        return originalStatSync(p);
+      });
+      fs.readFileSync = vi.fn((p, enc) => {
+        if (p === TOKEN_USAGE_PATH) return zeroEntry;
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return "";
+        return originalReadFileSync(p, enc);
+      });
+      fs.writeFileSync = vi.fn((p, data) => {
+        if (p === AGENT_USAGE_PATH) {
+          originalWriteFileSync(agentUsageFile, data);
+        } else {
+          originalWriteFileSync(p, data);
+        }
+      });
+
+      await main();
+
+      const agentUsage = JSON.parse(originalReadFileSync(agentUsageFile, "utf8"));
+      expect(agentUsage.ai_credits).toBe(0);
+      expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_AIC", "0");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("aic", "0");
+    });
+
+    test("surfaces fallback accounting warnings", async () => {
+      const malformedEntry = JSON.stringify({
+        model: "gpt-4o-mini-2024-07-18",
+        provider: "copilot",
+        input_tokens: 19288,
+        output_tokens: 35,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        ai_credits_this_response: null,
+        ai_credits_total: null,
+      });
+
+      fs.existsSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return true;
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return false;
+        return originalExistsSync(p);
+      });
+      fs.statSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_PATH) return { size: malformedEntry.length };
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return { size: 0 };
+        return originalStatSync(p);
+      });
+      fs.readFileSync = vi.fn((p, enc) => {
+        if (p === TOKEN_USAGE_PATH) return malformedEntry;
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_AWF_AUDIT_PATH) return "";
+        return originalReadFileSync(p, enc);
+      });
+
+      await main();
+
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("[ai-credits]"));
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("fallback accounting"));
+    });
+
     test("handles multiple model entries", async () => {
       const agentUsageFile = path.join(tmpDir, "agent_usage.json");
 
@@ -333,7 +462,7 @@ describe("parse_token_usage", () => {
       await main();
 
       const summaryCall = mockCore.summary.addRaw.mock.calls[0];
-      expect(summaryCall[0]).toContain("### Token Usage");
+      expect(summaryCall[0]).toContain("<summary>Token Usage</summary>");
       expectTokenUsageTableRows(summaryCall[0], [
         ["sonnet46", "100", "200"],
         ["gpt40", "50", "80"],
@@ -453,6 +582,42 @@ describe("parse_token_usage", () => {
       expect(agentUsage.output_tokens).toBe(305);
     });
 
+    test("deduplicates mirrored AWF token usage files before writing agent_usage", async () => {
+      const agentUsageFile = path.join(tmpDir, "agent_usage.json");
+      const fixtureContent = originalReadFileSync(path.join(__dirname, "fixtures", "awf-v0.28.7-aic-token-usage.jsonl"), "utf8");
+
+      fs.existsSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_PATH) return true;
+        if (p === TOKEN_USAGE_AWF_AUDIT_PATH) return false;
+        return originalExistsSync(p);
+      });
+      fs.statSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_PATH) return { size: fixtureContent.length };
+        if (p === TOKEN_USAGE_AWF_AUDIT_PATH) return { size: 0 };
+        return originalStatSync(p);
+      });
+      fs.readFileSync = vi.fn((p, enc) => {
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_PATH) return fixtureContent;
+        if (p === TOKEN_USAGE_AWF_AUDIT_PATH) return "";
+        return originalReadFileSync(p, enc);
+      });
+      fs.writeFileSync = vi.fn((p, data) => {
+        if (p === AGENT_USAGE_PATH) {
+          originalWriteFileSync(agentUsageFile, data);
+        } else {
+          originalWriteFileSync(p, data);
+        }
+      });
+
+      await main();
+
+      const agentUsage = JSON.parse(originalReadFileSync(agentUsageFile, "utf8"));
+      expect(agentUsage.input_tokens).toBe(39376);
+      expect(agentUsage.output_tokens).toBe(175);
+      expect(agentUsage.ai_credits).toBe(1.03602);
+      expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_AIC", "1.03602");
+    });
+
     test("calls setFailed when an error is thrown", async () => {
       fs.existsSync = vi.fn(p => {
         if (p === TOKEN_USAGE_PATH) return true;
@@ -503,6 +668,13 @@ describe("parse_token_usage", () => {
       expect(extractRequestId('{"model":"m"}')).toBe("");
     });
 
+    test("extractTokenUsageDedupeKey includes event and request_id", () => {
+      expect(extractTokenUsageDedupeKey('{"event":"token_usage","request_id":"req-123","model":"m"}')).toBe("token_usage:req-123");
+      expect(extractTokenUsageDedupeKey('{"event":"other","request_id":"req-123","model":"m"}')).toBe("other:req-123");
+      expect(extractTokenUsageDedupeKey('{"request_id":"req-123","model":"m"}')).toBe("token_usage:req-123");
+      expect(extractTokenUsageDedupeKey('{"model":"m"}')).toBe("");
+    });
+
     test("getReadableTokenUsagePaths skips failing stat path and keeps valid path", () => {
       fs.existsSync = vi.fn(p => p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_PATH);
       fs.statSync = vi.fn(p => {
@@ -532,6 +704,37 @@ describe("parse_token_usage", () => {
       expect(deduped.match(/"request_id":"req-1"/g)).toHaveLength(1);
     });
 
+    test("readDedupedTokenUsage keeps different events with the same request_id", () => {
+      const fileA = '{"event":"token_usage","request_id":"req-1","model":"m1","input_tokens":1}';
+      const fileB = '{"event":"token_steering","request_id":"req-1","model":"m1","input_tokens":2}';
+
+      fs.readFileSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_AUDIT_PATH) return fileA;
+        if (p === TOKEN_USAGE_PATH) return fileB;
+        return originalReadFileSync(p, "utf8");
+      });
+
+      const deduped = readDedupedTokenUsage([TOKEN_USAGE_AUDIT_PATH, TOKEN_USAGE_PATH]);
+      expect(deduped).toContain('"event":"token_usage"');
+      expect(deduped).toContain('"event":"token_steering"');
+      expect(deduped.match(/"request_id":"req-1"/g)).toHaveLength(2);
+    });
+
+    test("deduplicates mirrored AWF records before aggregating reported credits", () => {
+      const fixture = originalReadFileSync(path.join(__dirname, "fixtures", "awf-v0.28.7-aic-token-usage.jsonl"), "utf8");
+      fs.readFileSync = vi.fn(p => {
+        if (p === TOKEN_USAGE_AUDIT_PATH || p === TOKEN_USAGE_PATH) return fixture;
+        return originalReadFileSync(p, "utf8");
+      });
+
+      const deduped = readDedupedTokenUsage([TOKEN_USAGE_AUDIT_PATH, TOKEN_USAGE_PATH]);
+      const { parseTokenUsageJsonl } = require("./parse_mcp_gateway_log.cjs");
+      const summary = parseTokenUsageJsonl(deduped);
+
+      expect(summary.totalRequests).toBe(5);
+      expect(summary.totalAIC).toBe(1.03602);
+    });
+
     test("getSummaryTitle returns trimmed env title", () => {
       process.env.GH_AW_TOKEN_USAGE_SUMMARY_TITLE = "  Threat Detection Token Usage  ";
       expect(getSummaryTitle()).toBe("Threat Detection Token Usage");
@@ -544,9 +747,58 @@ describe("parse_token_usage", () => {
 
     test("buildStepSummarySection wraps markdown in a heading and details block", () => {
       const section = buildStepSummarySection("Token Usage", "| Alias |\n| --- |");
-      expect(section).toContain("### Token Usage");
       expect(section).toContain("<details>");
-      expect(section).toContain("<summary>Per-request AI credits and token totals</summary>");
+      expect(section).toContain("<summary>Token Usage</summary>");
+      expect(section).toContain("Per-request AI credits and token totals");
+    });
+
+    test("buildStepSummarySection emits the WSRF block after the token usage details block", () => {
+      const section = buildStepSummarySection("Token Usage", "| Alias |\n| --- |\n", {
+        measurement_state: "measured",
+        rebuild_factor: 1,
+        cumulative_input_tokens: 100,
+        peak_input_tokens: 100,
+        rebuild_excess_tokens: 0,
+        invocations: 1,
+      });
+
+      const tableIndex = section.indexOf("| Alias |");
+      const closingIndex = section.indexOf("</details>");
+      const wsrfIndex = section.indexOf("Working-Set Rebuild Factor");
+      expect(tableIndex).toBeGreaterThan(-1);
+      expect(tableIndex).toBeLessThan(closingIndex);
+      expect(wsrfIndex).toBeGreaterThan(closingIndex);
+    });
+
+    test("buildWorkingSetDetailsSection renders measured WSRF details", () => {
+      const section = buildWorkingSetDetailsSection({
+        measurement_state: "measured",
+        rebuild_factor: 3.9017857142857144,
+        cumulative_input_tokens: 874000,
+        peak_input_tokens: 224000,
+        rebuild_excess_tokens: 650000,
+        invocations: 5,
+      });
+
+      expect(section).toContain("Working-Set Rebuild Factor (WSRF): 3.90× (measured)");
+      expect(section).toContain("- State: `measured`");
+      expect(section).toContain("- Cumulative input tokens: 874,000");
+      expect(section).toContain("- Peak invocation input tokens: 224,000");
+      expect(section).toContain("- Rebuild excess tokens: 650,000");
+      expect(section).toContain("- Invocations: 5");
+    });
+
+    test("buildWorkingSetDetailsSection renders unavailable state when no factor exists", () => {
+      const section = buildWorkingSetDetailsSection({
+        measurement_state: "unavailable",
+        cumulative_input_tokens: 0,
+        peak_input_tokens: 0,
+        rebuild_excess_tokens: 0,
+        invocations: 0,
+      });
+
+      expect(section).toContain("Working-Set Rebuild Factor (WSRF): unavailable (unavailable)");
+      expect(section).toContain("- State: `unavailable`");
     });
 
     test("renderTokenTableAsPlainText strips table separator lines and pipes", () => {

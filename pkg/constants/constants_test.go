@@ -12,6 +12,7 @@ import (
 )
 
 func TestGetWorkflowDir(t *testing.T) {
+	t.Parallel()
 	expected := filepath.Join(".github", "workflows")
 	assert.Equal(t, expected, GetWorkflowDir())
 }
@@ -28,18 +29,21 @@ func TestGetWorkflowDirEnvEmpty(t *testing.T) {
 }
 
 func TestDefaultAllowedDomains(t *testing.T) {
+	t.Parallel()
 	expectedDomains := []string{"localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"}
 	require.NotEmpty(t, DefaultAllowedDomains)
 	assert.Equal(t, expectedDomains, DefaultAllowedDomains)
 }
 
 func TestSafeWorkflowEvents(t *testing.T) {
+	t.Parallel()
 	expectedEvents := []string{"workflow_dispatch", "schedule"}
 	require.NotEmpty(t, SafeWorkflowEvents)
 	assert.Equal(t, expectedEvents, SafeWorkflowEvents)
 }
 
 func TestAllowedExpressions(t *testing.T) {
+	t.Parallel()
 	require.NotEmpty(t, AllowedExpressions)
 
 	for _, expr := range []string{
@@ -54,7 +58,8 @@ func TestAllowedExpressions(t *testing.T) {
 }
 
 func TestAgenticEngines(t *testing.T) {
-	expectedEngines := []string{"claude", "codex", "copilot", "gemini", "antigravity", "opencode", "pi"}
+	t.Parallel()
+	expectedEngines := []string{"claude", "codex", "copilot", "gemini", "pi"}
 	require.NotEmpty(t, AgenticEngines)
 	assert.Equal(t, expectedEngines, AgenticEngines)
 	assert.Equal(t, "claude", string(ClaudeEngine))
@@ -65,6 +70,7 @@ func TestAgenticEngines(t *testing.T) {
 }
 
 func TestDefaultGitHubTools(t *testing.T) {
+	t.Parallel()
 	require.NotEmpty(t, DefaultGitHubToolsLocal)
 	require.NotEmpty(t, DefaultGitHubToolsRemote)
 	require.NotEmpty(t, DefaultReadOnlyGitHubTools)
@@ -86,6 +92,7 @@ func TestDefaultGitHubTools(t *testing.T) {
 		"DefaultReadOnlyGitHubTools": DefaultReadOnlyGitHubTools,
 	} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			for _, tool := range requiredTools {
 				assert.Contains(t, tools, tool)
 			}
@@ -94,6 +101,7 @@ func TestDefaultGitHubTools(t *testing.T) {
 }
 
 func TestDefaultBashTools(t *testing.T) {
+	t.Parallel()
 	require.NotEmpty(t, DefaultBashTools)
 	for _, tool := range []string{"echo", "printf", "ls", "cat", "grep"} {
 		assert.Contains(t, DefaultBashTools, tool)
@@ -101,6 +109,7 @@ func TestDefaultBashTools(t *testing.T) {
 }
 
 func TestPriorityFields(t *testing.T) {
+	t.Parallel()
 	require.NotEmpty(t, PriorityStepFields)
 	require.NotEmpty(t, PriorityJobFields)
 	require.NotEmpty(t, PriorityWorkflowFields)
@@ -110,6 +119,7 @@ func TestPriorityFields(t *testing.T) {
 }
 
 func TestConstantValues(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		value    string
@@ -118,11 +128,11 @@ func TestConstantValues(t *testing.T) {
 		{"CLIExtensionPrefix", string(CLIExtensionPrefix), "gh aw"},
 		{"DefaultMCPRegistryURL", string(DefaultMCPRegistryURL), "https://api.mcp.github.com/v0.1"},
 		{"OTELSentryEndpointSecretName", OTELSentryEndpointSecretName, "GH_AW_OTEL_SENTRY_ENDPOINT"},
-		{"AWFDefaultCommand", AWFDefaultCommand, "awf"},
-		{"AWFProxyLogsDir", AWFProxyLogsDir, "/tmp/gh-aw/sandbox/firewall/logs"},
-		{"AWFAuditDir", AWFAuditDir, "/tmp/gh-aw/sandbox/firewall/audit"},
-		{"PreAgentAuditFilePath", PreAgentAuditFilePath, "/tmp/gh-aw/pre-agent-audit.txt"},
-		{"AWFConfigFilePath", AWFConfigFilePath, "/tmp/gh-aw/awf-config.json"},
+		{"AWFDefaultCommand", string(AWFDefaultCommand), "awf"},
+		{"AWFProxyLogsDir", string(AWFProxyLogsDir), "/tmp/gh-aw/sandbox/firewall/logs"},
+		{"AWFAuditDir", string(AWFAuditDir), "/tmp/gh-aw/sandbox/firewall/audit"},
+		{"PreAgentAuditFilePath", string(PreAgentAuditFilePath), "/tmp/gh-aw/pre-agent-audit.txt"},
+		{"AWFConfigFilePath", string(AWFConfigFilePath), "/tmp/gh-aw/awf-config.json"},
 		{"AgentJobName", string(AgentJobName), "agent"},
 		{"ActivationJobName", string(ActivationJobName), "activation"},
 		{"PreActivationJobName", string(PreActivationJobName), "pre_activation"},
@@ -134,33 +144,37 @@ func TestConstantValues(t *testing.T) {
 		{"UploadCodeScanningJobName", string(UploadCodeScanningJobName), "upload_code_scanning_sarif"},
 		{"ConclusionJobName", string(ConclusionJobName), "conclusion"},
 		{"UnlockJobName", string(UnlockJobName), "unlock"},
-		{"SafeOutputArtifactName", SafeOutputArtifactName, "safe-output"},
-		{"AgentOutputArtifactName", AgentOutputArtifactName, "agent-output"},
-		{"SafeOutputItemsArtifactName", SafeOutputItemsArtifactName, "safe-outputs-items"},
-		{"TemporaryIdMapFilename", TemporaryIdMapFilename, "temporary-id-map.json"},
+		{"SafeOutputArtifactName", string(SafeOutputArtifactName), "safe-output"},
+		{"AgentOutputArtifactName", string(AgentOutputArtifactName), "agent-output"},
+		{"SafeOutputItemsArtifactName", string(SafeOutputItemsArtifactName), "safe-outputs-items"},
+		{"TemporaryIdMapFilename", string(TemporaryIdMapFilename), "temporary-id-map.json"},
 		{"SafeOutputsMCPServerID", string(SafeOutputsMCPServerID), "safeoutputs"},
 		{"CheckMembershipStepID", string(CheckMembershipStepID), "check_membership"},
 		{"CheckStopTimeStepID", string(CheckStopTimeStepID), "check_stop_time"},
 		{"CheckSkipIfMatchStepID", string(CheckSkipIfMatchStepID), "check_skip_if_match"},
 		{"CheckSkipIfNoMatchStepID", string(CheckSkipIfNoMatchStepID), "check_skip_if_no_match"},
 		{"CheckCommandPositionStepID", string(CheckCommandPositionStepID), "check_command_position"},
+		{"CheckCooldownStepID", string(CheckCooldownStepID), "check_cooldown"},
 		{"IsTeamMemberOutput", IsTeamMemberOutput, "is_team_member"},
 		{"StopTimeOkOutput", StopTimeOkOutput, "stop_time_ok"},
 		{"SkipCheckOkOutput", SkipCheckOkOutput, "skip_check_ok"},
 		{"SkipNoMatchCheckOkOutput", SkipNoMatchCheckOkOutput, "skip_no_match_check_ok"},
 		{"CommandPositionOkOutput", CommandPositionOkOutput, "command_position_ok"},
+		{"CooldownOkOutput", CooldownOkOutput, "cooldown_ok"},
 		{"ActivatedOutput", ActivatedOutput, "activated"},
 		{"DefaultActivationJobRunnerImage", DefaultActivationJobRunnerImage, "ubuntu-slim"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.expected, tt.value)
 		})
 	}
 }
 
 func TestKnownBuiltInJobNamesContainsAllKnownJobs(t *testing.T) {
+	t.Parallel()
 	for _, jobName := range []string{
 		string(AgentJobName),
 		string(ActivationJobName),
@@ -179,10 +193,12 @@ func TestKnownBuiltInJobNamesContainsAllKnownJobs(t *testing.T) {
 }
 
 func TestModelNameConstants(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, "test-model", string(ModelName("test-model")))
 }
 
 func TestNumericConstants(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		value    LineLength
@@ -194,12 +210,14 @@ func TestNumericConstants(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.GreaterOrEqual(t, tt.value, tt.minValue)
 		})
 	}
 }
 
 func TestPolicyConstants(t *testing.T) {
+	t.Parallel()
 	assert.EqualValues(t, 1000, DefaultMaxAICredits)
 	assert.EqualValues(t, 400, DefaultDetectionMaxAICredits)
 	assert.Equal(t, "5000", DefaultMaxDailyAICredits)
@@ -209,6 +227,7 @@ func TestPolicyConstants(t *testing.T) {
 }
 
 func TestTimeoutConstants(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		value      time.Duration
@@ -227,6 +246,7 @@ func TestTimeoutConstants(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.GreaterOrEqual(t, tt.value, tt.minValue)
 			if tt.checkExact {
 				assert.Equal(t, tt.exactValue, tt.value)
@@ -239,6 +259,7 @@ func TestTimeoutConstants(t *testing.T) {
 }
 
 func TestFeatureFlagConstants(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		value    FeatureFlag
@@ -254,18 +275,21 @@ func TestFeatureFlagConstants(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.expected, string(tt.value))
 		})
 	}
 }
 
 func TestFeatureFlagType(t *testing.T) {
+	t.Parallel()
 	var flag FeatureFlag = "test-flag"
 	assert.Equal(t, "test-flag", string(flag))
 	assert.Equal(t, MCPScriptsFeatureFlag, FeatureFlag("mcp-scripts"))
 }
 
 func TestSemanticTypeAliases(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		convert  func() string
@@ -295,12 +319,14 @@ func TestSemanticTypeAliases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.expected, tt.convert())
 		})
 	}
 }
 
 func TestTypeSafetyBetweenSemanticTypes(t *testing.T) {
+	t.Parallel()
 	job1 := AgentJobName
 	job2 := ActivationJobName
 	assert.NotEqual(t, job1, job2)
@@ -314,6 +340,7 @@ func TestTypeSafetyBetweenSemanticTypes(t *testing.T) {
 }
 
 func TestHelperMethods(t *testing.T) {
+	t.Parallel()
 	type semanticValue interface {
 		String() string
 		IsValid() bool
@@ -329,10 +356,15 @@ func TestHelperMethods(t *testing.T) {
 		{"JobName", JobName("agent"), JobName(""), "agent"},
 		{"StepID", StepID("check_membership"), StepID(""), "check_membership"},
 		{"CommandPrefix", CommandPrefix("gh aw"), CommandPrefix(""), "gh aw"},
+		{"WorkflowID", WorkflowID("ci-doctor"), WorkflowID(""), "ci-doctor"},
+		{"ArtifactName", ArtifactName("agent-output"), ArtifactName(""), "agent-output"},
+		{"Filename", Filename("agent_output.json"), Filename(""), "agent_output.json"},
+		{"FilePath", FilePath("/tmp/file"), FilePath(""), "/tmp/file"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.expected, tt.value.String())
 			assert.True(t, tt.value.IsValid())
 			assert.False(t, tt.empty.IsValid())
@@ -341,6 +373,7 @@ func TestHelperMethods(t *testing.T) {
 }
 
 func TestGetAllEngineSecretNames(t *testing.T) {
+	t.Parallel()
 	secrets := GetAllEngineSecretNames()
 	require.NotEmpty(t, secrets)
 
@@ -362,6 +395,7 @@ func TestGetAllEngineSecretNames(t *testing.T) {
 }
 
 func TestGetEngineOption_AllBuiltInEngines(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		engine       string
 		label        string
@@ -372,13 +406,12 @@ func TestGetEngineOption_AllBuiltInEngines(t *testing.T) {
 		{string(ClaudeEngine), "Claude", AnthropicAPIKey, []string{}},
 		{string(CodexEngine), "Codex", OpenAIAPIKey, []string{CodexAPIKey}},
 		{string(GeminiEngine), "Gemini", GeminiAPIKey, nil},
-		{string(AntigravityEngine), "Antigravity", AntigravityAPIKey, nil},
-		{string(OpenCodeEngine), "OpenCode", CopilotGitHubToken, []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey}},
 		{string(PiEngine), "Pi", CopilotGitHubToken, []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.engine, func(t *testing.T) {
+			t.Parallel()
 			opt := GetEngineOption(tt.engine)
 			require.NotNil(t, opt)
 			assert.Equal(t, tt.engine, opt.Value)

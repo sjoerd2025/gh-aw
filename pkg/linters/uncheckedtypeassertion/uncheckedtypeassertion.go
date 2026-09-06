@@ -7,32 +7,22 @@ import (
 	"go/ast"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:uncheckedtypeassertion")
+
 // Analyzer is the unchecked-type-assertion analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "uncheckedtypeassertion",
-	Doc:      "reports single-value type assertions that may panic if the dynamic type does not match",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/uncheckedtypeassertion",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("uncheckedtypeassertion", "reports single-value type assertions that may panic if the dynamic type does not match", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -47,11 +37,9 @@ func run(pass *analysis.Pass) (any, error) {
 		(*ast.TypeAssertExpr)(nil),
 	}
 
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		inspectTypeAssertExpr(pass, noLintIndex, generatedFiles, fileParents, n)
 	})
-
-	return nil, nil
 }
 
 func inspectTypeAssertExpr(pass *analysis.Pass, noLintIndex nolint.DirectiveIndex, generatedFiles filecheck.GeneratedIndex, fileParents map[*ast.File]map[ast.Node]ast.Node, n ast.Node) {
@@ -92,6 +80,7 @@ func inspectTypeAssertExpr(pass *analysis.Pass, noLintIndex nolint.DirectiveInde
 		return
 	}
 
+	pkgLog.Printf("flagging unchecked type assertion to %s at %s", t, pos)
 	pass.ReportRangef(
 		typeAssert,
 		"type assertion x.(%s) is unchecked and may panic; use the two-value form v, ok := x.(%s) instead",

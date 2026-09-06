@@ -34,6 +34,7 @@ async function main() {
 
     // Extract mentions configuration from validation config
     const mentionsConfig = validationConfig?.mentions || null;
+    const maxMentions = parseIntTemplatable(mentionsConfig?.max, 50);
 
     // Resolve allowed mentions for the output collector
     // This determines which @mentions are allowed in the agent output
@@ -43,7 +44,7 @@ async function main() {
     /** @type {number | undefined} */
     let maxBotMentions;
 
-    function validateFieldWithInputSchema(value, fieldName, inputSchema, lineNum) {
+    function validateFieldWithInputSchema(value, fieldName, inputSchema, lineNum, allowedAliasesSeen) {
       if (inputSchema.required && (value === undefined || value === null)) {
         return {
           isValid: false,
@@ -53,7 +54,7 @@ async function main() {
       if (value === undefined || value === null) {
         return {
           isValid: true,
-          normalizedValue: inputSchema.default || undefined,
+          normalizedValue: inputSchema.default ?? undefined,
         };
       }
       const inputType = inputSchema.type || "string";
@@ -66,7 +67,7 @@ async function main() {
               error: `Line ${lineNum}: ${fieldName} must be a string`,
             };
           }
-          normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxBotMentions });
+          normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen });
           break;
         case "boolean":
           if (typeof value !== "boolean") {
@@ -97,11 +98,11 @@ async function main() {
               error: `Line ${lineNum}: ${fieldName} must be one of: ${inputSchema.options.join(", ")}`,
             };
           }
-          normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxBotMentions });
+          normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen });
           break;
         default:
           if (typeof value === "string") {
-            normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxBotMentions });
+            normalizedValue = sanitizeContent(value, { allowedAliases: allowedMentions, maxMentions, maxBotMentions, allowedAliasesSeen });
           }
           break;
       }
@@ -112,17 +113,18 @@ async function main() {
     }
     function validateItemWithSafeJobConfig(item, jobConfig, lineNum) {
       const errors = [];
-      const normalizedItem = { ...item };
-      if (!jobConfig.inputs) {
+      const normalizedItem = { type: item.type };
+      if (!jobConfig || typeof jobConfig !== "object" || !jobConfig.inputs) {
         return {
           isValid: true,
           errors: [],
-          normalizedItem: item,
+          normalizedItem,
         };
       }
+      const allowedAliasesSeen = new Set();
       for (const [fieldName, inputSchema] of Object.entries(jobConfig.inputs)) {
         const fieldValue = item[fieldName];
-        const validation = validateFieldWithInputSchema(fieldValue, fieldName, inputSchema, lineNum);
+        const validation = validateFieldWithInputSchema(fieldValue, fieldName, inputSchema, lineNum, allowedAliasesSeen);
         if (!validation.isValid && validation.error) {
           errors.push(validation.error);
         } else if (validation.normalizedValue !== undefined) {
@@ -357,6 +359,7 @@ async function main() {
         if (hasValidationConfig(itemType)) {
           const validationResult = validateItem(item, itemType, i + 1, {
             allowedAliases: allowedMentions,
+            maxMentions,
             maxBotMentions,
             normalizeIssueClosingKeywords,
             dataEnabled: typeConfig !== null && typeof typeConfig === "object" && typeConfig.data_enabled === true,
@@ -380,16 +383,13 @@ async function main() {
             continue;
           }
           const safeJobConfig = jobOutputType;
-          if (safeJobConfig && safeJobConfig.inputs) {
-            const validation = validateItemWithSafeJobConfig(item, safeJobConfig, i + 1);
-            if (!validation.isValid) {
-              errors.push(...validation.errors);
-              continue;
-            }
-            Object.assign(item, validation.normalizedItem);
+          const validation = validateItemWithSafeJobConfig(item, safeJobConfig, i + 1);
+          if (!validation.isValid) {
+            errors.push(...validation.errors);
+            continue;
           }
           core.info(`Line ${i + 1}: Valid ${itemType} item`);
-          parsedItems.push(item);
+          parsedItems.push(validation.normalizedItem);
         }
       } catch (error) {
         const errorMsg = getErrorMessage(error);
@@ -449,7 +449,7 @@ async function main() {
         }
       }
     } catch {
-      // If we can't read the directory, assume no patch
+      // Directory cannot be read — ignored, assume no patch is present.
     }
     if (hasPatch) {
       core.info(`Found ${patchFiles.length} patch/bundle file(s): ${patchFiles.join(", ")}`);

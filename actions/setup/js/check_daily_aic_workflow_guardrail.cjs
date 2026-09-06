@@ -116,7 +116,7 @@ function shouldSkipDailyAICGuardrail() {
         return true;
       }
     } catch {
-      // Malformed aw_context: skip guardrail as a safe fallback for manual dispatch.
+      // Malformed aw_context is ignored: skip the guardrail as a safe fallback for manual dispatch.
     }
     // Existing behavior: dispatch-routed runs with aw_context bypass the guardrail.
     return true;
@@ -277,7 +277,12 @@ async function getRunAIC(artifactClient, runId, token, owner, repo) {
     artifactId: artifact.id,
     artifactName: artifact.name,
   });
-  const downloadRoot = fs.mkdtempSync(path.join(os.tmpdir(), `gh-aw-daily-guardrail-${runId}-`));
+  let downloadRoot;
+  try {
+    downloadRoot = fs.mkdtempSync(path.join(os.tmpdir(), `gh-aw-daily-guardrail-${runId}-`));
+  } catch (error) {
+    throw new Error(`Failed to create temporary artifact directory for run ${runId}: ${getErrorMessage(error)}`, { cause: error });
+  }
   const download = await artifactClient.downloadArtifact(artifact.id, {
     path: downloadRoot,
     findBy: {
@@ -337,6 +342,122 @@ function computeMaxInspectableRuns(remaining) {
   // artifact download). Adjust ESTIMATED_API_OPERATIONS_PER_RUN if observed
   // usage changes.
   return Math.max(0, Math.floor((remaining - RATE_LIMIT_RESERVE - REQUEST_OVERHEAD_BUDGET) / ESTIMATED_API_OPERATIONS_PER_RUN));
+}
+
+/**
+ * @param {unknown} error
+ * @param {number} status
+ * @returns {boolean}
+ */
+function hasHttpStatus(error, status) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const directStatus = "status" in error ? Number(error.status) : NaN;
+  if (directStatus === status) {
+    return true;
+  }
+  const responseStatus = "response" in error && error.response && typeof error.response === "object" && "status" in error.response ? Number(error.response.status) : NaN;
+  return responseStatus === status;
+}
+
+/**
+ * Returns true when the error is a permanent HTTP 404 — the only status
+ * treated as structural. Other 4xx errors (e.g. 403 permission failures,
+ * 422 validation errors) are treated as transient because they may resolve
+ * on retry or credential refresh, and should not permanently fail the guardrail.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isStructuralGuardrailError(error) {
+  return hasHttpStatus(error, 404);
+}
+
+/**
+ * @typedef {'workflow_id' | 'repo_workflow_name_fallback'} WorkflowRunLookupMode
+ */
+
+/**
+ * @param {any} githubClient
+ * @param {{ owner: string, repo: string, workflowId: number, workflowName: string, page: number, perPage: number, lookupMode: WorkflowRunLookupMode }} params
+ * @returns {Promise<{ response: any, lookupMode: WorkflowRunLookupMode, sourceRunCount: number, oldestUnfilteredCreatedAt?: string | null }>}
+ */
+async function listCompletedWorkflowRunsPage(githubClient, params) {
+  const { owner, repo, workflowId, workflowName, page, perPage, lookupMode } = params;
+  if (lookupMode === "repo_workflow_name_fallback") {
+    const response = await githubClient.rest.actions.listWorkflowRunsForRepo({
+      owner,
+      repo,
+      status: "completed",
+      per_page: perPage,
+      page,
+    });
+    const allRuns = response.data.workflow_runs || [];
+    const filteredRuns = allRuns.filter(run => (run?.name || "") === workflowName);
+    logDailyGuardrail("Filtered repository workflow runs by workflow name fallback", {
+      workflowName,
+      page,
+      totalRunsInPage: allRuns.length,
+      matchedRunsInPage: filteredRuns.length,
+    });
+    // Return the oldest unfiltered run's timestamp so the outer pagination loop
+    // can stop early when all remaining runs predate the 24h window, even when
+    // none of the runs on this page match the workflow name.
+    const lastUnfilteredRun = allRuns[allRuns.length - 1];
+    return {
+      response: {
+        ...response,
+        data: {
+          ...response.data,
+          workflow_runs: filteredRuns,
+        },
+      },
+      lookupMode,
+      sourceRunCount: allRuns.length,
+      oldestUnfilteredCreatedAt: lastUnfilteredRun?.created_at ?? null,
+    };
+  }
+
+  try {
+    const response = await githubClient.rest.actions.listWorkflowRuns({
+      owner,
+      repo,
+      workflow_id: workflowId,
+      status: "completed",
+      per_page: perPage,
+      page,
+    });
+    return {
+      response,
+      lookupMode,
+      sourceRunCount: response?.data?.workflow_runs?.length || 0,
+    };
+  } catch (error) {
+    if (!hasHttpStatus(error, 404)) {
+      throw error;
+    }
+    if (!workflowName) {
+      // A 404 with no explicit workflow name means we have no meaningful name
+      // to filter by in the fallback lookup — rethrow so the outer catch can
+      // classify this as a structural error rather than silently failing open.
+      throw error;
+    }
+    logDailyGuardrail("Workflow-specific run history query returned 404; falling back to repository run listing by workflow name", {
+      workflowId,
+      workflowName,
+      page,
+    });
+    return listCompletedWorkflowRunsPage(githubClient, {
+      owner,
+      repo,
+      workflowId,
+      workflowName,
+      page,
+      perPage,
+      lookupMode: "repo_workflow_name_fallback",
+    });
+  }
 }
 
 /**
@@ -448,17 +569,21 @@ async function main() {
   core.setOutput("daily_ai_credits_exceeded", "false");
   core.setOutput("daily_ai_credits_total_effective_tokens", "");
   core.setOutput("daily_ai_credits_threshold", "");
+  core.setOutput("daily_ai_credits_guardrail_status", "not_run");
   const threshold = parsePositiveCompactNumber(process.env.GH_AW_MAX_DAILY_AI_CREDITS);
   if (threshold <= 0) {
+    core.setOutput("daily_ai_credits_guardrail_status", "disabled");
     return;
   }
   if (shouldSkipDailyAICGuardrail()) {
+    core.setOutput("daily_ai_credits_guardrail_status", "skipped");
     core.info("Skipping daily workflow AI Credits guardrail for manual or command-driven runs.");
     return;
   }
 
   const token = process.env.GH_AW_GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
   if (!token) {
+    core.setOutput("daily_ai_credits_guardrail_status", "skipped");
     core.warning("Skipping daily workflow AI Credits guardrail because no GitHub token was available for artifact lookup.");
     return;
   }
@@ -484,9 +609,14 @@ async function main() {
 
     const workflowID = process.env.GH_AW_WORKFLOW_ID || "";
     const workflowName = process.env.GH_AW_WORKFLOW_NAME || workflowID || "workflow";
+    // Use only the explicitly configured workflow name for the name-based fallback
+    // lookup; the workflowID and "workflow" defaults are display-only values and
+    // would never match run.name in the API response.
+    const workflowFilterName = process.env.GH_AW_WORKFLOW_NAME || "";
     const actorLogin = process.env.GITHUB_TRIGGERING_ACTOR || currentRun.data.triggering_actor?.login || currentRun.data.actor?.login || process.env.GITHUB_ACTOR || "";
 
     if (!currentRun.data.workflow_id) {
+      core.setOutput("daily_ai_credits_guardrail_status", "skipped");
       core.warning("Skipping daily workflow AI Credits guardrail because the current workflow could not be resolved.");
       return;
     }
@@ -513,6 +643,8 @@ async function main() {
     const candidateRuns = [];
     let page = 1;
     let truncatedByRateLimit = false;
+    /** @type {WorkflowRunLookupMode} */
+    let workflowRunLookupMode = "workflow_id";
     // listWorkflowRuns returns runs in descending creation order (newest first).
     // The first run whose created_at falls before the cutoff means all remaining
     // runs on this page and every subsequent page are also outside the window, so
@@ -521,26 +653,32 @@ async function main() {
     while (page <= MAX_WORKFLOW_RUN_PAGES) {
       logDailyGuardrail("Querying completed workflow runs", {
         workflowId: currentRun.data.workflow_id,
+        workflowName,
+        lookupMode: workflowRunLookupMode,
         page,
         perPage: 100,
         cutoff: new Date(cutoffMs).toISOString(),
       });
-      const response = await githubClient.rest.actions.listWorkflowRuns({
+      const { response, lookupMode, sourceRunCount, oldestUnfilteredCreatedAt } = await listCompletedWorkflowRunsPage(githubClient, {
         owner,
         repo,
-        workflow_id: currentRun.data.workflow_id,
-        status: "completed",
-        per_page: 100,
+        workflowId: currentRun.data.workflow_id,
+        workflowName: workflowFilterName,
         page,
+        perPage: 100,
+        lookupMode: workflowRunLookupMode,
       });
+      workflowRunLookupMode = lookupMode;
       const runs = response.data.workflow_runs || [];
       logDailyGuardrail("Received workflow runs page", {
         page,
+        lookupMode: workflowRunLookupMode,
         runCount: runs.length,
+        sourceRunCount,
         firstRunId: runs[0]?.id ?? null,
         lastRunId: runs[runs.length - 1]?.id ?? null,
       });
-      if (runs.length === 0) {
+      if (runs.length === 0 && sourceRunCount === 0) {
         break;
       }
       for (const run of runs) {
@@ -560,7 +698,17 @@ async function main() {
           break;
         }
       }
-      if (reachedCutoff || candidateRuns.length >= maxInspectableRuns || runs.length < 100) {
+      // In fallback mode the filtered page may contain no matching runs while
+      // the unfiltered page had runs that predate the cutoff. Check the oldest
+      // unfiltered run so we stop paginating once all remaining runs are outside
+      // the 24h window, even when none of them match the workflow name.
+      if (!reachedCutoff && oldestUnfilteredCreatedAt != null) {
+        const oldestMs = Date.parse(oldestUnfilteredCreatedAt);
+        if (!Number.isFinite(oldestMs) || oldestMs < cutoffMs) {
+          reachedCutoff = true;
+        }
+      }
+      if (reachedCutoff || candidateRuns.length >= maxInspectableRuns || sourceRunCount < 100) {
         break;
       }
       page += 1;
@@ -692,23 +840,30 @@ async function main() {
     });
 
     if (totalAIC <= threshold) {
+      core.setOutput("daily_ai_credits_guardrail_status", "under_budget");
       await appendDailyAICSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, summaryMeta);
       core.info(`Daily workflow AIC guardrail not exceeded (${totalAIC}/${threshold}).`);
       return;
     }
 
     core.setOutput("daily_ai_credits_exceeded", "true");
+    core.setOutput("daily_ai_credits_guardrail_status", "exceeded");
     try {
       await appendDailyAICSummary(workflowName, actorLogin, threshold, countedRuns, rateLimit, summaryMeta);
     } catch (summaryError) {
       core.warning(`Failed to write daily AIC summary: ${getErrorMessage(summaryError)}`);
     }
-    core.warning(`Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold}.`);
-    core.setFailed(`Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold}.`);
+    // Log as info so the activation job succeeds. The daily_ai_credits_exceeded output
+    // is already set to "true"; the agent job's condition (daily_ai_credits_exceeded != 'true')
+    // will skip the agent, and the conclusion job will handle reporting via the
+    // daily_ai_credits_exceeded flag. Failing the activation job here causes the overall
+    // workflow to fail even though hitting the daily limit is an expected, graceful outcome.
+    core.info(`Daily workflow AIC guardrail exceeded for ${workflowName}: ${totalAIC}/${threshold}.`);
   } catch (error) {
+    core.setOutput("daily_ai_credits_guardrail_status", isStructuralGuardrailError(error) ? "structural_error" : "transient_error");
     // Treat unexpected guardrail execution errors as non-blocking skips so transient
     // API/runtime issues do not fail activation. The output stays at the default "false",
-    // allowing the agent to run. Legitimate threshold exceedance still fails via setFailed.
+    // allowing the agent to run.
     core.warning(`Daily workflow AI Credits guardrail encountered an unexpected error and will be skipped: ${getErrorMessage(error)}`);
   }
 }
@@ -727,4 +882,7 @@ module.exports = {
   computeMaxInspectableRuns,
   renderDailyAICSummary,
   formatDailyGuardrailLogMessage,
+  hasHttpStatus,
+  isStructuralGuardrailError,
+  listCompletedWorkflowRunsPage,
 };

@@ -20,7 +20,7 @@ GitHub Agentic Workflows supports environment variables in 13 distinct contexts:
 | **Container** | `container.env` | Container runtime | Container settings |
 | **Services** | `services.<id>.env` | Service containers | Database credentials |
 | **Sandbox Agent** | `sandbox.agent.env` | Sandbox runtime | Sandbox configuration |
-| **Sandbox MCP** | `sandbox.mcp.env` | Model Context Protocol (MCP) gateway | MCP debugging |
+| **Sandbox MCP** | `sandbox.mcp.env` | Model Context Protocol (MCP) gateway | MCP gateway configuration |
 | **MCP Tools** | `tools.<name>.env` | MCP server process | MCP server secrets |
 | **MCP Scripts** | `mcp-scripts.<name>.env` | MCP script execution | Tool-specific tokens |
 | **Safe Outputs Global** | `safe-outputs.env` | All safe-output jobs | Shared safe-output config |
@@ -120,6 +120,114 @@ env:
 
 > [!NOTE]
 > These variables are injected by the compiler and cannot be overridden by user-defined `env:` blocks in the workflow frontmatter.
+
+## Harness Settings and Runtime Tuning Variables
+
+The built-in Copilot, Claude, and Codex harnesses expose a small set of supported runtime controls. Prefer the structured `engine.harness` frontmatter fields when possible; set the underlying environment variables only when you need a value that is supplied by a GitHub Actions expression or shared across a workflow.
+
+### Shared harness retry settings
+
+These settings apply to the built-in Copilot, Claude, and Codex harnesses.
+
+| Variable | Frontmatter field | Default | Units / range | Description |
+| --- | --- | --- | --- | --- |
+| `GH_AW_HARNESS_MAX_RETRIES` | `engine.harness.max-retries` | `3` | retry attempts after the initial run; minimum `0`, maximum `100` | Maximum number of harness retries. `0` disables retries. Invalid values use the default; values above `100` are clamped to `100`. |
+| `GH_AW_HARNESS_INITIAL_DELAY_MS` | `engine.harness.initial-delay-ms` | `5000` | milliseconds; minimum `1` | Delay before the first retry. Invalid values use the default. |
+| `GH_AW_HARNESS_BACKOFF_MULTIPLIER` | `engine.harness.backoff-multiplier` | `2` | decimal multiplier; minimum `1` | Multiplier applied after each retry. Invalid values use the default. |
+| `GH_AW_HARNESS_MAX_DELAY_MS` | `engine.harness.max-delay-ms` | `60000` | milliseconds; minimum `1` | Maximum retry delay. Invalid values use the default. If set below `GH_AW_HARNESS_INITIAL_DELAY_MS`, it is clamped up to the initial delay. |
+
+### Shared post-result watchdog
+
+`GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS` configures the post-result stdio inactivity watchdog used by the built-in Copilot and Codex harnesses. It is measured in **milliseconds**. The default is `120000` ms (2 minutes), the minimum is `50` ms, and the maximum is `600000` ms (10 minutes). Unset, non-numeric, zero, and negative values use the default; positive values outside the supported range are clamped.
+
+The watchdog is dormant until the agent emits a terminal safe output. `noop` and ordinary task outputs such as comments, labels, pushes, and pull request creation are terminal. Diagnostic safe outputs such as `missing_tool`, `missing_data`, and `report_incomplete` are not terminal and do not arm the watchdog by themselves.
+
+After the watchdog arms, any stdout or stderr activity resets the inactivity clock. A quiet child process can therefore be terminated even while it is doing useful CPU or I/O work, such as a monorepo scan, build, or test command that produces no logs. If the watchdog fires after a terminal safe output already exists, the harness may still treat the run as successful because the requested safe output was already produced.
+
+For literal frontmatter values, use `engine.harness.watchdog-timeout` in seconds. For raw environment variables, use milliseconds:
+
+```yaml wrap
+---
+env:
+  # Allow quiet monorepo scans and builds after an intermediate safe output.
+  # Workflow-level env is visible to the agent; do not put secrets here.
+  GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS: "600000"
+---
+```
+
+```yaml wrap
+---
+engine:
+  id: copilot
+  harness:
+    # Same timeout expressed as a literal frontmatter value in seconds.
+    watchdog-timeout: 600
+---
+```
+
+### Shared stall watchdog
+
+`GH_AW_HARNESS_STALL_WARNING_MS` configures the driver-level stall watchdog shared by all built-in harnesses. It is measured in **milliseconds**. The default is `300000` ms (5 minutes), the minimum is `1000` ms, and the maximum is `3600000` ms (1 hour). Unset and non-numeric values use the default; positive values outside the supported range are clamped; zero or negative values disable the warnings.
+
+Unlike the post-result watchdog, the stall watchdog never terminates the agent process. Whenever the agent CLI produces no stdout or stderr output for the configured interval, the harness logs a warning in the `Execute ... CLI` step, for example:
+
+```text wrap
+[copilot-harness] attempt 1: stall watchdog: no output from '/usr/bin/copilot' for 5m 0s (elapsed=5m 1s pid=1234 warnings=1) - the step may be hung; GitHub Actions will cancel this step in about 14m 59s (timeout-minutes=20)
+```
+
+The warning repeats on each interval while the silence continues, and a `stall watchdog: output resumed after ...` line is logged once output comes back. This makes a hung step diagnosable from the step log alone, without cross-referencing job or step metadata. The final `process closed` line reports `stallWarnings=<count>` when any warning fired.
+
+### Engine-specific harness settings
+
+| Variable | Engine | Default | Units / range | Description |
+| --- | --- | --- | --- | --- |
+| `GH_AW_HARNESS_LONG_RUN_TOKEN_THRESHOLD` | Copilot | `10000` | tokens; minimum `0` | Token threshold used to classify long-running partial executions as `long_run_exit` instead of a generic partial execution. Invalid or negative values use the default. |
+| `GH_AW_HARNESS_STARTUP_RETRIES` | All engine harnesses | `1` | retry attempts; range `0`-`2` | Additional fresh-run retry budget for startup failures before the harness records session progress. Invalid values use the default; out-of-range integers are clamped. `GH_AW_CLAUDE_STARTUP_RETRIES` is still accepted as a Claude-compatible fallback when the shared variable is unset. |
+
+Copilot SDK driver settings such as `COPILOT_SDK_SEND_TIMEOUT_MS` are documented in [Copilot SDK Support](/gh-aw/reference/engines/#copilot-sdk-support) and the [Copilot SDK Driver Specification](/gh-aw/specs/copilot-sdk-driver-specification/).
+
+### Internal runtime variables
+
+`GH_AW_TIMEOUT_MINUTES` is compiler-managed. gh-aw derives it from the workflow `timeout-minutes` frontmatter value and passes it to harness and driver code so soft timeouts and SDK send timeouts stay below the GitHub Actions job timeout. Do not set `GH_AW_TIMEOUT_MINUTES` directly; set `timeout-minutes` in frontmatter instead.
+
+### Setup helper process timeouts
+
+The JavaScript setup helpers bound child processes, archive operations, and setup-time network requests with positive millisecond timeouts. These defaults protect workflows from indefinitely hung setup commands, but very large repositories or artifact payloads can require larger budgets. Set the relevant variable to a positive integer number of milliseconds; unset, zero, negative, or non-numeric values use the default. Values above Node's maximum timer delay of `2147483647` ms (about 24.8 days) are clamped to that maximum.
+
+| Variable | Default | Applies to |
+| --- | --- | --- |
+| `GH_AW_APPLY_SAMPLES_FETCH_TIMEOUT_MS` | `120000` | GitHub API fetches performed by `apply_samples.cjs`. |
+| `GH_AW_APPLY_SAMPLES_GIT_TIMEOUT_MS` | `120000` | Git commands used while replaying sample patches. |
+| `GH_AW_ARTIFACT_ARCHIVE_PROBE_TIMEOUT_MS` | `15000` | `zip -v` and `unzip -v` availability probes. |
+| `GH_AW_ARTIFACT_ARCHIVE_TIMEOUT_MS` | `300000` | `zip` and `unzip` archive creation/extraction. |
+| `GH_AW_ARTIFACT_FETCH_TIMEOUT_MS` | `120000` | Artifact service metadata and redirect requests. |
+| `GH_AW_ARTIFACT_TRANSFER_TIMEOUT_MS` | `300000` | Artifact blob upload and download transfers. |
+| `GH_AW_GIT_BRANCH_TIMEOUT_MS` | `15000` | Current branch detection via `git rev-parse`. |
+| `GH_AW_IMPORT_GIT_TIMEOUT_MS` | `300000` | Sparse-checkout/import git commands for remote `.github` content. |
+| `GH_AW_MCP_CONFIG_CONVERTER_TIMEOUT_MS` | `120000` | MCP configuration converter subprocess. |
+| `GH_AW_MCP_CONTAINER_STATUS_TIMEOUT_MS` | `15000` | Docker/container status probes used in MCP gateway diagnostics. |
+| `GH_AW_MCP_DOCKER_CLEANUP_TIMEOUT_MS` | `30000` | Stale MCP gateway container cleanup. |
+| `GH_AW_MCP_SERVER_CHECK_TIMEOUT_MS` | `120000` | MCP server health-check script. |
+| `GH_AW_OUTCOME_GH_TIMEOUT_MS` | `300000` | `gh` CLI calls made by outcome evaluation. |
+| `GH_AW_SAFEOUTPUTS_CLI_TIMEOUT_MS` | `120000` | `safeoutputs` CLI invocations used for structured diagnostics. |
+
+### MCP gateway readiness polling
+
+The MCP gateway startup step polls the gateway `/health` endpoint with exponential backoff until the gateway reports ready. Each retry parameter can be overridden; unset, zero, negative, or non-numeric values fall back to the default with a warning.
+
+| Variable | Default | Applies to |
+| --- | --- | --- |
+| `GH_AW_MCP_GATEWAY_HEALTH_MAX_ATTEMPTS` | `150` | Total health-check attempts, including the first one. |
+| `GH_AW_MCP_GATEWAY_HEALTH_INITIAL_DELAY_MS` | `250` | Delay the backoff starts from. |
+| `GH_AW_MCP_GATEWAY_HEALTH_MAX_DELAY_MS` | `1000` | Cap applied to every retry delay. |
+| `GH_AW_MCP_GATEWAY_HEALTH_BACKOFF_MULTIPLIER` | `2` | Multiplier applied to the delay before every retry. |
+| `GH_AW_MCP_GATEWAY_BACKEND_STARTUP_TIMEOUT_MS` | `120000` | MCP backend startup timeout the retry budget must outlast. |
+
+These values are cross-validated at startup:
+
+- A backoff multiplier below `1` is raised to `1` (constant delay).
+- A delay cap below the initial delay is raised to the initial delay.
+- The cumulative retry delay must cover the backend startup timeout plus 25 seconds for backend cleanup and final server registration; otherwise a warning is emitted that the health check may give up before the gateway is ready.
 
 ## CLI Configuration Variables
 
@@ -263,6 +371,22 @@ Environment variables follow a **most-specific-wins** model, consistent with Git
 
 These scopes are independent and operate in different contexts: `engine.env`, `container.env`, `services.<id>.env`, `sandbox.agent.env`, `sandbox.mcp.env`, `tools.<tool>.env`, `mcp-scripts.<tool>.env`.
 
+### `sandbox.mcp.env` validation and transport
+
+Variables under `sandbox.mcp.env` configure the MCP gateway process, but they are not injected into the startup shell script as raw `export NAME=VALUE` lines. Instead, gh-aw transports them through compiler-controlled step environment variables and reconstructs the final gateway container `-e NAME=VALUE` arguments at runtime. This keeps values out of shell interpolation paths and avoids command-injection hazards from special characters.
+
+Names in `sandbox.mcp.env` must match `^[A-Z_][A-Z0-9_]*$`. The internal `GH_AW_MCP_GATEWAY_` namespace is reserved for gh-aw transport metadata and cannot be used for custom variables.
+
+```yaml wrap
+sandbox:
+  mcp:
+    env:
+      DEBUG: "1"
+      LOG_LEVEL: trace
+```
+
+Use `sandbox.mcp.env` for gateway-facing configuration only. For MCP server credentials or per-tool settings, prefer `tools.<name>.env` or `mcp-scripts.<name>.env`.
+
 ### Override Example
 
 ```yaml wrap
@@ -284,15 +408,11 @@ jobs:
 ---
 ```
 
-## Related Documentation
+## Learn More
 
 - [Frontmatter Reference](/gh-aw/reference/frontmatter/) - Complete frontmatter configuration
-- [Governance Guide](/gh-aw/guides/governance/) - Roll out and manage defaults across enterprise, organization, and repository scopes
-- [Safe Outputs](/gh-aw/reference/safe-outputs/) - Safe output environment configuration
-- [Sandbox](/gh-aw/reference/sandbox/) - Sandbox environment variables
+- [Governance Guide](/gh-aw/reference/governance/) - Roll out and manage defaults across enterprise, organization, and repository scopes
 - [Compiler Enterprise Environment Controls](/gh-aw/reference/compiler-enterprise-environment-controls/) - Enterprise defaults for timeout, max-turns, detection model, model fallback, and max-ai-credits guardrails
 - [Cost Management](/gh-aw/reference/cost-management/) - Practical model and token guardrail rollout guidance
 - [Tools](/gh-aw/reference/tools/) - MCP tool configuration and guard policies
-- [MCP Scripts](/gh-aw/reference/mcp-scripts/) - MCP script tool configuration
-- [Engines](/gh-aw/reference/engines/) - AI engine configuration and model selection
 - [GitHub Actions Environment Variables](https://docs.github.com/en/actions/learn-github-actions/variables) - GitHub Actions documentation

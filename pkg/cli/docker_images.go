@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/github/gh-aw/pkg/ctxutil"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -29,14 +30,17 @@ func (e *DockerUnavailableError) Error() string {
 
 // DockerImages defines the Docker images used by the compile tool's static analysis scanners
 const (
-	ZizmorImage      = "ghcr.io/zizmorcore/zizmor:1.28.0@sha256:8e6b3e4fb74d1aa5d23e83ea369f386c66eced0d1fb944d32cd8b2aac100b00d"
+	ZizmorImage      = "ghcr.io/zizmorcore/zizmor:1.29.0@sha256:863026d54f91271b10b60b67ad8054cb37120167e162482597db102b3026a284"
 	PoutineImage     = "ghcr.io/boostsecurityio/poutine:1.1.6@sha256:722a8e0999b583c1540fe2974e691032b2d9d21b9256a17965132b6bfd0081b0"
 	ActionlintImage  = "rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667"
 	RunnerGuardImage = "ghcr.io/vigilant-llc/runner-guard:3.1.5@sha256:2df426ef96d21f1622e05b21329f26bd263fc46110609cefb6afe43457613ac0"
-	SyftImage        = "anchore/syft:v1.48.0@sha256:b4f1df79f97b817682d8b5ff941eb6bfe74f6172553a5e312c75bbc2eabc405c"
-	GrypeImage       = "anchore/grype:v0.116.0@sha256:fd4ab4d1042b522c896e73bdf09ab8bf384fa417df99d6dd0d6e1008c7e7c821"
+	SyftImage        = "anchore/syft:v1.51.0@sha256:678bfa565b60f747aac0f8e964fe5588a24445b8d0a480e91f6efd70020dfbb0"
+	GrypeImage       = "anchore/grype:v0.117.0@sha256:ddf9e9f204049f3a4a0955ef70873cabab6a31432125ad4f20a490b54950a253"
 	GrantImage       = "anchore/grant:v0.6.8@sha256:172463611795f43b77302cdfbd7b3f81295492a7330e0820cfe41c3674920237"
 	YamllintImage    = "pipelinecomponents/yamllint:latest@sha256:5ab5eb7da0ed5e606b07c1723fc8b275e925189f70ac259b26b7329cb5f8f44d"
+	// ShellcheckImage is the Docker fallback for shellcheck when the binary is not installed.
+	// Used automatically when the shellcheck binary is not found in PATH (e.g. on Windows).
+	ShellcheckImage = "koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d"
 )
 
 // inflightDownload holds the join channel and result for an in-progress pull.
@@ -64,17 +68,10 @@ var pullState = &dockerPullState{
 	mockDockerAvailable: true,
 }
 
-func normalizeDockerContext(ctx context.Context) context.Context {
-	if ctx == nil {
-		return context.TODO()
-	}
-	return ctx
-}
-
 // isDockerImageAvailableUnlocked checks if a Docker image is available locally
 // This function must be called with pullState.mu held (either RLock or Lock)
 func isDockerImageAvailableUnlocked(ctx context.Context, image string) bool {
-	ctx = normalizeDockerContext(ctx)
+	ctx = ctxutil.OrBackground(ctx)
 
 	// Check if we're in mock mode (for testing)
 	if pullState.mockAvailableInUse {
@@ -97,7 +94,7 @@ func isDockerImageAvailableUnlocked(ctx context.Context, image string) bool {
 
 // IsDockerImageAvailable checks if a Docker image is available locally
 func IsDockerImageAvailable(ctx context.Context, image string) bool {
-	ctx = normalizeDockerContext(ctx)
+	ctx = ctxutil.OrBackground(ctx)
 
 	pullState.mu.RLock()
 	defer pullState.mu.RUnlock()
@@ -113,7 +110,7 @@ func IsDockerImageDownloading(image string) bool {
 
 // IsDockerAvailable checks if the Docker daemon is running and accessible
 func IsDockerAvailable(ctx context.Context) bool {
-	ctx = normalizeDockerContext(ctx)
+	ctx = ctxutil.OrBackground(ctx)
 
 	mockEnabled, mockAvailable := func() (bool, bool) {
 		pullState.mu.RLock()
@@ -143,7 +140,7 @@ func IsDockerAvailable(ctx context.Context) bool {
 // The returned join function blocks until the download goroutine exits and returns
 // any error that occurred (nil on success or context cancellation).
 func StartDockerImageDownload(ctx context.Context, image string) (bool, func() error) {
-	ctx = normalizeDockerContext(ctx)
+	ctx = ctxutil.OrBackground(ctx)
 
 	// Check availability and downloading status atomically under lock
 	pullState.mu.Lock()

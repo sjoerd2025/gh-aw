@@ -92,14 +92,14 @@ func ResolveEngineID(workflowData *WorkflowData) string {
 	return workflowData.AI
 }
 
-// engineEnvHasKey reports whether the given env var key is present in the engine.env map.
-// Returns false if workflowData or EngineConfig is nil, or if the key is not in the map.
-func engineEnvHasKey(workflowData *WorkflowData, key string) bool {
+// engineEnvHasNonEmptyValue reports whether the given env var key is present in
+// engine.env and has a non-empty (after trimming whitespace) value.
+func engineEnvHasNonEmptyValue(workflowData *WorkflowData, key string) bool {
 	if workflowData == nil || workflowData.EngineConfig == nil {
 		return false
 	}
-	_, ok := workflowData.EngineConfig.Env[key]
-	return ok
+	value, ok := workflowData.EngineConfig.Env[key]
+	return ok && strings.TrimSpace(value) != ""
 }
 
 // applyEngineCwdEnv sets the GH_AW_ENGINE_CWD environment variable in the given env map
@@ -111,6 +111,17 @@ func applyEngineCwdEnv(env map[string]string, workflowData *WorkflowData) {
 		return
 	}
 	env["GH_AW_ENGINE_CWD"] = workflowData.EngineConfig.Cwd
+}
+
+// applyEngineVersionEnv sets the GH_AW_ENGINE_VERSION environment variable in the given
+// env map when engine.version is configured. This allows scripts and install helpers to
+// read the user-specified engine version at runtime without parsing frontmatter directly.
+// It is also useful for traceability when auditing which version of a custom engine ran.
+func applyEngineVersionEnv(env map[string]string, workflowData *WorkflowData) {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.Version == "" {
+		return
+	}
+	env["GH_AW_ENGINE_VERSION"] = workflowData.EngineConfig.Version
 }
 
 // applyOptionalEngineToolTimeouts adds optional tool timeout environment variables.
@@ -136,7 +147,7 @@ func applyEngineMaxTurnsEnv(env map[string]string, workflowData *WorkflowData) {
 }
 
 // applyEngineHarnessRetryEnv injects GH_AW_HARNESS_* environment variables from
-// the engine frontmatter retry policy fields (engine.harness.max-retries, etc.).
+// the engine frontmatter harness policy fields (engine.harness.max-retries, etc.).
 // Only fields that are explicitly set are injected; absent fields let the harness
 // fall back to its built-in defaults. Must be called before applyEngineAndAgentEnv
 // so that explicit engine.env overrides take precedence.
@@ -144,6 +155,7 @@ func applyEngineHarnessRetryEnv(env map[string]string, workflowData *WorkflowDat
 	if workflowData == nil || workflowData.EngineConfig == nil {
 		return
 	}
+
 	cfg := workflowData.EngineConfig
 	if cfg.HarnessMaxRetries != "" {
 		env["GH_AW_HARNESS_MAX_RETRIES"] = cfg.HarnessMaxRetries
@@ -157,6 +169,22 @@ func applyEngineHarnessRetryEnv(env map[string]string, workflowData *WorkflowDat
 	if cfg.HarnessMaxDelayMs != "" {
 		env["GH_AW_HARNESS_MAX_DELAY_MS"] = cfg.HarnessMaxDelayMs
 	}
+	if cfg.HarnessWatchdogTimeoutMs != "" {
+		env["GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS"] = cfg.HarnessWatchdogTimeoutMs
+	}
+}
+
+// buildShellHarnessCommand runs a shell command through the shared process runner.
+// This gives engines with shell pipeline execution the same stall diagnostics as
+// the dedicated JavaScript harnesses.
+func buildShellHarnessCommand(engineName, command string) string {
+	return fmt.Sprintf(
+		`%s %s/shell_harness.cjs %s %s`,
+		nodeRuntimeResolutionCommand,
+		SetupActionDestinationShell,
+		shellEscapeArg(engineName),
+		shellEscapeArg(command),
+	)
 }
 
 // applyEngineAndAgentEnv merges custom environment variables from engine and agent configs.
@@ -164,6 +192,7 @@ func applyEngineAndAgentEnv(env map[string]string, workflowData *WorkflowData, l
 	if workflowData == nil {
 		return
 	}
+	applyPlaywrightBrowserEnv(env, workflowData)
 	if workflowData.EngineConfig != nil && len(workflowData.EngineConfig.Env) > 0 {
 		maps.Copy(env, workflowData.EngineConfig.Env)
 	}
@@ -173,6 +202,13 @@ func applyEngineAndAgentEnv(env map[string]string, workflowData *WorkflowData, l
 		if log != nil {
 			log.Printf("Added %d custom env vars from agent config", len(agentConfig.Env))
 		}
+	}
+
+}
+
+func applyPlaywrightBrowserEnv(env map[string]string, workflowData *WorkflowData) {
+	if isPlaywrightCLIMode(workflowData.Tools) {
+		env["PLAYWRIGHT_BROWSERS_PATH"] = playwrightBrowsersPath
 	}
 }
 
@@ -240,6 +276,27 @@ func GenerateMultiSecretValidationStep(secretNames []string, engineName, docsURL
 	return GitHubActionStep(stepLines)
 }
 
+// EngineSecretValidationConfig describes how an engine validates its required
+// authentication secrets.
+type EngineSecretValidationConfig struct {
+	SecretNames []string
+	EngineName  string
+	DocsURL     string
+	Skip        func(*WorkflowData) bool
+}
+
+// BuildEngineSecretValidationStep applies an engine-specific skip policy and
+// delegates rendering to BuildDefaultSecretValidationStep.
+func BuildEngineSecretValidationStep(workflowData *WorkflowData, config EngineSecretValidationConfig) GitHubActionStep {
+	if config.Skip != nil && config.Skip(workflowData) {
+		return GitHubActionStep{}
+	}
+	if len(config.SecretNames) == 0 {
+		return GitHubActionStep{}
+	}
+	return BuildDefaultSecretValidationStep(workflowData, config.SecretNames, config.EngineName, config.DocsURL)
+}
+
 // BuildDefaultSecretValidationStep returns a secret validation step for the given engine
 // configuration, or an empty step when a custom command is specified. This consolidates
 // the common guard+delegate pattern shared across all engine GetSecretValidationStep
@@ -266,7 +323,7 @@ func BuildDefaultSecretValidationStep(workflowData *WorkflowData, secrets []stri
 }
 
 // collectCommonMCPSecrets returns the MCP-related secret names shared across all engines:
-//   - MCP_GATEWAY_API_KEY (when MCP servers are present)
+//   - MCP_GATEWAY_AGENT_ID (when MCP servers are present)
 //   - mcp-scripts secrets (when mcp-scripts feature is enabled)
 //
 // Parameters:
@@ -278,7 +335,7 @@ func collectCommonMCPSecrets(workflowData *WorkflowData) []string {
 	var secrets []string
 
 	if HasMCPServers(workflowData) {
-		secrets = append(secrets, "MCP_GATEWAY_API_KEY")
+		secrets = append(secrets, "MCP_GATEWAY_AGENT_ID")
 	}
 
 	if IsMCPScriptsEnabled(workflowData.MCPScripts) {
@@ -328,6 +385,33 @@ func FormatStepWithCommandAndEnv(stepLines []string, command string, env map[str
 	}
 
 	return stepLines
+}
+
+const agentExecutionExitCodePath = "/tmp/gh-aw/agent_execution_exit_code.txt"
+
+// buildAgentExecutionExitCodeTrap returns an EXIT trap that persists an agent
+// execution result for OTLP reporting and annotates non-zero exits in the log.
+func buildAgentExecutionExitCodeTrap() string {
+	return buildAgentExecutionExitCodeTrapWithCleanup("")
+}
+
+func buildAgentExecutionExitCodeTrapWithCleanup(cleanup string) string {
+	if cleanup != "" {
+		cleanup += "; "
+	}
+	return fmt.Sprintf(
+		"trap 'gh_aw_exit_code=$?; mkdir -p /tmp/gh-aw >/dev/null 2>&1 || true; printf \"%%s\" \"$gh_aw_exit_code\" > %s || true; %sif [ \"$gh_aw_exit_code\" -ne 0 ]; then echo \"::error::Agent execution exited with code $gh_aw_exit_code\"; fi' EXIT\n",
+		agentExecutionExitCodePath,
+		cleanup,
+	)
+}
+
+func wrapAgentExecutionCommand(command string) string {
+	const pipefailSetup = "set -o pipefail\n"
+	if commandWithoutPipefail, ok := strings.CutPrefix(command, pipefailSetup); ok {
+		return pipefailSetup + buildAgentExecutionExitCodeTrap() + commandWithoutPipefail
+	}
+	return buildAgentExecutionExitCodeTrap() + command
 }
 
 // appendEnvVarLine appends a YAML env var entry to lines.

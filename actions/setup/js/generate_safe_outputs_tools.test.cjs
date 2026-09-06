@@ -98,6 +98,28 @@ describe("generate_safe_outputs_tools", () => {
     expect(result.map((/** @type {{name: string}} */ t) => t.name)).not.toContain("missing_tool");
   });
 
+  it("preserves namespaced public names", () => {
+    fs.writeFileSync(
+      toolsSourcePath,
+      JSON.stringify([
+        ...sampleSourceTools,
+        {
+          name: "ado_create_work_item",
+          description: "Creates an Azure DevOps work item.",
+          inputSchema: { type: "object", properties: {} },
+        },
+      ])
+    );
+    fs.writeFileSync(configPath, JSON.stringify({ ado_create_work_item: { max: 1 } }));
+    fs.writeFileSync(toolsMetaPath, JSON.stringify({ description_suffixes: {}, repo_params: {}, dynamic_tools: [] }));
+
+    runScript();
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("ado_create_work_item");
+  });
+
   it("applies description suffix from tools_meta", () => {
     fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 5 } }));
     fs.writeFileSync(
@@ -232,6 +254,95 @@ describe("generate_safe_outputs_tools", () => {
     expect(result).toHaveLength(0);
   });
 
+  it("resolves env placeholders in GH_AW_TOOLS_META_JSON", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    const metaFromEnv = JSON.stringify({
+      description_suffixes: {
+        create_issue: " TARGET: ${GH_AW_INPUT_TARGET_REPO}",
+      },
+      repo_params: {},
+      dynamic_tools: [],
+    });
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: metaFromEnv,
+      GH_AW_INPUT_TARGET_REPO: "github/gh-aw",
+    });
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const createIssueTool = result.find((/** @type {{name: string, description: string}} */ t) => t.name === "create_issue");
+    expect(createIssueTool).toBeDefined();
+    expect(createIssueTool.description).toContain("TARGET: github/gh-aw");
+  });
+
+  it("resolves multiple distinct env placeholders in GH_AW_TOOLS_META_JSON", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    const metaFromEnv = JSON.stringify({
+      description_suffixes: {
+        create_issue: " TARGET: ${GH_AW_INPUT_TARGET_REPO} OWNER: ${GH_AW_GITHUB_REPOSITORY_OWNER}",
+      },
+      repo_params: {},
+      dynamic_tools: [],
+    });
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: metaFromEnv,
+      GH_AW_INPUT_TARGET_REPO: "github/gh-aw",
+      GH_AW_GITHUB_REPOSITORY_OWNER: "github",
+    });
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const createIssueTool = result.find((/** @type {{name: string, description: string}} */ t) => t.name === "create_issue");
+    expect(createIssueTool).toBeDefined();
+    expect(createIssueTool.description).toContain("TARGET: github/gh-aw");
+    expect(createIssueTool.description).toContain("OWNER: github");
+  });
+
+  it("leaves unresolved placeholders in GH_AW_TOOLS_META_JSON unchanged", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    const metaFromEnv = JSON.stringify({
+      description_suffixes: {
+        create_issue: " TARGET: ${GH_AW_INPUT_MISSING}",
+      },
+      repo_params: {},
+      dynamic_tools: [],
+    });
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: metaFromEnv,
+    });
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const createIssueTool = result.find((/** @type {{name: string, description: string}} */ t) => t.name === "create_issue");
+    expect(createIssueTool).toBeDefined();
+    expect(createIssueTool.description).toContain("TARGET: ${GH_AW_INPUT_MISSING}");
+  });
+
+  it("escapes quotes, backslashes, and newlines when resolving GH_AW_TOOLS_META_JSON placeholders", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    const metaFromEnv = JSON.stringify({
+      description_suffixes: {
+        create_issue: " TARGET: ${GH_AW_INPUT_TARGET_REPO}",
+      },
+      repo_params: {},
+      dynamic_tools: [],
+    });
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: metaFromEnv,
+      GH_AW_INPUT_TARGET_REPO: 'a"b\\c\nd',
+    });
+
+    // The written tools_meta.json must remain valid JSON despite the unsafe characters.
+    const writtenMeta = JSON.parse(fs.readFileSync(toolsMetaPath, "utf8"));
+    expect(writtenMeta.description_suffixes.create_issue).toContain('a"b\\c\nd');
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const createIssueTool = result.find((/** @type {{name: string, description: string}} */ t) => t.name === "create_issue");
+    expect(createIssueTool).toBeDefined();
+    expect(createIssueTool.description).toContain('TARGET: a"b\\c\nd');
+  });
+
   it("ignores non-tool config keys when filtering", () => {
     // dispatch_workflow and max_bot_mentions are not tool names in source file
     fs.writeFileSync(
@@ -280,13 +391,13 @@ describe("generate_safe_outputs_tools", () => {
     fs.writeFileSync(configPath, JSON.stringify({ create_issue: {} }));
     fs.writeFileSync(toolsMetaPath, JSON.stringify({ description_suffixes: {}, repo_params: {}, dynamic_tools: [] }));
 
-    expect(() => runScript({ GH_AW_SAFE_OUTPUTS_TOOLS_SOURCE_PATH: "/nonexistent/path.json" })).toThrow();
+    expect(() => runScript({ GH_AW_SAFE_OUTPUTS_TOOLS_SOURCE_PATH: "/nonexistent/path.json" })).toThrow("ERR_CONFIG:");
   });
 
   it("exits with error when config file is missing", () => {
     fs.writeFileSync(toolsMetaPath, JSON.stringify({ description_suffixes: {}, repo_params: {}, dynamic_tools: [] }));
 
-    expect(() => runScript({ GH_AW_SAFE_OUTPUTS_CONFIG_PATH: "/nonexistent/config.json" })).toThrow();
+    expect(() => runScript({ GH_AW_SAFE_OUTPUTS_CONFIG_PATH: "/nonexistent/config.json" })).toThrow("ERR_CONFIG:");
   });
 
   it("works when tools_meta file is missing (graceful fallback)", () => {

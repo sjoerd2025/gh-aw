@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"time"
 
 	actionpins "github.com/github/gh-aw/pkg/actionpins"
 	"github.com/github/gh-aw/pkg/logger"
@@ -36,6 +37,7 @@ type SkipIfCheckFailingConfig struct {
 type WorkflowData struct {
 	Name                           string
 	WorkflowID                     string           // workflow identifier derived from markdown filename (basename without extension)
+	CompiledVersion                string           // gh-aw compiler version emitted to generated install steps as GH_AW_COMPILED_VERSION (release tag for releases, "dev" for non-release builds) so the install script can resolve a compat.json window at runtime without churn
 	TrialMode                      bool             // whether the workflow is running in trial mode
 	TrialLogicalRepo               string           // target repository slug for trial mode (owner/repo)
 	UseSamples                     bool             // whether the agentic step should be replaced by a deterministic samples replay driver (hidden feature)
@@ -43,9 +45,12 @@ type WorkflowData struct {
 	FrontmatterEmoji               string           // emoji field from frontmatter (for display in footers and UI)
 	FrontmatterYAML                string           // raw frontmatter YAML content (rendered as comment in lock file for reference)
 	FrontmatterHash                string           // SHA-256 hash of frontmatter (computed before job building, used to derive stable heredoc delimiters)
+	BodyHash                       string           // SHA-256 hash of the markdown body (computed before job building)
 	FrontmatterFieldLines          map[string]int   // absolute 1-based line numbers of top-level frontmatter keys in the source file (populated by parser)
 	RawMarkdown                    string           // raw markdown body before include expansion, used for frontmatter hash computation without re-reading the file
 	Description                    string           // optional description rendered as comment in lock file
+	Intent                         string           // optional intent (durable outcome the workflow exists to achieve) rendered as comment in lock file
+	Docs                           string           // optional human-facing documentation URL preserved in lock metadata
 	Source                         string           // optional source field (owner/repo@ref/path) rendered as comment in lock file
 	Redirect                       string           // optional redirect field describing a moved workflow location
 	TrackerID                      string           // optional tracker identifier for created assets (min 8 chars, alphanumeric + hyphens/underscores)
@@ -54,6 +59,8 @@ type WorkflowData struct {
 	ImportedFiles                  []string         // list of files imported via imports field (rendered as comment in lock file)
 	Skills                         []string         // skill specs from frontmatter (owner/repo@sha or owner/repo/skill/path@sha)
 	SkillReferences                []SkillReference
+	Plugins                        []string
+	PluginReferences               []PluginReference
 	ImportedMarkdown               string   // Only imports WITH inputs (for compile-time substitution)
 	ImportPaths                    []string // Import file paths for runtime-import macro generation (imports without inputs)
 	PromptImports                  []parser.PromptImportEntry
@@ -81,6 +88,8 @@ type WorkflowData struct {
 	Tools                          map[string]any
 	LSP                            map[string]LSPServerConfig // top-level LSP server configuration for Copilot CLI
 	ParsedTools                    *Tools                     // Structured tools configuration (NEW: parsed from Tools map)
+	ExplicitlyDisabledTools        map[string]struct{}        // tool names explicitly set to false before default resolution mutates/removes their map entries
+	BashDisabled                   bool                       // true when tools.bash was fully and explicitly refused (bash: false, or bash: []) after default-tool resolution; used by engines that can fully disable shell execution (e.g. Codex's features.shell_tool=false), see EngineCapabilities.BashDisable
 	MarkdownContent                string
 	AI                             string        // "claude" or "codex" (for backwards compatibility)
 	Model                          string        // Top-level LLM model override (from frontmatter model: field or imports)
@@ -89,6 +98,7 @@ type WorkflowData struct {
 	AgentImportSpec                string        // Original import specification for agent file (e.g., "owner/repo/path@ref")
 	RepositoryImports              []string      // Repository-only imports (format: "owner/repo@ref") for .github folder merging
 	StopTime                       string
+	Cooldown                       time.Duration                   // minimum time between completed runs that executed the agent job
 	SkipIfMatch                    *SkipIfMatchConfig              // skip-if-match configuration with query and max threshold
 	SkipIfNoMatch                  *SkipIfNoMatchConfig            // skip-if-no-match configuration with query and min threshold
 	SkipIfCheckFailing             *SkipIfCheckFailingConfig       // skip-if-check-failing configuration
@@ -100,6 +110,7 @@ type WorkflowData struct {
 	OnRestoreMemory                bool                            // enable memory restore in pre-activation for on.steps via on.restore-memory (default false)
 	OnPermissions                  *Permissions                    // additional permissions for the pre-activation job from on.permissions
 	OnNeeds                        []string                        // custom workflow jobs that pre_activation/activation should depend on from on.needs
+	AmbientFolders                 []string                        // workspace-relative folders to bundle in the activation artifact and restore before the agent runs
 	ManualApproval                 string                          // environment name for manual approval from on: section
 	Command                        []string                        // for /command trigger support - multiple command names
 	CommandEvents                  []string                        // events where command should be active (nil = all events)
@@ -111,7 +122,7 @@ type WorkflowData struct {
 	LabelCommandDecentralized      bool                            // when true, label_command uses decentralized dispatch routing via agentic_commands.yml
 	LabelCommandOtherEvents        map[string]any                  // for merging label-command with other events
 	LabelCommandRemoveLabel        bool                            // whether to automatically remove the triggering label (default: true)
-	AIReaction                     string                          // AI reaction type like "eyes", "heart", etc.
+	AIReaction                     ReactionType                    // AI reaction type like "eyes", "heart", etc.
 	ReactionIssues                 *bool                           // whether reactions are allowed on issues/issue_comment triggers (default: true)
 	ReactionPullRequests           *bool                           // whether reactions are allowed on pull_request/pull_request_review_comment triggers (default: true)
 	ReactionDiscussions            *bool                           // whether reactions are allowed on discussion/discussion_comment triggers (default: true)
@@ -132,11 +143,14 @@ type WorkflowData struct {
 	SafeOutputs                    *SafeOutputsConfig              // output configuration for automatic output routes
 	SafeOutputsInputEnvVars        map[string]string               // GH_AW_INPUT_* env vars referenced by safe-outputs config; populated during MCP setup generation so renderers can forward them to the nested container
 	MCPScripts                     *MCPScriptsConfig               // mcp-scripts configuration for custom MCP tools
+	Enclaves                       EnclavesConfig                  // AWF-owned private repository enclave executors
 	LabelNames                     []string                        // label names that must match for pull_request_target labeled events (on.labels)
 	Roles                          []string                        // permission levels required to trigger workflow
 	Bots                           []string                        // allow list of bot identifiers that can trigger workflow
 	RateLimit                      *RateLimitConfig                // rate limiting configuration for workflow triggers
 	CacheMemoryConfig              *CacheMemoryConfig              // parsed cache-memory configuration
+	DriveMemoryConfig              *DriveMemoryConfig              // parsed drive-memory configuration
+	CommentMemoryConfig            *CommentMemoryConfig            // parsed tools.comment-memory configuration
 	RepoMemoryConfig               *RepoMemoryConfig               // parsed repo-memory configuration
 	Runtimes                       map[string]any                  // runtime version overrides from frontmatter
 	ToolsTimeout                   string                          // timeout for tool/MCP operations: numeric string (seconds) or GitHub Actions expression (empty = use engine default)
@@ -157,6 +171,7 @@ type WorkflowData struct {
 	OTLPEndpoint                   string                          // resolved OTLP endpoint (from observability.otlp.endpoint, including imports; set by injectOTLPConfig)
 	OTLPHeaders                    string                          // normalized OTLP headers in key=value,key=value format (from observability.otlp.headers, including imports; set by injectOTLPConfig)
 	OTLPEndpoints                  string                          // JSON-encoded array of all OTLP endpoints (from observability.otlp.endpoints; set by injectOTLPConfig as GH_AW_OTLP_ENDPOINTS)
+	OTLPUsesEnterpriseDefaults     bool                            // true when the OTLP endpoint/headers come from the enterprise default vars/secrets rather than frontmatter (set by injectOTLPConfig)
 	ResolvedMCPServers             map[string]any                  // fully merged mcp-servers from main workflow and all imports (for mcp inspect)
 	ActionPinWarnings              map[string]bool                 // cache of already-warned action pin failures (key: "repo@version")
 	ActionMode                     ActionMode                      // action mode for workflow compilation (dev, release, script)
@@ -165,6 +180,7 @@ type WorkflowData struct {
 	CheckoutConfigs                []*CheckoutConfig               // user-configured checkout settings from frontmatter
 	CheckoutDisabled               bool                            // true when checkout: false is set in frontmatter, or auto-disabled for pull_request_target
 	CheckoutExplicitlyDisabled     bool                            // true only when checkout: false is explicitly set in frontmatter (not auto-disabled)
+	CheckoutSkipDefault            bool                            // true when permissions.contents: none skips only the default workflow-repository checkout
 	IsPullRequestTarget            bool                            // true when the workflow's on: triggers contain pull_request_target (but NOT pull_request)
 	HasDispatchItemNumber          bool                            // true when workflow_dispatch has item_number input (generated by label trigger shorthand)
 	ConcurrencyJobDiscriminator    string                          // optional discriminator expression appended to job-level concurrency groups (from concurrency.job-discriminator)
@@ -183,7 +199,7 @@ type WorkflowData struct {
 	CachedConcurrencyGroupExprErr  error                           // cached result of validateConcurrencyGroupExpression(ConcurrencyGroupExpr); nil = valid; populated by applyDefaults
 	Experiments                    map[string][]string             // A/B testing experiments: maps experiment name to variant list (from frontmatter)
 	ExperimentConfigs              map[string]*ExperimentConfig    // Full A/B experiment metadata (populated alongside Experiments)
-	ExperimentsStorage             string                          // "cache" or "repo" (default "repo"); controls how experiment state is persisted across runs
+	ExperimentsStorage             ExperimentStorageMode           // "cache" or "repo" (default "repo"); controls how experiment state is persisted across runs
 	CachedConcurrencyGroupExprSet  bool                            // true once CachedConcurrencyGroupExprErr has been populated; distinguishes "valid (nil)" from "not yet computed"
 	CachedParsedToolsets           []string                        // cached result of ParseGitHubToolsets for the GitHub tool (for performance optimization); populated by applyDefaults
 	CachedAllowedDomainsStr        string                          // cached allowed-domains string for sanitization (for performance optimization); computed once and reused across multiple compilation steps
@@ -198,7 +214,9 @@ type WorkflowData struct {
 	DefaultAiCreditsPricing        *AiCreditsPricingConfig         // fallback per-token pricing from frontmatter models.default-ai-credits-pricing; used by AWF API proxy for unrecognized models
 	ActionPinMappings              map[string]string               // action-pin redirect table from aw.json action_pins: maps "owner/repo@version" → "owner/repo@version"
 	ContainerPinMappings           map[string]string               // container-pin redirect table from aw.json container_pins: maps source image → replacement image
+	GHES                           bool                            // select action versions compatible with GitHub Enterprise Server
 	Evals                          *EvalsConfig                    // BinEval evaluation configuration parsed from frontmatter evals field
+	Graders                        *GradersConfig                  // Deterministic graders configuration parsed from frontmatter graders field
 	ExcludedEnv                    []string                        // additional env var names to exclude from agent container via AWF --exclude-env (from frontmatter excluded-env field)
 }
 
@@ -223,6 +241,7 @@ func (d *WorkflowData) PinContext() *actionpins.PinContext {
 		StrictMode:        d.StrictMode,
 		EnforcePinned:     true,
 		AllowActionRefs:   d.AllowActionRefs,
+		GHES:              d.GHES,
 		Warnings:          d.ActionPinWarnings,
 		Mappings:          d.ActionPinMappings,
 		ContainerMappings: d.ContainerPinMappings,

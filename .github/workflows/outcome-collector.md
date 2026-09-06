@@ -14,10 +14,9 @@ permissions:
   actions: read
   discussions: read
 tracker-id: outcome-collector
-model: claude-haiku-4.5
+model: copilot/gpt-5.3-codex
 engine:
-  id: copilot
-  bare: true
+  id: codex
 strict: true
 timeout-minutes: 20
 network:
@@ -59,9 +58,6 @@ pre-agent-steps:
       else
         echo "No outcome evaluations to export"
       fi
-sandbox:
-  agent:
-    sudo: false
 ---
 
 # Outcome Collector

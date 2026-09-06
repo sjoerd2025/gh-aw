@@ -300,6 +300,7 @@ Import caching is crucial for performance and cycle detection. The `ImportCache`
 - `github.com/github/gh-aw/pkg/setutil` — set membership helpers used in import BFS traversal and cycle detection
 - `github.com/github/gh-aw/pkg/sliceutil` — slice helper utilities for validation and merging
 - `github.com/github/gh-aw/pkg/stringutil` — string normalization and ANSI/format helpers
+- `github.com/github/gh-aw/pkg/syncutil` — thread-safe one-shot caching (used for lazy JSON schema compilation)
 
 **Test-only**:
 - `github.com/github/gh-aw/pkg/testutil` — shared test fixtures and assertion helpers used by parser package tests
@@ -327,12 +328,20 @@ This appendix is generated from the current non-test Go source files in this pac
 | Constants | 10 |
 | Variables | 5 |
 | Functions and methods | 96 |
-| Additional symbols documented in this appendix | 13 |
+| Additional symbols documented in this appendix | 19 |
+
+### Additional types
+
+| File | Symbol | Declaration | Description |
+|------|--------|-------------|-------------|
+| `mcp.go` | `MCPRootInfo` | `type MCPRootInfo struct { URI string Name string }` | MCPRootInfo contains display metadata inferred from MCP server roots. |
 
 ### Additional constants and variables
 
 | File | Kind | Symbol | Declaration | Description |
 |------|------|--------|-------------|-------------|
+| `remote_resolve_sha.go` | `var` | `ErrVerificationSkipped` | `var ErrVerificationSkipped = errors.New("commit verification skipped")` | ErrVerificationSkipped is returned when commit verification cannot be completed due to auth/permission constraints. |
+| `schedule_parser.go` | `var` | `ErrUnsupportedSyntax` | `var ErrUnsupportedSyntax = errors.New("unsupported schedule syntax")` | ErrUnsupportedSyntax marks schedule inputs that are intentionally unsupported and should be rewritten to fuzzy or cron forms. |
 | `github_urls.go` | `const` | `URLTypeBlob` | `const URLTypeBlob GitHubURLType = "blob"` | File blob view |
 | `github_urls.go` | `const` | `URLTypeIssue` | `const URLTypeIssue GitHubURLType = "issue"` | Issue |
 | `github_urls.go` | `const` | `URLTypePullRequest` | `const URLTypePullRequest GitHubURLType = "pull"` | Pull request |
@@ -347,16 +356,19 @@ This appendix is generated from the current non-test Go source files in this pac
 
 | File | Symbol | Declaration | Description |
 |------|--------|-------------|-------------|
+| `github.go` | `IsAnyGitHubHostEnvVarSet` | `func IsAnyGitHubHostEnvVarSet() bool` | IsAnyGitHubHostEnvVarSet returns true when any GitHub host override environment variable is set. |
+| `github_urls.go` | `IsGitHubHost` | `func IsGitHubHost(host string) bool` | IsGitHubHost returns true for recognized GitHub and GHES hostnames. |
 | `import_cache.go` | `(*ImportCache).Get` | `func (*ImportCache).Get(owner, repo, path, sha string) (string, bool)` | Get retrieves a cached file path if it exists sha parameter should be the resolved commit SHA |
 | `import_cache.go` | `(*ImportCache).GetCacheDir` | `func (*ImportCache).GetCacheDir() string` | GetCacheDir returns the base cache directory path |
 | `import_cache.go` | `(*ImportCache).Set` | `func (*ImportCache).Set(owner, repo, path, sha string, content []byte) (string, error)` | Set stores a new cache entry by saving the content to the cache directory sha parameter should be the resolved commit SHA |
 | `import_error.go` | `(*FormattedParserError).Unwrap` | `func (*FormattedParserError).Unwrap() error` | Exported function or method declared in `import_error.go`. |
+| `schema_validation.go` | `IsImportSafeSharedWorkflowOn` | `func IsImportSafeSharedWorkflowOn(onValue any) bool` | IsImportSafeSharedWorkflowOn validates whether an imported `on:` block is restricted to safe shared-workflow triggers. |
 
 <!-- END SOURCE-VERIFIED EXPORT COVERAGE -->
 
 ## Source Synchronization
 
-Reviewed against recent source updates on 2026-07-24; no additional public-contract deltas were identified beyond the sections above.
+Reviewed against recent source updates on 2026-07-24; no additional public-contract deltas were identified beyond the sections above. Re-verified on 2026-08-14; no public-contract changes since the last review (only internal schema-suggestions refactoring landed). Re-verified on 2026-08-29; no public-contract deltas since the last review. Re-verified on 2026-09-03; no public-contract deltas since the last review.
 
 ---
 

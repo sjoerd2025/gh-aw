@@ -25,6 +25,7 @@ func TestFirewallWorkflowNetworkConfiguration(t *testing.T) {
 			ID: "claude",
 		},
 		NetworkPermissions: &NetworkPermissions{
+			Allowed:  []string{"claude"},
 			Firewall: &FirewallConfig{Enabled: true},
 		},
 		Tools: map[string]any{
@@ -178,8 +179,9 @@ func TestFirewallWorkflowBlocksExampleCom(t *testing.T) {
 	}
 }
 
-// TestCompileWorkflow_LegacySecurityFromFrontmatter validates that legacy-security: enable
-// passes schema validation and produces the expected AWF command with sudo and --legacy-security.
+// TestCompileWorkflow_LegacySecurityFromFrontmatter validates that
+// runtime: docker-sudo-iptables passes schema validation and produces the expected AWF
+// command with sudo and --legacy-security.
 func TestCompileWorkflow_LegacySecurityFromFrontmatter(t *testing.T) {
 	frontmatter := `---
 on: workflow_dispatch
@@ -187,7 +189,7 @@ engine: copilot
 sandbox:
   agent:
     id: awf
-    legacy-security: enable
+    runtime: docker-sudo-iptables
 network:
   allowed:
     - defaults
@@ -204,7 +206,7 @@ Test workflow with legacy security.`
 
 	compiler := NewCompiler()
 	err := compiler.CompileWorkflow(testFile)
-	require.NoError(t, err, "Compilation with legacy-security: enable should succeed")
+	require.NoError(t, err, "Compilation with runtime: docker-sudo-iptables should succeed")
 
 	lockFile := stringutil.MarkdownToLockFile(testFile)
 	lockContent, err := os.ReadFile(lockFile)
@@ -212,8 +214,8 @@ Test workflow with legacy security.`
 
 	lockStr := string(lockContent)
 
-	// Legacy mode should use sudo -E awf
-	assert.Contains(t, lockStr, "sudo -E awf", "Legacy security mode should use 'sudo -E awf' command")
+	// Legacy mode should preserve the runner PATH across sudo's secure_path.
+	assert.Contains(t, lockStr, `sudo -E /usr/bin/env PATH="$PATH" /usr/local/bin/awf`, "Legacy security mode should preserve PATH across sudo")
 
 	// Should emit --legacy-security flag
 	assert.Contains(t, lockStr, "--legacy-security", "Legacy security mode should emit --legacy-security flag")
@@ -256,7 +258,7 @@ Test workflow with strict security (default).`
 	lockStr := string(lockContent)
 
 	// Strict mode should NOT use sudo
-	assert.NotContains(t, lockStr, "sudo -E awf", "Strict security mode should NOT use 'sudo -E awf'")
+	assert.NotContains(t, lockStr, "sudo -E ", "Strict security mode should NOT use sudo")
 
 	// Should NOT emit --legacy-security flag
 	assert.NotContains(t, lockStr, "--legacy-security", "Strict security mode should NOT emit --legacy-security")

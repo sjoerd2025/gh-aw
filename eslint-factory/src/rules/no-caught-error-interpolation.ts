@@ -19,6 +19,24 @@ function isInlineRejectionHandler(node: TSESTree.ArrowFunctionExpression | TSEST
 }
 
 /**
+ * Returns true when the function node is an inline listener passed as the
+ * second argument to an EventEmitter-style `.on('error', fn)`,
+ * `.once('error', fn)`, or `.addListener('error', fn)` call.
+ */
+function isInlineEventErrorHandler(node: TSESTree.ArrowFunctionExpression | TSESTree.FunctionExpression): boolean {
+  const parent = node.parent;
+  if (!parent || parent.type !== AST_NODE_TYPES.CallExpression) return false;
+  const callee = parent.callee;
+  if (callee.type !== AST_NODE_TYPES.MemberExpression || callee.computed) return false;
+  const prop = callee.property;
+  if (prop.type !== AST_NODE_TYPES.Identifier) return false;
+  if (prop.name !== "on" && prop.name !== "once" && prop.name !== "addListener") return false;
+  if (parent.arguments[1] !== node) return false;
+  const eventArg = parent.arguments[0];
+  return eventArg?.type === AST_NODE_TYPES.Literal && eventArg.value === "error";
+}
+
+/**
  * Returns true when `node` is a bare `Identifier` expression — no member
  * access, no call, no unary/binary operation, no nullish coercion. Used to
  * identify direct `${someVar}` interpolations as opposed to safe forms such
@@ -44,13 +62,20 @@ function isCaughtErrorVariableDef(def: TSESLint.Scope.Definition): boolean {
   }
 
   // Inline rejection handler parameter (.catch(err => ...) / .then(_, err => ...))
+  // or inline EventEmitter 'error' event listener (.on('error', err => ...) etc.)
   // def.node is the function node for Parameter definitions
   if (def.type === "Parameter") {
     const fn = def.node as TSESTree.Node;
     if (fn.type !== AST_NODE_TYPES.ArrowFunctionExpression && fn.type !== AST_NODE_TYPES.FunctionExpression) {
       return false;
     }
-    return isInlineRejectionHandler(fn as TSESTree.ArrowFunctionExpression | TSESTree.FunctionExpression);
+    const fnNode = fn as TSESTree.ArrowFunctionExpression | TSESTree.FunctionExpression;
+    if (isInlineRejectionHandler(fnNode)) return true;
+    if (isInlineEventErrorHandler(fnNode)) {
+      // Only the first parameter receives the error object from an 'error' event
+      return fnNode.params[0] === def.name;
+    }
+    return false;
   }
 
   return false;
@@ -63,20 +88,21 @@ export const noCaughtErrorInterpolationRule = createRule({
     hasSuggestions: true,
     docs: {
       description:
-        "Disallow directly interpolating a caught error variable in a template literal (e.g. `${err}`). " +
+        "Disallow directly stringifying a caught error variable in a template literal or string concatenation (e.g. `${err}` or `'Error: ' + err`). " +
         "For Error objects this produces the redundant 'Error: message' prefix; for non-Error throws (plain objects, strings, etc.) " +
         "it silently produces '[object Object]' or another useless string. " +
         "Use getErrorMessage(err) for consistent, safe formatting, or String(err) when getErrorMessage is unavailable. " +
-        "Detected scopes: try/catch bindings, .catch(fn) inline callbacks, and .then(onFulfilled, onRejected) inline rejection handlers.",
+        "Detected scopes: try/catch bindings, .catch(fn) inline callbacks, .then(onFulfilled, onRejected) inline rejection handlers, " +
+        "and inline EventEmitter 'error' event listeners (.on('error', fn) / .once('error', fn) / .addListener('error', fn)).",
     },
     schema: [],
     messages: {
       bareErrorInterpolation:
-        "Directly interpolating caught error '{{errorVar}}' in a template literal is unsafe — " +
+        "Directly stringifying caught error '{{errorVar}}' is unsafe — " +
         "for Error objects it produces 'Error: message' (redundant prefix); for non-Error throws it produces '[object Object]'. " +
         "Use ${getErrorMessage({{errorVar}})} if it is available, or ${String({{errorVar}})} as an import-free alternative.",
-      useGetErrorMessage: "Replace \\${{{errorVar}}} with \\${getErrorMessage({{errorVar}})} — ensure getErrorMessage is imported from error_helpers.cjs.",
-      useStringFallback: "Replace \\${{{errorVar}}} with \\${String({{errorVar}})} — getErrorMessage is not in scope; String() is a safe import-free alternative.",
+      useGetErrorMessage: "Wrap '{{errorVar}}' with getErrorMessage() — ensure getErrorMessage is imported from error_helpers.cjs.",
+      useStringFallback: "Wrap '{{errorVar}}' with String() — getErrorMessage is not in scope; String() is a safe import-free alternative.",
     },
   },
   defaultOptions: [],
@@ -106,6 +132,61 @@ export const noCaughtErrorInterpolationRule = createRule({
       return false;
     }
 
+    function findVariable(node: TSESTree.Node, name: string): TSESLint.Scope.Variable | null {
+      let scope: Scope | null = sourceCode.getScope(node);
+      while (scope) {
+        const variable = scope.set.get(name);
+        if (variable) return variable;
+        scope = scope.upper;
+      }
+      return null;
+    }
+
+    function isCaughtErrorIdentifier(node: TSESTree.Expression): node is TSESTree.Identifier {
+      if (!isBareIdentifierExpression(node)) return false;
+
+      const variable = findVariable(node, node.name);
+      if (!variable) return false;
+      if (variable.defs.some(isCaughtErrorVariableDef)) return true;
+
+      return variable.defs.some(def => {
+        if (def.type !== "Variable") return false;
+        const declarator = def.node;
+        if (declarator.parent.type !== AST_NODE_TYPES.VariableDeclaration || declarator.parent.kind !== "const") return false;
+        if (declarator.init?.type !== AST_NODE_TYPES.Identifier) return false;
+        const sourceVariable = findVariable(declarator.init, declarator.init.name);
+        return sourceVariable?.defs.some(isCaughtErrorVariableDef) ?? false;
+      });
+    }
+
+    function reportCaughtError(node: TSESTree.Identifier): void {
+      const errorVar = node.name;
+      const getErrorMessageAvailable = hasResolvableLocalBinding(node, "getErrorMessage");
+
+      context.report({
+        node,
+        messageId: "bareErrorInterpolation",
+        data: { errorVar },
+        suggest: [
+          getErrorMessageAvailable
+            ? ({
+                messageId: "useGetErrorMessage" as const,
+                data: { errorVar },
+                fix(fixer) {
+                  return fixer.replaceText(node, `getErrorMessage(${errorVar})`);
+                },
+              } as const)
+            : ({
+                messageId: "useStringFallback" as const,
+                data: { errorVar },
+                fix(fixer) {
+                  return fixer.replaceText(node, `String(${errorVar})`);
+                },
+              } as const),
+        ],
+      });
+    }
+
     return {
       TemplateLiteral(node) {
         // Tagged templates pass values to the tag function as-is; they are not
@@ -113,50 +194,13 @@ export const noCaughtErrorInterpolationRule = createRule({
         if (node.parent?.type === AST_NODE_TYPES.TaggedTemplateExpression) return;
 
         for (const expr of node.expressions) {
-          if (!isBareIdentifierExpression(expr)) continue;
-
-          // Resolve the identifier through the full scope chain. This correctly
-          // handles closures: an identifier inside a nested function can still
-          // resolve to an outer catch binding.
-          let scope: Scope | null = sourceCode.getScope(expr);
-          let variable: TSESLint.Scope.Variable | null = null;
-          while (scope) {
-            const v = scope.set.get(expr.name);
-            if (v) {
-              variable = v;
-              break;
-            }
-            scope = scope.upper;
-          }
-
-          if (!variable || !variable.defs.some(isCaughtErrorVariableDef)) continue;
-
-          const errorVar = expr.name;
-          const getErrorMessageAvailable = hasResolvableLocalBinding(node, "getErrorMessage");
-
-          context.report({
-            node: expr,
-            messageId: "bareErrorInterpolation",
-            data: { errorVar },
-            suggest: [
-              getErrorMessageAvailable
-                ? ({
-                    messageId: "useGetErrorMessage" as const,
-                    data: { errorVar },
-                    fix(fixer) {
-                      return fixer.replaceText(expr, `getErrorMessage(${errorVar})`);
-                    },
-                  } as const)
-                : ({
-                    messageId: "useStringFallback" as const,
-                    data: { errorVar },
-                    fix(fixer) {
-                      return fixer.replaceText(expr, `String(${errorVar})`);
-                    },
-                  } as const),
-            ],
-          });
+          if (isCaughtErrorIdentifier(expr)) reportCaughtError(expr);
         }
+      },
+      BinaryExpression(node) {
+        if (node.operator !== "+") return;
+        if (isCaughtErrorIdentifier(node.left)) reportCaughtError(node.left);
+        if (isCaughtErrorIdentifier(node.right)) reportCaughtError(node.right);
       },
     };
   },

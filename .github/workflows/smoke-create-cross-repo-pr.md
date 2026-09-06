@@ -4,6 +4,7 @@ emoji: "🧪"
 name: Smoke Create Cross-Repo PR
 description: Smoke test validating cross-repo pull request creation in github/gh-aw-side-repo
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-create-cross-repo-pr
     strategy: centralized
@@ -64,13 +65,16 @@ safe-outputs:
 timeout-minutes: 10
 imports:
   - shared/otlp.md
+  - shared/smoke-test-brevity.md
+  - shared/reporting.md
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Smoke Test: Cross-Repo Pull Request Creation
-
-**IMPORTANT: Keep all outputs extremely short and concise. Use single-line responses where possible.**
 
 The workspace is checked out from `githubnext/gh-aw-side-repo` (a private side repository used for smoke testing).
 

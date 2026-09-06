@@ -130,6 +130,15 @@ interface MarkPullRequestAsReadyForReviewItem extends BaseSafeOutputItem {
 }
 
 /**
+ * JSONL item for approving a pending workflow run from a fork pull request
+ */
+interface ApproveWorkflowRunItem extends BaseSafeOutputItem {
+  type: "approve_workflow_run";
+  /** Positive integer workflow run ID */
+  run_id: number | string;
+}
+
+/**
  * JSONL item for adding a comment to an issue or PR
  */
 interface AddCommentItem extends BaseSafeOutputItem {
@@ -209,6 +218,19 @@ interface CreateCodeScanningAlertItem extends BaseSafeOutputItem {
 }
 
 /**
+ * JSONL item for uploading a code coverage report via actions/upload-code-coverage
+ */
+interface UploadCodeCoverageItem extends BaseSafeOutputItem {
+  type: "upload_code_coverage";
+  /** Path to the coverage report file (staging-relative, absolute, or workspace-relative) */
+  file: string;
+  /** Linguist language name for the coverage report (e.g. "Go", "TypeScript") */
+  language: string;
+  /** Label identifying this coverage report (e.g. "code-coverage/unit-tests") */
+  label: string;
+}
+
+/**
  * JSONL item for adding labels to an issue or PR
  */
 interface AddLabelsItem extends BaseSafeOutputItem {
@@ -283,8 +305,8 @@ interface UpdatePullRequestItem extends BaseSafeOutputItem {
   title?: string;
   /** Optional new pull request body (behavior depends on operation) */
   body?: string;
-  /** Update operation for body: 'replace' (default), 'append', or 'prepend' */
-  operation?: "replace" | "append" | "prepend";
+  /** Update operation for body: 'replace' (default), 'append', 'prepend', or 'replace-island' */
+  operation?: "replace" | "append" | "prepend" | "replace-island";
   /** When true, updates the pull request branch with the latest base branch changes before other updates */
   update_branch?: boolean;
   /** Optional pull request number for target "*" */
@@ -496,11 +518,13 @@ type SafeOutputItem =
   | CloseIssueItem
   | ClosePullRequestItem
   | MarkPullRequestAsReadyForReviewItem
+  | ApproveWorkflowRunItem
   | AddCommentItem
   | CommentMemoryItem
   | CreatePullRequestItem
   | CreatePullRequestReviewCommentItem
   | CreateCodeScanningAlertItem
+  | UploadCodeCoverageItem
   | AddLabelsItem
   | RemoveLabelsItem
   | AddReviewerItem
@@ -541,11 +565,13 @@ export {
   CloseIssueItem,
   ClosePullRequestItem,
   MarkPullRequestAsReadyForReviewItem,
+  ApproveWorkflowRunItem,
   AddCommentItem,
   CommentMemoryItem,
   CreatePullRequestItem,
   CreatePullRequestReviewCommentItem,
   CreateCodeScanningAlertItem,
+  UploadCodeCoverageItem,
   AddLabelsItem,
   RemoveLabelsItem,
   AddReviewerItem,

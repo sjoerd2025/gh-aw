@@ -3,6 +3,8 @@ private: true
 emoji: "🔍"
 name: Go Pattern Detector
 description: Detects common Go code patterns and anti-patterns to maintain code quality and consistency
+features:
+  gh-aw-detection: true
 on:
   schedule:
     - cron: "daily around 14:00 on weekdays"  # ~2 PM UTC weekdays
@@ -12,9 +14,6 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
 jobs:
   ast_grep:
@@ -72,6 +71,9 @@ tools:
   cli-proxy: true
 
 
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Go Code Pattern Detector

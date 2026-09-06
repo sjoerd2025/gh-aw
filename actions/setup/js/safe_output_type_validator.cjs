@@ -31,6 +31,8 @@ const ISSUE_INTENT_RATIONALE_MAX_LENGTH = 280;
 /**
  * @typedef {{
  *   allowedAliases?: string[],
+ *   maxMentions?: number,
+ *   allowedAliasesSeen?: Set<string>,
  *   maxBotMentions?: number,
  *   normalizeIssueClosingKeywords?: boolean,
  *   dataEnabled?: boolean,
@@ -42,9 +44,13 @@ const ISSUE_INTENT_RATIONALE_MAX_LENGTH = 280;
 // https://docs.github.com/issues/tracking-your-work-with-issues/linking-a-pull-request-to-an-issue
 const ISSUE_CLOSING_KEYWORDS = "fix|fixes|fixed|close|closes|closed|resolve|resolves|resolved";
 const ISSUE_REFERENCE_PATTERN = "(?:[a-zA-Z0-9_.-]+\\/[a-zA-Z0-9_.-]+)?#\\d+";
+// eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- ISSUE_CLOSING_KEYWORDS and ISSUE_REFERENCE_PATTERN are intentional regex fragments (alternation and character classes), not user input
 const ISSUE_CLOSING_WHOLE_SPAN_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b\\s+${ISSUE_REFERENCE_PATTERN})\``, "gi");
+// eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- ISSUE_CLOSING_KEYWORDS and ISSUE_REFERENCE_PATTERN are intentional regex fragments (alternation and character classes), not user input
 const ISSUE_CLOSING_BOTH_BACKTICK_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)\`(\\s+)\`(${ISSUE_REFERENCE_PATTERN})\``, "gi");
+// eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- ISSUE_CLOSING_KEYWORDS and ISSUE_REFERENCE_PATTERN are intentional regex fragments (alternation and character classes), not user input
 const ISSUE_CLOSING_KEYWORD_BACKTICK_PATTERN = new RegExp(`\`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)\`(\\s+)(${ISSUE_REFERENCE_PATTERN})`, "gi");
+// eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- ISSUE_CLOSING_KEYWORDS and ISSUE_REFERENCE_PATTERN are intentional regex fragments (alternation and character classes), not user input
 const ISSUE_CLOSING_REFERENCE_BACKTICK_PATTERN = new RegExp(`(\\b(?:${ISSUE_CLOSING_KEYWORDS})\\b)(\\s+)\`(${ISSUE_REFERENCE_PATTERN})\``, "gi");
 const NORMALIZE_CLOSER_BODY_TYPES = new Set(["create_issue", "add_comment", "create_pull_request"]);
 const ISSUE_INTENT_LABEL_TYPES = new Set(["add_labels", "remove_labels", "update_issue"]);
@@ -86,6 +92,8 @@ function normalizeIssueIntentRationale(rationale, options) {
   const sanitizedRationale = sanitizeContent(unfenceMarkdown(rationale), {
     maxLength: ISSUE_INTENT_RATIONALE_MAX_LENGTH,
     allowedAliases: options?.allowedAliases || [],
+    maxMentions: options?.maxMentions,
+    allowedAliasesSeen: options?.allowedAliasesSeen,
     maxBotMentions: options?.maxBotMentions,
   }).trim();
   // sanitizeContent appends "\n[Content truncated due to length]" when it truncates,
@@ -112,6 +120,8 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
       const name = sanitizeContent(label, {
         maxLength: 128,
         allowedAliases: options?.allowedAliases || [],
+        maxMentions: options?.maxMentions,
+        allowedAliasesSeen: options?.allowedAliasesSeen,
         maxBotMentions: options?.maxBotMentions,
       });
       if (!name) {
@@ -145,6 +155,8 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
     const name = sanitizeContent(label.name, {
       maxLength: 128,
       allowedAliases: options?.allowedAliases || [],
+      maxMentions: options?.maxMentions,
+      allowedAliasesSeen: options?.allowedAliasesSeen,
       maxBotMentions: options?.maxBotMentions,
     });
     if (!name) {
@@ -197,6 +209,7 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
  * @property {number} [minLength] - Minimum length for strings
  * @property {boolean} [positiveInteger] - Must be a positive integer
  * @property {boolean} [optionalPositiveInteger] - Optional but if present must be positive integer
+ * @property {boolean} [allowAuto] - Allows "auto" for optional positive integer fields
  * @property {boolean} [issueOrPRNumber] - Can be issue/PR number or undefined
  * @property {boolean} [issueNumberOrTemporaryId] - Can be issue number or temporary ID
  * @property {string[]} [enum] - Allowed values for the field
@@ -205,6 +218,10 @@ function validateIssueIntentLabels(value, lineNum, itemType, fieldName, options)
  * @property {number} [itemMaxLength] - For arrays, max length per item
  * @property {string} [pattern] - Regex pattern the value must match
  * @property {string} [patternError] - Error message for pattern mismatch
+ * @property {boolean} [rejectIfOversized] - When true, reject the field outright (instead of
+ *   silently truncating via sanitizeContent) if the raw pre-sanitization value exceeds
+ *   maxLength. Used for external-system fields (e.g. Linear) where truncation could turn an
+ *   oversized/placeholder value into a deceptively short but "valid" operation.
  * @property {boolean} [x-strip-on-error] - When true, strip the field on validation failure
  *   instead of rejecting the whole item. Bracket access only (validation["x-strip-on-error"])
  *   because the key contains hyphens. Used for optional enrichment fields like confidence and rationale.
@@ -349,11 +366,28 @@ function validateOptionalPositiveInteger(value, fieldName, lineNum) {
 }
 
 /**
+ * Validate an optional positive integer or the "auto" sentinel.
+ * @param {any} value - Value to validate
+ * @param {string} fieldName - Field name for error messages
+ * @param {number} lineNum - Line number for error messages
+ * @returns {{isValid: boolean, normalizedValue?: number|string, error?: string}}
+ */
+function validateOptionalPositiveIntegerOrAuto(value, fieldName, lineNum) {
+  if (value === undefined || value === null) {
+    return { isValid: true };
+  }
+  if (typeof value === "string" && value.trim().toLowerCase() === "auto") {
+    return { isValid: true, normalizedValue: "auto" };
+  }
+  return validateOptionalPositiveInteger(value, fieldName, lineNum);
+}
+
+/**
  * Validate an issue/PR number field (optional, accepts number or string)
  * @param {any} value - Value to validate
  * @param {string} fieldName - Field name for error messages
  * @param {number} lineNum - Line number for error messages
- * @returns {{isValid: boolean, error?: string}}
+ * @returns {{isValid: boolean, normalizedValue?: number|string, error?: string}}
  */
 function validateIssueOrPRNumber(value, fieldName, lineNum) {
   if (value === undefined) {
@@ -365,7 +399,7 @@ function validateIssueOrPRNumber(value, fieldName, lineNum) {
       error: `Line ${lineNum}: ${fieldName} must be a number or string`,
     };
   }
-  return { isValid: true };
+  return { isValid: true, normalizedValue: value };
 }
 
 /**
@@ -445,12 +479,26 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
 
   // Handle optionalPositiveInteger validation
   if (validation.optionalPositiveInteger) {
+    if (validation.allowAuto) {
+      return validateOptionalPositiveIntegerOrAuto(value, `${itemType} '${fieldName}'`, lineNum);
+    }
     return validateOptionalPositiveInteger(value, `${itemType} '${fieldName}'`, lineNum);
   }
 
   // Handle issueOrPRNumber validation
   if (validation.issueOrPRNumber) {
     return validateIssueOrPRNumber(value, `${itemType} '${fieldName}'`, lineNum);
+  }
+
+  if (Array.isArray(validation.type)) {
+    const actualType = Array.isArray(value) ? "array" : typeof value;
+    if (!validation.type.includes(actualType)) {
+      return {
+        isValid: false,
+        error: `Line ${lineNum}: ${itemType} '${fieldName}' must be one of: ${validation.type.join(", ")}`,
+      };
+    }
+    return { isValid: true, normalizedValue: value };
   }
 
   // Handle type validation
@@ -508,10 +556,21 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
         normalizedResult = sanitizeContent(normalizedResult, {
           maxLength: validation.maxLength,
           allowedAliases: options?.allowedAliases || [],
+          maxMentions: options?.maxMentions,
+          allowedAliasesSeen: options?.allowedAliasesSeen,
           maxBotMentions: options?.maxBotMentions,
         });
       }
       return { isValid: true, normalizedValue: normalizedResult };
+    }
+
+    // Reject outright (instead of silently truncating) when configured, so an oversized
+    // raw value cannot be converted into a deceptively short but "valid" operation.
+    if (validation.rejectIfOversized && validation.maxLength && value.length > validation.maxLength) {
+      return {
+        isValid: false,
+        error: `Line ${lineNum}: ${itemType} '${fieldName}' exceeds maximum length (${validation.maxLength} characters)`,
+      };
     }
 
     // Handle sanitization
@@ -521,6 +580,8 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
       finalValue = sanitizeContent(unfenceMarkdown(value), {
         maxLength: validation.maxLength || MAX_BODY_LENGTH,
         allowedAliases: options?.allowedAliases || [],
+        maxMentions: options?.maxMentions,
+        allowedAliasesSeen: options?.allowedAliasesSeen,
         maxBotMentions: options?.maxBotMentions,
       });
     }
@@ -540,13 +601,28 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
   }
 
   if (validation.type === "array") {
-    // Backward compatibility: create_issue agents sometimes provide comma-separated labels as a string.
-    // Normalize this into a string array before strict array validation.
+    // Backward compatibility: create_issue agents sometimes provide labels as a JSON array
+    // or comma-separated string. Normalize either form before strict array validation.
     if (itemType === "create_issue" && fieldName === "labels" && typeof value === "string") {
-      value = value
-        .split(",")
-        .map(item => item.trim())
-        .filter(Boolean);
+      const trimmedValue = value.trim();
+      if (trimmedValue.startsWith("[")) {
+        try {
+          const parsedValue = JSON.parse(trimmedValue);
+          if (Array.isArray(parsedValue)) {
+            // Filter out non-string entries from the JSON-parsed array.
+            value = parsedValue.filter(item => typeof item === "string");
+          }
+          // Non-array JSON values (objects, primitives) fall through to comma-separated parsing.
+        } catch {
+          // Invalid JSON — ignored, fall back to comma-separated parsing below.
+        }
+      }
+      if (typeof value === "string") {
+        value = value
+          .split(",")
+          .map(item => item.trim())
+          .filter(Boolean);
+      }
     }
 
     if (!Array.isArray(value)) {
@@ -584,6 +660,8 @@ function validateField(value, fieldName, validation, itemType, lineNum, options)
             ? sanitizeContent(item, {
                 maxLength: validation.itemMaxLength || 128,
                 allowedAliases: options?.allowedAliases || [],
+                maxMentions: options?.maxMentions,
+                allowedAliasesSeen: options?.allowedAliasesSeen,
                 maxBotMentions: options?.maxBotMentions,
               })
             : item
@@ -688,7 +766,10 @@ function validateItem(item, itemType, lineNum, options) {
     return { isValid: true, normalizedItem: item };
   }
 
-  const normalizedItem = { ...item };
+  // Build the downstream payload from the declared contract. The raw item is
+  // agent-controlled, so forwarding undeclared fields would let consumers act
+  // on values that were never validated.
+  const normalizedItem = { type: item.type };
   const errors = [];
 
   // Run custom validation first if defined
@@ -699,10 +780,13 @@ function validateItem(item, itemType, lineNum, options) {
     }
   }
 
+  // Share mention state across every sanitized field in this output item.
+  const validationOptions = { ...options, allowedAliasesSeen: new Set() };
+
   // Validate each configured field
   for (const [fieldName, validation] of Object.entries(typeConfig.fields)) {
     const fieldValue = item[fieldName];
-    const result = validateField(fieldValue, fieldName, validation, itemType, lineNum, options);
+    const result = validateField(fieldValue, fieldName, validation, itemType, lineNum, validationOptions);
 
     if (!result.isValid) {
       // When x-strip-on-error is set, strip the invalid optional field instead of rejecting the item.
@@ -714,6 +798,14 @@ function validateItem(item, itemType, lineNum, options) {
       }
     } else if (result.normalizedValue !== undefined) {
       normalizedItem[fieldName] = result.normalizedValue;
+    } else if (fieldValue !== undefined) {
+      let validationKind = Object.keys(validation).sort().join(",") || "unspecified";
+      if (validation.type) {
+        const validationType = Array.isArray(validation.type) ? validation.type.join("|") : validation.type;
+        validationKind = `type=${validationType}`;
+      }
+      const fieldValueType = Array.isArray(fieldValue) ? "array" : typeof fieldValue;
+      errors.push(`Line ${lineNum}: ${itemType} '${fieldName}' validation (${validationKind}) accepted ${fieldValueType} but did not produce a normalized value`);
     }
   }
 
@@ -825,6 +917,7 @@ module.exports = {
   validateField,
   validatePositiveInteger,
   validateOptionalPositiveInteger,
+  validateOptionalPositiveIntegerOrAuto,
   validateIssueOrPRNumber,
   validateIssueNumberOrTemporaryId,
 

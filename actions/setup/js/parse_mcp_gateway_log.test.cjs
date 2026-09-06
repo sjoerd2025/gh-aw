@@ -1,6 +1,8 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const fs = require("fs");
+const path = require("path");
 const {
   generateGatewayLogSummary,
   generatePlainTextGatewaySummary,
@@ -12,12 +14,14 @@ const {
   generateTokenSteeringSummary,
   generateModelAliasResolutionSummary,
   parseRpcMessagesJsonl,
+  getRpcMessageType,
   getRpcRequestLabel,
   generateRpcMessagesSummary,
   printAllGatewayFiles,
   parseTokenUsageJsonl,
   generateTokenUsageSummary,
   formatDurationMs,
+  writeStepSummaryWithTokenUsage,
 } = require("./parse_mcp_gateway_log.cjs");
 
 describe("parse_mcp_gateway_log", () => {
@@ -768,6 +772,189 @@ Some content here.`;
       }
     });
 
+    test("does not false-positive ai_credits_rate_limit_error from rpc-messages.jsonl content with rate-limit branch names and ai-credits commit messages", async () => {
+      // Regression test: rpc-messages.jsonl contains MCP tool call responses that include
+      // arbitrary repository data (branch names, commit messages) which can contain keywords
+      // like "rate-limit" and "ai-credits". These must NOT be treated as real rate limit errors.
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
+      const rpcMessagesPath = path.join(tmpDir, "rpc-messages.jsonl");
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+
+      try {
+        // Simulate a list_branches MCP response with a branch that contains "rate-limit"
+        // followed later in the same response by a branch with "ai-credits" (pattern 2 match)
+        const branchesPayload = JSON.stringify({
+          timestamp: "2026-08-02T08:39:00Z",
+          event: "message",
+          direction: "IN",
+          server_id: "github",
+          payload: {
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify([
+                    { name: "schema-coverage-rate-limit-6dc5507939c41e8a", sha: "abc123" },
+                    { name: "signed/jsweep/ai-credits-context-5df6a8a73adbb3c8", sha: "def456" },
+                  ]),
+                },
+              ],
+            },
+          },
+        });
+        // Simulate a list_workflow_runs MCP response with a commit message containing both
+        // "AI credits" and "rate-limit" (pattern 1 match)
+        const runsPayload = JSON.stringify({
+          timestamp: "2026-08-02T08:42:00Z",
+          event: "message",
+          direction: "IN",
+          server_id: "github",
+          payload: {
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify([
+                    {
+                      id: 30740108209,
+                      head_commit: {
+                        message: "Fix AI credits throughput rate-limit errors being silently swallowed (#49360)",
+                      },
+                    },
+                  ]),
+                },
+              ],
+            },
+          },
+        });
+        fs.writeFileSync(rpcMessagesPath, [branchesPayload, runsPayload].join("\n"));
+
+        const mockCore = {
+          info: vi.fn(),
+          debug: vi.fn(),
+          startGroup: vi.fn(),
+          endGroup: vi.fn(),
+          notice: vi.fn(),
+          warning: vi.fn(),
+          error: vi.fn(),
+          setFailed: vi.fn(),
+          exportVariable: vi.fn(),
+          setOutput: vi.fn(),
+          summary: {
+            addRaw: vi.fn().mockReturnThis(),
+            addDetails: vi.fn().mockReturnThis(),
+            write: vi.fn(),
+          },
+        };
+
+        fs.existsSync = vi.fn(filepath => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") return true;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") return false;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.jsonl") return false;
+          return originalExistsSync(filepath);
+        });
+
+        fs.readFileSync = vi.fn((filepath, encoding) => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") {
+            return originalReadFileSync(rpcMessagesPath, encoding);
+          }
+          return originalReadFileSync(filepath, encoding);
+        });
+
+        global.core = mockCore;
+
+        const { main } = require("./parse_mcp_gateway_log.cjs");
+        await main();
+
+        // ai_credits_rate_limit_error must NOT be set to true from branch names / commit messages
+        const setOutputCalls = mockCore.setOutput.mock.calls;
+        const rateLimitCall = setOutputCalls.find(([name]) => name === "ai_credits_rate_limit_error");
+        expect(rateLimitCall).toBeDefined();
+        expect(rateLimitCall[1]).toBe("false");
+      } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        delete global.core;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("detects ai_credits_rate_limit_error from stderr.log even when rpc-messages.jsonl contains only false-positive-like content", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-test-"));
+      const rpcMessagesPath = path.join(tmpDir, "rpc-messages.jsonl");
+      const stderrLogPath = path.join(tmpDir, "stderr.log");
+      const originalExistsSync = fs.existsSync;
+      const originalReadFileSync = fs.readFileSync;
+
+      try {
+        const rpcPayload = JSON.stringify({
+          timestamp: "2026-08-02T08:39:00Z",
+          event: "message",
+          direction: "IN",
+          server_id: "github",
+          payload: {
+            result: {
+              content: [{ type: "text", text: JSON.stringify([{ name: "schema-coverage-rate-limit-abc123" }]) }],
+            },
+          },
+        });
+        fs.writeFileSync(rpcMessagesPath, rpcPayload);
+        fs.writeFileSync(stderrLogPath, "CAPIError: 429 Too Many Requests");
+
+        const mockCore = {
+          info: vi.fn(),
+          debug: vi.fn(),
+          startGroup: vi.fn(),
+          endGroup: vi.fn(),
+          notice: vi.fn(),
+          warning: vi.fn(),
+          error: vi.fn(),
+          setFailed: vi.fn(),
+          exportVariable: vi.fn(),
+          setOutput: vi.fn(),
+          summary: {
+            addRaw: vi.fn().mockReturnThis(),
+            addDetails: vi.fn().mockReturnThis(),
+            write: vi.fn(),
+          },
+        };
+
+        fs.existsSync = vi.fn(filepath => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") return true;
+          if (filepath === "/tmp/gh-aw/mcp-logs/stderr.log") return true;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.md") return false;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.jsonl") return false;
+          if (filepath === "/tmp/gh-aw/mcp-logs/gateway.log") return false;
+          return originalExistsSync(filepath);
+        });
+
+        fs.readFileSync = vi.fn((filepath, encoding) => {
+          if (filepath === "/tmp/gh-aw/mcp-logs/rpc-messages.jsonl") {
+            return originalReadFileSync(rpcMessagesPath, encoding);
+          }
+          if (filepath === "/tmp/gh-aw/mcp-logs/stderr.log") {
+            return originalReadFileSync(stderrLogPath, encoding);
+          }
+          return originalReadFileSync(filepath, encoding);
+        });
+
+        global.core = mockCore;
+        const { main } = require("./parse_mcp_gateway_log.cjs");
+        await main();
+
+        const setOutputCalls = mockCore.setOutput.mock.calls;
+        const rateLimitCall = setOutputCalls.find(([name]) => name === "ai_credits_rate_limit_error");
+        expect(rateLimitCall).toBeDefined();
+        expect(rateLimitCall[1]).toBe("true");
+      } finally {
+        fs.existsSync = originalExistsSync;
+        fs.readFileSync = originalReadFileSync;
+        delete global.core;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     test("calls setFailed when an unexpected error is thrown inside main", async () => {
       const originalExistsSync = fs.existsSync;
       const originalReadFileSync = fs.readFileSync;
@@ -1118,6 +1305,21 @@ Some content here.`;
       const events = parseGatewayJsonlForDifcFiltered(jsonlContent);
       expect(events).toHaveLength(2);
     });
+
+    test("extracts events using the schema rpc-message/v2 'event' field (no top-level type)", () => {
+      const jsonlContent = JSON.stringify({
+        timestamp: "2026-08-15T23:30:00Z",
+        event: "difc_filtered",
+        _schema: "rpc-message/v2",
+        server_id: "github",
+        tool_name: "list_issues",
+        reason: "Integrity check failed",
+      });
+
+      const events = parseGatewayJsonlForDifcFiltered(jsonlContent);
+      expect(events).toHaveLength(1);
+      expect(events[0].tool_name).toBe("list_issues");
+    });
   });
 
   describe("parseGatewayJsonlForTokenSteering", () => {
@@ -1435,6 +1637,60 @@ Some content here.`;
       expect(result.requests).toHaveLength(1);
       expect(result.other).toHaveLength(0);
     });
+
+    // Regression test for https://github.com/github/gh-aw/issues/53254: real-world
+    // rpc-messages.jsonl files (schema "rpc-message/v2") use a top-level "event" field
+    // ("rpc_request"/"rpc_response") instead of the legacy top-level "type" field.
+    test("categorizes entries using the schema rpc-message/v2 'event' field", () => {
+      const content = [
+        JSON.stringify({
+          timestamp: "2026-08-15T23:48:42.233Z",
+          event: "rpc_request",
+          _schema: "rpc-message/v2",
+          direction: "OUT",
+          server_id: "github",
+          method: "tools/call",
+          payload: { jsonrpc: "2.0", method: "tools/call", params: { name: "list_issues", arguments: {} } },
+        }),
+        JSON.stringify({
+          timestamp: "2026-08-15T23:48:42.400Z",
+          event: "rpc_response",
+          _schema: "rpc-message/v2",
+          direction: "IN",
+          server_id: "github",
+          payload: { jsonrpc: "2.0", id: 1, result: {} },
+        }),
+      ].join("\n");
+
+      const result = parseRpcMessagesJsonl(content);
+      expect(result.requests).toHaveLength(1);
+      expect(result.responses).toHaveLength(1);
+      expect(result.other).toHaveLength(0);
+      expect(result.requests[0].server_id).toBe("github");
+      expect(result.requests[0].type).toBe("REQUEST");
+    });
+  });
+
+  describe("getRpcMessageType", () => {
+    test("returns the legacy type field when present", () => {
+      expect(getRpcMessageType({ type: "REQUEST", event: "rpc_response" })).toBe("REQUEST");
+    });
+
+    test("maps rpc_request to REQUEST", () => {
+      expect(getRpcMessageType({ event: "rpc_request" })).toBe("REQUEST");
+    });
+
+    test("maps rpc_response to RESPONSE", () => {
+      expect(getRpcMessageType({ event: "rpc_response" })).toBe("RESPONSE");
+    });
+
+    test("maps difc_filtered to DIFC_FILTERED", () => {
+      expect(getRpcMessageType({ event: "difc_filtered" })).toBe("DIFC_FILTERED");
+    });
+
+    test("returns empty string when neither field is present", () => {
+      expect(getRpcMessageType({ server_id: "github" })).toBe("");
+    });
   });
 
   describe("getRpcRequestLabel", () => {
@@ -1584,6 +1840,395 @@ Some content here.`;
     test("returns null for empty content", () => {
       expect(parseTokenUsageJsonl("")).toBeNull();
       expect(parseTokenUsageJsonl("   \n  ")).toBeNull();
+    });
+
+    test("prefers the exact AWF-reported total from run 33157406852", () => {
+      const content = fs.readFileSync(path.join(__dirname, "fixtures", "awf-v0.28.7-aic-token-usage.jsonl"), "utf8");
+      const summary = parseTokenUsageJsonl(content);
+
+      expect(summary).not.toBeNull();
+      expect(summary.totalRequests).toBe(5);
+      expect(summary.totalInputTokens).toBe(39376);
+      expect(summary.totalCacheReadTokens).toBe(57984);
+      expect(summary.totalOutputTokens).toBe(175);
+      expect(summary.aiCreditsSource).toBe("awf_reported");
+      expect(summary.entries.map(entry => entry.deltaAIC)).toEqual([0.29142, 0.2928, 0.15018, 0.1506, 0.15102]);
+      expect(summary.totalAIC).toBe(1.03602);
+      expect(generateTokenUsageSummary(summary)).toContain("1.03602");
+    });
+
+    test("retains legacy recomputation when AWF-reported fields are absent", () => {
+      const content = fs
+        .readFileSync(path.join(__dirname, "fixtures", "awf-v0.28.7-aic-token-usage.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map(line => {
+          const record = JSON.parse(line);
+          delete record.ai_credits_this_response;
+          delete record.ai_credits_total;
+          return JSON.stringify(record);
+        })
+        .join("\n");
+      const summary = parseTokenUsageJsonl(content);
+
+      expect(summary.aiCreditsSource).toBe("recomputed");
+      expect(summary.totalAIC).toBeCloseTo(0.44538, 6);
+    });
+
+    test("falls back to legacy pricing and warns for malformed AWF-reported AIC fields", () => {
+      const content = JSON.stringify({
+        provider: "copilot",
+        model: "gpt-4o-mini-2024-07-18",
+        input_tokens: 19288,
+        output_tokens: 35,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        ai_credits_this_response: "0.29142",
+        ai_credits_total: -1,
+      });
+      const summary = parseTokenUsageJsonl(content);
+
+      expect(summary.aiCreditsSource).toBe("recomputed");
+      expect(summary.entries[0].deltaAIC).toBeCloseTo(0.29142, 6);
+      expect(summary.totalAIC).toBeCloseTo(0.29142, 6);
+      expect(summary.aiCreditsWarnings).toEqual([expect.stringContaining("1 token usage record(s)")]);
+      expect(generateTokenUsageSummary(summary)).toContain("Warning:");
+    });
+
+    test("treats null AWF-reported AIC fields as malformed rather than zero", () => {
+      const summary = parseTokenUsageJsonl(
+        JSON.stringify({
+          provider: "copilot",
+          model: "gpt-4o-mini-2024-07-18",
+          input_tokens: 19288,
+          output_tokens: 35,
+          cache_read_tokens: 0,
+          cache_write_tokens: 0,
+          ai_credits_this_response: null,
+          ai_credits_total: null,
+        })
+      );
+
+      expect(summary.aiCreditsSource).toBe("recomputed");
+      expect(summary.totalAIC).toBeCloseTo(0.29142, 6);
+      expect(summary.aiCreditsWarnings).toEqual([expect.stringContaining("fallback accounting")]);
+    });
+
+    test("extends the last valid AWF-reported total with fallback pricing when a later total is malformed", () => {
+      const records = fs
+        .readFileSync(path.join(__dirname, "fixtures", "awf-v0.28.7-aic-token-usage.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map(line => JSON.parse(line));
+      records.at(-1).ai_credits_total = "1.03602";
+      const summary = parseTokenUsageJsonl(records.map(record => JSON.stringify(record)).join("\n"));
+
+      expect(summary.aiCreditsSource).toBe("awf_reported");
+      expect(summary.entries.at(-1).deltaAIC).toBe(0.15102);
+      expect(summary.totalAIC).toBe(1.03602);
+      expect(summary.aiCreditsWarnings).toEqual([expect.stringContaining("1 token usage record(s)")]);
+    });
+
+    test("exports the exact AWF-reported total to the main job output", async () => {
+      const tokenUsagePath = "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl";
+      const content = fs.readFileSync(path.join(__dirname, "fixtures", "awf-v0.28.7-aic-token-usage.jsonl"), "utf8");
+      const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation(filePath => filePath === tokenUsagePath);
+      const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation((filePath, encoding) => {
+        if (filePath === tokenUsagePath) return content;
+        return "";
+      });
+      const coreObj = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        exportVariable: vi.fn(),
+        setOutput: vi.fn(),
+        summary: {
+          addRaw: vi.fn(),
+          write: vi.fn().mockResolvedValue(undefined),
+        },
+      };
+
+      try {
+        await writeStepSummaryWithTokenUsage(coreObj);
+      } finally {
+        existsSpy.mockRestore();
+        readSpy.mockRestore();
+      }
+
+      expect(coreObj.exportVariable).toHaveBeenCalledWith("GH_AW_AIC", "1.03602");
+      expect(coreObj.setOutput).toHaveBeenCalledWith("aic", "1.03602");
+      expect(coreObj.info).toHaveBeenCalledWith("AI Credits: 1.03602");
+    });
+
+    test.each([
+      [true, 0.018],
+      [false, 0.0255],
+    ])("propagates explicit input_tokens_include_cache=%s through legacy repricing", (inputTokensIncludeCache, expectedAIC) => {
+      const summary = parseTokenUsageJsonl(
+        JSON.stringify({
+          provider: "copilot",
+          model: "gpt-4o-mini-2024-07-18",
+          input_tokens: 1000,
+          output_tokens: 100,
+          cache_read_tokens: 400,
+          cache_write_tokens: 100,
+          input_tokens_include_cache: inputTokensIncludeCache,
+        })
+      );
+
+      expect(summary.entries[0].inputTokensIncludeCache).toBe(inputTokensIncludeCache);
+      expect(summary.entries[0].deltaAIC).toBeCloseTo(expectedAIC, 6);
+      expect(summary.totalAIC).toBeCloseTo(expectedAIC, 6);
+    });
+
+    test("distinguishes zero AWF-reported credits from absent fields", () => {
+      const summary = parseTokenUsageJsonl(
+        JSON.stringify({
+          provider: "copilot",
+          model: "gpt-4o-mini-2024-07-18",
+          input_tokens: 1000,
+          output_tokens: 100,
+          cache_read_tokens: 0,
+          cache_write_tokens: 0,
+          ai_credits_this_response: 0,
+          ai_credits_total: 0,
+        })
+      );
+
+      expect(summary.aiCreditsSource).toBe("awf_reported");
+      expect(summary.entries[0].deltaAIC).toBe(0);
+      expect(summary.totalAIC).toBe(0);
+      expect(summary.aiCreditsWarnings).toEqual([]);
+      expect(generateTokenUsageSummary(summary)).toContain("| **Total** | | **1,000** | **100** | **0** | **0** | | **0** |");
+    });
+
+    test("exports AWF-reported zero to the main job output", async () => {
+      const tokenUsagePath = "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl";
+      const content = JSON.stringify({
+        provider: "copilot",
+        model: "gpt-4o-mini-2024-07-18",
+        input_tokens: 1000,
+        output_tokens: 100,
+        ai_credits_this_response: 0,
+        ai_credits_total: 0,
+      });
+      const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation(filePath => filePath === tokenUsagePath);
+      const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(filePath => {
+        if (filePath === tokenUsagePath) return content;
+        return "";
+      });
+      const coreObj = {
+        debug: vi.fn(),
+        info: vi.fn(),
+        exportVariable: vi.fn(),
+        setOutput: vi.fn(),
+        summary: {
+          addRaw: vi.fn(),
+          write: vi.fn().mockResolvedValue(undefined),
+        },
+      };
+
+      try {
+        await writeStepSummaryWithTokenUsage(coreObj);
+      } finally {
+        existsSpy.mockRestore();
+        readSpy.mockRestore();
+      }
+
+      expect(coreObj.exportVariable).toHaveBeenCalledWith("GH_AW_AIC", "0");
+      expect(coreObj.setOutput).toHaveBeenCalledWith("aic", "0");
+      expect(coreObj.info).toHaveBeenCalledWith("AI Credits: 0");
+    });
+
+    test("aggregates AWF-reported credits by model without changing the run total", () => {
+      const content = [
+        {
+          model: "gpt-4o-mini",
+          provider: "copilot",
+          input_tokens: 10,
+          output_tokens: 1,
+          ai_credits_this_response: 0.2,
+          ai_credits_total: 0.2,
+        },
+        {
+          model: "claude-sonnet-4-6",
+          provider: "copilot",
+          input_tokens: 20,
+          output_tokens: 2,
+          ai_credits_this_response: 0.8,
+          ai_credits_total: 1,
+        },
+      ]
+        .map(record => JSON.stringify(record))
+        .join("\n");
+
+      const summary = parseTokenUsageJsonl(content);
+
+      expect(summary.byModel["gpt-4o-mini"].aic).toBe(0.2);
+      expect(summary.byModel["claude-sonnet-4-6"].aic).toBe(0.8);
+      expect(summary.totalAIC).toBe(1);
+    });
+
+    test("keeps model names such as __proto__ as data without polluting object prototypes", () => {
+      const summary = parseTokenUsageJsonl(
+        JSON.stringify({
+          model: "__proto__",
+          provider: "copilot",
+          input_tokens: 10,
+          output_tokens: 1,
+          ai_credits_this_response: 0.1,
+          ai_credits_total: 0.1,
+        })
+      );
+
+      expect(Object.getPrototypeOf(summary.byModel)).toBeNull();
+      expect(summary.byModel["__proto__"].aic).toBe(0.1);
+      expect(Object.prototype).not.toHaveProperty("aic");
+    });
+
+    test("deduplicates repeated request IDs before aggregating reported credits", () => {
+      const record = {
+        request_id: "same-request",
+        model: "gpt-4o-mini",
+        provider: "copilot",
+        input_tokens: 10,
+        output_tokens: 1,
+        ai_credits_this_response: 0.2,
+        ai_credits_total: 0.2,
+      };
+      const summary = parseTokenUsageJsonl(`${JSON.stringify(record)}\n${JSON.stringify(record)}\n`);
+
+      expect(summary.totalRequests).toBe(1);
+      expect(summary.totalInputTokens).toBe(10);
+      expect(summary.byModel["gpt-4o-mini"].aic).toBe(0.2);
+      expect(summary.totalAIC).toBe(0.2);
+      expect(summary.aiCreditsWarnings).toEqual([expect.stringContaining("1 duplicate token usage record(s)")]);
+    });
+
+    test("warns and uses legacy provider semantics for invalid input_tokens_include_cache", () => {
+      const summary = parseTokenUsageJsonl(
+        JSON.stringify({
+          provider: "copilot",
+          model: "gpt-4o-mini-2024-07-18",
+          input_tokens: 1000,
+          output_tokens: 100,
+          cache_read_tokens: 400,
+          cache_write_tokens: 100,
+          input_tokens_include_cache: "invalid",
+        })
+      );
+
+      expect(summary.totalAIC).toBeCloseTo(0.0195, 6);
+      expect(summary.aiCreditsWarnings).toEqual([expect.stringContaining("invalid input_tokens_include_cache")]);
+    });
+
+    test("does not warn for invalid input_tokens_include_cache when AWF delta is valid", () => {
+      const summary = parseTokenUsageJsonl(
+        JSON.stringify({
+          provider: "copilot",
+          model: "gpt-4o-mini-2024-07-18",
+          input_tokens: 1000,
+          output_tokens: 100,
+          cache_read_tokens: 400,
+          cache_write_tokens: 100,
+          input_tokens_include_cache: "invalid",
+          ai_credits_this_response: 0.123,
+          ai_credits_total: 0.123,
+        })
+      );
+
+      expect(summary.totalAIC).toBe(0.123);
+      expect(summary.aiCreditsWarnings).toEqual([]);
+    });
+
+    test("uses the chronologically last valid AWF-reported total", () => {
+      const content = [
+        {
+          timestamp: "2026-08-28T09:00:02Z",
+          request_id: "third",
+          model: "gpt-4o-mini",
+          provider: "copilot",
+          input_tokens: 300,
+          output_tokens: 1,
+          ai_credits_this_response: 1,
+          ai_credits_total: 3,
+        },
+        {
+          timestamp: "2026-08-28T09:00:00Z",
+          request_id: "first",
+          model: "gpt-4o-mini",
+          provider: "copilot",
+          input_tokens: 100,
+          output_tokens: 1,
+          ai_credits_this_response: 1,
+          ai_credits_total: 1,
+        },
+        {
+          timestamp: "2026-08-28T09:00:01Z",
+          request_id: "second",
+          model: "gpt-4o-mini",
+          provider: "copilot",
+          input_tokens: 200,
+          output_tokens: 1,
+          ai_credits_this_response: 1,
+          ai_credits_total: 2,
+        },
+      ]
+        .map(record => JSON.stringify(record))
+        .join("\n");
+
+      const summary = parseTokenUsageJsonl(content);
+
+      expect(summary.entries.map(entry => entry.runningAIC)).toEqual([1, 2, 3]);
+      expect(summary.totalAIC).toBe(3);
+      expect(summary.ambientContextTokens).toBe(100);
+      expect(summary.aiCreditsWarnings).toEqual([]);
+    });
+
+    test("warns when AWF cumulative and per-request reported credits diverge", () => {
+      const content = [
+        {
+          request_id: "one",
+          model: "gpt-4o-mini",
+          provider: "copilot",
+          input_tokens: 1,
+          output_tokens: 1,
+          ai_credits_this_response: 0.2,
+          ai_credits_total: 0.2,
+        },
+        {
+          request_id: "two",
+          model: "gpt-4o-mini",
+          provider: "copilot",
+          input_tokens: 1,
+          output_tokens: 1,
+          ai_credits_this_response: 0.8,
+          ai_credits_total: 0.9,
+        },
+      ]
+        .map(record => JSON.stringify(record))
+        .join("\n");
+
+      const summary = parseTokenUsageJsonl(content);
+
+      expect(summary.totalAIC).toBe(0.9);
+      expect(summary.aiCreditsWarnings).toEqual([expect.stringContaining("differs from the sum")]);
+    });
+
+    test("keeps large AWF-reported totals compact in the human-readable table", () => {
+      const summary = parseTokenUsageJsonl(
+        JSON.stringify({
+          request_id: "large",
+          model: "gpt-4o-mini",
+          provider: "copilot",
+          input_tokens: 1,
+          output_tokens: 1,
+          ai_credits_this_response: 1234.56789,
+          ai_credits_total: 1234.56789,
+        })
+      );
+
+      expect(generateTokenUsageSummary(summary)).toContain("| 1.2K | 1.2K |");
     });
 
     test("parses a single entry and aggregates totals", () => {

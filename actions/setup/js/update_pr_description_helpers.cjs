@@ -10,6 +10,8 @@
 const { assembleMarkdownBodyParts, buildGeneratedFooter } = require("./markdown_body_helpers.cjs");
 const { generateWorkflowIdMarker } = require("./generate_footer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
+const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
+const { generateHistoryUrl } = require("./generate_history_link.cjs");
 
 /**
  * Build the AI footer with workflow attribution
@@ -97,6 +99,7 @@ function updateBody(params) {
   // When footer is enabled use the full footer (includes install instructions, XML marker, etc.)
   // When footer is disabled still add standalone workflow-id marker for searchability
   const aiFooter = includeFooter ? buildAIFooter(workflowName, runUrl, historyUrl) : "";
+  const footerSection = aiFooter ? `\n\n${aiFooter}` : "";
   const workflowIdMarker = !includeFooter && workflowId ? `\n\n${generateWorkflowIdMarker(workflowId)}` : "";
 
   // Sanitize new content to prevent injection attacks
@@ -113,7 +116,7 @@ function updateBody(params) {
   if (operation === "replace") {
     // Replace: use new content with optional AI footer
     core.info("Operation: replace (full body replacement)");
-    return contentWithCaution + aiFooter + workflowIdMarker;
+    return contentWithCaution + footerSection + workflowIdMarker;
   }
 
   if (operation === "replace-island") {
@@ -121,7 +124,7 @@ function updateBody(params) {
     const island = findIsland(currentBody, workflowId);
     const startMarker = buildIslandStartMarker(workflowId);
     const endMarker = buildIslandEndMarker(workflowId);
-    const islandContent = `${startMarker}\n${contentWithCaution}${aiFooter}${workflowIdMarker}\n${endMarker}`;
+    const islandContent = `${startMarker}\n${contentWithCaution}${footerSection}${workflowIdMarker}\n${endMarker}`;
 
     if (island.found) {
       // Replace the island content
@@ -139,18 +142,58 @@ function updateBody(params) {
   if (operation === "prepend") {
     // Prepend: add content, AI footer (if enabled), and horizontal line at the start
     core.info("Operation: prepend (add to start with separator)");
-    const prependSection = `${contentWithCaution}${aiFooter}${workflowIdMarker}\n\n---\n\n`;
+    const prependSection = `${contentWithCaution}${footerSection}${workflowIdMarker}\n\n---\n\n`;
     return prependSection + currentBody;
   }
 
   // Default to append
   core.info("Operation: append (add to end with separator)");
-  const appendSection = `\n\n---\n\n${contentWithCaution}${aiFooter}${workflowIdMarker}`;
+  const appendSection = `\n\n---\n\n${contentWithCaution}${footerSection}${workflowIdMarker}`;
   return currentBody + appendSection;
+}
+
+/**
+ * Build an updated entity body with workflow attribution.
+ * @param {Object} params - Body update parameters
+ * @param {any} params.context - GitHub Actions context for the target repository
+ * @param {string} params.currentBody - Current body content
+ * @param {string} params.newContent - New content to add or replace
+ * @param {string} params.operation - Body update operation
+ * @param {boolean} params.includeFooter - Whether to include the generated footer
+ * @param {any} [params.workflowRepo] - Original workflow repository for run attribution
+ * @param {"issue" | "pull_request"} params.itemType - Updated entity type
+ * @returns {string} Updated body content
+ */
+function buildUpdatedBody({ context, currentBody, newContent, operation, includeFooter, workflowRepo, itemType }) {
+  const workflowName = process.env.GH_AW_WORKFLOW_NAME || "GitHub Agentic Workflow";
+  const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
+  const workflowCallId = process.env.GH_AW_CALLER_WORKFLOW_ID || "";
+  const runUrl = buildWorkflowRunUrl(context, workflowRepo || context.repo);
+  const historyUrl =
+    generateHistoryUrl({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      itemType,
+      workflowCallId,
+      workflowId,
+      serverUrl: context.serverUrl,
+    }) || undefined;
+
+  return updateBody({
+    currentBody,
+    newContent,
+    operation,
+    workflowName,
+    runUrl,
+    workflowId,
+    includeFooter,
+    historyUrl,
+  });
 }
 
 module.exports = {
   buildAIFooter,
+  buildUpdatedBody,
   buildIslandStartMarker,
   buildIslandEndMarker,
   findIsland,

@@ -15,39 +15,12 @@ import (
 )
 
 var gitutilLog = logger.New("gitutil:gitutil")
-var ErrNotGitRepository = errors.New("not in a git repository")
+var ErrNotGitRepository = errors.New("not in a git repository (run this command from inside a git repository, or use 'git init' to create one)")
+var osGetwd = os.Getwd
+var osUserHomeDir = os.UserHomeDir
 
 var fullSHARegex = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var gitObjectIDRegex = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
-
-// IsRateLimitError checks if an error message indicates a GitHub API rate limit error.
-// This is used to detect transient failures caused by hitting the GitHub API rate limit
-// (HTTP 403 "API rate limit exceeded" or HTTP 429 responses).
-func IsRateLimitError(errMsg string) bool {
-	lowerMsg := strings.ToLower(errMsg)
-	return strings.Contains(lowerMsg, "api rate limit exceeded") ||
-		strings.Contains(lowerMsg, "rate limit exceeded") ||
-		strings.Contains(lowerMsg, "secondary rate limit")
-}
-
-// IsAuthError checks if an error message indicates an authentication issue.
-// This is used to detect when GitHub API calls fail due to missing or invalid credentials.
-func IsAuthError(errMsg string) bool {
-	gitutilLog.Printf("Checking if error is auth-related: %s", errMsg)
-	lowerMsg := strings.ToLower(errMsg)
-	isAuth := strings.Contains(lowerMsg, "gh_token") ||
-		strings.Contains(lowerMsg, "github_token") ||
-		strings.Contains(lowerMsg, "authentication") ||
-		strings.Contains(lowerMsg, "not logged into") ||
-		strings.Contains(lowerMsg, "unauthorized") ||
-		strings.Contains(lowerMsg, "forbidden") ||
-		strings.Contains(lowerMsg, "permission denied") ||
-		strings.Contains(lowerMsg, "saml enforcement")
-	if isAuth {
-		gitutilLog.Print("Detected authentication error")
-	}
-	return isAuth
-}
 
 // IsHexString checks if a string contains only hexadecimal characters.
 // This is used to validate Git commit SHAs and other hexadecimal identifiers.
@@ -66,6 +39,11 @@ func IsHexString(s string) bool {
 // IsValidFullSHA checks if s is a valid 40-character lowercase hexadecimal SHA.
 func IsValidFullSHA(s string) bool {
 	return fullSHARegex.MatchString(s)
+}
+
+// IsValidFullSHACaseInsensitive checks if s is a valid 40-character hexadecimal SHA.
+func IsValidFullSHACaseInsensitive(s string) bool {
+	return len(s) == 40 && IsHexString(s)
 }
 
 // ValidateGitRef returns an error if ref would be unsafe to pass as a positional
@@ -115,9 +93,35 @@ func ValidateGitPath(path string) error {
 func ExtractBaseRepo(repoPath string) string {
 	parts := strings.Split(repoPath, "/")
 	if len(parts) >= 2 {
-		return parts[0] + "/" + parts[1]
+		// Intentionally strings.Join instead of filepath.Join/path.Join: those
+		// helpers Clean the result, collapsing segments like ".." or "." that
+		// must be preserved verbatim here (repoPath is an owner/repo slug, not
+		// a filesystem path).
+		return strings.Join(parts[:2], "/")
 	}
 	return repoPath
+}
+
+// Getwd returns the current working directory. Unlike calling os.Getwd()
+// directly, the returned error includes actionable recovery guidance so
+// call sites do not need to duplicate their own wrapping message.
+func Getwd() (string, error) {
+	dir, err := osGetwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to determine current working directory: %w; check that the process has a valid working directory and read permissions", err)
+	}
+	return dir, nil
+}
+
+// UserHomeDir returns the current user's home directory. Unlike calling
+// os.UserHomeDir() directly, the returned error includes actionable recovery
+// guidance so call sites do not need to duplicate their own wrapping message.
+func UserHomeDir() (string, error) {
+	home, err := osUserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to determine home directory: %w; set HOME (Unix) or USERPROFILE/HOMEDRIVE/HOMEPATH (Windows), or run this command as a user with a valid home directory", err)
+	}
+	return home, nil
 }
 
 // FindGitRoot finds the root directory of the git repository.
@@ -128,10 +132,10 @@ func ExtractBaseRepo(repoPath string) string {
 func FindGitRoot() (string, error) {
 	gitutilLog.Print("Finding git root directory")
 
-	dir, err := os.Getwd()
+	dir, err := Getwd()
 	if err != nil {
 		gitutilLog.Printf("Failed to get current directory: %v", err)
-		return "", fmt.Errorf("failed to get current directory: %w", err)
+		return "", err
 	}
 
 	root, err := FindGitRootFrom(dir)

@@ -30,12 +30,17 @@ imports:
   - shared/reporting.md
 tools:
   github:
-    mode: gh-proxy
+    mode: local
   cli-proxy: true
 
+evals:
+  - id: project_activity_analyzed
+    question: Did the agent analyze recent gh-aw project activity for the daily status report?
+  - id: status_report_created
+    question: Did the agent create a daily status report with relevant project updates?
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 ---
 
 <!--

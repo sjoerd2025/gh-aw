@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test that validates OTEL span export and query access for Sentry, Grafana, and Datadog
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-otel-backends
     strategy: centralized
@@ -19,9 +20,8 @@ permissions:
   pull-requests: read
 name: Smoke OTEL
 engine:
-  id: copilot
-  max-continuations: 1
-  bare: true
+  id: codex
+model: copilot/gpt-5.3-codex
 strict: true
 tools:
   bash: true
@@ -45,8 +45,12 @@ imports:
   - shared/sentry.md
   - shared/grafana.md
   - shared/datadog.md
+  - shared/reporting.md
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke OTEL
@@ -110,7 +114,6 @@ echo "OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:+set}"
 echo "OTEL_EXPORTER_OTLP_HEADERS=${OTEL_EXPORTER_OTLP_HEADERS:+set}"
 echo "GH_AW_OTLP_ENDPOINTS=${GH_AW_OTLP_ENDPOINTS:+set}"
 echo "OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-}"
-echo "COPILOT_OTEL_FILE_EXPORTER_PATH=${COPILOT_OTEL_FILE_EXPORTER_PATH:-}"
 
 echo "=== OTEL configured backend hosts ==="
 if [ -n "${GH_AW_OTLP_ENDPOINTS:-}" ]; then

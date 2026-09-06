@@ -16,6 +16,7 @@ package workflow
 import (
 	"slices"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/sliceutil"
 )
@@ -30,7 +31,10 @@ const (
 	SandboxTypeDefault SandboxType = "default" // Alias for AWF (backward compat)
 )
 
-const defaultAgentWorkspaceWritePath = "/tmp/gh-aw/agent"
+const (
+	defaultAgentWorkspaceWritePath = "/tmp/gh-aw/agent"
+	defaultAgentLogsWritePath      = "/tmp/gh-aw/sandbox/agent/logs"
+)
 
 // SandboxConfig represents the top-level sandbox configuration from front matter
 // New format: { agent: "awf"|"srt"|{type, config}, mcp: {port, command, ...} }
@@ -49,37 +53,53 @@ type SandboxConfig struct {
 type AgentRuntime string
 
 const (
+	// AgentRuntimeDocker is the default runtime: Docker with a rootless AWF and
+	// network isolation. It is also the profile used when runtime is omitted.
+	AgentRuntimeDocker AgentRuntime = "docker"
+
+	// AgentRuntimeDockerSudoIptables runs Docker with a privileged AWF, legacy
+	// iptables networking, and host/service access. It is the only profile where
+	// sandbox.agent.allow-host-ports and GitHub Actions services: connectivity apply.
+	AgentRuntimeDockerSudoIptables AgentRuntime = "docker-sudo-iptables"
+
 	// AgentRuntimeGVisor runs the agent container under gVisor's runsc runtime for
-	// additional kernel-level isolation. Requires root access for installation.
+	// additional kernel-level isolation. The compiler emits the privileged
+	// host-level installation steps that runsc requires.
 	AgentRuntimeGVisor AgentRuntime = "gvisor"
 
 	// AgentRuntimeDockerSbx runs the agent inside a Docker sbx microVM with
 	// hypervisor-level isolation (KVM). Infrastructure containers (Squid proxy,
 	// api-proxy, MCP gateway) remain on the host in Docker Compose.
-	// Requires sudo: true and a KVM-capable runner with DOCKER_PAT / DOCKER_USERNAME secrets.
+	// The compiler emits the required privileged setup steps; the runner must be
+	// KVM-capable and provide DOCKER_PAT / DOCKER_USERNAME secrets.
 	AgentRuntimeDockerSbx AgentRuntime = "docker-sbx"
+
+	// AgentRuntimeCloudHypervisor runs the agent inside a Cloud Hypervisor microVM
+	// using AWF's preview cloud-hypervisor runtime mode.
+	AgentRuntimeCloudHypervisor AgentRuntime = "cloud-hypervisor"
 )
 
 // AgentSandboxConfig represents the agent sandbox configuration
 type AgentSandboxConfig struct {
-	ID                    string                                `yaml:"id,omitempty"`             // Agent ID: "awf" or "srt" (replaces Type in new object format)
-	Type                  SandboxType                           `yaml:"type,omitempty"`           // Sandbox type: "awf" or "srt" (legacy, use ID instead)
-	Version               string                                `yaml:"version,omitempty"`        // AWF version override used to install and run the matching firewall version
-	Platform              string                                `yaml:"platform,omitempty"`       // AWF platform.type override (github.com, ghes, ghec, ghec-self-hosted)
-	Runtime               AgentRuntime                          `yaml:"runtime,omitempty"`        // Container runtime for the agent container (e.g., "gvisor")
-	NetworkIsolation      bool                                  `yaml:"sudo,omitempty"`           // Internal: true = isolation mode (AWF --network-isolation). Frontmatter sudo: false (or omitted) maps to NetworkIsolation=true; sudo: true maps to NetworkIsolation=false.
-	SudoExplicitlyEnabled bool                                  `yaml:"-"`                        // True when sudo: true was explicitly set in frontmatter. Used to emit an error (strict) or warning (non-strict) at compile time.
-	LegacySecurity        bool                                  `yaml:"-"`                        // True when legacy-security: enable was set in frontmatter. Enables sudo, host-access, and iptables-based mode.
-	Disabled              bool                                  `yaml:"-"`                        // True when agent is explicitly set to false (disables firewall). This is a runtime flag, not serialized to YAML.
-	DisableReason         string                                `yaml:"-"`                        // Operator-authored justification from dangerously-disable-sandbox-agent feature; available for diagnostics and audit logging.
-	Config                *SandboxRuntimeConfig                 `yaml:"config,omitempty"`         // Custom SRT config (optional)
-	Command               string                                `yaml:"command,omitempty"`        // Custom command to replace AWF or SRT installation
-	Args                  []string                              `yaml:"args,omitempty"`           // Additional arguments to append to the command
-	Env                   map[string]string                     `yaml:"env,omitempty"`            // Environment variables to set on the step
-	Mounts                []string                              `yaml:"mounts,omitempty"`         // Container mounts to add for AWF (format: "source:dest:mode")
-	Memory                string                                `yaml:"memory,omitempty"`         // Memory limit for the AWF container (e.g., "4g", "8g")
-	ModelFallback         *TemplatableBool                      `yaml:"model-fallback,omitempty"` // AWF API proxy model fallback enable/disable flag (optional)
-	Targets               map[string]*AgentAPIProxyTargetConfig `yaml:"targets,omitempty"`        // Per-provider API proxy target overrides keyed by provider name (e.g. "openai", "anthropic")
+	ID             string                                `yaml:"id,omitempty"`              // Agent ID: "awf" or "srt" (replaces Type in new object format)
+	Type           SandboxType                           `yaml:"type,omitempty"`            // Sandbox type: "awf" or "srt" (legacy, use ID instead)
+	Version        string                                `yaml:"version,omitempty"`         // AWF version override used to install and run the matching firewall version
+	Platform       string                                `yaml:"platform,omitempty"`        // AWF platform.type override (github.com, ghes, ghec, ghec-self-hosted)
+	Runtime        AgentRuntime                          `yaml:"runtime,omitempty"`         // Sandbox runtime profile for the agent container (see sandbox_runtime_profile.go)
+	AllowHostPorts []int                                 `yaml:"-"`                         // Additional host TCP ports the agent may connect to (docker-sudo-iptables only).
+	Disabled       bool                                  `yaml:"-"`                         // True when agent is explicitly set to false (disables firewall). This is a runtime flag, not serialized to YAML.
+	Config         *SandboxRuntimeConfig                 `yaml:"config,omitempty"`          // Custom SRT config (optional)
+	Command        string                                `yaml:"command,omitempty"`         // Custom command to replace AWF or SRT installation
+	Args           []string                              `yaml:"args,omitempty"`            // Additional arguments to append to the command
+	Env            map[string]string                     `yaml:"env,omitempty"`             // Environment variables to set on the step
+	Mounts         []string                              `yaml:"mounts,omitempty"`          // Container mounts to add for AWF (format: "source:dest:mode")
+	Memory         string                                `yaml:"memory,omitempty"`          // Memory limit for the AWF container (e.g., "4g", "8g")
+	ModelFallback  *TemplatableBool                      `yaml:"model-fallback,omitempty"`  // AWF API proxy model fallback enable/disable flag (optional)
+	TokenSteering  *bool                                 `yaml:"token-steering,omitempty"`  // AWF API proxy token steering enable/disable flag (optional)
+	Targets        map[string]*AgentAPIProxyTargetConfig `yaml:"targets,omitempty"`         // Per-provider API proxy target overrides keyed by provider name (e.g. "openai", "anthropic")
+	RuntimeInstall *bool                                 `yaml:"runtime-install,omitempty"` // Controls generation of runtime installation steps (gVisor/docker-sbx). Default: true. Noop when runtime is not set.
+	Images         map[string]string                     `yaml:"images,omitempty"`          // Digest-pinned AWF infrastructure images keyed by AWF image role (see sandbox_agent_images.go)
+	CACert         string                                `yaml:"ca-cert,omitempty"`         // Host path to an additional CA certificate for API proxy upstream TLS verification (maps to apiProxy.caCert, AWF v0.28.10+)
 }
 
 // AiCreditsPricingConfig holds per-token pricing rates ($/1M tokens) used as a fallback
@@ -227,11 +247,10 @@ func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConf
 		sandboxLog.Print("No sandbox config found, creating default with agent: awf")
 		sandboxConfig = &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				Type:             SandboxTypeAWF,
-				NetworkIsolation: true, // Default: sudo: false (network isolation enabled)
+				Type: SandboxTypeAWF,
 			},
 		}
-		ensureDefaultAgentWritePath(sandboxConfig)
+		ensureDefaultAgentWritePath(sandboxConfig, engineConfig)
 		return sandboxConfig
 	}
 
@@ -239,7 +258,7 @@ func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConf
 	// The legacy Type field indicates explicit sandbox configuration
 	if sandboxConfig.Type != "" {
 		sandboxLog.Printf("Sandbox config uses legacy Type field: %s, preserving it", sandboxConfig.Type)
-		ensureDefaultAgentWritePath(sandboxConfig)
+		ensureDefaultAgentWritePath(sandboxConfig, engineConfig)
 		return sandboxConfig
 	}
 
@@ -247,10 +266,9 @@ func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConf
 	if sandboxConfig.Agent == nil {
 		sandboxLog.Print("Sandbox config exists without agent, setting default agent: awf")
 		sandboxConfig.Agent = &AgentSandboxConfig{
-			Type:             SandboxTypeAWF,
-			NetworkIsolation: true, // Default: sudo: false (network isolation enabled)
+			Type: SandboxTypeAWF,
 		}
-		ensureDefaultAgentWritePath(sandboxConfig)
+		ensureDefaultAgentWritePath(sandboxConfig, engineConfig)
 		return sandboxConfig
 	}
 
@@ -265,18 +283,38 @@ func applySandboxDefaults(sandboxConfig *SandboxConfig, engineConfig *EngineConf
 		sandboxConfig.Agent.Type = SandboxTypeAWF
 	}
 
-	// Apply the default sudo: false (network isolation) when sudo was not explicitly
-	// set to true in frontmatter. This ensures network isolation is the default.
-	if !sandboxConfig.Agent.SudoExplicitlyEnabled {
-		sandboxConfig.Agent.NetworkIsolation = true
-	}
-
-	ensureDefaultAgentWritePath(sandboxConfig)
+	ensureDefaultAgentWritePath(sandboxConfig, engineConfig)
 	return sandboxConfig
 }
 
-func ensureDefaultAgentWritePath(sandboxConfig *SandboxConfig) {
+// Cloud Hypervisor requires explicit filesystem.allowWrite entries for compiler-managed
+// output paths as well as the workspace.
+//
+// Under Cloud Hypervisor, /workspace and /tmp/gh-aw are separate virtiofs exports, and the
+// AWF planner narrows each export independently based on the allowWrite entries that fall
+// under it. Seeding only defaultAgentWorkspaceWritePath (/tmp/gh-aw/agent) leaves no allowed
+// path under /workspace, so that export is narrowed to read-only: the repo checkout becomes
+// unwritable, and HOME (which Cloud Hypervisor sets to /workspace/.awf-home) becomes
+// unwritable too. See gh-aw-firewall#7669/#7672 and the "Blocker 1" analysis on the tracking
+// issue for the empirical planner output that demonstrated this.
+const cloudHypervisorWorkspaceWritePath = "/workspace"
+const cloudHypervisorAwfHomeWritePath = "/workspace/.awf-home"
+
+// ensureDefaultAgentWritePath seeds the implicit filesystem.allowWrite entries for the
+// Cloud Hypervisor runtime only.
+//
+// The compose runtimes (Docker, gVisor) deliberately get no implicit allowWrite entries:
+// AWF enforces the policy there by narrowing its own writable bind mounts to read-only,
+// which turns the container rootfs read-only outside the allowlist. AWF's init-signal
+// bind mount at /tmp/awf-init then cannot have its mountpoint created and the agent
+// container fails to start ("make mountpoint \"/tmp/awf-init\": read-only file system").
+// Seeding a default there would therefore break every compose-runtime workflow, so
+// filesystem.allowWrite stays opt-in for those runtimes.
+func ensureDefaultAgentWritePath(sandboxConfig *SandboxConfig, engineConfig *EngineConfig) {
 	if sandboxConfig == nil || sandboxConfig.Agent == nil {
+		return
+	}
+	if sandboxConfig.Agent.Runtime != AgentRuntimeCloudHypervisor {
 		return
 	}
 	if sandboxConfig.Agent.Config == nil {
@@ -285,13 +323,65 @@ func ensureDefaultAgentWritePath(sandboxConfig *SandboxConfig) {
 	if sandboxConfig.Agent.Config.Filesystem == nil {
 		sandboxConfig.Agent.Config.Filesystem = &SRTFilesystemConfig{}
 	}
-	if slices.Contains(sandboxConfig.Agent.Config.Filesystem.AllowWrite, defaultAgentWorkspaceWritePath) {
+	addAllowWritePathIfMissing(sandboxConfig.Agent.Config.Filesystem, defaultAgentWorkspaceWritePath)
+	if engineConfig != nil && engineConfig.ID == string(constants.CopilotEngine) {
+		addAllowWritePathIfMissing(sandboxConfig.Agent.Config.Filesystem, defaultAgentLogsWritePath)
+	}
+	if engineConfig != nil && engineConfig.ID == string(constants.CodexEngine) {
+		// Codex writes runtime state under CODEX_HOME.
+		addAllowWritePathIfMissing(sandboxConfig.Agent.Config.Filesystem, constants.TmpMcpConfigDir)
+	}
+	addAllowWritePathIfMissing(sandboxConfig.Agent.Config.Filesystem, cloudHypervisorWorkspaceWritePath)
+	addAllowWritePathIfMissing(sandboxConfig.Agent.Config.Filesystem, cloudHypervisorAwfHomeWritePath)
+}
+
+// ensureCacheMemoryWritePaths adds compiler-provisioned cache directories to the
+// Cloud Hypervisor write policy. cacheMemoryDirFor is also used to grant engine
+// write tools, keeping both permission surfaces aligned.
+func ensureCacheMemoryWritePaths(sandboxConfig *SandboxConfig, cacheMemoryConfig *CacheMemoryConfig) {
+	if cacheMemoryConfig == nil || sandboxConfig == nil || sandboxConfig.Agent == nil ||
+		sandboxConfig.Agent.Runtime != AgentRuntimeCloudHypervisor {
 		return
 	}
-	sandboxConfig.Agent.Config.Filesystem.AllowWrite = append(
-		sandboxConfig.Agent.Config.Filesystem.AllowWrite,
-		defaultAgentWorkspaceWritePath,
-	)
+	if sandboxConfig.Agent.Config == nil {
+		sandboxConfig.Agent.Config = &SandboxRuntimeConfig{}
+	}
+	if sandboxConfig.Agent.Config.Filesystem == nil {
+		sandboxConfig.Agent.Config.Filesystem = &SRTFilesystemConfig{}
+	}
+	for _, cache := range cacheMemoryConfig.Caches {
+		addAllowWritePathIfMissing(sandboxConfig.Agent.Config.Filesystem, cacheMemoryDirFor(cache.ID))
+	}
+}
+
+// ensureRepoMemoryWritePaths adds compiler-provisioned repo-memory directories to the
+// Cloud Hypervisor write policy. Wiki memories are stored in the same RepoMemoryConfig
+// and share the /tmp/gh-aw/repo-memory/<id> layout. Without these entries the
+// /tmp/gh-aw export is narrowed to read-only outside the allowlist, so the agent cannot
+// write to the cloned memory working tree (writes fail with EROFS) and the repo-memory
+// push job has nothing to commit.
+func ensureRepoMemoryWritePaths(sandboxConfig *SandboxConfig, repoMemoryConfig *RepoMemoryConfig) {
+	if repoMemoryConfig == nil || sandboxConfig == nil || sandboxConfig.Agent == nil ||
+		sandboxConfig.Agent.Runtime != AgentRuntimeCloudHypervisor {
+		return
+	}
+	if sandboxConfig.Agent.Config == nil {
+		sandboxConfig.Agent.Config = &SandboxRuntimeConfig{}
+	}
+	if sandboxConfig.Agent.Config.Filesystem == nil {
+		sandboxConfig.Agent.Config.Filesystem = &SRTFilesystemConfig{}
+	}
+	for _, memory := range repoMemoryConfig.Memories {
+		addAllowWritePathIfMissing(sandboxConfig.Agent.Config.Filesystem, constants.TmpRepoMemoryDir+memory.ID)
+	}
+}
+
+// addAllowWritePathIfMissing appends path to filesystem.AllowWrite unless it is already present.
+func addAllowWritePathIfMissing(filesystem *SRTFilesystemConfig, path string) {
+	if slices.Contains(filesystem.AllowWrite, path) {
+		return
+	}
+	filesystem.AllowWrite = append(filesystem.AllowWrite, path)
 }
 
 func mergeImportedSandboxAgentMounts(sandboxConfig *SandboxConfig, importedMounts []string) *SandboxConfig {
@@ -312,6 +402,28 @@ func mergeImportedSandboxAgentMounts(sandboxConfig *SandboxConfig, importedMount
 	}
 
 	sandboxConfig.Agent.Mounts = sliceutil.MergeUnique(importedMounts, sandboxConfig.Agent.Mounts...)
+	return sandboxConfig
+}
+
+// mergeImportedSandboxAgentRuntimeInstall applies the runtime-install override
+// from imported workflows. When any import sets runtime-install: false the main
+// workflow's agent config inherits false (the restrictive value wins). A nil value
+// (field not set in any import) leaves the main workflow's own setting intact.
+func mergeImportedSandboxAgentRuntimeInstall(sandboxConfig *SandboxConfig, importedRuntimeInstall *bool) *SandboxConfig {
+	if importedRuntimeInstall == nil {
+		return sandboxConfig
+	}
+	if sandboxConfig == nil {
+		sandboxConfig = &SandboxConfig{}
+	}
+	if sandboxConfig.Agent == nil {
+		sandboxConfig.Agent = &AgentSandboxConfig{}
+	}
+	// Only apply when the imported value is false (restrictive wins) or when the
+	// main workflow has not explicitly set the field.
+	if !*importedRuntimeInstall || sandboxConfig.Agent.RuntimeInstall == nil {
+		sandboxConfig.Agent.RuntimeInstall = importedRuntimeInstall
+	}
 	return sandboxConfig
 }
 

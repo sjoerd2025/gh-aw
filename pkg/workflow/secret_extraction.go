@@ -135,7 +135,12 @@ func ExtractEnvExpressionsFromMap(values map[string]string) map[string]string {
 
 	for _, value := range values {
 		envVars := ExtractEnvExpressionsFromValue(value)
-		maps.Copy(allEnvVars, envVars)
+		for varName, envExpr := range envVars {
+			existingExpr, exists := allEnvVars[varName]
+			if !exists || (!strings.Contains(existingExpr, "||") && strings.Contains(envExpr, "||")) {
+				allEnvVars[varName] = envExpr
+			}
+		}
 	}
 
 	secretLog.Printf("Extracted total of %d unique env expressions from map", len(allEnvVars))
@@ -146,6 +151,21 @@ func ExtractEnvExpressionsFromMap(values map[string]string) map[string]string {
 // Example: "${{ secrets.DD_API_KEY }}" -> "\${DD_API_KEY}"
 // The backslash is used to escape the ${} for proper JSON rendering in Copilot configs
 func ReplaceSecretsWithEnvVars(value string, secrets map[string]string) string {
+	// Replace ${{ secrets.VAR }} with \${VAR} (backslash-escaped for copilot JSON config)
+	return replaceSecretsWithPrefixedEnvVars(value, secrets, "\\${")
+}
+
+// ReplaceSecretsWithShellEnvVars replaces secret expressions in a value with plain shell
+// environment variable references, without the backslash escape used for JSON configs.
+// Example: "${{ secrets.DD_API_KEY }}" -> "${DD_API_KEY}"
+// This is used for TOML configs written through an expanding heredoc, so the shell resolves
+// the value from the step's env mapping instead of the secret being interpolated directly
+// into the run block (RGS-008).
+func ReplaceSecretsWithShellEnvVars(value string, secrets map[string]string) string {
+	return replaceSecretsWithPrefixedEnvVars(value, secrets, "${")
+}
+
+func replaceSecretsWithPrefixedEnvVars(value string, secrets map[string]string, prefix string) string {
 	result := value
 	// Sort keys for deterministic output. When multiple secret names share the same
 	// expression (e.g. "${{ secrets.DD_APPLICATION_KEY || secrets.DD_APP_KEY }}" maps
@@ -154,27 +174,48 @@ func ReplaceSecretsWithEnvVars(value string, secrets map[string]string) string {
 	// already replaced and are no-ops. This ensures stable lock-file output across runs.
 	for _, varName := range sliceutil.SortedKeys(secrets) {
 		secretExpr := secrets[varName]
-		// Replace ${{ secrets.VAR }} with \${VAR} (backslash-escaped for copilot JSON config)
-		result = strings.ReplaceAll(result, secretExpr, "\\${"+varName+"}")
+		result = strings.ReplaceAll(result, secretExpr, prefix+varName+"}")
 	}
 	return result
 }
 
-// ReplaceSecretsWithBashVars replaces secret expressions in a value with bash env var references.
-// Example: "${{ secrets.DD_API_KEY }}" -> "${DD_API_KEY}"
-// Unlike ReplaceSecretsWithEnvVars, this does NOT add a backslash prefix, so bash expands
-// the variable at runtime. Used for non-Copilot MCP server env blocks where the step env block
-// already holds the corresponding env vars (injected by collectMCPEnvironmentVariables),
-// preventing direct secret interpolation in run blocks (RGS-008 compliance).
-func ReplaceSecretsWithBashVars(value string) string {
-	result := value
-	secrets := ExtractSecretsFromValue(value)
-	// Sort keys for deterministic output; see ReplaceSecretsWithEnvVars for rationale.
-	for _, varName := range sliceutil.SortedKeys(secrets) {
-		secretExpr := secrets[varName]
-		result = strings.ReplaceAll(result, secretExpr, "${"+varName+"}")
+// replaceEnvExpressionsWithPrefixedEnvVars replaces each GitHub Actions env
+// expression occurrence with a shell environment variable reference using the
+// provided prefix (for example, "${" for TOML or "\${" for escaped JSON).
+// Example: "${{ env.SENTRY_HOST || 'sentry.io' }}" -> "${SENTRY_HOST}".
+func replaceEnvExpressionsWithPrefixedEnvVars(value string, prefix string) string {
+	var result strings.Builder
+	start := 0
+	for {
+		startIdx := strings.Index(value[start:], "${{ env.")
+		if startIdx == -1 {
+			result.WriteString(value[start:])
+			break
+		}
+		startIdx += start
+		endIdx := strings.Index(value[startIdx:], "}}")
+		if endIdx == -1 {
+			result.WriteString(value[start:])
+			break
+		}
+		endIdx += startIdx + 2
+		fullExpr := value[startIdx:endIdx]
+		envPart := strings.TrimPrefix(fullExpr, "${{ env.")
+		envPart = strings.TrimSuffix(envPart, "}}")
+		envPart = strings.TrimSpace(envPart)
+		varName := envPart
+		if spaceIdx := strings.IndexAny(varName, " |"); spaceIdx != -1 {
+			varName = varName[:spaceIdx]
+		}
+		result.WriteString(value[start:startIdx])
+		if varName != "" {
+			result.WriteString(prefix + varName + "}")
+		} else {
+			result.WriteString(fullExpr)
+		}
+		start = endIdx
 	}
-	return result
+	return result.String()
 }
 
 // ExtractEnvExpressionsFromValue extracts all GitHub Actions env expressions from a string value
@@ -217,7 +258,10 @@ func ExtractEnvExpressionsFromValue(value string) map[string]string {
 
 		// Store the variable name and full expression
 		if varName != "" {
-			envExpressions[varName] = fullExpr
+			existingExpr, exists := envExpressions[varName]
+			if !exists || (!strings.Contains(existingExpr, "||") && strings.Contains(fullExpr, "||")) {
+				envExpressions[varName] = fullExpr
+			}
 			secretLog.Printf("Extracted env expression: %s", varName)
 		}
 
@@ -363,12 +407,7 @@ func ReplaceTemplateExpressionsWithEnvVars(value string) string {
 		result = strings.ReplaceAll(result, secretExpr, "\\${"+varName+"}")
 	}
 
-	// Extract and replace env vars — sort keys for deterministic output.
-	envVars := ExtractEnvExpressionsFromValue(value)
-	for _, varName := range sliceutil.SortedKeys(envVars) {
-		envExpr := envVars[varName]
-		result = strings.ReplaceAll(result, envExpr, "\\${"+varName+"}")
-	}
+	result = replaceEnvExpressionsWithPrefixedEnvVars(result, "\\${")
 
 	// Replace github.workspace with GITHUB_WORKSPACE env var
 	result = strings.ReplaceAll(result, "${{ github.workspace }}", "\\${GITHUB_WORKSPACE}")

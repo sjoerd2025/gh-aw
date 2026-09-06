@@ -22,8 +22,9 @@ For workflows that **persist state across runs** — deduplication, incremental 
 | Baselines that must survive cache expiry (e.g. security findings, dedup lists) | `repo-memory` |
 | Human-readable wiki pages for knowledge accumulation | `repo-memory` with `wiki: true` |
 | Persist notes/state inline on the triggering issue or PR | `comment-memory` |
+| Private-preview GitHub Drives backend (enrolled repos only) | `drive-memory` — see [drive-memory.md](drive-memory.md) |
 
-**Default to `cache-memory` unless you have a specific reason to use `repo-memory`.**
+**Default to `cache-memory` unless you have a specific reason to use `repo-memory`.** Do not suggest `drive-memory` unless the repository is confirmed enrolled in the GitHub Drives private preview.
 
 ---
 
@@ -90,6 +91,20 @@ tools:
     - id: results
       key: results-${{ github.run_id }}
       retention-days: 14
+```
+
+### Custom validation
+
+For domain-specific constraints beyond `allowed-extensions` (schema checks, cross-file uniqueness, timestamp policies), add `validation.script` — a Node.js script body (globals: `fs`, `path`, `memoryRoot`, `memoryId`, `memoryKind`) run over the memory directory after agent execution and before persistence. Throwing, returning `false`, timing out, or exiting nonzero rejects the save. Default timeout 1 minute (`validation.timeout-minutes`, max 5). Same mechanism for `repo-memory`. See [cache-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/cache-memory.md#custom-validation) and [repo-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/repo-memory.md#custom-validation).
+
+```yaml
+tools:
+  cache-memory:
+    validation:
+      timeout-minutes: 1
+      script: |
+        const index = JSON.parse(fs.readFileSync(path.join(memoryRoot, "index.json"), "utf8"));
+        if (!Array.isArray(index.entries)) throw new Error("index.json entries must be an array");
 ```
 
 ### Storage path

@@ -4,6 +4,7 @@ emoji: "🧪"
 name: Smoke Call Workflow
 description: Smoke test for the call-workflow safe output - orchestrator that calls a worker via workflow_call at compile-time fan-out
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-call-workflow
     strategy: centralized
@@ -35,6 +36,10 @@ tools:
   cli-proxy: true
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
+    id: awf
 ---
 
 # Smoke Test: Call Workflow Orchestrator

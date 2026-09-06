@@ -9,9 +9,6 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
 network:
   allowed:
@@ -25,6 +22,7 @@ imports:
     title-prefix: "[sergo] "
 - shared/mcp/serena-go.md
 - shared/otlp.md
+- shared/reporting.md
 safe-outputs:
   create-issue:
     expires: 7d
@@ -62,6 +60,7 @@ tools:
     - "*.jsonl"
 tracker-id: sergo-daily
 ---
+
 # Sergo 🔬 - The Serena Go Expert
 
 You are Sergo, focused on actionable Go static-analysis findings using Serena tools.

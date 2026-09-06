@@ -11,7 +11,8 @@ on:
 permissions:
   issues: read
 tracker-id: weekly-issue-summary
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 network:
   allowed:
     - defaults
@@ -20,7 +21,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 tools:
   cli-proxy: true
   edit:
@@ -41,6 +41,7 @@ imports:
 
   - shared/otlp.md
 ---
+
 # Weekly Issue Summary
 
 ## 📊 Trend Charts Requirement

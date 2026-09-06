@@ -17,10 +17,10 @@ var compilerYamlHeaderLog = logger.New("workflow:compiler_yaml:header")
 // for description, source, imports/includes, frontmatter-hash, stop-time, and manual-approval.
 // All ANSI escape codes are stripped from the output.
 // The gh-aw-metadata line is placed first for easy machine parsing.
-func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowData, frontmatterHash string, bodyHash string, secrets []string, actions []string) {
+func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowData, frontmatterHash string, bodyHash string, secrets []string, actions []string) error {
 	// Skip the ASCII art banner in wasm/editor mode — it takes up too much space
 	if c.skipHeader {
-		return
+		return nil
 	}
 
 	// Add lock metadata as the very first line for easy machine parsing.
@@ -37,14 +37,18 @@ func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowD
 		if data.Model != "" {
 			agentInfo.AgentModel = data.Model
 		}
+		if agentInfo.AgentID == "copilot" {
+			agentInfo.EngineBaseURLCustomized = isCopilotCustomConfig(data)
+		}
 		// Detection agent info: only if threat detection has its own engine config
 		if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil && data.SafeOutputs.ThreatDetection.EngineConfig != nil {
 			agentInfo.DetectionAgentID = data.SafeOutputs.ThreatDetection.EngineConfig.ID
 			agentInfo.DetectionAgentModel = data.SafeOutputs.ThreatDetection.Model
 		}
-		agentInfo.EngineVersions = collectEngineVersionsForMetadata(data)
+		agentInfo.EngineVersions = collectEngineVersionsForMetadata(data, c.engineRegistry)
 		agentInfo.AgentImageRunner = resolveAgentImageRunnerIdentifier(data.RawFrontmatter)
 		metadata := GenerateLockMetadata(LockHashInfo{FrontmatterHash: frontmatterHash, BodyHash: bodyHash}, data.StopTime, c.effectiveStrictMode(data.RawFrontmatter), agentInfo)
+		metadata.Docs = data.Docs
 		if metadata.CompilerVersion == "" && c.GetActionTag() != "" {
 			metadata.CompilerVersion = c.GetVersion()
 		}
@@ -61,7 +65,18 @@ func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowD
 	// The manifest records all secrets, external actions, container images, and frontmatter
 	// skills detected at compile time so that subsequent compilations can perform safe update
 	// enforcement.
-	manifest := NewGHAWManifest(secrets, actions, data.ActionResolutionFailures, data.DockerImagePins, data.Redirect, data.Skills, data.RawFrontmatter["on"])
+	manifest := NewGHAWManifest(secrets, actions, data.ActionResolutionFailures, data.DockerImagePins, data.Redirect, data.Skills, data.Plugins, data.RawFrontmatter["on"])
+	if data.ParsedFrontmatter != nil {
+		manifest.ThreatDetectionSuppressions = data.ParsedFrontmatter.ThreatDetectionSuppressions
+	} else {
+		suppressions, err := parseThreatDetectionSuppressions(data.RawFrontmatter["threat-detection-suppress"])
+		if err != nil {
+			return fmt.Errorf("threat-detection-suppress value is not recognized, expected a list of suppression identifiers: %w", err)
+		}
+		manifest.ThreatDetectionSuppressions = suppressions
+	}
+	manifest.MemoryValidationScripts = collectMemoryValidationScripts(data)
+	manifest.MCPServers = collectMCPServersForManifest(data)
 	if manifestJSON, err := manifest.ToJSON(); err == nil {
 		fmt.Fprintf(yaml, "# gh-aw-manifest: %s\n", manifestJSON)
 	} else {
@@ -83,6 +98,25 @@ func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowD
 		descriptionLines := strings.SplitSeq(strings.TrimSpace(cleanDescription), "\n")
 		for line := range descriptionLines {
 			fmt.Fprintf(yaml, "# %s\n", strings.TrimSpace(line))
+		}
+	}
+
+	// Add intent comment if provided
+	if data.Intent != "" {
+		if data.Description != "" {
+			yaml.WriteString("#\n")
+		}
+		cleanIntent := stringutil.StripANSI(data.Intent)
+		intentLines := strings.SplitSeq(strings.TrimSpace(cleanIntent), "\n")
+		first := true
+		for line := range intentLines {
+			if first {
+				fmt.Fprintf(yaml, "# Intent: %s\n", strings.TrimSpace(line))
+				first = false
+				continue
+			}
+			// Indent continuation lines so they stay visually attached to the intent block
+			fmt.Fprintf(yaml, "#         %s\n", strings.TrimSpace(line))
 		}
 	}
 
@@ -135,7 +169,6 @@ func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowD
 		yaml.WriteString("#\n")
 		yaml.WriteString("# inlined-imports: true\n")
 	}
-
 	// Add frontmatter-declared env vars with source attribution.
 	// Note: programmatically injected env vars (e.g. OTEL_* from OTLP config) are not listed here.
 	if len(data.EnvSources) > 0 {
@@ -190,4 +223,5 @@ func (c *Compiler) generateWorkflowHeader(yaml *strings.Builder, data *WorkflowD
 	}
 
 	yaml.WriteString("\n")
+	return nil
 }

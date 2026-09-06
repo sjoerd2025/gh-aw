@@ -297,11 +297,11 @@ func TestClaudeEngineComputeAllowedTools(t *testing.T) {
 			expected: "Bash,BashOutput,ExitPlanMode,Glob,Grep,KillBash,LS,NotebookRead,Read,Task,TodoWrite",
 		},
 		{
-			name: "neutral playwright tool",
+			name: "neutral playwright CLI tool does not add MCP permissions",
 			tools: map[string]any{
 				"playwright": nil,
 			},
-			expected: "ExitPlanMode,Glob,Grep,LS,NotebookRead,Read,Task,TodoWrite,mcp__playwright__browser_click,mcp__playwright__browser_close,mcp__playwright__browser_console_messages,mcp__playwright__browser_drag,mcp__playwright__browser_evaluate,mcp__playwright__browser_file_upload,mcp__playwright__browser_fill_form,mcp__playwright__browser_handle_dialog,mcp__playwright__browser_hover,mcp__playwright__browser_install,mcp__playwright__browser_navigate,mcp__playwright__browser_navigate_back,mcp__playwright__browser_network_requests,mcp__playwright__browser_press_key,mcp__playwright__browser_resize,mcp__playwright__browser_select_option,mcp__playwright__browser_snapshot,mcp__playwright__browser_tabs,mcp__playwright__browser_take_screenshot,mcp__playwright__browser_type,mcp__playwright__browser_wait_for",
+			expected: "ExitPlanMode,Glob,Grep,LS,NotebookRead,Read,Task,TodoWrite",
 		},
 		// Wildcard normalization tests - "cmd *" should normalize to "Bash(cmd)"
 		{
@@ -333,7 +333,7 @@ func TestClaudeEngineComputeAllowedTools(t *testing.T) {
 			// Extract cache-memory config from tools if present
 			compiler := NewCompiler()
 			cacheMemoryConfig, _ := compiler.extractCacheMemoryConfigFromMap(tt.tools)
-			result := engine.computeAllowedClaudeToolsString(tt.tools, nil, cacheMemoryConfig, nil, nil)
+			result := engine.computeAllowedClaudeToolsString(tt.tools, nil, cacheMemoryConfig, nil, nil, nil)
 
 			// Parse expected and actual results into sets for comparison
 			expectedTools := make(map[string]struct{})
@@ -384,7 +384,7 @@ func TestClaudeEngineComputeAllowedToolsDeduplicatesNormalizedBashEntries(t *tes
 		t.Fatalf("extract cache-memory config: %v", err)
 	}
 
-	result := engine.computeAllowedClaudeToolsString(tools, nil, cacheMemoryConfig, nil, nil)
+	result := engine.computeAllowedClaudeToolsString(tools, nil, cacheMemoryConfig, nil, nil, nil)
 	expected := "Bash(jq),BashOutput,ExitPlanMode,Glob,Grep,KillBash,LS,NotebookRead,Read,Task,TodoWrite"
 	if result != expected {
 		t.Fatalf("unexpected allowed tools\nwant: %s\ngot:  %s", expected, result)
@@ -472,7 +472,7 @@ func TestClaudeEngineComputeAllowedToolsWithSafeOutputs(t *testing.T) {
 			// Extract cache-memory config from tools if present
 			compiler := NewCompiler()
 			cacheMemoryConfig, _ := compiler.extractCacheMemoryConfigFromMap(tt.tools)
-			result := engine.computeAllowedClaudeToolsString(tt.tools, tt.safeOutputs, cacheMemoryConfig, nil, nil)
+			result := engine.computeAllowedClaudeToolsString(tt.tools, tt.safeOutputs, cacheMemoryConfig, nil, nil, nil)
 
 			// Split both expected and result into slices and check each tool is present
 			expectedTools := strings.Split(tt.expected, ",")
@@ -512,6 +512,7 @@ func TestClaudeEngineComputeAllowedToolsWithSandboxAllowWrite(t *testing.T) {
 
 	sandboxConfig := &SandboxConfig{
 		Agent: &AgentSandboxConfig{
+			Runtime: AgentRuntimeCloudHypervisor,
 			Config: &SandboxRuntimeConfig{
 				Filesystem: &SRTFilesystemConfig{
 					AllowWrite: []string{"/tmp"},
@@ -520,10 +521,37 @@ func TestClaudeEngineComputeAllowedToolsWithSandboxAllowWrite(t *testing.T) {
 		},
 	}
 
-	got := engine.computeAllowedClaudeToolsString(map[string]any{}, nil, cacheMemoryConfig, nil, sandboxConfig)
+	got := engine.computeAllowedClaudeToolsString(map[string]any{}, nil, cacheMemoryConfig, nil, nil, sandboxConfig)
 	want := "Edit(/tmp/*),ExitPlanMode,Glob,Grep,LS,MultiEdit(/tmp/*),NotebookRead,Read,Read(/tmp/*),Task,TodoWrite,Write(/tmp/*)"
 	if got != want {
 		t.Fatalf("unexpected allowed tools\nwant: %s\ngot:  %s", want, got)
+	}
+}
+
+func TestClaudeEngineSandboxAllowWriteNarrowsDefaultTmpAccess(t *testing.T) {
+	engine := NewClaudeEngine()
+	cacheMemoryConfig, err := NewCompiler().extractCacheMemoryConfigFromMap(map[string]any{})
+	if err != nil {
+		t.Fatalf("extract cache-memory config: %v", err)
+	}
+
+	sandboxConfig := &SandboxConfig{
+		Agent: &AgentSandboxConfig{
+			Runtime: AgentRuntimeCloudHypervisor,
+			Config: &SandboxRuntimeConfig{
+				Filesystem: &SRTFilesystemConfig{
+					AllowWrite: []string{"/workspace"},
+				},
+			},
+		},
+	}
+
+	got := engine.computeAllowedClaudeToolsString(map[string]any{}, nil, cacheMemoryConfig, nil, nil, sandboxConfig)
+	if !strings.Contains(got, "Write(/workspace/*)") {
+		t.Fatalf("expected workspace write permission in %q", got)
+	}
+	if strings.Contains(got, "Write(/tmp/*)") {
+		t.Fatalf("unexpected broad tmp write permission in %q", got)
 	}
 }
 
@@ -540,7 +568,7 @@ func TestClaudeEngineAddsTmpByDefault(t *testing.T) {
 		},
 	}
 
-	got := engine.computeAllowedClaudeToolsString(map[string]any{}, nil, cacheMemoryConfig, nil, sandboxConfig)
+	got := engine.computeAllowedClaudeToolsString(map[string]any{}, nil, cacheMemoryConfig, nil, nil, sandboxConfig)
 	want := "Edit(/tmp/*),ExitPlanMode,Glob,Grep,LS,MultiEdit(/tmp/*),NotebookRead,Read,Read(/tmp/*),Task,TodoWrite,Write(/tmp/*)"
 	if got != want {
 		t.Fatalf("unexpected allowed tools\nwant: %s\ngot:  %s", want, got)

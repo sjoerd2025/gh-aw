@@ -12,9 +12,6 @@ permissions:
   # Note: PR write operations handled via safe-outputs
   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 engine:
   id: copilot
@@ -23,10 +20,11 @@ max-tool-denials: 3
 strict: true
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [pull_requests, repos]
   bash:
     - "jq *"
@@ -48,6 +46,9 @@ evals:
     question: Did the workflow review open draft pull requests and classify stale drafts according to the warning and cleanup policy?
   - id: warnings-or-closures-applied
     question: Were the expected labels, comments, and closures applied to stale draft pull requests when appropriate?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Draft PR Cleanup Agent 🧹
@@ -174,8 +175,6 @@ For each PR classified as "Ready to Close":
 **Note**: The `stale-draft` label should already be present from the warning phase, but if it's missing, add it.
 
 ### Step 6: Generate Summary Report
-
-**Report Formatting**: Use h3 (###) or lower for all headers in the report. Wrap long sections (>10 items) in `<details><summary>Section Name</summary>` tags to improve readability.
 
 Create a summary of actions taken:
 

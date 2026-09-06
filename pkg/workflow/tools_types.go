@@ -1,6 +1,8 @@
 package workflow
 
 import (
+	"encoding/json"
+	"fmt"
 	"maps"
 	"strings"
 
@@ -76,6 +78,7 @@ type ToolsConfig struct {
 	Playwright       *PlaywrightToolConfig       `yaml:"playwright,omitempty"`
 	AgenticWorkflows *AgenticWorkflowsToolConfig `yaml:"agentic-workflows,omitempty"`
 	CacheMemory      *CacheMemoryToolConfig      `yaml:"cache-memory,omitempty"`
+	DriveMemory      *DriveMemoryToolConfig      `yaml:"drive-memory,omitempty"`
 	CommentMemory    *CommentMemoryToolConfig    `yaml:"comment-memory,omitempty"`
 	RepoMemory       *RepoMemoryToolConfig       `yaml:"repo-memory,omitempty"`
 	Timeout          *TemplatableInt32           `yaml:"timeout,omitempty"`
@@ -107,6 +110,9 @@ type Tools = ToolsConfig
 func ParseToolsConfig(toolsMap map[string]any) (*ToolsConfig, error) {
 	toolsTypesLog.Printf("Parsing tools configuration: tool_count=%d", len(toolsMap))
 	config := NewTools(toolsMap)
+	if config.GitHub != nil && config.GitHub.reposParseErr != nil {
+		return nil, config.GitHub.reposParseErr
+	}
 	toolNames := config.GetToolNames()
 	toolsTypesLog.Printf("Parsed tools configuration: result_count=%d, tools=%v", len(toolNames), toolNames)
 	return config, nil
@@ -177,7 +183,7 @@ func mcpServerConfigToMap(config MCPServerConfig) map[string]any {
 
 // ToMap converts the ToolsConfig back to a map[string]any for backward compatibility.
 // This is useful when interfacing with legacy code that expects map[string]any.
-func (t *ToolsConfig) ToMap() map[string]any {
+func (t *ToolsConfig) ToMap() map[string]any { //nolint:largefunc // Existing conversion preserves backwards-compatible map shape.
 	if t == nil {
 		toolsTypesLog.Print("Converting nil ToolsConfig to empty map")
 		return make(map[string]any)
@@ -216,6 +222,9 @@ func (t *ToolsConfig) ToMap() map[string]any {
 	}
 	if t.CacheMemory != nil {
 		result["cache-memory"] = t.CacheMemory.Raw
+	}
+	if t.DriveMemory != nil {
+		result["drive-memory"] = t.DriveMemory.Raw
 	}
 	if t.CommentMemory != nil {
 		result["comment-memory"] = t.CommentMemory.Raw
@@ -299,7 +308,56 @@ const (
 
 // GitHubReposScope represents the repository scope for guard policy enforcement
 // Can be one of: "all", "public", or an array of repository patterns
-type GitHubReposScope any // string or []any (YAML-parsed arrays are []any)
+type GitHubReposScope []string
+
+func parseGitHubReposScope(value any) (GitHubReposScope, error) {
+	switch repos := value.(type) {
+	case string:
+		return GitHubReposScope{repos}, nil
+	case []string:
+		return GitHubReposScope(repos), nil
+	case []any:
+		result := make(GitHubReposScope, 0, len(repos))
+		for _, repo := range repos {
+			value, ok := repo.(string)
+			if !ok {
+				return nil, fmt.Errorf("repository scope entries must be strings, got %T", repo)
+			}
+			result = append(result, value)
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("repository scope must be a string or array of strings, got %T", value)
+	}
+}
+
+// UnmarshalYAML normalizes scalar and array repository scopes to a string slice.
+func (s *GitHubReposScope) UnmarshalYAML(unmarshal func(any) error) error {
+	var value any
+	if err := unmarshal(&value); err != nil {
+		return err
+	}
+	scope, err := parseGitHubReposScope(value)
+	if err != nil {
+		return err
+	}
+	*s = scope
+	return nil
+}
+
+// UnmarshalJSON normalizes scalar and array repository scopes to a string slice.
+func (s *GitHubReposScope) UnmarshalJSON(data []byte) error {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	scope, err := parseGitHubReposScope(value)
+	if err != nil {
+		return err
+	}
+	*s = scope
+	return nil
+}
 
 // GitHubToolConfig represents the configuration for the GitHub tool
 // Can be nil (enabled with defaults), string, or an object with specific settings
@@ -320,7 +378,8 @@ type GitHubToolConfig struct {
 	// Supports: "all", "public", or an array of patterns ["owner/repo", "owner/*"] (lowercase)
 	AllowedRepos GitHubReposScope `yaml:"allowed-repos,omitempty"`
 	// Repos is deprecated. Use AllowedRepos (yaml:"allowed-repos") instead.
-	Repos GitHubReposScope `yaml:"repos,omitempty"`
+	Repos         GitHubReposScope `yaml:"repos,omitempty"`
+	reposParseErr error
 	// MinIntegrity defines the minimum integrity level required: "none", "unapproved", "approved", "merged"
 	MinIntegrity GitHubIntegrityLevel `yaml:"min-integrity,omitempty"`
 	// BlockedUsers is an optional list of GitHub usernames whose content is unconditionally blocked.
@@ -360,12 +419,12 @@ type GitHubToolConfig struct {
 	// DisapprovalIntegrity is the integrity level assigned when a disapproval reaction is present.
 	// Optional, defaults to "none". Requires integrity-reactions feature flag and MCPG >= v0.2.18.
 	// Valid values: "none", "unapproved", "approved", "merged"
-	DisapprovalIntegrity string `yaml:"disapproval-integrity,omitempty"`
+	DisapprovalIntegrity GitHubIntegrityLevel `yaml:"disapproval-integrity,omitempty"`
 	// EndorserMinIntegrity is the minimum integrity level required for an endorser (reactor) to
 	// promote content. Optional, defaults to "approved". Requires integrity-reactions feature flag
 	// and MCPG >= v0.2.18.
 	// Valid values: "approved", "unapproved", "merged"
-	EndorserMinIntegrity string `yaml:"endorser-min-integrity,omitempty"`
+	EndorserMinIntegrity GitHubIntegrityLevel `yaml:"endorser-min-integrity,omitempty"`
 	// PrivateToPublicFlows opts out of cross-visibility protections for private→public data flows.
 	// Accepts either the string "allow" (blanket opt-out) or a []string of MCP server IDs
 	// (selective exemption for those servers only).
@@ -377,16 +436,16 @@ type GitHubToolConfig struct {
 
 // PlaywrightToolConfig represents the configuration for the Playwright tool
 type PlaywrightToolConfig struct {
-	Version string   `yaml:"version,omitempty"`
-	Args    []string `yaml:"args,omitempty"`
-	// Mode selects the integration approach: "mcp" (default) runs a Docker-based MCP
-	// server; "cli" installs @playwright/cli via npm for token-efficient CLI invocations.
-	Mode string `yaml:"mode,omitempty"`
+	Version string `yaml:"version,omitempty"`
+	// Mode accepts "cli" for backward compatibility with explicit configurations.
+	// CLI mode is also used when this field is omitted.
+	Mode     string   `yaml:"mode,omitempty"`
+	Browsers []string `yaml:"browsers,omitempty"`
 }
 
-// IsCLIMode returns true when the playwright tool is configured in CLI mode (mode: cli).
+// IsCLIMode returns true when the Playwright tool uses the supported CLI mode.
 func (p *PlaywrightToolConfig) IsCLIMode() bool {
-	return p != nil && strings.EqualFold(p.Mode, "cli")
+	return p != nil && (p.Mode == "" || strings.EqualFold(p.Mode, "cli"))
 }
 
 // BashToolConfig represents the configuration for the Bash tool
@@ -423,6 +482,12 @@ type CacheMemoryToolConfig struct {
 	Raw any `yaml:"-"`
 }
 
+// DriveMemoryToolConfig represents the configuration for drive-memory.
+type DriveMemoryToolConfig struct {
+	// Can be boolean, object, or array - handled by drive_memory_config.go.
+	Raw any `yaml:"-"`
+}
+
 // CommentMemoryToolConfig represents the configuration for comment-memory.
 // This is handled separately by comment_memory.go.
 type CommentMemoryToolConfig struct {
@@ -456,26 +521,29 @@ type MCPServerConfig struct {
 // Per MCP Gateway Specification v1.0.0: All stdio-based MCP servers MUST be containerized.
 // Direct command execution is not supported.
 type MCPGatewayRuntimeConfig struct {
-	Container            string            `yaml:"container,omitempty"`              // Container image for the gateway (required)
-	Version              string            `yaml:"version,omitempty"`                // Optional version/tag for the container
-	Entrypoint           string            `yaml:"entrypoint,omitempty"`             // Optional entrypoint override for the container
-	Args                 []string          `yaml:"args,omitempty"`                   // Arguments for docker run
-	EntrypointArgs       []string          `yaml:"entrypointArgs,omitempty"`         // Arguments passed to container entrypoint
-	Env                  map[string]string `yaml:"env,omitempty"`                    // Environment variables for the gateway
-	Port                 int               `yaml:"port,omitempty"`                   // Port for the gateway HTTP server (default: 8080)
-	APIKey               string            `yaml:"api-key,omitempty"`                // API key for gateway authentication
-	Domain               string            `yaml:"domain,omitempty"`                 // Domain for gateway URL (localhost or host.docker.internal)
-	Mounts               []string          `yaml:"mounts,omitempty"`                 // Volume mounts for the gateway container (format: "source:dest:mode")
-	PayloadDir           string            `yaml:"payload-dir,omitempty"`            // Directory path for storing large payload JSON files (must be absolute path)
-	PayloadPathPrefix    string            `yaml:"payload-path-prefix,omitempty"`    // Path prefix to remap payload paths for agent containers (e.g., /workspace/payloads)
-	PayloadSizeThreshold int               `yaml:"payload-size-threshold,omitempty"` // Size threshold in bytes for storing payloads to disk (default: 524288 = 512KB)
-	TrustedBots          []string          `yaml:"trusted-bots,omitempty"`           // Additional bot identity strings to pass to the gateway, merged with its built-in list
-	KeepaliveInterval    int               `yaml:"keepalive-interval,omitempty"`     // Keepalive ping interval in seconds for HTTP MCP backends (0=default 1500s, -1=disabled, >0=custom)
-	SessionTimeout       string            `yaml:"session-timeout,omitempty"`        // Session timeout for MCP gateway sessions as a Go duration string (e.g. "4h", "30m"); empty = gateway default (precedence: stdin config > MCP_GATEWAY_SESSION_TIMEOUT env var > built-in default 6h)
-	ToolTimeout          string            `yaml:"tool-timeout,omitempty"`           // Timeout for individual MCP tool calls as a Go duration string (e.g. "2m", "30s"); empty = gateway built-in default (60s)
-	StartupTimeout       int               `yaml:"-"`                                // Startup timeout in seconds for all MCP backends; always emitted to override gateway's built-in 30s default (gh-aw default: 120s, from tools.startup-timeout)
-	OTLPEndpoint         string            `yaml:"-"`                                // OTLP collector endpoint (derived from observability.otlp, not user-settable)
-	OTLPHeaders          string            `yaml:"-"`                                // Raw OTLP HTTP headers string (derived from observability.otlp, not user-settable)
+	Container             string                                    `yaml:"container,omitempty"`              // Container image for the gateway (required)
+	Version               string                                    `yaml:"version,omitempty"`                // Optional version/tag for the container
+	Entrypoint            string                                    `yaml:"entrypoint,omitempty"`             // Optional entrypoint override for the container
+	Args                  []string                                  `yaml:"args,omitempty"`                   // Arguments for docker run
+	EntrypointArgs        []string                                  `yaml:"entrypointArgs,omitempty"`         // Arguments passed to container entrypoint
+	Env                   map[string]string                         `yaml:"env,omitempty"`                    // Environment variables for the gateway
+	Port                  int                                       `yaml:"port,omitempty"`                   // Port for the gateway HTTP server (default: 8080)
+	AgentID               string                                    `yaml:"agent-id,omitempty"`               // Agent/session identifier for gateway authentication
+	AgentIDs              []string                                  `yaml:"-"`                                // Multiple isolated gateway agent identities
+	AgentPolicies         map[string]MCPGatewayAgentPolicy          `yaml:"-"`                                // Per-agent gateway access policies
+	DelegationControllers map[string]MCPGatewayDelegationController `yaml:"-"`                                // Dynamic identity delegation controllers
+	Domain                string                                    `yaml:"domain,omitempty"`                 // Domain for gateway URL (localhost or host.docker.internal)
+	Mounts                []string                                  `yaml:"mounts,omitempty"`                 // Volume mounts for the gateway container (format: "source:dest:mode")
+	PayloadDir            string                                    `yaml:"payload-dir,omitempty"`            // Directory path for storing large payload JSON files (must be absolute path)
+	PayloadPathPrefix     string                                    `yaml:"payload-path-prefix,omitempty"`    // Path prefix to remap payload paths for agent containers (e.g., /workspace/payloads)
+	PayloadSizeThreshold  int                                       `yaml:"payload-size-threshold,omitempty"` // Size threshold in bytes for storing payloads to disk (default: 524288 = 512KB)
+	TrustedBots           []string                                  `yaml:"trusted-bots,omitempty"`           // Additional bot identity strings to pass to the gateway, merged with its built-in list
+	KeepaliveInterval     int                                       `yaml:"keepalive-interval,omitempty"`     // Keepalive ping interval in seconds for HTTP MCP backends (0=default 1500s, -1=disabled, >0=custom)
+	SessionTimeout        string                                    `yaml:"session-timeout,omitempty"`        // Session timeout for MCP gateway sessions as a Go duration string (e.g. "4h", "30m"); empty = gateway default (precedence: stdin config > MCP_GATEWAY_SESSION_TIMEOUT env var > built-in default 6h)
+	ToolTimeout           string                                    `yaml:"tool-timeout,omitempty"`           // Timeout for individual MCP tool calls as a Go duration string (e.g. "2m", "30s"); empty = gateway built-in default (60s)
+	StartupTimeout        int                                       `yaml:"-"`                                // Startup timeout in seconds for all MCP backends; always emitted to override gateway's built-in 30s default (gh-aw default: 120s, from tools.startup-timeout)
+	OTLPEndpoint          string                                    `yaml:"-"`                                // OTLP collector endpoint (derived from observability.otlp, not user-settable)
+	OTLPHeaders           string                                    `yaml:"-"`                                // Raw OTLP HTTP headers string (derived from observability.otlp, not user-settable)
 	// ForcePublicRepos controls the gateway's runtime public-repo override.
 	// When set to a pointer to false, the compiler emits "forcePublicRepos": false in the gateway
 	// JSON config, disabling the runtime check that restricts repos to "public" when the
@@ -485,6 +553,18 @@ type MCPGatewayRuntimeConfig struct {
 	// sink-visibility="public" enforcement. Emitted as gateway.sinkVisibilityExemptServers.
 	// Set from tools.github.private-to-public-flows: [server-ids...].
 	SinkVisibilityExemptServers []string `yaml:"-"`
+}
+
+type MCPGatewayAgentPolicy struct {
+	Servers   []string            `json:"servers"`
+	Tools     map[string][]string `json:"tools,omitempty"`
+	AllowOnly map[string]any      `json:"allow-only,omitempty"`
+}
+
+type MCPGatewayDelegationController struct {
+	Server            string         `json:"server"`
+	Policy            map[string]any `json:"policy"`
+	ControlCapability string         `json:"controlCapability"`
 }
 
 // HasTool checks if a tool is present in the configuration
@@ -512,6 +592,8 @@ func (t *Tools) HasTool(name string) bool {
 		return t.AgenticWorkflows != nil
 	case "cache-memory":
 		return t.CacheMemory != nil
+	case "drive-memory":
+		return t.DriveMemory != nil
 	case "comment-memory":
 		return t.CommentMemory != nil
 	case "repo-memory":
@@ -558,6 +640,9 @@ func (t *Tools) GetToolNames() []string {
 	}
 	if t.CacheMemory != nil {
 		names = append(names, "cache-memory")
+	}
+	if t.DriveMemory != nil {
+		names = append(names, "drive-memory")
 	}
 	if t.CommentMemory != nil {
 		names = append(names, "comment-memory")

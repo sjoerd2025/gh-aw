@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -24,16 +25,19 @@ const spikeDetectionMultiplier = 2.0
 // CrossRunAuditReport represents aggregated audit data across multiple workflow runs.
 // It includes firewall analysis, metrics trends, MCP server health, and error trends.
 type CrossRunAuditReport struct {
-	RunsAnalyzed    int                       `json:"runs_analyzed"`
-	RunsWithData    int                       `json:"runs_with_data"`
-	RunsWithoutData int                       `json:"runs_without_data"`
-	Summary         CrossRunSummary           `json:"summary"`
-	MetricsTrend    MetricsTrendData          `json:"metrics_trend"`
-	MCPHealth       []MCPServerCrossRunHealth `json:"mcp_health,omitempty"`
-	ErrorTrend      ErrorTrendData            `json:"error_trend"`
-	DomainInventory []DomainInventoryEntry    `json:"domain_inventory"`
-	PerRunBreakdown []PerRunFirewallBreakdown `json:"per_run_breakdown"`
-	Drain3Insights  []ObservabilityInsight    `json:"drain3_insights,omitempty"`
+	RunsAnalyzed        int                         `json:"runs_analyzed"`
+	RunsWithData        int                         `json:"runs_with_data"`
+	RunsWithoutData     int                         `json:"runs_without_data"`
+	Summary             CrossRunSummary             `json:"summary"`
+	MetricsTrend        MetricsTrendData            `json:"metrics_trend"`
+	MCPHealth           []MCPServerCrossRunHealth   `json:"mcp_health,omitempty"`
+	ErrorTrend          ErrorTrendData              `json:"error_trend"`
+	DomainInventory     []DomainInventoryEntry      `json:"domain_inventory"`
+	PerRunBreakdown     []PerRunFirewallBreakdown   `json:"per_run_breakdown"`
+	Drain3Insights      []ObservabilityInsight      `json:"drain3_insights,omitempty"`
+	ClusterAnalysis     *ClusterAnalysis            `json:"cluster_analysis,omitempty"`
+	GitHubAPIRateLimit  *GitHubAPIRateLimitReport   `json:"github_api_rate_limit,omitempty"`
+	GitHubAPIRateLimits []*GitHubAPIRateLimitReport `json:"github_api_rate_limits,omitempty"`
 }
 
 // CrossRunSummary provides top-level statistics across all analyzed runs.
@@ -79,13 +83,60 @@ type MetricsTrendData struct {
 
 // MCPServerCrossRunHealth describes the health of a single MCP server across runs.
 type MCPServerCrossRunHealth struct {
-	ServerName    string  `json:"server_name"`
+	MCPServerStatsBase
 	RunsConnected int     `json:"runs_connected"` // Runs where server was used (appeared in tool usage)
 	TotalRuns     int     `json:"total_runs"`
-	TotalCalls    int     `json:"total_calls"`
-	TotalErrors   int     `json:"total_errors"`
 	ErrorRate     float64 `json:"error_rate"` // 0.0–1.0
 	Unreliable    bool    `json:"unreliable"` // True if error_rate > 0.10 or connected < 75% of runs
+}
+
+// MarshalJSON preserves the cross-run MCP health JSON schema while sharing the
+// per-server stat fields with the other MCP server report types.
+func (h MCPServerCrossRunHealth) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ServerName    string  `json:"server_name"`
+		RunsConnected int     `json:"runs_connected"`
+		TotalRuns     int     `json:"total_runs"`
+		TotalCalls    int     `json:"total_calls"`
+		TotalErrors   int     `json:"total_errors"`
+		ErrorRate     float64 `json:"error_rate"`
+		Unreliable    bool    `json:"unreliable"`
+	}{
+		ServerName:    h.ServerName,
+		RunsConnected: h.RunsConnected,
+		TotalRuns:     h.TotalRuns,
+		TotalCalls:    h.ToolCallCount,
+		TotalErrors:   h.ErrorCount,
+		ErrorRate:     h.ErrorRate,
+		Unreliable:    h.Unreliable,
+	})
+}
+
+// UnmarshalJSON is the counterpart to MarshalJSON, mapping the legacy
+// "total_calls"/"total_errors" wire keys back into the embedded MCPServerStatsBase.
+func (h *MCPServerCrossRunHealth) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		ServerName    string  `json:"server_name"`
+		RunsConnected int     `json:"runs_connected"`
+		TotalRuns     int     `json:"total_runs"`
+		TotalCalls    int     `json:"total_calls"`
+		TotalErrors   int     `json:"total_errors"`
+		ErrorRate     float64 `json:"error_rate"`
+		Unreliable    bool    `json:"unreliable"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	h.MCPServerStatsBase = MCPServerStatsBase{
+		ServerName:    aux.ServerName,
+		ToolCallCount: aux.TotalCalls,
+		ErrorCount:    aux.TotalErrors,
+	}
+	h.RunsConnected = aux.RunsConnected
+	h.TotalRuns = aux.TotalRuns
+	h.ErrorRate = aux.ErrorRate
+	h.Unreliable = aux.Unreliable
+	return nil
 }
 
 // ErrorTrendData summarizes error and warning patterns across runs.
@@ -137,15 +188,19 @@ type PerRunFirewallBreakdown struct {
 
 // crossRunInput bundles per-run data needed for aggregation.
 type crossRunInput struct {
-	RunID            int64
-	WorkflowName     string
-	Conclusion       string
-	Duration         time.Duration
-	FirewallAnalysis *FirewallAnalysis
-	Metrics          LogMetrics
-	MCPToolUsage     *MCPToolUsageData
-	MCPFailures      []MCPFailureReport
-	ErrorCount       int
+	RunID               int64
+	WorkflowName        string
+	Conclusion          string
+	Duration            time.Duration
+	FirewallAnalysis    *FirewallAnalysis
+	Metrics             LogMetrics
+	MCPToolUsage        *MCPToolUsageData
+	MCPFailures         []MCPFailureReport
+	ErrorCount          int
+	TaskDomain          *TaskDomainInfo
+	BehaviorFingerprint *BehaviorFingerprint
+	GradersCluster      string
+	EvalsCluster        string
 }
 
 // buildCrossRunAuditReport aggregates data from multiple runs into a CrossRunAuditReport.
@@ -167,6 +222,7 @@ func buildCrossRunAuditReport(inputs []crossRunInput) *CrossRunAuditReport {
 		report.RunsAnalyzed, report.RunsWithData, report.Summary.UniqueDomains, len(report.MCPHealth))
 
 	report.Drain3Insights = buildDrain3InsightsFromCrossRunInputs(inputs)
+	report.ClusterAnalysis = buildClusterAnalysis(inputs)
 	return report
 }
 
@@ -342,11 +398,13 @@ func buildCrossRunMCPHealth(mcpServerMap map[string]*crossRunMCPServerAgg, total
 			unreliable = true
 		}
 		health = append(health, MCPServerCrossRunHealth{
-			ServerName:    name,
+			MCPServerStatsBase: MCPServerStatsBase{
+				ServerName:    name,
+				ToolCallCount: agg.totalCalls,
+				ErrorCount:    agg.totalErrors,
+			},
 			RunsConnected: connected,
 			TotalRuns:     totalRuns,
-			TotalCalls:    agg.totalCalls,
-			TotalErrors:   agg.totalErrors,
 			ErrorRate:     errorRate,
 			Unreliable:    unreliable,
 		})

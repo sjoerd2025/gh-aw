@@ -18,10 +18,11 @@ runtimes:
     version: "20"
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [repos]
   edit:
   bash: ["*"]
@@ -57,7 +58,7 @@ strict: true
 
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 ---
 
 # jsweep - JavaScript Unbloater

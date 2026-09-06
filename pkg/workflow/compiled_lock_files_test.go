@@ -140,6 +140,25 @@ func TestCompiledLockFiles_SafeOutputsJobOutputs(t *testing.T) {
 	t.Logf("Validated safe_outputs job outputs for %d workflow(s)", checkedWorkflows)
 }
 
+func TestSmokeClaudeAllowsRequiredChromeServiceDomains(t *testing.T) {
+	data, err := NewCompiler().ParseWorkflowFile(filepath.Join(workflowsDir, "smoke-claude.md"))
+	require.NoError(t, err, "should parse smoke-claude workflow")
+	require.NotNil(t, data.NetworkPermissions, "smoke-claude should configure network permissions")
+
+	for _, domain := range []string{
+		"content-autofill.googleapis.com",
+		"www.google.com",
+		"accounts.google.com",
+		"android.clients.google.com",
+		"www.gstatic.com",
+	} {
+		assert.Contains(t, data.NetworkPermissions.Allowed, domain,
+			"smoke-claude should allow the Chrome service domain %s", domain)
+	}
+	assert.NotContains(t, data.NetworkPermissions.Allowed, "chrome",
+		"smoke-claude should not allow the broad chrome network ecosystem")
+}
+
 func TestCompiledLockFiles_SmokePiOmitsYoloArg(t *testing.T) {
 	lockPath := filepath.Join(workflowsDir, "smoke-pi.lock.yml")
 	lockBytes, err := os.ReadFile(lockPath)
@@ -169,6 +188,57 @@ func TestCompiledLockFiles_SmokePiKeepsCLIProxySafeoutputsWiring(t *testing.T) {
 		"smoke-pi lock file should request the safeoutputs CLI wrapper")
 	assert.Contains(t, lockContent, `export PATH="${RUNNER_TEMP}/gh-aw/mcp-cli/bin:$PATH"`,
 		"smoke-pi lock file should add mounted MCP CLI wrappers to PATH before executing Pi")
+}
+
+func TestCompiledLockFiles_CLIEngineInstallStepNamesIncludeCLISuffix(t *testing.T) {
+	tests := []struct {
+		lockFile    string
+		wantNames   []string
+		absentNames []string
+	}{
+		{
+			lockFile: "smoke-crush.lock.yml",
+			wantNames: []string{
+				"Install Crush CLI",
+			},
+			absentNames: []string{
+				"Install Crush",
+			},
+		},
+		{
+			lockFile: "smoke-opencode.lock.yml",
+			wantNames: []string{
+				"Install OpenCode CLI",
+			},
+			absentNames: []string{
+				"Install OpenCode",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.lockFile, func(t *testing.T) {
+			lockPath := filepath.Join(workflowsDir, tt.lockFile)
+			lockBytes, err := os.ReadFile(lockPath)
+			require.NoError(t, err, "should read %s", tt.lockFile)
+
+			stepNames := map[string]bool{}
+			for line := range strings.SplitSeq(string(lockBytes), "\n") {
+				line = strings.TrimSpace(line)
+				name, ok := strings.CutPrefix(line, "- name: ")
+				if ok {
+					stepNames[name] = true
+				}
+			}
+
+			for _, wantName := range tt.wantNames {
+				assert.Contains(t, stepNames, wantName)
+			}
+			for _, absentName := range tt.absentNames {
+				assert.NotContains(t, stepNames, absentName)
+			}
+		})
+	}
 }
 
 // TestCompiledLockFiles_WorkflowCallOutputs validates that compiled lock files for workflows

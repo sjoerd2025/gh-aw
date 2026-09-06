@@ -21,7 +21,7 @@ engine:
 strict: true
 experiments:
   model_size:
-    variants: [claude-sonnet-4.6, claude-haiku-4.5]
+    variants: [claude-sonnet-5, claude-haiku-4.5]
     description: "Tests whether Claude Haiku produces equivalent instruction conciseness improvements at lower token cost versus Claude Sonnet."
     hypothesis: "H0: no change in PR creation rate or run success rate. H1: Claude Haiku reduces AI credit usage >=30% with equivalent run success rate (>=0.90)."
     metric: ai_credits_total
@@ -32,7 +32,9 @@ experiments:
       - name: empty_output_rate
         threshold: "<=0.10"
     min_samples: 20
-    weight: [50, 50]
+    continual:
+      seed: daily-caveman-model-size-v1
+      ramp: [10, 25, 50]
     start_date: "2026-06-04"
 
 network:
@@ -41,6 +43,7 @@ network:
     - github
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 3d
     title-prefix: "[caveman] "
@@ -54,12 +57,13 @@ safe-outputs:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   cache-memory: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   edit:
   bash:

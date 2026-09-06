@@ -1,10 +1,12 @@
 ---
-description: Guide for using skills in agentic workflows — compiler-managed `skills:` installs plus hint, fusion, and inline strategies
+description: Guide for using skills and plugins in agentic workflows — compiler-managed `skills:`/`plugins:` installs plus hint, fusion, and inline strategies
 ---
 
 # Skills in Agentic Workflows
 
 Use skills — domain-specific knowledge files (`SKILL.md`) under `skills/` or `.github/skills/` — in workflows.
+
+**Rule:** when a user asks for a specific skill or agent plugin, declare it in the built-in top-level `skills:` or `plugins:` frontmatter fields. gh-aw resolves and installs them before the agent runs. Never install skills or plugins on the fly — no `steps:`/`post-steps:` that run `gh skill install`, `copilot plugin install`, `npx`, `curl`, or `git clone`, and no prompt text telling the agent to fetch or install a skill or plugin at run time.
 
 ---
 
@@ -18,7 +20,7 @@ find "${GITHUB_WORKSPACE}" -name "SKILL.md" -maxdepth 6
 
 ## Frontmatter `skills:` (Preferred for External Skills)
 
-Declare external skills to install at activation time with the top-level `skills:` array.
+Declare skills to install at activation time with the top-level `skills:` array.
 The compiler emits the activation steps, prepares the required `gh` support, installs each skill, and wires it into the engine.
 Do **not** add manual `gh` setup or `gh skill install` steps for this.
 
@@ -26,6 +28,9 @@ Do **not** add manual `gh` setup or `gh skill install` steps for this.
 skills:
   # Shared auth via the workflow activation token
   - mattpocock/skills/tdd@801dca688564c529fa84f247f64472520d9ebe28
+
+  # Local skill path for development (installed with --from-local)
+  - .github/skills/my-skill
 
   # Per-skill token for a private skill repository
   - skill: mattpocock/skills/diagnosing-bugs@801dca688564c529fa84f247f64472520d9ebe28
@@ -39,6 +44,7 @@ skills:
 ```
 
 - Static references must be pinned to a full 40-character lowercase commit SHA; `${{ ... }}` expressions are allowed in the ref position and resolved at runtime.
+- Local paths (for example, `skills/my-skill` or `.github/skills/my-skill`) are supported for local development and are installed via `--from-local`.
 - Object entries set per-skill auth via `github-token` or `github-app`.
 - Use `skills:` for external skill installs and `imports:` for prompt/context files you want merged into the workflow.
 
@@ -46,23 +52,21 @@ Distinct from the prompt-side strategies below (hint / fusion / inline), which s
 
 ---
 
-## Strategy 0 — Agent Finder (Discovery First)
+## Frontmatter `plugins:` (Preferred for Agent Plugins)
 
-**Use when**: the relevant skill is not obvious, the repository may not contain the right skill yet, or you want to discover installable skills before loading local ones.
+When the user asks for a specific [Agent Plugin](https://agent-plugins.org), declare it in the top-level `plugins:` array. The compiler resolves each `owner/repository[/path]@ref` to a commit SHA at compile time, and the agent job checks out and registers every plugin with the engine before the agent starts.
 
-Query **GitHub Agent Finder** through its REST API (ARD search shape: `query.text`; add `query.filter` to narrow by resource type — omit `filter` to search all types):
-
-```bash
-curl -s https://agentfinder.github.com/api/v1/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":{"text":"<the user task, in plain language>","filter":{"type":["application/ai-skill"]}},"pageSize":10}'
+```yaml
+plugins:
+  - octo-org/agent-plugin@v1
+  - octo-org/agent-plugins/plugins/example@main
 ```
 
-After discovery:
-
-- Prefer repository-local skills when they satisfy the task.
-- Extract only the specific guidance you need; do not paste entire skills when a fragment is enough.
-- If the user chooses an external skill, add it to frontmatter `skills:` instead of adding manual install steps.
+- `ref` is required (branch, tag, or 40-character commit SHA); unresolvable refs fail compilation.
+- Experimental: compiling a workflow that uses `plugins:` emits a warning.
+- Supported by `copilot`, `claude`, `codex`, and imported engines that declare `engine.behaviors.plugins`; `gemini` and `pi` reject `plugins:` at compile time.
+- Plugin repositories must be public — unlike `skills:`, there is no per-entry `github-token`/`github-app`.
+- See [syntax-tools-imports.md](syntax-tools-imports.md) for the full field reference.
 
 ---
 
@@ -94,7 +98,7 @@ Use a unique inline skill name per workflow file. Name must start with a lowerca
 
 ---
 
-## Strategy 1 — Hint (Generalist)
+## Strategy 0 — Hint (Generalist)
 
 **Use when**: the task strategy is unknown at authoring time, or the agent must adapt to whatever skills are available. The prompt tells the agent skills exist and to discover/apply the relevant ones itself.
 
@@ -108,7 +112,7 @@ content and apply the guidance it provides.
 
 ---
 
-## Strategy 2 — Fusion (Ultra-Cognitive)
+## Strategy 1 — Fusion (Ultra-Cognitive)
 
 **Use when**: you know exactly which skill (or part of it) is needed and want minimal context overhead. Inline **only the specific sections** the agent needs; never paste the entire SKILL.md.
 
@@ -190,6 +194,7 @@ Report findings as inline review comments.
 
 ## Anti-Patterns
 
+- ❌ **Do not install skills or plugins on the fly** — never add `steps:`/`post-steps:` or prompt instructions that run `gh skill install`, `copilot plugin install`, `npx`, `curl`, or `git clone` to fetch a skill or plugin at run time; declare `skills:`/`plugins:` instead and let gh-aw install them before the agent runs
 - ❌ **Do not load entire skill files** when only one section is relevant — use fusion instead
 - ❌ **Do not hint without bounds** — if using the hint strategy, constrain the agent with a `maxdepth` and a relevance filter to avoid reading every SKILL.md in a large repo
 - ❌ **Do not paste skills verbatim** without adapting them to the workflow's context — fused fragments should read as natural prose, not as lifted documentation

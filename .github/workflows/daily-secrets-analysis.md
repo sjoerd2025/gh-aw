@@ -13,13 +13,17 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 engine:
   id: copilot
   copilot-sdk: true
 max-tool-denials: 3
 strict: true
+network:
+  allowed:
+    - defaults
+    - go
+    - node
 tracker-id: daily-secrets-analysis
 tools:
   cli-proxy: true
@@ -33,6 +37,7 @@ imports:
     with:
       title-prefix: "[daily secrets] "
   - shared/otlp.md
+  - shared/reporting.md
 evals:
   - id: secrets_analyzed
     question: Did the agent analyze secret usage patterns across compiled lock.yml workflow files?
@@ -156,29 +161,30 @@ echo "Permission blocks: $PERMISSION_BLOCKS"
 Look for potential security concerns:
 
 ```bash
-# Find direct expression interpolation (potential template injection)
+# Check direct event-data interpolation (template injection risk)
 echo "=== Checking for template injection risks ==="
-# Search for github.event patterns that might indicate unsafe expression usage
-# Avoiding literal expression syntax to prevent actionlint parsing issues
-PATTERN='github.event.'
-DIRECT_INTERP=$(grep -rn "$PATTERN" .github/workflows/*.lock.yml | \
-  grep -c -v "env:")
-if [ "$DIRECT_INTERP" -gt 0 ]; then
-  echo "⚠️  Found $DIRECT_INTERP potential template injection risks"
-  echo "Files with direct interpolation:"
-  grep -rl "$PATTERN" .github/workflows/*.lock.yml | head -5
+# This Go test parses each workflow and inspects only executable run: blocks,
+# so github.event references in env: assignments do not cause false positives.
+if ! command -v go >/dev/null 2>&1; then
+  echo "ℹ️  Go toolchain unavailable here; this check is enforced in CI"
+elif go test ./pkg/workflow/ -run TestCompiledLockFiles_NoGitHubEventExpressionsInRunScripts; then
+  echo "✅ No direct github.event interpolation in run: scripts"
 else
-  echo "✅ No template injection risks found"
+  echo "⚠️  Template injection risk detected (see test output above)"
 fi
 
 # Check for secrets in outputs (security risk)
+# This is enforced deterministically in CI by the Go test
+# TestCompiledLockFiles_NoSecretsInOutputs in pkg/workflow, which parses the actual
+# YAML `outputs:` maps (job outputs and on.workflow_call outputs) instead of using a
+# line-proximity grep, so it reports no false positives.
 echo "=== Checking for secrets in job outputs ==="
-SECRETS_IN_OUTPUTS=$(grep -A5 "outputs:" .github/workflows/*.lock.yml | \
-  grep "secrets\." | wc -l)
-if [ "$SECRETS_IN_OUTPUTS" -gt 0 ]; then
-  echo "⚠️  Found $SECRETS_IN_OUTPUTS potential secret exposure in outputs"
-else
+if ! command -v go >/dev/null 2>&1; then
+  echo "ℹ️  Go toolchain unavailable here; this check is enforced in CI"
+elif go test ./pkg/workflow/ -run TestCompiledLockFiles_NoSecretsInOutputs; then
   echo "✅ No secrets in job outputs"
+else
+  echo "⚠️  Secret exposure detected in job outputs (see test output above)"
 fi
 ```
 
@@ -307,7 +313,6 @@ For detailed information about secret usage patterns, see:
 
 ## Notes
 
-- **Report Formatting**: Use h3 (`###`) or lower for all headers in your report. Never use h1 (`#`) or h2 (`##`) — these are reserved for the issue title. Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability.
 - Focus on **trends and changes** rather than static inventory
 - Highlight **security concerns** prominently
 - Keep the report **concise but comprehensive**

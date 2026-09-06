@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -41,7 +42,7 @@ func ensureEvalsResultsFromBranch(ctx context.Context, run WorkflowRun, runDir, 
 		}
 		return false
 	}
-	decoded, err := readRemoteRepoBranchFileContext(ctx, repoOverride, refName, constants.EvalsResultFilename, host)
+	decoded, err := readRemoteRepoBranchFileContext(ctx, repoOverride, refName, constants.EvalsResultFilename.String(), host)
 	if err != nil {
 		if !isRemoteFileNotFound(err) {
 			logsOrchestratorLog.Printf("Failed to fetch evals branch file for run %d: branch=%s ref=%s repo=%s err=%v", run.DatabaseID, branchName, refName, repoOverride, err)
@@ -54,7 +55,7 @@ func ensureEvalsResultsFromBranch(ctx context.Context, run WorkflowRun, runDir, 
 		return false
 	}
 
-	dest := filepath.Join(runDir, constants.EvalsResultFilename)
+	dest := filepath.Join(runDir, constants.EvalsResultFilename.String())
 	if writeErr := os.WriteFile(dest, decoded, constants.FilePermPublic); writeErr != nil {
 		logsOrchestratorLog.Printf("Failed to write evals branch file for run %d: %v", run.DatabaseID, writeErr)
 		return false
@@ -141,7 +142,7 @@ func resolveRunStateBranchRef(ctx context.Context, repoOverride, branchName stri
 		cmd := workflow.ExecGHContext(ctx, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			if isRemoteFileNotFoundOutput(string(out)) {
+			if errorutil.IsNotFoundOutput(string(out)) {
 				return "", os.ErrNotExist
 			}
 			return "", fmt.Errorf("failed to list commits for state branch %s: %w", branchName, err)

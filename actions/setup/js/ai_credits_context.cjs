@@ -18,6 +18,10 @@ const BUDGET_EXCEEDED_EVENT = "budget_exceeded";
 // The literal error type emitted by the AWF API proxy (HTTP 400) when maxAiCredits is active
 // and the requested model is not in the built-in pricing table.
 const UNKNOWN_MODEL_AI_CREDITS_TYPE = "unknown_model_ai_credits";
+// The literal error type emitted by the AWF API proxy (HTTP 403) when the consecutive cache
+// miss counter reaches the apiProxy.maxCacheMisses limit. Engine-agnostic: all engines share
+// the same proxy guardrail.
+const MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE = "max_cache_misses_exceeded";
 const MAX_AI_CREDITS_EXCEEDED_STDIO_RE = /maximum ai credits exceeded(?:\s*\((\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\))?/i;
 const DEFAULT_AGENT_STDIO_LOG = "/tmp/gh-aw/agent-stdio.log";
 const AGENT_STDIO_LOG_MAX_TAIL = 64 * 1024; // 64 KB — sufficient for any realistic error block
@@ -40,27 +44,11 @@ function parsePositiveNumberString(value) {
 }
 
 /**
- * @param {string} left
- * @param {string} right
- * @returns {boolean}
- */
-function isNumberStringGreaterThanOrEqual(left, right) {
-  if (!left || !right) return false;
-  const leftNumber = Number.parseFloat(left);
-  const rightNumber = Number.parseFloat(right);
-  return Number.isFinite(leftNumber) && Number.isFinite(rightNumber) && leftNumber >= rightNumber;
-}
-
-/**
  * @param {boolean} hasRateLimitSignal
- * @param {string} aiCredits
- * @param {string} maxAICredits
  * @returns {boolean}
  */
-function shouldReportAICreditsRateLimitError(hasRateLimitSignal, aiCredits, maxAICredits) {
-  if (!hasRateLimitSignal) return false;
-  if (!aiCredits || !maxAICredits) return true;
-  return isNumberStringGreaterThanOrEqual(aiCredits, maxAICredits);
+function shouldReportAICreditsRateLimitError(hasRateLimitSignal) {
+  return hasRateLimitSignal;
 }
 
 /**
@@ -218,22 +206,7 @@ function parseAICreditsErrorInfoFromAuditEntry(entry) {
 function iterateAuditEntries(auditJsonlPathOverride, defaultValue, contentGuard, accumulate) {
   try {
     const auditJsonlPath = resolveFirewallAuditLogPath(auditJsonlPathOverride);
-    if (!fs.existsSync(auditJsonlPath)) return defaultValue;
-    const content = fs.readFileSync(auditJsonlPath, "utf8");
-    if (!content.trim()) return defaultValue;
-    if (contentGuard && !contentGuard(content)) return defaultValue;
-    let result = defaultValue;
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed[0] !== "{") continue;
-      try {
-        const nextResult = accumulate(result, JSON.parse(trimmed));
-        if (nextResult !== undefined) result = nextResult;
-      } catch {
-        // ignore malformed lines
-      }
-    }
-    return result;
+    return iterateJSONLFiles([auditJsonlPath], defaultValue, contentGuard, accumulate);
   } catch {
     return defaultValue;
   }
@@ -318,7 +291,6 @@ function parseAICreditsErrorInfoFromAuditLog(auditJsonlPathOverride) {
  * Detects a `max_ai_credits_exceeded` signal from a single firewall audit log entry.
  * Checks for the explicit `max_ai_credits_exceeded` boolean field, its camelCase variant,
  * or a `budget_exceeded` event with `reason: "hard_limit"` and `forced_termination: true`
- * as written by the aw-harness upon hard-limit abort (§11.2.2).
  * Only inspects top-level fields to avoid false positives from nested provider responses.
  *
  * @param {unknown} entry
@@ -426,6 +398,30 @@ function parseUnknownModelAICreditsAndModelFromAuditLog(auditJsonlPathOverride) 
 }
 
 /**
+ * Detects a `max_cache_misses_exceeded` event from the AWF API proxy event logs.
+ * The proxy emits this HTTP 403 error when the consecutive cache miss counter reaches
+ * the configured `apiProxy.maxCacheMisses` limit. Detection is engine-agnostic:
+ * all agentic engines share the same AWF API proxy guardrail.
+ * Structured entries emitted by the AWF API proxy look like:
+ *   { "type": "max_cache_misses_exceeded", "consecutive_cache_misses": 6, "max_cache_misses": 5 }
+ *
+ * @param {string} [eventLogPathOverride]
+ * @returns {boolean}
+ */
+function parseMaxCacheMissesExceededFromEventLog(eventLogPathOverride) {
+  return iterateJSONLFiles(
+    resolveUnknownModelAICreditsLogPaths(eventLogPathOverride),
+    false,
+    content => content.includes(MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE),
+    (acc, entry) => {
+      if (acc) return true; // already detected, short-circuit
+      return traverseObjectTree(entry, (_key, value) => value === MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE) || undefined;
+    },
+    acc => acc
+  );
+}
+
+/**
  * Single-pass combined read of the audit log, returning all AI credits fields at once.
  * Used by resolveAICreditsFailureState to avoid reading the same file twice.
  * No contentGuard is applied: rate-limit signal detection must scan all entries anyway,
@@ -497,7 +493,7 @@ function resolveAICreditsFailureState({ logProvenance = true } = {}) {
   const aiCredits = auditAICredits || stdioSignals.aiCredits || envAICredits || "";
   const maxAICredits = auditMaxAICredits || stdioSignals.maxAICredits || envMaxAICredits || "";
   const rawAICreditsRateLimitError = auditRateLimitError || stdioSignals.rateLimitError || envRateLimitSignalHasEvidence;
-  const aiCreditsRateLimitError = shouldReportAICreditsRateLimitError(rawAICreditsRateLimitError, aiCredits, maxAICredits);
+  const aiCreditsRateLimitError = shouldReportAICreditsRateLimitError(rawAICreditsRateLimitError);
   return { aiCredits, maxAICredits, aiCreditsRateLimitError, maxAICreditsExceeded: auditMaxAICreditsExceeded || stdioSignals.maxAICreditsExceeded };
 }
 
@@ -552,5 +548,7 @@ module.exports = {
   parseMaxAICreditsExceededFromAuditLog,
   parseUnknownModelAICreditsFromAuditLog,
   parseUnknownModelAICreditsAndModelFromAuditLog,
+  parseMaxCacheMissesExceededFromEventLog,
   resolveAICreditsFailureState,
+  MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE,
 };

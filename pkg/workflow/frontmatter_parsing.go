@@ -13,6 +13,11 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 	frontmatterTypesLog.Printf("Parsing frontmatter config with %d fields", len(frontmatter))
 	var config FrontmatterConfig
 
+	githubApp, err := extractTypedTopLevelGitHubApp(frontmatter)
+	if err != nil {
+		return nil, err
+	}
+
 	// Use JSON marshaling for the entire frontmatter conversion.
 	// TemplatableInt32.UnmarshalJSON transparently handles both integer literals
 	// (e.g. timeout-minutes: 30) and GitHub Actions expressions
@@ -26,6 +31,9 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 	if err := json.Unmarshal(jsonBytes, &config); err != nil {
 		frontmatterTypesLog.Printf("Failed to unmarshal frontmatter: %v", err)
 		return nil, fmt.Errorf("failed to unmarshal frontmatter into config: %w", err)
+	}
+	if err := validateThreatDetectionSuppressions(config.ThreatDetectionSuppressions); err != nil {
+		return nil, err
 	}
 
 	if err := validateRunsOnValue(config.RunsOn); err != nil {
@@ -41,6 +49,15 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 		if threatRaw, ok := safeOutputsRaw["threat-detection"].(map[string]any); ok {
 			if err := validateRunsOnValue(threatRaw["runs-on"]); err != nil {
 				return nil, err
+			}
+		}
+		if jobsRaw, ok := safeOutputsRaw["jobs"].(map[string]any); ok {
+			for _, jobRaw := range jobsRaw {
+				if job, ok := jobRaw.(map[string]any); ok {
+					if err := validateRunsOnValue(job["runs-on"]); err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 	}
@@ -61,6 +78,16 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 			config.PermissionsTyped = permissionsTyped
 			frontmatterTypesLog.Print("Parsed typed permissions config")
 		}
+	}
+
+	// permissions.contents: none (or the "none" shorthand) signals that the workflow
+	// does not need its own repository content, so the automatic workflow-repository
+	// checkout (and "Checkout PR branch" step) should be skipped. Other explicitly
+	// configured checkout entries (e.g. a target-only sidecar checkout of a different
+	// repository) are unaffected and are still checked out normally.
+	if checkoutSkipDefaultFromPermissions(frontmatter["permissions"]) {
+		config.CheckoutSkipDefault = true
+		frontmatterTypesLog.Print("Skipping default checkout: permissions.contents is none")
 	}
 
 	// Parse checkout field - supports single object, array of objects, or false to disable
@@ -87,6 +114,17 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 		}
 	}
 
+	// Parse typed on.stop-after field if on exists. Parse errors (e.g. wrong type) are
+	// intentionally not fatal here: extractStopAfterFromOn re-validates the raw value
+	// and returns the actual compile error at the point stop-after is consumed.
+	if len(config.On) > 0 {
+		stopAfter, err := parseOnStopAfterValue(config.On)
+		if err == nil {
+			config.OnStopAfter = stopAfter
+			frontmatterTypesLog.Printf("Parsed typed on.stop-after config: %q", stopAfter)
+		}
+	}
+
 	// Populate typed ExperimentConfigs from the raw frontmatter map so that both the
 	// legacy bare-array form and the new object form are available as ExperimentConfig
 	// structs without callers needing to type-assert config.Experiments entries.
@@ -95,6 +133,18 @@ func ParseFrontmatterConfig(frontmatter map[string]any) (*FrontmatterConfig, err
 	if rawSkills, ok := frontmatter["skills"].([]any); ok {
 		config.SkillReferences = parseRawSkillReferences(rawSkills)
 	}
+	if rawPlugins, ok := frontmatter["plugins"].([]any); ok {
+		config.PluginReferences = parseRawPluginReferences(rawPlugins)
+	}
+	if ambientFolders, err := extractAmbientFolders(frontmatter); err != nil {
+		return nil, err
+	} else if ambientFolders != nil {
+		config.AmbientFolders, err = normalizeAmbientFolders(ambientFolders)
+		if err != nil {
+			return nil, err
+		}
+	}
+	config.GitHubApp = githubApp
 
 	frontmatterTypesLog.Printf("Successfully parsed frontmatter config: name=%s, engine=%v", config.Name, config.Engine)
 	return &config, nil
@@ -268,6 +318,8 @@ func parsePermissionsConfig(permissions map[string]any) (*PermissionsConfig, err
 				config.Actions = levelStr
 			case "checks":
 				config.Checks = levelStr
+			case "code-quality":
+				config.CodeQuality = levelStr
 			case "contents":
 				config.Contents = levelStr
 			case "deployments":
@@ -278,6 +330,8 @@ func parsePermissionsConfig(permissions map[string]any) (*PermissionsConfig, err
 				config.Issues = levelStr
 			case "discussions":
 				config.Discussions = levelStr
+			case "drives":
+				config.Drives = levelStr
 			case "packages":
 				config.Packages = levelStr
 			case "pages":

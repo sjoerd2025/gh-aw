@@ -39,12 +39,26 @@ describe("no-setfailed-then-exit-zero", () => {
         `core.setFailed("bad"); process.exit(code);`,
         // process.exit with non-zero string literal — not matched
         `core.setFailed("bad"); process.exit("0");`,
+        // Computed process["exit"] with non-zero argument is fine
+        `core.setFailed("bad"); process["exit"](1);`,
+        // Computed process["exitCode"] with non-zero assignment is fine
+        `core.setFailed("bad"); process["exitCode"] = 1;`,
         // Computed alias not matching core
         `const c = other; function f() { c.setFailed("bad"); process.exit(0); }`,
         // Destructured from non-core — not flagged
         `const { setFailed } = other; function f() { setFailed("bad"); process.exit(0); }`,
         // Destructured setFailed with return is the correct pattern
         `const { setFailed } = core; function f() { setFailed("bad"); return; }`,
+        // process.exitCode = 0 without a preceding core.setFailed is fine
+        `process.exitCode = 0;`,
+        // core.setFailed followed by process.exitCode = 1 is fine — non-zero code preserves failure
+        `core.setFailed("bad"); process.exitCode = 1;`,
+        // core.setFailed followed by process.exitCode = variable — runtime value unknown, not flagged
+        `core.setFailed("bad"); process.exitCode = code;`,
+        // return between setFailed and process.exitCode = 0 stops scanning
+        `function f() { core.setFailed("bad"); return; process.exitCode = 0; }`,
+        // process.exitCode = "0" (string, not the number literal) — not matched
+        `core.setFailed("bad"); process.exitCode = "0";`,
       ],
       invalid: [
         // Adjacent: core.setFailed immediately followed by process.exit(0)
@@ -87,6 +101,16 @@ describe("no-setfailed-then-exit-zero", () => {
           code: `switch (x) { case 1: core.setFailed("bad"); process.exit(0); break; }`,
           errors: [{ messageId: "noSetFailedThenExitZero", suggestions: [{ messageId: "replaceWithReturn", output: `switch (x) { case 1: core.setFailed("bad"); return; break; }` }] }],
         },
+        // Nested setFailed in if-block, then sibling process.exit(0) in enclosing block
+        {
+          code: `function f() { if (bad) { core.setFailed("x"); } process.exit(0); }`,
+          errors: [{ messageId: "noSetFailedThenExitZero", suggestions: [] }],
+        },
+        // Existing same-block detection remains invalid
+        {
+          code: `function f() { core.setFailed("bad"); core.info("msg"); process.exit(0); }`,
+          errors: [{ messageId: "noSetFailedThenExitZero", suggestions: [] }],
+        },
         // Destructured setFailed from core
         {
           code: `const { setFailed } = core; function f() { setFailed("bad"); process.exit(0); }`,
@@ -96,6 +120,31 @@ describe("no-setfailed-then-exit-zero", () => {
         {
           code: `const { setFailed: sf } = core; function f() { sf("bad"); process.exit(0); }`,
           errors: [{ messageId: "noSetFailedThenExitZero", suggestions: [{ messageId: "replaceWithReturn", output: `const { setFailed: sf } = core; function f() { sf("bad"); return; }` }] }],
+        },
+        // Adjacent: core.setFailed immediately followed by process.exitCode = 0
+        {
+          code: `core.setFailed("bad"); process.exitCode = 0;`,
+          errors: [{ messageId: "noSetFailedThenExitCodeZero", suggestions: [{ messageId: "removeExitCodeZero", output: `core.setFailed("bad"); ` }] }],
+        },
+        // Non-adjacent: intervening log statement does not stop detection for exitCode = 0
+        {
+          code: `core.setFailed("bad"); core.info("msg"); process.exitCode = 0;`,
+          errors: [{ messageId: "noSetFailedThenExitCodeZero", suggestions: [{ messageId: "removeExitCodeZero", output: `core.setFailed("bad"); core.info("msg"); ` }] }],
+        },
+        // Inside a function
+        {
+          code: `function f() { core.setFailed("bad"); process.exitCode = 0; }`,
+          errors: [{ messageId: "noSetFailedThenExitCodeZero", suggestions: [{ messageId: "removeExitCodeZero", output: `function f() { core.setFailed("bad");  }` }] }],
+        },
+        // Computed process["exit"](0)
+        {
+          code: `core.setFailed("bad"); process["exit"](0);`,
+          errors: [{ messageId: "noSetFailedThenExitZero", suggestions: [{ messageId: "replaceWithReturn", output: `core.setFailed("bad"); return;` }] }],
+        },
+        // Computed process["exitCode"] = 0
+        {
+          code: `core.setFailed("bad"); process["exitCode"] = 0;`,
+          errors: [{ messageId: "noSetFailedThenExitCodeZero", suggestions: [{ messageId: "removeExitCodeZero", output: `core.setFailed("bad"); ` }] }],
         },
       ],
     });

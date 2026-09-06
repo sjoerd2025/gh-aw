@@ -10,10 +10,8 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
+model: mai-code-1-flash-picker
 engine:
   id: copilot
   copilot-sdk: true
@@ -27,7 +25,7 @@ imports:
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [pull_requests, repos, issues, labels]
   repo-memory:
     branch-name: memory/pr-triage
@@ -53,7 +51,7 @@ safe-outputs:
   messages:
     run-started: "🔍 Starting PR triage analysis... [{workflow_name}]({run_url}) is categorizing and prioritizing agent-created PRs"
     run-success: "✅ PR triage complete! [{workflow_name}]({run_url}) has analyzed and categorized PRs. Check the issue for detailed report."
-    run-failure: "❌ PR triage failed! [{workflow_name}]({run_url}) {status}. Some PRs may not be triaged."
+    run-failure: "❌ PR triage failed! [{workflow_name}]({run_url}) {status}. Some PRs may not be triaged. Check the [run logs]({run_url}) for details before rerunning triage."
 timeout-minutes: 30
 # Default AI credit budget for this workflow.
 max-ai-credits: 1500
@@ -66,6 +64,9 @@ evals:
     question: Does the agent output confirm that category, risk, and action data were determined for each processed PR?
   - id: report-produced
     question: Does the agent output include a triage report summarizing the PRs processed?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # PR Triage Agent
@@ -84,6 +85,7 @@ You triage open agent-created PRs: categorize, score risk/priority, recommend ac
 - Load prior state from `/tmp/gh-aw/repo-memory/default/` when present.
 - Fetch open PRs authored by `app/github-copilot`.
 - Keep PRs authored by `app/github-copilot`, including same-repo branches and forks.
+- Apply a **1-hour cooldown**: skip any PR that was opened or last updated (new commits, edits) less than 1 hour before the current run time. These PRs are likely still being actively worked on by the authoring agent; re-triage them on a later run once they have stabilized.
 - Capture number/title/body/files/age/labels/review status/comments and optional agent-quality metadata using the GitHub MCP tools (`pull_request_read` with methods `get`, `get_files`, `get_reviews`, `get_review_comments`).
 - Fetch CI status using the GitHub MCP `pull_request_read` tool with method `get_check_runs` for each PR. Do **not** use `gh pr checks` or `gh pr view` — they use GraphQL which is blocked by the CLI proxy.
 
@@ -149,6 +151,7 @@ Write `/tmp/gh-aw/repo-memory/default/pr-triage-latest.json` containing run meta
 
 - Be consistent and criteria-driven.
 - Prefer actionable outputs over narration.
+- Respect the 1-hour cooldown: never label, comment on, or report an action for a PR opened or updated within the last hour.
 - Handle edge cases: empty PR descriptions, mixed-change PRs, stale PRs, superseded PRs, and failing CI.
 - **Never use `gh pr checks` or `gh pr view`** — these commands issue GraphQL operations that the CLI proxy blocks with 403. Use the GitHub MCP `pull_request_read` tool with method `get_check_runs` for CI status and method `get` for PR details instead.
 - When `get_check_runs` returns no data or fails for a PR, treat CI status as unknown and continue triaging; do not retry via CLI commands.

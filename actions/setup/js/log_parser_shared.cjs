@@ -826,7 +826,15 @@ function convertCopilotEventsToLegacyLogEntries(logEntries) {
   };
 
   const normalizeToolName = (rawToolName, mcpServerName) => {
-    const toolName = typeof rawToolName === "string" && rawToolName.trim() ? rawToolName.trim() : "unknown";
+    let toolName = typeof rawToolName === "string" && rawToolName.trim() ? rawToolName.trim() : "unknown";
+    // The Copilot CLI emits the builtin shell tool as lowercase "bash", but the
+    // shared formatters (formatToolUse, commandSummary bullet list) special-case
+    // the capitalized "Bash" name used by Claude. Normalize so Copilot's bash
+    // calls get the same command formatting instead of falling through to the
+    // generic tool renderer.
+    if (toolName.toLowerCase() === "bash") {
+      toolName = "Bash";
+    }
     if (toolName.startsWith("mcp__")) {
       return toolName;
     }
@@ -1307,6 +1315,16 @@ function formatSafeOutputsPreview(safeOutputsContent, options = {}) {
         const bodyPreview = truncateString(bodyStr.replace(/\n/g, " "), 80);
         preview.push(`      Body: ${bodyPreview}`);
       }
+      // noop, missing_tool, and missing_data carry their primary content in
+      // "message"/"reason" rather than title/body — surface those too.
+      if (entry.message) {
+        const messageStr = typeof entry.message === "string" ? entry.message : String(entry.message);
+        preview.push(`      Message: ${truncateString(messageStr.replace(/\n/g, " "), 80)}`);
+      }
+      if (entry.reason) {
+        const reasonStr = typeof entry.reason === "string" ? entry.reason : String(entry.reason);
+        preview.push(`      Reason: ${truncateString(reasonStr.replace(/\n/g, " "), 80)}`);
+      }
     }
 
     if (hasMore) {
@@ -1342,6 +1360,20 @@ function formatSafeOutputsPreview(safeOutputsContent, options = {}) {
         preview.push(bodyPreview);
         preview.push("``````");
         preview.push("</details>");
+        preview.push("");
+      }
+
+      // noop, missing_tool, and missing_data carry their primary content in
+      // "message"/"reason" rather than title/body — surface those too.
+      if (entry.message) {
+        const messageStr = typeof entry.message === "string" ? entry.message : String(entry.message);
+        preview.push(`**Message:** ${truncateString(messageStr, 200)}`);
+        preview.push("");
+      }
+
+      if (entry.reason) {
+        const reasonStr = typeof entry.reason === "string" ? entry.reason : String(entry.reason);
+        preview.push(`**Reason:** ${truncateString(reasonStr, 200)}`);
         preview.push("");
       }
 

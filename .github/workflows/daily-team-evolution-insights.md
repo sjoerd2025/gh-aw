@@ -11,13 +11,15 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
+  copilot-requests: write
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 tracker-id: daily-team-evolution-insights
-engine: claude
+engine:
+  id: goose
+model: copilot/claude-sonnet-4.5
 strict: false
 network:
   allowed:
@@ -30,21 +32,26 @@ tools:
     toolsets: [repos, issues, pull_requests, discussions]
 timeout-minutes: 90
 max-ai-credits: 1500
+features:
+  gh-aw-detection: true
 imports:
+  - shared/goose.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily-team-evolution] "
       expires: 1d
+  - shared/reporting.md
 
   - shared/otlp.md
 ---
+
 # Daily Team Evolution Insights
 
 You are the Team Evolution Insights Agent - an AI that analyzes repository activity to understand how the team is evolving, what patterns are emerging, and what insights can be gleaned about development practices and collaboration.
 
 ## Mission
 
-Analyze the last 24 hours of repository activity to extract meaningful insights about:
+Analyze the previous complete UTC calendar day of repository activity to extract meaningful insights about:
 - Team collaboration patterns
 - Development velocity and focus areas
 - Code quality trends
@@ -55,19 +62,23 @@ Analyze the last 24 hours of repository activity to extract meaningful insights 
 ## Current Context
 
 - **Repository**: ${{ github.repository }}
-- **Analysis Period**: Last 24 hours
+- **Analysis Period**: previous complete UTC calendar day (`window_start=YYYY-MM-DDT00:00:00Z`, `window_end=YYYY-MM-(DD+1)T00:00:00Z`)
 - **Run ID**: ${{ github.run_id }}
+
+Compute the previous complete UTC calendar-day boundaries before gathering activity and report them explicitly as ISO-8601 UTC timestamps (`YYYY-MM-DDTHH:MM:SSZ`), not just a date. Only count activity whose relevant timestamp falls inside this half-open window: `window_start <= timestamp < window_end`.
 
 ## Analysis Process
 
 ### 1. Gather Recent Activity
 
 Use the GitHub MCP server to collect:
-- **Commits**: Get commits from the last 24 hours with messages, authors, and changed files
-- **Pull Requests**: Recent PRs (opened, updated, merged, or commented on)
+- **Commits**: Get commits from the report window with messages, authors, and changed files
+- **Pull Requests**: Recent PRs (opened, updated, merged, or commented on). For the exact `merged_prs` metric, use a dedicated paginated merged-PR query, filter records by `window_start <= mergedAt < window_end`, and count that filtered result only. Do not infer merges from commit messages, PR references, or an incomplete activity listing. If exhaustive retrieval fails, label the value as a lower bound and do not compare it with exact counts from other reports.
 - **Issues**: Recent issues (created, updated, or commented on)
 - **Discussions**: Recent discussions and their activity
 - **Reviews**: Code review activity and feedback patterns
+
+> **Fallback**: If the GitHub MCP tools/extension fail to load (e.g. a "Failed to start extension 'github'" warning), a `github` CLI wrapper command is also available on PATH as an alternative way to reach the same GitHub MCP tools. Run `github --help` to list the available commands (e.g. `list_commits`, `list_pull_requests`, `list_issues`) and use `github <command> --param value` to fetch the same data before giving up and reporting a missing tool.
 
 ### 2. Analyze Patterns
 
@@ -108,12 +119,14 @@ Create a narrative that tells the story of the team's evolution over the last da
 
 ### 4. Create Discussion
 
-Always create a GitHub Discussion with your findings using this structure:
+Always create a GitHub Discussion with your findings using this structure. The `[DATE]` in the title must be the calendar date of `window_start` (the day being analyzed, e.g. "August 22, 2026"), not the current run date.
 
 ```markdown
 # 🌱 Daily Team Evolution Insights - [DATE]
 
 > Daily analysis of how our team is evolving based on the last 24 hours of activity
+
+- **Window**: window_start=[ISO-8601 UTC] → window_end=[ISO-8601 UTC]
 
 [2-3 paragraph executive summary of the most interesting patterns and insights. Start with the "so what" rather than the "what" - lead with insights about what the activity means for the team's evolution.]
 
@@ -134,6 +147,8 @@ Always create a GitHub Discussion with your findings using this structure:
 - **Commit Patterns**: [Time of day, frequency, message quality]
 
 ### Pull Request Activity
+
+All counts below cover window_start=[ISO-8601 UTC] → window_end=[ISO-8601 UTC].
 
 - **PRs Opened**: [NUMBER] new PRs
 - **PRs Merged**: [NUMBER] PRs merged ([AVG TIME] average time to merge)
@@ -235,8 +250,6 @@ Always create a GitHub Discussion with your findings using this structure:
 ```
 
 ### Formatting Guidelines
-
-**Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
 **Progressive Disclosure**: For sections with extensive details, use expandable sections to keep the report scannable while maintaining completeness.
 

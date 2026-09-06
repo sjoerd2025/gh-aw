@@ -16,6 +16,7 @@ import (
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/scanfindings"
 )
 
 var poutineLog = logger.New("cli:poutine")
@@ -31,18 +32,25 @@ type poutineFinding struct {
 	} `json:"meta"`
 }
 
+// poutineRule describes a poutine rule definition from the JSON output
+type poutineRule struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Level       string `json:"level"` // error, warning, note
+}
+
+// poutineRules maps rule identifiers to their definitions
+type poutineRules map[string]poutineRule
+
 // poutineOutput represents the complete JSON output from poutine
 type poutineOutput struct {
 	Findings []poutineFinding `json:"findings"`
-	Rules    map[string]struct {
-		ID          string `json:"id"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Level       string `json:"level"` // error, warning, note
-	} `json:"rules"`
+	Rules    poutineRules     `json:"rules"`
 }
 
-// ensurePoutineConfig creates .poutine.yml to configure allowed runners if it doesn't exist
+// ensurePoutineConfig creates .poutine.yml to configure allowed runners and
+// acknowledged findings if it doesn't exist
 func ensurePoutineConfig(gitRoot string) error {
 	configPath := filepath.Join(gitRoot, ".poutine.yml")
 
@@ -62,6 +70,17 @@ rulesConfig:
   pr_runs_on_self_hosted:
     allowed_runners:
       - ubuntu-slim  # GitHub's new built-in runner (not self-hosted)
+
+# Acknowledge findings that do not apply to gh-aw generated workflows.
+# poutine has no inline ignore comment mechanism; skips must be declared here.
+skip:
+  # The generated "activation" job runs helper scripts from
+  # "$RUNNER_TEMP/gh-aw/actions/*.sh". Those scripts are extracted from the
+  # pinned gh-aw action, not from the repository checkout, so they cannot be
+  # controlled by an untrusted contributor. The rule still fires because the
+  # workflow declares an untrusted trigger (for example workflow_call).
+  - rule: untrusted_checkout_exec
+    job: activation
 `
 
 	// Write the config file
@@ -80,12 +99,13 @@ func runPoutineOnDirectory(workflowDir string, verbose bool, strict bool) error 
 	// Find git root to get the absolute path for Docker volume mount
 	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
-		return fmt.Errorf("failed to find git root: %w", err)
+		return err
 	}
 
 	// Validate gitRoot is an absolute path (security: ensure trusted path from git)
-	if !filepath.IsAbs(gitRoot) {
-		return fmt.Errorf("git root is not an absolute path: %s", gitRoot)
+	gitRoot, err = fileutil.ValidateAbsolutePath(gitRoot)
+	if err != nil {
+		return fmt.Errorf("invalid git root %q: %w", gitRoot, err)
 	}
 
 	// Ensure poutine config exists with custom runner configuration
@@ -94,16 +114,28 @@ func runPoutineOnDirectory(workflowDir string, verbose bool, strict bool) error 
 	}
 
 	// Build the Docker command with JSON output for easier parsing
-	// docker run --rm -v "$(pwd)":/workdir -w /workdir ghcr.io/boostsecurityio/poutine:latest analyze_local . --format json
+	// docker run --rm -v "$(pwd)":/workdir -w /workdir <PoutineImage> analyze_local . --format json
 	// #nosec G204 -- gitRoot comes from git rev-parse (trusted source) and is validated as absolute path
 	// exec.Command with separate args (not shell execution) prevents command injection
+	volumeMount, err := buildDockerVolumeMount(gitRoot, "/workdir")
+	if err != nil {
+		return fmt.Errorf("invalid docker mount path: %w", err)
+	}
+	poutineImageRef, err := validateDockerImageRef(PoutineImage)
+	if err != nil {
+		return fmt.Errorf("invalid poutine scanner image reference %q: %w", PoutineImage, err)
+	}
+	dockerPath, err := fileutil.ResolveExecutablePath("docker")
+	if err != nil {
+		return fmt.Errorf("docker command not found: %w", err)
+	}
 	cmd := exec.Command(
-		"docker",
+		dockerPath,
 		"run",
 		"--rm",
-		"-v", gitRoot+":/workdir",
+		"-v", volumeMount,
 		"-w", "/workdir",
-		"ghcr.io/boostsecurityio/poutine:latest",
+		poutineImageRef,
 		"analyze_local",
 		".",
 		"--format", "json",
@@ -115,8 +147,18 @@ func runPoutineOnDirectory(workflowDir string, verbose bool, strict bool) error 
 
 	// In verbose mode, also show the command that users can run directly
 	if verbose {
-		dockerCmd := fmt.Sprintf("docker run --rm -v \"%s:/workdir\" -w /workdir ghcr.io/boostsecurityio/poutine:latest analyze_local . --format json --quiet",
-			gitRoot)
+		dockerCmd := shellJoinArgs([]string{
+			"docker",
+			"run",
+			"--rm",
+			"-v", volumeMount,
+			"-w", "/workdir",
+			poutineImageRef,
+			"analyze_local",
+			".",
+			"--format", "json",
+			"--quiet",
+		})
 		fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("Run poutine directly: "+dockerCmd))
 	}
 
@@ -152,7 +194,7 @@ func runPoutineOnDirectory(workflowDir string, verbose bool, strict bool) error 
 			if exitCode == 1 {
 				// In strict mode, any findings in the scan are treated as errors
 				if strict && totalWarnings > 0 {
-					return fmt.Errorf("strict mode: poutine found %d security warnings/errors - workflows must have no poutine findings in strict mode", totalWarnings)
+					return fmt.Errorf("strict mode: poutine found %d security warnings/errors - workflows must have no poutine findings in strict mode. Example: rerun after resolving all reported findings", totalWarnings)
 				}
 				// In non-strict mode, findings are logged but not treated as errors
 				return nil
@@ -175,12 +217,13 @@ func runPoutineOnFile(lockFile string, verbose bool, strict bool) error {
 	// Find git root to get the absolute path for Docker volume mount
 	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
-		return fmt.Errorf("failed to find git root: %w", err)
+		return err
 	}
 
 	// Validate gitRoot is an absolute path (security: ensure trusted path from git)
-	if !filepath.IsAbs(gitRoot) {
-		return fmt.Errorf("git root is not an absolute path: %s", gitRoot)
+	gitRoot, err = fileutil.ValidateAbsolutePath(gitRoot)
+	if err != nil {
+		return fmt.Errorf("invalid git root %q: %w", gitRoot, err)
 	}
 
 	// Ensure poutine config exists with custom runner configuration
@@ -195,16 +238,28 @@ func runPoutineOnFile(lockFile string, verbose bool, strict bool) error {
 	}
 
 	// Build the Docker command with JSON output for easier parsing
-	// docker run --rm -v "$(pwd)":/workdir -w /workdir ghcr.io/boostsecurityio/poutine:latest analyze_local . --format json
+	// docker run --rm -v "$(pwd)":/workdir -w /workdir <PoutineImage> analyze_local . --format json
 	// #nosec G204 -- gitRoot comes from git rev-parse (trusted source) and is validated as absolute path
 	// exec.Command with separate args (not shell execution) prevents command injection
+	volumeMount, err := buildDockerVolumeMount(gitRoot, "/workdir")
+	if err != nil {
+		return fmt.Errorf("invalid docker mount path: %w", err)
+	}
+	poutineImageRef, err := validateDockerImageRef(PoutineImage)
+	if err != nil {
+		return fmt.Errorf("invalid poutine scanner image reference %q: %w", PoutineImage, err)
+	}
+	dockerPath, err := fileutil.ResolveExecutablePath("docker")
+	if err != nil {
+		return fmt.Errorf("docker command not found: %w", err)
+	}
 	cmd := exec.Command(
-		"docker",
+		dockerPath,
 		"run",
 		"--rm",
-		"-v", gitRoot+":/workdir",
+		"-v", volumeMount,
 		"-w", "/workdir",
-		"ghcr.io/boostsecurityio/poutine:latest",
+		poutineImageRef,
 		"analyze_local",
 		".",
 		"--format", "json",
@@ -216,8 +271,18 @@ func runPoutineOnFile(lockFile string, verbose bool, strict bool) error {
 
 	// In verbose mode, also show the command that users can run directly
 	if verbose {
-		dockerCmd := fmt.Sprintf("docker run --rm -v \"%s:/workdir\" -w /workdir ghcr.io/boostsecurityio/poutine:latest analyze_local . --format json --quiet",
-			gitRoot)
+		dockerCmd := shellJoinArgs([]string{
+			"docker",
+			"run",
+			"--rm",
+			"-v", volumeMount,
+			"-w", "/workdir",
+			poutineImageRef,
+			"analyze_local",
+			".",
+			"--format", "json",
+			"--quiet",
+		})
 		fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("Run poutine directly: "+dockerCmd))
 	}
 
@@ -255,7 +320,7 @@ func runPoutineOnFile(lockFile string, verbose bool, strict bool) error {
 			if exitCode == 1 {
 				// In strict mode, any findings in the scan are treated as errors
 				if strict && totalWarnings > 0 {
-					return fmt.Errorf("strict mode: poutine found %d security warnings/errors in %s - workflows must have no poutine findings in strict mode", totalWarnings, filepath.Base(lockFile))
+					return fmt.Errorf("strict mode: poutine found %d security warnings/errors in %s - workflows must have no poutine findings in strict mode. Example: rerun after resolving all reported findings in %s", totalWarnings, filepath.Base(lockFile), filepath.Base(lockFile))
 				}
 				// In non-strict mode, findings are logged but not treated as errors
 				return nil
@@ -283,7 +348,7 @@ func parseAndDisplayPoutineOutput(stdout, targetFile string, verbose bool) (int,
 	if !strings.HasPrefix(trimmed, "{") {
 		// Non-JSON output, likely an error
 		if trimmed != "" {
-			return 0, fmt.Errorf("unexpected poutine output format: %s", trimmed)
+			return 0, fmt.Errorf("unexpected poutine output format (expected JSON object). Example: {\"findings\":[]}. Got: %s", trimmed)
 		}
 		return 0, nil
 	}
@@ -314,68 +379,8 @@ func parseAndDisplayPoutineOutput(stdout, targetFile string, verbose bool) (int,
 		fileLines = strings.Split(string(fileContent), "\n")
 	}
 
-	// Display detailed findings using CompilerError format
-	for _, finding := range relevantFindings {
-		// Get rule details
-		ruleInfo := output.Rules[finding.RuleID]
-		severity := ruleInfo.Level
-		if severity == "" {
-			severity = "warning" // Default to warning if not specified
-		}
-
-		title := ruleInfo.Title
-		if title == "" {
-			title = finding.RuleID
-		}
-
-		// Get line number (poutine uses 1-based indexing)
-		lineNum := finding.Meta.Line
-		if lineNum == 0 {
-			lineNum = 1 // Default to line 1 if not specified
-		}
-
-		// Create context lines around the error
-		var context []string
-		if len(fileLines) > 0 && lineNum > 0 && lineNum <= len(fileLines) {
-			startLine := max(1, lineNum-2)
-			endLine := min(len(fileLines), lineNum+2)
-
-			for i := startLine; i <= endLine; i++ {
-				if i-1 < len(fileLines) {
-					context = append(context, fileLines[i-1])
-				}
-			}
-		}
-
-		// Map severity to error type
-		errorType := "warning"
-		switch severity {
-		case "error":
-			errorType = "error"
-		case "note":
-			errorType = "info"
-		}
-
-		// Build message with details
-		message := fmt.Sprintf("[%s] %s: %s", severity, finding.RuleID, title)
-		if finding.Meta.Details != "" {
-			message = fmt.Sprintf("%s - %s", message, finding.Meta.Details)
-		}
-
-		// Create and format CompilerError
-		compilerErr := console.CompilerError{
-			Position: console.ErrorPosition{
-				File:   finding.Meta.Path,
-				Line:   lineNum,
-				Column: 1, // poutine doesn't provide column info
-			},
-			Type:    errorType,
-			Message: message,
-			Context: context,
-		}
-
-		fmt.Fprint(os.Stderr, console.FormatError(compilerErr))
-	}
+	// Display detailed findings using the shared finding representation
+	scanfindings.Render(os.Stderr, poutineFindingsToShared(relevantFindings, output.Rules, targetFile, fileLines))
 
 	return totalWarnings, nil
 }
@@ -393,7 +398,7 @@ func parseAndDisplayPoutineOutputForDirectory(stdout string, verbose bool, gitRo
 	if !strings.HasPrefix(trimmed, "{") {
 		// Non-JSON output, likely an error
 		if trimmed != "" {
-			return 0, fmt.Errorf("unexpected poutine output format: %s", trimmed)
+			return 0, fmt.Errorf("unexpected poutine output format (expected JSON object). Example: {\"findings\":[]}. Got: %s", trimmed)
 		}
 		return 0, nil
 	}
@@ -457,69 +462,51 @@ func parseAndDisplayPoutineOutputForDirectory(stdout string, verbose bool, gitRo
 			fileLines = strings.Split(string(fileContent), "\n")
 		}
 
-		// Display detailed findings using CompilerError format
-		for _, finding := range findings {
-			// Get rule details
-			ruleInfo := output.Rules[finding.RuleID]
-			severity := ruleInfo.Level
-			if severity == "" {
-				severity = "warning" // Default to warning if not specified
-			}
-
-			title := ruleInfo.Title
-			if title == "" {
-				title = finding.RuleID
-			}
-
-			// Get line number (poutine uses 1-based indexing)
-			lineNum := finding.Meta.Line
-			if lineNum == 0 {
-				lineNum = 1 // Default to line 1 if not specified
-			}
-
-			// Create context lines around the error
-			var context []string
-			if len(fileLines) > 0 && lineNum > 0 && lineNum <= len(fileLines) {
-				startLine := max(1, lineNum-2)
-				endLine := min(len(fileLines), lineNum+2)
-
-				for i := startLine; i <= endLine; i++ {
-					if i-1 < len(fileLines) {
-						context = append(context, fileLines[i-1])
-					}
-				}
-			}
-
-			// Map severity to error type
-			errorType := "warning"
-			switch severity {
-			case "error":
-				errorType = "error"
-			case "note":
-				errorType = "info"
-			}
-
-			// Build message with details
-			message := fmt.Sprintf("[%s] %s: %s", severity, finding.RuleID, title)
-			if finding.Meta.Details != "" {
-				message = fmt.Sprintf("%s - %s", message, finding.Meta.Details)
-			}
-
-			// Create and format CompilerError
-			compilerErr := console.CompilerError{
-				Position: console.ErrorPosition{
-					File:   finding.Meta.Path,
-					Line:   lineNum,
-					Column: 1, // poutine doesn't provide column info
-				},
-				Type:    errorType,
-				Message: message,
-				Context: context,
-			}
-
-			fmt.Fprint(os.Stderr, console.FormatError(compilerErr))
-		}
+		// Display detailed findings using the shared finding representation
+		scanfindings.Render(os.Stderr, poutineFindingsToShared(findings, output.Rules, filePath, fileLines))
 	}
 
 	return totalWarnings, nil
+}
+
+// poutineFindingsToShared maps poutine's native findings onto the shared finding
+// representation used by every scanner integration. Rule metadata supplies the
+// severity level and title when available.
+func poutineFindingsToShared(findings []poutineFinding, rules poutineRules, filePath string, fileLines []string) []scanfindings.Finding {
+	shared := make([]scanfindings.Finding, 0, len(findings))
+	for _, finding := range findings {
+		ruleInfo := rules[finding.RuleID]
+
+		severityLabel := ruleInfo.Level
+		if severityLabel == "" {
+			severityLabel = "warning" // Default to warning if not specified
+		}
+
+		title := ruleInfo.Title
+		if title == "" {
+			title = finding.RuleID
+		}
+
+		// Get line number (poutine uses 1-based indexing)
+		lineNum := finding.Meta.Line
+		if lineNum == 0 {
+			lineNum = 1 // Default to line 1 if not specified
+		}
+
+		message := scanfindings.FormatMessage(severityLabel, finding.RuleID, title)
+		if finding.Meta.Details != "" {
+			message = fmt.Sprintf("%s - %s", message, finding.Meta.Details)
+		}
+
+		shared = append(shared, scanfindings.Finding{
+			RuleID:   finding.RuleID,
+			Severity: scanfindings.ParseSeverity(severityLabel),
+			Message:  message,
+			File:     firstNonEmpty(finding.Meta.Path, filePath),
+			Line:     lineNum,
+			Column:   1, // poutine doesn't provide column info
+			Context:  scanfindings.ContextLines(fileLines, lineNum),
+		})
+	}
+	return shared
 }

@@ -14,10 +14,10 @@ permissions:
   copilot-requests: write
 tracker-id: daily-repo-chronicle
 engine:
-  id: copilot
-  copilot-sdk: true
+  id: pi
+  model-provider: openai
+model: openai/gpt-5.4
 
-max-tool-denials: 3
 timeout-minutes: 45
 
 network:
@@ -28,7 +28,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 tools:
   cli-proxy: true
   edit:
@@ -55,6 +54,7 @@ imports:
       expires: 3d
   - shared/trends.md
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 evals:

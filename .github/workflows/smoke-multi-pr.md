@@ -4,6 +4,7 @@ emoji: "🧪"
 name: Smoke Multi PR
 description: Test creating multiple pull requests in a single workflow run
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-multi-pr
     strategy: centralized
@@ -50,8 +51,13 @@ safe-outputs:
 timeout-minutes: 10
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
+    id: awf
 ---
 
 # Smoke Test: Multiple Pull Request Creation

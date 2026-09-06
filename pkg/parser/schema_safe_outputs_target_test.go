@@ -6,6 +6,97 @@ import (
 	"testing"
 )
 
+func TestMainWorkflowSchema_SafeOutputConfigCoverage(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on":     "push",
+		"engine": "copilot",
+		"safe-outputs": map[string]any{
+			"add-comment": map[string]any{
+				"allows-comment-ids":        []any{"IC_kwDOABCD123456"},
+				"hide-older-comments-match": []any{"workflow-id"},
+			},
+			"assign-milestone": map[string]any{
+				"auto_create": true,
+			},
+			"create-issue": map[string]any{
+				"require-temporary-id": true,
+			},
+			"create-pull-request": map[string]any{
+				"require-temporary-id": true,
+			},
+			"push-to-pull-request-branch": map[string]any{
+				"base-branch": "main",
+			},
+			"threat-detection": map[string]any{
+				"engine-config": "copilot",
+				"environment":   "production",
+				"model":         "gpt-5",
+			},
+		},
+	}
+
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/safe-output-config-coverage-test.md"); err != nil {
+		t.Fatalf("expected safe-output configuration fields to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchema_UpdatePullRequestSupportsReplaceIsland(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on":     "push",
+		"engine": "copilot",
+		"safe-outputs": map[string]any{
+			"update-pull-request": map[string]any{
+				"operation": "replace-island",
+			},
+		},
+	}
+
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/update-pull-request-replace-island-test.md"); err != nil {
+		t.Fatalf("expected update-pull-request replace-island operation to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchema_AzureDevOpsUpdateWorkItemSupportsStatus(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on":     "push",
+		"engine": "copilot",
+		"safe-outputs": map[string]any{
+			"ado-update-work-item": map[string]any{
+				"target": 42,
+				"status": true,
+			},
+		},
+	}
+
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/ado-update-work-item-status-test.md"); err != nil {
+		t.Fatalf("expected ado-update-work-item status to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchema_SafeOutputsRejectsCommentMemory(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on":     "push",
+		"engine": "copilot",
+		"safe-outputs": map[string]any{
+			"comment-memory": map[string]any{
+				"footer": true,
+			},
+		},
+	}
+
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/safe-output-comment-memory-test.md"); err == nil {
+		t.Fatal("expected safe-outputs.comment-memory to fail schema validation")
+	}
+}
+
 // TestMainWorkflowSchema_SafeOutputsTargetProperties validates that safe output
 // types which support target/target-repo/allowed-repos in the Go code also accept
 // those properties in the JSON schema. This is a regression test for cases where
@@ -138,6 +229,8 @@ func TestMainWorkflowSchema_SafeOutputsTargetProperties(t *testing.T) {
 			safeOutputs: map[string]any{
 				"remove-labels": map[string]any{
 					"allowed":       []any{"bug", "feature"},
+					"issues":        true,
+					"pull-requests": false,
 					"target":        "*",
 					"target-repo":   "github/github",
 					"allowed-repos": []any{"github/docs"},
@@ -285,12 +378,13 @@ func TestMainWorkflowSchema_SafeOutputsTargetProperties(t *testing.T) {
 			},
 		},
 		{
-			name: "dispatch-workflow with target-repo and allowed-repos",
+			name: "dispatch-workflow with target-repo, allowed-repos, and allowed-refs",
 			safeOutputs: map[string]any{
 				"dispatch-workflow": map[string]any{
 					"workflows":     []any{"worker"},
 					"target-repo":   "github/github",
 					"allowed-repos": []any{"github/docs"},
+					"allowed-refs":  []any{"refs/heads/release/*"},
 				},
 			},
 		},
@@ -301,6 +395,15 @@ func TestMainWorkflowSchema_SafeOutputsTargetProperties(t *testing.T) {
 					"target":        "*",
 					"target-repo":   "github/github",
 					"allowed-repos": []any{"github/docs"},
+				},
+			},
+		},
+		{
+			name: "create-check-run with target",
+			safeOutputs: map[string]any{
+				"create-check-run": map[string]any{
+					"name":   "Test Check",
+					"target": "*",
 				},
 			},
 		},

@@ -113,6 +113,20 @@ on:
 
 Human-friendly formats are automatically converted to standard cron expressions, with the original format preserved as a comment in the generated workflow file.
 
+### Cooldown (`cooldown:`)
+
+Set `on.cooldown` to skip agent execution until a duration has elapsed since the latest completed run that started the `agent` job. This is useful when a workflow runs more frequently than you want the agent to act, such as checking hourly but allowing an agent run every four hours:
+
+```aw wrap
+on:
+  schedule: hourly
+  cooldown: 4h
+```
+
+The duration uses Go duration syntax, such as `5m`, `1h`, or `1h30m`, and must be at least five minutes. GitHub Actions expressions are not supported. The cooldown starts when the previous workflow run finishes, provided the `agent` job started, regardless of whether that job succeeded or failed. Runs where the `agent` job was skipped do not restart the cooldown.
+
+The compiler adds `actions: read` to the pre-activation job so it can inspect completed runs. If run history cannot be queried, the cooldown check fails open and allows the agent to run.
+
 ### Issue Triggers (`issues:`)
 
 Trigger on issue events. [Full event reference](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#issues).
@@ -150,6 +164,20 @@ on:
   reaction: "rocket"
 ```
 
+The `types:` list accepts standard GitHub pull request activity types, including transition events such as `ready_for_review` and `converted_to_draft`.
+
+### Pull Request Target Triggers (`pull_request_target:`)
+
+Trigger on pull request events in the context of the base repository. Use this only when the workflow needs write-capable repository context, and avoid checking out untrusted fork code. See [Checkout](/gh-aw/reference/checkout/#pull_request_target-checkout) for the safe checkout pattern.
+
+```yaml wrap
+on:
+  pull_request_target:
+    types: [opened, ready_for_review]
+```
+
+`pull_request_target.types` accepts the same activity names as `pull_request`, including `ready_for_review`.
+
 #### Fork Filtering (`forks:`)
 
 Pull request workflows block forks by default for security. Use the `forks:` field to allow specific fork patterns:
@@ -162,6 +190,50 @@ on:
 ```
 
 Use `["owner/repo"]` for a specific repository, `["owner/*"]` for an entire org/user, or `["*"]` to allow all forks (use with caution). Omit `forks:` for the default behavior (same-repository PRs only). The compiler uses repository ID comparison so fork detection is unaffected by repository renames.
+
+#### Stacked PR Filtering (`max-stack:`)
+
+When using stacked pull requests (a chain of PRs each targeting the previous one), every PR in the stack normally triggers workflows. This multiplies CI cost for identical changes being reviewed at multiple layers. The `max-stack:` field lets you limit which stack layers run the workflow.
+
+By default (`max-stack: 1`), workflows run only on the **top-most PR** in the stack — the one currently under review. Lower-stack PRs are skipped automatically.
+
+This is supported for both `pull_request` and `pull_request_review` triggers.
+
+```yaml wrap
+on:
+  pull_request:
+    types: [opened, synchronize]
+    max-stack: 1   # default: run only on the top/latest PR in a stack
+```
+
+To run on the **top N** layers (for example, if you review multiple interdependent PRs at once):
+
+```yaml wrap
+on:
+  pull_request:
+    types: [opened, synchronize]
+    max-stack: 2   # run on the top 2 PRs in a stack
+```
+
+To **disable** stack protection and run on every PR in a stack:
+
+```yaml wrap
+on:
+  pull_request:
+    types: [opened, synchronize]
+    max-stack: -1  # run on all pull requests regardless of stack position
+```
+
+You can also apply the same filter to review events:
+
+```yaml wrap
+on:
+  pull_request_review:
+    types: [submitted]
+    max-stack: 2   # run only for reviews on the top 2 PRs in a stack
+```
+
+Non-stacked PRs and non-`pull_request`/`pull_request_review` events are unaffected by this setting.
 
 ### Comment Triggers
 
@@ -821,7 +893,7 @@ on: "deployment error"              # deployment_status with state == 'error' gu
 on: "deployment failed or error"    # deployment_status with state == 'failure' or 'error' guard
 ```
 
-## Related Documentation
+## Learn More
 
 - [Schedule Syntax](/gh-aw/reference/schedule-syntax/) - Complete schedule format reference
 - [Command Triggers](/gh-aw/reference/command-triggers/) - Special @mention triggers and context text

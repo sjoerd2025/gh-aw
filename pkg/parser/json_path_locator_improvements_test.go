@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"github.com/santhosh-tekuri/jsonschema/v6/kind"
 )
 
@@ -179,7 +180,31 @@ func TestLocateJSONPathForPathInfoSkipsRegexForNonAdditionalPropertiesErrorKind(
 	}
 }
 
-func TestLocateJSONPathForPathInfoUsesRegexFallbackForGroupErrorKind(t *testing.T) {
+func TestLocateJSONPathForPathInfoUsesGroupCausesForAdditionalProperties(t *testing.T) {
+	yamlContent := `on:
+  push:
+    branches: [main]
+  foobar: invalid`
+
+	info := JSONPathInfo{
+		Path:      "/on",
+		Message:   "this message is intentionally not parseable",
+		ErrorKind: &kind.Group{},
+		Causes: []*jsonschema.ValidationError{
+			{ErrorKind: &kind.AdditionalProperties{Properties: []string{"foobar"}}},
+		},
+	}
+
+	location := LocateJSONPathForPathInfo(yamlContent, info)
+	if !location.Found {
+		t.Fatal("expected location to be found")
+	}
+	if location.Line != 4 || location.Column != 3 {
+		t.Fatalf("expected additional property location at line 4, col 3; got line %d, col %d", location.Line, location.Column)
+	}
+}
+
+func TestLocateJSONPathForPathInfoDoesNotRegexCompositeErrorKind(t *testing.T) {
 	yamlContent := `on:
   push:
     branches: [main]
@@ -192,15 +217,13 @@ func TestLocateJSONPathForPathInfoUsesRegexFallbackForGroupErrorKind(t *testing.
 	}
 
 	location := LocateJSONPathForPathInfo(yamlContent, info)
-	if !location.Found {
-		t.Fatal("expected location to be found")
-	}
-	if location.Line != 4 || location.Column != 3 {
-		t.Fatalf("expected additional property location at line 4, col 3; got line %d, col %d", location.Line, location.Column)
+	expected := LocateJSONPathInYAML(yamlContent, "/on")
+	if location != expected {
+		t.Fatalf("expected fallback to LocateJSONPathInYAML location %+v, got %+v", expected, location)
 	}
 }
 
-func TestLocateJSONPathForPathInfoUsesRegexFallbackForOneOfErrorKind(t *testing.T) {
+func TestLocateJSONPathForPathInfoUsesNestedAdditionalPropertiesErrorKind(t *testing.T) {
 	yamlContent := `on:
   push:
     branches: [main]
@@ -208,8 +231,17 @@ func TestLocateJSONPathForPathInfoUsesRegexFallbackForOneOfErrorKind(t *testing.
 
 	info := JSONPathInfo{
 		Path:      "/on",
-		Message:   "at '/on': 'oneOf' failed, none matched\n- at '/on': additional properties 'foobar' not allowed\n- at '/on': got object, want null",
+		Message:   "this message is intentionally not parseable",
 		ErrorKind: &kind.OneOf{},
+		Causes: []*jsonschema.ValidationError{
+			{
+				ErrorKind: &kind.Group{},
+				Causes: []*jsonschema.ValidationError{
+					{ErrorKind: &kind.AdditionalProperties{Properties: []string{"foobar"}}},
+				},
+			},
+			{ErrorKind: &kind.Type{}},
+		},
 	}
 
 	location := LocateJSONPathForPathInfo(yamlContent, info)
@@ -418,6 +450,97 @@ func TestFindFrontmatterBounds(t *testing.T) {
 
 			if actualLines != tt.expectedFrontmatterLines {
 				t.Errorf("Expected %d frontmatter lines, got %d", tt.expectedFrontmatterLines, actualLines)
+			}
+		})
+	}
+}
+
+func TestMatchesPathSegmentKey(t *testing.T) {
+	tests := []struct {
+		name        string
+		trimmedLine string
+		key         string
+		expected    bool
+	}{
+		{
+			name:        "exact match with colon",
+			trimmedLine: "engine: copilot",
+			key:         "engine",
+			expected:    true,
+		},
+		{
+			name:        "match with space before colon",
+			trimmedLine: "engine :",
+			key:         "engine",
+			expected:    true,
+		},
+		{
+			name:        "match with tab before colon",
+			trimmedLine: "engine\t: value",
+			key:         "engine",
+			expected:    true,
+		},
+		{
+			name:        "prefix collision - longer key must not match",
+			trimmedLine: "engine-type: fast",
+			key:         "engine",
+			expected:    false,
+		},
+		{
+			name:        "different key",
+			trimmedLine: "other: value",
+			key:         "engine",
+			expected:    false,
+		},
+		{
+			name:        "empty trimmedLine",
+			trimmedLine: "",
+			key:         "engine",
+			expected:    false,
+		},
+		{
+			name:        "key with dot (regex metacharacter) matches literal dot",
+			trimmedLine: "on.push: value",
+			key:         "on.push",
+			expected:    true,
+		},
+		{
+			name:        "key with dot does not match different separator",
+			trimmedLine: "onXpush: value",
+			key:         "on.push",
+			expected:    false,
+		},
+		{
+			name:        "key with plus (regex metacharacter)",
+			trimmedLine: "a+b: value",
+			key:         "a+b",
+			expected:    true,
+		},
+		{
+			name:        "key with brackets (regex metacharacter)",
+			trimmedLine: "items[0]: value",
+			key:         "items[0]",
+			expected:    true,
+		},
+		{
+			name:        "colon-only line after key",
+			trimmedLine: "engine:",
+			key:         "engine",
+			expected:    true,
+		},
+		{
+			name:        "no colon at all",
+			trimmedLine: "engine value",
+			key:         "engine",
+			expected:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := matchesPathSegmentKey(tt.trimmedLine, tt.key)
+			if result != tt.expected {
+				t.Errorf("matchesPathSegmentKey(%q, %q) = %v, want %v", tt.trimmedLine, tt.key, result, tt.expected)
 			}
 		})
 	}

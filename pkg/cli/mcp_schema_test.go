@@ -12,6 +12,7 @@ import (
 )
 
 func TestGenerateSchema(t *testing.T) {
+	t.Parallel()
 	t.Run("generates schema for simple struct", func(t *testing.T) {
 		type SimpleOutput struct {
 			Name  string `json:"name" jsonschema:"Name of the item"`
@@ -215,6 +216,7 @@ func TestGenerateSchema(t *testing.T) {
 }
 
 func TestAddSchemaDefault(t *testing.T) {
+	t.Parallel()
 	t.Run("adds default to existing property", func(t *testing.T) {
 		type TestStruct struct {
 			Name  string `json:"name" jsonschema:"Name field"`
@@ -286,31 +288,25 @@ func TestAddSchemaDefault(t *testing.T) {
 }
 
 func TestGenerateSchemaWithDefaults(t *testing.T) {
-	t.Run("manually adds default values to schema", func(t *testing.T) {
+	t.Parallel()
+	t.Run("adds default values to schema", func(t *testing.T) {
 		type OutputWithDefaults struct {
 			Name    string `json:"name" jsonschema:"Name of the item"`
 			Count   int    `json:"count" jsonschema:"Number of items"`
 			Enabled bool   `json:"enabled" jsonschema:"Whether enabled"`
 		}
 
-		schema, err := GenerateSchema[OutputWithDefaults]()
+		schema, err := generateSchemaWithDefaults[OutputWithDefaults](map[string]any{
+			"name":    "test",
+			"count":   100,
+			"enabled": true,
+		})
 		if err != nil {
-			t.Fatalf("GenerateSchema failed: %v", err)
+			t.Fatalf("generateSchemaWithDefaults failed: %v", err)
 		}
 
 		if schema == nil {
 			t.Fatal("Expected schema to be non-nil")
-		}
-
-		// Manually add default values
-		if nameProp, ok := schema.Properties["name"]; ok {
-			nameProp.Default = json.RawMessage(`"test"`)
-		}
-		if countProp, ok := schema.Properties["count"]; ok {
-			countProp.Default = json.RawMessage(`100`)
-		}
-		if enabledProp, ok := schema.Properties["enabled"]; ok {
-			enabledProp.Default = json.RawMessage(`true`)
 		}
 
 		// Check name property has default
@@ -361,9 +357,39 @@ func TestGenerateSchemaWithDefaults(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("ignores missing default properties", func(t *testing.T) {
+		type OutputWithDefaults struct {
+			Name string `json:"name" jsonschema:"Name of the item"`
+		}
+
+		schema, err := generateSchemaWithDefaults[OutputWithDefaults](map[string]any{
+			"name":    "test",
+			"missing": "ignored",
+		})
+		if err != nil {
+			t.Fatalf("generateSchemaWithDefaults failed: %v", err)
+		}
+
+		nameProp, ok := schema.Properties["name"]
+		if !ok {
+			t.Fatal("Expected 'name' property to be defined")
+		}
+		var nameDefault string
+		if err := json.Unmarshal(nameProp.Default, &nameDefault); err != nil {
+			t.Fatalf("Failed to unmarshal name default: %v", err)
+		}
+		if nameDefault != "test" {
+			t.Errorf("Expected name default to be 'test', got %v", nameDefault)
+		}
+		if _, ok := schema.Properties["missing"]; ok {
+			t.Fatal("Expected 'missing' property not to be defined")
+		}
+	})
 }
 
 func TestGeneratedSchemasValidateRealOutput(t *testing.T) {
+	t.Parallel()
 	t.Run("validates LogsData schema against real data", func(t *testing.T) {
 		// Generate schema for LogsData
 		schema, err := GenerateSchema[LogsData]()

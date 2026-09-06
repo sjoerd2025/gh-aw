@@ -3,19 +3,17 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
-	"regexp"
-	"sort"
+	"os"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
-	"github.com/goccy/go-yaml"
 )
 
 var workflowBuilderLog = logger.New("workflow:workflow_builder")
 
-// buildInitialWorkflowData creates the initial WorkflowData struct with basic fields populated
+// buildInitialWorkflowData creates the initial WorkflowData struct with basic fields populated.
 func (c *Compiler) buildInitialWorkflowData(
 	result *parser.FrontmatterResult,
 	toolsResult *toolsProcessingResult,
@@ -34,6 +32,10 @@ func (c *Compiler) buildInitialWorkflowData(
 		agentFile = ""
 		agentImportSpec = ""
 	}
+	docs := c.extractMetadataDocs(result.Frontmatter)
+	if docs == "" {
+		docs = importsResult.MergedMetadataDocs
+	}
 
 	workflowData := &WorkflowData{
 		Name:                       toolsResult.workflowName,
@@ -43,6 +45,8 @@ func (c *Compiler) buildInitialWorkflowData(
 		FrontmatterFieldLines:      result.FieldLines,
 		RawMarkdown:                result.Markdown,
 		Description:                c.extractDescription(result.Frontmatter),
+		Intent:                     c.extractIntent(result.Frontmatter),
+		Docs:                       docs,
 		Source:                     c.extractSource(result.Frontmatter),
 		Redirect:                   c.extractRedirect(result.Frontmatter),
 		TrackerID:                  toolsResult.trackerID,
@@ -51,6 +55,8 @@ func (c *Compiler) buildInitialWorkflowData(
 		ImportedFiles:              importsResult.ImportedFiles,
 		Skills:                     extractFrontmatterSkills(toolsResult.parsedFrontmatter, result.Frontmatter),
 		SkillReferences:            extractFrontmatterSkillReferences(toolsResult.parsedFrontmatter, result.Frontmatter),
+		Plugins:                    mergeFrontmatterPlugins(toolsResult.parsedFrontmatter, result.Frontmatter, importsResult.MergedPlugins, importsResult.MergedPluginObjects),
+		PluginReferences:           mergeFrontmatterPluginReferences(toolsResult.parsedFrontmatter, result.Frontmatter, importsResult.MergedPlugins, importsResult.MergedPluginObjects),
 		ImportedMarkdown:           toolsResult.importedMarkdown, // Only imports WITH inputs
 		ImportPaths:                toolsResult.importPaths,      // Import paths for runtime-import macros (imports without inputs)
 		PromptImports:              toolsResult.promptImports,    // Ordered prompt contributions from imports
@@ -66,18 +72,20 @@ func (c *Compiler) buildInitialWorkflowData(
 		AI:                         engineSetup.engineSetting,
 		Model:                      engineSetup.model,
 		EngineConfig:               engineSetup.engineConfig,
+		GHES:                       c.ghesArtifactCompat,
 		AgentFile:                  agentFile,
 		AgentImportSpec:            agentImportSpec,
 		RepositoryImports:          importsResult.RepositoryImports,
 		NetworkPermissions:         engineSetup.networkPermissions,
 		SandboxConfig:              applySandboxDefaults(engineSetup.sandboxConfig, engineSetup.engineConfig),
 		RunnerConfig:               extractRunnerConfig(result.Frontmatter),
+		Enclaves:                   extractEnclavesConfig(result.Frontmatter),
 		NeedsTextOutput:            toolsResult.needsTextOutput,
 		ToolsTimeout:               toolsResult.toolsTimeout,
 		ToolsStartupTimeout:        toolsResult.toolsStartupTimeout,
 		TrialMode:                  c.trialMode,
 		TrialLogicalRepo:           c.trialLogicalRepoSlug,
-		UseSamples:                 c.useSamples,
+		UseSamples:                 c.samplesEnabledFromImports(result.Frontmatter, importsResult.MergedFeatures),
 		StrictMode:                 c.strictMode,
 		AllowActionRefs:            c.allowActionRefs,
 		ValidateAWFConfig:          !c.skipValidation,
@@ -90,6 +98,14 @@ func (c *Compiler) buildInitialWorkflowData(
 		InlinedImports:             inlinedImports,
 		EngineConfigSteps:          engineSetup.configSteps,
 	}
+	if importsResult.MergedConcurrency != "" && !hasExplicitConcurrencyGroup(result.Frontmatter) {
+		var importedConcurrency any
+		if err := json.Unmarshal([]byte(importsResult.MergedConcurrency), &importedConcurrency); err == nil {
+			workflowData.Concurrency = c.extractTopLevelYAMLSection(map[string]any{"concurrency": importedConcurrency}, "concurrency")
+		} else {
+			workflowBuilderLog.Printf("Skipping imported concurrency merge: invalid JSON: %v", err)
+		}
+	}
 
 	// Populate checkout configs from parsed frontmatter.
 	// Fall back to raw frontmatter parsing when full ParseFrontmatterConfig fails
@@ -98,12 +114,21 @@ func (c *Compiler) buildInitialWorkflowData(
 		workflowData.CheckoutConfigs = toolsResult.parsedFrontmatter.CheckoutConfigs
 		workflowData.CheckoutDisabled = toolsResult.parsedFrontmatter.CheckoutDisabled
 		workflowData.CheckoutExplicitlyDisabled = toolsResult.parsedFrontmatter.CheckoutExplicitlyDisabled
-	} else if rawCheckout, ok := result.Frontmatter["checkout"]; ok {
-		if checkoutValue, ok := rawCheckout.(bool); ok && !checkoutValue {
-			workflowData.CheckoutDisabled = true
-			workflowData.CheckoutExplicitlyDisabled = true
-		} else if configs, err := ParseCheckoutConfigs(rawCheckout); err == nil {
-			workflowData.CheckoutConfigs = configs
+		workflowData.CheckoutSkipDefault = toolsResult.parsedFrontmatter.CheckoutSkipDefault
+	} else {
+		if rawCheckout, ok := result.Frontmatter["checkout"]; ok {
+			if checkoutValue, ok := rawCheckout.(bool); ok && !checkoutValue {
+				workflowData.CheckoutDisabled = true
+				workflowData.CheckoutExplicitlyDisabled = true
+			} else if configs, err := ParseCheckoutConfigs(rawCheckout); err == nil {
+				workflowData.CheckoutConfigs = configs
+			}
+		}
+		// permissions.contents: none signals that the default workflow-repository
+		// checkout should be skipped (see checkoutSkipDefaultFromPermissions, the
+		// single source of truth shared with the primary ParseFrontmatterConfig path).
+		if checkoutSkipDefaultFromPermissions(result.Frontmatter["permissions"]) {
+			workflowData.CheckoutSkipDefault = true
 		}
 	}
 
@@ -128,6 +153,18 @@ func (c *Compiler) buildInitialWorkflowData(
 			}
 			workflowData.CheckoutConfigs = append(workflowData.CheckoutConfigs, importedConfigs...)
 		}
+	}
+
+	// Warn when permissions.contents: none skips the default checkout but no other
+	// checkout: entries (own repo, imports) are configured, since that leaves the
+	// agent with no working-directory checkout at all (effectively equivalent to
+	// checkout: false, but without the explicit intent that flag signals).
+	if workflowData.CheckoutSkipDefault && !workflowData.CheckoutDisabled && len(workflowData.CheckoutConfigs) == 0 {
+		warningMsg := "permissions.contents: none skips the default workflow-repository checkout, " +
+			"but no other checkout: entries are configured; the agent job will have no repository " +
+			"checked out. Add a target checkout: entry, or set checkout: false to make the intent explicit."
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
+		c.IncrementWarningCount()
 	}
 
 	// Auto-disable checkout for pull_request_target-only workflows when not explicitly configured.
@@ -212,831 +249,4 @@ func (c *Compiler) buildInitialWorkflowData(
 	}
 
 	return workflowData
-}
-
-func extractLSPConfig(parsedFrontmatter *FrontmatterConfig, frontmatter map[string]any) map[string]LSPServerConfig {
-	if parsedFrontmatter != nil && len(parsedFrontmatter.LSP) > 0 {
-		return parsedFrontmatter.LSP
-	}
-
-	rawLSP, ok := frontmatter["lsp"]
-	if !ok {
-		return nil
-	}
-
-	jsonBytes, err := json.Marshal(rawLSP)
-	if err != nil {
-		workflowBuilderLog.Printf("Failed to marshal lsp frontmatter config: %v", err)
-		return nil
-	}
-
-	var lsp map[string]LSPServerConfig
-	if err := json.Unmarshal(jsonBytes, &lsp); err != nil {
-		workflowBuilderLog.Printf("Failed to unmarshal lsp frontmatter config: %v", err)
-		return nil
-	}
-
-	if len(lsp) == 0 {
-		return nil
-	}
-	return lsp
-}
-
-func extractFrontmatterSkills(parsedFrontmatter *FrontmatterConfig, frontmatter map[string]any) []string {
-	refs := extractFrontmatterSkillReferences(parsedFrontmatter, frontmatter)
-	if len(refs) == 0 {
-		return nil
-	}
-
-	skills := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		if ref.Skill == "" {
-			continue
-		}
-		skills = append(skills, ref.Skill)
-	}
-	if len(skills) == 0 {
-		return nil
-	}
-	return skills
-}
-
-func extractFrontmatterSkillReferences(parsedFrontmatter *FrontmatterConfig, frontmatter map[string]any) []SkillReference {
-	if parsedFrontmatter != nil && len(parsedFrontmatter.SkillReferences) > 0 {
-		return append([]SkillReference(nil), parsedFrontmatter.SkillReferences...)
-	}
-
-	// Fall back to raw frontmatter when ParseFrontmatterConfig failed for non-skills reasons
-	// (e.g. unrecognized tool shapes). Safe because validateFrontmatterSkills already ran
-	// and succeeded on this frontmatter before we reach this point.
-	rawSkills, ok := frontmatter["skills"].([]any)
-	if !ok || len(rawSkills) == 0 {
-		return nil
-	}
-
-	return parseRawSkillReferences(rawSkills)
-}
-
-func extractMainModelCostsOverlay(toolsResult *toolsProcessingResult, frontmatter map[string]any) map[string]any {
-	// Fall back to raw frontmatter when ParseFrontmatterConfig failed (e.g. due to unrecognized
-	// tool config shapes like bash: ["*"]).
-	if toolsResult.parsedFrontmatter != nil && len(toolsResult.parsedFrontmatter.ModelCosts) > 0 {
-		if providers, hasProviders := toolsResult.parsedFrontmatter.ModelCosts["providers"]; hasProviders {
-			if providersMap, ok := providers.(map[string]any); ok && len(providersMap) > 0 {
-				return map[string]any{"providers": providersMap}
-			}
-		}
-		return nil
-	}
-
-	rawModels, ok := frontmatter["models"]
-	if !ok {
-		return nil
-	}
-	modelsMap, ok := rawModels.(map[string]any)
-	if !ok {
-		return nil
-	}
-	providers, hasProviders := modelsMap["providers"]
-	if !hasProviders {
-		return nil
-	}
-	providersMap, ok := providers.(map[string]any)
-	if !ok || len(providersMap) == 0 {
-		return nil
-	}
-	return map[string]any{"providers": providersMap}
-}
-
-func mergeModelCostOverlays(importedOverlays []map[string]any, mainOverlay map[string]any) map[string]any {
-	capacity := len(importedOverlays)
-	if len(mainOverlay) > 0 {
-		capacity++
-	}
-	overlays := make([]map[string]any, 0, capacity)
-	overlays = append(overlays, importedOverlays...)
-	if len(mainOverlay) > 0 {
-		overlays = append(overlays, mainOverlay)
-	}
-	if len(overlays) == 0 {
-		return nil
-	}
-
-	merged := maps.Clone(overlays[0])
-	for i := 1; i < len(overlays); i++ {
-		merged = mergeModelCostOverlayPair(merged, overlays[i])
-	}
-	return merged
-}
-
-func mergeModelCostOverlayPair(base, overlay map[string]any) map[string]any {
-	result := maps.Clone(base)
-	baseProviders, _ := base["providers"].(map[string]any)
-	overlayProviders, _ := overlay["providers"].(map[string]any)
-
-	if len(overlayProviders) == 0 {
-		return result
-	}
-
-	var mergedProviders map[string]any
-	if baseProviders == nil {
-		mergedProviders = make(map[string]any)
-	} else {
-		mergedProviders = maps.Clone(baseProviders)
-	}
-	for providerName, overlayProviderAny := range overlayProviders {
-		overlayProvider, ok := overlayProviderAny.(map[string]any)
-		if !ok {
-			mergedProviders[providerName] = overlayProviderAny
-			continue
-		}
-
-		baseProvider, _ := baseProviders[providerName].(map[string]any)
-		baseModels, _ := baseProvider["models"].(map[string]any)
-		overlayModels, _ := overlayProvider["models"].(map[string]any)
-
-		var mergedProvider map[string]any
-		if baseProvider == nil {
-			mergedProvider = make(map[string]any)
-		} else {
-			mergedProvider = maps.Clone(baseProvider)
-		}
-		overlayProviderNonModels := maps.Clone(overlayProvider)
-		delete(overlayProviderNonModels, "models")
-		maps.Copy(mergedProvider, overlayProviderNonModels)
-		var mergedModels map[string]any
-		if baseModels == nil {
-			mergedModels = make(map[string]any)
-		} else {
-			mergedModels = maps.Clone(baseModels)
-		}
-		maps.Copy(mergedModels, overlayModels)
-		mergedProvider["models"] = mergedModels
-		mergedProviders[providerName] = mergedProvider
-	}
-
-	result["providers"] = mergedProviders
-	return result
-}
-
-// extractMainModelPolicyOverlay returns only models.allowed/blocked policy
-// entries and never treats providers data as policy.
-func extractMainModelPolicyOverlay(toolsResult *toolsProcessingResult, frontmatter map[string]any) map[string][]string {
-	if toolsResult.parsedFrontmatter != nil {
-		mainPolicy := map[string][]string{
-			"allowed": toolsResult.parsedFrontmatter.ModelPolicyAllowed,
-			"blocked": toolsResult.parsedFrontmatter.ModelPolicyBlocked,
-		}
-		if len(mainPolicy["allowed"]) > 0 || len(mainPolicy["blocked"]) > 0 {
-			return mainPolicy
-		}
-	}
-	modelsMap, ok := frontmatter["models"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	mainPolicy := map[string][]string{
-		"allowed": parseModelPolicyList(modelsMap["allowed"]),
-		"blocked": parseModelPolicyList(modelsMap["blocked"]),
-	}
-	if len(mainPolicy["allowed"]) == 0 && len(mainPolicy["blocked"]) == 0 {
-		return nil
-	}
-	return mainPolicy
-}
-
-// toFloat64 converts any numeric value from a parsed YAML/JSON frontmatter map to float64.
-// Returns (value, true) on success, or (0, false) if the value is nil or not a numeric type.
-func toFloat64(v any) (float64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return n, true
-	case float32:
-		return float64(n), true
-	case int:
-		return float64(n), true
-	case int32:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	case uint:
-		return float64(n), true
-	case uint32:
-		return float64(n), true
-	case uint64:
-		return float64(n), true
-	default:
-		return 0, false
-	}
-}
-
-// resolveDefaultAiCreditsPricing returns models.default-ai-credits-pricing from the main
-// workflow frontmatter when present, otherwise falls back to the first imported value.
-func resolveDefaultAiCreditsPricing(frontmatter map[string]any, imported map[string]any) *AiCreditsPricingConfig {
-	if pricing := extractDefaultAiCreditsPricingFromModels(frontmatter); pricing != nil {
-		return pricing
-	}
-	return extractDefaultAiCreditsPricingFromObject(imported)
-}
-
-// extractDefaultAiCreditsPricingFromModels returns the fallback AI credits pricing configured
-// under models.default-ai-credits-pricing in the workflow frontmatter, or nil if absent.
-func extractDefaultAiCreditsPricingFromModels(frontmatter map[string]any) *AiCreditsPricingConfig {
-	modelsMap, ok := frontmatter["models"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	return extractDefaultAiCreditsPricingFromModelsMap(modelsMap)
-}
-
-func extractDefaultAiCreditsPricingFromModelsMap(modelsMap map[string]any) *AiCreditsPricingConfig {
-	if modelsMap == nil {
-		return nil
-	}
-	pricingVal, hasPricing := modelsMap["default-ai-credits-pricing"]
-	if !hasPricing {
-		return nil
-	}
-	pricingObj, ok := pricingVal.(map[string]any)
-	if !ok {
-		return nil
-	}
-	return extractDefaultAiCreditsPricingFromObject(pricingObj)
-}
-
-func extractDefaultAiCreditsPricingFromObject(pricingObj map[string]any) *AiCreditsPricingConfig {
-	if pricingObj == nil {
-		return nil
-	}
-	var input, output float64
-	if v, ok := toFloat64(pricingObj["input"]); ok {
-		input = v
-	}
-	if v, ok := toFloat64(pricingObj["output"]); ok {
-		output = v
-	}
-	var cachedInput *float64
-	if v, ok := toFloat64(pricingObj["cache_read"]); ok {
-		cachedInput = &v
-	}
-	var cacheWrite *float64
-	if v, ok := toFloat64(pricingObj["cache_write"]); ok {
-		cacheWrite = &v
-	}
-	return &AiCreditsPricingConfig{
-		Input:       input,
-		Output:      output,
-		CachedInput: cachedInput,
-		CacheWrite:  cacheWrite,
-	}
-}
-
-func mergeModelPolicyOverlays(importedPolicies []map[string][]string, mainPolicy map[string][]string) ([]string, []string) {
-	overlays := make([]map[string][]string, 0, len(importedPolicies)+1)
-	overlays = append(overlays, importedPolicies...)
-	if len(mainPolicy) > 0 {
-		overlays = append(overlays, mainPolicy)
-	}
-	if len(overlays) == 0 {
-		return nil, nil
-	}
-
-	allowedSet := map[string]struct{}{}
-	disallowedSet := map[string]struct{}{}
-	for _, overlay := range overlays {
-		for _, model := range overlay["allowed"] {
-			if model != "" {
-				allowedSet[model] = struct{}{}
-			}
-		}
-		for _, model := range overlay["blocked"] {
-			if model != "" {
-				disallowedSet[model] = struct{}{}
-			}
-		}
-	}
-
-	allowedModels := make([]string, 0, len(allowedSet))
-	for model := range allowedSet {
-		allowedModels = append(allowedModels, model)
-	}
-	disallowedModels := make([]string, 0, len(disallowedSet))
-	for model := range disallowedSet {
-		disallowedModels = append(disallowedModels, model)
-	}
-	allowedModels = filterAllowedModelConflictsWithSet(allowedModels, disallowedSet)
-	sort.Strings(allowedModels)
-	sort.Strings(disallowedModels)
-	return allowedModels, disallowedModels
-}
-
-func filterAllowedModelConflictsWithSet(allowed []string, disallowedSet map[string]struct{}) []string {
-	if len(allowed) == 0 || len(disallowedSet) == 0 {
-		return allowed
-	}
-	filtered := make([]string, 0, len(allowed))
-	for _, model := range allowed {
-		if modelConflictsWithDisallowedPolicy(model, disallowedSet) {
-			continue
-		}
-		filtered = append(filtered, model)
-	}
-	return filtered
-}
-
-func modelConflictsWithDisallowedPolicy(model string, disallowedSet map[string]struct{}) bool {
-	for disallowed := range disallowedSet {
-		if disallowed == model {
-			return true
-		}
-		if modelPolicyPatternMatches(disallowed, model) {
-			return true
-		}
-		// Also check the inverse direction so an allowed wildcard pattern (for example
-		// "*opus*") conflicts with a disallowed exact entry ("claude-opus").
-		if modelPolicyPatternMatches(model, disallowed) {
-			return true
-		}
-	}
-	return false
-}
-
-func modelPolicyPatternMatches(pattern, value string) bool {
-	if pattern == value {
-		return true
-	}
-	if !strings.ContainsAny(pattern, "*?") {
-		return false
-	}
-	re := "^" + regexp.QuoteMeta(pattern) + "$"
-	re = strings.ReplaceAll(re, `\*`, ".*")
-	re = strings.ReplaceAll(re, `\?`, ".")
-	matched, err := regexp.MatchString(re, value)
-	return err == nil && matched
-}
-
-// resolveInlinedImports returns true if inlined-imports is enabled.
-// It reads the value directly from the raw (pre-parsed) frontmatter map, which is always
-// populated regardless of whether ParseFrontmatterConfig succeeded.
-func resolveInlinedImports(rawFrontmatter map[string]any) bool {
-	return ParseBoolFromConfig(rawFrontmatter, "inlined-imports", nil)
-}
-
-// mergeExcludedEnvVarNames unions the imported and main excluded-env name lists,
-// deduplicates entries across both sources, and returns a sorted slice for
-// deterministic output.
-func mergeExcludedEnvVarNames(fromImports, fromMain []string) []string {
-	if len(fromImports) == 0 && len(fromMain) == 0 {
-		return nil
-	}
-	// Use max() for capacity hints: overflow-safe (no addition) and a tighter
-	// lower-bound than either length alone.
-	hint := max(len(fromImports), len(fromMain))
-	seen := make(map[string]struct{}, hint)
-	merged := make([]string, 0, hint)
-	for _, name := range fromImports {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			merged = append(merged, name)
-		}
-	}
-	for _, name := range fromMain {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			merged = append(merged, name)
-		}
-	}
-	sort.Strings(merged)
-	return merged
-}
-
-// extractYAMLSections extracts YAML configuration sections from frontmatter
-func (c *Compiler) extractYAMLSections(frontmatter map[string]any, workflowData *WorkflowData) error {
-	workflowBuilderLog.Print("Extracting YAML sections from frontmatter")
-
-	workflowData.On = c.extractTopLevelYAMLSection(frontmatter, "on")
-	workflowData.HasDispatchItemNumber = extractDispatchItemNumber(frontmatter)
-	workflowData.Permissions = c.extractPermissions(frontmatter)
-	workflowData.Network = c.extractTopLevelYAMLSection(frontmatter, "network")
-	workflowData.ConcurrencyJobDiscriminator = extractConcurrencyJobDiscriminator(frontmatter)
-	workflowData.Concurrency = c.extractConcurrencySection(frontmatter)
-	workflowData.RunName = c.extractTopLevelYAMLSection(frontmatter, "run-name")
-	workflowData.Env = c.extractTopLevelYAMLSection(frontmatter, "env")
-	workflowData.Features = c.extractFeatures(frontmatter)
-
-	ifCondition, err := c.extractIfCondition(frontmatter)
-	if err != nil {
-		return err
-	}
-	workflowData.If = ifCondition
-
-	// Extract timeout-minutes (canonical form)
-	workflowData.TimeoutMinutes = c.extractTopLevelYAMLSection(frontmatter, "timeout-minutes")
-
-	workflowData.RunsOn = c.extractTopLevelYAMLSection(frontmatter, "runs-on")
-	if v, ok := frontmatter["runs-on-slim"]; ok && !isEmptyRunsOnValue(v) {
-		workflowData.RunsOnSlim = c.extractTopLevelYAMLSection(map[string]any{"runs-on": v}, "runs-on")
-	}
-	workflowData.Environment = c.extractTopLevelYAMLSection(frontmatter, "environment")
-	workflowData.Container = c.extractTopLevelYAMLSection(frontmatter, "container")
-	workflowData.Cache = c.extractTopLevelYAMLSection(frontmatter, "cache")
-	return nil
-}
-
-// extractConcurrencyJobDiscriminator reads the job-discriminator value from the
-// frontmatter concurrency block without modifying the original map.
-// Returns the discriminator expression string or empty string if not present.
-func extractConcurrencyJobDiscriminator(frontmatter map[string]any) string {
-	concurrencyRaw, ok := frontmatter["concurrency"]
-	if !ok {
-		return ""
-	}
-	concurrencyMap, ok := concurrencyRaw.(map[string]any)
-	if !ok {
-		return ""
-	}
-	discriminator, ok := concurrencyMap["job-discriminator"]
-	if !ok {
-		return ""
-	}
-	discriminatorStr, ok := discriminator.(string)
-	if !ok {
-		return ""
-	}
-	return discriminatorStr
-}
-
-// extractConcurrencySection extracts the workflow-level concurrency YAML section,
-// stripping the gh-aw-specific job-discriminator field so it does not appear in
-// the compiled lock file (which must be valid GitHub Actions YAML).
-func (c *Compiler) extractConcurrencySection(frontmatter map[string]any) string {
-	concurrencyRaw, ok := frontmatter["concurrency"]
-	if !ok {
-		return ""
-	}
-	concurrencyMap, ok := concurrencyRaw.(map[string]any)
-	if !ok || len(concurrencyMap) == 0 {
-		// String or empty format: serialize as-is (no job-discriminator possible)
-		return c.extractTopLevelYAMLSection(frontmatter, "concurrency")
-	}
-
-	_, hasDiscriminator := concurrencyMap["job-discriminator"]
-	if !hasDiscriminator {
-		return c.extractTopLevelYAMLSection(frontmatter, "concurrency")
-	}
-
-	// Build a copy of the concurrency map without job-discriminator for serialization.
-	// Use len(concurrencyMap) for capacity: at most one entry (job-discriminator) will be
-	// omitted, so this is a slight over-allocation that avoids a subtle negative-capacity
-	// edge case if job-discriminator were the only key.
-	cleanMap := make(map[string]any, len(concurrencyMap))
-	for k, v := range concurrencyMap {
-		if k != "job-discriminator" {
-			cleanMap[k] = v
-		}
-	}
-	// When job-discriminator is the only field, there is no user-specified workflow-level
-	// group to emit; return empty so the compiler can generate the default concurrency.
-	if len(cleanMap) == 0 {
-		return ""
-	}
-	// Use a minimal temporary frontmatter containing only the concurrency key to avoid
-	// copying the entire (potentially large) frontmatter map.
-	return c.extractTopLevelYAMLSection(map[string]any{"concurrency": cleanMap}, "concurrency")
-}
-
-// extractDispatchItemNumber reports whether the frontmatter's on.workflow_dispatch
-// trigger exposes an item_number input. This is the signature produced by the label
-// trigger shorthand (e.g. "on: pull_request labeled my-label"). Reading the
-// structured map avoids re-parsing the rendered YAML string later.
-func extractDispatchItemNumber(frontmatter map[string]any) bool {
-	onVal, ok := frontmatter["on"]
-	if !ok {
-		return false
-	}
-	onMap, ok := onVal.(map[string]any)
-	if !ok {
-		return false
-	}
-	wdVal, ok := onMap["workflow_dispatch"]
-	if !ok {
-		return false
-	}
-	wdMap, ok := wdVal.(map[string]any)
-	if !ok {
-		return false
-	}
-	inputsVal, ok := wdMap["inputs"]
-	if !ok {
-		return false
-	}
-	inputsMap, ok := inputsVal.(map[string]any)
-	if !ok {
-		return false
-	}
-	_, ok = inputsMap["item_number"]
-	return ok
-}
-
-// processAndMergeSteps handles the merging of imported steps with main workflow steps
-func (c *Compiler) processAndMergeSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
-	workflowBuilderLog.Print("Processing and merging custom steps")
-
-	workflowData.CustomSteps = c.extractTopLevelYAMLSection(frontmatter, "steps")
-
-	// Parse copilot-setup-steps if present (these go at the start)
-	var copilotSetupSteps []any
-	if importsResult.CopilotSetupSteps != "" {
-		if err := yaml.Unmarshal([]byte(importsResult.CopilotSetupSteps), &copilotSetupSteps); err != nil {
-			workflowBuilderLog.Printf("Failed to unmarshal copilot-setup steps: %v", err)
-		} else {
-			// Convert to typed steps for action pinning
-			typedCopilotSteps, err := SliceToSteps(copilotSetupSteps)
-			if err != nil {
-				workflowBuilderLog.Printf("Failed to convert copilot-setup steps to typed steps: %v", err)
-			} else {
-				// Apply action pinning to copilot-setup steps
-				typedCopilotSteps, err = applyActionPinsToTypedSteps(typedCopilotSteps, workflowData)
-				if err != nil {
-					return fmt.Errorf("copilot-setup steps: %w", err)
-				}
-				// Convert back to []any for YAML marshaling
-				copilotSetupSteps = StepsToSlice(typedCopilotSteps)
-			}
-		}
-	}
-
-	// Parse other imported steps if present (these go after copilot-setup but before main steps)
-	var otherImportedSteps []any
-	if importsResult.MergedSteps != "" {
-		if err := yaml.Unmarshal([]byte(importsResult.MergedSteps), &otherImportedSteps); err != nil {
-			return fmt.Errorf("failed to parse imported steps: %w", err)
-		}
-		// Convert to typed steps for action pinning
-		typedOtherSteps, err := SliceToSteps(otherImportedSteps)
-		if err != nil {
-			return fmt.Errorf("failed to convert imported steps: %w", err)
-		}
-		// Apply action pinning to other imported steps
-		typedOtherSteps, err = applyActionPinsToTypedSteps(typedOtherSteps, workflowData)
-		if err != nil {
-			return fmt.Errorf("imported steps: %w", err)
-		}
-		// Convert back to []any for YAML marshaling
-		otherImportedSteps = StepsToSlice(typedOtherSteps)
-	}
-
-	// If there are main workflow steps, parse them
-	var mainSteps []any
-	if workflowData.CustomSteps != "" {
-		var mainStepsWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(workflowData.CustomSteps), &mainStepsWrapper); err != nil {
-			return fmt.Errorf("failed to parse custom steps: %w", err)
-		}
-		if mainStepsVal, hasSteps := mainStepsWrapper["steps"]; hasSteps {
-			if steps, ok := mainStepsVal.([]any); ok {
-				mainSteps = steps
-				// Convert to typed steps for action pinning
-				typedMainSteps, err := SliceToSteps(mainSteps)
-				if err != nil {
-					return fmt.Errorf("failed to convert main steps: %w", err)
-				}
-				// Apply action pinning to main steps
-				typedMainSteps, err = applyActionPinsToTypedSteps(typedMainSteps, workflowData)
-				if err != nil {
-					return fmt.Errorf("steps: %w", err)
-				}
-				// Convert back to []any for YAML marshaling
-				mainSteps = StepsToSlice(typedMainSteps)
-			}
-		}
-	}
-
-	// Merge steps in the correct order:
-	// 1. copilot-setup-steps (at start)
-	// 2. other imported steps (after copilot-setup)
-	// 3. main frontmatter steps (last)
-	var allSteps []any
-	if len(copilotSetupSteps) > 0 || len(mainSteps) > 0 || len(otherImportedSteps) > 0 {
-		allSteps = append(allSteps, copilotSetupSteps...)
-		allSteps = append(allSteps, otherImportedSteps...)
-		allSteps = append(allSteps, mainSteps...)
-
-		// Convert back to YAML with "steps:" wrapper
-		stepsWrapper := map[string]any{"steps": allSteps}
-		stepsYAML, err := yaml.Marshal(stepsWrapper)
-		if err == nil {
-			// Remove quotes from uses values with version comments
-			workflowData.CustomSteps = unquoteUsesWithComments(string(stepsYAML))
-		}
-	}
-	return nil
-}
-
-// processAndMergePreSteps handles the processing and merging of pre-steps with action pinning.
-// Pre-steps run at the very beginning of the agent job, before checkout and the subsequent
-// built-in steps, allowing users to mint tokens or perform other setup that must happen
-// before the repository is checked out. Imported pre-steps are merged before the main
-// workflow's pre-steps so that the main workflow can override or extend the imports.
-func (c *Compiler) processAndMergePreSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
-	workflowBuilderLog.Print("Processing and merging pre-steps")
-
-	mainPreStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "pre-steps")
-
-	// Parse imported pre-steps if present (these go before the main workflow's pre-steps)
-	var importedPreSteps []any
-	if importsResult.MergedPreSteps != "" {
-		if err := yaml.Unmarshal([]byte(importsResult.MergedPreSteps), &importedPreSteps); err != nil {
-			return fmt.Errorf("failed to parse imported pre-steps: %w", err)
-		}
-		typedImported, err := SliceToSteps(importedPreSteps)
-		if err != nil {
-			return fmt.Errorf("failed to convert imported pre-steps: %w", err)
-		}
-		typedImported, err = applyActionPinsToTypedSteps(typedImported, workflowData)
-		if err != nil {
-			return fmt.Errorf("imported pre-steps: %w", err)
-		}
-		importedPreSteps = StepsToSlice(typedImported)
-	}
-
-	// Parse main workflow pre-steps if present
-	var mainPreSteps []any
-	if mainPreStepsYAML != "" {
-		var mainWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(mainPreStepsYAML), &mainWrapper); err != nil {
-			return fmt.Errorf("failed to parse pre-steps: %w", err)
-		}
-		if mainVal, ok := mainWrapper["pre-steps"]; ok {
-			if steps, ok := mainVal.([]any); ok {
-				mainPreSteps = steps
-				typedMain, err := SliceToSteps(mainPreSteps)
-				if err != nil {
-					return fmt.Errorf("failed to convert pre-steps: %w", err)
-				}
-				typedMain, err = applyActionPinsToTypedSteps(typedMain, workflowData)
-				if err != nil {
-					return fmt.Errorf("pre-steps: %w", err)
-				}
-				mainPreSteps = StepsToSlice(typedMain)
-			}
-		}
-	}
-
-	// Merge in order: imported pre-steps first, then main workflow's pre-steps
-	var allPreSteps []any
-	if len(importedPreSteps) > 0 || len(mainPreSteps) > 0 {
-		allPreSteps = append(allPreSteps, importedPreSteps...)
-		allPreSteps = append(allPreSteps, mainPreSteps...)
-
-		stepsWrapper := map[string]any{"pre-steps": allPreSteps}
-		stepsYAML, err := yaml.Marshal(stepsWrapper)
-		if err == nil {
-			workflowData.PreSteps = unquoteUsesWithComments(string(stepsYAML))
-		}
-	}
-	return nil
-}
-
-// processAndMergePreAgentSteps handles processing and merging of pre-agent-steps with action pinning.
-// Imported pre-agent-steps are prepended so main workflow pre-agent-steps run last.
-func (c *Compiler) processAndMergePreAgentSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
-	workflowBuilderLog.Print("Processing and merging pre-agent-steps")
-
-	mainPreAgentStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "pre-agent-steps")
-
-	var importedPreAgentSteps []any
-	if importsResult.MergedPreAgentSteps != "" {
-		if err := yaml.Unmarshal([]byte(importsResult.MergedPreAgentSteps), &importedPreAgentSteps); err != nil {
-			return fmt.Errorf("failed to parse imported pre-agent-steps: %w", err)
-		}
-		typedImported, err := SliceToSteps(importedPreAgentSteps)
-		if err != nil {
-			return fmt.Errorf("failed to convert imported pre-agent-steps: %w", err)
-		}
-		typedImported, err = applyActionPinsToTypedSteps(typedImported, workflowData)
-		if err != nil {
-			return fmt.Errorf("imported pre-agent-steps: %w", err)
-		}
-		importedPreAgentSteps = StepsToSlice(typedImported)
-	}
-
-	var mainPreAgentSteps []any
-	if mainPreAgentStepsYAML != "" {
-		var mainWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(mainPreAgentStepsYAML), &mainWrapper); err != nil {
-			return fmt.Errorf("failed to parse pre-agent-steps: %w", err)
-		}
-		if mainVal, ok := mainWrapper["pre-agent-steps"]; ok {
-			if steps, ok := mainVal.([]any); ok {
-				mainPreAgentSteps = steps
-				typedMain, err := SliceToSteps(mainPreAgentSteps)
-				if err != nil {
-					return fmt.Errorf("failed to convert pre-agent-steps: %w", err)
-				}
-				typedMain, err = applyActionPinsToTypedSteps(typedMain, workflowData)
-				if err != nil {
-					return fmt.Errorf("pre-agent-steps: %w", err)
-				}
-				mainPreAgentSteps = StepsToSlice(typedMain)
-			}
-		}
-	}
-
-	var allPreAgentSteps []any
-	if len(importedPreAgentSteps) > 0 || len(mainPreAgentSteps) > 0 {
-		allPreAgentSteps = append(allPreAgentSteps, importedPreAgentSteps...)
-		allPreAgentSteps = append(allPreAgentSteps, mainPreAgentSteps...)
-
-		stepsWrapper := map[string]any{"pre-agent-steps": allPreAgentSteps}
-		stepsYAML, err := yaml.Marshal(stepsWrapper)
-		if err == nil {
-			workflowData.PreAgentSteps = unquoteUsesWithComments(string(stepsYAML))
-		}
-	}
-	return nil
-}
-
-// processAndMergePostSteps handles the processing and merging of post-steps with action pinning.
-// Imported post-steps are appended after the main workflow's post-steps.
-func (c *Compiler) processAndMergePostSteps(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
-	workflowBuilderLog.Print("Processing and merging post-steps")
-
-	mainPostStepsYAML := c.extractTopLevelYAMLSection(frontmatter, "post-steps")
-
-	// Parse imported post-steps if present (these go after the main workflow's post-steps)
-	var importedPostSteps []any
-	if importsResult.MergedPostSteps != "" {
-		if err := yaml.Unmarshal([]byte(importsResult.MergedPostSteps), &importedPostSteps); err != nil {
-			return fmt.Errorf("failed to parse imported post-steps: %w", err)
-		}
-		typedImported, err := SliceToSteps(importedPostSteps)
-		if err != nil {
-			return fmt.Errorf("failed to convert imported post-steps: %w", err)
-		}
-		typedImported, err = applyActionPinsToTypedSteps(typedImported, workflowData)
-		if err != nil {
-			return fmt.Errorf("imported post-steps: %w", err)
-		}
-		importedPostSteps = StepsToSlice(typedImported)
-	}
-
-	// Parse main workflow post-steps if present
-	var mainPostSteps []any
-	if mainPostStepsYAML != "" {
-		var mainWrapper map[string]any
-		if err := yaml.Unmarshal([]byte(mainPostStepsYAML), &mainWrapper); err != nil {
-			return fmt.Errorf("failed to parse post-steps: %w", err)
-		}
-		if mainVal, ok := mainWrapper["post-steps"]; ok {
-			if steps, ok := mainVal.([]any); ok {
-				mainPostSteps = steps
-				typedMain, err := SliceToSteps(mainPostSteps)
-				if err != nil {
-					return fmt.Errorf("failed to convert post-steps: %w", err)
-				}
-				typedMain, err = applyActionPinsToTypedSteps(typedMain, workflowData)
-				if err != nil {
-					return fmt.Errorf("post-steps: %w", err)
-				}
-				mainPostSteps = StepsToSlice(typedMain)
-			}
-		}
-	}
-
-	// Merge in order: main workflow's post-steps first, then imported post-steps
-	var allPostSteps []any
-	if len(mainPostSteps) > 0 || len(importedPostSteps) > 0 {
-		allPostSteps = append(allPostSteps, mainPostSteps...)
-		allPostSteps = append(allPostSteps, importedPostSteps...)
-
-		stepsWrapper := map[string]any{"post-steps": allPostSteps}
-		stepsYAML, err := yaml.Marshal(stepsWrapper)
-		if err == nil {
-			workflowData.PostSteps = unquoteUsesWithComments(string(stepsYAML))
-		}
-	}
-	return nil
-}
-
-// frontmatterHasTrigger reports whether the given "on:" frontmatter value contains
-// the specified trigger name. It handles all three YAML "on:" forms:
-//   - string scalar:  on: pull_request_target
-//   - sequence:       on: [pull_request_target, push]
-//   - mapping:        on:\n  pull_request_target:\n    types: [closed]
-func frontmatterHasTrigger(onVal any, trigger string) bool {
-	switch v := onVal.(type) {
-	case string:
-		return v == trigger
-	case []any:
-		for _, item := range v {
-			if s, ok := item.(string); ok && s == trigger {
-				return true
-			}
-		}
-	case map[string]any:
-		_, ok := v[trigger]
-		return ok
-	}
-	return false
 }

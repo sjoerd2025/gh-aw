@@ -11,16 +11,18 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: daily-awf-spec-compiler-surfacing
-model: copilot/gpt-5.4
+model: openai/gpt-5.4
 engine:
-  id: pi
+  id: codex
+  model-provider: openai
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default, issues, pull_requests]
   repo-memory:
     branch-name: memory/awf-feature-surfacing
@@ -40,6 +42,11 @@ imports:
   - shared/otlp.md
 features:
   gh-aw-detection: true
+evals:
+  - id: spec_updates_reviewed
+    question: Did the agent review AWF specification and compiler updates for features that should be surfaced in gh-aw?
+  - id: finding_reported_or_noop
+    question: Did the agent create an issue for an actionable surfacing gap, or report that no issue was needed?
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -141,6 +148,12 @@ Before finishing, write:
 - Do not create duplicate issues for already-tracked feature IDs.
 - Prefer fewer high-confidence items over broad speculation.
 - Never finish without either `create_issue` or `noop`.
+
+## Reporting Guidelines
+
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks for progressive disclosure.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
 ## agent: `awf-change-detector`
 ---
 description: Extracts user-relevant feature candidates from schema/compiler diffs

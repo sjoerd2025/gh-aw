@@ -3,6 +3,7 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
@@ -31,6 +32,13 @@ type workflowBuildContext struct {
 // ParseWorkflowFile parses a workflow markdown file and returns a WorkflowData structure.
 // This is the main orchestration function that coordinates all compilation phases.
 func (c *Compiler) ParseWorkflowFile(markdownPath string) (*WorkflowData, error) {
+	c.configureGHESCompatibility()
+
+	// Behavior-defined engines are contributed by a workflow's imports, so their
+	// registry and catalog must not affect subsequent compilations.
+	c.engineRegistry = NewEngineRegistry()
+	c.engineCatalog = NewEngineCatalog(c.engineRegistry)
+
 	orchestratorWorkflowLog.Printf("Starting workflow file parsing: %s", markdownPath)
 
 	parseResult, err := c.parseFrontmatterSection(markdownPath)
@@ -123,6 +131,8 @@ func (c *Compiler) validateWorkflowBuildContext(ctx *workflowBuildContext) error
 	if err := c.validateWorkflowModelAliasMap(ctx); err != nil {
 		return err
 	}
+	c.warnCodexCopilotModelCompatibility(ctx.workflowData, ctx.cleanPath)
+	c.warnUnknownConfiguredModels(ctx.workflowData, ctx.cleanPath)
 	if err := c.validateWorkflowEngineSettings(ctx.cleanPath, ctx.workflowData); err != nil {
 		return err
 	}
@@ -150,6 +160,7 @@ func (c *Compiler) validateWorkflowEngineSettings(cleanPath string, workflowData
 		c.validateEngineDriver,
 		c.validateEngineMCPSessionTimeout,
 		c.validateEngineMCPToolTimeout,
+		validateCopilotSDKEngineArgs,
 	}
 	for _, check := range checks {
 		if err := check(workflowData); err != nil {
@@ -170,6 +181,9 @@ func (c *Compiler) validateWorkflowToolConfigurations(ctx *workflowBuildContext)
 	if err := validateBashToolConfig(ctx.workflowData.ParsedTools, ctx.workflowData.Name); err != nil {
 		return fmt.Errorf("%s: %w", ctx.cleanPath, err)
 	}
+	if err := validateCLIProxyBashCompatibility(ctx.workflowData.Tools, ctx.workflowData.Name); err != nil {
+		return fmt.Errorf("%s: %w", ctx.cleanPath, err)
+	}
 	if err := validateGitHubToolConfig(ctx.workflowData.ParsedTools, ctx.workflowData.Name); err != nil {
 		return fmt.Errorf("%s: %w", ctx.cleanPath, err)
 	}
@@ -180,6 +194,7 @@ func (c *Compiler) validateWorkflowToolConfigurations(ctx *workflowBuildContext)
 		return fmt.Errorf("%s: %w", ctx.cleanPath, err)
 	}
 	emitGitHubLockdownGuardPolicyWarning(c, ctx.workflowData.ParsedTools, ctx.cleanPath)
+	emitMinIntegrityNoneBashWarning(c, ctx.workflowData.ParsedTools, ctx.cleanPath)
 	var gatewayConfig *MCPGatewayRuntimeConfig
 	if ctx.workflowData.SandboxConfig != nil {
 		gatewayConfig = ctx.workflowData.SandboxConfig.MCP
@@ -219,11 +234,16 @@ func (c *Compiler) populateWorkflowBuildContext(ctx *workflowBuildContext) error
 	if err := c.mergeImportedOnFields(ctx.frontmatter.Frontmatter, ctx.workflowData, ctx.engineSetup.importsResult); err != nil {
 		return err
 	}
+	ambientFolders, err := resolveAmbientFolders(ctx.frontmatter.Frontmatter, ctx.engineSetup.importsResult)
+	if err != nil {
+		return formatCompilerError(ctx.cleanPath, "error", err.Error(), err)
+	}
+	ctx.workflowData.AmbientFolders = ambientFolders
 	return c.processOnSectionAndFilters(ctx.frontmatter.Frontmatter, ctx.workflowData, ctx.cleanPath)
 }
 
 func (c *Compiler) attachSharedActionResolver(workflowData *WorkflowData) {
-	actionCache, actionResolver := c.getSharedActionResolver()
+	actionCache, actionResolver := c.ensureSharedActionCacheAndResolver()
 	workflowData.Ctx = c.ctx
 	workflowData.ActionCache = actionCache
 	workflowData.ActionResolver = actionResolver
@@ -232,10 +252,41 @@ func (c *Compiler) attachSharedActionResolver(workflowData *WorkflowData) {
 	workflowData.ContainerPinMappings = c.getContainerPinMappings()
 }
 
+func hasExplicitConcurrencyGroup(frontmatter map[string]any) bool {
+	concurrencyValue, ok := frontmatter["concurrency"]
+	if !ok {
+		return false
+	}
+	if concurrencyString, ok := concurrencyValue.(string); ok {
+		return strings.TrimSpace(concurrencyString) != ""
+	}
+	concurrencyMap, ok := concurrencyValue.(map[string]any)
+	if !ok {
+		return false
+	}
+	groupValue, ok := concurrencyMap["group"]
+	if !ok {
+		return false
+	}
+	groupString, ok := groupValue.(string)
+	return ok && strings.TrimSpace(groupString) != ""
+}
+
 func (c *Compiler) mergeImportedWorkflowConfiguration(ctx *workflowBuildContext) error {
+	if ctx.engineSetup.importsResult.MergedConcurrency != "" && !hasExplicitConcurrencyGroup(ctx.frontmatter.Frontmatter) {
+		var importedConcurrency any
+		if err := json.Unmarshal([]byte(ctx.engineSetup.importsResult.MergedConcurrency), &importedConcurrency); err == nil {
+			ctx.workflowData.Concurrency = c.extractTopLevelYAMLSection(map[string]any{"concurrency": importedConcurrency}, "concurrency")
+		} else {
+			orchestratorWorkflowLog.Printf("Skipping imported concurrency merge: invalid JSON: %v", err)
+		}
+	}
+	if ctx.workflowData.ConcurrencyJobDiscriminator == "" {
+		ctx.workflowData.ConcurrencyJobDiscriminator = ctx.engineSetup.importsResult.MergedJobDiscriminator
+	}
 	c.mergeImportedObservability(ctx.workflowData, ctx.engineSetup.importsResult.MergedObservability)
 	if err := c.mergeWorkflowEnv(ctx.frontmatter.Frontmatter, ctx.workflowData, ctx.engineSetup.importsResult); err != nil {
-		return err
+		return formatCompilerError(ctx.cleanPath, "error", err.Error(), err)
 	}
 	c.injectOTLPConfig(ctx.workflowData)
 	if len(ctx.engineSetup.importsResult.MergedFeatures) == 0 {
@@ -351,19 +402,27 @@ func applyMergedRawObservability(
 
 func (c *Compiler) mergeWorkflowEnv(frontmatter map[string]any, workflowData *WorkflowData, importsResult *parser.ImportsResult) error {
 	topEnv := ExtractMapField(frontmatter, "env")
-	if importsResult.MergedEnv == "" {
-		setMainWorkflowEnvSources(workflowData, topEnv)
-		return nil
+	var importedEnvJSON string
+	if importsResult != nil {
+		importedEnvJSON = importsResult.MergedEnv
 	}
-	mergedEnvMap, err := mergeEnv(topEnv, importsResult.MergedEnv)
+
+	mergedEnvMap, err := mergeEnv(topEnv, importedEnvJSON)
 	if err != nil {
 		return fmt.Errorf("failed to merge env from imports: %w", err)
+	}
+	if err := validateTopLevelEnvExpressions(mergedEnvMap); err != nil {
+		return err
 	}
 	if len(mergedEnvMap) == 0 {
 		return nil
 	}
+	if importedEnvJSON == "" {
+		setMainWorkflowEnvSources(workflowData, topEnv)
+	} else {
+		workflowData.EnvSources = buildMergedEnvSources(mergedEnvMap, topEnv, importsResult.MergedEnvSources)
+	}
 	workflowData.Env = c.extractTopLevelYAMLSection(map[string]any{"env": mergedEnvMap}, "env")
-	workflowData.EnvSources = buildMergedEnvSources(mergedEnvMap, topEnv, importsResult.MergedEnvSources)
 	return nil
 }
 
@@ -391,7 +450,7 @@ func buildMergedEnvSources(mergedEnv map[string]any, topEnv map[string]any, impo
 }
 
 // extractAdditionalConfigurations extracts cache-memory, repo-memory, mcp-scripts, and safe-outputs configurations
-func (c *Compiler) extractAdditionalConfigurations(
+func (c *Compiler) extractAdditionalConfigurations( //nolint:largefunc // Existing orchestration phase remains centralized; this change only adds SDK validation state.
 	frontmatter map[string]any,
 	tools map[string]any,
 	markdownDir string,
@@ -408,17 +467,26 @@ func (c *Compiler) extractAdditionalConfigurations(
 		return err
 	}
 	workflowData.CacheMemoryConfig = cacheMemoryConfig
+	ensureCacheMemoryWritePaths(workflowData.SandboxConfig, cacheMemoryConfig)
 
-	// Extract repo-memory config and check for errors
+	// Extract experimental drive-memory config and check for errors.
 	toolsConfig, err := ParseToolsConfig(tools)
 	if err != nil {
 		return err
 	}
+	driveMemoryConfig, err := c.extractDriveMemoryConfig(toolsConfig)
+	if err != nil {
+		return err
+	}
+	workflowData.DriveMemoryConfig = driveMemoryConfig
+
+	// Extract repo-memory config and check for errors
 	repoMemoryConfig, err := c.extractRepoMemoryConfig(toolsConfig, workflowData.WorkflowID)
 	if err != nil {
 		return err
 	}
 	workflowData.RepoMemoryConfig = repoMemoryConfig
+	ensureRepoMemoryWritePaths(workflowData.SandboxConfig, repoMemoryConfig)
 
 	// Extract and process mcp-scripts and safe-outputs
 	workflowData.Command, workflowData.CommandEvents, workflowData.CommandCentralized, workflowData.CommandPlaceholder = c.extractCommandConfig(frontmatter)
@@ -445,15 +513,8 @@ func (c *Compiler) extractAdditionalConfigurations(
 	// Use the already extracted output configuration
 	workflowData.SafeOutputs = safeOutputs
 
-	// Extract comment-memory from tools and attach to safe-outputs configuration.
-	// comment-memory now belongs under tools: next to cache-memory and repo-memory.
-	commentMemoryConfig := c.extractCommentMemoryConfig(toolsConfig)
-	if commentMemoryConfig != nil {
-		if workflowData.SafeOutputs == nil {
-			workflowData.SafeOutputs = &SafeOutputsConfig{}
-		}
-		workflowData.SafeOutputs.CommentMemory = commentMemoryConfig
-	}
+	// comment-memory belongs under tools: next to cache-memory and repo-memory.
+	workflowData.CommentMemoryConfig = c.extractCommentMemoryConfig(toolsConfig)
 
 	// Extract mcp-scripts configuration
 	workflowData.MCPScripts = c.extractMCPScriptsConfig(frontmatter)
@@ -519,6 +580,16 @@ func (c *Compiler) extractAdditionalConfigurations(
 	}
 	workflowData.SafeOutputs = mergedSafeOutputs
 
+	// Force-disable threat detection when samples replay is active. This mirrors the
+	// force-disable in extractSafeOutputsConfig, but is re-applied here because
+	// workflowData.UseSamples can become true only after imported `features.samples: true`
+	// is folded in (see samplesEnabledFromImports), which happens after the main
+	// frontmatter's safe-outputs were first extracted.
+	if workflowData.UseSamples && workflowData.SafeOutputs != nil && workflowData.SafeOutputs.ThreatDetection != nil {
+		orchestratorWorkflowLog.Print("Disabling threat-detection because samples replay is enabled (via imports)")
+		workflowData.SafeOutputs.ThreatDetection = nil
+	}
+
 	// Apply default threat detection when safe-outputs came entirely from imports/includes
 	// (i.e. the main frontmatter has no safe-outputs: section). In this case the merge
 	// produces a non-nil SafeOutputs but leaves ThreatDetection nil, which would suppress
@@ -551,7 +622,18 @@ func (c *Compiler) extractAdditionalConfigurations(
 		return fmt.Errorf("invalid evals configuration: %w", err)
 	}
 	workflowData.Evals = evalsConfig
-	if err := validateExperimentMetricReferences(workflowData.ExperimentConfigs, workflowData.Evals); err != nil {
+
+	// Extract deterministic graders configuration, including graders contributed by imports.
+	gradersFrontmatter, err := mergeImportedGradersFrontmatter(frontmatter, importsResult.MergedGraders)
+	if err != nil {
+		return fmt.Errorf("failed to merge graders from imports: %w", err)
+	}
+	gradersConfig, err := c.parseGradersFromFrontmatter(gradersFrontmatter)
+	if err != nil {
+		return fmt.Errorf("invalid graders configuration: %w", err)
+	}
+	workflowData.Graders = gradersConfig
+	if err := validateExperimentMetricReferences(workflowData.ExperimentConfigs, workflowData.Evals, workflowData.Graders); err != nil {
 		return fmt.Errorf("invalid experiments configuration: %w", err)
 	}
 
@@ -619,7 +701,7 @@ func ensureOnMap(frontmatter map[string]any) map[string]any {
 }
 
 // processOnSectionAndFilters processes the on section configuration and applies various filters
-func (c *Compiler) processOnSectionAndFilters(
+func (c *Compiler) processOnSectionAndFilters( //nolint:largefunc // Existing orchestration phase remains centralized; unrelated to SDK tool catalog changes.
 	frontmatter map[string]any,
 	workflowData *WorkflowData,
 	cleanPath string,
@@ -666,6 +748,9 @@ func (c *Compiler) processOnSectionAndFilters(
 
 	// Apply pull request fork filter if specified
 	c.applyPullRequestForkFilter(workflowData, frontmatter)
+
+	// Apply pull request stack filter (default: latest stacked PR only)
+	c.applyPullRequestStackFilter(workflowData, frontmatter)
 
 	// Apply label filter if specified
 	c.applyLabelFilter(workflowData, frontmatter)

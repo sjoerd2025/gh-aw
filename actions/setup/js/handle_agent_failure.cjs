@@ -11,7 +11,16 @@ const { MAX_SUB_ISSUES, getSubIssueCount } = require("./sub_issue_helpers.cjs");
 const { formatMissingData, formatMissingTools } = require("./missing_info_formatter.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
 const { AWF_INFRA_LINE_RE } = require("./log_parser_shared.cjs");
-const { resolveFirewallAuditLogPath, resolveAICreditsFailureState, parseMaxAICreditsFromAuditLog, parseAICreditsErrorInfoFromAuditLog, parseUnknownModelAICreditsFromAuditLog } = require("./ai_credits_context.cjs");
+const { applyAddMaskRedaction, collectAddMaskedValues, isAddMaskCommandLine } = require("./add_mask_redaction.cjs");
+const {
+  resolveFirewallAuditLogPath,
+  resolveAICreditsFailureState,
+  parseMaxAICreditsFromAuditLog,
+  parseAICreditsErrorInfoFromAuditLog,
+  parseUnknownModelAICreditsFromAuditLog,
+  parseMaxCacheMissesExceededFromEventLog,
+} = require("./ai_credits_context.cjs");
+const { MAX_CACHE_MISSES_EXCEEDED_PATTERN, SHELL_EXPANSION_GUARD_REJECTED_PATTERN } = require("./detect_agent_errors.cjs");
 const { formatAICCredits } = require("./daily_aic_workflow_helpers.cjs");
 const { formatAIC } = require("./model_costs.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
@@ -24,6 +33,17 @@ const os = require("os");
 const path = require("path");
 
 const DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS = 24 * 7;
+/** Claude Code error emitted when a `--continue` resume finds no deferred tool marker. */
+const NO_DEFERRED_MARKER_LINE_RE = /No deferred tool marker found/i;
+/** Claude harness line reporting that the no-deferred-marker error was recovered by a fresh retry. */
+const CLAUDE_HARNESS_NO_DEFERRED_MARKER_RECOVERY_RE = /^\[claude-harness\].*no deferred tool marker on --continue.*retrying as fresh run.*--continue disabled permanently/i;
+/**
+ * Terminal failure reported by an engine harness wrapper, e.g.
+ * `[copilot-harness] unexpected error: copilot-sdk headless server did not become ready ...`.
+ * These lines carry the actionable root cause even though the harness prefix marks them as
+ * infrastructure output, so they are extracted as engine error details.
+ */
+const HARNESS_UNEXPECTED_ERROR_RE = /^\[(?:copilot|claude|codex)-harness\]\s*unexpected error:\s*(.+)$/;
 const FAILURE_ISSUE_DEDUP_WINDOW_HOURS = 24;
 const FAILURE_ISSUE_CATEGORY_DAILY_CAP = 50;
 const FAILURE_ISSUE_WINDOW_MS = FAILURE_ISSUE_DEDUP_WINDOW_HOURS * 60 * 60 * 1000;
@@ -47,13 +67,24 @@ const ALLOWED_FILES_ERROR_RE = /^(?<summary>.*outside the allowed-files list) \(
 
 /**
  * Parse action failure issue expiration from environment.
- * @returns {number} Expiration in hours (defaults to 168 when unset/invalid)
+ *
+ * A value of "0" is an explicit signal from the compiler that no maintenance
+ * workflow will exist to enforce expiration, so expiration must be disabled
+ * (no expiration marker is written to failure issues). Missing/invalid values
+ * fall back to the 168-hour default for backwards compatibility with older
+ * generated lock files that always set a positive value.
+ * @returns {number} Expiration in hours (0 means disabled; defaults to 168 when unset/invalid)
  */
 function getActionFailureIssueExpiresHours() {
   const raw = process.env.GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS || "";
-  const parsed = Number.parseInt(raw, 10);
-  if (Number.isInteger(parsed) && parsed > 0) {
-    return parsed;
+  if (raw === "") {
+    return DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS;
+  }
+  if (raw === "0") {
+    return 0;
+  }
+  if (/^[1-9]\d*$/.test(raw)) {
+    return Number(raw);
   }
   return DEFAULT_ACTION_FAILURE_ISSUE_EXPIRES_HOURS;
 }
@@ -240,13 +271,16 @@ function buildFailureMatchCategories(options) {
   if (options.hasMissingData) categories.push("missing_data");
   if (options.hasCacheMissMisconfiguration) categories.push("cache_miss_misconfiguration");
   if (options.secretVerificationFailed) categories.push("secret_verification_failed");
+  if (options.hasDockerSbxSecretsFailed) categories.push("docker_sbx_secrets_missing");
   if (options.inferenceAccessError) categories.push("inference_access_error");
   if (options.mcpPolicyError) categories.push("mcp_policy_error");
   if (options.modelNotSupportedError) categories.push("model_not_supported_error");
   if (options.http400ResponseError) categories.push("http_400_response_error");
   if (options.aiCreditsRateLimitError) categories.push("ai_credits_rate_limit_error");
+  if (options.hasEngineRateLimit429) categories.push("engine_rate_limit_429");
   if (options.unknownModelAICredits) categories.push("unknown_model_ai_credits");
   if (options.missingModelPricingError) categories.push("missing_model_pricing");
+  if (options.shellExpansionGuardRejected) categories.push("shell_expansion_guard_rejected");
   if (options.maxAICreditsExceeded) categories.push("max_ai_credits_exceeded");
   if (options.hasAppTokenMintingFailed) categories.push("app_token_minting_failed");
   if (options.hasLockdownCheckFailed) categories.push("lockdown_check_failed");
@@ -283,12 +317,15 @@ function buildFailureMatchCategories(options) {
  * @param {boolean} options.hasStaleLockFileFailed
  * @param {boolean} options.hasDailyAICExceeded
  * @param {boolean} options.aiCreditsRateLimitError
+ * @param {boolean} options.hasEngineRateLimit429
  * @param {boolean} options.maxAICreditsExceeded
  * @param {boolean} options.hasAssignmentErrors
  * @param {boolean} options.http400ResponseError
  * @param {boolean} options.unknownModelAICredits
+ * @param {boolean} [options.hasDockerSbxSecretsFailed]
  * @param {boolean} [options.missingModelPricingError]
  * @param {string} [options.missingModelPricingModelName]
+ * @param {boolean} [options.shellExpansionGuardRejected]
  * @returns {string}
  */
 function buildFailureIssueTitle(options) {
@@ -296,6 +333,7 @@ function buildFailureIssueTitle(options) {
   if (options.hasDailyAICExceeded) return `[aw] ${workflowName} exceeded daily AI credits budget`;
   if (options.maxAICreditsExceeded) return `[aw] ${workflowName} exceeded max AI credits`;
   if (options.aiCreditsRateLimitError) return `[aw] ${workflowName} hit AI credits rate limit`;
+  if (options.hasEngineRateLimit429) return `[aw] ${workflowName} hit engine rate limit (HTTP 429)`;
   // Missing model pricing is surfaced by the proxy as HTTP 400, so prefer the
   // specialized title before falling back to the generic transport-level error.
   if (options.missingModelPricingError) {
@@ -312,6 +350,8 @@ function buildFailureIssueTitle(options) {
   if (options.hasLockdownCheckFailed) return `[aw] ${workflowName} failed lockdown check`;
   if (options.hasOAuthTokenCheckFailed) return `[aw] ${workflowName} has OAuth token misconfiguration`;
   if (options.hasStaleLockFileFailed) return `[aw] ${workflowName} has stale lock file`;
+  if (options.shellExpansionGuardRejected) return `[aw] ${workflowName} hit shell expansion guard rejection`;
+  if (options.hasDockerSbxSecretsFailed) return `[aw] ${workflowName} is missing docker-sbx Docker Hub secrets`;
   if (options.isTimedOut) return `[aw] ${workflowName} timed out`;
   if (options.hasToolDenialsExceeded) return `[aw] ${workflowName} exceeded tool denial limit`;
   if (options.hasCacheMissMisconfiguration) return `[aw] ${workflowName} has cache-memory miss misconfiguration`;
@@ -579,24 +619,55 @@ async function ensureParentIssue(previousParentNumber = null, ownerOverride, rep
       const existingIssue = searchResult.data.items[0];
       core.info(`Found existing parent issue #${existingIssue.number}: ${existingIssue.html_url}`);
 
-      // Check the sub-issue count
-      const subIssueCount = await getSubIssueCount(owner, repo, existingIssue.number);
+      // Enforce the parent issue's own expiration marker: an expired parent
+      // must not keep receiving new sub-issues, mirroring isReusableFailureIssue's
+      // handling of individual per-run failure issues.
+      let existingBody;
+      if (typeof existingIssue.body === "string") {
+        existingBody = existingIssue.body;
+      } else {
+        // The search API response may omit or truncate the body field; fetch the
+        // full issue to reliably read the expiration marker.
+        try {
+          const issueResult = await github.rest.issues.get({
+            owner,
+            repo,
+            issue_number: existingIssue.number,
+          });
+          existingBody = issueResult.data.body || "";
+        } catch (error) {
+          core.warning(`Could not fetch parent issue #${existingIssue.number} body: ${getErrorMessage(error)}. Continuing without expiration marker check.`);
+          existingBody = "";
+        }
+      }
+      const parentExpirationDate = extractExpirationDate(existingBody);
 
-      if (subIssueCount !== null && subIssueCount >= MAX_SUB_ISSUES) {
-        core.warning(`Parent issue #${existingIssue.number} has ${subIssueCount} sub-issues (max: ${MAX_SUB_ISSUES})`);
-        core.info(`Creating a new parent issue (previous parent #${existingIssue.number} is full)`);
+      if (parentExpirationDate && parentExpirationDate.getTime() <= Date.now()) {
+        core.info(`Parent issue #${existingIssue.number} has expired (expired ${parentExpirationDate.toISOString()})`);
+        core.info(`Creating a new parent issue (previous parent #${existingIssue.number} has expired)`);
 
         // Fall through to create a new parent issue, passing the previous parent number
         previousParentNumber = existingIssue.number;
       } else {
-        // Parent issue is within limits, return it
-        if (subIssueCount !== null) {
-          core.info(`Parent issue has ${subIssueCount} sub-issues (within limit of ${MAX_SUB_ISSUES})`);
+        // Check the sub-issue count
+        const subIssueCount = await getSubIssueCount(owner, repo, existingIssue.number);
+
+        if (subIssueCount !== null && subIssueCount >= MAX_SUB_ISSUES) {
+          core.warning(`Parent issue #${existingIssue.number} has ${subIssueCount} sub-issues (max: ${MAX_SUB_ISSUES})`);
+          core.info(`Creating a new parent issue (previous parent #${existingIssue.number} is full)`);
+
+          // Fall through to create a new parent issue, passing the previous parent number
+          previousParentNumber = existingIssue.number;
+        } else {
+          // Parent issue is within limits, return it
+          if (subIssueCount !== null) {
+            core.info(`Parent issue has ${subIssueCount} sub-issues (within limit of ${MAX_SUB_ISSUES})`);
+          }
+          return {
+            number: existingIssue.number,
+            node_id: existingIssue.node_id,
+          };
         }
-        return {
-          number: existingIssue.number,
-          node_id: existingIssue.node_id,
-        };
       }
     }
   } catch (error) {
@@ -1447,7 +1518,7 @@ function loadToolDenialsExceededEvents() {
             timestamp: typeof parsed.timestamp === "string" ? parsed.timestamp : "",
           });
         } catch {
-          // Skip malformed lines
+          // Malformed line — ignored.
         }
       }
     }
@@ -1489,7 +1560,7 @@ function buildToolDenialsExceededContext(events, workflowId) {
   try {
     template = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
   return (
     "\n" +
@@ -1627,10 +1698,11 @@ function buildTimeoutContext(isTimedOut, timeoutMinutes) {
  * @param {boolean} hasToolDenialsExceeded
  * @param {boolean} isTimedOut
  * @param {boolean} hasMissingModelPricingError
+ * @param {boolean} hasShellExpansionGuardRejected
  * @returns {boolean}
  */
-function shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, hasMissingModelPricingError = false) {
-  return agentConclusion === "failure" && !hasToolDenialsExceeded && !isTimedOut && !hasMissingModelPricingError;
+function shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, hasMissingModelPricingError = false, hasShellExpansionGuardRejected = false) {
+  return agentConclusion === "failure" && !hasToolDenialsExceeded && !isTimedOut && !hasMissingModelPricingError && !hasShellExpansionGuardRejected;
 }
 
 /**
@@ -1644,6 +1716,16 @@ function isIssueWritePermissionError(error) {
   const status = Number(typedError?.status);
   const message = getErrorMessage(error).toLowerCase();
   return status === 403 && (message.includes("resource not accessible by integration") || message.includes("resource not accessible by personal access token") || message.includes("insufficient permissions"));
+}
+
+/**
+ * Publish the failure issue as step outputs so later conclusion steps can act on it.
+ * @param {{number: number, html_url: string}} issue
+ * @returns {void}
+ */
+function setFailureIssueOutputs(issue) {
+  core.setOutput("failure_issue_number", String(issue.number));
+  core.setOutput("failure_issue_url", issue.html_url);
 }
 
 /**
@@ -1661,7 +1743,7 @@ function buildInferenceAccessErrorContext(hasInferenceAccessError) {
   try {
     template = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
   return "\n" + template;
 }
@@ -1982,6 +2064,57 @@ function buildEngineMaxRunsExceededContext(engineLabel) {
 }
 
 /**
+ * Detect max consecutive cache misses failures in text payloads.
+ * Returns true when content includes either the `max_cache_misses_exceeded` error type
+ * or the "Maximum consecutive cache misses exceeded" message fragment.
+ * Uses the shared MAX_CACHE_MISSES_EXCEEDED_PATTERN from detect_agent_errors for
+ * consistency with the unified detection mechanism.
+ * @param {string|null|undefined} content
+ * @returns {boolean}
+ */
+function hasEngineMaxCacheMissesExceededSignal(content) {
+  if (!content) {
+    return false;
+  }
+  return MAX_CACHE_MISSES_EXCEEDED_PATTERN.test(content);
+}
+
+/**
+ * Detect sandbox shell-expansion guard rejections in text payloads.
+ * @param {string|null|undefined} content
+ * @returns {boolean}
+ */
+function hasShellExpansionGuardRejectedSignal(content) {
+  if (!content) {
+    return false;
+  }
+  return SHELL_EXPANSION_GUARD_REJECTED_PATTERN.test(content);
+}
+
+/**
+ * Build dedicated context for sandbox shell-expansion guard rejections.
+ * @param {boolean} hasShellExpansionGuardRejected
+ * @returns {string}
+ */
+function buildShellExpansionGuardRejectedContext(hasShellExpansionGuardRejected) {
+  if (!hasShellExpansionGuardRejected) {
+    return "";
+  }
+  return "\n" + renderPromptTemplate("shell_expansion_guard_rejected.md");
+}
+
+/**
+ * Build dedicated context for max consecutive cache misses failures.
+ * Renders the max-cache-misses-exceeded prompt template with the active engine label.
+ * @param {string} [engineLabel]
+ * @returns {string}
+ */
+function buildEngineMaxCacheMissesExceededContext(engineLabel) {
+  const normalizedEngineLabel = (typeof engineLabel === "string" ? engineLabel : "").trim() || "AI";
+  return "\n" + renderPromptTemplate("max_cache_misses_exceeded.md", { engine_label: normalizedEngineLabel });
+}
+
+/**
  * Read and render token usage from token-usage.jsonl for inclusion in the ET computation table.
  * Returns null gracefully when files are absent, empty, or unparseable.
  * @returns {{ markdown: string, modelNames: string[] } | null} Pre-rendered per-model markdown table data, or null
@@ -2015,9 +2148,10 @@ function readTokenUsageMarkdown() {
  * @param {string} aiCredits
  * @param {string} maxAICredits
  * @param {string} runUrl
+ * @param {boolean} [isBudgetExceeded] - true when the agent exceeded the configured max-ai-credits budget; false when the 429 was a throughput throttle
  * @returns {string}
  */
-function buildAICreditsRateLimitErrorContext(hasAICreditsRateLimitError, aiCredits, maxAICredits, runUrl) {
+function buildAICreditsRateLimitErrorContext(hasAICreditsRateLimitError, aiCredits, maxAICredits, runUrl, isBudgetExceeded = false) {
   if (!hasAICreditsRateLimitError) {
     return "";
   }
@@ -2041,16 +2175,21 @@ function buildAICreditsRateLimitErrorContext(hasAICreditsRateLimitError, aiCredi
     metricsSummary = ` Used \`${formattedAICredits}\`.`;
   }
 
-  // Suggest a new limit: 2x current max, or 2x actual usage if max is unknown, or a reasonable default
-  const baseForSuggestion = Number.isFinite(numericMaxAICredits) && numericMaxAICredits > 0 ? numericMaxAICredits : Number.isFinite(numericAICredits) && numericAICredits > 0 ? numericAICredits : 0;
-  const suggestedCredits = baseForSuggestion > 0 ? Math.ceil(baseForSuggestion * 2) : 2000;
-
-  const templateName = "ai_credits_rate_limit_error.md";
+  // Use the budget-exceeded template when the agent exhausted its configured limit;
+  // use the throughput-throttle template when the 429 arrived before the budget was spent.
+  const templateName = isBudgetExceeded ? "ai_credits_rate_limit_error.md" : "ai_credits_rate_limit_throttle.md";
   let templatePath = "";
   try {
     templatePath = getPromptPath(templateName);
   } catch (error) {
     throw new Error(`failed to resolve template path for ${templateName} (${getErrorMessage(error)}); ensure RUNNER_TEMP or GH_AW_PROMPTS_DIR is set and the template file exists`, { cause: error });
+  }
+
+  let suggestedCredits;
+  if (isBudgetExceeded) {
+    // Suggest a new limit: 2x current max, or 2x actual usage if max is unknown, or a reasonable default.
+    const baseForSuggestion = Number.isFinite(numericMaxAICredits) && numericMaxAICredits > 0 ? numericMaxAICredits : Number.isFinite(numericAICredits) && numericAICredits > 0 ? numericAICredits : 0;
+    suggestedCredits = baseForSuggestion > 0 ? Math.ceil(baseForSuggestion * 2) : 2000;
   }
 
   try {
@@ -2095,7 +2234,7 @@ function buildLockdownCheckFailedContext(hasLockdownCheckFailed) {
   try {
     template = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
   return "\n" + template;
 }
@@ -2118,7 +2257,7 @@ function buildOAuthTokenCheckFailedContext(hasOAuthTokenCheckFailed, runUrl) {
   try {
     template = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
   return "\n" + renderTemplate(template, { run_url: runUrl });
 }
@@ -2140,7 +2279,7 @@ function buildStaleLockFileFailedContext(hasStaleLockFileFailed) {
   try {
     template = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
   return "\n" + template;
 }
@@ -2501,6 +2640,18 @@ function buildSecretVerificationContext(secretVerificationResult, engineSecretFa
 }
 
 /**
+ * Build a docker-sbx setup context from the dedicated runtime guidance template.
+ * @param {string} dockerSbxSecretsResult
+ * @returns {string}
+ */
+function buildDockerSbxSecretsContext(dockerSbxSecretsResult) {
+  if (dockerSbxSecretsResult !== "failed") {
+    return "";
+  }
+  return renderPromptTemplate("docker_sbx_secrets_missing.md");
+}
+
+/**
  * Check whether agent-stdio.log contains a terminal_reason: "completed" result entry,
  * indicating the agent finished its task successfully despite a non-zero job exit code.
  * Log lines may be prefixed with a timestamp (e.g. "2026-04-27T21:45:00.080Z  {JSON}").
@@ -2528,7 +2679,7 @@ function hasAgentTerminalReasonCompleted() {
     // lines or parsing JSON.
     return /"terminal_reason"[ ]?:[ ]?"completed"/.test(logContent);
   } catch {
-    // IO error — assume not completed
+    // IO error is ignored — assume not completed.
   }
   return false;
 }
@@ -2574,6 +2725,33 @@ function detectAWFFirewallStartupFailureFromLog() {
 }
 
 /**
+ * Detect whether the agent failure was caused by engine HTTP 429/rate limiting.
+ * Checks agent-stdio.log first, then falls back to OTLP mirror payloads.
+ * @returns {boolean}
+ */
+function detectEngineRateLimit429Failure() {
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
+  try {
+    if (fs.existsSync(stdioLogPath)) {
+      const logContent = fs.readFileSync(stdioLogPath, "utf8");
+      // If the agent completed successfully (terminal_reason: "completed"), the failure
+      // was caused by something other than the agent itself. Suppress the 429 signal to
+      // avoid giving a rate-limit title to an unrelated post-processing failure.
+      if (/"terminal_reason"[ ]?:[ ]?"completed"/.test(logContent)) {
+        return false;
+      }
+      if (hasEngineRateLimit429Signal(logContent)) {
+        return true;
+      }
+    }
+  } catch {
+    // Ignore read errors and continue with OTLP mirror fallback.
+  }
+  return hasEngineRateLimit429InOTELMirror();
+}
+
+/**
  * Extract terminal error messages from agent-stdio.log to surface engine failures.
  * First tries to match known error patterns (ERROR:, Error:, Fatal:, panic:, Reconnecting...).
  * Falls back to the last non-empty lines of the log when no patterns match, so that
@@ -2583,6 +2761,8 @@ function detectAWFFirewallStartupFailureFromLog() {
  */
 function buildEngineFailureContext(options = {}) {
   const suppressEngineRateLimit429 = options.suppressEngineRateLimit429 === true;
+  const maxCacheMissesExceededFromDetection = options.maxCacheMissesExceeded === true;
+  const shellExpansionGuardRejectedFromDetection = options.shellExpansionGuardRejected === true;
   // Derive agent-stdio.log path from the agent output file path (same directory)
   const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
   const stdioLogPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : "/tmp/gh-aw/agent-stdio.log";
@@ -2590,19 +2770,44 @@ function buildEngineFailureContext(options = {}) {
   // Include engine ID in failure messages when available (e.g. "copilot", "claude", "codex")
   const engineId = process.env.GH_AW_ENGINE_ID || "";
   const engineLabel = engineId ? ` \`${engineId}\`` : " AI";
+  const hasStructuredMaxCacheMissesSignal = maxCacheMissesExceededFromDetection || parseMaxCacheMissesExceededFromEventLog();
 
   try {
     if (!fs.existsSync(stdioLogPath)) {
+      if (shellExpansionGuardRejectedFromDetection) {
+        core.info("agent-stdio.log not found, but shell expansion guard rejection was detected — using dedicated context message");
+        return buildShellExpansionGuardRejectedContext(true);
+      }
+      if (hasStructuredMaxCacheMissesSignal) {
+        core.info("agent-stdio.log not found, but structured max cache misses signal was detected — using dedicated context message");
+        return buildEngineMaxCacheMissesExceededContext(engineLabel);
+      }
       core.info(`agent-stdio.log not found at ${stdioLogPath}, skipping engine failure context`);
       return "";
     }
 
     const logContent = fs.readFileSync(stdioLogPath, "utf8");
     if (!logContent.trim()) {
+      if (shellExpansionGuardRejectedFromDetection) {
+        core.info("agent-stdio.log is empty, but shell expansion guard rejection was detected — using dedicated context message");
+        return buildShellExpansionGuardRejectedContext(true);
+      }
+      if (hasStructuredMaxCacheMissesSignal) {
+        core.info("agent-stdio.log is empty, but structured max cache misses signal was detected — using dedicated context message");
+        return buildEngineMaxCacheMissesExceededContext(engineLabel);
+      }
       return "";
     }
 
     const lines = logContent.split("\n");
+
+    // Values registered through `::add-mask::` are masked in the live job log but appear
+    // verbatim in the captured log file. Collect them so every excerpt rendered into the
+    // failure issue is redacted.
+    const maskedValues = collectAddMaskedValues(logContent);
+    if (maskedValues.length > 0) {
+      core.info(`Detected ${maskedValues.length} add-mask value(s) in agent-stdio.log; redacting them from rendered output`);
+    }
 
     // Guard: if the agent completed successfully (terminal_reason: "completed"), the job
     // failure was caused by something other than the agent itself (e.g., post-processing
@@ -2618,14 +2823,46 @@ function buildEngineFailureContext(options = {}) {
       return buildEngineRateLimit429Context(engineLabel);
     }
 
+    if (hasShellExpansionGuardRejectedSignal(logContent) || shellExpansionGuardRejectedFromDetection) {
+      core.info("Detected shell expansion guard rejection — using dedicated context message");
+      return buildShellExpansionGuardRejectedContext(true);
+    }
+
     if (hasEngineMaxRunsExceededSignal(logContent)) {
       core.info("Detected engine max-runs guardrail signal — using dedicated context message");
       return buildEngineMaxRunsExceededContext(engineLabel);
     }
 
-    const errorMessages = new Set();
+    if (hasEngineMaxCacheMissesExceededSignal(logContent) || hasStructuredMaxCacheMissesSignal) {
+      core.info("Detected engine max cache misses signal — using dedicated context message");
+      return buildEngineMaxCacheMissesExceededContext(engineLabel);
+    }
 
-    for (const line of lines) {
+    const errorMessages = new Set();
+    // "No deferred tool marker found" is only noise when the Claude harness reports that it
+    // recovered from it by retrying fresh with --continue permanently disabled. Correlate each
+    // marker line with a later harness-prefixed recovery line so that markers that were never
+    // recovered (including a terminal marker after an earlier recovered one) stay visible.
+    const recoveredNoDeferredMarkerLines = new Set();
+    {
+      const pendingMarkerLines = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (NO_DEFERRED_MARKER_LINE_RE.test(line)) {
+          pendingMarkerLines.push(i);
+          continue;
+        }
+        if (pendingMarkerLines.length > 0 && CLAUDE_HARNESS_NO_DEFERRED_MARKER_RECOVERY_RE.test(line)) {
+          for (const markerLine of pendingMarkerLines) {
+            recoveredNoDeferredMarkerLines.add(markerLine);
+          }
+          pendingMarkerLines.length = 0;
+        }
+      }
+    }
+    const isRecoveredNoDeferredMarkerLine = index => recoveredNoDeferredMarkerLines.has(index);
+
+    for (const [lineIndex, line] of lines.entries()) {
       // Codex / generic CLI: "ERROR: <message>" at the start of a line
       const errorPrefixMatch = line.match(/^ERROR:\s*(.+)$/);
       if (errorPrefixMatch) {
@@ -2636,7 +2873,20 @@ function buildEngineFailureContext(options = {}) {
       // Node.js / generic: "Error: <message>" at the start of a line
       const errorCapMatch = line.match(/^Error:\s*(.+)$/);
       if (errorCapMatch) {
-        errorMessages.add(errorCapMatch[1].trim());
+        const message = errorCapMatch[1].trim();
+        if (isRecoveredNoDeferredMarkerLine(lineIndex)) {
+          continue;
+        }
+        errorMessages.add(message);
+        continue;
+      }
+
+      // Engine harness wrappers report their terminal failure as
+      // "[<engine>-harness] unexpected error: <message>" (e.g. the copilot-sdk headless server
+      // never becoming ready). Surface it as the root cause instead of falling back to the tail.
+      const harnessUnexpectedErrorMatch = line.match(HARNESS_UNEXPECTED_ERROR_RE);
+      if (harnessUnexpectedErrorMatch) {
+        errorMessages.add(harnessUnexpectedErrorMatch[1].trim());
         continue;
       }
 
@@ -2707,7 +2957,7 @@ function buildEngineFailureContext(options = {}) {
         }
         context += "\n<details>\n<summary>Error details</summary>\n\n";
         for (const message of errorMessages) {
-          context += `- ${message}\n`;
+          context += `- ${applyAddMaskRedaction(message, maskedValues)}\n`;
         }
         context += `\n</details>\n\nSee [Diagnosing AWF Failures](https://github.com/github/gh-aw-firewall/blob/main/docs/diagnosing-awf-failures.md) for troubleshooting guidance.\n\n`;
         return context;
@@ -2715,7 +2965,7 @@ function buildEngineFailureContext(options = {}) {
 
       let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated before producing output.`) + "\n**Error details:**\n";
       for (const message of errorMessages) {
-        context += `- ${message}\n`;
+        context += `- ${applyAddMaskRedaction(message, maskedValues)}\n`;
       }
       context += "\n";
       return context;
@@ -2729,16 +2979,45 @@ function buildEngineFailureContext(options = {}) {
     // pattern in sync with parse_copilot_log.cjs.
     const INFRA_LINE_RE = AWF_INFRA_LINE_RE;
 
+    // AWF infrastructure messages can wrap onto indented continuation lines, e.g.
+    //   [WARN] --pids-limit/container.pidsLimit is not supported by this microVM runtime …
+    //      The Docker agent cgroup cannot be passed through, so pids.max/pids.current are unavailable.
+    // Those continuations belong to the infrastructure line above them, so they must be
+    // filtered out as well — otherwise they can be reported as the "last agent output".
+    const infraContinuationLines = new Set();
+    {
+      let previousWasInfra = false;
+      for (const [index, line] of lines.entries()) {
+        if (!line.trim()) {
+          previousWasInfra = false;
+          continue;
+        }
+        if (INFRA_LINE_RE.test(line)) {
+          previousWasInfra = true;
+          continue;
+        }
+        if (previousWasInfra && /^\s/.test(line)) {
+          infraContinuationLines.add(index);
+          continue;
+        }
+        previousWasInfra = false;
+      }
+    }
+
     // Fallback: no known error patterns found — include the last non-empty lines so that
     // failures caused by timeouts or unexpected terminations still surface useful context.
     const TAIL_LINES = 10;
-    const nonEmptyLines = lines.filter(l => l.trim());
+    const nonEmptyLines = lines.map((line, index) => ({ line, index })).filter(entry => entry.line.trim());
     if (nonEmptyLines.length === 0) {
       return "";
     }
 
     // Exclude AWF infrastructure lines so the fallback displays only actual engine output.
-    const agentLines = nonEmptyLines.filter(l => !INFRA_LINE_RE.test(l));
+    // `::add-mask::` command lines are runner directives, not agent output: drop them so the
+    // rendered tail neither leaks the masked value nor wastes a tail slot.
+    const agentLines = nonEmptyLines
+      .filter(entry => !INFRA_LINE_RE.test(entry.line) && !infraContinuationLines.has(entry.index) && !isAddMaskCommandLine(entry.line) && !isRecoveredNoDeferredMarkerLine(entry.index))
+      .map(entry => entry.line);
 
     if (agentLines.length === 0) {
       // The log contains only AWF infrastructure lines — the engine exited before producing
@@ -2773,7 +3052,7 @@ function buildEngineFailureContext(options = {}) {
     core.info(`No specific error patterns found; including last ${tailLines.length} line(s) of agent-stdio.log as fallback`);
 
     let context = buildWarningAlertLine("Engine Failure", `The${engineLabel} engine terminated unexpectedly.`) + "\n**Last agent output:**\n\`\`\`\n";
-    context += tailLines.join("\n");
+    context += applyAddMaskRedaction(tailLines.join("\n"), maskedValues);
     context += "\n```\n\n";
     return context;
   } catch (error) {
@@ -3050,6 +3329,7 @@ async function main() {
     const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE || "";
     const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL || "";
     const secretVerificationResult = process.env.GH_AW_SECRET_VERIFICATION_RESULT || "";
+    const dockerSbxSecretsResult = process.env.GH_AW_DOCKER_SBX_SECRETS_RESULT || "";
     const engineSecretFailureMessage = process.env.GH_AW_ENGINE_SECRET_FAILURE_MESSAGE || "";
     const assignmentErrors = process.env.GH_AW_ASSIGNMENT_ERRORS || "";
     const assignmentErrorCount = process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0";
@@ -3069,11 +3349,13 @@ async function main() {
     const agenticEngineTimeout = process.env.GH_AW_AGENTIC_ENGINE_TIMEOUT === "true";
     const modelNotSupportedError = process.env.GH_AW_MODEL_NOT_SUPPORTED_ERROR === "true";
     const http400ResponseError = process.env.GH_AW_HTTP_400_RESPONSE_ERROR === "true";
+    const maxCacheMissesExceeded = process.env.GH_AW_MAX_CACHE_MISSES_EXCEEDED === "true" && agentConclusion === "failure";
     const unknownModelAICreditsFromOutput = process.env.GH_AW_UNKNOWN_MODEL_AI_CREDITS === "true";
     const unknownModelAICreditsFromAudit = parseUnknownModelAICreditsFromAuditLog();
     const unknownModelAICredits = unknownModelAICreditsFromAudit || (unknownModelAICreditsFromOutput && agentConclusion === "failure");
     const missingModelPricingError = process.env.GH_AW_MISSING_MODEL_PRICING_ERROR === "true" && agentConclusion === "failure";
     const missingModelPricingModelName = process.env.GH_AW_MISSING_MODEL_PRICING_MODEL_NAME || "";
+    const shellExpansionGuardRejected = process.env.GH_AW_SHELL_EXPANSION_GUARD_REJECTED === "true" && agentConclusion === "failure";
     const pushRepoMemoryResult = process.env.GH_AW_PUSH_REPO_MEMORY_RESULT || "";
     const reportFailureAsIssue = parseBoolTemplatable(process.env.GH_AW_FAILURE_REPORT_AS_ISSUE, true);
     // Parse included categories filter for report-failure-as-issue (optional JSON array of category strings)
@@ -3187,6 +3469,7 @@ async function main() {
     core.info(`Unknown model AI credits error: ${unknownModelAICredits}`);
     core.info(`Unknown model AI credits sources (audit/output): ${unknownModelAICreditsFromAudit}/${unknownModelAICreditsFromOutput}`);
     core.info(`Missing model pricing error: ${missingModelPricingError} (model: ${missingModelPricingModelName || "(unknown)"})`);
+    core.info(`Shell expansion guard rejected: ${shellExpansionGuardRejected}`);
     core.info(`Push repo-memory result: ${pushRepoMemoryResult}`);
     core.info(`App token minting failed (safe_outputs/conclusion/activation): ${safeOutputsAppTokenMintingFailed}/${conclusionAppTokenMintingFailed}/${activationAppTokenMintingFailed}`);
     core.info(`Lockdown check failed: ${hasLockdownCheckFailed}`);
@@ -3202,7 +3485,7 @@ async function main() {
     // A step-level timeout (timeout-minutes on the engine execution step) is detected by
     // the detect-copilot-errors step which checks for SIGTERM/SIGKILL/SIGINT signals
     // in the engine output and sets the agentic_engine_timeout output.
-    const isTimedOut = agentConclusion === "timed_out" || agenticEngineTimeout;
+    const isTimedOut = (agentConclusion === "timed_out" || agenticEngineTimeout) && !shellExpansionGuardRejected;
 
     // Check if there are assignment errors (regardless of agent job status).
     // Use assignment_errors as the single source of truth because it includes
@@ -3332,6 +3615,7 @@ async function main() {
     if (hasToolDenialsExceeded) {
       core.info(`Detected ${toolDenialsExceededEvents.length} guard.tool_denials_exceeded event(s) from Copilot SDK events.jsonl`);
     }
+    const hasEngineRateLimit429 = agentConclusion === "failure" && !maxAICreditsExceeded && !aiCreditsRateLimitError && detectEngineRateLimit429Failure();
 
     // Detect cache-miss misconfiguration: the agent reported a missing_data with reason
     // "cache_memory_miss" after a cache restore matched. This indicates the prompt
@@ -3355,13 +3639,16 @@ async function main() {
     // OR the stale lock file check failed OR the agent reported task incompletion via report_incomplete
     // OR a cache-miss was detected after cache restore succeeded (configuration problem)
     // OR the agent reported missing tools or missing data (treated as agent failures by default)
-    // OR the secret validation step failed (engine secret missing).
+    // OR the secret validation step failed (engine secret missing)
+    // OR docker-sbx is configured but its required Docker Hub secrets are missing.
     // BUT skip if we only have noop outputs (that's a successful no-action scenario)
     const hasSecretVerificationFailed = secretVerificationResult === "failed";
+    const hasDockerSbxSecretsFailed = dockerSbxSecretsResult === "failed";
     if (
       agentConclusion !== "failure" &&
       !isTimedOut &&
       !hasSecretVerificationFailed &&
+      !hasDockerSbxSecretsFailed &&
       !hasAssignmentErrors &&
       !hasAssignCopilotFailures &&
       !hasSkillInstallFailures &&
@@ -3383,7 +3670,7 @@ async function main() {
       !hasToolDenialsExceeded
     ) {
       core.info(
-        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/oauth-token-check/stale-lock-file/daily-workflow-aic/ai-credits/max-ai-credits-exceeded/report-incomplete/cache-miss/missing-tool/missing-data/tool-denials-exceeded/secret-verification errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
+        `Agent job did not fail and no assignment/discussion/code-push/push-repo-memory/app-token/lockdown/oauth-token-check/stale-lock-file/daily-workflow-aic/ai-credits/max-ai-credits-exceeded/report-incomplete/cache-miss/missing-tool/missing-data/tool-denials-exceeded/secret-verification/docker-sbx-secret errors and has safe outputs (conclusion: ${agentConclusion}), skipping failure handling`
       );
       return;
     }
@@ -3434,6 +3721,25 @@ async function main() {
       ({ owner, repo } = context.repo);
     }
 
+    /** @type {{ number: number, labels: Array<string | { name?: string | null }> } | null} */
+    let failureIssue = null;
+    const failureIssueNumber = Number.parseInt(process.env.GH_AW_FAILURE_ISSUE_NUMBER || "", 10);
+    if (Number.isFinite(failureIssueNumber) && failureIssueNumber > 0) {
+      const { data: issue } = await github.rest.issues.get({
+        owner,
+        repo,
+        issue_number: failureIssueNumber,
+      });
+      if (issue.pull_request) {
+        throw new Error(`Failure item #${failureIssueNumber} is a pull request, not an issue`);
+      }
+      if (issue.state !== "open") {
+        throw new Error(`Failure issue #${failureIssueNumber} is not open`);
+      }
+      failureIssue = issue;
+      core.info(`Reusing failure issue #${failureIssueNumber}`);
+    }
+
     // Try to find a pull request for the current branch
     const pullRequest = await findPullRequestForCurrentBranch();
     const currentBranch = getCurrentBranch();
@@ -3480,12 +3786,15 @@ async function main() {
       hasStaleLockFileFailed,
       hasDailyAICExceeded,
       aiCreditsRateLimitError,
+      hasEngineRateLimit429,
       maxAICreditsExceeded,
+      shellExpansionGuardRejected,
       hasAssignmentErrors,
       http400ResponseError,
       unknownModelAICredits,
       missingModelPricingError,
       missingModelPricingModelName,
+      hasDockerSbxSecretsFailed,
     });
     const failureCategories = buildFailureMatchCategories({
       agentConclusion,
@@ -3504,11 +3813,13 @@ async function main() {
       hasMissingData,
       hasCacheMissMisconfiguration,
       secretVerificationFailed: hasSecretVerificationFailed,
+      hasDockerSbxSecretsFailed,
       inferenceAccessError,
       mcpPolicyError,
       modelNotSupportedError,
       http400ResponseError,
       aiCreditsRateLimitError,
+      hasEngineRateLimit429,
       unknownModelAICredits,
       missingModelPricingError,
       maxAICreditsExceeded,
@@ -3579,12 +3890,14 @@ async function main() {
     core.info(`Checking for existing issue with precise failure metadata for title: "${issueTitle}"`);
 
     try {
-      const existingIssue = await findExistingFailureIssue({
-        owner,
-        repo,
-        workflowId: workflowID,
-        failureCategories,
-      });
+      const existingIssue = failureIssue
+        ? null
+        : await findExistingFailureIssue({
+            owner,
+            repo,
+            workflowId: workflowID,
+            failureCategories,
+          });
 
       // Build missing model pricing context once; both issue-create and issue-comment
       // paths render the same remediation block and should not refetch models.dev.
@@ -3664,7 +3977,12 @@ async function main() {
         // context is the more actionable signal.
         // Also suppress when missing-model-pricing is detected: the pricing error is the
         // root cause and the engine error block would be redundant noise.
-        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError) ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded }) : "";
+        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected)
+          ? buildEngineFailureContext({
+              suppressEngineRateLimit429: maxAICreditsExceeded,
+              maxCacheMissesExceeded,
+            })
+          : "";
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
 
@@ -3677,7 +3995,7 @@ async function main() {
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
         const http400ResponseErrorContext = buildHTTP400ResponseErrorContext(http400ResponseError);
-        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl);
+        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl, maxAICreditsExceeded);
         const unknownModelAICreditsContext = buildUnknownModelAICreditsContext(unknownModelAICredits);
 
         // Build GitHub App token minting failure context
@@ -3711,6 +4029,7 @@ async function main() {
           workflow_source_url: workflowSourceURL,
           secret_verification_failed: String(hasSecretVerificationFailed),
           secret_verification_context: buildSecretVerificationContext(secretVerificationResult, engineSecretFailureMessage),
+          docker_sbx_secrets_context: buildDockerSbxSecretsContext(dockerSbxSecretsResult),
           credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
@@ -3735,6 +4054,7 @@ async function main() {
           ai_credits_rate_limit_error_context: aiCreditsRateLimitErrorContext,
           unknown_model_ai_credits_context: unknownModelAICreditsContext,
           missing_model_pricing_context: missingModelPricingContext,
+          shell_expansion_guard_rejected_context: buildShellExpansionGuardRejectedContext(shellExpansionGuardRejected),
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
           oauth_token_check_failed_context: oauthTokenCheckFailedContext,
@@ -3778,11 +4098,13 @@ async function main() {
       } else {
         // No existing issue, create a new one
         core.info("No existing issue found, creating a new one");
-        const cappedCategories = await getCappedFailureCategories({
-          owner,
-          repo,
-          failureCategories,
-        });
+        const cappedCategories = failureIssue
+          ? []
+          : await getCappedFailureCategories({
+              owner,
+              repo,
+              failureCategories,
+            });
         if (cappedCategories.length > 0) {
           const summary = cappedCategories.map(({ category, count }) => `${category} (${count}/${FAILURE_ISSUE_CATEGORY_DAILY_CAP})`).join(", ");
           core.warning(`Daily per-category issue cap reached for ${summary}.`);
@@ -3885,7 +4207,9 @@ async function main() {
         // context is the more actionable signal.
         // Also suppress when missing-model-pricing is detected: the pricing error is the
         // root cause and the engine error block would be redundant noise.
-        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError) ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded }) : "";
+        const engineFailureContext = shouldBuildEngineFailureContext(agentConclusion, hasToolDenialsExceeded, isTimedOut, missingModelPricingError, shellExpansionGuardRejected)
+          ? buildEngineFailureContext({ suppressEngineRateLimit429: maxAICreditsExceeded })
+          : "";
 
         // Build timeout context
         const timeoutContext = buildTimeoutContext(isTimedOut, timeoutMinutes);
@@ -3899,7 +4223,7 @@ async function main() {
         // Build model not supported error context
         const modelNotSupportedErrorContext = buildModelNotSupportedErrorContext(modelNotSupportedError);
         const http400ResponseErrorContext = buildHTTP400ResponseErrorContext(http400ResponseError);
-        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl);
+        const aiCreditsRateLimitErrorContext = buildAICreditsRateLimitErrorContext(aiCreditsRateLimitError || maxAICreditsExceeded, aiCredits, maxAICredits, runUrl, maxAICreditsExceeded);
         const unknownModelAICreditsContext = buildUnknownModelAICreditsContext(unknownModelAICredits);
 
         // Build GitHub App token minting failure context
@@ -3937,6 +4261,7 @@ async function main() {
           pull_request_info: pullRequest ? `  \n**Pull Request:** [#${pullRequest.number}](${pullRequest.html_url})` : "",
           secret_verification_failed: String(hasSecretVerificationFailed),
           secret_verification_context: buildSecretVerificationContext(secretVerificationResult, engineSecretFailureMessage),
+          docker_sbx_secrets_context: buildDockerSbxSecretsContext(dockerSbxSecretsResult),
           credential_auth_error_context: credentialAuthErrorContext,
           assignment_errors_context: assignmentErrorsContext,
           assign_copilot_failure_context: assignCopilotFailureContext,
@@ -3961,6 +4286,7 @@ async function main() {
           ai_credits_rate_limit_error_context: aiCreditsRateLimitErrorContext,
           unknown_model_ai_credits_context: unknownModelAICreditsContext,
           missing_model_pricing_context: missingModelPricingContext,
+          shell_expansion_guard_rejected_context: buildShellExpansionGuardRejectedContext(shellExpansionGuardRejected),
           app_token_minting_failed_context: appTokenMintingFailedContext,
           lockdown_check_failed_context: lockdownCheckFailedContext,
           oauth_token_check_failed_context: oauthTokenCheckFailedContext,
@@ -4004,16 +4330,33 @@ async function main() {
         const bodyLines = detectionCaution ? [detectionCaution, "", issueBodyContent, "", footerWithExpires] : [issueBodyContent, "", footerWithExpires];
         const issueBody = bodyLines.join("\n");
 
-        const newIssue = await github.rest.issues.create({
-          owner,
-          repo,
-          title: issueTitle,
-          body: issueBody,
-          labels: ["agentic-workflows"],
-          headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
-        });
+        let newIssue;
+        if (failureIssue) {
+          const labels = [...new Set([...(failureIssue.labels || []).map(label => (typeof label === "string" ? label : label.name || "")).filter(Boolean), "agentic-workflows"])];
+          newIssue = await github.rest.issues.update({
+            owner,
+            repo,
+            issue_number: failureIssue.number,
+            title: issueTitle,
+            body: issueBody,
+            labels,
+            state: "open",
+            headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
+          });
+          core.info(`✓ Reused failure issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
+        } else {
+          newIssue = await github.rest.issues.create({
+            owner,
+            repo,
+            title: issueTitle,
+            body: issueBody,
+            labels: ["agentic-workflows"],
+            headers: { "X-GitHub-Api-Version": GITHUB_API_VERSION },
+          });
+          core.info(`✓ Created new issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
+        }
 
-        core.info(`✓ Created new issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
+        setFailureIssueOutputs(newIssue.data);
 
         // Link as sub-issue to parent if parent issue was created
         if (parentIssue) {
@@ -4055,6 +4398,7 @@ module.exports = {
   buildTimeoutContext,
   shouldBuildEngineFailureContext,
   isIssueWritePermissionError,
+  setFailureIssueOutputs,
   buildAssignCopilotFailureContext,
   buildEngineFailureContext,
   detectAWFFirewallStartupFailureFromLog,
@@ -4079,8 +4423,13 @@ module.exports = {
   hasEngineMaxRunsExceededSignal,
   hasEngineRateLimit429Signal,
   hasEngineRateLimit429InOTELMirror,
+  detectEngineRateLimit429Failure,
   buildEngineMaxRunsExceededContext,
   buildEngineRateLimit429Context,
+  hasEngineMaxCacheMissesExceededSignal,
+  buildEngineMaxCacheMissesExceededContext,
+  hasShellExpansionGuardRejectedSignal,
+  buildShellExpansionGuardRejectedContext,
   readTokenUsageMarkdown,
   parseFirewallAuthErrors,
   parseMaxAICreditsFromAuditLog,
@@ -4090,6 +4439,7 @@ module.exports = {
   detectAndHandleFailureCascade,
   findRecentFailureIssues,
   buildSecretVerificationContext,
+  buildDockerSbxSecretsContext,
   CASCADE_WINDOW_MINUTES,
   CASCADE_WINDOW_MS,
   CASCADE_THRESHOLD,

@@ -18,7 +18,7 @@ type SafeJobConfig struct {
 	// Standard GitHub Actions job properties
 	Name           string            `yaml:"name,omitempty"`
 	Description    string            `yaml:"description,omitempty"`
-	RunsOn         any               `yaml:"runs-on,omitempty"`
+	RunsOn         string            `yaml:"runs-on,omitempty"`
 	If             string            `yaml:"if,omitempty"`
 	Needs          []string          `yaml:"needs,omitempty"`
 	Steps          []any             `yaml:"steps,omitempty"`
@@ -31,6 +31,7 @@ type SafeJobConfig struct {
 	GitHubToken string                      `yaml:"github-token,omitempty"`
 	Output      string                      `yaml:"output,omitempty"`
 	Max         int                         `yaml:"max,omitempty"` // Maximum number of times this output type may be emitted per run (default: 1)
+	runsOnError error                       `yaml:"-"`
 }
 
 // parseSafeJobsConfig parses safe-jobs configuration from a jobs map.
@@ -66,11 +67,14 @@ func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJ
 			}
 		}
 
-		// Parse runs-on (also accept "runner" as alias)
-		if runsOn, exists := jobConfig["runs-on"]; exists {
-			safeJob.RunsOn = runsOn
-		} else if runner, exists := jobConfig["runner"]; exists {
-			safeJob.RunsOn = runner
+		// Parse runs-on using the shared custom-job parser.
+		runsOnJob := &Job{}
+		if err := c.extractCustomJobRunsOn(runsOnJob, jobName, jobConfig); err != nil {
+			safeJob.runsOnError = err
+		} else if isEmptySafeJobRunsOn(jobConfig["runs-on"]) {
+			safeJob.RunsOn = ""
+		} else {
+			safeJob.RunsOn = runsOnJob.RunsOn
 		}
 
 		// Parse if condition
@@ -181,6 +185,13 @@ func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJ
 	return result
 }
 
+func isEmptySafeJobRunsOn(value any) bool {
+	if _, isObject := value.(map[string]any); isObject {
+		return false
+	}
+	return isEmptyRunsOnValue(value)
+}
+
 // buildSafeJobs creates custom safe-output jobs defined in SafeOutputs.Jobs
 func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool) ([]string, error) {
 	if data.SafeOutputs == nil || len(data.SafeOutputs.Jobs) == 0 {
@@ -231,25 +242,17 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 		// Add any additional dependencies from the config
 		job.Needs = append(job.Needs, jobConfig.Needs...)
 
-		// Set runs-on
-		if jobConfig.RunsOn != nil {
-			if runsOnStr, ok := jobConfig.RunsOn.(string); ok {
-				job.RunsOn = "runs-on: " + runsOnStr
-			} else if runsOnList, ok := jobConfig.RunsOn.([]any); ok {
-				// Handle array format
-				var runsOnItems []string
-				for _, item := range runsOnList {
-					if itemStr, ok := item.(string); ok {
-						runsOnItems = append(runsOnItems, "      - "+itemStr)
-					}
-				}
-				if len(runsOnItems) > 0 {
-					job.RunsOn = "runs-on:\n" + strings.Join(runsOnItems, "\n")
-				}
-			}
-		} else {
-			job.RunsOn = "runs-on: ubuntu-latest" // Default
+		const defaultRunsOn = "ubuntu-latest"
+
+		// Set runs-on, defaulting to ubuntu-latest when omitted.
+		if jobConfig.runsOnError != nil {
+			return nil, fmt.Errorf("invalid runs-on for safe-job '%s': %w", normalizedJobName, jobConfig.runsOnError)
 		}
+		runsOn := jobConfig.RunsOn
+		if runsOn == "" {
+			runsOn = "runs-on: " + defaultRunsOn
+		}
+		job.RunsOn = runsOn
 
 		// Set if condition - combine safe output type check with user-provided condition
 		// Custom safe jobs should only run if the agent output contains the job name (tool call)
@@ -284,10 +287,11 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 		// Safe-jobs depend on the agent job, so the prefix comes from needs.agent.outputs.
 		agentArtifactPrefix := artifactPrefixExprForAgentDownstreamJob(data)
 		downloadSteps := buildArtifactDownloadSteps(ArtifactDownloadConfig{
-			ArtifactName: agentArtifactPrefix + constants.AgentArtifactName,
-			DownloadPath: SafeJobsDownloadDirExpr,
-			SetupEnvStep: false, // We'll handle env vars separately to add job-specific ones
-			StepName:     "Download agent output artifact",
+			ArtifactName:     agentArtifactPrefix + constants.AgentArtifactName.String(),
+			FallbackArtifact: agentArtifactPrefix + constants.AgentOutputFallbackArtifactName.String(),
+			DownloadPath:     SafeJobsDownloadDirExpr,
+			SetupEnvStep:     false, // We'll handle env vars separately to add job-specific ones
+			StepName:         "Download agent output artifact",
 		}, c.getActionPin)
 		steps = append(steps, downloadSteps...)
 
@@ -299,7 +303,7 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 			// GH_AW_AGENT_OUTPUT uses the runner.temp Actions expression so the path is
 			// resolved by the runner without requiring a $GITHUB_OUTPUT write.
 			setupEnvVars := map[string]string{
-				"GH_AW_AGENT_OUTPUT": SafeJobsDownloadDirExpr + constants.AgentOutputFilename,
+				"GH_AW_AGENT_OUTPUT": SafeJobsDownloadDirExpr + constants.AgentOutputFilename.String(),
 			}
 			// All job-specific env vars (literal or expression-based) are injected with
 			// their original values. Nothing goes through $GITHUB_OUTPUT.

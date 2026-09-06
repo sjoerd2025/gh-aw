@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -50,8 +49,8 @@ When no workflow is specified, lists all workflows with a summary of their allow
 and blocked domain counts.
 
 When a workflow ID or file is specified, lists all effective allowed and blocked
-domains for that workflow, including domains expanded from ecosystem identifiers
-(e.g., "node", "python", "github") and engine defaults.
+domains for that workflow, including domains expanded from named domain sets
+(e.g., "node", "python", "github", "copilot").
 
 The workflow argument can be:
 - A workflow ID (basename without .md extension, e.g., "weekly-research")
@@ -115,9 +114,9 @@ func RunListDomains(jsonOutput bool) error {
 	}
 
 	if jsonOutput {
-		jsonBytes, err := json.MarshalIndent(summaries, "", "  ")
+		jsonBytes, err := marshalIndentJSONOrWrap(summaries, "domain summaries")
 		if err != nil {
-			return fmt.Errorf("failed to marshal JSON: %w", err)
+			return err
 		}
 		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil
@@ -155,9 +154,9 @@ func RunWorkflowDomains(workflowArg string, jsonOutput bool) error {
 			AllowedDomains: allowedDomains,
 			BlockedDomains: blockedDomains,
 		}
-		jsonBytes, err := json.MarshalIndent(detail, "", "  ")
+		jsonBytes, err := marshalIndentJSONOrWrap(detail, "domain details")
 		if err != nil {
-			return fmt.Errorf("failed to marshal JSON: %w", err)
+			return err
 		}
 		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return nil

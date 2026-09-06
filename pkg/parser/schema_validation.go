@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -58,6 +60,18 @@ func validateSharedWorkflowFields(frontmatter map[string]any) error {
 			}
 			continue
 		}
+		if key == "concurrency" {
+			if err := validateSharedWorkflowConcurrencyField(frontmatter["concurrency"]); err != nil {
+				return err
+			}
+			continue
+		}
+		if key == "features" {
+			if err := validateSharedWorkflowFeaturesField(frontmatter["features"]); err != nil {
+				return err
+			}
+			continue
+		}
 		if setutil.Contains(sharedWorkflowForbiddenFields, key) {
 			forbiddenFound = append(forbiddenFound, key)
 		}
@@ -69,6 +83,50 @@ func validateSharedWorkflowFields(frontmatter map[string]any) error {
 			return fmt.Errorf("field '%s' cannot be used in shared workflows (only allowed in main workflows with 'on' trigger)", forbiddenFound[0])
 		}
 		return fmt.Errorf("fields %v cannot be used in shared workflows (only allowed in main workflows with 'on' trigger)", forbiddenFound)
+	}
+
+	return nil
+}
+
+func validateSharedWorkflowConcurrencyField(concurrencyValue any) error {
+	switch value := concurrencyValue.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return errors.New("field 'concurrency' cannot be used in shared workflows (only concurrency.group and concurrency.job-discriminator are import-safe)")
+		}
+		return nil
+	case map[string]any:
+		for key := range value {
+			if key != "group" && key != "job-discriminator" {
+				return fmt.Errorf("field 'concurrency' in shared workflows can only include import-safe fields group and job-discriminator; found unsupported key: %s", key)
+			}
+		}
+		return nil
+	default:
+		return errors.New("field 'concurrency' cannot be used in shared workflows (only concurrency.group and concurrency.job-discriminator are import-safe)")
+	}
+}
+
+// sharedWorkflowAllowedFeaturesFields lists the features.* sub-fields that are safe to
+// import from shared workflows. Other feature keys are configuration/experimental
+// settings intended only for main workflows and are rejected.
+var sharedWorkflowAllowedFeaturesFields = map[string]struct{}{
+	"samples":             {},
+	"intentional-failure": {},
+}
+
+// validateSharedWorkflowFeaturesField validates features: usage in shared workflows.
+// Shared workflows may use features: only for import-safe feature flags.
+func validateSharedWorkflowFeaturesField(featuresValue any) error {
+	featuresMap, ok := featuresValue.(map[string]any)
+	if !ok {
+		return errors.New("field 'features' cannot be used in shared workflows (only features.samples and features.intentional-failure are import-safe)")
+	}
+
+	for key := range featuresMap {
+		if _, ok := sharedWorkflowAllowedFeaturesFields[key]; !ok {
+			return fmt.Errorf("field 'features' in shared workflows can only include import-safe fields samples and intentional-failure; found unsupported key: %s", key)
+		}
 	}
 
 	return nil
@@ -102,6 +160,12 @@ func validateSharedWorkflowOnField(onValue any) error {
 	return nil
 }
 
+// IsImportSafeSharedWorkflowOn reports whether an on: block contains only fields
+// that are safe for shared workflow imports and no trigger events.
+func IsImportSafeSharedWorkflowOn(onValue any) bool {
+	return validateSharedWorkflowOnField(onValue) == nil
+}
+
 // ValidateMainWorkflowFrontmatterWithSchemaAndLocation validates main workflow frontmatter with file location info.
 //
 // This function validates all frontmatter fields including pass-through fields that are
@@ -124,6 +188,9 @@ func ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter map[string
 	if err := validateUnsupportedJobInputs(filtered); err != nil {
 		return err
 	}
+	if err := validateMetadataDocs(filtered); err != nil {
+		return err
+	}
 
 	// Then run the standard schema validation with location
 	if err := validateWithSchemaAndLocation(filtered, mainWorkflowSchema, "main workflow file", filePath); err != nil {
@@ -132,6 +199,28 @@ func ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter map[string
 
 	// Finally run other custom validation rules
 	return validateEngineSpecificRules(filtered)
+}
+
+func validateMetadataDocs(frontmatter map[string]any) error {
+	metadata, ok := frontmatter["metadata"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	docs, ok := metadata["docs"].(string)
+	if !ok {
+		return nil
+	}
+	parsed, err := url.ParseRequestURI(docs)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+		return errors.New("metadata.docs must be a valid absolute HTTPS URL")
+	}
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || number == 0 {
+			return errors.New("metadata.docs must be a valid absolute HTTPS URL")
+		}
+	}
+	return nil
 }
 
 // ValidateIncludedFileFrontmatterWithSchemaAndLocation validates included file frontmatter with file location info
@@ -150,6 +239,9 @@ func ValidateIncludedFileFrontmatterWithSchemaAndLocation(frontmatter map[string
 
 	// First check for forbidden fields in shared workflows
 	if err := validateSharedWorkflowFields(filtered); err != nil {
+		return err
+	}
+	if err := validateMetadataDocs(filtered); err != nil {
 		return err
 	}
 

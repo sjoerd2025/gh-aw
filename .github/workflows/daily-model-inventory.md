@@ -64,6 +64,7 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the OpenAI API key is sent only to the official OpenAI models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             https://api.openai.com/v1/models) || true
@@ -121,6 +122,7 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the Anthropic API key is sent only to the official Anthropic models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
@@ -180,6 +182,7 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the Gemini API key is sent only to the official Google models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
             "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}") || true
           if [ "${HTTP_STATUS:-0}" = "200" ]; then
@@ -225,7 +228,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Create placeholder for Copilot billing models
+      - name: Create placeholder for GitHub Copilot billing models
         id: fetch
         shell: bash
         run: |
@@ -247,7 +250,7 @@ jobs:
         shell: bash
         run: cat /tmp/gh-aw/agent/model-inventory/copilot-billing/models.json 2>/dev/null || echo "(no models.json)"
 
-      - name: Upload Copilot billing models artifact
+      - name: Upload GitHub Copilot billing models artifact
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -262,15 +265,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Install Copilot SDK with bundled Copilot CLI
+      - name: Install GitHub Copilot SDK with bundled GitHub Copilot CLI
         shell: bash
         run: |
           set -euo pipefail
           SDK_DIR="$RUNNER_TEMP/copilot-sdk"
           mkdir -p "$SDK_DIR"
-          npm install --prefix "$SDK_DIR" --no-save @github/copilot-sdk@1.0.8
+          npm install --prefix "$SDK_DIR" --no-save @github/copilot-sdk@1.0.11
 
-      - name: Fetch Copilot SDK model billing information
+      - name: Fetch GitHub Copilot SDK model billing information
         shell: bash
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
@@ -301,7 +304,7 @@ jobs:
         shell: bash
         run: cat /tmp/gh-aw/agent/model-inventory/copilot-sdk/models.json 2>/dev/null || echo "(no models.json)"
 
-      - name: Upload Copilot SDK models artifact
+      - name: Upload GitHub Copilot SDK models artifact
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -318,10 +321,12 @@ steps:
 
   - name: Predownload models.dev API index
     shell: bash
+    # runner-guard:ignore RGS-012 -- unauthenticated GET from a public read-only model index; no secrets are sent.
     run: |
       set -euo pipefail
       OUT="/tmp/gh-aw/agent/model-inventory/models-dev"
       mkdir -p "$OUT"
+      # runner-guard:ignore RGS-012 -- unauthenticated GET from a public read-only model index; no secrets are sent.
       curl -fsS https://models.dev/api.json -o "$OUT/api.json"
       echo "Downloaded models.dev API index to $OUT/api.json"
 
@@ -335,11 +340,11 @@ steps:
 
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
+    id: awf
 tools:
   cli-proxy: true
   playwright:
-    mode: cli
   bash:
     - "*"
   github:

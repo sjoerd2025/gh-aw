@@ -12,25 +12,23 @@ permissions:
   discussions: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
+features:
+  gh-aw-detection: true
 
 tracker-id: eslint-monster
-model: copilot/gpt-5.4
+model: openai/gpt-5.4
 engine:
-  id: pi
+  id: codex
+  model-provider: openai
 strict: true
 timeout-minutes: 45
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default, issues, discussions]
   bash:
-    - "cat /tmp/gh-aw/agent/eslint-factory.log"
-    - "cat /tmp/gh-aw/agent/eslint-diagnostics.txt"
-    - "cat /tmp/gh-aw/agent/skill-index.txt"
+    - "*"
 steps:
   - name: Run ESLint factory pre-check
     id: eslint_scan
@@ -83,6 +81,15 @@ safe-outputs:
   noop:
 imports:
   - shared/otlp.md
+  - shared/reporting.md
+evals:
+  - id: eslint_diagnostics_analyzed
+    question: Did the agent analyze the ESLint factory diagnostics and group actionable findings?
+  - id: remediation_dispatched_or_noop
+    question: Did the agent dispatch remediation for actionable findings, or use noop when the scan was clean?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

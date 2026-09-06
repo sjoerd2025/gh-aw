@@ -14,7 +14,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBuildConcurrentDownloadParams_RepoOverride(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		repoOverride string
+		wantHost     string
+		wantOwner    string
+		wantRepo     string
+	}{
+		{name: "owner and repo", repoOverride: "owner/repo", wantOwner: "owner", wantRepo: "repo"},
+		{name: "host owner and repo", repoOverride: "ghe.example/owner/repo", wantHost: "ghe.example", wantOwner: "owner", wantRepo: "repo"},
+		{name: "empty component", repoOverride: "owner/"},
+		{name: "empty host-qualified component", repoOverride: "ghe.example/owner/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			params := buildConcurrentDownloadParams("", false, tt.repoOverride, nil, false, nil)
+			assert.Equal(t, tt.wantHost, params.dlHost)
+			assert.Equal(t, tt.wantOwner, params.dlOwner)
+			assert.Equal(t, tt.wantRepo, params.dlRepo)
+		})
+	}
+}
+
 func TestRunHasEvals(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		setup    func(t *testing.T, dir string)
@@ -24,7 +51,7 @@ func TestRunHasEvals(t *testing.T) {
 			name: "root-level evals.jsonl (flattenSingleFileArtifacts output)",
 			setup: func(t *testing.T, dir string) {
 				t.Helper()
-				require.NoError(t, os.WriteFile(filepath.Join(dir, constants.EvalsResultFilename), []byte("{}"), 0600))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, constants.EvalsResultFilename.String()), []byte("{}"), 0600))
 			},
 			expected: true,
 		},
@@ -32,9 +59,9 @@ func TestRunHasEvals(t *testing.T) {
 			name: "evals/evals.jsonl (un-flattened artifact directory)",
 			setup: func(t *testing.T, dir string) {
 				t.Helper()
-				evalsDir := filepath.Join(dir, constants.EvalsArtifactName)
+				evalsDir := filepath.Join(dir, constants.EvalsArtifactName.String())
 				require.NoError(t, os.Mkdir(evalsDir, 0700))
-				require.NoError(t, os.WriteFile(filepath.Join(evalsDir, constants.EvalsResultFilename), []byte("{}"), 0600))
+				require.NoError(t, os.WriteFile(filepath.Join(evalsDir, constants.EvalsResultFilename.String()), []byte("{}"), 0600))
 			},
 			expected: true,
 		},
@@ -42,9 +69,9 @@ func TestRunHasEvals(t *testing.T) {
 			name: "hash-prefixed {hash}-evals/evals.jsonl (workflow_call variant)",
 			setup: func(t *testing.T, dir string) {
 				t.Helper()
-				evalsDir := filepath.Join(dir, "abc123-"+constants.EvalsArtifactName)
+				evalsDir := filepath.Join(dir, "abc123-"+constants.EvalsArtifactName.String())
 				require.NoError(t, os.Mkdir(evalsDir, 0700))
-				require.NoError(t, os.WriteFile(filepath.Join(evalsDir, constants.EvalsResultFilename), []byte("{}"), 0600))
+				require.NoError(t, os.WriteFile(filepath.Join(evalsDir, constants.EvalsResultFilename.String()), []byte("{}"), 0600))
 			},
 			expected: true,
 		},
@@ -52,7 +79,7 @@ func TestRunHasEvals(t *testing.T) {
 			name: "evals/ directory exists but contains no evals.jsonl",
 			setup: func(t *testing.T, dir string) {
 				t.Helper()
-				evalsDir := filepath.Join(dir, constants.EvalsArtifactName)
+				evalsDir := filepath.Join(dir, constants.EvalsArtifactName.String())
 				require.NoError(t, os.Mkdir(evalsDir, 0700))
 				require.NoError(t, os.WriteFile(filepath.Join(evalsDir, "other.txt"), []byte("data"), 0600))
 			},
@@ -62,9 +89,9 @@ func TestRunHasEvals(t *testing.T) {
 			name: "usage/evals.jsonl (compact usage artifact)",
 			setup: func(t *testing.T, dir string) {
 				t.Helper()
-				usageDir := filepath.Join(dir, constants.UsageArtifactName)
+				usageDir := filepath.Join(dir, constants.UsageArtifactName.String())
 				require.NoError(t, os.Mkdir(usageDir, 0700))
-				require.NoError(t, os.WriteFile(filepath.Join(usageDir, constants.EvalsResultFilename), []byte("{}"), 0600))
+				require.NoError(t, os.WriteFile(filepath.Join(usageDir, constants.EvalsResultFilename.String()), []byte("{}"), 0600))
 			},
 			expected: true,
 		},
@@ -72,9 +99,9 @@ func TestRunHasEvals(t *testing.T) {
 			name: "hash-prefixed {hash}-usage/evals.jsonl (workflow_call compact usage artifact)",
 			setup: func(t *testing.T, dir string) {
 				t.Helper()
-				usageDir := filepath.Join(dir, "abc123-"+constants.UsageArtifactName)
+				usageDir := filepath.Join(dir, "abc123-"+constants.UsageArtifactName.String())
 				require.NoError(t, os.Mkdir(usageDir, 0700))
-				require.NoError(t, os.WriteFile(filepath.Join(usageDir, constants.EvalsResultFilename), []byte("{}"), 0600))
+				require.NoError(t, os.WriteFile(filepath.Join(usageDir, constants.EvalsResultFilename.String()), []byte("{}"), 0600))
 			},
 			expected: true,
 		},
@@ -95,6 +122,7 @@ func TestRunHasEvals(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			tc.setup(t, dir)
 			assert.Equal(t, tc.expected, runHasEvals(dir, false))
@@ -103,7 +131,9 @@ func TestRunHasEvals(t *testing.T) {
 }
 
 func TestBackfillRunTokenUsageFromFirewall(t *testing.T) {
+	t.Parallel()
 	t.Run("backfills run and metrics token usage from firewall summary", func(t *testing.T) {
+		t.Parallel()
 		metrics := LogMetrics{}
 		result := DownloadResult{}
 		tokenUsage := &TokenUsageSummary{
@@ -119,10 +149,12 @@ func TestBackfillRunTokenUsageFromFirewall(t *testing.T) {
 	})
 
 	t.Run("does not overwrite non-zero event token usage", func(t *testing.T) {
+		t.Parallel()
 		metrics := LogMetrics{TokenUsage: 123}
-		result := DownloadResult{
+		result := DownloadResult{RunAnalysis: RunAnalysis{
 			Run:     WorkflowRun{TokenUsage: 123},
 			Metrics: LogMetrics{TokenUsage: 123},
+		},
 		}
 		tokenUsage := &TokenUsageSummary{
 			TotalInputTokens:  2000,
@@ -138,16 +170,20 @@ func TestBackfillRunTokenUsageFromFirewall(t *testing.T) {
 }
 
 func TestTryLoadCachedRunResultBypassesForExplicitEvalsArtifactRequest(t *testing.T) {
+	t.Parallel()
 	runOutputDir := t.TempDir()
 	summary := &RunSummary{
 		CLIVersion:  GetVersion(),
 		RunID:       123,
 		ProcessedAt: time.Now(),
-		Run: WorkflowRun{
-			DatabaseID: 123,
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID: 123,
+			},
 		},
 	}
 	require.NoError(t, saveRunSummary(runOutputDir, summary, false))
+	require.NoError(t, markArtifactDownloaded(runOutputDir, string(ArtifactSetAll)))
 
 	result, ok := tryLoadCachedRunResult(context.Background(), WorkflowRun{DatabaseID: 123}, runOutputDir, concurrentRunDownloadParams{
 		evalsOnly:              false,
@@ -159,16 +195,21 @@ func TestTryLoadCachedRunResultBypassesForExplicitEvalsArtifactRequest(t *testin
 }
 
 func TestTryLoadCachedRunResultUsesCacheWhenEvalsNotRequested(t *testing.T) {
+	t.Parallel()
 	runOutputDir := t.TempDir()
 	summary := &RunSummary{
 		CLIVersion:  GetVersion(),
 		RunID:       124,
 		ProcessedAt: time.Now(),
-		Run: WorkflowRun{
-			DatabaseID: 124,
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID: 124,
+			},
 		},
 	}
+
 	require.NoError(t, saveRunSummary(runOutputDir, summary, false))
+	require.NoError(t, markArtifactDownloaded(runOutputDir, string(ArtifactSetAll)))
 
 	result, ok := tryLoadCachedRunResult(context.Background(), WorkflowRun{DatabaseID: 124}, runOutputDir, concurrentRunDownloadParams{
 		evalsOnly:              false,
@@ -180,12 +221,85 @@ func TestTryLoadCachedRunResultUsesCacheWhenEvalsNotRequested(t *testing.T) {
 	assert.True(t, result.Cached)
 }
 
+func TestTryLoadCachedRunResultBypassesCacheWhenRequestedArtifactIsMissing(t *testing.T) {
+	t.Parallel()
+	runOutputDir := t.TempDir()
+	summary := &RunSummary{
+		CLIVersion:  GetVersion(),
+		RunID:       125,
+		ProcessedAt: time.Now(),
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{DatabaseID: 125},
+		},
+	}
+	require.NoError(t, saveRunSummary(runOutputDir, summary, false))
+	require.NoError(t, markArtifactDownloaded(runOutputDir, "activation"))
+
+	result, ok := tryLoadCachedRunResult(context.Background(), WorkflowRun{DatabaseID: 125}, runOutputDir, concurrentRunDownloadParams{
+		artifactFilter: []string{"agent"},
+	})
+
+	assert.False(t, ok)
+	assert.Nil(t, result)
+}
+
+func TestTryLoadCachedRunResultUsesCacheWhenRequestedArtifactsArePresent(t *testing.T) {
+	t.Parallel()
+	runOutputDir := t.TempDir()
+	summary := &RunSummary{
+		CLIVersion:  GetVersion(),
+		RunID:       126,
+		ProcessedAt: time.Now(),
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{DatabaseID: 126},
+		},
+	}
+	require.NoError(t, saveRunSummary(runOutputDir, summary, false))
+	require.NoError(t, markArtifactDownloaded(runOutputDir, "activation"))
+	require.NoError(t, markArtifactDownloaded(runOutputDir, "usage"))
+
+	result, ok := tryLoadCachedRunResult(context.Background(), WorkflowRun{DatabaseID: 126}, runOutputDir, concurrentRunDownloadParams{
+		artifactFilter: []string{"activation", "usage"},
+	})
+
+	require.True(t, ok)
+	require.NotNil(t, result)
+	assert.True(t, result.Cached)
+}
+
+func TestTryLoadCachedRunResultRequiresCompleteMarkerForAllArtifacts(t *testing.T) {
+	t.Parallel()
+	runOutputDir := t.TempDir()
+	summary := &RunSummary{
+		CLIVersion:  GetVersion(),
+		RunID:       127,
+		ProcessedAt: time.Now(),
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{DatabaseID: 127},
+		},
+	}
+	require.NoError(t, saveRunSummary(runOutputDir, summary, false))
+	require.NoError(t, markArtifactDownloaded(runOutputDir, "activation"))
+	require.NoError(t, markArtifactDownloaded(runOutputDir, "usage"))
+
+	result, ok := tryLoadCachedRunResult(context.Background(), WorkflowRun{DatabaseID: 127}, runOutputDir, concurrentRunDownloadParams{})
+	assert.False(t, ok)
+	assert.Nil(t, result)
+
+	require.NoError(t, markArtifactDownloaded(runOutputDir, string(ArtifactSetAll)))
+	result, ok = tryLoadCachedRunResult(context.Background(), WorkflowRun{DatabaseID: 127}, runOutputDir, concurrentRunDownloadParams{})
+	require.True(t, ok)
+	require.NotNil(t, result)
+	assert.True(t, result.Cached)
+}
+
 // TestTryLoadCachedRunResultPersistsSafeItemsCountAfterBackfill verifies that when
 // tryLoadCachedRunResult heals a stale SafeItemsCount (0 → N) via backfillCacheHitIfNeeded,
 // the healed value is written back to run_summary.json on disk so downstream readers
 // (e.g. api-consumption-report) see the correct count without falling back to the
 // activity summary.
 func TestTryLoadCachedRunResultPersistsSafeItemsCountAfterBackfill(t *testing.T) {
+	t.Parallel()
 	runOutputDir := t.TempDir()
 
 	// Write a run_summary.json with SafeItemsCount=0 (stale cache).
@@ -193,12 +307,15 @@ func TestTryLoadCachedRunResultPersistsSafeItemsCountAfterBackfill(t *testing.T)
 		CLIVersion:  GetVersion(),
 		RunID:       200,
 		ProcessedAt: time.Now(),
-		Run: WorkflowRun{
-			DatabaseID:     200,
-			SafeItemsCount: 0,
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID:     200,
+				SafeItemsCount: 0,
+			},
 		},
 	}
 	require.NoError(t, saveRunSummary(runOutputDir, summary, false))
+	require.NoError(t, markArtifactDownloaded(runOutputDir, string(ArtifactSetAll)))
 
 	// Write a usage/activity/summary.json so backfill has something to pull from.
 	activityPath := filepath.Join(runOutputDir, "usage", "activity", "summary.json")

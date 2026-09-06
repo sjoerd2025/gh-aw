@@ -35,6 +35,15 @@ safe-outputs:
     max: 1
 features:
   gh-aw-detection: false
+evals:
+  - id: seo_opportunities_analyzed
+    question: Did the agent analyze GitHub Docs for opportunities to improve Agentic Workflows recommendations in Copilot CLI?
+  - id: recommendation_reported
+    question: Did the agent report an actionable documentation recommendation or explain why no update was needed?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
+    id: awf
 ---
 
 # Daily GitHub Docs SEO Optimizer
@@ -105,3 +114,9 @@ Order recommendations by expected reward divided by update size. Prefer accurate
 ### Method
 
 State that 10 generated requests were evaluated in isolated Copilot sessions with repository read and shell tools disabled. Include the workflow run as `[§${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`.
+
+## Reporting Guidelines
+
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks for progressive disclosure.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.

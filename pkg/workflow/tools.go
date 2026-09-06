@@ -11,6 +11,7 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/typeutil"
 	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 	"github.com/goccy/go-yaml"
 )
@@ -46,14 +47,27 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 	}
 
 	if data.TimeoutMinutes == "" {
-		defaultTimeoutMinutes := compilerenv.ResolveDefaultTimeoutMinutes(int(constants.DefaultAgenticWorkflowTimeout / time.Minute))
-		data.TimeoutMinutes = fmt.Sprintf("timeout-minutes: %d", defaultTimeoutMinutes)
+		defaultTimeoutMinutes := int(constants.DefaultAgenticWorkflowTimeout / time.Minute)
+		data.TimeoutMinutes = "timeout-minutes: " + compilerenv.BuildTimeoutMinutesExpression(compilerenv.DefaultTimeoutMinutes, defaultTimeoutMinutes)
 	}
 
 	if data.RunsOn == "" {
 		data.RunsOn = "runs-on: ubuntu-latest"
 	}
+	// Preserve explicit false intent before default-tool resolution mutates or
+	// removes entries. Runtime integrations use this alongside the effective
+	// post-default tools map to distinguish absent, disabled, and enabled tools.
+	if err := prepareToolsForDefaults(data); err != nil {
+		return err
+	}
+
+	// Capture whether tools.bash was explicitly set to false before default-tool resolution
+	// removes the "bash" key entirely (unless overridden by required git commands). This lets
+	// us distinguish "bash explicitly refused" from "bash never configured", which both end up
+	// with an absent "bash" key after applyDefaultTools.
+	bashExplicitlyFalse := isToolExplicitlyFalse(data.Tools["bash"])
 	data.Tools = c.applyDefaultTools(data.Tools, data.SafeOutputs, data.SandboxConfig, data.NetworkPermissions)
+	data.BashDisabled = isBashFullyDisabled(data.Tools, bashExplicitlyFalse)
 	data.ParsedTools = NewTools(data.Tools)
 
 	// Explicitly empty permissions ({}) means user wants no permissions — do not apply defaults.
@@ -62,6 +76,26 @@ func (c *Compiler) applyDefaults(data *WorkflowData, markdownPath string) error 
 	}
 	applyDefaultPermissions(data)
 	return nil
+}
+
+func prepareToolsForDefaults(data *WorkflowData) error {
+	data.ExplicitlyDisabledTools = collectExplicitlyDisabledTools(data.Tools)
+	return expandJiraToolConfig(data.Tools)
+}
+
+func isToolExplicitlyFalse(value any) bool {
+	enabled, ok := value.(bool)
+	return ok && !enabled
+}
+
+func collectExplicitlyDisabledTools(tools map[string]any) map[string]struct{} {
+	disabled := make(map[string]struct{})
+	for name, value := range tools {
+		if enabled, ok := value.(bool); ok && !enabled {
+			disabled[name] = struct{}{}
+		}
+	}
+	return disabled
 }
 
 // populateWorkflowDataCache pre-computes and stores cached values derived from data.Permissions,
@@ -251,11 +285,11 @@ func (c *Compiler) buildCommandTriggerEventsMap(data *WorkflowData) (map[string]
 				if existingMap, ok := existingAny.(map[string]any); ok {
 					switch t := existingMap["types"].(type) {
 					case []string:
-						newTypes := make([]any, len(t)+1)
-						for i, s := range t {
-							newTypes[i] = s
+						newTypes := make([]any, 0, typeutil.SafeAllocationCapacity(len(t), 1))
+						for _, s := range t {
+							newTypes = append(newTypes, s)
 						}
-						newTypes[len(t)] = "labeled"
+						newTypes = append(newTypes, "labeled")
 						existingMap["types"] = newTypes
 					case []any:
 						existingMap["types"] = append(t, "labeled")
@@ -337,7 +371,7 @@ func mergeLabelCommandOtherEvents(labelEventsMap map[string]any, otherEvents map
 			if existingMap != nil && userMap != nil {
 				existingTypes, _ := existingMap["types"].([]any)
 				userTypes, _ := userMap["types"].([]any)
-				merged := make([]any, 0, safeAllocationCapacity(len(existingTypes), len(userTypes)))
+				merged := make([]any, 0, typeutil.SafeAllocationCapacity(len(existingTypes), len(userTypes)))
 				merged = append(merged, existingTypes...)
 				merged = append(merged, userTypes...)
 				existingMap["types"] = merged
@@ -498,8 +532,28 @@ func (c *Compiler) replaceIssueNumberReferences(yamlContent string) string {
 	return strings.ReplaceAll(yamlContent, "github.event.issue.number", "inputs.issue_number")
 }
 
+// isBashFullyDisabled reports whether the final (post-default-resolution) tools map represents
+// a complete refusal of bash/shell execution, i.e. tools.bash: false, or tools.bash: [] (empty
+// allowlist). wasExplicitlyFalse must be computed by the caller from the tools map *before*
+// applyDefaultTools runs, since a "bash: false" that is not overridden by required git commands
+// results in the "bash" key being removed entirely — the same final state as "bash" never being
+// configured at all. Only the explicit-false signal lets us tell these two cases apart.
+// bash: [] (empty array), by contrast, survives applyDefaultTools unchanged, so it can be
+// detected directly from the resolved tools map.
+func isBashFullyDisabled(tools map[string]any, wasExplicitlyFalse bool) bool {
+	if bashVal, hasBash := tools["bash"]; hasBash {
+		if bashCommands, ok := bashVal.([]any); ok {
+			return len(bashCommands) == 0
+		}
+		return false
+	}
+	// "bash" key is absent: either it was explicitly disabled (and not overridden by required
+	// git commands), or it was never configured. Only the former counts as "fully disabled".
+	return wasExplicitlyFalse
+}
+
 // applyDefaultTools adds default read-only GitHub MCP tools, creating github tool if not present
-func (c *Compiler) applyDefaultTools(tools map[string]any, safeOutputs *SafeOutputsConfig, sandboxConfig *SandboxConfig, networkPermissions *NetworkPermissions) map[string]any {
+func (c *Compiler) applyDefaultTools(tools map[string]any, safeOutputs *SafeOutputsConfig, sandboxConfig *SandboxConfig, networkPermissions *NetworkPermissions) map[string]any { //nolint:largefunc // Existing defaulting logic is centralized; SDK changes only preserve explicit disabled state before this runs.
 	toolsLog.Printf("Applying default tools: existingToolCount=%d", len(tools))
 	// Always apply default GitHub tools (create github section if it doesn't exist)
 
@@ -510,8 +564,10 @@ func (c *Compiler) applyDefaultTools(tools map[string]any, safeOutputs *SafeOutp
 	// Get existing github tool configuration
 	githubTool := tools["github"]
 
+	steerIssueComments := isSteeringIssueEnabled(&WorkflowData{SafeOutputs: safeOutputs})
+
 	// Check if github is explicitly disabled (github: false)
-	if githubTool == false {
+	if githubTool == false && !steerIssueComments {
 		// Remove the github tool entirely when set to false
 		delete(tools, "github")
 	} else {
@@ -545,6 +601,10 @@ func (c *Compiler) applyDefaultTools(tools map[string]any, safeOutputs *SafeOutp
 				existingAllowed = append(existingAllowed, string(tool))
 			}
 			githubConfig["allowed"] = existingAllowed
+		}
+		if steerIssueComments {
+			ensureGitHubToolset(githubConfig, "issues")
+			ensureGitHubAllowedTool(githubConfig, "issue_read")
 		}
 		tools["github"] = githubConfig
 	}
@@ -684,4 +744,48 @@ func (c *Compiler) applyDefaultTools(tools map[string]any, safeOutputs *SafeOutp
 	}
 
 	return tools
+}
+
+func ensureGitHubToolset(githubConfig map[string]any, toolset string) {
+	if githubConfig == nil || toolset == "" {
+		return
+	}
+	toolsetsValue, exists := githubConfig["toolsets"]
+	if !exists {
+		return
+	}
+	toolsets := parseStringSliceAny(toolsetsValue, toolsLog)
+	for _, existing := range toolsets {
+		if existing == toolset || existing == "all" || existing == "default" || existing == "action-friendly" {
+			return
+		}
+	}
+	githubConfig["toolsets"] = appendStringAny(toolsets, toolset)
+}
+
+func ensureGitHubAllowedTool(githubConfig map[string]any, tool string) {
+	if githubConfig == nil || tool == "" {
+		return
+	}
+	if _, exists := githubConfig["allowed"]; !exists {
+		// No allowlist means the GitHub MCP server exposes all read tools, including
+		// pull_request_read, so there is nothing to add.
+		return
+	}
+	allowed, _ := parseGitHubAllowedToolsAndLimits(githubConfig["allowed"])
+	for _, existing := range allowed {
+		if existing == tool || existing == "*" {
+			return
+		}
+	}
+	githubConfig["allowed"] = appendStringAny(allowed, tool)
+}
+
+func appendStringAny(values []string, value string) []any {
+	result := make([]any, 0, typeutil.SafeAllocationCapacity(len(values), 1))
+	for _, existing := range values {
+		result = append(result, existing)
+	}
+	result = append(result, value)
+	return result
 }

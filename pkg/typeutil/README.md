@@ -6,9 +6,11 @@
 
 JSON and YAML parsers produce `any` values whose concrete type varies at runtime (`int`, `float64`, `string`, etc.). This package provides safe, well-documented conversion functions that handle the common cases without requiring callers to write their own type switches.
 
-Functions are grouped into three categories: **strict conversions** (return a `(value, ok)` pair to distinguish zero from missing/invalid), **safe overflow conversions** (clamp to zero on overflow instead of panicking), and **lenient conversions** (also handle string inputs, returning zero on failure). A separate group handles token-limit strings with optional `K`/`M` multiplier suffixes.
+Functions are grouped into four categories: **strict conversions** (return a `(value, ok)` pair to distinguish zero from missing/invalid), **safe overflow conversions** (clamp to zero on overflow instead of panicking), **lenient conversions** (also handle string inputs, returning zero on failure), and **map-extraction helpers** (pull typed values from `map[string]any` by key or path). A separate group handles token-limit strings with optional `K`/`M` multiplier suffixes.
 
-Choose the right category based on the source: use strict conversions for YAML config fields where the YAML library has already typed the value; use lenient conversions for heterogeneous sources such as JSON metrics or log-parsed data where a zero default on failure is acceptable.
+Choose the right category based on the source: use strict conversions for YAML config fields where the YAML library has already typed the value; use lenient conversions for heterogeneous sources such as JSON metrics or log-parsed data where a zero default on failure is acceptable; use map-extraction helpers when working with JSON/YAML-decoded `map[string]any` structures.
+
+**File layout**: numeric conversion functions live in `convert.go`; map-extraction helpers (`ParseBool`, `LookupMap`, `LookupString`, `LookupStringPath`) live in `lookup.go`.
 
 ## Public API
 
@@ -27,6 +29,7 @@ Choose the right category based on the source: use strict conversions for YAML c
 | `LookupMap` | Safe map extraction from `map[string]any` by key |
 | `LookupString` | Safe string extraction from `map[string]any` by key |
 | `LookupStringPath` | Safe nested string extraction by key path |
+| `SafeAllocationCapacity` | Overflow-safe sum of capacity hints for slice/map preallocation |
 
 ### Strict Conversions
 
@@ -41,14 +44,6 @@ v, ok := typeutil.ParseIntValue(someYAMLField)
 if !ok {
     return errors.New("field is missing or not an integer")
 }
-```
-
-#### `ParseBool(m map[string]any, key string) bool`
-
-Extracts a boolean value from a `map[string]any` by key. Returns `false` if the map is `nil`, the key is absent, or the value is not a `bool`.
-
-```go
-enabled := typeutil.ParseBool(config, "enabled")
 ```
 
 ### K/M Suffix Parsing
@@ -112,6 +107,45 @@ Safely converts any value (`float64`, `int`, `int64`, `string`) to `float64`, re
 ratio := typeutil.ConvertToFloat(jsonData["ratio"])
 ```
 
+### Map Extraction
+
+> Defined in `lookup.go`.
+
+#### `ParseBool(m map[string]any, key string) bool`
+
+Extracts a boolean value from a `map[string]any` by key. Returns `false` if the map is `nil`, the key is absent, or the value is not a `bool`.
+
+```go
+enabled := typeutil.ParseBool(config, "enabled")
+```
+
+#### `LookupMap(m map[string]any, key string) (map[string]any, bool)`
+
+Extracts a `map[string]any` value from `m` by key. Returns `(nil, false)` if the map is `nil`, the key is absent, or the value is not a `map[string]any`.
+
+#### `LookupString(m map[string]any, key string) (string, bool)`
+
+Extracts a `string` value from `m` by key. Returns `("", false)` if the map is `nil`, the key is absent, or the value is not a `string`.
+
+#### `LookupStringPath(m map[string]any, path ...string) (string, bool)`
+
+Extracts a nested string value by following a sequence of keys through `map[string]any` layers. Returns `("", false)` if any step in the path is missing or has an invalid type, or if the path is empty.
+
+```go
+cmd, ok := typeutil.LookupStringPath(event, "input", "command")
+```
+
+### Allocation Sizing
+
+#### `SafeAllocationCapacity(parts ...int) int`
+
+Returns the summed capacity hint from `parts` when the total fits in `int`. When the sum would overflow, or any part is negative, it returns `0` so callers can safely skip preallocation (e.g. `make([]T, 0, n)`) rather than change correctness or panic. Defined in `allocation.go`; intentionally side-effect free so it does not pull in a logging dependency.
+
+```go
+n := typeutil.SafeAllocationCapacity(len(a), len(b))
+result := make([]Item, 0, n)
+```
+
 ## Choosing the Right Function
 
 | Situation | Function to use |
@@ -119,10 +153,14 @@ ratio := typeutil.ConvertToFloat(jsonData["ratio"])
 | YAML/Go-typed numeric field; must detect missing vs zero | `ParseIntValue` |
 | JSON / log-parsed metric; zero default on failure is fine | `ConvertToInt` |
 | Boolean flag in a `map[string]any` | `ParseBool` |
+| Nested `map[string]any` value by key | `LookupMap` |
+| String value from `map[string]any` by key | `LookupString` |
+| String value from nested `map[string]any` by key path | `LookupStringPath` |
 | Casting `uint64` counter to `int` | `SafeUint64ToInt` |
 | Numeric value from any source as float | `ConvertToFloat` |
 | Token/limit string with optional `K`/`M` suffix | `ParseInt64KMSuffix` |
 | Canonicalize a `K`/`M`-suffixed string to base-10 | `NormalizeInt64KMSuffix` |
+| Summing capacity hints for slice/map preallocation | `SafeAllocationCapacity` |
 
 ## Usage Examples
 
@@ -149,6 +187,10 @@ limit, ok := typeutil.ParseInt64KMSuffix("128K")
 if !ok {
     return errors.New("invalid token limit value")
 }
+
+// Safely size a preallocated slice from multiple length hints
+cap := typeutil.SafeAllocationCapacity(len(existing), len(incoming))
+merged := make([]Item, 0, cap)
 ```
 
 ## Dependencies
@@ -158,9 +200,11 @@ if !ok {
 
 ## Design Notes
 
-- All debug output uses `logger.New("typeutil:convert")` and is only emitted when `DEBUG=typeutil:*`.
+- Numeric conversion debug output uses `logger.New("typeutil:convert")` and is only emitted when `DEBUG=typeutil:*`.
 - `float64 → int` truncation is logged at debug level when the fractional part is lost.
 - `uint64 → int` overflow returns `0` rather than panicking, following the defensive convention used elsewhere in the codebase.
+- Map-extraction helpers (`ParseBool`, `LookupMap`, `LookupString`, `LookupStringPath`) are defined in `lookup.go` to keep `convert.go` focused on single-value numeric conversion.
+- `SafeAllocationCapacity` (`allocation.go`) returns `0` on overflow or negative inputs rather than panicking, matching the defensive-zero convention used by the other overflow-safe conversions in this package.
 
 ---
 

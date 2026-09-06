@@ -42,6 +42,8 @@ package workflow
 //
 
 // extractSafeOutputsConfig extracts output configuration from frontmatter
+//
+//nolint:largefunc // Existing centralized safe-output extraction remains intentionally sequential.
 func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOutputsConfig {
 	safeOutputsConfigLog.Print("Extracting safe-outputs configuration from frontmatter")
 
@@ -52,12 +54,24 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			safeOutputsConfigLog.Printf("Processing safe-outputs configuration with %d top-level keys", len(outputMap))
 			config = &SafeOutputsConfig{}
 
+			config.CreateWorkItems = c.parseCreateWorkItemConfig(outputMap)
+			config.UpdateWorkItems = c.parseUpdateWorkItemConfig(outputMap)
+			config.CommentOnWorkItems = c.parseCommentOnWorkItemConfig(outputMap)
+			config.AssignWorkItems = c.parseAssignWorkItemConfig(outputMap)
+			config.LinkWorkItems = c.parseLinkWorkItemsConfig(outputMap)
+			config.UploadWorkItemAttachments = c.parseUploadWorkItemAttachmentConfig(outputMap)
+			config.LinearCreateIssue = c.parseLinearCreateIssueConfig(outputMap)
+			config.LinearAddComment = c.parseLinearAddCommentConfig(outputMap)
+			config.LinearUpdateIssue = c.parseLinearUpdateIssueConfig(outputMap)
+
 			// Handle create-issue
 			issuesConfig := c.parseCreateIssuesConfig(outputMap)
 			if issuesConfig != nil {
 				safeOutputsConfigLog.Print("Configured create-issue output handler")
 				config.CreateIssues = issuesConfig
 			}
+
+			c.extractJiraSafeOutputConfigs(outputMap, config)
 
 			// Handle create-agent-session
 			agentSessionConfig := c.parseAgentSessionConfig(outputMap)
@@ -111,6 +125,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 			markPRReadyConfig := c.parseMarkPullRequestAsReadyForReviewConfig(outputMap)
 			if markPRReadyConfig != nil {
 				config.MarkPullRequestAsReadyForReview = markPRReadyConfig
+			}
+
+			// Handle approve-workflow-run
+			approveWorkflowRunConfig := c.parseApproveWorkflowRunConfig(outputMap)
+			if approveWorkflowRunConfig != nil {
+				config.ApproveWorkflowRun = approveWorkflowRunConfig
 			}
 
 			// Handle dismiss-pull-request-review (and dismiss-review alias)
@@ -264,6 +284,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				config.UploadArtifact = uploadArtifactConfig
 			}
 
+			// Handle upload-code-coverage
+			uploadCodeCoverageConfig := c.parseUploadCodeCoverageConfig(outputMap)
+			if uploadCodeCoverageConfig != nil {
+				config.UploadCodeCoverage = uploadCodeCoverageConfig
+			}
+
 			// Handle update-release
 			updateReleaseConfig := c.parseUpdateReleaseConfig(outputMap)
 			if updateReleaseConfig != nil {
@@ -354,8 +380,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				if _, exists := outputMap["noop"]; !exists {
 					config.NoOp = &NoOpConfig{}
 					config.NoOp.Max = defaultIntStr(1) // Default max
-					trueVal := "true"
-					config.NoOp.ReportAsIssue = &trueVal // Default to reporting to issue
+					// Implicit noop is for transparency logging only; it must not create
+					// issues without a maintenance workflow to expire them, so report-as-issue
+					// defaults to false here (users can opt in with an explicit noop: block).
+					falseVal := "false"
+					config.NoOp.ReportAsIssue = &falseVal
+					config.NoOp.Implicit = true // Not authored by the user
 				}
 			}
 
@@ -367,11 +397,12 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 				// Enable report-incomplete by default if safe-outputs exists and it wasn't explicitly disabled.
 				// This ensures agents always have a first-class channel to signal task incompletion.
 				if _, exists := outputMap["report-incomplete"]; !exists {
-					trueVal := "true"
+					trueVal := defaultReportIncompleteCreateIssue(config)
 					config.ReportIncomplete = &ReportIncompleteConfig{
 						CreateIssue: &trueVal,
 						TitlePrefix: "",
 						Labels:      nil,
+						Implicit:    true,
 					}
 				}
 			}
@@ -394,11 +425,11 @@ func (c *Compiler) extractSafeOutputsConfig(frontmatter map[string]any) *SafeOut
 		}
 	}
 
-	// Force-disable threat detection when --use-samples is active: the replay driver
+	// Force-disable threat detection when samples replay is active: the replay driver
 	// emits synthetic outputs solely for deterministic end-to-end tests, and running
 	// an LLM-backed detection pass would defeat that determinism.
-	if config != nil && c.useSamples && config.ThreatDetection != nil {
-		safeOutputsConfigLog.Print("Disabling threat-detection because --use-samples is set")
+	if config != nil && c.samplesEnabled(frontmatter) && config.ThreatDetection != nil {
+		safeOutputsConfigLog.Print("Disabling threat-detection because samples replay is enabled")
 		config.ThreatDetection = nil
 	}
 

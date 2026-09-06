@@ -14,6 +14,8 @@ import (
 )
 
 func TestGetRequiredSecretsForWorkflow(t *testing.T) {
+	t.Parallel()
+
 	// Create a temporary directory with test workflow files
 	tempDir := t.TempDir()
 	workflowsDir := filepath.Join(tempDir, ".github", "workflows")
@@ -108,7 +110,7 @@ on: push
 		}
 	})
 
-	for _, eng := range []string{"opencode", "pi"} {
+	for _, eng := range []string{"pi"} {
 		t.Run(eng+" engine with permissions.copilot-requests: write does not require copilot token", func(t *testing.T) {
 			workflowPath := filepath.Join(workflowsDir, eng+"-with-permission.md")
 			workflowContent := fmt.Sprintf(`---
@@ -133,6 +135,8 @@ on: push
 }
 
 func TestGetRequiredSecretsForWorkflows(t *testing.T) {
+	t.Parallel()
+
 	t.Run("collects secrets from multiple workflows", func(t *testing.T) {
 		// Create a temporary directory with test workflow files
 		tempDir := t.TempDir()

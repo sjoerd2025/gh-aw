@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -15,6 +16,7 @@ import (
 )
 
 var maintenanceLog = logger.New("workflow:maintenance_workflow")
+var actionFailureIssueExpiryLineRegex = regexp.MustCompile(`(?m)^(\s*GH_AW_ACTION_FAILURE_ISSUE_EXPIRES_HOURS:\s*")[1-9]\d*(")\s*$`)
 
 // generateInstallCLISteps generates YAML steps to install or build the gh-aw CLI.
 // In dev mode: builds from source using Setup Go + Build gh-aw (./gh-aw binary available)
@@ -135,7 +137,7 @@ func isNoOpReportAsIssueEnabled(reportAsIssue *string) bool {
 // maintenance workflow is deleted and the function returns immediately.
 // opts.RepoSlug is the owner/repo slug used to determine the default branch for the push
 // trigger; pass an empty string to fall back to "main".
-func GenerateMaintenanceWorkflow(ctx context.Context, opts GenerateMaintenanceWorkflowOptions) error {
+func GenerateMaintenanceWorkflow(ctx context.Context, opts GenerateMaintenanceWorkflowOptions) error { //nolint:largefunc // Existing workflow orchestration remains centralized.
 	workflowDataList := opts.WorkflowDataList
 	workflowDir := opts.WorkflowDir
 	version := opts.Version
@@ -174,6 +176,7 @@ func GenerateMaintenanceWorkflow(ctx context.Context, opts GenerateMaintenanceWo
 			ActionTag:       actionTag,
 			Resolver:        resolver,
 			CustomCron:      autoUpgradeCronFrom(repoConfig),
+			UpgradeOptions:  autoUpgradeOptionsFrom(repoConfig),
 		})
 	}
 
@@ -196,10 +199,17 @@ func GenerateMaintenanceWorkflow(ctx context.Context, opts GenerateMaintenanceWo
 	runsOnValue := FormatRunsOn(configuredRunsOn, defaultRunsOn)
 
 	// Scan workflows for expires fields and track the minimum expires value
-	hasExpires, minExpires, triggerReason := scanWorkflowsForExpires(workflowDataList)
+	hasExpires, minExpires, triggerReason := scanWorkflowsForExpires(workflowDataList, repoConfig)
 
 	if !hasExpires {
 		maintenanceLog.Print("No workflows use expires field, skipping maintenance workflow generation")
+
+		// No maintenance workflow means no scheduled close-expired-issues consumer.
+		// Since the implicit 168-hour action-failure default was not an opt-in
+		// (see scanWorkflowsForExpires), disable the runtime expiration marker in
+		// the already-compiled lock files so failure issues do not claim an
+		// expiration that nothing will enforce.
+		disableDefaultActionFailureExpiryMarkers(workflowDataList, workflowDir)
 
 		// Delete existing maintenance workflow file if it exists (no expires means no need for maintenance)
 		maintenanceFile := filepath.Join(workflowDir, "agentics-maintenance.yml")
@@ -239,6 +249,7 @@ func GenerateMaintenanceWorkflow(ctx context.Context, opts GenerateMaintenanceWo
 			ActionTag:       actionTag,
 			Resolver:        resolver,
 			CustomCron:      autoUpgradeCronFrom(repoConfig),
+			UpgradeOptions:  autoUpgradeOptionsFrom(repoConfig),
 		})
 	}
 
@@ -266,7 +277,7 @@ func GenerateMaintenanceWorkflow(ctx context.Context, opts GenerateMaintenanceWo
 		strings.TrimSpace(compileGitHubTokenSecret) != "",
 	)
 	copilotOrgBilling := allCopilotWorkflowsUseOrgBilling(workflowDataList)
-	content := buildMaintenanceWorkflowYAML(ctx, buildMaintenanceWorkflowYAMLOptions{
+	content, err := buildMaintenanceWorkflowYAML(ctx, buildMaintenanceWorkflowYAMLOptions{
 		cronSchedule:        cronSchedule,
 		scheduleDesc:        scheduleDesc,
 		minExpiresDays:      minExpiresDays,
@@ -283,6 +294,9 @@ func GenerateMaintenanceWorkflow(ctx context.Context, opts GenerateMaintenanceWo
 		createCompilePR:     enableCompileCreatePullRequest,
 		copilotOrgBilling:   copilotOrgBilling,
 	})
+	if err != nil {
+		return fmt.Errorf("failed to finalize maintenance workflow YAML: %w", err)
+	}
 
 	// Write the maintenance workflow file
 	maintenanceFile := filepath.Join(workflowDir, "agentics-maintenance.yml")
@@ -324,6 +338,7 @@ func GenerateMaintenanceWorkflow(ctx context.Context, opts GenerateMaintenanceWo
 		ActionTag:       actionTag,
 		Resolver:        resolver,
 		CustomCron:      autoUpgradeCronFrom(repoConfig),
+		UpgradeOptions:  autoUpgradeOptionsFrom(repoConfig),
 	})
 }
 
@@ -336,10 +351,22 @@ func autoUpgradeCronFrom(cfg *RepoConfig) string {
 	return cfg.AutoUpgradeCron
 }
 
+func autoUpgradeOptionsFrom(cfg *RepoConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.AutoUpgradeOptions
+}
+
 // handleMaintenanceDisabled handles the case where maintenance is disabled in repo config.
 // It warns about workflows that use expires and deletes any existing maintenance workflow.
 func handleMaintenanceDisabled(workflowDataList []*WorkflowData, workflowDir string) error {
 	maintenanceLog.Print("Maintenance disabled via repo config, skipping generation")
+
+	// Explicit opt-out means no scheduled close-expired-issues consumer will
+	// exist regardless of any action_failure_issue_expires configuration, so
+	// disable the runtime expiration marker just like the no-recognized-source case.
+	disableDefaultActionFailureExpiryMarkers(workflowDataList, workflowDir)
 
 	// Warn if any workflow uses expires — those features rely on maintenance
 	// and will silently become no-ops when it is disabled.
@@ -395,7 +422,15 @@ func allCopilotWorkflowsUseOrgBilling(workflowDataList []*WorkflowData) bool {
 // scanWorkflowsForExpires checks all workflow data for expires fields and returns
 // whether any expires fields are set, the minimum expires value in hours, and the
 // first reason that triggered maintenance workflow generation.
-func scanWorkflowsForExpires(workflowDataList []*WorkflowData) (bool, int, string) {
+//
+// repoConfig may be nil. When maintenance.action_failure_issue_expires is
+// explicitly configured in aw.json, it is treated as an opt-in trigger for
+// maintenance workflow generation (see IsActionFailureIssueExpiresExplicit).
+// The implicit 168-hour default is intentionally excluded from this scan:
+// since safe-outputs.report-failure-as-issue defaults to true, treating the
+// implicit default as an always-on trigger would force agentics-maintenance.yml
+// into essentially every repository with a gh-aw workflow.
+func scanWorkflowsForExpires(workflowDataList []*WorkflowData, repoConfig *RepoConfig) (bool, int, string) { //nolint:largefunc // Existing expiration scan remains centralized.
 	hasExpires := false
 	minExpires := 0 // Track minimum expires value in hours
 	triggerReason := ""
@@ -447,8 +482,12 @@ func scanWorkflowsForExpires(workflowDataList []*WorkflowData) (bool, int, strin
 				}
 			}
 		}
-		// Check for no-op runs issue expiration (runtime defaults to 30 days)
-		if workflowData.SafeOutputs.NoOp != nil {
+		// Check for no-op runs issue expiration (runtime defaults to 30 days).
+		// The implicit noop fallback now defaults report-as-issue to false (see
+		// safe_outputs_config_extraction.go), so it creates no issues and never
+		// needs a maintenance workflow. The Implicit check below is kept as a
+		// defense-in-depth guard in case that default ever changes.
+		if workflowData.SafeOutputs.NoOp != nil && !workflowData.SafeOutputs.NoOp.Implicit {
 			if isNoOpReportAsIssueEnabled(workflowData.SafeOutputs.NoOp.ReportAsIssue) {
 				hasExpires = true
 				expires := defaultNoOpIssueExpirationHours
@@ -461,5 +500,85 @@ func scanWorkflowsForExpires(workflowDataList []*WorkflowData) (bool, int, strin
 		}
 	}
 
+	// Check for an explicitly configured action-failure issue expiry. Unlike the
+	// implicit 168-hour default, an explicit value is an opt-in and should both
+	// trigger maintenance workflow generation and participate in the minimum
+	// expires calculation, but only when some workflow could actually create
+	// action-failure issues (report-failure-as-issue defaults to true).
+	if repoConfig.IsActionFailureIssueExpiresExplicit() && anyWorkflowMayReportFailureAsIssue(workflowDataList) {
+		hasExpires = true
+		expires := repoConfig.ActionFailureIssueExpiresHours()
+		setTriggerReason(fmt.Sprintf("maintenance.action_failure_issue_expires=%dh is explicitly configured in %s", expires, RepoConfigFileName))
+		maintenanceLog.Printf("Repo config explicitly sets action_failure_issue_expires to %d hours", expires)
+		if minExpires == 0 || expires < minExpires {
+			minExpires = expires
+		}
+	}
+
 	return hasExpires, minExpires, triggerReason
+}
+
+// disableDefaultActionFailureExpiryMarkers rewrites the already-compiled lock
+// files for workflowDataList so that the implicit 168-hour action-failure
+// expiration marker is disabled (set to "0", meaning "no expiration"). This is
+// called only when scanWorkflowsForExpires determined that no maintenance
+// workflow will be generated, so the implicit default (which is not an
+// opt-in) must not be advertised in failure issues since nothing would enforce
+// it. Workflows that explicitly configured maintenance.action_failure_issue_expires
+// are never affected by this function, because an explicit configuration
+// always makes scanWorkflowsForExpires report hasExpires=true.
+func disableDefaultActionFailureExpiryMarkers(workflowDataList []*WorkflowData, workflowDir string) {
+	var lockFiles []string
+	for _, workflowData := range workflowDataList {
+		if workflowData == nil || workflowData.WorkflowID == "" {
+			continue
+		}
+		lockFiles = append(lockFiles, filepath.Join(workflowDir, workflowData.WorkflowID+".lock.yml"))
+	}
+	patchActionFailureExpiryMarkersInFiles(lockFiles)
+}
+
+// patchActionFailureExpiryMarkersInFiles disables the implicit action-failure
+// expiry marker (see actionFailureIssueExpiryLineRegex) in each of the given
+// lock files, in place. Missing files (e.g. from --no-emit compiles) are
+// skipped without error.
+func patchActionFailureExpiryMarkersInFiles(lockFiles []string) {
+	for _, lockFile := range lockFiles {
+		if lockFile == "" {
+			continue
+		}
+		content, err := os.ReadFile(lockFile)
+		if err != nil {
+			// Lock file may not exist (e.g. --no-emit compiles); nothing to patch.
+			continue
+		}
+		updated := actionFailureIssueExpiryLineRegex.ReplaceAllString(string(content), `${1}0${2}`)
+		if updated == string(content) {
+			continue
+		}
+		if err := os.WriteFile(lockFile, []byte(updated), constants.FilePermPublic); err != nil {
+			maintenanceLog.Printf("Warning: failed to disable action-failure expiry marker in %s: %v", lockFile, err)
+			continue
+		}
+		maintenanceLog.Printf("Disabled implicit action-failure expiry marker in %s (no maintenance workflow will enforce it)", lockFile)
+	}
+}
+
+// anyWorkflowMayReportFailureAsIssue returns true unless every workflow in the
+// list explicitly disables safe-outputs.report-failure-as-issue. The setting
+// defaults to enabled (true) when unset, but an empty list cannot report
+// failures and therefore returns false.
+func anyWorkflowMayReportFailureAsIssue(workflowDataList []*WorkflowData) bool {
+	for _, workflowData := range workflowDataList {
+		if workflowData == nil {
+			continue
+		}
+		if workflowData.SafeOutputs == nil || workflowData.SafeOutputs.ReportFailureAsIssue == nil {
+			return true
+		}
+		if workflowData.SafeOutputs.ReportFailureAsIssue.String() != "false" {
+			return true
+		}
+	}
+	return false
 }

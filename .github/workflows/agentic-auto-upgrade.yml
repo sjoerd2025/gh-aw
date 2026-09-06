@@ -68,10 +68,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_AW_OPERATION: upgrade
           GH_AW_CMD_PREFIX: ./gh-aw
+          GH_AW_UPGRADE_OPTIONS: '["--pre-releases"]'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');
+            const path = require('path');
+            const actionsDir = path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions');
+            const { setupGlobals } = require(path.join(actionsDir, 'setup_globals.cjs'));
             setupGlobals(core, github, context, exec, io, getOctokit);
-            const { mainNotifyIssue } = require('${{ runner.temp }}/gh-aw/actions/run_operation_update_upgrade.cjs');
+            const { mainNotifyIssue } = require(path.join(actionsDir, 'run_operation_update_upgrade.cjs'));
             await mainNotifyIssue();

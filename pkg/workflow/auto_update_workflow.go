@@ -2,11 +2,13 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/ctxutil"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
@@ -56,6 +58,8 @@ type GenerateAutoUpdateWorkflowOptions struct {
 	// fuzzy weekly schedule. When non-empty, it is used as-is in the generated
 	// workflow without scattering. An empty string falls back to FUZZY:WEEKLY.
 	CustomCron string
+	// UpgradeOptions contains supported command-line options passed to gh aw upgrade.
+	UpgradeOptions []string
 }
 
 // GenerateAutoUpdateWorkflow generates or removes the agentic-auto-upgrade.yml workflow
@@ -67,7 +71,7 @@ type GenerateAutoUpdateWorkflowOptions struct {
 //
 // When disabled (or when maintenance is disabled), any existing agentic-auto-upgrade.yml
 // is deleted.
-func GenerateAutoUpdateWorkflow(opts GenerateAutoUpdateWorkflowOptions) error {
+func GenerateAutoUpdateWorkflow(opts GenerateAutoUpdateWorkflowOptions) error { //nolint:largefunc // Generation keeps schedule resolution and emitted workflow inputs together.
 	outputFile := filepath.Join(opts.WorkflowDir, AutoUpdateWorkflowFileName)
 
 	if !opts.Enabled {
@@ -110,18 +114,19 @@ func GenerateAutoUpdateWorkflow(opts GenerateAutoUpdateWorkflowOptions) error {
 		githubScriptPin = getActionPin("actions/github-script")
 	}
 
-	ctx := opts.Context
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	content := buildAutoUpdateWorkflowYAML(
+	ctx := ctxutil.OrBackground(opts.Context)
+	content, err := buildAutoUpdateWorkflowYAML(
 		cronSchedule,
 		setupActionRef,
 		githubScriptPin,
 		generateInstallCLISteps(ctx, actionMode, opts.Version, opts.ActionTag, opts.Resolver),
 		getCLICmdPrefix(actionMode),
 		opts.CustomCron != "",
+		opts.UpgradeOptions,
 	)
+	if err != nil {
+		return fmt.Errorf("failed to finalize auto-update workflow YAML: %w", err)
+	}
 
 	autoUpdateWorkflowLog.Printf("Writing auto-update workflow to %s", outputFile)
 	if err := fileutil.EnsureParentDir(outputFile, constants.DirPermPublic); err != nil {
@@ -155,16 +160,17 @@ func buildAutoUpdateSeed(repoSlug string, actionMode ActionMode) string {
 	}
 	// Release/action/script mode: incorporate repo slug for per-repo scattering.
 	if repoSlug != "" {
-		return repoSlug + "/" + autoUpdateWorkflowIdentifier
+		return repoSlug + "/" + autoUpdateWorkflowIdentifier //nolint:manualpathconcat // Repository slugs are not filesystem paths.
 	}
 	return autoUpdateWorkflowIdentifier
 }
 
 // buildAutoUpdateWorkflowYAML generates the YAML content for agentic-auto-upgrade.yml.
-func buildAutoUpdateWorkflowYAML(
+func buildAutoUpdateWorkflowYAML( //nolint:largefunc // The renderer preserves the generated workflow field order.
 	cronSchedule, setupActionRef, githubScriptPin, installCLISteps, cliCmdPrefix string,
 	isCustomCron bool,
-) string {
+	upgradeOptions []string,
+) (string, error) {
 	var customInstructions string
 	if isCustomCron {
 		customInstructions = `Alternative regeneration methods:
@@ -193,8 +199,16 @@ The weekly schedule is deterministically scattered based on the repository slug.
 	}
 
 	header := GenerateWorkflowHeader("", "pkg/workflow/auto_update_workflow.go", customInstructions)
+	upgradeOptionsEnv := ""
+	if len(upgradeOptions) > 0 {
+		encodedOptions, err := json.Marshal(upgradeOptions)
+		if err != nil {
+			return "", fmt.Errorf("failed to encode auto-upgrade options: %w", err)
+		}
+		upgradeOptionsEnv = "\n          GH_AW_UPGRADE_OPTIONS: '" + escapeYAMLSingleQuoted(string(encodedOptions)) + "'"
+	}
 
-	return header + `name: Agentic Auto-Upgrade
+	yaml := header + `name: Agentic Auto-Upgrade
 
 on:
   schedule:
@@ -222,7 +236,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_AW_OPERATION: upgrade
-          GH_AW_CMD_PREFIX: ` + cliCmdPrefix + `
+          GH_AW_CMD_PREFIX: ` + cliCmdPrefix + upgradeOptionsEnv + `
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -231,4 +245,9 @@ jobs:
             const { mainNotifyIssue } = require('${{ runner.temp }}/gh-aw/actions/run_operation_update_upgrade.cjs');
             await mainNotifyIssue();
 `
+	finalYAML, err := finalizeRunnerTempSafety(yaml)
+	if err != nil {
+		return "", fmt.Errorf("runner temp safety: %w", err)
+	}
+	return finalYAML, nil
 }

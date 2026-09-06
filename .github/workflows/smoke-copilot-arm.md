@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke Copilot ARM64
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-copilot-arm
     strategy: centralized
@@ -29,6 +30,7 @@ imports:
   - shared/mcp/serena-go.md
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/smoke-test-brevity.md
 network:
   allowed:
     - defaults
@@ -44,7 +46,6 @@ tools:
     - "*"
   github:
   playwright:
-    mode: cli
   web-fetch:
 runtimes:
   go:
@@ -111,17 +112,18 @@ safe-outputs:
     messages:
       append-only-comments: true
       footer: "> 📰 *BREAKING: Report filed by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
-      run-started: "📰 BREAKING: [{workflow_name}]({run_url}) is now investigating this {event_type}. Sources say the story is developing..."
-      run-success: "📰 VERDICT: [{workflow_name}]({run_url}) has concluded. All systems operational. This is a developing story. 🎤"
-      run-failure: "📰 DEVELOPING STORY: [{workflow_name}]({run_url}) reports {status}. Our correspondents are investigating the incident..."
+      run-started: "[{workflow_name}]({run_url}) ARM64 smoke test started for this {event_type}."
+      run-success: "[{workflow_name}]({run_url}) ARM64 smoke test completed successfully."
+      run-failure: "[{workflow_name}]({run_url}) ARM64 smoke test {status}. Check the logs for details."
 timeout-minutes: 15
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Copilot Engine Validation (ARM64)
-
-**IMPORTANT: Keep all outputs extremely short and concise. Use single-line responses where possible. No verbose explanations.**
 
 **PURPOSE**: This smoke test validates that the Copilot engine, AWF firewall, MCP servers, and safe outputs work correctly on Linux ARM64 (ubuntu-24.04-arm) runners. This is critical for ensuring multi-architecture support.
 
@@ -141,7 +143,7 @@ features:
    - Extract the discussion number from the result (e.g., if the result is `{"number": 123, "title": "...", ...}`, extract 123)
    - Use the `add_comment` tool with `discussion_number: <extracted_number>` to add a fun, playful comment stating that the ARM64 smoke test agent was here
 9. **Build gh-aw**: Run `GOCACHE=/tmp/gh-aw/agent/go-cache GOMODCACHE=/tmp/gh-aw/agent/go-mod make build` to verify the agent can successfully build the gh-aw project on ARM64 (both caches must be set under `/tmp/gh-aw/agent` because the default cache locations are not writable). If the command fails, mark this test as ❌ and report the failure.
-10. **Discussion Creation Testing**: Use the `create_discussion` safe-output tool to create a discussion in the announcements category titled "copilot-arm64 was here" with the label "ai-generated". Use the temporary ID `aw_smoke_discussion` for this discussion so you can reference it in the Output section.
+10. **Discussion Creation Testing**: Use the `create_discussion` safe-output tool to create a discussion in the announcements category titled "copilot-arm64 was here" with the label "ai-generated" and `temporary_id: "aw_discuss"` so you can reference it in the Output section.
 11. **Workflow Dispatch Testing**: Use the `dispatch_workflow` safe output tool to trigger the `haiku-printer` workflow with a haiku as the message input. Create an original, creative haiku about ARM64 or multi-architecture computing.
 12. **PR Review Testing**: Review the diff of the current pull request. Leave 1-2 inline `create_pull_request_review_comment` comments on specific lines, then call `submit_pull_request_review` with a brief body summarizing your review and event `COMMENT`.
 
@@ -164,7 +166,7 @@ features:
    - Overall status: PASS or FAIL
    - Mention the pull request author and any assignees
 
-3. Use the `add_comment` tool to add a **fun and creative comment** to the newly created discussion (use the temporary ID `aw_smoke_discussion` from step 10) - be playful and entertaining in your comment
+3. Use the `add_comment` tool to add a **fun and creative comment** to the newly created discussion (use `item_number: "aw_discuss"` from step 10) - be playful and entertaining in your comment
 
 4. Use the `send_slack_message` tool to send a brief summary message (e.g., "ARM64 smoke test ${{ github.run_id }}: All tests passed! ✅")
 

@@ -16,8 +16,7 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 tracker-id: daily-spdd-spec-planner
 engine:
   id: copilot
@@ -76,6 +75,13 @@ safe-outputs:
   max-bot-mentions: 1
 
 timeout-minutes: 20
+evals:
+  - id: specifications_analyzed
+    question: Did the agent analyze repository specifications using the SPDD planning process?
+  - id: prioritized_plan_reported
+    question: Did the agent report a prioritized plan with actionable specification work items?
+features:
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

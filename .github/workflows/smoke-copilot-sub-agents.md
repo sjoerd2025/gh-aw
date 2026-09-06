@@ -3,8 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke Copilot SDK inline sub-agents
 on:
-  schedule:
-    - cron: daily
+  schedule: every 2 days
   workflow_dispatch:
 permissions:
   contents: read
@@ -46,10 +45,16 @@ safe-outputs:
 timeout-minutes: 10
 features:
   gh-aw-detection: false
+imports:
+  - shared/reporting.md
 evals:
   - id: sub_agent_strategy_goal_met
     question: Does the agent output show that the objective for experiment sub_agent_strategy was successfully completed?
 
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
+    id: awf
 ---
 
 # Smoke Test: Copilot SDK Inline Sub-Agents

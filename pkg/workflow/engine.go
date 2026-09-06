@@ -4,11 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
-	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
@@ -97,7 +95,7 @@ type EngineConfig struct {
 	// Defaults to the repository workspace (GITHUB_WORKSPACE) when empty.
 	Cwd string
 
-	// Harness retry policy fields — templatable integers (literal value or ${{ expr }}).
+	// Harness policy fields — templatable integers (literal value or ${{ expr }}).
 	// When set, the value is injected as the corresponding GH_AW_HARNESS_* env var so
 	// that all harness scripts (copilot, claude, codex) can read it from the environment.
 	// The harness falls back to its built-in default when the env var is absent.
@@ -106,6 +104,7 @@ type EngineConfig struct {
 	HarnessInitialDelayMs    string // engine.harness.initial-delay-ms   → GH_AW_HARNESS_INITIAL_DELAY_MS
 	HarnessBackoffMultiplier string // engine.harness.backoff-multiplier → GH_AW_HARNESS_BACKOFF_MULTIPLIER
 	HarnessMaxDelayMs        string // engine.harness.max-delay-ms       → GH_AW_HARNESS_MAX_DELAY_MS
+	HarnessWatchdogTimeoutMs string // engine.harness.watchdog-timeout (seconds) → GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS
 }
 
 // InlineEngineDriver represents an inline engine.driver source block that gh-aw materializes
@@ -119,24 +118,24 @@ type InlineEngineDriver struct {
 // EngineAuthConfig represents engine.auth frontmatter settings that map to
 // AWF_AUTH_* environment variables consumed by the AWF API proxy sidecar.
 type EngineAuthConfig struct {
-	Type     string
-	Audience string
-	Provider string // "azure", "anthropic", or "gcp"
+	Type     string `json:"type"`
+	Audience string `json:"audience"`
+	Provider string `json:"provider"` // "azure", "anthropic", or "gcp"
 	// Azure WIF fields
-	AzureTenantID string
-	AzureClientID string
-	AzureScope    string
-	AzureCloud    string
+	AzureTenantID string `json:"azure-tenant-id"`
+	AzureClientID string `json:"azure-client-id"`
+	AzureScope    string `json:"azure-scope"`
+	AzureCloud    string `json:"azure-cloud"`
 	// Anthropic WIF fields
-	AnthropicFederationRuleID string
-	AnthropicOrganizationID   string
-	AnthropicServiceAccountID string
-	AnthropicWorkspaceID      string
+	AnthropicFederationRuleID string `json:"federation-rule-id"`
+	AnthropicOrganizationID   string `json:"organization-id"`
+	AnthropicServiceAccountID string `json:"service-account-id"`
+	AnthropicWorkspaceID      string `json:"workspace-id"`
 	// Google / Vertex AI WIF fields
-	GoogleWorkloadIdentityProvider string
-	GoogleServiceAccount           string
-	GoogleProject                  string
-	GoogleLocation                 string
+	GoogleWorkloadIdentityProvider string `json:"workload-identity-provider"`
+	GoogleServiceAccount           string `json:"service-account"`
+	GoogleProject                  string `json:"project"`
+	GoogleLocation                 string `json:"location"`
 }
 
 // NetworkPermissions represents network access permissions for workflow execution
@@ -362,9 +361,11 @@ func applyReferencedEngineFields(config *EngineConfig, engineObj map[string]any,
 }
 
 func resolveEngineModel(engineObj map[string]any, topLevel engineTopLevelConfig, fallback string) string {
-	if modelStr, ok := engineObj["model"].(string); ok {
-		fallback = modelStr
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("'engine.model' is deprecated. Use top-level 'model' instead. Run 'gh aw fix' to automatically migrate."))
+	if modelStr, ok := engineObj["model"].(string); ok && modelStr != "" {
+		// engine.model is an explicit override for this engine instance and takes
+		// precedence over the top-level model (e.g. threat-detection.engine.model
+		// selecting a different model than the main agent engine).
+		return modelStr
 	}
 	if topLevel.model != "" {
 		return topLevel.model
@@ -526,6 +527,9 @@ func applyEngineHarnessField(config *EngineConfig, engineObj map[string]any) {
 		}
 		if v, ok := h["max-delay-ms"]; ok {
 			config.HarnessMaxDelayMs = parseMaxTurnsValue(v)
+		}
+		if v, ok := h["watchdog-timeout"]; ok {
+			config.HarnessWatchdogTimeoutMs = parseHarnessWatchdogTimeoutValue(v)
 		}
 	}
 }
@@ -699,7 +703,7 @@ func (c *Compiler) extractEngineConfigFromJSON(engineJSON string) (*EngineConfig
 
 	var engineData any
 	if err := json.Unmarshal([]byte(engineJSON), &engineData); err != nil {
-		return nil, "", fmt.Errorf("failed to parse engine JSON: %w", err)
+		return nil, "", fmt.Errorf("engine configuration must contain valid JSON: %w", err)
 	}
 
 	// Use the existing ExtractEngineConfig function by creating a temporary frontmatter map

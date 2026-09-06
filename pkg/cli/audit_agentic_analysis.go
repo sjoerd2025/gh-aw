@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/scanfindings"
 	"github.com/github/gh-aw/pkg/timeutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -144,11 +145,13 @@ func mergeMCPToolUsageInfo(toolUsage []ToolUsageInfo, mcpToolUsage *MCPToolUsage
 
 	if len(mcpToolUsage.Summary) > 0 {
 		for _, summary := range mcpToolUsage.Summary {
+			toolSummary := summary
+			toolSummary.syncFieldsFromBase()
 			switch {
-			case summary.ServerName != "" && summary.ToolName != "":
-				addOrUpdateToolUsage(summary.ServerName+"."+summary.ToolName, summary.CallCount, summary.MaxInputSize, summary.MaxOutputSize, summary.MaxDuration)
-			case summary.ToolName != "":
-				addOrUpdateToolUsage(summary.ToolName, summary.CallCount, summary.MaxInputSize, summary.MaxOutputSize, summary.MaxDuration)
+			case toolSummary.ServerName != "" && toolSummary.ToolName != "":
+				addOrUpdateToolUsage(toolSummary.ServerName+"."+toolSummary.ToolName, toolSummary.CallCount, toolSummary.MaxInputSize, toolSummary.MaxOutputSize, toolSummary.MaxDuration)
+			case toolSummary.ToolName != "":
+				addOrUpdateToolUsage(toolSummary.ToolName, toolSummary.CallCount, toolSummary.MaxInputSize, toolSummary.MaxOutputSize, toolSummary.MaxDuration)
 			}
 		}
 	} else {
@@ -402,8 +405,8 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 	return assessments
 }
 
-func generateAgenticAssessmentFindings(assessments []AgenticAssessment) []Finding {
-	findings := make([]Finding, 0, len(assessments))
+func generateAgenticAssessmentFindings(assessments []AgenticAssessment) []AuditFinding {
+	findings := make([]AuditFinding, 0, len(assessments))
 	for _, assessment := range assessments {
 		category := "agentic"
 		impact := "Review recommended"
@@ -427,9 +430,9 @@ func generateAgenticAssessmentFindings(assessments []AgenticAssessment) []Findin
 			category = "coordination"
 			impact = "Context continuity improves downstream debugging and auditability"
 		}
-		findings = append(findings, Finding{
+		findings = append(findings, AuditFinding{
 			Category:    category,
-			Severity:    assessment.Severity,
+			Severity:    scanfindings.ParseSeverity(assessment.Severity),
 			Title:       prettifyAssessmentKind(assessment.Kind),
 			Description: assessment.Summary,
 			Impact:      impact,

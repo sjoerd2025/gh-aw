@@ -107,6 +107,8 @@ Results are saved in `trials/*.json` with workflow runs, issues, PRs, and commen
 {
   "workflow_name": "weekly-research",
   "run_id": "12345678",
+  "success": true,
+  "safe_output_errors": [],
   "safe_outputs": {
     "issues_created": [{
       "number": 5,
@@ -121,7 +123,9 @@ Results are saved in `trials/*.json` with workflow runs, issues, PRs, and commen
 }
 ```
 
-**Success indicators:** Green checkmark, expected outputs created, no errors in logs.
+`success` provides an explicit pass/fail signal for each workflow result. When safe-output processing rejects one or more requested actions, `safe_output_errors` contains the rejected-message errors and `gh aw trial` exits non-zero instead of reporting unconditional success.
+
+**Success indicators:** Green checkmark, expected outputs created, no safe-output errors in logs or JSON results.
 
 **Common issues:**
 
@@ -139,10 +143,9 @@ gh aw trial v1.md v2.md v3.md --repeat 2
 cat trials/combined-results.*.json | jq '.results[] | {workflow: .workflow_name, issues: .safe_outputs.issues_created | length}'
 ```
 
-## Related Documentation
+## Learn More
 
 - [MultiRepoOps](/gh-aw/patterns/multi-repo-ops/) — Run workflows from separate repositories
-- [MultiRepoOps](/gh-aw/patterns/multi-repo-ops/) - Coordinate across multiple repositories
 - [OrchestratorOps](/gh-aw/patterns/orchestrator-ops/) — Orchestrate multi-step initiatives
 - [CLI Commands](/gh-aw/setup/cli/) - Complete CLI reference
 - [Safe Outputs Reference](/gh-aw/reference/safe-outputs/) - Configuration options

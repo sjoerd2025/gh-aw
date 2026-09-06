@@ -15,6 +15,7 @@ import (
 )
 
 func TestBuildSafeOutputChainMetrics(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-safe-output-chains-*")
 
 	manifest := `{"type":"create_issue","repo":"github/gh-aw","number":101,"temporaryId":"aw_alpha","timestamp":"2026-01-01T00:00:00Z"}
@@ -30,7 +31,7 @@ func TestBuildSafeOutputChainMetrics(t *testing.T) {
   "aw_beta": {"repo": "github/gh-aw", "number": 102}
 }
 `
-	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, constants.TemporaryIdMapFilename), []byte(temporaryIDMap), 0o600), "should write temporary ID map fixture")
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, constants.TemporaryIdMapFilename.String()), []byte(temporaryIDMap), 0o600), "should write temporary ID map fixture")
 
 	metrics := buildSafeOutputChainMetrics(tmpDir)
 
@@ -43,13 +44,14 @@ func TestBuildSafeOutputChainMetrics(t *testing.T) {
 }
 
 func TestBuildSafeOutputChainMetricsIgnoresMalformedTemporaryIDMap(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-safe-output-chains-malformed-map-*")
 
 	manifest := `{"type":"create_issue","repo":"github/gh-aw","number":301,"temporaryId":"aw_alpha","timestamp":"2026-01-01T00:00:00Z"}
 {"type":"add_comment","repo":"github/gh-aw","number":301,"timestamp":"2026-01-01T00:01:00Z"}
 `
 	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, safeOutputItemsManifestFilename), []byte(manifest), 0o600), "should write manifest fixture")
-	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, constants.TemporaryIdMapFilename), []byte(`{"aw_alpha":`), 0o600), "should write malformed temporary ID map fixture")
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, constants.TemporaryIdMapFilename.String()), []byte(`{"aw_alpha":`), 0o600), "should write malformed temporary ID map fixture")
 
 	metrics := buildSafeOutputChainMetrics(tmpDir)
 
@@ -62,6 +64,7 @@ func TestBuildSafeOutputChainMetricsIgnoresMalformedTemporaryIDMap(t *testing.T)
 }
 
 func TestBuildLogsDataIncludesSafeOutputChainMetrics(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-logs-chain-metrics-*")
 	runDir := filepath.Join(tmpDir, "run-91001")
 	require.NoError(t, os.MkdirAll(runDir, 0o755), "should create run directory")
@@ -71,7 +74,7 @@ func TestBuildLogsDataIncludesSafeOutputChainMetrics(t *testing.T) {
 {"type":"assign_to_agent","repo":"github/gh-aw","number":201,"timestamp":"2026-01-01T00:02:00Z"}
 `
 	require.NoError(t, os.WriteFile(filepath.Join(runDir, safeOutputItemsManifestFilename), []byte(manifest), 0o600), "should write manifest fixture")
-	require.NoError(t, os.WriteFile(filepath.Join(runDir, constants.TemporaryIdMapFilename), []byte(`{"aw_alpha":{"repo":"github/gh-aw","number":201}}`), 0o600), "should write temporary ID map fixture")
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, constants.TemporaryIdMapFilename.String()), []byte(`{"aw_alpha":{"repo":"github/gh-aw","number":201}}`), 0o600), "should write temporary ID map fixture")
 
 	processedRuns := []ProcessedRun{
 		{
@@ -121,6 +124,7 @@ func TestBuildLogsDataIncludesSafeOutputChainMetrics(t *testing.T) {
 }
 
 func TestBuildLogsDataTracksTemporaryIDMapHealth(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-logs-temp-map-health-*")
 	missingRunDir := filepath.Join(tmpDir, "run-92001")
 	invalidRunDir := filepath.Join(tmpDir, "run-92002")
@@ -134,7 +138,7 @@ func TestBuildLogsDataTracksTemporaryIDMapHealth(t *testing.T) {
 `
 	require.NoError(t, os.WriteFile(filepath.Join(missingRunDir, safeOutputItemsManifestFilename), []byte(missingManifest), 0o600), "should write manifest for missing-map run")
 	require.NoError(t, os.WriteFile(filepath.Join(invalidRunDir, safeOutputItemsManifestFilename), []byte(invalidManifest), 0o600), "should write manifest for invalid-map run")
-	require.NoError(t, os.WriteFile(filepath.Join(invalidRunDir, constants.TemporaryIdMapFilename), []byte(`{"aw_invalid":`), 0o600), "should write malformed temporary ID map")
+	require.NoError(t, os.WriteFile(filepath.Join(invalidRunDir, constants.TemporaryIdMapFilename.String()), []byte(`{"aw_invalid":`), 0o600), "should write malformed temporary ID map")
 
 	processedRuns := []ProcessedRun{
 		{
@@ -171,6 +175,7 @@ func TestBuildLogsDataTracksTemporaryIDMapHealth(t *testing.T) {
 }
 
 func TestBuildLogsDataLeavesTemporaryIDMapStatusEmptyWithoutSafeOutputArtifacts(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-logs-no-safe-output-artifacts-*")
 	runDir := filepath.Join(tmpDir, "run-93001")
 	require.NoError(t, os.MkdirAll(runDir, 0o755), "should create run directory")

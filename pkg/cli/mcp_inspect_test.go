@@ -15,6 +15,7 @@ import (
 )
 
 func TestMCPInspectSubcommand_NoArgBehaviorDocumented(t *testing.T) {
+	t.Parallel()
 	cmd := NewMCPInspectSubcommand()
 	if cmd == nil {
 		t.Fatal("Expected mcp inspect subcommand to be created")
@@ -29,6 +30,7 @@ func TestMCPInspectSubcommand_NoArgBehaviorDocumented(t *testing.T) {
 }
 
 func TestMCPInspectClientImplementation_UsesCLIGetVersion(t *testing.T) {
+	t.Parallel()
 	implementation := mcpInspectClientImplementation()
 
 	if implementation.Name != "gh-aw-inspector" {
@@ -40,6 +42,7 @@ func TestMCPInspectClientImplementation_UsesCLIGetVersion(t *testing.T) {
 }
 
 func TestMCPEmojiIconSource_ReturnsDataURI(t *testing.T) {
+	t.Parallel()
 	source := mcpEmojiIconSource("📊")
 	if !strings.HasPrefix(source, "data:image/svg+xml;base64,") {
 		t.Fatalf("expected base64 data URI source, got %q", source)
@@ -379,5 +382,61 @@ func TestFilterOutSafeOutputs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDisplayServerCapabilities_WithPrompts(t *testing.T) {
+	info := &parser.MCPServerInfo{
+		Tools: []*mcp.Tool{
+			{Name: "example-tool", Description: "Example tool"},
+		},
+		Resources: []*mcp.Resource{
+			{URI: "file:///repo/workflow.md", Name: "workflow", Description: "Workflow resource"},
+		},
+		Prompts: []*mcp.Prompt{
+			{
+				Name:        "summarize",
+				Title:       "Quick Summary",
+				Description: "Summarize the current workflow",
+				Arguments: []*mcp.PromptArgument{
+					{Name: "topic", Required: true},
+				},
+			},
+		},
+		Roots: []*parser.MCPRootInfo{
+			{URI: "file://", Name: "file"},
+		},
+	}
+
+	stdout, _ := captureOutput(t, func() error {
+		displayServerCapabilities(info, "")
+		return nil
+	})
+
+	if !strings.Contains(stdout, "summarize") {
+		t.Fatalf("expected prompt name in stdout, got %q", stdout)
+	}
+	if !strings.Contains(stdout, "Quick Summary") {
+		t.Fatalf("expected prompt title in stdout, got %q", stdout)
+	}
+	if !strings.Contains(stdout, "Arguments") {
+		t.Fatalf("expected prompts table headers in stdout, got %q", stdout)
+	}
+}
+
+func TestDisplayServerCapabilities_WithoutPrompts(t *testing.T) {
+	info := &parser.MCPServerInfo{
+		Tools: []*mcp.Tool{
+			{Name: "example-tool", Description: "Example tool"},
+		},
+	}
+
+	stdout, _ := captureOutput(t, func() error {
+		displayServerCapabilities(info, "")
+		return nil
+	})
+
+	if strings.Contains(stdout, "Arguments") {
+		t.Fatalf("did not expect prompts table headers in stdout, got %q", stdout)
 	}
 }

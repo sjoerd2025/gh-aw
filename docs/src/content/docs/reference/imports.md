@@ -59,6 +59,8 @@ An imported workflow can only be imported once per workflow.
 
 In markdown, use `{{#runtime-import filepath}}` to inject the content of another file directly into the body at that position. This is useful for sharing reusable prompt snippets, tone instructions, or reference material across workflows.
 
+Imported markdown can include safe GitHub Actions expressions such as `${{ needs.pre_activation.outputs.activated }}` or `${{ needs.build.outputs.version }}`. gh-aw validates those expressions across the full nested runtime-import tree at compile time, so shared prompt files can reuse job outputs without weakening expression-safety checks.
+
 ```aw wrap
 ---
 on: schedule
@@ -84,7 +86,9 @@ Paths are resolved within the `.github` folder. You can specify paths with or wi
 
 ## Shared Workflow Components
 
-Files without an `on` field are shared workflow components: they are validated, can be imported by other workflows, and are not compiled into standalone GitHub Actions. Shared components may also define import-safe `on` keys (`skip-if-match`, `skip-if-no-match`, `skip-roles`, `skip-bots`, `github-token`, `github-app`) for reuse through imports.
+Files without a trigger event are shared workflow components: they are validated, can be imported by other workflows, and are not compiled into standalone GitHub Actions. Shared components may also define import-safe `on` keys (`skip-if-match`, `skip-if-no-match`, `skip-roles`, `skip-bots`, `github-token`, `github-app`) and the top-level `ambient-folders` field for reuse through imports.
+
+A shared workflow's frontmatter can contain comments only. Comment-only frontmatter is treated as present, so the file still parses as a shared component and produces an empty frontmatter map rather than failing with `no frontmatter found`. Only truly missing or whitespace-only frontmatter is rejected.
 
 When you regularly import the same pair together, bundle them into one shared file:
 
@@ -227,7 +231,7 @@ Use this form when workflows in different directories need the same stable impor
 
 ### Cross-repo imports
 
-Paths matching `owner/repo/path@ref` are fetched from GitHub at compile time. The `@ref` suffix can be a semantic tag (`@v1.0.0`), branch (`@main`), or commit SHA. Remote imports are cached in `.github/aw/imports/` by commit SHA to support offline compilation; local imports are never cached. See [Reusing Workflows](/gh-aw/guides/reusing-workflows/) for installation and update flows.
+Paths matching `owner/repo/path@ref` are fetched from GitHub at compile time. The `@ref` suffix can be a semantic tag (`@v1.0.0`), branch (`@main`), or commit SHA. Remote imports are cached in `.github/aw/imports/` by commit SHA to support offline compilation; local imports are never cached. See [Adding Existing Workflows](/gh-aw/guides/working-with-workflows/#adding-existing-workflows) for installation flows.
 
 ```aw wrap
 ---
@@ -297,6 +301,7 @@ Shared workflow files (without `on:` field) can define the fields below. Other f
 | `network` | Network permission specifications |
 | `permissions` | GitHub Actions permissions (validated, not merged) |
 | `runtimes` | Runtime version overrides (node, python, go, etc.) |
+| `plugins` | Agent Plugin references |
 | `secret-masking` | Secret masking steps |
 | `env` | Workflow-level environment variables |
 | `pre-agent-steps` | Steps that run after artifacts download, before engine execution |
@@ -307,7 +312,7 @@ Shared workflow files (without `on:` field) can define the fields below. Other f
 
 ### Field-Specific Merge Semantics
 
-Imports are processed using breadth-first traversal: direct imports first, then nested. Earlier imports in the list take precedence; circular imports fail at compile time.
+Imported step fields use dependency order: a file's steps are processed after the steps from everything it imports and before the steps from anything that imports it. Ties retain declaration order, and circular imports fail at compile time. Other fields keep discovery order (direct imports first, then nested), so first-wins scalar precedence remains backward compatible.
 
 | Field | Merge strategy |
 |-------|---------------|
@@ -317,13 +322,14 @@ Imports are processed using breadth-first traversal: direct imports first, then 
 | `permissions:` | Validation only — not merged. Main must declare all imported permissions at sufficient levels (`write` ≥ `read` ≥ `none`). |
 | `safe-outputs:` | Each type defined once; main overrides imports. Duplicate types across imports fail. |
 | `runtimes:` | Main overrides imports; imported values fill in unspecified fields. |
+| `plugins:` | Union by plugin path. Identical refs are deduplicated; compatible semantic versions select the highest version. Incompatible major versions or conflicting non-semver refs fail. |
 | `services:` | All services merged; duplicate names fail compilation. |
 | `github-app:` | Main workflow's `github-app` takes precedence; first imported value fills in if main does not define one. |
 | `checkout:` | Imported checkout entries are appended after the main workflow's entries. For duplicate (repository, path) pairs, the main workflow's entry takes precedence: first-seen wins for `ref`, and auth is mutually exclusive — once `github-token` or `github-app` is set by the main workflow, an imported duplicate cannot add the other auth method. `checkout: false` in the main workflow disables all checkout including imported entries. |
 | `engine.mcp` | First-wins across imports. Shared files may define `engine:` with only `mcp.tool-timeout` and/or `mcp.session-timeout` (no engine identifier). The importing workflow's own engine setting always takes precedence; the first imported value fills in if the main workflow does not set a value. |
-| `steps:` | Imported steps prepended to main; concatenated in import order. |
-| `pre-agent-steps:` | Imported pre-agent-steps prepended to main; concatenated in import order. |
-| `post-steps:` | Imported post-steps appended after main; concatenated in import order. |
+| `steps:` | Imported steps are prepended to main in dependency order; prerequisites precede dependents and unrelated siblings retain declaration order. |
+| `pre-agent-steps:` | Imported pre-agent steps are prepended to main in dependency order; prerequisites precede dependents and unrelated siblings retain declaration order. |
+| `post-steps:` | Imported post-steps are appended after main in dependency order; prerequisites precede dependents and unrelated siblings retain declaration order. |
 | `jobs:` | Not merged — define only in the main workflow. Use `safe-outputs.jobs` for importable jobs. |
 | `safe-outputs.jobs` | Names must be unique; duplicates fail. Order determined by `needs:` dependencies. |
 | `env:` | Main workflow env vars take precedence over imports. Duplicate keys across different imports fail compilation — move to the main workflow to override imported values. |
@@ -374,7 +380,7 @@ steps:
 Process the issue using the rotated token from the imported step.
 ```
 
-Steps from imports run **before** steps defined in the main workflow, in import declaration order.
+Steps from imports run **before** steps defined in the main workflow. Imported prerequisites run before the files that depend on them, while unrelated sibling imports retain declaration order.
 
 ### Importing MCP Servers
 
@@ -449,7 +455,7 @@ jobs:
     outputs:
       artifact_name: ${{ steps.build.outputs.artifact_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build
         id: build
         run: |
@@ -561,9 +567,9 @@ gh aw compile my-workflow
 >
 > `inlined-imports: true` cannot be combined with agent file imports (`.github/agents/` files). If your workflow imports a custom agent file, remove it before enabling inlined imports.
 
-## Related Documentation
+## Learn More
 
-- [Reusing Workflows](/gh-aw/guides/reusing-workflows/) - Adding and updating installed workflows with `gh aw add` and `gh aw update`
+- [Adding Existing Workflows](/gh-aw/guides/working-with-workflows/#adding-existing-workflows) - Installing workflows with `gh aw add`
 - [Frontmatter](/gh-aw/reference/frontmatter/) - Configuration options reference
 - [MCPs](/gh-aw/guides/mcps/) - Model Context Protocol setup
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Safe output configuration details

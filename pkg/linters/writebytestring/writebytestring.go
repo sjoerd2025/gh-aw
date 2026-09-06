@@ -10,9 +10,10 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/coverage"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
@@ -43,34 +44,26 @@ var writerIface = func() *types.Interface {
 }()
 
 // Analyzer is the write-byte-string analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "writebytestring",
-	Doc:      "reports w.Write([]byte(s)) calls where s is a string that can be replaced with io.WriteString(w, s)",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/writebytestring",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
+var Analyzer = analyzerutil.New("writebytestring", "reports w.Write([]byte(s)) calls where s is a string that can be replaced with io.WriteString(w, s)", run)
+
+// hotThreshold gates findings on coverage data; see coverage package docs.
+var hotThreshold *int
+
+func init() {
+	hotThreshold = coverage.RegisterHotThresholdFlag(Analyzer)
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 	filesWithImportEdit := make(map[token.Pos]bool)
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeWriteCall(pass, n, generatedFiles, noLintIndex, filesWithImportEdit)
 	})
-	return nil, nil
 }
 
 // analyzeWriteCall checks whether a call expression is a w.Write([]byte(s))
@@ -113,6 +106,10 @@ func analyzeWriteCall(pass *analysis.Pass, n ast.Node, generatedFiles filecheck.
 
 	// The receiver must implement io.Writer.
 	if !implementsWriter(pass, sel.X) {
+		return
+	}
+
+	if !coverage.ShouldApply(pass, call.Pos(), *hotThreshold) {
 		return
 	}
 

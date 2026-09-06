@@ -61,8 +61,13 @@ safe-outputs:
 # Or disable entirely:
 safe-outputs:
   create-pull-request:
-  threat-detection: false  # Disable threat detection
+  threat-detection: false  # Disable threat detection entirely
 ```
+
+The `features.gh-aw-detection` flag controls the detection implementation, not
+whether threat detection runs. The external `threat-detect` implementation is
+the default; set `features.gh-aw-detection: false` to select the legacy inline
+engine implementation.
 
 > [!NOTE]
 > When a workflow explicitly sets `threat-detection: false`, that setting takes precedence over any imported fragments. Imported shared workflows that configure safe outputs without a `threat-detection` key will not re-enable threat detection in the importing workflow.
@@ -249,9 +254,9 @@ safe-outputs:
           path: /tmp/gh-aw/threat-detection/
 ```
 
-**Available Artifacts:** Custom steps have access to `/tmp/gh-aw/threat-detection/prompt.txt` (workflow prompt), `agent_output.json` (safe output items), and `aw.patch` (git patch file).
+**Available Artifacts:** Custom steps have access to `/tmp/gh-aw/threat-detection/prompt.txt` (workflow prompt), `agent_output.json` (safe output items), and `aw.patch` (git patch file). gh-aw also stages `/tmp/gh-aw/threat-detection/aw-prompts/prompt-template.txt`, `/tmp/gh-aw/threat-detection/aw-prompts/prompt-import-tree.json`, `/tmp/gh-aw/threat-detection/aw_info.json`, and any restored `/tmp/gh-aw/threat-detection/comment-memory/*.md` files so detectors can analyze prompt structure, activation context, and persisted comment memory.
 
-**Execution Order:** Download artifacts → Execute pre-steps (`steps:`) → Run AI analysis (if enabled) → Execute post-steps (`post-steps:`) → Upload detection log.
+**Execution Order:** Download artifacts → Stage detection inputs → Execute pre-steps (`steps:`) → Run AI analysis (if enabled) → Execute post-steps (`post-steps:`) → Upload detection log.
 
 ## Example: LlamaGuard Integration
 
@@ -421,10 +426,10 @@ The protection list is composed of four sources:
 |-------|----------|
 | **AI detection always fails** | Review custom prompt for overly strict instructions, check if legitimate patterns trigger detection, adjust prompt context, or temporarily disable to test |
 | **Custom steps not running** | Verify YAML indentation, ensure steps array is properly formatted, review compilation output, check if AI detection failed first |
-| **Large patches cause timeouts** | Increase `timeout-minutes`, configure `max-patch-size`, truncate content before analysis, or split changes into smaller PRs |
+| **Large patches cause timeouts** | Increase `jobs.detection.timeout-minutes` (10 minutes by default, or `vars.GH_AW_DEFAULT_DETECTION_JOB_TIMEOUT_MINUTES`), configure `max-patch-size`, truncate content before analysis, or split changes into smaller PRs |
 | **False positives** | Refine prompt with specific exclusions, adjust tool thresholds, add workflow context explaining patterns, review detection logs |
 
-## Related Documentation
+## Learn More
 
 - [Safe Outputs Reference](/gh-aw/reference/safe-outputs/) - Complete safe outputs configuration
 - [Security Guide](/gh-aw/introduction/architecture/) - Overall security best practices

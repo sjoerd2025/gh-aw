@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
+	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -672,7 +674,11 @@ func TestFetchAndSaveRemoteIncludes_PathTraversalRejected(t *testing.T) {
 	spec := &WorkflowSpec{
 		RepoSpec: RepoSpec{RepoSlug: "github/gh-aw", Version: "main"},
 	}
-	err := fetchAndSaveRemoteIncludes(t.Context(), "@include ../secrets/evil.md\n", spec, targetDir, false, false, nil, mockFetch)
+	err := fetchAndSaveRemoteIncludesWithOptions(t.Context(), "@include ../secrets/evil.md\n", includesFetchOptions{
+		spec:      spec,
+		targetDir: targetDir,
+		fetchFn:   mockFetch,
+	})
 	require.Error(t, err)
 	require.NoFileExists(t, filepath.Join(tmpDir, ".github", "secrets", "evil.md"))
 }
@@ -690,7 +696,11 @@ func TestFetchAndSaveRemoteIncludes_NestedTraversalRejected(t *testing.T) {
 		RepoSpec: RepoSpec{RepoSlug: "github/gh-aw", Version: "main"},
 	}
 	// A path that doesn't start with "../" but still escapes via a sub-directory component.
-	err := fetchAndSaveRemoteIncludes(t.Context(), "@include subdir/../../secrets/evil.md\n", spec, targetDir, false, false, nil, mockFetch)
+	err := fetchAndSaveRemoteIncludesWithOptions(t.Context(), "@include subdir/../../secrets/evil.md\n", includesFetchOptions{
+		spec:      spec,
+		targetDir: targetDir,
+		fetchFn:   mockFetch,
+	})
 	require.Error(t, err)
 	require.NoFileExists(t, filepath.Join(tmpDir, ".github", "secrets", "evil.md"))
 }
@@ -707,7 +717,11 @@ func TestFetchAndSaveRemoteIncludes_SharedIncludeStaysUnderSharedDir(t *testing.
 	spec := &WorkflowSpec{
 		RepoSpec: RepoSpec{RepoSlug: "github/gh-aw", Version: "main"},
 	}
-	err := fetchAndSaveRemoteIncludes(t.Context(), "@include shared/helper.md\n", spec, targetDir, false, false, nil, mockFetch)
+	err := fetchAndSaveRemoteIncludesWithOptions(t.Context(), "@include shared/helper.md\n", includesFetchOptions{
+		spec:      spec,
+		targetDir: targetDir,
+		fetchFn:   mockFetch,
+	})
 	require.NoError(t, err)
 	assert.FileExists(t, filepath.Join(tmpDir, ".github", "shared", "helper.md"))
 }
@@ -1536,6 +1550,141 @@ safe-outputs:
 	assert.Contains(t, tracker.CreatedFiles, ymlPath)
 }
 
+func TestFetchAndSaveRemoteDispatchWorkflows_YmlFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	ymlContent := `name: Dispatched workflow
+on:
+  workflow_dispatch:
+jobs:
+  run: {runs-on: ubuntu-latest, steps: [{run: echo hello}]}
+`
+	downloader := func(_ context.Context, _, _, remotePath, _ string) ([]byte, error) {
+		if filepath.Ext(remotePath) == ".yml" {
+			return []byte(ymlContent), nil
+		}
+		return nil, errors.New("not found")
+	}
+	content := `---
+engine: copilot
+safe-outputs:
+  dispatch-workflow:
+    - worker
+---
+`
+	spec := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "github/gh-aw", Version: "main"},
+		WorkflowPath: ".github/workflows/orchestrator.md",
+	}
+	tracker := &FileTracker{OriginalContent: make(map[string][]byte), gitRoot: tmpDir}
+
+	err := fetchAndSaveRemoteDispatchWorkflows(context.Background(), content, spec, tmpDir, false, false, tracker, downloader)
+	require.NoError(t, err)
+
+	ymlPath := filepath.Join(tmpDir, "worker.yml")
+	got, err := os.ReadFile(ymlPath)
+	require.NoError(t, err)
+	assert.YAMLEq(t, ymlContent, string(got))
+	assert.Contains(t, tracker.CreatedFiles, ymlPath)
+}
+
+// TestFetchAndSaveRemoteDispatchWorkflows_ConflictDifferentSource verifies that an existing
+// dispatch workflow from a different source causes an error when force=false.
+func TestFetchAndSaveRemoteDispatchWorkflows_ConflictDifferentSource(t *testing.T) {
+	tmpDir := t.TempDir()
+	conflictContent := `---
+source: otherorg/other-repo/.github/workflows/worker.md@v1
+---
+# Worker from other repo
+`
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "worker.md"), []byte(conflictContent), 0600))
+
+	content := `---
+engine: copilot
+safe-outputs:
+  dispatch-workflow:
+    - worker
+---
+
+# Orchestrator
+`
+	spec := &WorkflowSpec{
+		RepoSpec: RepoSpec{
+			RepoSlug: "github/gh-aw",
+			Version:  "main",
+		},
+		WorkflowPath: ".github/workflows/orchestrator.md",
+	}
+
+	err := fetchAndSaveRemoteDispatchWorkflows(context.Background(), content, spec, tmpDir, false, false, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "dispatch workflow")
+	require.ErrorContains(t, err, "already exists")
+
+	// The existing file must be untouched.
+	gotContent, readErr := os.ReadFile(filepath.Join(tmpDir, "worker.md"))
+	require.NoError(t, readErr)
+	assert.Equal(t, conflictContent, string(gotContent))
+}
+
+// TestFetchAndSaveRemoteDispatchWorkflows_TrackingBeforeWrite verifies that TrackModified is
+// called with the original file content (i.e. before os.WriteFile overwrites it), so that
+// RollbackAllFiles can restore the correct previous state.
+func TestFetchAndSaveRemoteDispatchWorkflows_TrackingBeforeWrite(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	originalContent := `---
+source: github/gh-aw/.github/workflows/worker.md@v0.9.0
+engine: copilot
+---
+# Old worker
+`
+	workerPath := filepath.Join(tmpDir, "worker.md")
+	require.NoError(t, os.WriteFile(workerPath, []byte(originalContent), 0600))
+
+	newContent := `---
+engine: copilot
+---
+# New worker
+`
+	downloader := func(_ context.Context, _, _, remotePath, _ string) ([]byte, error) {
+		if filepath.Ext(remotePath) == ".md" {
+			return []byte(newContent), nil
+		}
+		return nil, errors.New("not found")
+	}
+
+	content := `---
+engine: copilot
+safe-outputs:
+  dispatch-workflow:
+    - worker
+---
+
+# Orchestrator
+`
+	spec := &WorkflowSpec{
+		RepoSpec: RepoSpec{
+			RepoSlug: "github/gh-aw",
+			Version:  "v1.0.0",
+		},
+		WorkflowPath: ".github/workflows/orchestrator.md",
+	}
+
+	tracker := &FileTracker{
+		OriginalContent: make(map[string][]byte),
+		gitRoot:         tmpDir,
+	}
+
+	err := fetchAndSaveRemoteDispatchWorkflows(context.Background(), content, spec, tmpDir, false, true, tracker, downloader)
+	require.NoError(t, err)
+
+	// The tracker must have captured the *original* content, not the newly written bytes.
+	absWorkerPath, _ := filepath.Abs(workerPath)
+	captured, ok := tracker.OriginalContent[absWorkerPath]
+	require.True(t, ok, "worker.md should be in OriginalContent")
+	assert.Equal(t, []byte(originalContent), captured, "tracker should capture original content before overwrite")
+}
+
 // TestFetchAndSaveRemoteCallWorkflows_TrackingBeforeWrite verifies that TrackModified is
 // called with the original file content (i.e. before os.WriteFile overwrites it), so that
 // RollbackAllFiles can restore the correct previous state.
@@ -1635,76 +1784,159 @@ safe-outputs:
 	}
 }
 
-// --- extractResources tests ---
+func TestFetchAndSaveRemoteResources_InstallsAndRestoresGraderEvaluator(t *testing.T) {
+	tmpDir := t.TempDir()
+	setupMinimalGitRepo(t, tmpDir)
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0o755))
 
-// TestExtractResources_BasicList verifies that resource paths are extracted from the resources field.
-func TestExtractResources_BasicList(t *testing.T) {
+	const evaluatorPath = ".github/workflows/graders/example-operational-value.sh"
 	content := `---
-engine: copilot
-on: issues
-resources:
-  - triage-issue.md
-  - close-stale.md
-  - my-action.yml
+on: workflow_dispatch
+graders:
+  operational-value:
+    run: .github/workflows/graders/example-operational-value.sh
 ---
 
 # Workflow
 `
-	resources, err := extractResources(content)
-	require.NoError(t, err, "should not error for valid resources")
-	assert.Equal(t, []string{"triage-issue.md", "close-stale.md", "my-action.yml"}, resources, "should extract all listed resources")
+	evaluatorContent := []byte("#!/usr/bin/env bash\necho old\n")
+	download := func(_ context.Context, owner, repo, filePath, ref string) ([]byte, error) {
+		assert.Equal(t, "workflows/graders/example-operational-value.sh", filePath)
+		return evaluatorContent, nil
+	}
+
+	spec := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: "main"},
+		WorkflowPath: "workflows/graded.md",
+	}
+	require.NoError(t, fetchAndSaveRemoteResourcesWithDownloader(t.Context(), content, spec, workflowsDir, false, false, nil, download))
+
+	installedPath := filepath.Join(tmpDir, filepath.FromSlash(evaluatorPath))
+	installed, err := os.ReadFile(installedPath)
+	require.NoError(t, err)
+	assert.Equal(t, evaluatorContent, installed)
+	require.NoError(t, fetchAndSaveRemoteResourcesWithDownloader(t.Context(), content, spec, workflowsDir, false, false, nil, download))
+
+	evaluatorContent = []byte("#!/usr/bin/env bash\necho conflict\n")
+	err = fetchAndSaveRemoteResourcesWithDownloader(t.Context(), content, spec, workflowsDir, false, false, nil, download)
+	require.ErrorContains(t, err, evaluatorPath)
+	require.ErrorContains(t, err, "--force")
+
+	workflowPath := filepath.Join(workflowsDir, "graded.md")
+	require.NoError(t, os.WriteFile(workflowPath, []byte(content), 0o644))
+	compiler := workflow.NewCompiler()
+	compiler.SetNoEmit(true)
+	require.NoError(t, compiler.CompileWorkflow(workflowPath))
+
+	require.NoError(t, os.Remove(installedPath))
+	evaluatorContent = []byte("#!/usr/bin/env bash\necho new\n")
+	require.NoError(t, fetchAndSaveRemoteResourcesWithDownloader(t.Context(), content, spec, workflowsDir, false, true, nil, download))
+	restored, err := os.ReadFile(installedPath)
+	require.NoError(t, err)
+	assert.Equal(t, evaluatorContent, restored)
 }
 
-// TestExtractResources_MacroRejected verifies that an entry with GitHub Actions expression syntax causes an error.
-func TestExtractResources_MacroRejected(t *testing.T) {
+// TestFetchAndSaveRemoteResources_InstallsRepoRootGraderEvaluatorFromNestedPackage verifies that
+// a repository-root anchored grader evaluator (not under ".github/workflows") is fetched from
+// its exact repository-root path even when the declaring workflow belongs to a nested package,
+// instead of being incorrectly prefixed with the package's own directory.
+func TestFetchAndSaveRemoteResources_InstallsRepoRootGraderEvaluatorFromNestedPackage(t *testing.T) {
+	tmpDir := t.TempDir()
+	setupMinimalGitRepo(t, tmpDir)
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0o755))
+
+	const evaluatorPath = ".github/graders/shared-operational-value.sh"
 	content := `---
-engine: copilot
-on: issues
-resources:
-  - plain-workflow.md
-  - ${{ vars.WORKFLOW }}.md
+on: workflow_dispatch
+graders:
+  operational-value:
+    run: .github/graders/shared-operational-value.sh
 ---
 
 # Workflow
 `
-	resources, err := extractResources(content)
-	require.Error(t, err, "should error when a resource entry contains macro syntax")
-	assert.Nil(t, resources, "should return nil resources on error")
-	require.ErrorContains(t, err, "${{", "error message should mention the disallowed syntax")
+	evaluatorContent := []byte("#!/usr/bin/env bash\necho shared\n")
+	download := func(_ context.Context, owner, repo, filePath, ref string) ([]byte, error) {
+		assert.Equal(t, evaluatorPath, filePath)
+		return evaluatorContent, nil
+	}
+
+	spec := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: "main", PackagePath: "packages/repo-assist"},
+		WorkflowPath: "packages/repo-assist/workflows/graded.md",
+	}
+	require.NoError(t, fetchAndSaveRemoteResourcesWithDownloader(t.Context(), content, spec, workflowsDir, false, false, nil, download))
+
+	installed, err := os.ReadFile(filepath.Join(tmpDir, filepath.FromSlash(evaluatorPath)))
+	require.NoError(t, err)
+	assert.Equal(t, evaluatorContent, installed)
 }
 
-// TestExtractResources_AllMacrosRejected verifies that all-macro lists return an error.
-func TestExtractResources_AllMacrosRejected(t *testing.T) {
+func TestFetchAndSaveRemoteResources_InstallsLocalDotGraderEvaluator(t *testing.T) {
+	tmpDir := t.TempDir()
+	setupMinimalGitRepo(t, tmpDir)
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0o755))
+
 	content := `---
-engine: copilot
-on: issues
-resources:
-  - ${{ vars.WORKFLOW_A }}
-  - ${{ vars.WORKFLOW_B }}
+on: workflow_dispatch
+graders:
+  operational-value:
+    run: ./scripts/example-operational-value.sh
 ---
 
 # Workflow
 `
-	resources, err := extractResources(content)
-	require.Error(t, err, "should error when all resources are macros")
-	assert.Nil(t, resources)
+	evaluatorContent := []byte("#!/usr/bin/env bash\necho local\n")
+	download := func(_ context.Context, owner, repo, filePath, ref string) ([]byte, error) {
+		assert.Equal(t, "workflows/scripts/example-operational-value.sh", filePath)
+		return evaluatorContent, nil
+	}
+
+	spec := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: "main"},
+		WorkflowPath: "workflows/graded.md",
+	}
+	require.NoError(t, fetchAndSaveRemoteResourcesWithDownloader(t.Context(), content, spec, workflowsDir, false, false, nil, download))
+
+	installed, err := os.ReadFile(filepath.Join(workflowsDir, "scripts", "example-operational-value.sh"))
+	require.NoError(t, err)
+	assert.Equal(t, evaluatorContent, installed)
 }
 
-// TestExtractResources_NoResourcesField verifies that nil is returned when no resources field.
-func TestExtractResources_NoResourcesField(t *testing.T) {
+func TestFetchAndSaveRemoteResources_RejectsGraderEvaluatorSymlinkedParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional privileges on Windows")
+	}
+	tmpDir := t.TempDir()
+	setupMinimalGitRepo(t, tmpDir)
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0o755))
+	outsideDir := t.TempDir()
+	require.NoError(t, os.Symlink(outsideDir, filepath.Join(workflowsDir, "scripts")))
+
 	content := `---
-engine: copilot
-on: issues
+on: workflow_dispatch
+graders:
+  operational-value:
+    run: ./scripts/example-operational-value.sh
 ---
 
 # Workflow
 `
-	resources, err := extractResources(content)
-	require.NoError(t, err, "should not error when no resources field")
-	assert.Empty(t, resources, "should return nil when no resources field")
-}
+	download := func(_ context.Context, owner, repo, filePath, ref string) ([]byte, error) {
+		return []byte("#!/usr/bin/env bash\necho unsafe\n"), nil
+	}
 
-// --- fetchAndSaveRemoteResources tests ---
+	spec := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: "main"},
+		WorkflowPath: "workflows/graded.md",
+	}
+	require.NoError(t, fetchAndSaveRemoteResourcesWithDownloader(t.Context(), content, spec, workflowsDir, false, true, nil, download))
+	assert.NoFileExists(t, filepath.Join(outsideDir, "example-operational-value.sh"))
+}
 
 // TestFetchAndSaveRemoteResources_NoResources verifies that the function is a no-op when the
 // workflow has no resources field.

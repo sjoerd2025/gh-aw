@@ -19,6 +19,9 @@ import (
 	"github.com/github/gh-aw/pkg/linters/fileclosenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/fmterrorfnoverbs"
 	"github.com/github/gh-aw/pkg/linters/fprintlnsprintf"
+	"github.com/github/gh-aw/pkg/linters/generatedyamlheredoc"
+	"github.com/github/gh-aw/pkg/linters/globwalkignorederror"
+	"github.com/github/gh-aw/pkg/linters/goroutinemissingrecover"
 	"github.com/github/gh-aw/pkg/linters/hardcodedfilepath"
 	"github.com/github/gh-aw/pkg/linters/httpnoctx"
 	"github.com/github/gh-aw/pkg/linters/httprespbodyclose"
@@ -30,15 +33,18 @@ import (
 	"github.com/github/gh-aw/pkg/linters/lenstringzero"
 	"github.com/github/gh-aw/pkg/linters/logfatallibrary"
 	"github.com/github/gh-aw/pkg/linters/manualmutexunlock"
+	"github.com/github/gh-aw/pkg/linters/manualpathconcat"
 	"github.com/github/gh-aw/pkg/linters/mapclearloop"
 	"github.com/github/gh-aw/pkg/linters/mapdeletecheck"
 	"github.com/github/gh-aw/pkg/linters/nilctxpassed"
 	"github.com/github/gh-aw/pkg/linters/osexitinlibrary"
 	"github.com/github/gh-aw/pkg/linters/osgetenvlibrary"
 	"github.com/github/gh-aw/pkg/linters/ossetenvlibrary"
+	"github.com/github/gh-aw/pkg/linters/packagelevelmutableslicemap"
 	panicinlibrarycode "github.com/github/gh-aw/pkg/linters/panic-in-library-code"
 	"github.com/github/gh-aw/pkg/linters/rawloginlib"
 	"github.com/github/gh-aw/pkg/linters/regexpcompileinfunction"
+	"github.com/github/gh-aw/pkg/linters/regexpdynamicpattern"
 	"github.com/github/gh-aw/pkg/linters/seenmapbool"
 	"github.com/github/gh-aw/pkg/linters/sortslice"
 	"github.com/github/gh-aw/pkg/linters/sprintfbool"
@@ -59,7 +65,9 @@ import (
 	"github.com/github/gh-aw/pkg/linters/timesleepnocontext"
 	"github.com/github/gh-aw/pkg/linters/tolowerequalfold"
 	"github.com/github/gh-aw/pkg/linters/trimleftright"
+	"github.com/github/gh-aw/pkg/linters/uncheckedflushreturn"
 	"github.com/github/gh-aw/pkg/linters/uncheckedtypeassertion"
+	"github.com/github/gh-aw/pkg/linters/walkfuncerrshadow"
 	"github.com/github/gh-aw/pkg/linters/wgdonenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/writebytestring"
 )
@@ -90,6 +98,9 @@ var allAnalyzers = []*analysis.Analyzer{
 	excessivefuncparams.Analyzer,
 	fileclosenotdeferred.Analyzer,
 	fmterrorfnoverbs.Analyzer,
+	generatedyamlheredoc.Analyzer,
+	globwalkignorederror.Analyzer,
+	goroutinemissingrecover.Analyzer,
 	hardcodedfilepath.Analyzer,
 	httpnoctx.Analyzer,
 	httprespbodyclose.Analyzer,
@@ -98,15 +109,18 @@ var allAnalyzers = []*analysis.Analyzer{
 	largefunc.Analyzer,
 	logfatallibrary.Analyzer,
 	manualmutexunlock.Analyzer,
+	manualpathconcat.Analyzer,
 	mapclearloop.Analyzer,
 	mapdeletecheck.Analyzer,
 	nilctxpassed.Analyzer,
 	osexitinlibrary.Analyzer,
 	osgetenvlibrary.Analyzer,
 	ossetenvlibrary.Analyzer,
+	packagelevelmutableslicemap.Analyzer,
 	panicinlibrarycode.Analyzer,
 	rawloginlib.Analyzer,
 	regexpcompileinfunction.Analyzer,
+	regexpdynamicpattern.Analyzer,
 	ssljson.Analyzer,
 	seenmapbool.Analyzer,
 	sortslice.Analyzer,
@@ -131,6 +145,8 @@ var allAnalyzers = []*analysis.Analyzer{
 	tolowerequalfold.Analyzer,
 	trimleftright.Analyzer,
 	uncheckedtypeassertion.Analyzer,
+	uncheckedflushreturn.Analyzer,
+	walkfuncerrshadow.Analyzer,
 	wgdonenotdeferred.Analyzer,
 	writebytestring.Analyzer,
 }

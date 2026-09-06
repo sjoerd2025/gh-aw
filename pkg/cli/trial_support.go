@@ -55,7 +55,7 @@ func downloadAllArtifacts(hostRepoSlug, runID string, verbose bool) (*TrialArtif
 	}
 
 	// Walk through all downloaded artifacts
-	err = filepath.Walk(tempDir, func(path string, info os.FileInfo, err error) error {
+	walkErr := filepath.Walk(tempDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -75,7 +75,7 @@ func downloadAllArtifacts(hostRepoSlug, runID string, verbose bool) (*TrialArtif
 
 		// Handle specific artifact types
 		switch {
-		case strings.HasSuffix(path, constants.AgentOutputFilename):
+		case strings.HasSuffix(path, constants.AgentOutputFilename.String()):
 			// Parse safe outputs
 			trialSupportLog.Printf("Processing safe outputs artifact: %s", relPath)
 			if safeOutputs := parseJSONArtifact(path, verbose); safeOutputs != nil {
@@ -111,9 +111,9 @@ func downloadAllArtifacts(hostRepoSlug, runID string, verbose bool) (*TrialArtif
 		return nil
 	})
 
-	if err != nil {
+	if walkErr != nil {
 		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Error walking artifact directory: %v", err)))
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Error walking artifact directory: %v", walkErr)))
 		}
 	}
 

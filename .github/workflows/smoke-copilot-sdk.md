@@ -3,6 +3,7 @@ private: true
 emoji: "🔬"
 description: Smoke Copilot SDK
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-copilot-sdk
     strategy: centralized
@@ -20,6 +21,9 @@ engine:
   id: copilot
   copilot-sdk: true
   bare: true
+imports:
+  - shared/smoke-test-brevity.md
+  - shared/reporting.md
 max-tool-denials: 3
 tools:
   bash:
@@ -35,11 +39,13 @@ safe-outputs:
 timeout-minutes: 10
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
+    id: awf
 ---
 
 # Smoke Test: Copilot SDK Engine Validation
-
-**IMPORTANT: Keep all outputs extremely short and concise.**
 
 ## Tasks
 

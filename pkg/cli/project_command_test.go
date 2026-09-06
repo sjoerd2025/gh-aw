@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"slices"
 	"strconv"
 	"testing"
@@ -15,6 +16,7 @@ import (
 )
 
 func TestNewProjectCommand(t *testing.T) {
+	t.Parallel()
 	cmd := NewProjectCommand()
 	require.NotNil(t, cmd, "Command should be created")
 	assert.Equal(t, "project", cmd.Use, "Command name should be 'project'")
@@ -24,6 +26,7 @@ func TestNewProjectCommand(t *testing.T) {
 }
 
 func TestNewProjectNewCommand(t *testing.T) {
+	t.Parallel()
 	cmd := NewProjectNewCommand()
 	require.NotNil(t, cmd, "Command should be created")
 	assert.Equal(t, "new <title>", cmd.Use, "Command usage should be 'new <title>'")
@@ -41,53 +44,8 @@ func TestNewProjectNewCommand(t *testing.T) {
 	assert.Equal(t, "l", linkFlag.Shorthand, "Link flag should have short form 'l'")
 }
 
-func TestEscapeGraphQLString(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "plain text",
-			input:    "Hello World",
-			expected: "Hello World",
-		},
-		{
-			name:     "with quotes",
-			input:    `Project "Alpha"`,
-			expected: `Project \"Alpha\"`,
-		},
-		{
-			name:     "with backslash",
-			input:    `Path\to\file`,
-			expected: `Path\\to\\file`,
-		},
-		{
-			name:     "with newline",
-			input:    "Line 1\nLine 2",
-			expected: "Line 1\\nLine 2",
-		},
-		{
-			name:     "with tab",
-			input:    "Name\tValue",
-			expected: "Name\\tValue",
-		},
-		{
-			name:     "complex string",
-			input:    "Test \"project\"\nWith\ttabs\\and backslashes",
-			expected: "Test \\\"project\\\"\\nWith\\ttabs\\\\and backslashes",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := escapeGraphQLString(tt.input)
-			assert.Equal(t, tt.expected, result, "GraphQL string should be properly escaped")
-		})
-	}
-}
-
 func TestProjectConfig(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		config      ProjectConfig
@@ -125,6 +83,7 @@ func TestProjectConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.NotEmpty(t, tt.config.Title, "Project title should not be empty")
 			assert.NotEmpty(t, tt.config.Owner, "Project owner should not be empty")
 			assert.NotEmpty(t, tt.config.OwnerType, "Owner type should not be empty")
@@ -134,6 +93,7 @@ func TestProjectConfig(t *testing.T) {
 }
 
 func TestProjectNewCommandArgs(t *testing.T) {
+	t.Parallel()
 	cmd := NewProjectNewCommand()
 
 	tests := []struct {
@@ -160,6 +120,7 @@ func TestProjectNewCommandArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := cmd.Args(cmd, tt.args)
 			if tt.shouldErr {
 				assert.Error(t, err, "Should return error for invalid arguments")
@@ -171,6 +132,7 @@ func TestProjectNewCommandArgs(t *testing.T) {
 }
 
 func TestProjectNewCommandFlags(t *testing.T) {
+	t.Parallel()
 	cmd := NewProjectNewCommand()
 
 	// Check standard flags
@@ -194,6 +156,7 @@ func TestProjectNewCommandFlags(t *testing.T) {
 }
 
 func TestParseProjectURL(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		url            string
@@ -232,6 +195,7 @@ func TestParseProjectURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result, err := parseProjectURL(tt.url)
 			if tt.shouldErr {
 				assert.Error(t, err, "Should return error for invalid URL")
@@ -246,6 +210,7 @@ func TestParseProjectURL(t *testing.T) {
 }
 
 func TestEnsureSingleSelectOptionBefore(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		options        []singleSelectOption
@@ -307,6 +272,7 @@ func TestEnsureSingleSelectOptionBefore(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result, changed := ensureSingleSelectOptionBefore(tt.options, tt.desired, tt.beforeName)
 			assert.Equal(t, tt.expectChanged, changed, "Changed status should match expectation")
 			assert.Len(t, result, tt.expectedLength, "Result length should match")
@@ -335,6 +301,7 @@ func TestEnsureSingleSelectOptionBefore(t *testing.T) {
 }
 
 func TestSingleSelectOptionsEqual(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		a        []singleSelectOption
@@ -386,6 +353,7 @@ func TestSingleSelectOptionsEqual(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := singleSelectOptionsEqual(tt.a, tt.b)
 			assert.Equal(t, tt.expected, result, "Equality check should match expectation")
 		})
@@ -393,6 +361,7 @@ func TestSingleSelectOptionsEqual(t *testing.T) {
 }
 
 func TestProjectConfigWithProjectSetup(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		config      ProjectConfig
@@ -558,40 +527,45 @@ func TestGraphQLRequestBodyStructure(t *testing.T) {
 }
 
 func TestValidateOwnerUsesStringLoginField(t *testing.T) {
-	oldRunGH := projectCommandRunGH
-	defer func() { projectCommandRunGH = oldRunGH }()
+	oldRunGHInputContext := projectCommandRunGHInputContext
+	defer func() { projectCommandRunGHInputContext = oldRunGHInputContext }()
 
 	tests := []struct {
 		name      string
 		ownerType string
 		owner     string
+		wantQuery string
 	}{
-		{name: "organization login false stays string", ownerType: "org", owner: "false"},
-		{name: "user login null stays string", ownerType: "user", owner: "null"},
+		{name: "organization login false stays string", ownerType: "org", owner: "false", wantQuery: `query($login: String!) { organization(login: $login) { id login } }`},
+		{name: "user login null stays string", ownerType: "user", owner: "null", wantQuery: `query($login: String!) { user(login: $login) { id login } }`},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var captured []string
-			projectCommandRunGH = func(spinnerMessage string, args ...string) ([]byte, error) {
-				captured = append([]string(nil), args...)
+			var capturedArgs []string
+			var request map[string]any
+			projectCommandRunGHInputContext = func(ctx context.Context, spinnerMessage string, input io.Reader, args ...string) ([]byte, error) {
+				capturedArgs = append([]string(nil), args...)
+				request = parseGraphQLRequestBody(t, input)
 				return []byte(`{}`), nil
 			}
 
 			err := validateOwner(context.Background(), tt.ownerType, tt.owner, false)
 			require.NoError(t, err)
 
-			require.Contains(t, captured, "login="+tt.owner)
-			loginIndex := slices.Index(captured, "login="+tt.owner)
-			require.Positive(t, loginIndex)
-			assert.Equal(t, "-f", captured[loginIndex-1], "login must be passed with -f so gh keeps String! values as strings")
+			require.Equal(t, tt.wantQuery, request["query"])
+			vars, ok := request["variables"].(map[string]any)
+			require.True(t, ok, "variables should be a JSON object")
+			assert.Equal(t, tt.owner, vars["login"])
+			assert.NotContains(t, tt.wantQuery, tt.owner, "owner login must not be string-interpolated into query")
+			assert.Equal(t, []string{"api", "graphql", "--input", "-"}, capturedArgs)
 		})
 	}
 }
 
 func TestGetOwnerNodeIdUsesStringLoginField(t *testing.T) {
-	oldRunGH := projectCommandRunGH
-	defer func() { projectCommandRunGH = oldRunGH }()
+	oldRunGHInputContext := projectCommandRunGHInputContext
+	defer func() { projectCommandRunGHInputContext = oldRunGHInputContext }()
 
 	tests := []struct {
 		name      string
@@ -625,9 +599,11 @@ func TestGetOwnerNodeIdUsesStringLoginField(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var captured []string
-			projectCommandRunGH = func(spinnerMessage string, args ...string) ([]byte, error) {
-				captured = append([]string(nil), args...)
+			var capturedArgs []string
+			var request map[string]any
+			projectCommandRunGHInputContext = func(ctx context.Context, spinnerMessage string, input io.Reader, args ...string) ([]byte, error) {
+				capturedArgs = append([]string(nil), args...)
+				request = parseGraphQLRequestBody(t, input)
 				return []byte("NODE_ID_123"), nil
 			}
 
@@ -635,28 +611,23 @@ func TestGetOwnerNodeIdUsesStringLoginField(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, "NODE_ID_123", nodeID)
 
-			queryArg := "query=" + tt.wantQuery
-			require.Contains(t, captured, queryArg)
-			queryIndex := slices.Index(captured, queryArg)
-			require.Positive(t, queryIndex)
-			assert.Equal(t, "-f", captured[queryIndex-1], "query must be passed with -f")
+			require.Equal(t, tt.wantQuery, request["query"])
+			vars, ok := request["variables"].(map[string]any)
+			require.True(t, ok, "variables should be a JSON object")
+			assert.Equal(t, tt.owner, vars["login"])
+			assert.NotContains(t, tt.wantQuery, tt.owner, "owner login must not be string-interpolated into query")
 
-			require.Contains(t, captured, "login="+tt.owner)
-			loginIndex := slices.Index(captured, "login="+tt.owner)
-			require.Positive(t, loginIndex)
-			assert.Equal(t, "-f", captured[loginIndex-1], "login must be passed with -f so gh keeps String! values as strings")
-
-			jqIndex := slices.Index(captured, "--jq")
+			jqIndex := slices.Index(capturedArgs, "--jq")
 			require.Positive(t, jqIndex)
-			require.Less(t, jqIndex, len(captured)-1)
-			assert.Equal(t, tt.wantJQ, captured[jqIndex+1])
+			require.Less(t, jqIndex, len(capturedArgs)-1)
+			assert.Equal(t, tt.wantJQ, capturedArgs[jqIndex+1])
 		})
 	}
 }
 
 func TestGetStatusFieldUsesStringLoginAndIntNumberFields(t *testing.T) {
-	oldRunGH := projectCommandRunGH
-	defer func() { projectCommandRunGH = oldRunGH }()
+	oldRunGHInputContext := projectCommandRunGHInputContext
+	defer func() { projectCommandRunGHInputContext = oldRunGHInputContext }()
 
 	tests := []struct {
 		name         string
@@ -683,11 +654,13 @@ func TestGetStatusFieldUsesStringLoginAndIntNumberFields(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var calls [][]string
-			projectCommandRunGH = func(spinnerMessage string, args ...string) ([]byte, error) {
-				call := append([]string(nil), args...)
-				calls = append(calls, call)
-				switch jqPathArg(t, call) {
+			var callsArgs [][]string
+			var requests []map[string]any
+			projectCommandRunGHInputContext = func(ctx context.Context, spinnerMessage string, input io.Reader, args ...string) ([]byte, error) {
+				callArgs := append([]string(nil), args...)
+				callsArgs = append(callsArgs, callArgs)
+				requests = append(requests, parseGraphQLRequestBody(t, input))
+				switch jqPathArg(t, callArgs) {
 				case tt.wantProjectJ:
 					return []byte(tt.wantProject), nil
 				case tt.wantFieldsJ:
@@ -704,18 +677,37 @@ func TestGetStatusFieldUsesStringLoginAndIntNumberFields(t *testing.T) {
 			require.Len(t, field.options, 1)
 			assert.Equal(t, "Todo", field.options[0].Name)
 
-			require.Len(t, calls, 2)
-			for _, call := range calls {
-				loginIndex := slices.Index(call, "login="+tt.info.ownerLogin)
-				require.Positive(t, loginIndex)
-				assert.Equal(t, "-f", call[loginIndex-1], "login must be passed with -f so gh keeps String! values as strings")
+			require.Len(t, callsArgs, 2)
+			require.Len(t, requests, 2)
+			for i, call := range callsArgs {
+				wantJQ := tt.wantFieldsJ
+				if i == 0 {
+					wantJQ = tt.wantProjectJ
+				}
+				assert.Equal(t, []string{"api", "graphql", "--input", "-", "--jq", wantJQ}, call)
 
-				numberIndex := slices.Index(call, "number="+strconv.Itoa(tt.info.projectNumber))
-				require.Positive(t, numberIndex)
-				assert.Equal(t, "-F", call[numberIndex-1], "project number must keep -F so gh coerces Int! values correctly")
+				req := requests[i]
+				vars, ok := req["variables"].(map[string]any)
+				require.True(t, ok, "variables should be a JSON object")
+				query, ok := req["query"].(string)
+				require.True(t, ok, "query should be a string")
+				assert.Equal(t, tt.info.ownerLogin, vars["login"])
+				require.IsType(t, float64(0), vars["number"])
+				assert.InDelta(t, tt.info.projectNumber, vars["number"].(float64), 1e-9)
+				assert.NotContains(t, query, tt.info.ownerLogin, "owner login must not be string-interpolated into query")
+				assert.NotContains(t, query, strconv.Itoa(tt.info.projectNumber), "project number must not be string-interpolated into query")
 			}
 		})
 	}
+}
+
+func parseGraphQLRequestBody(t *testing.T, input io.Reader) map[string]any {
+	t.Helper()
+	data, err := io.ReadAll(input)
+	require.NoError(t, err)
+	var request map[string]any
+	require.NoError(t, json.Unmarshal(data, &request))
+	return request
 }
 
 func jqPathArg(t *testing.T, args []string) string {
@@ -724,4 +716,37 @@ func jqPathArg(t *testing.T, args []string) string {
 	require.Positive(t, jqIndex)
 	require.Less(t, jqIndex, len(args)-1)
 	return args[jqIndex+1]
+}
+
+// TestProjectGraphQLQueryConstantsAreParameterized ensures the project GraphQL documents
+// stay static templates that declare their inputs as GraphQL variables, so user-controlled
+// values can never be interpolated into a query string.
+func TestProjectGraphQLQueryConstantsAreParameterized(t *testing.T) {
+	queries := map[string][]string{
+		"validateOrgOwnerQuery":  {"$login: String!"},
+		"validateUserOwnerQuery": {"$login: String!"},
+		"orgOwnerNodeIDQuery":    {"$login: String!"},
+		"userOwnerNodeIDQuery":   {"$login: String!"},
+		"orgProjectFieldsQuery":  {"$login: String!", "$number: Int!"},
+		"userProjectFieldsQuery": {"$login: String!", "$number: Int!"},
+	}
+	values := map[string]string{
+		"validateOrgOwnerQuery":  validateOrgOwnerQuery,
+		"validateUserOwnerQuery": validateUserOwnerQuery,
+		"orgOwnerNodeIDQuery":    orgOwnerNodeIDQuery,
+		"userOwnerNodeIDQuery":   userOwnerNodeIDQuery,
+		"orgProjectFieldsQuery":  orgProjectFieldsQuery,
+		"userProjectFieldsQuery": userProjectFieldsQuery,
+	}
+
+	for name, declarations := range queries {
+		t.Run(name, func(t *testing.T) {
+			query := values[name]
+			assert.NotContains(t, query, "%s", "query must not contain format verbs")
+			assert.NotContains(t, query, "%v", "query must not contain format verbs")
+			for _, declaration := range declarations {
+				assert.Contains(t, query, declaration, "query must declare its inputs as GraphQL variables")
+			}
+		})
+	}
 }

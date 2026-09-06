@@ -14,6 +14,8 @@ import (
 
 var claudeLog = logger.New("workflow:claude_engine")
 
+const claudeDebugLogFile = constants.TmpGhAwAgentDir + "claude-debug.log"
+
 // ClaudeEngine represents the Claude Code agentic engine
 type ClaudeEngine struct {
 	BaseEngine
@@ -30,12 +32,15 @@ func NewClaudeEngine() *ClaudeEngine {
 			experimental:     false,
 			ghSkillAgentName: "claude-code",
 			capabilities: EngineCapabilities{
-				ToolsAllowlist:   true,
-				MaxTurns:         true,  // Claude supports max-turns feature
-				MaxContinuations: false, // Claude Code does not support --max-autopilot-continues-style continuation
-				WebSearch:        true,  // Claude has built-in WebSearch support
-				NativeAgentFile:  false, // Claude does not support agent file natively; the compiler prepends the agent file content to prompt.txt
-				BareMode:         true,  // Claude CLI supports --bare
+				ToolsAllowlist:       true,
+				MCP:                  true,
+				MaxTurns:             true,  // Claude supports max-turns feature
+				MaxContinuations:     false, // Claude Code does not support --max-autopilot-continues-style continuation
+				WebSearch:            true,  // Claude has built-in WebSearch support
+				NativeAgentFile:      false, // Claude does not support agent file natively; the compiler prepends the agent file content to prompt.txt
+				BareMode:             true,  // Claude CLI supports --bare
+				BashCommandAllowlist: true,  // Claude enforces tools.bash allowlist via --allowed-tools Bash(cmd)
+				Plugins:              true,  // Claude Code loads Agent Plugins via --plugin-dir
 			},
 			dedicatedLLMGatewayPort: constants.ClaudeLLMGatewayPort,
 		},
@@ -82,16 +87,14 @@ func (e *ClaudeEngine) GetSupportedEnvVarKeys() []string {
 // Returns an empty step if custom command is specified or if Anthropic WIF is configured.
 func (e *ClaudeEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
 	provider := e.ResolveLLMProvider(workflowData)
-	if provider == LLMProviderAnthropic && isAnthropicWIF(workflowData) {
-		return GitHubActionStep{}
-	}
-	providerSecrets := llmProviderSecretNames(provider)
-	return BuildDefaultSecretValidationStep(
-		workflowData,
-		providerSecrets,
-		"Claude Code",
-		llmProviderDocsURL(provider),
-	)
+	return BuildEngineSecretValidationStep(workflowData, EngineSecretValidationConfig{
+		SecretNames: llmProviderSecretNames(provider),
+		EngineName:  "Claude Code",
+		DocsURL:     llmProviderDocsURL(provider),
+		Skip: func(workflowData *WorkflowData) bool {
+			return provider == LLMProviderAnthropic && isAnthropicWIF(workflowData)
+		},
+	})
 }
 
 // isAnthropicWIF returns true when the workflow is configured to use Anthropic
@@ -109,8 +112,8 @@ func (e *ClaudeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 
 	// Skip installation if custom command is specified
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
-		claudeLog.Printf("Skipping installation steps: custom command specified (%s)", workflowData.EngineConfig.Command)
-		return []GitHubActionStep{}
+		claudeLog.Printf("Skipping Claude CLI installation: custom command specified (%s)", workflowData.EngineConfig.Command)
+		return buildNpmEngineInstallStepsWithAWF(nil, workflowData, false)
 	}
 
 	// Use version from engine config if provided, otherwise default to pinned version
@@ -132,7 +135,7 @@ func (e *ClaudeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 			CooldownEnabled:   false,
 		},
 	)
-	if isDockerSbxRuntime(workflowData) {
+	if isDockerSbxRuntime(workflowData) || isCloudHypervisorRuntime(workflowData) {
 		npmSteps = append(npmSteps, GenerateDockerSbxNpmCLIInstallStep(
 			"@anthropic-ai/claude-code",
 			version,
@@ -143,6 +146,13 @@ func (e *ClaudeEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHub
 		))
 	}
 	return BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
+}
+
+// GetPluginInstallationSteps checks out pinned Agent Plugins for the Claude engine.
+// Claude Code loads plugin directories through the --plugin-dir flag added by
+// appendClaudePluginArgs, so no CLI installation command is required.
+func (e *ClaudeEngine) GetPluginInstallationSteps(workflowData *WorkflowData) []GitHubActionStep {
+	return generatePluginInstallationSteps(workflowData, pluginInstallSpec{})
 }
 
 // GetDeclaredOutputFiles returns the output files that Claude may produce
@@ -203,12 +213,7 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	}
 
 	// Add timeout at step level (GitHub Actions standard)
-	if workflowData.TimeoutMinutes != "" {
-		timeoutValue := strings.TrimPrefix(workflowData.TimeoutMinutes, "timeout-minutes: ")
-		stepLines = append(stepLines, "        timeout-minutes: "+timeoutValue)
-	} else {
-		stepLines = append(stepLines, fmt.Sprintf("        timeout-minutes: %d", int(constants.DefaultAgenticWorkflowTimeout/time.Minute)))
-	}
+	stepLines = append(stepLines, "        timeout-minutes: "+resolveStepTimeoutValue(workflowData))
 
 	// Filter environment variables to only include allowed secrets.
 	// This is a security measure to prevent exposing unnecessary secrets to the AWF container.
@@ -218,7 +223,7 @@ func (e *ClaudeEngine) GetExecutionSteps(workflowData *WorkflowData, logFile str
 	// fallback expression that is always allowed when cli-proxy is enabled)
 	addCliProxyGHTokenToEnv(filteredEnv, workflowData)
 
-	stepLines = FormatStepWithCommandAndEnv(stepLines, command, filteredEnv)
+	stepLines = FormatStepWithCommandAndEnv(stepLines, wrapAgentExecutionCommand(command), filteredEnv)
 	steps = append(steps, GitHubActionStep(stepLines))
 	return steps
 }
@@ -242,13 +247,13 @@ func (e *ClaudeEngine) buildClaudeCliArgs(workflowData *WorkflowData, toolsWithM
 
 	// Note: we use --allowed-tools (not the simpler --tools from v2.0.31+) because it provides
 	// fine-grained control: Bash(git:*), MCP tool prefixes, path-specific tools, etc.
-	allowedTools = e.computeAllowedClaudeToolsString(toolsWithMountedCLIs, workflowData.SafeOutputs, workflowData.CacheMemoryConfig, workflowData.MCPScripts, workflowData.SandboxConfig)
+	allowedTools = e.computeAllowedClaudeToolsString(toolsWithMountedCLIs, workflowData.SafeOutputs, workflowData.CacheMemoryConfig, workflowData.DriveMemoryConfig, workflowData.MCPScripts, workflowData.SandboxConfig)
 	if allowedTools != "" {
 		claudeArgs = append(claudeArgs, "--allowed-tools", allowedTools)
 	}
 
-	// --debug-file implicitly enables debug mode and captures logs more reliably than 2>&1 | tee.
-	claudeArgs = append(claudeArgs, "--debug-file", logFile, "--verbose")
+	// Keep debug output separate from the stream-json transcript captured by tee.
+	claudeArgs = append(claudeArgs, "--debug-file", claudeDebugLogFile, "--verbose")
 
 	permissionMode := resolveClaudePermissionMode(workflowData)
 	claudeArgs = append(claudeArgs, "--permission-mode", permissionMode)
@@ -262,9 +267,21 @@ func (e *ClaudeEngine) buildClaudeCliArgs(workflowData *WorkflowData, toolsWithM
 		claudeArgs = append(claudeArgs, "--bare")
 	}
 
+	claudeArgs = appendClaudePluginArgs(claudeArgs, workflowData)
+
 	claudeArgs = appendClaudeCustomEngineArgs(claudeArgs, permissionModeValueIndex, workflowData)
 
 	return claudeArgs, mcpConfigArg, allowedTools
+}
+
+// appendClaudePluginArgs adds one --plugin-dir flag per checked-out Agent Plugin so the
+// Claude CLI loads the plugin directory without an interactive marketplace install.
+func appendClaudePluginArgs(claudeArgs []string, workflowData *WorkflowData) []string {
+	for _, pluginPath := range pluginLocalPaths(workflowData) {
+		claudeLog.Printf("Adding plugin directory: %s", pluginPath)
+		claudeArgs = append(claudeArgs, "--plugin-dir", "./"+pluginPath)
+	}
+	return claudeArgs
 }
 
 // resolveClaudePermissionMode returns the --permission-mode value to use, applying any
@@ -399,24 +416,27 @@ func (e *ClaudeEngine) buildClaudeFullCommand(workflowData *WorkflowData, claude
 			WorkflowData:   workflowData,
 			UsesTTY:        true, // Claude Code CLI requires TTY
 			AllowedDomains: allowedDomains,
-			PathSetup:      "touch " + AgentStepSummaryPath, // Runs BEFORE AWF on the host
+			PathSetup:      "mkdir -p " + constants.TmpGhAwAgentDir + " && (umask 177 && touch " + claudeDebugLogFile + ") && touch " + AgentStepSummaryPath, // Runs BEFORE AWF on the host
 			// Exclude every env var whose step-env value is a secret so the agent
 			// cannot read raw token values via bash tools (env / printenv).
-			ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, llmProviderSecretNames(e.ResolveLLMProvider(workflowData))),
+			ExcludeEnvVarNames:   ComputeAWFExcludeEnvVarNames(workflowData, llmProviderSecretNames(e.ResolveLLMProvider(workflowData))),
+			RetryStartupFailures: true,
 		})
 	}
 
 	// Run Claude command without AWF wrapper.
-	// Note: Claude Code CLI writes debug logs to --debug-file and JSON output to stdout.
+	// Note: Claude Code CLI writes debug logs to a separate --debug-file and JSON output to stdout.
 	// Use tee to capture stdout (stream-json output) to the log file while also displaying on console.
-	// The combined output (debug logs + JSON) will be in the log file for parsing.
+	// Leave stderr on the workflow log so non-JSON diagnostics cannot corrupt the parser input.
 	// PATH is already set correctly by actions/setup-* steps which prepend to PATH.
 	return fmt.Sprintf(`set -o pipefail
           printf '%%s' "$(date +%%s%%3N)" > %s
           touch %s
           (umask 177 && touch %s)
+          mkdir -p %s
+          (umask 177 && touch %s)
           # Execute Claude Code CLI with prompt from file
-          %s 2>&1 | tee -a %s`, AgentCLIStartMsPath, AgentStepSummaryPath, logFile, claudeCommand, logFile)
+          %s | tee -a %s`, AgentCLIStartMsPath, AgentStepSummaryPath, logFile, constants.TmpGhAwAgentDir, claudeDebugLogFile, claudeCommand, logFile)
 }
 
 // buildClaudeCommandEnv builds the environment variable map for the Claude execution step.
@@ -451,6 +471,7 @@ func (e *ClaudeEngine) buildClaudeCommandEnv(workflowData *WorkflowData) map[str
 		maps.Copy(env, getGitIdentityEnvVars())
 	}
 	applyClaudeTimeoutEnvVars(env, workflowData)
+	applyDefaultMaxAICreditsEnvToMap(env, workflowData)
 	applySafeOutputEnvToMap(env, workflowData)
 	applyTraceContextEnvToMap(env)
 	applyOptionalEngineToolTimeouts(env, workflowData)

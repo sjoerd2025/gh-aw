@@ -13,6 +13,7 @@ interface SafeOutputConfig {
  */
 interface CreateIssueConfig extends SafeOutputConfig {
   "title-prefix"?: string;
+  "body-footer"?: string;
   "deduplicate-by-title"?: boolean | number;
   labels?: string[];
   "target-repo"?: string;
@@ -73,6 +74,15 @@ interface MarkPullRequestAsReadyForReviewConfig extends SafeOutputConfig {
 }
 
 /**
+ * Configuration for approving pending workflow runs awaiting required approval
+ */
+interface ApproveWorkflowRunConfig extends SafeOutputConfig {
+  fork?: boolean;
+  comment?: boolean;
+  "allowed-workflows": string[];
+}
+
+/**
  * Configuration for adding comments to issues or PRs
  */
 interface AddCommentConfig extends SafeOutputConfig {
@@ -85,6 +95,7 @@ interface AddCommentConfig extends SafeOutputConfig {
  */
 interface CreatePullRequestConfig extends SafeOutputConfig {
   "title-prefix"?: string;
+  "body-footer"?: string;
   labels?: string[];
   reviewers?: string | string[];
   "team-reviewers"?: string | string[];
@@ -152,6 +163,14 @@ interface ResolvePullRequestReviewThreadConfig extends SafeOutputConfig {
  */
 interface CreateCodeScanningAlertConfig extends SafeOutputConfig {
   driver?: string;
+}
+
+/**
+ * Configuration for uploading a code coverage report via actions/upload-code-coverage
+ */
+interface UploadCodeCoverageConfig extends SafeOutputConfig {
+  "fail-on-error"?: boolean;
+  "wait-for-processing-timeout"?: number;
 }
 
 /**
@@ -354,11 +373,13 @@ type SpecificSafeOutputConfig =
   | CloseIssueConfig
   | ClosePullRequestConfig
   | MarkPullRequestAsReadyForReviewConfig
+  | ApproveWorkflowRunConfig
   | AddCommentConfig
   | CreatePullRequestConfig
   | CreatePullRequestReviewCommentConfig
   | SubmitPullRequestReviewConfig
   | CreateCodeScanningAlertConfig
+  | UploadCodeCoverageConfig
   | AutofixCodeScanningAlertConfig
   | AddLabelsConfig
   | AddReviewerConfig
@@ -391,11 +412,13 @@ export {
   CloseIssueConfig,
   ClosePullRequestConfig,
   MarkPullRequestAsReadyForReviewConfig,
+  ApproveWorkflowRunConfig,
   AddCommentConfig,
   CreatePullRequestConfig,
   CreatePullRequestReviewCommentConfig,
   SubmitPullRequestReviewConfig,
   CreateCodeScanningAlertConfig,
+  UploadCodeCoverageConfig,
   AutofixCodeScanningAlertConfig,
   AddLabelsConfig,
   AddReviewerConfig,

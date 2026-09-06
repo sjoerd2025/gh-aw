@@ -14,10 +14,10 @@ permissions:
   actions: read
   discussions: read
 tracker-id: daily-fact-thread
-model: gpt-5.4
+model: openai/gpt-5.4
 engine:
   id: codex
-  bare: true
+  model-provider: openai
 strict: true
 experiments:
   reasoning_depth:
@@ -36,7 +36,7 @@ experiments:
     start_date: "2026-05-11"
     issue: 31324
 timeout-minutes: 15
-runs-on: aw-gpu-runner-T4
+runs-on: ubuntu-latest
 runtimes:
   node:
     version: "22"
@@ -47,11 +47,12 @@ network:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
       - default
       - discussions
@@ -66,6 +67,7 @@ safe-outputs:
 imports:
   - shared/otlp.md
   - shared/mcp/mempalace.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 evals:
@@ -76,11 +78,6 @@ evals:
 {{#runtime-import? .github/shared-instructions.md}}
 
 ### Daily Fact About gh-aw
-
-**Report Formatting**: Use h3 (###) or lower for all headers in your report
-to maintain proper document hierarchy. Wrap long sections in
-`<details><summary>View Full Details</summary>` tags to improve readability.
-
 
 Your task is to post a poetic, whimsical fact about the ${{ github.repository }} project to discussion #4750.
 

@@ -64,6 +64,77 @@ func (c CommandPrefix) IsValid() bool {
 //	func CompileWorkflow(id WorkflowID) error { ... }
 type WorkflowID string
 
+// String returns the string representation of the workflow ID
+func (w WorkflowID) String() string {
+	return string(w)
+}
+
+// IsValid returns true if the workflow ID is non-empty
+func (w WorkflowID) IsValid() bool {
+	return w != ""
+}
+
+// ArtifactName represents the name of a GitHub Actions artifact (as passed to
+// actions/upload-artifact and actions/download-artifact).
+// This semantic type distinguishes artifact names from arbitrary strings,
+// preventing accidental mixing of artifact names with filenames or file paths.
+//
+// Example usage:
+//
+//	const AgentArtifactName ArtifactName = "agent"
+//	func DownloadArtifact(name ArtifactName) error { ... }
+type ArtifactName string
+
+// String returns the string representation of the artifact name
+func (a ArtifactName) String() string {
+	return string(a)
+}
+
+// IsValid returns true if the artifact name is non-empty
+func (a ArtifactName) IsValid() bool {
+	return a != ""
+}
+
+// Filename represents the base name of a file (without a directory path).
+// This semantic type distinguishes filenames from full file paths or artifact
+// names, preventing accidental mixing of the two.
+//
+// Example usage:
+//
+//	const AgentOutputFilename Filename = "agent_output.json"
+//	func WriteFile(name Filename) error { ... }
+type Filename string
+
+// String returns the string representation of the filename
+func (f Filename) String() string {
+	return string(f)
+}
+
+// IsValid returns true if the filename is non-empty
+func (f Filename) IsValid() bool {
+	return f != ""
+}
+
+// FilePath represents a filesystem (or GitHub Actions expression) path to a
+// file or directory. This semantic type distinguishes file paths from bare
+// filenames, preventing accidental mixing of the two.
+//
+// Example usage:
+//
+//	const AWFConfigFilePath FilePath = "/tmp/gh-aw/awf-config.json"
+//	func ReadFile(path FilePath) ([]byte, error) { ... }
+type FilePath string
+
+// String returns the string representation of the file path
+func (p FilePath) String() string {
+	return string(p)
+}
+
+// IsValid returns true if the file path is non-empty
+func (p FilePath) IsValid() bool {
+	return p != ""
+}
+
 // MaxExpressionLineLength is the maximum length for a single line expression before breaking into multiline.
 const MaxExpressionLineLength LineLength = 120
 
@@ -122,31 +193,29 @@ const (
 	// MaxNetworkPort is the maximum valid network port number
 	MaxNetworkPort = 65535
 
-	// ClaudeLLMGatewayPort is the port for the Claude LLM gateway
-	ClaudeLLMGatewayPort = 10000
+	// CodexLLMGatewayPort is the port for the Codex/OpenAI LLM gateway.
+	// AWF's api-proxy sidecar assigns 10000 to the OpenAI-compatible provider.
+	CodexLLMGatewayPort = 10000
 
-	// CodexLLMGatewayPort is the port for the Codex LLM gateway
-	CodexLLMGatewayPort = 10001
+	// ClaudeLLMGatewayPort is the port for the Claude/Anthropic LLM gateway.
+	// AWF's api-proxy sidecar assigns 10001 to the Anthropic-compatible provider.
+	ClaudeLLMGatewayPort = 10001
 
 	// CopilotLLMGatewayPort is the port for the Copilot LLM gateway
 	CopilotLLMGatewayPort = 10002
 
 	// GeminiLLMGatewayPort is the port for the Gemini LLM gateway
 	GeminiLLMGatewayPort = 10003
-
-	// AntigravityLLMGatewayPort is the port for the Antigravity LLM gateway.
-	// Aliased to GeminiLLMGatewayPort because the two share the same port value.
-	AntigravityLLMGatewayPort = GeminiLLMGatewayPort
 )
 
 // AWFNoProxyHosts is the value for the NO_PROXY and no_proxy environment variables
 // in the AWF agent execution environment.  Both plain hostnames and explicit host:port
-// forms are listed because some HTTP client runtimes (e.g. Bun, which backs OpenCode)
+// forms are listed because some HTTP client runtimes (e.g. Bun)
 // compare the full host:port string against the list rather than stripping the port
 // before matching, causing them to route through Squid even when the hostname alone
 // appears in the list.
 // AWFAPIProxyContainerIP is also listed so that requests from custom providers
-// (e.g. OpenCode's awf-proxy provider) routed to the internal api-proxy sidecar
+// (e.g. an awf-proxy provider) routed to the internal api-proxy sidecar
 // bypass Squid instead of being forwarded through it.
 const AWFNoProxyHosts = "localhost,127.0.0.1," +
 	"host.docker.internal," +
@@ -173,14 +242,26 @@ const OTELSentryEndpointSecretName = "GH_AW_OTEL_SENTRY_ENDPOINT"
 
 // AWFDefaultCommand is the default AWF command prefix.
 // Strict security (no sudo) is the default since AWF v0.27.32.
-const AWFDefaultCommand = "awf"
+const AWFDefaultCommand CommandPrefix = "awf"
 
-// AWFLegacySecurityCommand is the AWF command prefix for legacy security mode.
-// Used when legacy-security: enable is set in frontmatter.
-const AWFLegacySecurityCommand = "sudo -E awf"
+// AWFCloudHypervisorCommand runs AWF with the host privileges required to
+// create a Cloud Hypervisor VM while preserving the runner paths it consumes.
+// sudo supplies SUDO_UID and SUDO_GID for AWF to recover the invoking identity.
+const AWFCloudHypervisorCommand = "sudo --preserve-env awf"
+
+// DefaultCloudHypervisorVCPUs and DefaultCloudHypervisorMemoryMiB are the
+// minimum viable guest sizing defaults for the Cloud Hypervisor agent runtime.
+const (
+	DefaultCloudHypervisorVCPUs     = 2
+	DefaultCloudHypervisorMemoryMiB = 4096
+)
+
+// AWFLegacySecurityCommand runs the trusted system AWF binary with the runner's
+// PATH restored after sudo applies secure_path.
+const AWFLegacySecurityCommand = `sudo -E /usr/bin/env PATH="$PATH" /usr/local/bin/awf`
 
 // AWFProxyLogsDir is the default directory for AWF proxy logs
-const AWFProxyLogsDir = "/tmp/gh-aw/sandbox/firewall/logs"
+const AWFProxyLogsDir FilePath = "/tmp/gh-aw/sandbox/firewall/logs"
 
 // AWFProxyLogsDirExpr is the host-side AWF proxy logs path resolved by Actions expression.
 const AWFProxyLogsDirExpr = GhAwRootDir + "/sandbox/firewall/logs"
@@ -191,7 +272,7 @@ const AWFProxyLogsDirShell = GhAwRootDirShell + "/sandbox/firewall/logs"
 // AWFAuditDir is the directory for AWF audit files (policy-manifest.json, squid.conf, docker-compose.redacted.yml).
 // These files are written by AWF when --audit-dir is specified and provide structured policy/configuration data
 // needed by the `awf logs audit` command for enriching log entries with policy rule matching.
-const AWFAuditDir = "/tmp/gh-aw/sandbox/firewall/audit"
+const AWFAuditDir FilePath = "/tmp/gh-aw/sandbox/firewall/audit"
 
 // AWFAuditDirExpr is the host-side AWF audit dir path resolved by Actions expression.
 const AWFAuditDirExpr = GhAwRootDir + "/sandbox/firewall/audit"
@@ -203,7 +284,7 @@ const AWFAuditDirShell = GhAwRootDirShell + "/sandbox/firewall/audit"
 // The audit step runs after all pre-agent preparation (skills, agents, MCP servers) is
 // complete, capturing a file listing of agent-related directories before the AI engine
 // starts. This file is included in the agent artifact for post-run inspection.
-const PreAgentAuditFilePath = "/tmp/gh-aw/pre-agent-audit.txt"
+const PreAgentAuditFilePath FilePath = "/tmp/gh-aw/pre-agent-audit.txt"
 
 // AWFConfigFilePath is the path inside the /tmp/gh-aw tree where the AWF config file
 // is copied so it can be included in the unified agent artifact.
@@ -211,7 +292,7 @@ const PreAgentAuditFilePath = "/tmp/gh-aw/pre-agent-audit.txt"
 // but that path is outside the /tmp/gh-aw/ root used by all other artifact paths.
 // A copy at this path is created before artifact upload so the config is available
 // for post-run analysis without mixing path roots in the artifact.
-const AWFConfigFilePath = "/tmp/gh-aw/awf-config.json"
+const AWFConfigFilePath FilePath = "/tmp/gh-aw/awf-config.json"
 
 // AWFConfigFilePathExpr is the host-side AWF config path resolved by Actions expression.
 const AWFConfigFilePathExpr = GhAwRootDir + "/awf-config.json"
@@ -220,7 +301,7 @@ const AWFConfigFilePathExpr = GhAwRootDir + "/awf-config.json"
 // by the agent harness before exiting. It is co-located with other firewall observability
 // data under /tmp/gh-aw/sandbox/firewall/ so the existing chmod and artifact-upload steps
 // pick it up automatically.
-const AWFReflectFilePath = "/tmp/gh-aw/sandbox/firewall/awf-reflect.json"
+const AWFReflectFilePath FilePath = "/tmp/gh-aw/sandbox/firewall/awf-reflect.json"
 
 // AWFReflectFilePathExpr is the host-side AWF /reflect output path resolved by Actions expression.
 const AWFReflectFilePathExpr = GhAwRootDir + "/sandbox/firewall/awf-reflect.json"
@@ -291,9 +372,12 @@ const GhAwRootDirShell = "${RUNNER_TEMP}/gh-aw"
 // Uses the shell env var form since mounts are resolved in a shell context.
 const DefaultGhAwMount = GhAwRootDirShell + ":" + GhAwRootDirShell + ":ro"
 
+// GhCLIPath is the path to the gh CLI binary in the GitHub Actions runner.
+const GhCLIPath = "/usr/bin/gh"
+
 // DefaultGhBinaryMount is the mount path for the gh CLI binary in containerized MCP servers
 // The gh CLI is required for agentic-workflows MCP server to run gh commands
-const DefaultGhBinaryMount = "/usr/bin/gh:/usr/bin/gh:ro"
+const DefaultGhBinaryMount = GhCLIPath + ":" + GhCLIPath + ":ro"
 
 // DefaultTmpGhAwMount is the mount path for temporary gh-aw files in containerized MCP servers
 // Used for logs, cache, and other runtime data that needs read-write access
@@ -310,8 +394,18 @@ const DefaultSafeOutputsMount = GhAwRootDirShell + "/safeoutputs:" + GhAwRootDir
 
 // Timeout constants using time.Duration for type safety and clear units
 
-// DefaultAgenticWorkflowTimeout is the default timeout for agentic workflow execution
+// DefaultAgenticWorkflowTimeout is the default timeout for the agentic execution step.
 const DefaultAgenticWorkflowTimeout = 20 * time.Minute
+
+// DefaultAgentJobTimeout is the default timeout for the generated agent job.
+// It bounds the whole job (setup, execution and teardown steps) and is
+// independent from DefaultAgenticWorkflowTimeout, which only bounds the
+// agentic execution step.
+const DefaultAgentJobTimeout = time.Hour
+
+// DefaultDetectionJobTimeout is the default timeout for the generated threat
+// detection job and its agentic execution step.
+const DefaultDetectionJobTimeout = 10 * time.Minute
 
 // DefaultToolTimeout is the default timeout for tool/MCP server operations
 const DefaultToolTimeout = 60 * time.Second
@@ -384,19 +478,25 @@ var IgnoredFrontmatterFields = []string{}
 //
 // Forbidden fields fall into these categories:
 //   - Workflow triggers: on (defines it as a main workflow)
-//   - Workflow execution: run-name, runs-on, concurrency, if, timeout-minutes
+//   - Workflow execution: run-name, runs-on, if, timeout-minutes
 //   - Workflow metadata: name, tracker-id, strict
-//   - Workflow features: container, environment, features
+//   - Workflow features: container, environment
 //   - Access control: github-token
+//
+// The concurrency field is partially import-safe: shared workflows may contribute
+// import-safe concurrency.group values and concurrency.job-discriminator values,
+// but unsupported concurrency keys (for example cancel-in-progress) are rejected.
+//
+// The features field is partially import-safe: shared workflows may contribute
+// the import-safe features.samples and features.intentional-failure flags, but
+// other feature keys are rejected.
 //
 // All other fields defined in main_workflow_schema.json can be used in shared workflows
 // and will be properly imported and merged when the shared workflow is imported.
 var SharedWorkflowForbiddenFields = []string{
 	"on",              // Trigger field - only for main workflows
-	"concurrency",     // Concurrency control
 	"container",       // Container configuration
 	"environment",     // Deployment environment
-	"features",        // Feature flags
 	"github-token",    // GitHub token configuration
 	"if",              // Conditional execution
 	"name",            // Workflow name
@@ -431,8 +531,13 @@ const AgentsDir = ".github/agents/"
 const WorkflowsLockYmlGlob = WorkflowsDirSlash + "*.lock.yml"
 
 // WorkflowsLockYmlGitAttributesEntry is the .gitattributes entry that marks lock YAML
-// files as generated and sets the merge strategy.
-const WorkflowsLockYmlGitAttributesEntry = WorkflowsLockYmlGlob + " linguist-generated=true merge=ours"
+// files as generated.
+const WorkflowsLockYmlGitAttributesEntry = WorkflowsLockYmlGlob + " linguist-generated=true"
+
+// WorkflowsLockYmlGitAttributesEntryLegacy is the previous .gitattributes entry format that
+// included an ineffective "merge=ours" attribute. It is only used to detect and clean up
+// entries that gh-aw itself previously wrote, so we do not overwrite repository-owned policy.
+const WorkflowsLockYmlGitAttributesEntryLegacy = WorkflowsLockYmlGlob + " linguist-generated=true merge=ours"
 
 // Temporary runtime directory constants (/tmp/gh-aw tree)
 //
@@ -467,6 +572,9 @@ const AgentStdioLogPath = TmpGhAwDir + "/agent-stdio.log"
 // Engine harnesses read this file to pass the compiled prompt to the AI engine.
 const AwPromptsFile = TmpGhAwDir + "/aw-prompts/prompt.txt"
 
+// AwPromptsFileExpr is the host-side prompt path in GitHub Actions expression form.
+const AwPromptsFileExpr = GhAwRootDir + "/aw-prompts/prompt.txt"
+
 // AwPromptsFileShell is the runtime prompt file path in shell env-var form for host-side paths.
 const AwPromptsFileShell = GhAwRootDirShell + "/aw-prompts/prompt.txt"
 
@@ -486,9 +594,6 @@ const TmpMcpLogsDir = TmpGhAwDir + "/mcp-logs/"
 
 // TmpMcpLogsSafeOutputsDir is the safe-outputs MCP server log directory.
 const TmpMcpLogsSafeOutputsDir = TmpGhAwDir + "/mcp-logs/safeoutputs"
-
-// TmpMcpLogsPlaywrightDir is the Playwright MCP server log directory.
-const TmpMcpLogsPlaywrightDir = TmpGhAwDir + "/mcp-logs/playwright"
 
 // TmpMcpLogsMount is the Docker volume mount spec for the MCP logs directory.
 const TmpMcpLogsMount = TmpGhAwDir + "/mcp-logs:" + TmpGhAwDir + "/mcp-logs"
@@ -511,9 +616,6 @@ const TmpAwPatchGlob = TmpGhAwDir + "/aw-*.patch"
 // TmpGeminiClientErrorGlob is the glob for Gemini client error JSON diagnostic files.
 const TmpGeminiClientErrorGlob = TmpGhAwDir + "/gemini-client-error-*.json"
 
-// TmpAntigravityClientErrorGlob is the glob for Antigravity client error JSON diagnostic files.
-const TmpAntigravityClientErrorGlob = TmpGhAwDir + "/antigravity-client-error-*.json"
-
 // TmpPiAgentDir is the Pi engine agent working directory.
 const TmpPiAgentDir = TmpGhAwDir + "/pi-agent-dir"
 
@@ -524,9 +626,17 @@ const ThreatDetectionLogPath = TmpGhAwDir + "/threat-detection/detection.log"
 const ThreatDetectionDir = TmpGhAwDir + "/threat-detection"
 
 // ThreatDetectionResultPath is the structured verdict output file written by the
-// external threat-detect binary (features: gh-aw-detection: true). The binary writes
+// external threat-detect binary (enabled by default; set features.gh-aw-detection to false
+// to use the inline path). The binary writes
 // a four-field JSON verdict to this path via --output; threat-detect conclude reads it.
 const ThreatDetectionResultPath = TmpGhAwDir + "/threat-detection/detection_result.json"
+
+// ThreatDetectionStepSummaryPath is the path used as the step-summary target inside the
+// AWF sandbox for the external threat-detect binary. The sandbox cannot write to the
+// runner's real GITHUB_STEP_SUMMARY path (the _runner_file_commands directory is not
+// mounted), so threat-detect is invoked with --step-summary pointing here instead.
+// A post-execution host step then appends this file to the real $GITHUB_STEP_SUMMARY.
+const ThreatDetectionStepSummaryPath = TmpGhAwDir + "/step-summary.md"
 
 // TmpProxyLogsDir is the DIFC proxy logs directory (with trailing slash).
 const TmpProxyLogsDir = TmpGhAwDir + "/proxy-logs/"

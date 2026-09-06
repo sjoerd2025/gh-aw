@@ -33,10 +33,13 @@ description: Complete reference for gh aw CLI commands and their MCP tool equiva
 Initialize a repository for agentic workflows.
 
 ```bash
-gh aw init
+gh aw init                              # Initialize with defaults (non-interactive)
+gh aw init --engine claude              # Skip Copilot-specific artifacts
+gh aw init --no-mcp                     # Skip MCP server integration (Copilot engine)
+gh aw init --no-agent                   # Skip custom agent creation (Copilot engine)
 ```
 
-Creates `.github/skills/agentic-workflows/SKILL.md` and supporting files.
+Creates `.github/skills/agentic-workflows/SKILL.md`. With the Copilot engine (default), also creates the custom agent (`.github/agents/agentic-workflows.md`) and enables MCP server integration — use `--no-mcp`/`--no-agent` to skip either. Non-Copilot engines skip both Copilot-specific artifacts automatically.
 
 **MCP equivalent**: Not available — run from a local terminal or use the `upgrade` tool for updates.
 
@@ -253,7 +256,7 @@ default_model_copilot: "gpt-5-mini"
 default_model_codex: null   # delete this variable
 ```
 
-Recognized keys include `default_max_ai_credits`, `default_max_turn_cache_misses`, `default_detection_max_ai_credits`, `default_max_daily_ai_credits`, `default_timeout_minutes`, `default_max_turns`, `default_detection_model`, `default_utc`, `default_model_copilot`, `default_model_claude`, `default_model_codex`. The compiler resolves model selection as `GH_AW_MODEL_*` → `GH_AW_DEFAULT_MODEL_*` → built-in engine fallback.
+Recognized keys include `default_max_ai_credits`, `default_max_turn_cache_misses`, `default_detection_max_ai_credits`, `default_max_daily_ai_credits`, `default_timeout_minutes`, `default_agent_job_timeout_minutes`, `default_detection_job_timeout_minutes`, `default_max_turns`, `default_detection_model`, `default_utc`, `default_model_copilot`, `default_model_claude`, `default_model_codex`. The compiler resolves model selection as `GH_AW_MODEL_*` → `GH_AW_DEFAULT_MODEL_*` → built-in engine fallback.
 
 **MCP equivalent**: Not available — run from a local terminal.
 

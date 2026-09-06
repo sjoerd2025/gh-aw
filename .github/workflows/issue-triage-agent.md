@@ -1,6 +1,10 @@
 ---
 emoji: "🔧"
 timeout-minutes: 5
+engine:
+  id: codex
+  model-provider: github
+model: copilot/gpt-5.3-codex
 strict: true
 on:
   schedule: "daily around 14:00 on weekdays"  # ~2 PM UTC, weekdays only
@@ -8,10 +12,8 @@ on:
 permissions:
   issues: read
 
-sandbox:
-  agent:
-    sudo: false
 
+  copilot-requests: write
 tools:
   cli-proxy: true
   github:
@@ -36,6 +38,9 @@ evals:
     question: Did the agent apply at least one label to an unlabeled issue, or correctly skip when no unlabeled issues were found?
   - id: allowed_labels_only
     question: Does the agent output show that only labels from the allowed set were applied to issues?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Issue Triage Agent

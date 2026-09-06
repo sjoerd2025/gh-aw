@@ -31,6 +31,10 @@ func writeStepsSection(yaml *strings.Builder, stepsYAML string) {
 	if stepsYAML == "" {
 		return
 	}
+	// Inject zizmor ignore annotations before uses: lines from unverified creators.
+	// YAML comments are stripped during parse/marshal, so they must be re-injected here
+	// before the indentation-normalization pass below rewrites each line.
+	stepsYAML = injectZizmorUnverifiedCreatorAnnotations(stepsYAML)
 	lines := strings.Split(stepsYAML, "\n")
 	var blockScalarState yamlBlockScalarState
 	for _, line := range lines[1:] { // skip the "pre-steps:" / "pre-agent-steps:" / "post-steps:" header line
@@ -75,8 +79,6 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 			modelEnvVar = constants.EnvVarModelAgentClaude
 		case "codex":
 			modelEnvVar = constants.EnvVarModelAgentCodex
-		case "opencode":
-			modelEnvVar = constants.EnvVarModelAgentOpenCode
 		case "custom":
 			modelEnvVar = constants.EnvVarModelAgentCustom
 		default:
@@ -85,7 +87,7 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	}
 
 	// Agent version - use the actual installation version (includes defaults)
-	agentVersion := getInstallationVersion(data, engine)
+	agentVersion := getInstallationVersion(data, engine, c.engineRegistry)
 
 	// Version: prefer explicit engine config version, fall back to the installation version
 	// so the run details always show the version being used rather than "(none)".
@@ -134,7 +136,14 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 		firewallType = "squid"
 	}
 
-	compilerYamlStepLifecycleLog.Printf("Generating aw_info step: engine=%s, modelConfigured=%t, version=%s, firewallEnabled=%t, staged=%s", engineID, modelConfigured, version, firewallEnabled, stagedValue)
+	// Sandbox agent runtime (e.g., "gvisor", "docker-sbx", "cloud-hypervisor"), stored in aw_info.json
+	// for observability and used by the logs/audit --runtime filter.
+	agentRuntime := ""
+	if data.SandboxConfig != nil && data.SandboxConfig.Agent != nil {
+		agentRuntime = string(data.SandboxConfig.Agent.Runtime)
+	}
+
+	compilerYamlStepLifecycleLog.Printf("Generating aw_info step: engine=%s, modelConfigured=%t, version=%s, firewallEnabled=%t, staged=%s, agentRuntime=%s", engineID, modelConfigured, version, firewallEnabled, stagedValue, agentRuntime)
 
 	yaml.WriteString("      - name: Generate agentic run info\n")
 	yaml.WriteString("        id: generate_aw_info\n")
@@ -173,6 +182,14 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 	fmt.Fprintf(yaml, "          GH_AW_INFO_AWF_VERSION: \"%s\"\n", firewallVersion)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_AWMG_VERSION: \"%s\"\n", mcpGatewayVersion)
 	fmt.Fprintf(yaml, "          GH_AW_INFO_FIREWALL_TYPE: \"%s\"\n", firewallType)
+	fmt.Fprintf(yaml, "          GH_AW_INFO_AGENT_RUNTIME: \"%s\"\n", agentRuntime)
+	if operationalValueGraderEnabled(data) {
+		yaml.WriteString("          GH_AW_INFO_FETCH_RUN_CREATED_AT: \"true\"\n")
+	}
+	// Only emit the cache-memory flag when at least one cache is configured.
+	if data.CacheMemoryConfig != nil && len(data.CacheMemoryConfig.Caches) > 0 {
+		yaml.WriteString("          GH_AW_INFO_CACHE_MEMORY: \"true\"\n")
+	}
 	if data.Source != "" {
 		fmt.Fprintf(yaml, "          GH_AW_INFO_FRONTMATTER_SOURCE: %q\n", data.Source)
 		// Body-modified defaults to false at compile time; update flows may override this
@@ -214,8 +231,8 @@ func (c *Compiler) generateCreateAwInfo(yaml *strings.Builder, data *WorkflowDat
 			fmt.Fprintf(yaml, "          GH_AW_INFO_MODEL_COSTS: '%s'\n", escapedModelCostsJSON)
 		}
 	}
-	if len(data.Features) > 0 {
-		if featuresJSON, err := json.Marshal(data.Features); err == nil {
+	if runtimeFeatures := runtimeVisibleFeatures(data.Features); len(runtimeFeatures) > 0 {
+		if featuresJSON, err := json.Marshal(runtimeFeatures); err == nil {
 			// Escape single quotes for YAML single-quoted scalar safety
 			escapedFeaturesJSON := strings.ReplaceAll(string(featuresJSON), "'", "''")
 			fmt.Fprintf(yaml, "          GH_AW_INFO_FEATURES: '%s'\n", escapedFeaturesJSON)

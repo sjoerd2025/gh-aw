@@ -40,6 +40,7 @@ func renderCrossRunReportMarkdownToWriter(w io.Writer, report *CrossRunAuditRepo
 	renderMarkdownErrorTrendToWriter(w, report)
 	renderMarkdownDomainInventoryToWriter(w, report)
 	renderMarkdownDrain3InsightsToWriter(w, report.Drain3Insights)
+	renderMarkdownClusterAnalysisToWriter(w, report.ClusterAnalysis)
 	renderMarkdownPerRunBreakdownToWriter(w, report.PerRunBreakdown)
 }
 
@@ -103,7 +104,7 @@ func renderMarkdownMCPHealthToWriter(w io.Writer, report *CrossRunAuditReport) {
 		}
 		fmt.Fprintf(w, "| `%s` | %d/%d | %.1f%% | %d | %d | %s |\n",
 			h.ServerName, h.RunsConnected, h.TotalRuns,
-			h.ErrorRate*100, h.TotalCalls, h.TotalErrors, status)
+			h.ErrorRate*100, h.ToolCallCount, h.ErrorCount, status)
 	}
 	fmt.Fprintln(w)
 }
@@ -219,6 +220,7 @@ func renderCrossRunReportPretty(report *CrossRunAuditReport) {
 	renderPrettyErrorTrend(report)
 	renderPrettyDomainInventory(report)
 	renderPrettyDrain3Insights(report.Drain3Insights)
+	renderPrettyClusterAnalysis(report.ClusterAnalysis)
 	renderPrettyPerRunBreakdown(report.PerRunBreakdown)
 	renderPrettyFinalStatus(report)
 }
@@ -289,7 +291,7 @@ func renderPrettyMCPHealth(report *CrossRunAuditReport) {
 		}
 		fmt.Fprintf(os.Stderr, "  %s %-30s  connected=%d/%d  calls=%d  errors=%d  error_rate=%.1f%%\n",
 			statusIcon, h.ServerName, h.RunsConnected, h.TotalRuns,
-			h.TotalCalls, h.TotalErrors, h.ErrorRate*100)
+			h.ToolCallCount, h.ErrorCount, h.ErrorRate*100)
 	}
 	fmt.Fprintln(os.Stderr)
 }

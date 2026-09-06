@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test workflow that validates Gemini engine functionality twice daily
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-gemini
     strategy: centralized
@@ -37,10 +38,11 @@ engine:
   id: gemini
 strict: true
 imports:
-  - shared/gh.md
   - shared/reporting-otlp.md
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/smoke-test-brevity.md
+  - shared/playwright-title-test.md
 network:
   allowed:
     - defaults
@@ -75,14 +77,13 @@ evals:
   - id: sub_agent_strategy_goal_met
     question: Does the agent output show that the objective for experiment sub_agent_strategy was successfully completed?
 
+sandbox:
+  agent:
+    id: awf
+    runtime: cloud-hypervisor
 ---
 
 # Smoke Test: Gemini Engine Validation
-
-**CRITICAL EFFICIENCY REQUIREMENTS:**
-- Keep ALL outputs extremely short and concise. Use single-line responses.
-- NO verbose explanations or unnecessary context.
-- Minimize file reading - only read what is absolutely necessary for the task.
 
 {{#if experiments.sub_agent_strategy == 'single_agent'}}
 ## Test Requirements (Single Agent — Baseline)

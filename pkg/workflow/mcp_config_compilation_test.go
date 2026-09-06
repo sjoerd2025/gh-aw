@@ -66,7 +66,7 @@ This workflow tests that MCP server env vars are sorted alphabetically.
 
 	// Find the test-server env section in the generated YAML
 	// Look for "test-server" first, then find the env section after it
-	testServerIndex := strings.Index(yamlContent, `"test-server"`)
+	testServerIndex := strings.LastIndex(yamlContent, `"test-server"`)
 	if testServerIndex == -1 {
 		t.Fatalf("Could not find test-server section in generated YAML")
 	}
@@ -333,7 +333,6 @@ Test workflow.
 			tmpFile.Close()
 
 			compiler := NewCompiler()
-			compiler.SetSkipValidation(true)
 
 			workflowData, err := compiler.ParseWorkflowFile(tmpFile.Name())
 			if err != nil {
@@ -346,7 +345,7 @@ Test workflow.
 			}
 
 			// Find the server-specific block in the YAML
-			serverIndex := strings.Index(yamlContent, tt.serverName)
+			serverIndex := strings.LastIndex(yamlContent, tt.serverName)
 			if serverIndex == -1 {
 				t.Fatalf("Could not find server %s in generated YAML", tt.serverName)
 			}
@@ -597,7 +596,7 @@ mcp-servers:
 				t.Fatalf("Failed to generate YAML: %v", err)
 			}
 
-			serverIdx := strings.Index(yamlContent, `"my-server"`)
+			serverIdx := strings.LastIndex(yamlContent, `"my-server"`)
 			if serverIdx == -1 {
 				t.Fatal("Could not find my-server block in generated YAML")
 			}
@@ -682,7 +681,7 @@ Do nothing.
 	}
 
 	// Locate the my-server block.
-	serverIdx := strings.Index(yamlContent, `"my-server"`)
+	serverIdx := strings.LastIndex(yamlContent, `"my-server"`)
 	if serverIdx == -1 {
 		t.Fatal("Could not find my-server block in generated YAML")
 	}
@@ -758,7 +757,7 @@ Do nothing.
 		t.Fatalf("Failed to generate YAML: %v", err)
 	}
 
-	serverIdx := strings.Index(yamlContent, `"datadog"`)
+	serverIdx := strings.LastIndex(yamlContent, `"datadog"`)
 	if serverIdx == -1 {
 		t.Fatal("Could not find datadog block in generated YAML")
 	}
@@ -919,7 +918,7 @@ Do nothing.
 				t.Fatalf("Failed to generate YAML: %v", err)
 			}
 
-			serverIdx := strings.Index(yamlContent, tt.serverName)
+			serverIdx := strings.LastIndex(yamlContent, tt.serverName)
 			if serverIdx == -1 {
 				t.Fatalf("Could not find server %s in generated YAML", tt.serverName)
 			}
@@ -936,5 +935,76 @@ Do nothing.
 				}
 			}
 		})
+	}
+}
+
+// TestMCPServerRequiredFalseCompilation verifies that a server marked with
+// required: false is accepted by validation and rendered into the gateway
+// configuration so its startup failure can be degraded to a warning.
+func TestMCPServerRequiredFalseCompilation(t *testing.T) {
+	workflowContent := `---
+on:
+  workflow_dispatch:
+strict: false
+permissions:
+  contents: read
+engine: copilot
+mcp-servers:
+  optional-http:
+    type: http
+    url: "https://example.com/mcp"
+    required: false
+  critical-http:
+    type: http
+    url: "https://example.com/other-mcp"
+---
+
+# Test MCP Required Flag
+
+This workflow tests that non-critical MCP servers are marked as such.
+`
+
+	tmpFile, err := os.CreateTemp("", "test-mcp-required-*.md")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(workflowContent); err != nil {
+		t.Fatalf("Failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	compiler := NewCompiler()
+	compiler.SetSkipValidation(true)
+
+	workflowData, err := compiler.ParseWorkflowFile(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("Failed to parse workflow file: %v", err)
+	}
+
+	yamlContent, _, _, err := compiler.generateYAML(workflowData, tmpFile.Name())
+	if err != nil {
+		t.Fatalf("Failed to generate YAML: %v", err)
+	}
+
+	optionalIndex := strings.Index(yamlContent, `"optional-http"`)
+	if optionalIndex == -1 {
+		t.Fatalf("Could not find optional-http server in generated YAML")
+	}
+	if !strings.Contains(yamlContent, `"critical-http"`) {
+		t.Fatalf("Could not find critical-http server in generated YAML")
+	}
+
+	// The required flag must be emitted only for the non-critical server.
+	requiredIndex := strings.Index(yamlContent, `"required": false`)
+	if requiredIndex == -1 {
+		t.Fatalf("Expected \"required\": false to be rendered for optional-http")
+	}
+	if strings.Count(yamlContent, `"required": false`) != 1 {
+		t.Errorf("Expected exactly one \"required\": false entry, got %d", strings.Count(yamlContent, `"required": false`))
+	}
+	if requiredIndex < optionalIndex {
+		t.Errorf("Expected \"required\": false to be rendered inside the optional-http server block")
 	}
 }

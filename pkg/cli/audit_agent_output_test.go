@@ -3,18 +3,20 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/github/gh-aw/pkg/scanfindings"
 	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func hasFindingByCategory(findings []Finding, category string) bool {
+func hasFindingByCategory(findings []AuditFinding, category string) bool {
 	for _, finding := range findings {
 		if finding.Category == category {
 			return true
@@ -26,11 +28,12 @@ func hasFindingByCategory(findings []Finding, category string) bool {
 
 // TestKeyFindingsGeneration verifies key findings are generated correctly
 func TestKeyFindingsGeneration(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		run           WorkflowRun
 		metrics       MetricsData
-		errors        []ErrorInfo
+		errors        []ValidationIssue
 		mcpFailures   []MCPFailureReport
 		missingTools  []MissingToolReport
 		expectedCount int
@@ -49,7 +52,7 @@ func TestKeyFindingsGeneration(t *testing.T) {
 				ErrorCount: 3,
 				TokenUsage: 1000,
 			},
-			errors: []ErrorInfo{
+			errors: []ValidationIssue{
 				{Type: "error", Message: "Test error 1"},
 				{Type: "error", Message: "Test error 2"},
 				{Type: "error", Message: "Test error 3"},
@@ -101,6 +104,7 @@ func TestKeyFindingsGeneration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			processedRun := ProcessedRun{
 				Run:          tt.run,
 				MCPFailures:  tt.mcpFailures,
@@ -114,7 +118,7 @@ func TestKeyFindingsGeneration(t *testing.T) {
 
 			// Verify expected categories
 			if tt.hasFailure {
-				var failureFinding *Finding
+				var failureFinding *AuditFinding
 				for _, finding := range findings {
 					if finding.Category == "error" && strings.Contains(finding.Title, "Failed") {
 						failureFinding = &finding
@@ -123,7 +127,7 @@ func TestKeyFindingsGeneration(t *testing.T) {
 				}
 				require.NotNil(t, failureFinding,
 					"Expected an error finding with 'Failed' in title for scenario %q", tt.name)
-				assert.Equal(t, "critical", failureFinding.Severity,
+				assert.Equal(t, scanfindings.SeverityCritical, failureFinding.Severity,
 					"Expected critical severity for failure finding in scenario %q", tt.name)
 			}
 
@@ -137,11 +141,12 @@ func TestKeyFindingsGeneration(t *testing.T) {
 
 // TestRecommendationsGeneration verifies recommendations are generated correctly
 func TestRecommendationsGeneration(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		run              WorkflowRun
 		metrics          MetricsData
-		findings         []Finding
+		findings         []AuditFinding
 		mcpFailures      []MCPFailureReport
 		missingTools     []MissingToolReport
 		expectedMinCount int
@@ -152,7 +157,7 @@ func TestRecommendationsGeneration(t *testing.T) {
 			run: WorkflowRun{
 				Conclusion: "failure",
 			},
-			findings: []Finding{
+			findings: []AuditFinding{
 				{Severity: "critical", Category: "error"},
 			},
 			expectedMinCount: 1,
@@ -166,7 +171,7 @@ func TestRecommendationsGeneration(t *testing.T) {
 			metrics: MetricsData{
 				Turns: 15,
 			},
-			findings: []Finding{
+			findings: []AuditFinding{
 				{Severity: "high", Category: "cost", Title: "High Cost"},
 				{Severity: "medium", Category: "performance", Title: "Many Iterations"},
 			},
@@ -197,6 +202,7 @@ func TestRecommendationsGeneration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			processedRun := ProcessedRun{
 				Run:          tt.run,
 				MCPFailures:  tt.mcpFailures,
@@ -235,6 +241,7 @@ func TestRecommendationsGeneration(t *testing.T) {
 
 // TestPerformanceMetricsGeneration verifies performance metrics are calculated correctly
 func TestPerformanceMetricsGeneration(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name                  string
 		run                   WorkflowRun
@@ -290,6 +297,7 @@ func TestPerformanceMetricsGeneration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			processedRun := ProcessedRun{
 				Run:              tt.run,
 				FirewallAnalysis: tt.firewallAnalysis,
@@ -319,6 +327,7 @@ func TestPerformanceMetricsGeneration(t *testing.T) {
 
 // TestAuditDataJSONStructure verifies the JSON structure includes all new fields
 func TestAuditDataJSONStructure(t *testing.T) {
+	t.Parallel()
 	// Create comprehensive audit data
 	run := WorkflowRun{
 		DatabaseID:   123456,
@@ -358,7 +367,7 @@ func TestAuditDataJSONStructure(t *testing.T) {
 	}
 
 	// Build audit data
-	auditData := buildAuditData(processedRun, metrics, nil)
+	auditData := buildAuditData(context.Background(), processedRun, metrics, nil)
 
 	// Marshal to JSON
 	jsonBytes, err := json.MarshalIndent(auditData, "", "  ")

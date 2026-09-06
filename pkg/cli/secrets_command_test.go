@@ -12,6 +12,7 @@ import (
 )
 
 func TestNewSecretsCommand(t *testing.T) {
+	t.Parallel()
 	cmd := NewSecretsCommand()
 
 	require.NotNil(t, cmd, "NewSecretsCommand should not return nil")
@@ -41,6 +42,7 @@ func TestNewSecretsCommand(t *testing.T) {
 }
 
 func TestSecretsCommandHelp(t *testing.T) {
+	t.Parallel()
 	cmd := NewSecretsCommand()
 
 	// Verify RunE returns help when command is run without subcommand
@@ -49,6 +51,7 @@ func TestSecretsCommandHelp(t *testing.T) {
 }
 
 func TestSecretsCommandStructure(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		expectedUse    string
@@ -72,6 +75,7 @@ func TestSecretsCommandStructure(t *testing.T) {
 }
 
 func TestSecretsBootstrapEngineFlagUsage(t *testing.T) {
+	t.Parallel()
 	cmd := NewSecretsCommand()
 
 	var bootstrapCmd *cobra.Command
@@ -88,13 +92,14 @@ func TestSecretsBootstrapEngineFlagUsage(t *testing.T) {
 	require.NotNil(t, engineFlag, "--engine flag should exist on bootstrap")
 
 	// Assert the full shared engine list is present so future additions are detected.
-	expectedEngines := []string{"copilot", "claude", "codex", "gemini", "antigravity", "opencode", "pi"}
+	expectedEngines := []string{"copilot", "claude", "codex", "gemini", "pi"}
 	for _, engine := range expectedEngines {
 		assert.Contains(t, engineFlag.Usage, engine, "--engine help should include %s engine", engine)
 	}
 }
 
 func TestSecretsCommandUnknownSubcommandReturnsError(t *testing.T) {
+	t.Parallel()
 	cmd := NewSecretsCommand()
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)

@@ -21,25 +21,27 @@ concurrency:
   cancel-in-progress: false
 max-turns: 100
 engine:
-  id: claude
+  id: codex
+  model-provider: openai
 imports:
   - ../skills/jqschema/SKILL.md
   - shared/mcp/serena-go.md
   - shared/reporting.md
   - shared/otlp.md
+  - shared/graders.md
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   agentic-workflows:
   edit:
   playwright:
-    mode: cli
   bash: true
   cache-memory:
     key: cloclo-memory-${{ github.workflow }}
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[cloclo] "
@@ -62,6 +64,8 @@ evals:
     question: Did the agent create a pull request or post a comment?
   - id: summary-comment-added
     question: Does the agent output confirm that a summary comment was added to the original conversation thread?
+
+model: openai/gpt-5.4
 ---
 
 # /cloclo

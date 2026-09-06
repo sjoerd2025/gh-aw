@@ -29,7 +29,7 @@ A workflow file may optionally include one or more inline sub-agent definitions 
 
 ## File Organization
 
-Agentic workflows live in `.github/workflows` as Markdown files (`*.md`) and compile to GitHub Actions workflow files (`*.lock.yml`).
+Agentic workflows live in `.github/workflows` as Markdown files (`*.md`) and compile to GitHub Actions workflow files (`*.lock.yml`). Run `gh aw compile` to generate the lock file.
 
 ```text
 .github/
@@ -37,8 +37,6 @@ Agentic workflows live in `.github/workflows` as Markdown files (`*.md`) and com
   ├── ci-doctor.md # Agentic Workflow
   └── ci-doctor.lock.yml # Compiled GitHub Actions Workflow
 ```
-
-Run `gh aw compile` to generate the lock file.
 
 ```sh wrap
 gh aw compile
@@ -68,17 +66,12 @@ The `gh-aw-metadata` line is always first, enabling reliable machine parsing. Th
 
 The **markdown body** is loaded at runtime and can be edited directly on GitHub.com without recompilation. Only **frontmatter changes** require recompilation.
 
-See [Editing Workflows](/gh-aw/guides/editing-workflows/) for complete guidance on when and how to recompile workflows.
+See [Editing Workflows](/gh-aw/guides/working-with-workflows/#editing-workflows) for complete guidance on when and how to recompile workflows.
 
 ## Best Practices
 
 Use descriptive kebab-case names such as `issue-responder.md` or `weekly-summary.md`, avoid spaces and special characters, and commit both the source `.md` files and generated `.lock.yml` files.
 
-## Related Documentation
+## Learn More
 
-- [Editing Workflows](/gh-aw/guides/editing-workflows/) — When to recompile versus edit directly
-- [Frontmatter](/gh-aw/reference/frontmatter/) — Workflow configuration options
-- [Markdown](/gh-aw/reference/markdown/) — Writing the markdown body
-- [Imports](/gh-aw/reference/imports/) — Reusing shared workflow content
-- [CLI Commands](/gh-aw/setup/cli/) — Workflow management commands
-- [MCPs](/gh-aw/guides/mcps/) — Model Context Protocol configuration
+See also [Editing Workflows](/gh-aw/guides/working-with-workflows/#editing-workflows) for recompilation guidance, [Frontmatter](/gh-aw/reference/frontmatter/) for configuration, [Markdown](/gh-aw/reference/markdown/) for the body format, [Imports](/gh-aw/reference/imports/) for shared content, [CLI Commands](/gh-aw/setup/cli/) for workflow management, and [MCPs](/gh-aw/guides/mcps/) for Model Context Protocol configuration.

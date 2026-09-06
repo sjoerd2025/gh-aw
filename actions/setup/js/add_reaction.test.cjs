@@ -107,6 +107,15 @@ describe("add_reaction", () => {
       expect(mockGithub.request).not.toHaveBeenCalled();
     });
 
+    it("should reject inherited property names as invalid reaction types", async () => {
+      process.env.GH_AW_REACTION = "constructor";
+
+      await runScript();
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Invalid reaction type"));
+      expect(mockGithub.request).not.toHaveBeenCalled();
+    });
+
     it("should accept all valid reaction types", async () => {
       const validReactions = ["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"];
 
@@ -324,7 +333,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalled();
       expect(mockCore.setFailed).toHaveBeenCalled();
     });
 
@@ -339,7 +347,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalled();
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("not found"));
     });
 
@@ -487,7 +494,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
     });
 
@@ -502,7 +508,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalled();
       expect(mockCore.setFailed).toHaveBeenCalled();
     });
 
@@ -526,7 +531,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
     });
 
@@ -537,8 +541,18 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
+    });
+
+    it("should warn and continue for rate limit 403 errors", async () => {
+      const rateLimitError = new Error("API rate limit exceeded for installation");
+      /** @type {any} */ rateLimitError.status = 403;
+      mockGithub.request.mockRejectedValueOnce(rateLimitError);
+
+      await runScript();
+
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("GitHub API rate limiting"));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
 
     it("should fail for other non-403 errors", async () => {
@@ -548,7 +562,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
     });
   });
@@ -683,12 +696,11 @@ describe("add_reaction", () => {
       expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
 
-    it("should call core.error and core.setFailed for non-locked errors", async () => {
+    it("should call core.setFailed for non-locked errors", async () => {
       const { handleReactionError } = await importHelpers();
 
       handleReactionError(new Error("Some API error"));
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction: Some API error"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(`${ERR_API}: Failed to add reaction`));
     });
   });

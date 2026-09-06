@@ -64,7 +64,7 @@ func appendCustomMCPServerIfEligible(servers []string, toolName string, toolValu
 //
 // Returns nil when no servers are eligible for mounting.
 // The GitHub MCP server is excluded (handled differently).
-func getMCPCLIServerNames(data *WorkflowData) []string {
+func getMCPCLIServerNames(data *WorkflowData) []string { //nolint:largefunc // Existing CLI proxy selection handles all supported tool sources.
 	if data == nil {
 		return nil
 	}
@@ -121,12 +121,13 @@ func getMCPCLIServerNames(data *WorkflowData) []string {
 		servers = append(servers, constants.MCPScriptsMCPServerID.String())
 	}
 
-	// Copilot always runs with --disable-builtin-mcps. When at least one CLI mount
-	// trigger is active (safeoutputs/mcpscripts or cli-proxy), the mount script
-	// discovers all MCP servers from the gateway manifest (including GitHub and
-	// custom servers such as azure-devops) and exposes wrappers on PATH. Reflect
-	// that runtime reality in the generated CLI server list so agents can call
-	// these wrappers deterministically instead of guessing command names.
+	// Copilot normally runs with --disable-builtin-mcps. When at least one CLI
+	// mount trigger is active (safeoutputs/mcpscripts or cli-proxy), the mount
+	// script discovers all MCP servers from the gateway manifest (including
+	// GitHub and custom servers such as azure-devops) and exposes wrappers on
+	// PATH. Reflect that runtime reality in the generated CLI server list so
+	// agents can call these wrappers deterministically instead of guessing
+	// command names.
 	//
 	// Use cli-proxy as part of the activation condition because the initial
 	// collection deliberately excludes GitHub: a workflow with cli-proxy: true
@@ -205,7 +206,7 @@ func getMountedCLIServerNamesIfBashRestricted(workflowData *WorkflowData, tools 
 	return getMCPCLIServerNames(buildCLIWorkflowDataForMounts(workflowData, tools, safeOutputs, mcpScripts))
 }
 
-func withMountedCLIShellCommandsInRestrictedBash(workflowData *WorkflowData) map[string]any {
+func withMountedCLIShellCommandsInRestrictedBash(workflowData *WorkflowData) map[string]any { //nolint:largefunc // Existing shell wrapper logic preserves command rewriting order.
 	if workflowData == nil {
 		return nil
 	}
@@ -308,7 +309,9 @@ func (c *Compiler) generateMCPCLIMountStep(yaml *strings.Builder, data *Workflow
 	yaml.WriteString("        id: mount-mcp-clis\n")
 	yaml.WriteString("        continue-on-error: true\n")
 	yaml.WriteString("        env:\n")
-	yaml.WriteString("          MCP_GATEWAY_API_KEY: ${{ steps.start-mcp-gateway.outputs.gateway-api-key }}\n")
+	if !enclavesEnabled(data) {
+		yaml.WriteString("          MCP_GATEWAY_AGENT_ID: ${{ steps.start-mcp-gateway.outputs.gateway-agent-id }}\n")
+	}
 	yaml.WriteString("          MCP_GATEWAY_DOMAIN: ${{ steps.start-mcp-gateway.outputs.gateway-domain }}\n")
 	yaml.WriteString("          MCP_GATEWAY_PORT: ${{ steps.start-mcp-gateway.outputs.gateway-port }}\n")
 	fmt.Fprintf(yaml, "        uses: %s\n", getActionPin("actions/github-script"))
@@ -341,7 +344,17 @@ func GetMCPCLIPathSetup(data *WorkflowData) string {
 //
 // The server list is computed at compile time from the workflow configuration.
 // Each entry uses the `--help` convention so agents can discover tool signatures at runtime.
+//
+// The section is omitted when shell execution is fully disabled (tools.bash: false or
+// tools.bash: []): the agent has no way to invoke the CLI wrappers, so advertising them
+// would steer the model towards an unusable tool path (for example telling it to call the
+// safeoutputs CLI from bash when only the safeoutputs MCP tools are reachable).
 func buildMCPCLIPromptSection(data *WorkflowData) *PromptSection {
+	if data != nil && data.BashDisabled {
+		mcpCLIMountLog.Print("Skipping MCP CLI tools prompt section: bash is fully disabled")
+		return nil
+	}
+
 	servers := getMCPCLIServerNames(data)
 	if len(servers) == 0 {
 		return nil
@@ -356,8 +369,13 @@ func buildMCPCLIPromptSection(data *WorkflowData) *PromptSection {
 		lines[i] = fmt.Sprintf("- `%s` — run `%s --help` to see available tools", server, server)
 	}
 
+	promptFile := mcpCLIToolsPromptFile
+	if slices.Contains(servers, constants.SafeOutputsMCPServerID.String()) {
+		promptFile = mcpCLIToolsWithSafeOutputsPromptFile
+	}
+
 	return &PromptSection{
-		Content: mcpCLIToolsPromptFile,
+		Content: promptFile,
 		IsFile:  true,
 		EnvVars: map[string]string{
 			"GH_AW_MCP_CLI_SERVERS_LIST": strings.Join(lines, "\n"),

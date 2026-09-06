@@ -25,25 +25,61 @@ print_timing() {
   echo "⏱️  TIMING: $label took ${duration}ms"
 }
 
-# Usage: check_mcp_servers.sh GATEWAY_CONFIG_PATH GATEWAY_URL GATEWAY_API_KEY
+# Usage: check_mcp_servers.sh GATEWAY_CONFIG_PATH GATEWAY_URL GATEWAY_AGENT_ID
 #
 # Arguments:
 #   GATEWAY_CONFIG_PATH : Path to the gateway output configuration file (gateway-output.json)
 #   GATEWAY_URL         : The HTTP URL of the MCP gateway (e.g., http://localhost:8080)
-#   GATEWAY_API_KEY     : API key for gateway authentication
+#   GATEWAY_AGENT_ID    : Agent/session identifier for gateway authentication
 #
 # Exit codes:
 #   0 - At least one server connected and no required servers failed (optional server failures logged as warnings)
 #   1 - Invalid arguments, configuration file issues, no successful connections, or required server failures
 
 if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 GATEWAY_CONFIG_PATH GATEWAY_URL GATEWAY_API_KEY" >&2
+  echo "Usage: $0 GATEWAY_CONFIG_PATH GATEWAY_URL GATEWAY_AGENT_ID" >&2
   exit 1
 fi
 
 GATEWAY_CONFIG_PATH="$1"
 GATEWAY_URL="$2"
-GATEWAY_API_KEY="$3"
+GATEWAY_AGENT_ID="$3"
+
+# Optional comma-separated list of non-critical server names. The gateway output
+# does not echo the `required` flag from the input configuration, so the caller
+# forwards the names of servers declared with `required: false` here.
+OPTIONAL_SERVERS="${GH_AW_MCP_OPTIONAL_SERVERS:-}"
+DEFERRED_SERVERS="${GH_AW_MCP_DEFERRED_SERVERS:-}"
+
+# server_in_list NAME LIST → 0 when LIST contains the exact comma-delimited name
+server_in_list() {
+  local name="$1"
+  local remaining="$2"
+  local entry
+  [ -z "$remaining" ] && return 1
+  while [ -n "$remaining" ]; do
+    entry="${remaining%%,*}"
+    if [ "$entry" = "$name" ]; then
+      return 0
+    fi
+    if [ "$remaining" = "$entry" ]; then
+      break
+    fi
+    remaining="${remaining#*,}"
+  done
+  return 1
+}
+
+is_optional_server() {
+  server_in_list "$1" "$OPTIONAL_SERVERS"
+}
+
+is_deferred_server() {
+  # Deferral is a closed compiler-owned lifecycle contract. Do not allow this
+  # internal environment variable to suppress checks for arbitrary MCP servers.
+  [ "$1" = "awf-enclave" ] || return 1
+  server_in_list "$1" "$DEFERRED_SERVERS"
+}
 
 # Start overall timing
 SCRIPT_START_TIME=$(date +%s%3N)
@@ -86,6 +122,7 @@ SERVERS_CHECKED=0
 SERVERS_SUCCEEDED=0
 SERVERS_FAILED=0
 SERVERS_SKIPPED=0
+SERVERS_DEFERRED=0
 REQUIRED_SERVERS_FAILED=0
 
 # Retry configuration for slow-starting servers
@@ -106,10 +143,19 @@ while IFS= read -r SERVER_NAME; do
     continue
   fi
 
-  # Check whether server is marked optional in configuration JSON.
+  if is_deferred_server "$SERVER_NAME"; then
+    echo "↷ $SERVER_NAME: deferred until its AWF-owned backend starts"
+    SERVERS_DEFERRED=$((SERVERS_DEFERRED + 1))
+    continue
+  fi
+
+  # Check whether server is marked optional in configuration JSON or via the
+  # GH_AW_MCP_OPTIONAL_SERVERS environment variable.
   # Servers are required by default; set required: false to degrade failures to warnings.
   REQUIRED=true
   if echo "$SERVER_CONFIG" | jq -e '.required == false' >/dev/null 2>&1; then
+    REQUIRED=false
+  elif is_optional_server "$SERVER_NAME"; then
     REQUIRED=false
   fi
   
@@ -232,7 +278,7 @@ while IFS= read -r SERVER_NAME; do
       echo "✗ $SERVER_NAME: failed to connect (required)"
       REQUIRED_SERVERS_FAILED=$((REQUIRED_SERVERS_FAILED + 1))
     else
-      echo "⚠ $SERVER_NAME: failed to connect (optional)"
+      echo "⚠ $SERVER_NAME: non-critical MCP server unavailable, continuing without it"
     fi
     echo "  URL: ${SERVER_URL@Q}"
     echo "  Last error: ${LAST_ERROR@Q}"
@@ -250,7 +296,7 @@ print_timing $SCRIPT_START_TIME "Overall MCP server checks"
 echo ""
 if [ $REQUIRED_SERVERS_FAILED -gt 0 ]; then
   echo "ERROR: $REQUIRED_SERVERS_FAILED required server(s) failed connectivity check"
-  echo "Succeeded: $SERVERS_SUCCEEDED, Failed: $SERVERS_FAILED, Skipped: $SERVERS_SKIPPED"
+  echo "Succeeded: $SERVERS_SUCCEEDED, Failed: $SERVERS_FAILED, Skipped: $SERVERS_SKIPPED, Deferred: $SERVERS_DEFERRED"
   echo ""
   echo "One or more startup-critical MCP servers failed ping/initialize/tools/list"
   echo "after multiple retry attempts with progressive timeouts (10s, 20s, 30s)."
@@ -260,10 +306,11 @@ if [ $REQUIRED_SERVERS_FAILED -gt 0 ]; then
   echo "  - MCP server unavailable or rejecting requests"
   echo "  - Network connectivity or DNS issues"
   echo ""
-  echo "Check the gateway logs and individual server logs for more details:"
-  echo "  /tmp/gh-aw/mcp-logs/stderr.log"
-  echo "  /tmp/gh-aw/mcp-logs/start-gateway.log"
+  echo "Check the MCP server output above and individual server logs for more details."
   exit 1
+elif [ $SERVERS_SUCCEEDED -eq 0 ] && [ $SERVERS_FAILED -eq 0 ] && [ $SERVERS_DEFERRED -gt 0 ]; then
+  echo "✓ Deferred $SERVERS_DEFERRED late-starting server(s) to their owner readiness checks"
+  exit 0
 elif [ $SERVERS_SUCCEEDED -eq 0 ] && [ $SERVERS_FAILED -eq 0 ]; then
   echo "ERROR: No HTTP servers were successfully checked"
   echo "This could indicate:"
@@ -274,21 +321,19 @@ elif [ $SERVERS_SUCCEEDED -eq 0 ] && [ $SERVERS_FAILED -eq 0 ]; then
   exit 1
 elif [ $SERVERS_SUCCEEDED -eq 0 ]; then
   echo "ERROR: All $SERVERS_FAILED optional server(s) failed; no successful connections"
-  echo "Succeeded: 0, Failed: $SERVERS_FAILED, Skipped: $SERVERS_SKIPPED"
+  echo "Succeeded: 0, Failed: $SERVERS_FAILED, Skipped: $SERVERS_SKIPPED, Deferred: $SERVERS_DEFERRED"
   echo ""
   echo "All configured HTTP MCP servers are optional but none connected successfully."
   echo "At least one server must connect for the gateway to be considered healthy."
   echo ""
-  echo "Check the gateway logs and individual server logs for more details:"
-  echo "  /tmp/gh-aw/mcp-logs/stderr.log"
-  echo "  /tmp/gh-aw/mcp-logs/start-gateway.log"
+  echo "Check the MCP server output above and individual server logs for more details."
   exit 1
 else
   if [ $SERVERS_FAILED -gt 0 ]; then
     echo "WARNING: $SERVERS_FAILED optional server(s) failed connectivity check; continuing startup"
-    echo "✓ Checks completed with warnings ($SERVERS_SUCCEEDED succeeded, $SERVERS_FAILED failed, $SERVERS_SKIPPED skipped)"
+    echo "✓ Checks completed with warnings ($SERVERS_SUCCEEDED succeeded, $SERVERS_FAILED failed, $SERVERS_SKIPPED skipped, $SERVERS_DEFERRED deferred)"
   else
-    echo "✓ All checks passed ($SERVERS_SUCCEEDED succeeded, $SERVERS_SKIPPED skipped)"
+    echo "✓ All checks passed ($SERVERS_SUCCEEDED succeeded, $SERVERS_SKIPPED skipped, $SERVERS_DEFERRED deferred)"
   fi
   exit 0
 fi

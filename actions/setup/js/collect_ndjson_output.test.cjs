@@ -61,6 +61,12 @@ describe("collect_ndjson_output.cjs", () => {
             },
           },
           add_comment: { defaultMax: 1, fields: { body: { required: !0, type: "string", sanitize: !0, maxLength: 65e3 }, item_number: { issueOrPRNumber: !0 } } },
+          add_labels: { defaultMax: 5, fields: { labels: { required: !0, type: "array" }, item_number: { issueNumberOrTemporaryId: !0 } } },
+          assign_milestone: {
+            defaultMax: 1,
+            customValidation: "requiresOneOf:milestone_number,milestone_title",
+            fields: { issue_number: { issueNumberOrTemporaryId: !0 }, milestone_number: { optionalPositiveInteger: !0 }, milestone_title: { type: "string", sanitize: !0, maxLength: 128 } },
+          },
           create_pull_request: {
             defaultMax: 1,
             fields: {
@@ -121,6 +127,13 @@ describe("collect_ndjson_output.cjs", () => {
             fields: { tag: { type: "string", sanitize: !0, maxLength: 256 }, operation: { required: !0, type: "string", enum: ["replace", "append", "prepend"] }, body: { required: !0, type: "string", sanitize: !0, maxLength: 65e3 } },
           },
           dispatch_workflow: {
+            defaultMax: 1,
+            fields: {
+              workflow_name: { required: !0, type: "string", sanitize: !0, minLength: 1, maxLength: 256, pattern: ".*\\S.*", patternError: "must not be empty" },
+              inputs: { type: "object" },
+            },
+          },
+          call_workflow: {
             defaultMax: 1,
             fields: {
               workflow_name: { required: !0, type: "string", sanitize: !0, minLength: 1, maxLength: 256, pattern: ".*\\S.*", patternError: "must not be empty" },
@@ -255,10 +268,32 @@ describe("collect_ndjson_output.cjs", () => {
       const parsedOutput = JSON.parse(outputCall[1]);
       expect(parsedOutput.errors).toHaveLength(1);
     }),
+    it("should preserve call_workflow workflow_name and inputs during ingestion (regression for github/gh-aw#55176)", async () => {
+      // Samples-mode replay (and the live dynamic call_workflow MCP tool) emits a
+      // canonical message with both workflow_name and inputs set. Before the fix,
+      // call_workflow had no ValidationConfig entry, so ingestion fell back to
+      // validateItemWithSafeJobConfig, which dropped every field except "type"
+      // because the call_workflow safe-outputs config lacks an "inputs" key.
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
+        ndjsonContent = '{"type": "call_workflow", "workflow_name": "test-copilot-call-worker", "inputs": {"sentinel": "hello-sentinel"}}';
+      (fs.writeFileSync(testFile, ndjsonContent), (process.env.GH_AW_SAFE_OUTPUTS = testFile));
+      const __config = '{"call_workflow":{"max":1,"workflows":["test-copilot-call-worker"],"workflow_files":{"test-copilot-call-worker":"./.github/workflows/test-copilot-call-worker.lock.yml"}}}',
+        configPath = "/tmp/gh-aw/safeoutputs/config.json";
+      (fs.mkdirSync("/tmp/gh-aw/safeoutputs", { recursive: !0 }), fs.writeFileSync(configPath, __config), await eval(`(async () => { ${collectScript}; await main(); })()`));
+      const setOutputCalls = mockCore.setOutput.mock.calls,
+        outputCall = setOutputCalls.find(call => "output" === call[0]);
+      expect(outputCall).toBeDefined();
+      const parsedOutput = JSON.parse(outputCall[1]);
+      (expect(parsedOutput.items).toHaveLength(1),
+        expect(parsedOutput.items[0].type).toBe("call_workflow"),
+        expect(parsedOutput.items[0].workflow_name).toBe("test-copilot-call-worker"),
+        expect(parsedOutput.items[0].inputs).toEqual({ sentinel: "hello-sentinel" }),
+        expect(parsedOutput.errors).toHaveLength(0));
+    }),
     it("should preserve Slack mrkdwn links in custom safe-job string inputs", async () => {
       const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
       const slackText = "Tracking issue: <https://github.com/octo-org/octo-repo/issues/123|Build failure — Build github/gh-aw#456>";
-      const ndjsonContent = JSON.stringify({ type: "post_to_slack", text: slackText });
+      const ndjsonContent = JSON.stringify({ type: "post_to_slack", text: slackText, channel: "security-alerts" });
       fs.writeFileSync(testFile, ndjsonContent);
       process.env.GH_AW_SAFE_OUTPUTS = testFile;
       fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ post_to_slack: { inputs: { text: { type: "string", required: true } } } }));
@@ -268,6 +303,19 @@ describe("collect_ndjson_output.cjs", () => {
       expect(outputCall).toBeDefined();
       const parsedOutput = JSON.parse(outputCall[1]);
       (expect(parsedOutput.errors).toHaveLength(0), expect(parsedOutput.items).toEqual([{ type: "post_to_slack", text: slackText }]));
+      expect(parsedOutput.items[0]).not.toHaveProperty("channel");
+    }),
+    it("should preserve zero-valued defaults in custom safe-job inputs", async () => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type: "process_batch" }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ process_batch: { inputs: { count: { type: "number", default: 0 } } } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const outputCall = mockCore.setOutput.mock.calls.find(call => "output" === call[0]);
+      expect(outputCall).toBeDefined();
+      const parsedOutput = JSON.parse(outputCall[1]);
+      expect(parsedOutput.errors).toHaveLength(0);
+      expect(parsedOutput.items).toEqual([{ type: "process_batch", count: 0 }]);
     }),
     it("should reject items with unexpected output types", async () => {
       const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -881,9 +929,9 @@ describe("collect_ndjson_output.cjs", () => {
           const parsedOutput = JSON.parse(outputCall[1]);
           (expect(parsedOutput.items).toHaveLength(1),
             expect(parsedOutput.items[0].type).toBe("create_issue"),
-            expect(parsedOutput.items[0].priority).toBe(5),
-            expect(parsedOutput.items[0].urgent).toBe(!0),
-            expect(parsedOutput.items[0].assignee).toBe(null),
+            expect(parsedOutput.items[0]).not.toHaveProperty("priority"),
+            expect(parsedOutput.items[0]).not.toHaveProperty("urgent"),
+            expect(parsedOutput.items[0]).not.toHaveProperty("assignee"),
             expect(parsedOutput.errors).toHaveLength(0));
         }),
         it("should attempt repair but fail gracefully with excessive malformed JSON", async () => {
@@ -928,12 +976,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(1),
-            expect(parsedOutput.items[0].type).toBe("create_issue"),
-            expect(parsedOutput.items[0].metadata).toBeDefined(),
-            expect(parsedOutput.items[0].metadata.project).toBe("test"),
-            expect(parsedOutput.items[0].metadata.tags).toEqual(["important", "urgent"]),
-            expect(parsedOutput.errors).toHaveLength(0));
+          (expect(parsedOutput.items).toHaveLength(1), expect(parsedOutput.items[0].type).toBe("create_issue"), expect(parsedOutput.items[0]).not.toHaveProperty("metadata"), expect(parsedOutput.errors).toHaveLength(0));
         }),
         it("should handle complex backslash scenarios with graceful failure", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -1052,7 +1095,7 @@ describe("collect_ndjson_output.cjs", () => {
           (expect(parsedOutput.items).toHaveLength(1),
             expect(parsedOutput.items[0].type).toBe("create_issue"),
             expect(parsedOutput.items[0].title).toBe("Combined issues"),
-            expect(parsedOutput.items[0].priority).toBe(1),
+            expect(parsedOutput.items[0]).not.toHaveProperty("priority"),
             expect(parsedOutput.errors).toHaveLength(0));
         }));
     }),
@@ -1317,6 +1360,43 @@ describe("collect_ndjson_output.cjs", () => {
           const outputCall = mockCore.setOutput.mock.calls.find(call => "output" === call[0]),
             parsedOutput = JSON.parse(outputCall[1]);
           expect(parsedOutput.items[0].body).toBe("Hey `@username` and `@org/team`, check this out! But preserve email@domain.com");
+        }),
+        it("should preserve allowed aliases after max when no more than max occur", async () => {
+          const allowed = Array.from({ length: 60 }, (_, i) => `user${i}`);
+          const validationPath = "/tmp/gh-aw/safeoutputs/validation.json";
+          const validationConfig = JSON.parse(fs.readFileSync(validationPath, "utf8"));
+          validationConfig.mentions = { allowContext: false, allowed, max: 3 };
+          fs.writeFileSync(validationPath, JSON.stringify(validationConfig));
+
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+          const ndjsonContent = '{"type":"create_issue","title":"Late allowlist entries","body":"Thanks @user57, @user58, and @user59"}';
+          fs.writeFileSync(testFile, ndjsonContent);
+          process.env.GH_AW_SAFE_OUTPUTS = testFile;
+          fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", '{"create_issue":true}');
+
+          await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+          const outputCall = mockCore.setOutput.mock.calls.find(call => call[0] === "output");
+          const parsedOutput = JSON.parse(outputCall[1]);
+          expect(parsedOutput.items[0].body).toBe("Thanks @user57, @user58, and @user59");
+        }),
+        it("should apply the mention limit across all fields in one item", async () => {
+          const validationPath = "/tmp/gh-aw/safeoutputs/validation.json";
+          const validationConfig = JSON.parse(fs.readFileSync(validationPath, "utf8"));
+          validationConfig.mentions = { allowContext: false, allowed: ["user1", "user2", "user3", "user4"], max: 3 };
+          fs.writeFileSync(validationPath, JSON.stringify(validationConfig));
+
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+          fs.writeFileSync(testFile, '{"type":"create_issue","title":"@user1 @user2","body":"@user3 @user4 @user1"}');
+          process.env.GH_AW_SAFE_OUTPUTS = testFile;
+          fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", '{"create_issue":true}');
+
+          await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+          const outputCall = mockCore.setOutput.mock.calls.find(call => call[0] === "output");
+          const parsedOutput = JSON.parse(outputCall[1]);
+          expect(parsedOutput.items[0].title).toBe("@user1 @user2");
+          expect(parsedOutput.items[0].body).toBe("@user3 `@user4` @user1");
         }),
         it("should neutralize bot trigger phrases", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",

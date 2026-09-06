@@ -25,6 +25,7 @@ func deterministicRNG() *rand.Rand {
 // TestPoissonSample verifies that the Poisson sampler produces an empirical mean
 // and variance close to lambda (within statistical tolerance for 100 000 draws).
 func TestPoissonSample(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	const lambda = 10.0 // within Knuth's exact branch (≤15)
 	const n = 100_000
@@ -46,6 +47,7 @@ func TestPoissonSample(t *testing.T) {
 
 // TestPoissonSampleLargeLambda exercises the normal-approximation branch (lambda > 15).
 func TestPoissonSampleLargeLambda(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	const lambda = 100.0
 	const n = 100_000
@@ -61,18 +63,53 @@ func TestPoissonSampleLargeLambda(t *testing.T) {
 
 // TestPoissonSampleEdgeCases checks boundary conditions.
 func TestPoissonSampleEdgeCases(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	assert.Equal(t, 0, poissonSample(rng, 0), "lambda=0 should return 0")
 	assert.Equal(t, 0, poissonSample(rng, -5), "negative lambda should return 0")
 }
 
 func TestUseNormalApproximationForPoissonThreshold(t *testing.T) {
+	t.Parallel()
 	assert.False(t, useNormalApproximationForPoisson(poissonNormalApproximationThreshold), "lambda at threshold should use Knuth exact branch")
 	assert.True(t, useNormalApproximationForPoisson(poissonNormalApproximationThreshold+0.0001), "lambda above threshold should use Normal approximation")
 }
 
+func TestKnuthAlgorithmUsedForLowLambda(t *testing.T) {
+	t.Parallel()
+	for _, lambda := range []float64{0.1, 1, 5, 15} {
+		assert.False(t, useNormalApproximationForPoisson(lambda), "lambda=%v must use Knuth exact branch", lambda)
+	}
+}
+
+func TestNormalApproximationForHighLambda(t *testing.T) {
+	t.Parallel()
+	rng := deterministicRNG()
+	for _, lambda := range []float64{15.0001, 16, 100} {
+		assert.True(t, useNormalApproximationForPoisson(lambda), "lambda=%v must use normal approximation", lambda)
+		for range 100 {
+			assert.GreaterOrEqual(t, poissonSample(rng, lambda), 0, "normal approximation must not return negative draws")
+		}
+	}
+}
+
+func TestZeroLambdaYieldsZeroSample(t *testing.T) {
+	t.Parallel()
+	rng := deterministicRNG()
+	for range 100 {
+		assert.Equal(t, 0, poissonSample(rng, 0), "lambda=0 must always draw zero runs")
+	}
+}
+
+func TestLambdaCrossoverBoundaryAt15(t *testing.T) {
+	t.Parallel()
+	assert.False(t, useNormalApproximationForPoisson(15.0), "lambda==15 must use Knuth exact branch")
+	assert.True(t, useNormalApproximationForPoisson(math.Nextafter(15.0, math.Inf(1))), "lambda>15 must use normal approximation")
+}
+
 // TestPercentileInt checks the int variant of the percentile helper.
 func TestPercentileInt(t *testing.T) {
+	t.Parallel()
 	sorted := []int{10, 20, 30, 40, 50, 60, 70, 80, 90, 100}
 	assert.Equal(t, 10, percentileInt(sorted, 10), "P10")
 	assert.Equal(t, 50, percentileInt(sorted, 50), "P50")
@@ -82,6 +119,7 @@ func TestPercentileInt(t *testing.T) {
 
 // TestMeanStdDevInt verifies the mean/stddev helper on a known distribution.
 func TestMeanStdDevInt(t *testing.T) {
+	t.Parallel()
 	// population stddev of {2,4,4,4,5,5,7,9} = 2, mean = 5.
 	xs := []int{2, 4, 4, 4, 5, 5, 7, 9}
 	mean, stddev := meanStdDevInt(xs)
@@ -95,6 +133,7 @@ func TestMeanStdDevInt(t *testing.T) {
 
 // TestRunMonteCarloNilOnEmpty verifies that runMonteCarlo returns nil for empty inputs.
 func TestRunMonteCarloNilOnEmpty(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	assert.Nil(t, runMonteCarlo(nil, 0, 10.0, rng), "nil observations")
 	assert.Nil(t, runMonteCarlo([]int{100, 200}, 2, 0.0, rng), "zero lambda")
@@ -105,6 +144,7 @@ func TestRunMonteCarloNilOnEmpty(t *testing.T) {
 // non-finite λ inputs (NaN and +Inf) without hanging or panicking.
 // Specification reference: R-MC-001 requires graceful handling of degenerate λ values.
 func TestRunMonteCarloNonFiniteLambda(t *testing.T) {
+	t.Parallel()
 	obs := []int{1000, 2000, 3000}
 
 	tests := []struct {
@@ -118,6 +158,7 @@ func TestRunMonteCarloNonFiniteLambda(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			rng := deterministicRNG()
 			result := runMonteCarlo(obs, len(obs), tt.lambda, rng)
 			assert.Nil(t, result, "non-finite λ=%v should return nil (zero-projection fallback)", tt.lambda)
@@ -130,6 +171,7 @@ func TestRunMonteCarloNonFiniteLambda(t *testing.T) {
 // rather than producing a summary with zero projections, signalling to the caller that
 // there are no runs to project.
 func TestRunMonteCarloZeroLambdaFallback(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name                  string
 		etObs                 []int
@@ -169,6 +211,7 @@ func TestRunMonteCarloZeroLambdaFallback(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			rng := deterministicRNG()
 			result := runMonteCarlo(tt.etObs, tt.successCount, tt.observedRunsPerPeriod, rng)
 			if tt.wantNil {
@@ -183,6 +226,7 @@ func TestRunMonteCarloZeroLambdaFallback(t *testing.T) {
 // TestRunMonteCarloBasicProperties checks that the Monte Carlo summary satisfies
 // statistical invariants (P10 ≤ P50 ≤ P90, mean ≥ 0, stddev ≥ 0).
 func TestRunMonteCarloBasicProperties(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	// 20 historical runs, all successful, each using ~1 000 tokens.
 	etObs := make([]int, 20)
@@ -200,8 +244,27 @@ func TestRunMonteCarloBasicProperties(t *testing.T) {
 	assert.LessOrEqual(t, mc.P50ProjectedAIC, mc.P90ProjectedAIC, "AIC P50 ≤ P90")
 }
 
+func TestTrialCountIsTenThousand(t *testing.T) {
+	t.Parallel()
+	rng := deterministicRNG()
+	mc := runMonteCarlo([]int{1_000, 2_000, 3_000}, 3, 4.0, rng)
+	require.NotNil(t, mc)
+	assert.Equal(t, 10_000, monteCarloIterations)
+	assert.Equal(t, 10_000, mc.Iterations)
+}
+
+func TestPercentileOrdering(t *testing.T) {
+	t.Parallel()
+	rng := deterministicRNG()
+	mc := runMonteCarlo([]int{500, 1_000, 2_000, 4_000, 8_000}, 5, 12.0, rng)
+	require.NotNil(t, mc)
+	assert.LessOrEqual(t, mc.P10ProjectedAIC, mc.P50ProjectedAIC)
+	assert.LessOrEqual(t, mc.P50ProjectedAIC, mc.P90ProjectedAIC)
+}
+
 // TestRunMonteCarloZeroSuccessRate verifies that a 0% success rate produces zero AIC.
 func TestRunMonteCarloZeroSuccessRate(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	aicObs := []int{1000, 2000, 3000}
 	// successCount = 0 → successRate = 0/3 = 0.
@@ -211,9 +274,52 @@ func TestRunMonteCarloZeroSuccessRate(t *testing.T) {
 	assert.InDelta(t, 0.0, mc.P90ProjectedAIC, 1e-12, "zero success rate → zero AIC P90")
 }
 
+func TestBernoulliGatesETContribution(t *testing.T) {
+	t.Parallel()
+	rng := deterministicRNG()
+	mc := runMonteCarlo([]int{1_000, 2_000, 3_000}, 0, 5.0, rng)
+	require.NotNil(t, mc)
+	assert.Zero(t, mc.MeanProjectedAIC)
+	assert.Zero(t, mc.P50ProjectedAIC)
+	assert.Zero(t, mc.P90ProjectedAIC)
+}
+
+func TestHighEffectiveTokensNoOverflow(t *testing.T) {
+	t.Parallel()
+	rng := deterministicRNG()
+	mc := runMonteCarlo([]int{1_000_000, 1_250_000, 1_500_000}, 3, 20.0, rng)
+	require.NotNil(t, mc)
+	for _, got := range []float64{mc.MeanProjectedAIC, mc.StdDevAIC, mc.P10ProjectedAIC, mc.P50ProjectedAIC, mc.P90ProjectedAIC} {
+		assert.False(t, math.IsNaN(got), "Monte Carlo output must not be NaN")
+		assert.False(t, math.IsInf(got, 0), "Monte Carlo output must not overflow to infinity")
+		assert.GreaterOrEqual(t, got, 0.0, "Monte Carlo output must be non-negative")
+	}
+}
+
+func TestBootstrapDrawsWithReplacement(t *testing.T) {
+	t.Parallel()
+	rng := deterministicRNG()
+	obs := []int{100, 200, 300}
+	counts := map[int]int{}
+	repeated := false
+	for range 100 {
+		draw := bootstrapAICObservation(rng, obs)
+		counts[draw]++
+		if counts[draw] > 1 {
+			repeated = true
+		}
+	}
+
+	assert.True(t, repeated, "bootstrap sampling with replacement must allow repeated draws")
+	for _, observation := range obs {
+		assert.Positive(t, counts[observation], "bootstrap sampling must draw from the full historical pool")
+	}
+}
+
 // TestRunMonteCarloOrderOfMagnitude checks that the simulation mean is within
 // 20% of the deterministic point estimate.
 func TestRunMonteCarloOrderOfMagnitude(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	etObs := []int{10_000, 12_000, 11_000, 9_500, 10_500}
 	successCount := 5
@@ -246,6 +352,7 @@ func TestRunMonteCarloOrderOfMagnitude(t *testing.T) {
 
 // TestRunMonteCarloSortedOutputs verifies CI ordering holds across many random seeds.
 func TestRunMonteCarloSortedOutputs(t *testing.T) {
+	t.Parallel()
 	etObs := []int{5_000, 7_000, 6_000, 4_500}
 	for seed := range 5 {
 		rng := rand.New(rand.NewSource(int64(seed))) //nolint:gosec
@@ -259,6 +366,7 @@ func TestRunMonteCarloSortedOutputs(t *testing.T) {
 // TestRunMonteCarloDistributionShape verifies that the ET distribution is roughly
 // unimodal by checking that the mean lies between P10 and P90.
 func TestRunMonteCarloDistributionShape(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	etObs := make([]int, 50)
 	for i := range etObs {
@@ -274,6 +382,7 @@ func TestRunMonteCarloDistributionShape(t *testing.T) {
 // TestGammaSampleMeanVariance verifies that gammaSample produces the expected mean
 // (= shape) and variance (= shape) for a Gamma(shape, scale=1) distribution.
 func TestGammaSampleMeanVariance(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	const shape = 5.5 // typical value: n+0.5 for n=5 observed runs
 	const n = 200_000
@@ -296,6 +405,7 @@ func TestGammaSampleMeanVariance(t *testing.T) {
 // fractional shape values (0.3, 0.5, 0.8) to ensure the recursive identity
 // Gamma(shape) = Gamma(shape+1) × U^(1/shape) is exercised correctly.
 func TestGammaSampleSmallShape(t *testing.T) {
+	t.Parallel()
 	const n = 200_000
 	for _, shape := range []float64{0.3, 0.5, 0.8} {
 		rng := deterministicRNG()
@@ -311,6 +421,7 @@ func TestGammaSampleSmallShape(t *testing.T) {
 
 // TestGammaSampleEdgeCases checks boundary and degenerate inputs.
 func TestGammaSampleEdgeCases(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 	assert.InDelta(t, 0.0, gammaSample(rng, 0), 0, "shape=0 → 0")
 	assert.InDelta(t, 0.0, gammaSample(rng, -1), 0, "shape<0 → 0")
@@ -319,6 +430,7 @@ func TestGammaSampleEdgeCases(t *testing.T) {
 // TestRunMonteCarloIsReliable verifies that IsReliable reflects the minimum
 // observation threshold.
 func TestRunMonteCarloIsReliable(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 
 	// Below threshold: 3 observations < minObservationsForReliableForecast (10).
@@ -348,6 +460,7 @@ func TestRunMonteCarloIsReliable(t *testing.T) {
 // the rate is well-estimated (large sample).  With small n the posterior Gamma has
 // higher relative variance, so the simulated ET distribution should be broader.
 func TestRunMonteCarloGammaPoissonWiderCI(t *testing.T) {
+	t.Parallel()
 	// Same observed rate (λ = 10) but different sample sizes.
 	etVal := 1_000 // constant ET to isolate run-count variability
 	const lambda = 10.0
@@ -377,6 +490,7 @@ func TestRunMonteCarloGammaPoissonWiderCI(t *testing.T) {
 // TestRunMonteCarloFullEpisodePath is a smoke test that exercises runMonteCarlo
 // with a realistic setup and validates ET percentile ordering.
 func TestRunMonteCarloFullEpisodePath(t *testing.T) {
+	t.Parallel()
 	rng := deterministicRNG()
 
 	// Simulate 30 completed runs with varied token counts.
@@ -412,7 +526,7 @@ func TestResolveForecastWorkflowsFromRemote_RateLimitFallsBackToPartialResults(t
 
 	attempts := 0
 	var backoffs []time.Duration
-	forecastFetchGitHubWorkflows = func(repoOverride string, verbose bool) (map[string]*GitHubWorkflow, error) {
+	forecastFetchGitHubWorkflows = func(_ context.Context, repoOverride string, verbose bool) (map[string]*GitHubWorkflow, error) {
 		attempts++
 		return nil, errors.New("API rate limit exceeded")
 	}
@@ -445,7 +559,17 @@ func TestResolveForecastWorkflowsFromRemote_RateLimitFallsBackToPartialResults(t
 }
 
 func TestMonteCarloFixtureVariantsAreAvailable(t *testing.T) {
+	t.Parallel()
+	t.Run("minimal fixture", func(t *testing.T) {
+		t.Parallel()
+		fixture := loadFixture(t, "run_summary_minimal.json")
+		run, ok := fixture["run"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "success", run["conclusion"])
+	})
+
 	t.Run("zero ET fixture", func(t *testing.T) {
+		t.Parallel()
 		fixture := loadFixture(t, "run_summary_zero_et.json")
 		usage, ok := fixture["token_usage_summary"].(map[string]any)
 		require.True(t, ok)
@@ -455,6 +579,7 @@ func TestMonteCarloFixtureVariantsAreAvailable(t *testing.T) {
 	})
 
 	t.Run("failed run fixture", func(t *testing.T) {
+		t.Parallel()
 		fixture := loadFixture(t, "run_summary_failed.json")
 		run, ok := fixture["run"].(map[string]any)
 		require.True(t, ok)
@@ -462,11 +587,34 @@ func TestMonteCarloFixtureVariantsAreAvailable(t *testing.T) {
 	})
 
 	t.Run("high ET fixture", func(t *testing.T) {
+		t.Parallel()
 		fixture := loadFixture(t, "run_summary_high_et.json")
 		usage, ok := fixture["token_usage_summary"].(map[string]any)
 		require.True(t, ok)
 		totalEffectiveTokens, ok := usage["total_effective_tokens"].(float64)
 		require.True(t, ok)
 		assert.GreaterOrEqual(t, totalEffectiveTokens, 1_000_000.0)
+	})
+
+	t.Run("cancelled run fixture", func(t *testing.T) {
+		t.Parallel()
+		fixture := loadFixture(t, "run_summary_cancelled.json")
+		run, ok := fixture["run"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "cancelled", run["conclusion"])
+	})
+
+	t.Run("partial ET fixture", func(t *testing.T) {
+		t.Parallel()
+		fixture := loadFixture(t, "run_summary_partial_et.json")
+		run, ok := fixture["run"].(map[string]any)
+		require.True(t, ok)
+		assert.Empty(t, run["conclusion"])
+
+		usage, ok := fixture["token_usage_summary"].(map[string]any)
+		require.True(t, ok)
+		totalEffectiveTokens, ok := usage["total_effective_tokens"].(float64)
+		require.True(t, ok)
+		assert.Positive(t, totalEffectiveTokens)
 	})
 }

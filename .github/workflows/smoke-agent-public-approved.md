@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test that validates assign-to-agent with the agentic-workflows custom agent
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-agent-public-approved
     strategy: centralized
@@ -19,14 +20,15 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    runtime: cloud-hypervisor
+    id: awf
 name: "Smoke Agent: public/approved"
 engine: claude
 strict: true
 imports:
   - shared/github-guard-policy.md
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:

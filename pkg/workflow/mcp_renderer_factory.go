@@ -90,7 +90,7 @@ type renderStandardJSONMCPConfigOptions struct {
 }
 
 // renderDefaultJSONMCPConfig is a convenience wrapper for renderStandardJSONMCPConfig used by
-// simple JSON engines (Claude, Gemini, OpenCode) that share the standard
+// simple JSON engines (Claude, Gemini) that share the standard
 // renderCustomMCPConfigWrapperWithContext callback and differ only in their config path.
 func renderDefaultJSONMCPConfig(
 	sb *strings.Builder,
@@ -164,7 +164,7 @@ func buildMCPRendererFactory(workflowData *WorkflowData, format string, includeC
 // buildStandardJSONMCPRenderers constructs MCPToolRenderers with the standard rendering callbacks
 // shared across JSON-format engines (Claude, Gemini, Copilot, Codex gateway).
 //
-// All standard tool callbacks (GitHub, Playwright, CacheMemory, AgenticWorkflows,
+// All standard tool callbacks (GitHub, CacheMemory, AgenticWorkflows,
 // SafeOutputs, MCPScripts) are wired to the corresponding unified renderer methods
 // via createRenderer. Cache-memory is always a no-op for these engines.
 //
@@ -179,9 +179,6 @@ func buildStandardJSONMCPRenderers(
 		RenderGitHub: func(yaml *strings.Builder, githubTool map[string]any, isLast bool, workflowData *WorkflowData) {
 			createRenderer(isLast).RenderGitHubMCP(yaml, githubTool, workflowData)
 		},
-		RenderPlaywright: func(yaml *strings.Builder, playwrightTool any, isLast bool) {
-			createRenderer(isLast).RenderPlaywrightMCP(yaml, playwrightTool)
-		},
 		RenderCacheMemory: noOpCacheMemoryRenderer,
 		RenderAgenticWorkflows: func(yaml *strings.Builder, isLast bool) {
 			createRenderer(isLast).RenderAgenticWorkflowsMCP(yaml)
@@ -191,6 +188,9 @@ func buildStandardJSONMCPRenderers(
 		},
 		RenderMCPScripts: func(yaml *strings.Builder, mcpScripts *MCPScriptsConfig, isLast bool) {
 			createRenderer(isLast).RenderMCPScriptsMCP(yaml, mcpScripts, workflowData)
+		},
+		RenderEnclave: func(yaml *strings.Builder, workflowData *WorkflowData, isLast bool) {
+			writeEnclaveMCPJSON(yaml, workflowData, isLast)
 		},
 		RenderCustomMCPConfig: renderCustom,
 	}

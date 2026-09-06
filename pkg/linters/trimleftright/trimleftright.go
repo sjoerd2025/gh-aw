@@ -10,46 +10,33 @@ package trimleftright
 
 import (
 	"go/ast"
-	"go/token"
-	"strconv"
 	"unicode"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:trimleftright")
+
 // Analyzer is the trimleftright analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "trimleftright",
-	Doc:      "reports likely mistaken strings.TrimLeft/TrimRight calls using multi-character alphanumeric literal cutsets",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/trimleftright",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("trimleftright", "reports likely mistaken strings.TrimLeft/TrimRight calls using multi-character alphanumeric literal cutsets", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeTrimLeftRight(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeTrimLeftRight checks whether a call is a strings.TrimLeft or
@@ -84,7 +71,7 @@ func analyzeTrimLeftRight(pass *analysis.Pass, n ast.Node, generatedFiles filech
 		return
 	}
 
-	cutset, isCutset := stringLitValue(call.Args[1])
+	cutset, isCutset := astutil.StringLitValue(call.Args[1])
 	if !isCutset || !looksSuspiciousCutset(cutset) {
 		return
 	}
@@ -97,25 +84,13 @@ func analyzeTrimLeftRight(pass *analysis.Pass, n ast.Node, generatedFiles filech
 		suggested = "TrimSuffix"
 	}
 
+	pkgLog.Printf("flagging strings.%s with suspicious cutset at %s", funcName, pos)
 	pass.Report(analysis.Diagnostic{
 		Pos: call.Pos(),
 		End: call.End(),
 		Message: "strings." + funcName + " with a multi-character cutset treats each character independently; " +
 			"use strings." + suggested + " if you intend to remove the exact string",
 	})
-}
-
-// stringLitValue returns the unquoted string value of a string-literal AST node.
-func stringLitValue(expr ast.Expr) (string, bool) {
-	lit, ok := expr.(*ast.BasicLit)
-	if !ok || lit.Kind != token.STRING {
-		return "", false
-	}
-	s, err := strconv.Unquote(lit.Value)
-	if err != nil {
-		return "", false
-	}
-	return s, true
 }
 
 // looksSuspiciousCutset reports likely TrimPrefix/TrimSuffix confusion.

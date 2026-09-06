@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test to validate --allow-host-service-ports with Redis service container
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-service-ports
     strategy: centralized
@@ -14,11 +15,12 @@ permissions:
   issues: read
   pull-requests: read
 name: Smoke Service Ports
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 strict: true
 sandbox:
   agent:
-    legacy-security: enable
+    runtime: docker-sudo-iptables
 services:
   redis:
     image: redis:7
@@ -50,13 +52,14 @@ timeout-minutes: 5
 imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
 features:
   gh-aw-detection: false
 ---
 
 # Smoke Test: Service Ports (Redis)
 
-**Purpose:** Validate that the `--allow-host-service-ports` feature works end-to-end. This workflow opts into `legacy-security: enable` so the compiler can configure AWF to allow traffic to the Redis service port.
+**Purpose:** Validate that the `--allow-host-service-ports` feature works end-to-end. This workflow uses `runtime: docker-sudo-iptables` so the compiler can configure AWF to allow traffic to the Redis service port.
 
 **IMPORTANT:** Inside AWF's sandbox, you must connect to services via `host.docker.internal` (not `localhost`). The service containers run on the host, and AWF routes traffic through the host gateway. Since the workflow maps port 6379:6379, port 6379 should work. Keep all outputs concise.
 

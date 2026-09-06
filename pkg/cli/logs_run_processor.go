@@ -24,6 +24,7 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/repoutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/sourcegraph/conc/pool"
 )
@@ -31,13 +32,15 @@ import (
 // concurrentRunDownloadParams holds parameters shared across all goroutines
 // in the concurrent download pool, avoiding repetitive parameter passing.
 type concurrentRunDownloadParams struct {
-	outputDir      string
-	verbose        bool
-	dlHost         string
-	dlOwner        string
-	dlRepo         string
-	artifactFilter []string
-	evalsOnly      bool
+	outputDir             string
+	verbose               bool
+	dlHost                string
+	dlOwner               string
+	dlRepo                string
+	artifactFilter        []string
+	evalsOnly             bool
+	storageLimit          *logsStorageLimit
+	maxGitHubAPIRateLimit int
 	// evalsArtifactRequested is true when the caller wants evals results, either
 	// because --evals was passed (evalsOnly) or because --artifacts evals was
 	// explicitly listed. This drives the fallback download of the dedicated evals
@@ -52,13 +55,16 @@ type concurrentRunDownloadParams struct {
 // artifactSets is the original pre-resolution set list used to determine evalsOnly fallback behavior.
 // evalsOnly skips non-evals artifacts to reduce download volume on evals-focused runs.
 type runArtifactsConcurrentOptions struct {
-	outputDir      string
-	verbose        bool
-	maxRuns        int
-	repoOverride   string
-	artifactFilter []string
-	evalsOnly      bool
-	artifactSets   []string
+	outputDir              string
+	verbose                bool
+	maxRuns                int
+	repoOverride           string
+	artifactFilter         []string
+	evalsOnly              bool
+	artifactSets           []string
+	maxConcurrentDownloads int
+	storageLimit           *logsStorageLimit
+	maxGitHubAPIRateLimit  int
 }
 
 // buildConcurrentDownloadParams constructs download parameters by parsing the optional
@@ -69,13 +75,9 @@ type runArtifactsConcurrentOptions struct {
 func buildConcurrentDownloadParams(outputDir string, verbose bool, repoOverride string, artifactFilter []string, evalsOnly bool, artifactSets []string) concurrentRunDownloadParams {
 	var dlHost, dlOwner, dlRepo string
 	if repoOverride != "" {
-		// Accepted formats: "owner/repo" or "HOST/owner/repo".
-		parts := strings.SplitN(repoOverride, "/", 3)
-		switch len(parts) {
-		case 3: // HOST/owner/repo
-			dlHost, dlOwner, dlRepo = parts[0], parts[1], parts[2]
-		case 2: // owner/repo
-			dlOwner, dlRepo = parts[0], parts[1]
+		ownerRepo, host := repoutil.NormalizeRepoForAPI(repoOverride)
+		if owner, repo, err := repoutil.SplitRepoSlug(ownerRepo); err == nil {
+			dlHost, dlOwner, dlRepo = host, owner, repo
 		}
 	}
 	evalsArtifactRequested := isEvalsArtifactRequested(evalsOnly, artifactSets)
@@ -133,23 +135,35 @@ func downloadRunArtifactsConcurrent(ctx context.Context, runs []WorkflowRun, opt
 	progressBar := initDownloadProgressBar(opts.verbose, totalRuns)
 	var completedCount atomic.Int64
 	maxConcurrent := getMaxConcurrentDownloads()
+	if opts.maxConcurrentDownloads > 0 {
+		maxConcurrent = opts.maxConcurrentDownloads
+	}
 	params := buildConcurrentDownloadParams(opts.outputDir, opts.verbose, opts.repoOverride, opts.artifactFilter, opts.evalsOnly, opts.artifactSets)
+	params.storageLimit = opts.storageLimit
+	params.maxGitHubAPIRateLimit = opts.maxGitHubAPIRateLimit
 
 	// Configure concurrent download pool with bounded parallelism and context cancellation.
 	// The conc pool automatically handles panic recovery and prevents goroutine leaks.
-	p := pool.NewWithResults[DownloadResult]().
+	// Results are written into a slot pre-allocated per run rather than collected via
+	// pool.NewWithResults, whose completion order is not guaranteed to match submission
+	// order. Preserving submission (API) order lets storage/rate-limit continuation
+	// cursors rely on the position of the oldest run in the batch even though downloads
+	// still run concurrently (the storage limiter itself remains the throughput gate).
+	results := make([]DownloadResult, len(runs))
+	p := pool.New().
 		WithContext(ctx).
 		WithMaxGoroutines(maxConcurrent)
 
 	// Each download task runs concurrently with context awareness.
-	for _, run := range runs {
-		p.Go(func(ctx context.Context) (DownloadResult, error) {
-			return processSingleRunDownload(ctx, run, params, &completedCount, progressBar)
+	for i, run := range runs {
+		p.Go(func(ctx context.Context) error {
+			result, _ := processSingleRunDownload(ctx, run, params, &completedCount, progressBar)
+			results[i] = result
+			return nil
 		})
 	}
 
-	results, err := p.Wait()
-	if err != nil && opts.verbose {
+	if err := p.Wait(); err != nil && opts.verbose {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Download interrupted: %v", err)))
 	}
 	if progressBar != nil {
@@ -180,7 +194,10 @@ func resolveRunRepoContext(run WorkflowRun, params concurrentRunDownloadParams) 
 // all other runs without artifacts are marked as skipped.
 func handleArtifactDownloadError(result *DownloadResult, err error, verbose bool) {
 	run := result.Run
-	if errors.Is(err, ErrNoArtifacts) {
+	if errors.Is(err, errLogsStorageLimitReached) {
+		result.Skipped = true
+		result.Error = err
+	} else if errors.Is(err, ErrNoArtifacts) {
 		logsOrchestratorLog.Printf("No artifacts available for run %d (conclusion=%s)", run.DatabaseID, run.Conclusion)
 		if isFailureConclusion(run.Conclusion) {
 			result.Metrics = LogMetrics{}
@@ -194,6 +211,17 @@ func handleArtifactDownloadError(result *DownloadResult, err error, verbose bool
 	}
 }
 
+// logsRunPreflightAPIReserve conservatively estimates the number of core API
+// requests a single run's full processing pipeline can make after the
+// preflight rate-limit check: artifact listing, one or more artifact
+// downloads, an optional workflow-logs fetch, an optional evals fallback
+// download, and the jobs fetch performed later by buildProcessedRun. A single
+// check before downloadRunArtifacts cannot bound the ceiling on its own
+// because usage is only sampled once; reserving this budget upfront prevents
+// the remaining calls from silently pushing usage past a configured ceiling
+// before the next check.
+const logsRunPreflightAPIReserve = 8
+
 // processSingleRunDownload executes the full download and analysis pipeline for one run.
 // It is called concurrently from downloadRunArtifactsConcurrent for each run in the batch.
 func processSingleRunDownload(
@@ -205,7 +233,7 @@ func processSingleRunDownload(
 ) (DownloadResult, error) {
 	select {
 	case <-ctx.Done():
-		return DownloadResult{Run: run, Skipped: true, Error: ctx.Err()}, nil
+		return DownloadResult{RunAnalysis: RunAnalysis{Run: run}, Skipped: true, Error: ctx.Err()}, nil
 	default:
 	}
 	if params.verbose {
@@ -218,20 +246,27 @@ func processSingleRunDownload(
 	result, ok := tryLoadCachedRunResult(ctx, run, runOutputDir, perRunParams)
 	if !ok {
 		logsOrchestratorLog.Printf("Downloading artifacts for run %d: owner=%s, repo=%s", run.DatabaseID, perRunParams.dlOwner, perRunParams.dlRepo)
-		err := downloadRunArtifacts(ctx, downloadArtifactsOptions{runID: run.DatabaseID, outputDir: runOutputDir, verbose: params.verbose, owner: perRunParams.dlOwner, repo: perRunParams.dlRepo, hostname: perRunParams.dlHost, artifactFilter: params.artifactFilter})
-
-		result = &DownloadResult{Run: run, LogsPath: runOutputDir}
-		if err != nil {
-			handleArtifactDownloadError(result, err, params.verbose)
-		} else {
+		result = &DownloadResult{RunAnalysis: RunAnalysis{Run: run}, LogsPath: runOutputDir}
+		err := params.storageLimit.runDownload(ctx, runOutputDir, func() error {
+			if err := waitForConfiguredRateLimit(ctx, params.verbose, params.maxGitHubAPIRateLimit, logsRunPreflightAPIReserve); err != nil {
+				return err
+			}
+			if err := downloadRunArtifacts(ctx, downloadArtifactsOptions{runID: run.DatabaseID, outputDir: runOutputDir, verbose: params.verbose, owner: perRunParams.dlOwner, repo: perRunParams.dlRepo, hostname: perRunParams.dlHost, artifactFilter: params.artifactFilter}); err != nil {
+				return err
+			}
 			// When evals are requested but not found in the usage artifact (older runs
 			// that predate the conclusion-job copy), fall back to the dedicated evals
-			// artifact so those runs are not silently skipped.  This applies both when
+			// artifact so those runs are not silently skipped. This applies both when
 			// --evals is set and when --artifacts evals was explicitly listed.
 			if params.evalsArtifactRequested && !runHasEvals(runOutputDir, params.verbose) {
 				tryDownloadEvalsArtifactFallback(ctx, run.DatabaseID, runOutputDir, perRunParams)
 			}
 			analyzeRunArtifacts(ctx, result, runOutputDir, params.verbose, params.artifactFilter)
+			return nil
+		})
+
+		if err != nil {
+			handleArtifactDownloadError(result, err, params.verbose)
 		}
 	} else {
 		logsOrchestratorLog.Printf("Cache hit for run %d, using cached summary", run.DatabaseID)
@@ -251,15 +286,27 @@ func processSingleRunDownload(
 // Errors are logged but not propagated — the caller proceeds with whatever was downloaded.
 func tryDownloadEvalsArtifactFallback(ctx context.Context, runID int64, runOutputDir string, params concurrentRunDownloadParams) {
 	logsOrchestratorLog.Printf("evals not found in usage artifact for run %d, attempting fallback download of dedicated evals artifact", runID)
-	evalsFilter := []string{constants.EvalsArtifactName}
-	if err := downloadRunArtifacts(ctx, downloadArtifactsOptions{runID: runID, outputDir: runOutputDir, verbose: params.verbose, owner: params.dlOwner, repo: params.dlRepo, hostname: params.dlHost, artifactFilter: evalsFilter}); err != nil {
+	evalsFilter := []string{constants.EvalsArtifactName.String()}
+	err := waitForConfiguredRateLimit(ctx, params.verbose, params.maxGitHubAPIRateLimit, 1)
+	if err == nil {
+		err = downloadRunArtifacts(ctx, downloadArtifactsOptions{runID: runID, outputDir: runOutputDir, verbose: params.verbose, owner: params.dlOwner, repo: params.dlRepo, hostname: params.dlHost, artifactFilter: evalsFilter})
+	}
+	if err != nil {
 		logsOrchestratorLog.Printf("Fallback evals artifact download failed for run %d: %v", runID, err)
 		if params.verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Evals not found in usage artifact for run %d and fallback download failed: %v", runID, err)))
 		}
+
 	} else {
 		logsOrchestratorLog.Printf("Fallback evals artifact downloaded for run %d", runID)
 	}
+}
+
+func waitForConfiguredRateLimit(ctx context.Context, verbose bool, configuredMax, reserve int) error {
+	if configuredMax == 0 {
+		return nil
+	}
+	return checkAndWaitForRateLimitShared(ctx, verbose, configuredMax, reserve)
 }
 
 // tryLoadCachedRunResult attempts to return a pre-built DownloadResult from the on-disk
@@ -274,6 +321,17 @@ func tryLoadCachedRunResult(
 	if !ok {
 		return nil, false
 	}
+	if len(params.artifactFilter) == 0 {
+		if missing := findMissingFilterEntries([]string{string(ArtifactSetAll)}, runOutputDir); len(missing) > 0 {
+			logsOrchestratorLog.Printf("Cache bypass for run %d: complete artifact marker missing", run.DatabaseID)
+			return nil, false
+		}
+	} else {
+		if missing := findMissingFilterEntries(params.artifactFilter, runOutputDir); len(missing) > 0 {
+			logsOrchestratorLog.Printf("Cache bypass for run %d: requested artifacts missing locally: %v", run.DatabaseID, missing)
+			return nil, false
+		}
+	}
 
 	// When --evals is requested but evals are not present in the cached run directory
 	// (e.g., the run was cached before evals were included in the usage artifact),
@@ -287,38 +345,24 @@ func tryLoadCachedRunResult(
 	}
 
 	result := DownloadResult{
-		Run:                     summary.Run,
-		Metrics:                 summary.Metrics,
-		AwContext:               summary.AwContext,
-		TaskDomain:              summary.TaskDomain,
-		BehaviorFingerprint:     summary.BehaviorFingerprint,
-		AgenticAssessments:      summary.AgenticAssessments,
-		AccessAnalysis:          summary.AccessAnalysis,
-		FirewallAnalysis:        summary.FirewallAnalysis,
-		RedactedDomainsAnalysis: summary.RedactedDomainsAnalysis,
-		MissingTools:            summary.MissingTools,
-		MissingData:             summary.MissingData,
-		Noops:                   summary.Noops,
-		MCPFailures:             summary.MCPFailures,
-		MCPToolUsage:            summary.MCPToolUsage,
-		TokenUsage:              summary.TokenUsage,
-		GitHubRateLimitUsage:    summary.GitHubRateLimitUsage,
-		JobDetails:              summary.JobDetails,
-		LogsPath:                runOutputDir,
-		Cached:                  true,
+		RunAnalysis: summary.RunAnalysis,
+		LogsPath:    runOutputDir,
+		Cached:      true,
 	}
 	// Re-apply the usage activity backfill to heal stale cache entries.
 	// Capture the SafeItemsCount before backfill to detect whether the field was healed.
 	safeItemsBefore := result.Run.SafeItemsCount
-	backfillCacheHitIfNeeded(&result, runOutputDir, params.verbose)
+	activitySummaryApplied := backfillCacheHitIfNeeded(&result, runOutputDir, params.verbose)
 	// If the backfill populated SafeItemsCount (i.e. it was 0 before and is now non-zero),
 	// persist the healed value back to run_summary.json so downstream readers (e.g.
 	// the api-consumption-report) see the correct count without having to fall back to
 	// usage/activity/summary.json.
-	if result.Run.SafeItemsCount != safeItemsBefore {
+	if result.Run.SafeItemsCount != safeItemsBefore || activitySummaryApplied {
 		healed := *summary
 		healed.Run = result.Run
 		healed.Metrics = result.Metrics
+		healed.MCPToolUsage = result.MCPToolUsage
+		healed.WorkingSet = result.WorkingSet
 		if err := saveRunSummary(runOutputDir, &healed, params.verbose); err != nil {
 			logsOrchestratorLog.Printf("Warning: failed to persist healed run summary for run %d: %v", result.Run.DatabaseID, err)
 		}
@@ -339,7 +383,7 @@ func analyzeRunArtifacts(ctx context.Context, result *DownloadResult, runOutputD
 
 	// Firewall artifact gating: firewall/gateway logs live in the agent artifact.
 	// Skip silently when the artifact was intentionally excluded from the filter.
-	hasFirewallArtifact := artifactMatchesFilter(constants.AgentArtifactName, artifactFilter)
+	hasFirewallArtifact := artifactMatchesFilter(constants.AgentArtifactName.String(), artifactFilter)
 
 	applyRunSecurityAnalysis(result, runOutputDir, verbose, hasFirewallArtifact)
 
@@ -444,6 +488,12 @@ func applyRunBehavioralSignals(result *DownloadResult, runOutputDir string, verb
 	}
 	result.MCPFailures = mcpFailures
 
+	skillActivations, skillErr := extractSkillActivationsFromRun(runOutputDir, result.Run, verbose, expName, expVariant)
+	if skillErr != nil && verbose {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to extract skill activations for run %d: %v", result.Run.DatabaseID, skillErr)))
+	}
+	result.SkillActivations = skillActivations
+
 	// MCP tool usage data lives in gateway.jsonl which is part of the agent artifact.
 	var mcpToolUsage *MCPToolUsageData
 	if hasFirewallArtifact {
@@ -490,10 +540,11 @@ func applyRunUsageMetrics(result *DownloadResult, metrics *LogMetrics, runOutput
 // RunSummary struct, and writes it to disk.  It also sets the agentic-analysis fields on
 // result directly so they are available to the caller.
 func finalizeAndSaveRunSummary(ctx context.Context, result *DownloadResult, runOutputDir string, metrics LogMetrics, verbose bool) {
-	jobDetails, jobErr := fetchJobDetails(ctx, result.Run.DatabaseID, verbose)
+	jobDetails, jobErr := fetchJobDetails(ctx, result.Run.DatabaseID, runOutputDir, verbose)
 	if jobErr != nil && verbose {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to fetch job details for run %d: %v", result.Run.DatabaseID, jobErr)))
-	} else {
+	}
+	if jobDetails != nil {
 		result.JobDetails = jobDetails
 	}
 
@@ -511,8 +562,10 @@ func finalizeAndSaveRunSummary(ctx context.Context, result *DownloadResult, runO
 		MissingData:             result.MissingData,
 		Noops:                   result.Noops,
 		MCPFailures:             result.MCPFailures,
+		SkillActivations:        result.SkillActivations,
 		MCPToolUsage:            result.MCPToolUsage,
 		TokenUsage:              result.TokenUsage,
+		WorkingSet:              result.WorkingSet,
 		GitHubRateLimitUsage:    result.GitHubRateLimitUsage,
 		JobDetails:              jobDetails,
 	}
@@ -522,50 +575,58 @@ func finalizeAndSaveRunSummary(ctx context.Context, result *DownloadResult, runO
 	result.BehaviorFingerprint = behaviorFingerprint
 	result.AgenticAssessments = agenticAssessments
 
-	summary := &RunSummary{
-		CLIVersion:              GetVersion(),
-		RunID:                   result.Run.DatabaseID,
-		ProcessedAt:             time.Now(),
-		Run:                     result.Run,
-		Metrics:                 metrics,
-		AwContext:               result.AwContext,
-		TaskDomain:              result.TaskDomain,
-		BehaviorFingerprint:     result.BehaviorFingerprint,
-		AgenticAssessments:      result.AgenticAssessments,
-		AccessAnalysis:          result.AccessAnalysis,
-		FirewallAnalysis:        result.FirewallAnalysis,
-		RedactedDomainsAnalysis: result.RedactedDomainsAnalysis,
-		MissingTools:            result.MissingTools,
-		MissingData:             result.MissingData,
-		Noops:                   result.Noops,
-		MCPFailures:             result.MCPFailures,
-		MCPToolUsage:            result.MCPToolUsage,
-		TokenUsage:              result.TokenUsage,
-		GitHubRateLimitUsage:    result.GitHubRateLimitUsage,
-		ArtifactsList:           artifacts,
-		JobDetails:              jobDetails,
-	}
+	summary := newRunSummary(result, metrics, jobDetails, artifacts)
 	if saveErr := saveRunSummary(runOutputDir, summary, verbose); saveErr != nil && verbose {
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to save run summary for run %d: %v", result.Run.DatabaseID, saveErr)))
 	}
 }
 
-// backfillCacheHitIfNeeded re-applies the usage activity summary backfill to heal
-// stale cache entries that were saved before safe-outputs or turn backfill was
-// introduced. It is a no-op when both Run.Turns and Run.SafeItemsCount are already
-// non-zero. Errors loading the summary are logged when verbose is true; a missing
-// summary file is silent (no summary = nothing to backfill).
-func backfillCacheHitIfNeeded(result *DownloadResult, runOutputDir string, verbose bool) {
-	backfillRunTokenUsageFromFirewall(&result.Metrics, result, result.TokenUsage)
-	if result.Run.Turns == 0 || result.Run.SafeItemsCount == 0 {
-		usageActivitySummary, err := loadUsageActivitySummary(runOutputDir)
-		if err != nil && verbose {
-			logsOrchestratorLog.Printf("Warning: failed to load usage activity summary for cache-hit backfill (run %d): %v", result.Run.DatabaseID, err)
-		}
-		if usageActivitySummary != nil {
-			applyUsageActivitySummaryToResult(usageActivitySummary, result, true)
-		}
+func newRunSummary(result *DownloadResult, metrics LogMetrics, jobDetails []JobInfoWithDuration, artifacts []string) *RunSummary {
+	return &RunSummary{
+		CLIVersion:  GetVersion(),
+		RunID:       result.Run.DatabaseID,
+		ProcessedAt: time.Now(),
+		RunAnalysis: RunAnalysis{
+			Run:                     result.Run,
+			Metrics:                 metrics,
+			AwContext:               result.AwContext,
+			TaskDomain:              result.TaskDomain,
+			BehaviorFingerprint:     result.BehaviorFingerprint,
+			AgenticAssessments:      result.AgenticAssessments,
+			AccessAnalysis:          result.AccessAnalysis,
+			FirewallAnalysis:        result.FirewallAnalysis,
+			RedactedDomainsAnalysis: result.RedactedDomainsAnalysis,
+			MissingTools:            result.MissingTools,
+			MissingData:             result.MissingData,
+			Noops:                   result.Noops,
+			MCPFailures:             result.MCPFailures,
+			SkillActivations:        result.SkillActivations,
+			MCPToolUsage:            result.MCPToolUsage,
+			TokenUsage:              result.TokenUsage,
+			WorkingSet:              result.WorkingSet,
+			GitHubRateLimitUsage:    result.GitHubRateLimitUsage,
+			JobDetails:              jobDetails,
+		},
+		ArtifactsList: artifacts,
 	}
+}
+
+// backfillCacheHitIfNeeded re-applies the usage activity summary backfill to heal
+// stale cache entries that were saved before compact activity metrics were
+// introduced. Errors loading the summary are logged when verbose is true; a missing
+// summary file is silent (no summary = nothing to backfill). It returns whether an
+// activity summary was applied so the caller can persist healed cache data.
+func backfillCacheHitIfNeeded(result *DownloadResult, runOutputDir string, verbose bool) bool {
+	backfillRunTokenUsageFromFirewall(&result.Metrics, result, result.TokenUsage)
+	usageActivitySummary, err := loadUsageActivitySummary(runOutputDir)
+	if err != nil && verbose {
+		logsOrchestratorLog.Printf("Warning: failed to load usage activity summary for cache-hit backfill (run %d): %v", result.Run.DatabaseID, err)
+	}
+	if usageActivitySummary == nil {
+		return false
+	}
+	applyUsageActivitySummaryToResult(usageActivitySummary, result, true)
+	return true
 }
 
 func backfillRunTokenUsageFromFirewall(metrics *LogMetrics, result *DownloadResult, tokenUsage *TokenUsageSummary) {
@@ -592,12 +653,12 @@ func runContainsSafeOutputType(runDir string, safeOutputType string, verbose boo
 	normalizedType := stringutil.NormalizeSafeOutputIdentifier(safeOutputType)
 
 	// Look for agent_output.json in the run directory
-	agentOutputPath := filepath.Join(runDir, constants.AgentOutputFilename)
+	agentOutputPath := filepath.Join(runDir, constants.AgentOutputFilename.String())
 
 	// Support both new flattened form and old directory form
 	if stat, err := os.Stat(agentOutputPath); err != nil || stat.IsDir() {
 		// Try old structure
-		oldPath := filepath.Join(runDir, constants.AgentOutputArtifactName, constants.AgentOutputArtifactName)
+		oldPath := filepath.Join(runDir, constants.AgentOutputArtifactName.String(), constants.AgentOutputArtifactName.String())
 		if fileutil.FileExists(oldPath) {
 			agentOutputPath = oldPath
 		} else {
@@ -619,7 +680,7 @@ func runContainsSafeOutputType(runDir string, safeOutputType string, verbose boo
 	}
 
 	if err := json.Unmarshal(content, &safeOutput); err != nil {
-		return false, fmt.Errorf("failed to parse agent_output.json: %w", err)
+		return false, fmt.Errorf("could not parse agent_output.json, expected valid JSON with an \"items\" array: %w", err)
 	}
 
 	// Check each item for the specified type
@@ -703,12 +764,12 @@ func runHasEvals(runDir string, verbose bool) bool {
 	logsOrchestratorLog.Printf("Checking run for evals results: dir=%s", runDir)
 
 	// Case 1: flattenSingleFileArtifacts moved the file directly to the run root.
-	rootEvalsFile := filepath.Join(runDir, constants.EvalsResultFilename)
+	rootEvalsFile := filepath.Join(runDir, constants.EvalsResultFilename.String())
 	if fileutil.FileExists(rootEvalsFile) {
 		logsOrchestratorLog.Printf("Found evals results at: %s", rootEvalsFile)
 		return true
 	}
-	usageEvalsFile := filepath.Join(runDir, constants.UsageArtifactName, constants.EvalsResultFilename)
+	usageEvalsFile := filepath.Join(runDir, constants.UsageArtifactName.String(), constants.EvalsResultFilename.String())
 	if fileutil.FileExists(usageEvalsFile) {
 		logsOrchestratorLog.Printf("Found evals results in usage artifact at: %s", usageEvalsFile)
 		return true
@@ -725,16 +786,16 @@ func runHasEvals(runDir string, verbose bool) bool {
 		}
 		name := entry.Name()
 		// Match exact "evals" or workflow_call prefixed "{hash}-evals".
-		if name == constants.EvalsArtifactName || strings.HasSuffix(name, "-"+constants.EvalsArtifactName) {
-			evalsFile := filepath.Join(runDir, name, constants.EvalsResultFilename)
+		if name == constants.EvalsArtifactName.String() || strings.HasSuffix(name, "-"+constants.EvalsArtifactName.String()) {
+			evalsFile := filepath.Join(runDir, name, constants.EvalsResultFilename.String())
 			if fileutil.FileExists(evalsFile) {
 				logsOrchestratorLog.Printf("Found evals results at: %s", evalsFile)
 				return true
 			}
 		}
 		// Match workflow_call-prefixed "{hash}-usage".
-		if strings.HasSuffix(name, "-"+constants.UsageArtifactName) {
-			evalsFile := filepath.Join(runDir, name, constants.EvalsResultFilename)
+		if strings.HasSuffix(name, "-"+constants.UsageArtifactName.String()) {
+			evalsFile := filepath.Join(runDir, name, constants.EvalsResultFilename.String())
 			if fileutil.FileExists(evalsFile) {
 				logsOrchestratorLog.Printf("Found evals results in workflow_call usage artifact at: %s", evalsFile)
 				return true

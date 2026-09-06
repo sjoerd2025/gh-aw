@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var concurrencyLog = logger.New("workflow:concurrency")
@@ -29,9 +30,16 @@ func GenerateConcurrencyConfig(workflowData *WorkflowData, isCommandTrigger bool
 	concurrencyConfig := fmt.Sprintf("concurrency:\n  group: \"%s\"", groupValue)
 
 	// Add cancel-in-progress if appropriate
-	if shouldEnableCancelInProgress(workflowData, isCommandTrigger) {
+	cancelInProgress := shouldEnableCancelInProgress(workflowData, isCommandTrigger)
+	if cancelInProgress {
 		concurrencyLog.Print("Enabling cancel-in-progress for concurrency group")
 		concurrencyConfig += "\n  cancel-in-progress: true"
+	} else if isGroupConcurrencyQueueEnabled(workflowData) {
+		// queue: max cannot be combined with cancel-in-progress: true, so only add it
+		// when cancellation is not enabled. This ensures back-to-back triggers (e.g.
+		// push events) are queued sequentially instead of displacing pending runs.
+		concurrencyLog.Print("Enabling queue: max for top-level concurrency group")
+		concurrencyConfig += "\n  queue: max"
 	}
 
 	return concurrencyConfig
@@ -175,7 +183,7 @@ func isSlashCommandWorkflow(on string) bool {
 // inserted between the primary identifiers and the tail, providing a stable per-item
 // key for manual workflow_dispatch runs triggered via the label trigger shorthand.
 func entityConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumber bool) string {
-	parts := make([]string, 0, safeAllocationCapacity(len(primaryParts), len(tailParts), 1))
+	parts := make([]string, 0, typeutil.SafeAllocationCapacity(len(primaryParts), len(tailParts), 1))
 	parts = append(parts, primaryParts...)
 	if hasItemNumber {
 		parts = append(parts, "inputs.item_number")
@@ -190,7 +198,7 @@ func entityConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumb
 // When contains(github.actor, '[bot]') is true, the expression short-circuits to
 // github.run_id so that bot-triggered runs never share a group with human runs.
 func botIsolatedConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumber bool) string {
-	parts := make([]string, 0, safeAllocationCapacity(len(primaryParts), len(tailParts), 2))
+	parts := make([]string, 0, typeutil.SafeAllocationCapacity(len(primaryParts), len(tailParts), 2))
 	// Prepend the bot-actor isolation check: bot runs always get a unique key
 	parts = append(parts, "contains(github.actor, '[bot]') && github.run_id")
 	parts = append(parts, primaryParts...)

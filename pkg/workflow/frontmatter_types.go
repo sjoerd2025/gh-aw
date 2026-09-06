@@ -6,8 +6,10 @@ import (
 
 var frontmatterTypesLog = logger.New("workflow:frontmatter_types")
 
+type RunnerTopology string
+
 // RunnerTopologyArcDind is the topology value for ARC runners with Docker-in-Docker sidecars.
-const RunnerTopologyArcDind = "arc-dind"
+const RunnerTopologyArcDind RunnerTopology = "arc-dind"
 
 // RunnerConfig represents runner topology configuration from the workflow frontmatter.
 // The topology field is the single stable contract between gh-aw and AWF for runner
@@ -16,7 +18,7 @@ const RunnerTopologyArcDind = "arc-dind"
 type RunnerConfig struct {
 	// Topology identifies the runner execution topology.
 	// Supported values: "arc-dind" (ARC with Docker-in-Docker sidecar).
-	Topology string `json:"topology,omitempty" yaml:"topology,omitempty"`
+	Topology RunnerTopology `json:"topology,omitempty" yaml:"topology,omitempty"`
 }
 
 // RuntimeConfig represents the configuration for a single runtime
@@ -52,11 +54,13 @@ type RuntimesConfig struct {
 type GitHubActionsPermissionsConfig struct {
 	Actions             string `json:"actions,omitempty"`
 	Checks              string `json:"checks,omitempty"`
+	CodeQuality         string `json:"code-quality,omitempty"`
 	Contents            string `json:"contents,omitempty"`
 	Deployments         string `json:"deployments,omitempty"`
 	IDToken             string `json:"id-token,omitempty"`
 	Issues              string `json:"issues,omitempty"`
 	Discussions         string `json:"discussions,omitempty"`
+	Drives              string `json:"drives,omitempty"`
 	Packages            string `json:"packages,omitempty"`
 	Pages               string `json:"pages,omitempty"`
 	PullRequests        string `json:"pull-requests,omitempty"`
@@ -133,6 +137,13 @@ type GuardrailMetric struct {
 	Threshold string `json:"threshold"`
 }
 
+// ContinualExperimentConfig opts an existing A/B experiment into automatic traffic ramping.
+// The first declared variant remains control and the second is the candidate.
+type ContinualExperimentConfig struct {
+	Seed string `json:"seed"`
+	Ramp []int  `json:"ramp"`
+}
+
 // ExperimentNotify specifies where to post significance alerts when an experiment reaches
 // statistical significance.
 type ExperimentNotify struct {
@@ -141,6 +152,20 @@ type ExperimentNotify struct {
 
 	// Issue is a GitHub issue number to post a significance comment to.
 	Issue int `json:"issue,omitempty"`
+}
+
+// ExperimentDecisionConfig configures deterministic interpretation of an experiment analysis.
+type ExperimentDecisionConfig struct {
+	// MinimumEffect is the minimum absolute improvement required for promotion.
+	MinimumEffect float64 `json:"minimum_effect,omitempty"`
+
+	// RegressionTolerance is the maximum absolute regression tolerated before rejection.
+	// When omitted, MinimumEffect is used.
+	RegressionTolerance *float64 `json:"regression_tolerance,omitempty"`
+
+	// Confidence is the required evidence threshold in the open interval (0, 1).
+	// Frequentist analyses require p <= 1-confidence; Bayesian analyses use probability of superiority.
+	Confidence float64 `json:"confidence,omitempty"`
 }
 
 // ExperimentConfig represents the rich metadata for a single A/B experiment.
@@ -191,11 +216,17 @@ type ExperimentConfig struct {
 	// Valid values: t_test, mann_whitney, proportion_test, bayesian_ab.
 	AnalysisType string `json:"analysis_type,omitempty"`
 
+	// Decision configures deterministic interpretation of the statistical analysis.
+	Decision *ExperimentDecisionConfig `json:"decision,omitempty"`
+
 	// Tags are free-form labels for filtering experiments in dashboards.
 	Tags []string `json:"tags,omitempty"`
 
 	// Notify specifies where to post significance alerts when the experiment concludes.
 	Notify *ExperimentNotify `json:"notify,omitempty"`
+
+	// Continual enables deterministic control/candidate assignment and automatic traffic ramping.
+	Continual *ContinualExperimentConfig `json:"continual,omitempty"`
 }
 
 // RateLimitConfig represents rate limiting configuration for workflow triggers
@@ -226,6 +257,13 @@ type OTLPEndpointConfig struct {
 type OTLPGitHubAppConfig struct {
 	// Audience is an optional OIDC audience passed to core.getIDToken(audience).
 	Audience string `json:"audience,omitempty"`
+}
+
+// OTLPWorkloadIdentityConfig configures cloud workload identity federation for OTLP export.
+type OTLPWorkloadIdentityConfig struct {
+	Provider       string `json:"provider,omitempty"`
+	Audience       string `json:"audience,omitempty"`
+	ServiceAccount string `json:"service-account,omitempty"`
 }
 
 // OTLPConfig holds configuration for OTLP (OpenTelemetry Protocol) trace export.
@@ -290,6 +328,10 @@ type OTLPConfig struct {
 	// When configured, gh-aw mints an OIDC token before actions/setup and passes
 	// it to setup so OTLP requests can include an Authorization bearer token.
 	GitHubApp *OTLPGitHubAppConfig `json:"github-app,omitempty"`
+
+	// WorkloadIdentity exchanges a GitHub Actions OIDC token for a cloud access
+	// token before OTLP export. Google is currently the supported provider.
+	WorkloadIdentity *OTLPWorkloadIdentityConfig `json:"workload-identity,omitempty"`
 }
 
 // ObservabilityConfig represents workflow observability options.
@@ -303,26 +345,35 @@ type FrontmatterConfig struct {
 	// Core workflow fields
 	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
-	Emoji       string `json:"emoji,omitempty"` // Optional emoji to represent the workflow visually
+	// Intent captures the durable outcome the workflow exists to achieve
+	// (why it exists), as opposed to Description (what it does).
+	Intent string `json:"intent,omitempty"`
+	Emoji  string `json:"emoji,omitempty"` // Optional emoji to represent the workflow visually
 	// Engine accepts both a plain string engine name (e.g. "copilot") and an object-style
 	// configuration (e.g. {id: copilot, max-continuations: 2}).  Using any prevents
 	// JSON unmarshal failures when the engine is an object, which would otherwise cause
 	// ParseFrontmatterConfig to return nil and break features that depend on it (e.g. OTLP).
-	Engine             any               `json:"engine,omitempty"`
-	Source             string            `json:"source,omitempty"`
-	Redirect           string            `json:"redirect,omitempty"`
-	TrackerID          string            `json:"tracker-id,omitempty"`
-	Version            string            `json:"version,omitempty"`
-	TimeoutMinutes     *TemplatableInt32 `json:"timeout-minutes,omitempty"`
-	MaxAICredits       *TemplatableInt32 `json:"max-ai-credits,omitempty"`
-	MaxTurnCacheMisses *int32            `json:"max-turn-cache-misses,omitempty"`
-	MaxDailyAICredits  *TemplatableInt32 `json:"max-daily-ai-credits,omitempty"`
-	MaxToolDenials     *TemplatableInt32 `json:"max-tool-denials,omitempty"`
-	Strict             *bool             `json:"strict,omitempty"`  // Pointer to distinguish unset from false
-	Private            *bool             `json:"private,omitempty"` // If true, workflow cannot be added to other repositories
-	Labels             []string          `json:"labels,omitempty"`
-	Skills             []any             `json:"skills,omitempty"`
-	SkillReferences    []SkillReference  `json:"-"`
+	Engine                      any                          `json:"engine,omitempty"`
+	Source                      string                       `json:"source,omitempty"`
+	Redirect                    string                       `json:"redirect,omitempty"`
+	TrackerID                   string                       `json:"tracker-id,omitempty"`
+	ThreatDetectionSuppressions []ThreatDetectionSuppression `json:"threat-detection-suppress,omitempty"`
+	TimeoutMinutes              *TemplatableInt32            `json:"timeout-minutes,omitempty"`
+	MaxTurns                    *TemplatableInt32            `json:"max-turns,omitempty"`
+	MaxRuns                     *TemplatableInt32            `json:"max-runs,omitempty"` // Deprecated: top-level legacy alias for max-turns; migrate with 'gh aw fix'
+	MaxAICredits                *TemplatableInt32            `json:"max-ai-credits,omitempty"`
+	MaxTurnCacheMisses          *int32                       `json:"max-turn-cache-misses,omitempty"`
+	MaxDailyAICredits           *TemplatableInt32            `json:"max-daily-ai-credits,omitempty"`
+	MaxToolDenials              *TemplatableInt32            `json:"max-tool-denials,omitempty"`
+	Strict                      *bool                        `json:"strict,omitempty"`  // Pointer to distinguish unset from false
+	Private                     *bool                        `json:"private,omitempty"` // If true, workflow cannot be added to other repositories
+	Labels                      []string                     `json:"labels,omitempty"`
+	Skills                      []any                        `json:"skills,omitempty"`
+	SkillReferences             []SkillReference             `json:"-"`
+	Plugins                     []any                        `json:"plugins,omitempty"`
+	PluginReferences            []PluginReference            `json:"-"`
+	AmbientFolders              []string                     `json:"ambient-folders,omitempty"`
+	GitHubApp                   *GitHubAppConfig             `json:"github-app,omitempty"`
 
 	// Configuration sections - using strongly-typed structs
 	Tools            *ToolsConfig               `json:"tools,omitempty"`
@@ -333,11 +384,13 @@ type FrontmatterConfig struct {
 	Jobs             map[string]any             `json:"jobs,omitempty"`        // Custom workflow jobs (too dynamic to type)
 	SafeOutputs      *SafeOutputsConfig         `json:"safe-outputs,omitempty"`
 	MCPScripts       *MCPScriptsConfig          `json:"mcp-scripts,omitempty"`
+	Enclaves         EnclavesConfig             `json:"enclaves,omitempty"`
 	PermissionsTyped *PermissionsConfig         `json:"-"` // New typed field (not in JSON to avoid conflict)
 
 	// Event and trigger configuration
 	On          map[string]any `json:"on,omitempty"`          // Complex trigger config with many variants (too dynamic to type)
 	OnNeeds     []string       `json:"-"`                     // New typed field extracted from on.needs (not in JSON to avoid conflict)
+	OnStopAfter string         `json:"-"`                     // Typed field extracted from on.stop-after (not in JSON to avoid conflict). Accepts a relative delta ("+25h"), an absolute timestamp, or a GitHub Actions expression (e.g. "${{ inputs.stop-after }}").
 	Permissions map[string]any `json:"permissions,omitempty"` // Deprecated: use PermissionsTyped (can be string or map)
 	Concurrency map[string]any `json:"concurrency,omitempty"`
 	If          string         `json:"if,omitempty"`
@@ -368,7 +421,6 @@ type FrontmatterConfig struct {
 	// Import and inclusion
 	Imports        any            `json:"imports,omitempty"`         // Can be string or array
 	ImportSchema   map[string]any `json:"import-schema,omitempty"`   // Schema for validating 'with' values when this workflow is imported
-	Include        any            `json:"include,omitempty"`         // Can be string or array
 	InlinedImports bool           `json:"inlined-imports,omitempty"` // If true, inline all imports at compile time instead of using runtime-import macros
 	Resources      []string       `json:"resources,omitempty"`       // Additional workflow .md or action .yml files to fetch alongside this workflow
 
@@ -414,9 +466,10 @@ type FrontmatterConfig struct {
 	CheckoutConfigs            []*CheckoutConfig `json:"-"`                  // Parsed checkout configs (not in JSON)
 	CheckoutDisabled           bool              `json:"-"`                  // true when checkout: false is set in frontmatter
 	CheckoutExplicitlyDisabled bool              `json:"-"`                  // true only when checkout: false is explicitly written by the user in frontmatter
+	CheckoutSkipDefault        bool              `json:"-"`                  // true when permissions.contents: none skips only the default workflow-repository checkout
 
-	// Model is the top-level LLM model override. When set, it takes precedence over
-	// engine.model. Use this field instead of engine.model.
+	// Model is the top-level LLM model default. An engine.model value overrides it
+	// for that engine instance.
 	// Example: model: gpt-5.4
 	Model string `json:"model,omitempty"`
 
@@ -424,6 +477,11 @@ type FrontmatterConfig struct {
 	// Can be a plain list (shorthand) or an object with a questions list and optional
 	// engine-config / runs-on overrides.
 	Evals any `json:"evals,omitempty"`
+
+	// Graders configures deterministic graders that compute metrics from
+	// post-agent trace files. Can be {} for zero-config (all built-ins) or a map
+	// of grader IDs with optional enabled/script overrides.
+	Graders any `json:"graders,omitempty"`
 
 	// ExcludedEnv lists additional environment variable names that must be excluded from
 	// the agent container via AWF's --exclude-env flag.  Use this when an env var is set

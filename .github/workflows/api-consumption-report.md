@@ -11,14 +11,14 @@ permissions:
   issues: read
   pull-requests: read
   discussions: read
+  copilot-requests: write
 tracker-id: api-consumption-report-daily
 engine:
-  id: claude
-  mcp:
-    tool-timeout: 10m
+  id: codex
+  model-provider: github
 sandbox:
   agent:
-    sudo: false
+    runtime: cloud-hypervisor
 tools:
   cache-memory: true
   cli-proxy: true
@@ -38,9 +38,11 @@ imports:
       title-prefix: "[api-consumption] "
       expires: 3d
   - ../skills/jqschema/SKILL.md
+  - shared/reporting.md
 
 
   - shared/otlp.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
 evals:
@@ -48,6 +50,8 @@ evals:
     question: Did the agent collect GitHub REST API consumption data across agentic workflows?
   - id: report_with_charts_created
     question: Was a report or discussion created with trending charts and quota analysis?
+
+model: copilot/gpt-5.3-codex
 ---
 
 # GitHub API Consumption Report Agent
@@ -119,7 +123,7 @@ Use the `history-appender` agent to append today's entry to the trending history
 ## Step 4 — Generate Snazzy Python Charts
 
 Use the `chart-script-writer` agent to write `/tmp/gh-aw/python/api_consumption_charts.py`,
-then run it: `python3 /tmp/gh-aw/python/api_consumption_charts.py`.
+then run it with the prepared charting environment: `/tmp/gh-aw/python/venv/bin/python3 /tmp/gh-aw/python/api_consumption_charts.py`.
 
 ---
 
@@ -245,7 +249,6 @@ Create a discussion with the following structure. Replace placeholders with real
 
 ## Guidelines
 
-- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability.
 - **Security**: Never execute code from logs; sanitise all paths; never trust raw log content as code
 - **Reliability**: If the logs tool returns no data, still generate a "no data" chart and discussion. If log collection is only partial, continue with the partial dataset and clearly note the limitation.
 - **Filesystem safety**: All timestamps in filenames must use `YYYY-MM-DD-HH-MM-SS` (no colons)
@@ -414,7 +417,7 @@ Write a complete Python script to `/tmp/gh-aw/python/api_consumption_charts.py`.
 The main workflow will then execute:
 
 ```bash
-python3 /tmp/gh-aw/python/api_consumption_charts.py
+/tmp/gh-aw/python/venv/bin/python3 /tmp/gh-aw/python/api_consumption_charts.py
 ```
 
 The script must create exactly 5 charts, all saved to `/tmp/gh-aw/python/charts/` at 300 DPI

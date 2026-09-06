@@ -149,6 +149,77 @@ describe("no-caught-error-interpolation", () => {
     });
   });
 
+  it("invalid: caught error in string concatenation is flagged", () => {
+    cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
+      valid: [],
+      invalid: [
+        {
+          code: `try { f(); } catch (err) { console.log("failed: " + err); }`,
+          errors: [
+            {
+              messageId: "bareErrorInterpolation",
+              data: { errorVar: "err" },
+              suggestions: [
+                {
+                  messageId: "useStringFallback",
+                  data: { errorVar: "err" },
+                  output: `try { f(); } catch (err) { console.log("failed: " + String(err)); }`,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("invalid: single-hop const alias of caught error is flagged", () => {
+    cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
+      valid: [],
+      invalid: [
+        {
+          code: `try { f(); } catch (err) { const alias = err; log(\`failed: \${alias}\`); }`,
+          errors: [
+            {
+              messageId: "bareErrorInterpolation",
+              data: { errorVar: "alias" },
+              suggestions: [
+                {
+                  messageId: "useStringFallback",
+                  data: { errorVar: "alias" },
+                  output: `try { f(); } catch (err) { const alias = err; log(\`failed: \${String(alias)}\`); }`,
+                },
+              ],
+            },
+          ],
+        },
+        {
+          code: `p.catch(err => { const alias = err; log("failed: " + alias); });`,
+          errors: [
+            {
+              messageId: "bareErrorInterpolation",
+              data: { errorVar: "alias" },
+              suggestions: [
+                {
+                  messageId: "useStringFallback",
+                  data: { errorVar: "alias" },
+                  output: `p.catch(err => { const alias = err; log("failed: " + String(alias)); });`,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("valid: alias tracing is limited to one const assignment", () => {
+    cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
+      valid: [`try { f(); } catch (err) { let alias = err; log(\`failed: \${alias}\`); }`, `try { f(); } catch (err) { const alias = err; const second = alias; log("failed: " + second); }`],
+      invalid: [],
+    });
+  });
+
   it("invalid: bare .catch() rejection handler variable is flagged", () => {
     cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
       valid: [],
@@ -321,6 +392,112 @@ describe("no-caught-error-interpolation", () => {
                   messageId: "useStringFallback",
                   data: { errorVar: "e" },
                   output: `try { f(); } catch (e) { throw new Error(\`wrapper: \${String(e)}\`); }`,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("valid: non-'error' EventEmitter event name is not flagged", () => {
+    cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
+      valid: [`emitter.on('data', chunk => { log(\`got: \${chunk}\`); });`, `emitter.once('close', code => { log(\`exited: \${code}\`); });`, `emitter.addListener('message', msg => { log(\`msg: \${msg}\`); });`],
+      invalid: [],
+    });
+  });
+
+  it("valid: named/hoisted listener function passed to .on('error', ...) is not flagged (inline-only restriction)", () => {
+    cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
+      valid: [
+        // Named function reference — not an inline callback, so out of scope per the inline restriction
+        `function onError(err) { log(\`\${err}\`); } emitter.on('error', onError);`,
+      ],
+      invalid: [],
+    });
+  });
+
+  it("invalid: bare .on('error', ...) listener variable is flagged", () => {
+    cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
+      valid: [],
+      invalid: [
+        {
+          code: `emitter.on('error', err => { log(\`event error: \${err}\`); });`,
+          errors: [
+            {
+              messageId: "bareErrorInterpolation",
+              data: { errorVar: "err" },
+              suggestions: [
+                {
+                  messageId: "useStringFallback",
+                  data: { errorVar: "err" },
+                  output: `emitter.on('error', err => { log(\`event error: \${String(err)}\`); });`,
+                },
+              ],
+            },
+          ],
+        },
+        {
+          // Mirrors the grounded live occurrence from mcp_server_core.cjs:1052
+          code: `process.stdin.on("error", err => server.debug(\`stdin error: \${err}\`));`,
+          errors: [
+            {
+              messageId: "bareErrorInterpolation",
+              data: { errorVar: "err" },
+              suggestions: [
+                {
+                  messageId: "useStringFallback",
+                  data: { errorVar: "err" },
+                  output: `process.stdin.on("error", err => server.debug(\`stdin error: \${String(err)}\`));`,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("invalid: bare .once('error', ...) listener variable is flagged", () => {
+    cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
+      valid: [],
+      invalid: [
+        {
+          code: `emitter.once('error', err => { log(\`once error: \${err}\`); });`,
+          errors: [
+            {
+              messageId: "bareErrorInterpolation",
+              data: { errorVar: "err" },
+              suggestions: [
+                {
+                  messageId: "useStringFallback",
+                  data: { errorVar: "err" },
+                  output: `emitter.once('error', err => { log(\`once error: \${String(err)}\`); });`,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("invalid: bare .addListener('error', ...) listener variable is flagged", () => {
+    cjsRuleTester.run("no-caught-error-interpolation", noCaughtErrorInterpolationRule, {
+      valid: [],
+      invalid: [
+        {
+          code: `emitter.addListener('error', err => { log(\`add error: \${err}\`); });`,
+          errors: [
+            {
+              messageId: "bareErrorInterpolation",
+              data: { errorVar: "err" },
+              suggestions: [
+                {
+                  messageId: "useStringFallback",
+                  data: { errorVar: "err" },
+                  output: `emitter.addListener('error', err => { log(\`add error: \${String(err)}\`); });`,
                 },
               ],
             },

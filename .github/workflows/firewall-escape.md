@@ -38,7 +38,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 
 safe-outputs:
   create-discussion:
@@ -49,6 +48,7 @@ safe-outputs:
 
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:

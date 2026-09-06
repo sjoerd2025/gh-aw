@@ -3,12 +3,32 @@
 package cli
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 )
 
+func TestBuildLogsCommandArgsIncludesResourceBudgets(t *testing.T) {
+	cmdArgs, _, _ := buildLogsCommandArgs(context.Background(), logsArgs{
+		Count:                 1,
+		Timeout:               1,
+		MaxGitHubAPIRateLimit: -2000,
+		MaxStorageMB:          10240,
+	})
+	command := strings.Join(cmdArgs, " ")
+
+	if !strings.Contains(command, "--max-github-api-rate-limit -2000") {
+		t.Fatalf("command args do not include GitHub API rate-limit budget: %s", command)
+	}
+	if !strings.Contains(command, "--max-storage 10240") {
+		t.Fatalf("command args do not include storage budget: %s", command)
+	}
+}
+
 // TestTimeoutFlagParsing tests that the timeout flag is properly parsed
 func TestTimeoutFlagParsing(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name            string
 		timeout         int
@@ -37,6 +57,7 @@ func TestTimeoutFlagParsing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Test that the timeout value is correctly used
 			if tt.expectTimeout && tt.timeout == 0 {
 				t.Errorf("Expected timeout to be set but got 0")
@@ -51,8 +72,45 @@ func TestTimeoutFlagParsing(t *testing.T) {
 	}
 }
 
+func TestEffectiveMCPLogsToolSoftTimeoutSeconds(t *testing.T) {
+	t.Parallel()
+	t.Run("no gateway deadline leaves CLI timeout unchanged", func(t *testing.T) {
+		t.Parallel()
+		got, ok := effectiveMCPLogsToolSoftTimeoutSeconds(context.Background(), 5)
+		if ok || got != 0 {
+			t.Fatalf("effectiveMCPLogsToolSoftTimeoutSeconds without deadline = (%d, %v), want (0, false)", got, ok)
+		}
+	})
+
+	t.Run("gateway deadline below CLI timeout returns safety margin", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		got, ok := effectiveMCPLogsToolSoftTimeoutSeconds(ctx, 5)
+		if !ok {
+			t.Fatal("expected soft timeout when gateway deadline is shorter than CLI timeout")
+		}
+		if got < 50 || got > 54 {
+			t.Fatalf("soft timeout = %d seconds, want between 50 and 54 seconds", got)
+		}
+	})
+
+	t.Run("gateway deadline beyond CLI timeout leaves CLI timeout unchanged", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		got, ok := effectiveMCPLogsToolSoftTimeoutSeconds(ctx, 5)
+		if ok || got != 0 {
+			t.Fatalf("effectiveMCPLogsToolSoftTimeoutSeconds with long deadline = (%d, %v), want (0, false)", got, ok)
+		}
+	})
+}
+
 // TestTimeoutLogic tests the timeout logic without making network calls
 func TestTimeoutLogic(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		timeout       int
@@ -93,6 +151,7 @@ func TestTimeoutLogic(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Simulate the timeout check logic (timeout is in minutes, elapsed in seconds)
 			var timeoutReached bool
 			if tt.timeout > 0 {
@@ -113,11 +172,13 @@ func TestTimeoutLogic(t *testing.T) {
 // scales its implicit timeout with larger fetch windows while preserving
 // explicit user-provided timeouts.
 func TestEffectiveMCPLogsToolTimeoutMinutes(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		requestedTimeout int
 		count            int
 		workflowName     string
+		engine           string
 		want             int
 	}{
 		{
@@ -176,6 +237,24 @@ func TestEffectiveMCPLogsToolTimeoutMinutes(t *testing.T) {
 			workflowName:     "my-workflow",
 			want:             3,
 		},
+		// Engine-filtering cases: minimum 5 minutes when an engine filter is given,
+		// regardless of whether workflow_name is also present.
+		{
+			name:             "engine filtering with named workflow uses all-workflow minimum",
+			requestedTimeout: 0,
+			count:            2,
+			workflowName:     "my-workflow",
+			engine:           "claude",
+			want:             defaultMCPLogsMinTimeoutMinutesAllWorkflows,
+		},
+		{
+			name:             "engine filtering without workflow name also uses all-workflow minimum",
+			requestedTimeout: 0,
+			count:            2,
+			workflowName:     "",
+			engine:           "claude",
+			want:             defaultMCPLogsMinTimeoutMinutesAllWorkflows,
+		},
 		// All-workflow cases: minimum 5 minutes when no workflow_name is given
 		{
 			name:             "small count uses all-workflow minimum (no workflow name)",
@@ -198,12 +277,35 @@ func TestEffectiveMCPLogsToolTimeoutMinutes(t *testing.T) {
 			workflowName:     "",
 			want:             (250 + mcpLogsRunsPerDefaultTimeoutMinute - 1) / mcpLogsRunsPerDefaultTimeoutMinute, // ceil(250/mcpLogsRunsPerDefaultTimeoutMinute) > defaultMCPLogsMinTimeoutMinutesAllWorkflows
 		},
+		// Timeout cap cases: user-supplied value must not exceed maxMCPLogsSubprocessTimeoutMinutes
+		{
+			name:             "explicit timeout exactly at max is preserved",
+			requestedTimeout: maxMCPLogsSubprocessTimeoutMinutes,
+			count:            100,
+			workflowName:     "my-workflow",
+			want:             maxMCPLogsSubprocessTimeoutMinutes,
+		},
+		{
+			name:             "explicit timeout above max is capped",
+			requestedTimeout: maxMCPLogsSubprocessTimeoutMinutes + 1,
+			count:            100,
+			workflowName:     "my-workflow",
+			want:             maxMCPLogsSubprocessTimeoutMinutes,
+		},
+		{
+			name:             "very large explicit timeout is capped",
+			requestedTimeout: 100000,
+			count:            100,
+			workflowName:     "",
+			want:             maxMCPLogsSubprocessTimeoutMinutes,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := effectiveMCPLogsToolTimeoutMinutes(tt.requestedTimeout, tt.count, tt.workflowName); got != tt.want {
-				t.Errorf("effectiveMCPLogsToolTimeoutMinutes(%d, %d, %q) = %d, want %d", tt.requestedTimeout, tt.count, tt.workflowName, got, tt.want)
+			t.Parallel()
+			if got := effectiveMCPLogsToolTimeoutMinutes(tt.requestedTimeout, tt.count, tt.workflowName, tt.engine); got != tt.want {
+				t.Errorf("effectiveMCPLogsToolTimeoutMinutes(%d, %d, %q, %q) = %d, want %d", tt.requestedTimeout, tt.count, tt.workflowName, tt.engine, got, tt.want)
 			}
 		})
 	}

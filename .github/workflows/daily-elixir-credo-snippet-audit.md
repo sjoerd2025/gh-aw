@@ -29,7 +29,7 @@ network:
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   bash:
     - "*"
@@ -43,7 +43,8 @@ imports:
       reviewers: [copilot]
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 steps:
   - name: Install Credo tooling project
     run: |

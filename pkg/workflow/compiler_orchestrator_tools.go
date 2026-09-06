@@ -40,6 +40,50 @@ type toolsProcessingResult struct {
 	hasExplicitGitHubTool bool // true if tools.github was explicitly configured in frontmatter
 }
 
+// toolsAndConfigData holds the pre-markdown-expansion configuration resolved
+// from frontmatter: safe outputs, secret masking, tools/mcp-servers, and
+// runtimes. It is an intermediate result used by processToolsAndMarkdown.
+type toolsAndConfigData struct {
+	effectiveMarkdown string
+	safeOutputs       *SafeOutputsConfig
+	secretMasking     *SecretMaskingConfig
+	toolsData         *mergedToolsData
+	runtimes          map[string]any
+	runInstallScripts bool
+}
+
+// resolveToolsAndConfig resolves safe outputs, secret masking, tools/mcp-servers,
+// and runtimes configuration ahead of markdown include expansion.
+func (c *Compiler) resolveToolsAndConfig(result *parser.FrontmatterResult, markdownDir string,
+	agenticEngine CodingAgentEngine, engineSetting string, importsResult *parser.ImportsResult) (*toolsAndConfigData, error) {
+	effectiveMarkdown, err := c.extractEffectiveMarkdown(importsResult, result.Markdown)
+	if err != nil {
+		return nil, err
+	}
+	c.warnDeprecatedFrontmatterFields(result.Frontmatter)
+	safeOutputs := c.extractSafeOutputsConfig(result.Frontmatter)
+	secretMasking, err := c.resolveSecretMasking(result.Frontmatter, importsResult)
+	if err != nil {
+		return nil, err
+	}
+	toolsData, err := c.resolveToolsConfiguration(result, effectiveMarkdown, markdownDir, importsResult, agenticEngine, engineSetting)
+	if err != nil {
+		return nil, err
+	}
+	runtimes, runInstallScripts, err := c.resolveRuntimes(result.Frontmatter, importsResult)
+	if err != nil {
+		return nil, err
+	}
+	return &toolsAndConfigData{
+		effectiveMarkdown: effectiveMarkdown,
+		safeOutputs:       safeOutputs,
+		secretMasking:     secretMasking,
+		toolsData:         toolsData,
+		runtimes:          runtimes,
+		runInstallScripts: runInstallScripts,
+	}, nil
+}
+
 // processToolsAndMarkdown processes tools configuration, runtimes, and markdown content.
 // This function handles:
 // - Safe outputs and secret masking configuration
@@ -52,25 +96,13 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 	agenticEngine CodingAgentEngine, engineSetting string, importsResult *parser.ImportsResult) (*toolsProcessingResult, error) {
 	orchestratorToolsLog.Printf("Processing tools and markdown")
 	workflowLog.Print("Processing tools and includes...")
-	effectiveMarkdown, err := c.extractEffectiveMarkdown(importsResult, result.Markdown)
+
+	config, err := c.resolveToolsAndConfig(result, markdownDir, agenticEngine, engineSetting, importsResult)
 	if err != nil {
 		return nil, err
 	}
-	c.warnDeprecatedFrontmatterFields(result.Frontmatter)
-	safeOutputs := c.extractSafeOutputsConfig(result.Frontmatter)
-	secretMasking, err := c.resolveSecretMasking(result.Frontmatter, importsResult)
-	if err != nil {
-		return nil, err
-	}
-	toolsData, err := c.resolveToolsConfiguration(result, effectiveMarkdown, markdownDir, importsResult, agenticEngine)
-	if err != nil {
-		return nil, err
-	}
-	runtimes, runInstallScripts, err := c.resolveRuntimes(result.Frontmatter, importsResult)
-	if err != nil {
-		return nil, err
-	}
-	markdownData, err := c.resolveMarkdownArtifacts(effectiveMarkdown, markdownDir, cleanPath, result, importsResult, toolsData.includedToolFiles)
+
+	markdownData, err := c.resolveMarkdownArtifacts(config.effectiveMarkdown, markdownDir, cleanPath, result, importsResult, config.toolsData.includedToolFiles)
 	if err != nil {
 		return nil, err
 	}
@@ -82,28 +114,28 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 	parsedFrontmatter := c.tryParseFrontmatterConfig(result.Frontmatter)
 
 	return &toolsProcessingResult{
-		tools:                 toolsData.tools,
-		resolvedMCPServers:    toolsData.resolvedMCPServers,
-		runtimes:              runtimes,
-		runInstallScripts:     runInstallScripts,
-		toolsTimeout:          toolsData.toolsTimeout,
-		toolsStartupTimeout:   toolsData.toolsStartupTimeout,
+		tools:                 config.toolsData.tools,
+		resolvedMCPServers:    config.toolsData.resolvedMCPServers,
+		runtimes:              config.runtimes,
+		runInstallScripts:     config.runInstallScripts,
+		toolsTimeout:          config.toolsData.toolsTimeout,
+		toolsStartupTimeout:   config.toolsData.toolsStartupTimeout,
 		markdownContent:       markdownData.markdownContent,
 		importedMarkdown:      markdownData.importedMarkdown,
 		importPaths:           markdownData.importPaths,
 		promptImports:         markdownData.promptImports,
 		mainWorkflowMarkdown:  markdownData.mainWorkflowMarkdown,
-		rawMainMarkdown:       effectiveMarkdown,
+		rawMainMarkdown:       config.effectiveMarkdown,
 		allIncludedFiles:      markdownData.allIncludedFiles,
 		workflowName:          markdownData.workflowName,
 		frontmatterName:       markdownData.frontmatterName,
 		frontmatterEmoji:      markdownData.frontmatterEmoji,
 		needsTextOutput:       needsTextOutput,
 		trackerID:             trackerID,
-		safeOutputs:           safeOutputs,
-		secretMasking:         secretMasking,
+		safeOutputs:           config.safeOutputs,
+		secretMasking:         config.secretMasking,
 		parsedFrontmatter:     parsedFrontmatter,
-		hasExplicitGitHubTool: toolsData.hasExplicitGitHubTool,
+		hasExplicitGitHubTool: config.toolsData.hasExplicitGitHubTool,
 	}, nil
 }
 
@@ -174,6 +206,7 @@ func (c *Compiler) resolveToolsConfiguration(
 	markdownDir string,
 	importsResult *parser.ImportsResult,
 	agenticEngine CodingAgentEngine,
+	engineSetting string,
 ) (*mergedToolsData, error) {
 	topTools := extractToolsMapFromFrontmatter(result.Frontmatter)
 	if err := ValidateToolsSection(topTools); err != nil {
@@ -196,6 +229,9 @@ func (c *Compiler) resolveToolsConfiguration(
 		orchestratorToolsLog.Printf("Tools merge failed: %v", err)
 		return nil, fmt.Errorf("failed to merge tools: %w", err)
 	}
+	if err := expandLinearTool(tools); err != nil {
+		return nil, err
+	}
 	githubToolExplicit := hasExplicitGitHubTool(tools, topTools)
 	toolsTimeout, toolsStartupTimeout, err := c.extractToolTimeouts(tools)
 	if err != nil {
@@ -206,7 +242,15 @@ func (c *Compiler) resolveToolsConfiguration(
 		orchestratorToolsLog.Printf("MCP configuration validation failed: %v", err)
 		return nil, err
 	}
+	tools, err = enforceMCPProxyTools(agenticEngine, tools)
+	if err != nil {
+		return nil, err
+	}
 	tools = c.adjustToolsForEngineCapabilities(result.Frontmatter, agenticEngine, tools)
+	tools, err = enforceMCPProxyTools(agenticEngine, tools)
+	if err != nil {
+		return nil, err
+	}
 	if err := c.validateEngineToolRequirements(result.Frontmatter, agenticEngine, tools); err != nil {
 		return nil, err
 	}
@@ -218,6 +262,47 @@ func (c *Compiler) resolveToolsConfiguration(
 		toolsStartupTimeout:   toolsStartupTimeout,
 		hasExplicitGitHubTool: githubToolExplicit,
 	}, nil
+}
+
+// enforceMCPProxyTools exposes MCP-backed tools through CLI proxies for engines
+// that do not have an MCP client.
+func enforceMCPProxyTools(engine MCPProxyEngine, tools map[string]any) (map[string]any, error) {
+	if engine == nil || engine.GetCapabilities().MCP {
+		return tools, nil
+	}
+
+	if githubValue, exists := tools["github"]; exists {
+		switch github := githubValue.(type) {
+		case bool:
+			if !github {
+				return nil, fmt.Errorf("engine '%s' does not support MCP; tools.github cannot be disabled because gh-proxy is required", engine.GetID())
+			}
+		case map[string]any:
+			if modeValue, hasMode := github["mode"]; hasMode {
+				mode, ok := modeValue.(string)
+				if !ok || (mode != string(GitHubMCPModeGHProxy) && mode != string(GitHubMCPModeCLI)) {
+					return nil, fmt.Errorf("engine '%s' does not support MCP; tools.github.mode must be gh-proxy", engine.GetID())
+				}
+			}
+			github["mode"] = string(GitHubMCPModeGHProxy)
+		case nil, string:
+			tools["github"] = map[string]any{"mode": string(GitHubMCPModeGHProxy)}
+		}
+	}
+
+	if _, exists := tools["github"]; !exists {
+		tools["github"] = map[string]any{"mode": string(GitHubMCPModeGHProxy)}
+	} else if enabled, ok := tools["github"].(bool); ok && enabled {
+		tools["github"] = map[string]any{"mode": string(GitHubMCPModeGHProxy)}
+	}
+
+	if cliProxy, exists := tools["cli-proxy"]; exists {
+		if enabled, ok := cliProxy.(bool); ok && !enabled {
+			return nil, fmt.Errorf("engine '%s' does not support MCP; tools.cli-proxy cannot be disabled", engine.GetID())
+		}
+	}
+	tools["cli-proxy"] = true
+	return tools, nil
 }
 
 func nonEmptyStrings(values ...string) []string {
@@ -294,10 +379,10 @@ func (c *Compiler) adjustToolsForEngineCapabilities(frontmatter map[string]any, 
 	if agenticEngine.GetCapabilities().ToolsAllowlist {
 		return tools
 	}
-	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Using experimental %s support (engine: %s)", agenticEngine.GetDisplayName(), agenticEngine.GetID())))
+	fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Using experimental %s support (engine: %s)", agenticEngine.GetDisplayName(), agenticEngine.GetID())))
 	c.IncrementWarningCount()
 	if _, hasTools := frontmatter["tools"]; hasTools {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("'tools' section ignored when using engine: %s (%s doesn't support MCP tool allow-listing)", agenticEngine.GetID(), agenticEngine.GetDisplayName())))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("'tools' section ignored when using engine: %s (%s doesn't support MCP tool allow-listing)", agenticEngine.GetID(), agenticEngine.GetDisplayName())))
 		c.IncrementWarningCount()
 	}
 	return map[string]any{"github": map[string]any{}}
@@ -310,6 +395,7 @@ func (c *Compiler) validateEngineToolRequirements(frontmatter map[string]any, ag
 		func() error { return c.validateMaxToolDenialsSupport(frontmatter, agenticEngine) },
 		func() error { return c.validateUniversalLLMConsumerModel(frontmatter, agenticEngine) },
 		func() error { return c.validatePiEngineRequirements(NewTools(tools), agenticEngine) },
+		func() error { return c.validateBashCommandAllowlistSupport(tools, agenticEngine) },
 	}
 	for _, validator := range validators {
 		if err := validator(); err != nil {

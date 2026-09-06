@@ -52,6 +52,7 @@ describe("add_workflow_run_comment", () => {
     delete process.env.GITHUB_WORKFLOW;
     delete process.env.GH_AW_TRACKER_ID;
     delete process.env.GH_AW_LOCK_FOR_AGENT;
+    delete process.env.GH_AW_WORKFLOW_EMOJI;
     delete process.env.GITHUB_SERVER_URL;
     delete process.env.GH_AW_SAFE_OUTPUT_MESSAGES;
 
@@ -100,6 +101,17 @@ describe("add_workflow_run_comment", () => {
     importCounter += 1;
     return import("./add_workflow_run_comment.cjs?test=" + importCounter);
   }
+
+  describe("discussion endpoint validation", () => {
+    it("rejects malformed and non-positive discussion endpoint numbers", async () => {
+      const { parseDiscussionEndpoint } = await importAddWorkflowRunComment();
+
+      for (const endpoint of ["discussion:12junk", "discussion:0", "discussion:12:extra"]) {
+        expect(() => parseDiscussionEndpoint(endpoint, "discussion")).toThrow("Invalid discussion endpoint");
+      }
+      expect(() => parseDiscussionEndpoint("discussion_comment:5junk:2", "discussion_comment")).toThrow("Invalid discussion endpoint");
+    });
+  });
 
   // Helper function to run the script
   async function runScript() {
@@ -961,6 +973,14 @@ describe("add_workflow_run_comment", () => {
       const { buildCommentBody } = await importAddWorkflowRunComment();
       const body = buildCommentBody("issues", "https://github.com/testowner/testrepo/actions/runs/99");
       expect(body).toContain("https://github.com/testowner/testrepo/actions/runs/99");
+    });
+
+    it("should use workflow emoji from environment in the started status line", async () => {
+      process.env.GH_AW_WORKFLOW_EMOJI = "🤖";
+      const { buildCommentBody } = await importAddWorkflowRunComment();
+      const body = buildCommentBody("issues", "https://example.com/run/1");
+      expect(body).toContain("🤖 [");
+      expect(body).not.toContain("🚀 [");
     });
 
     it("should always include reaction comment type marker", async () => {

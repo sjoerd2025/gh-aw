@@ -25,7 +25,7 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 	// Extract custom steps and outputs from jobs.pre-activation if present.
 	customSteps, customOutputs, err := c.extractPreActivationCustomFields(data.Jobs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to extract pre-activation custom fields: %w", err)
+		return nil, fmt.Errorf("failed to extract pre-activation custom fields (check that jobs.pre_activation and jobs.activation only use 'steps', 'outputs', and 'pre-steps' fields): %w", err)
 	}
 
 	setupActionRef := c.resolveActionReference("./actions/setup", data)
@@ -65,10 +65,14 @@ func (c *Compiler) buildPreActivationJob(data *WorkflowData, needsPermissionChec
 		steps = append(steps, c.generateScriptModeCleanupStep())
 	}
 
+	runsOn := c.formatFrameworkJobRunsOn(data)
+	if data.OnRestoreMemory && data.DriveMemoryConfig != nil && len(data.DriveMemoryConfig.Drives) > 0 {
+		runsOn = "runs-on: ubuntu-latest"
+	}
 	return &Job{
 		Name:        string(constants.PreActivationJobName),
 		If:          jobIfCondition,
-		RunsOn:      c.formatFrameworkJobRunsOn(data),
+		RunsOn:      runsOn,
 		Environment: c.indentYAMLLines(resolveSafeOutputsEnvironment(data), "    "),
 		Permissions: permissions,
 		Steps:       steps,
@@ -92,8 +96,8 @@ func (c *Compiler) buildPreActivationPermissions(data *WorkflowData, setupAction
 	if needsContentsRead {
 		perms = NewPermissionsContentsRead()
 	}
-	// Add actions: read permission if rate limiting is configured (needed to query workflow runs).
-	if data.RateLimit != nil {
+	// Add actions: read permission if run history checks are configured.
+	if data.RateLimit != nil || data.Cooldown > 0 {
 		if perms == nil {
 			perms = NewPermissions()
 		}
@@ -123,11 +127,21 @@ func (c *Compiler) buildPreActivationPermissions(data *WorkflowData, setupAction
 }
 
 func (c *Compiler) buildPreActivationCheckSteps(data *WorkflowData, steps []string, needsPermissionCheck bool) []string {
+	// For command workflows, run command position check before the membership check.
+	// check_membership uses an if: condition that requires command_position_ok == 'true',
+	// so the command check must execute first. This prevents a confusing "access denied"
+	// warning from appearing when an issue is opened without the slash command.
+	if len(data.Command) > 0 {
+		steps = c.appendPreActivationCommandPositionStep(data, steps)
+	}
 	if needsPermissionCheck {
 		steps = c.generateMembershipCheck(data, steps)
 	}
 	if data.RateLimit != nil {
 		steps = c.generateRateLimitCheck(data, steps)
+	}
+	if data.Cooldown > 0 {
+		steps = c.generateCooldownCheck(data, steps)
 	}
 	if data.StopTime == "" {
 		return steps
@@ -235,9 +249,8 @@ func (c *Compiler) buildPreActivationRolesBotsCmdSteps(data *WorkflowData, steps
 	if len(data.SkipBots) > 0 {
 		steps = c.appendPreActivationSkipBotsStep(data, steps)
 	}
-	if len(data.Command) > 0 {
-		steps = c.appendPreActivationCommandPositionStep(data, steps)
-	}
+	// Command position step is added in buildPreActivationCheckSteps (before check_membership)
+	// for command workflows so that check_membership can be made conditional on it.
 	return steps
 }
 
@@ -254,20 +267,26 @@ func (c *Compiler) buildPreActivationMemoryRestoreSteps(data *WorkflowData, step
 		steps = append(steps, cacheMemorySteps.String())
 	}
 
+	var driveMemorySteps strings.Builder
+	c.generatePreActivationDriveMemoryRestoreSteps(&driveMemorySteps, data)
+	if driveMemorySteps.Len() > 0 {
+		steps = append(steps, driveMemorySteps.String())
+	}
+
 	var repoMemorySteps strings.Builder
 	generateRepoMemorySteps(&repoMemorySteps, data)
 	if repoMemorySteps.Len() > 0 {
 		steps = append(steps, repoMemorySteps.String())
 	}
 
-	if data.SafeOutputs != nil && data.SafeOutputs.CommentMemory != nil {
+	if data.CommentMemoryConfig != nil {
 		if configLines, ok := c.generateCommentMemoryEarlyConfigLines(data); ok {
 			steps = append(steps, strings.Join(configLines, ""))
 			var commentMemorySteps strings.Builder
 			commentMemorySteps.WriteString("      - name: Prepare comment memory files\n")
 			fmt.Fprintf(&commentMemorySteps, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
 			commentMemorySteps.WriteString("        with:\n")
-			fmt.Fprintf(&commentMemorySteps, "          github-token: %s\n", getEffectiveSafeOutputGitHubToken(data.SafeOutputs.CommentMemory.GitHubToken))
+			fmt.Fprintf(&commentMemorySteps, "          github-token: %s\n", getEffectiveSafeOutputGitHubToken(data.CommentMemoryConfig.GitHubToken))
 			commentMemorySteps.WriteString("          script: |\n")
 			commentMemorySteps.WriteString("            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');\n")
 			commentMemorySteps.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
@@ -278,6 +297,13 @@ func (c *Compiler) buildPreActivationMemoryRestoreSteps(data *WorkflowData, step
 	}
 
 	return steps
+}
+
+func (c *Compiler) generatePreActivationDriveMemoryRestoreSteps(builder *strings.Builder, data *WorkflowData) {
+	if data.DriveMemoryConfig == nil || len(data.DriveMemoryConfig.Drives) == 0 {
+		return
+	}
+	generateDriveMemorySteps(builder, driveMemoryRestoreOnlyData(data), c.getActionPin)
 }
 
 func generatePreActivationCacheMemoryRestoreSteps(builder *strings.Builder, data *WorkflowData) {
@@ -373,7 +399,7 @@ func (c *Compiler) injectPreActivationOnSteps(data *WorkflowData, steps, customS
 	for i, stepMap := range data.OnSteps {
 		stepYAML, err := ConvertStepToYAML(stepMap)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to convert on.steps[%d] to YAML: %w", i, err)
+			return nil, nil, fmt.Errorf("failed to convert on.steps[%d] to YAML (ensure the step is a valid GitHub Actions step object with 'name', 'uses', or 'run' fields): %w", i, err)
 		}
 		steps = append(steps, stepYAML)
 		if id, ok := stepMap["id"].(string); ok && id != "" {
@@ -391,7 +417,8 @@ func buildPreActivationActivatedConditions(data *WorkflowData, needsPermissionCh
 func buildPreActivationMembershipAndTimeConditions(data *WorkflowData, needsPermissionCheck bool) []ConditionNode {
 	conditions := appendPreActivationCondition(nil, needsPermissionCheck, constants.CheckMembershipStepID, constants.IsTeamMemberOutput)
 	conditions = appendPreActivationCondition(conditions, data.StopTime != "", constants.CheckStopTimeStepID, constants.StopTimeOkOutput)
-	return appendPreActivationCondition(conditions, data.RateLimit != nil, constants.CheckRateLimitStepID, constants.RateLimitOkOutput)
+	conditions = appendPreActivationCondition(conditions, data.RateLimit != nil, constants.CheckRateLimitStepID, constants.RateLimitOkOutput)
+	return appendPreActivationCondition(conditions, data.Cooldown > 0, constants.CheckCooldownStepID, constants.CooldownOkOutput)
 }
 
 func buildPreActivationSkipAndCommandConditions(data *WorkflowData) []ConditionNode {
@@ -436,7 +463,7 @@ func buildPreActivationActivatedNode(data *WorkflowData, conditions []ConditionN
 			)
 			return BuildStringLiteral("true"), nil
 		}
-		return nil, errors.New("developer error: pre-activation job created without permission check or stop-time configuration")
+		return nil, errors.New("developer error: pre-activation job created without activation checks or custom steps")
 	}
 	if len(conditions) == 1 {
 		return conditions[0], nil
@@ -668,7 +695,7 @@ func validatePreActivationJobConfig(jobs map[string]any, jobName string) (map[st
 
 	configMap, ok := preActivationJob.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("jobs.%s must be an object, got %T", jobName, preActivationJob)
+		return nil, fmt.Errorf("jobs.%s must be an object, got %T. Example:\njobs:\n  %s:\n    steps:\n      - run: echo hello", jobName, preActivationJob, jobName)
 	}
 
 	allowedFields := map[string]struct{}{
@@ -679,12 +706,12 @@ func validatePreActivationJobConfig(jobs map[string]any, jobName string) (map[st
 	for field := range configMap {
 		if field == "setup-steps" {
 			return nil, fmt.Errorf(
-				"jobs.%s.setup-steps is not allowed: setup-steps are refused for activation/pre-activation jobs because they can short-circuit protections",
-				jobName,
+				"jobs.%s.setup-steps is not allowed for activation/pre-activation jobs because it can short-circuit protections. Use 'steps', 'outputs', or 'pre-steps' instead. Example:\njobs:\n  %s:\n    steps:\n      - run: echo hello",
+				jobName, jobName,
 			)
 		}
 		if !setutil.Contains(allowedFields, field) {
-			return nil, fmt.Errorf("jobs.%s: unsupported field '%s' - only 'steps', 'outputs', and 'pre-steps' are allowed", jobName, field)
+			return nil, fmt.Errorf("jobs.%s: unsupported field '%s'. Only 'steps', 'outputs', and 'pre-steps' are allowed. Example:\njobs:\n  %s:\n    steps:\n      - run: echo hello", jobName, field, jobName)
 		}
 	}
 	return configMap, nil
@@ -699,18 +726,18 @@ func extractPreActivationJobSteps(jobName string, configMap map[string]any) ([]s
 
 	stepsList, ok := stepsValue.([]any)
 	if !ok {
-		return nil, fmt.Errorf("jobs.%s.steps must be an array, got %T", jobName, stepsValue)
+		return nil, fmt.Errorf("jobs.%s.steps must be an array of step objects, got %T. Example:\njobs:\n  %s:\n    steps:\n      - run: echo hello", jobName, stepsValue, jobName)
 	}
 
 	var steps []string
 	for i, step := range stepsList {
 		stepMap, ok := step.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("jobs.%s.steps[%d] must be an object, got %T", jobName, i, step)
+			return nil, fmt.Errorf("jobs.%s.steps[%d] must be an object, got %T. Example:\njobs:\n  %s:\n    steps:\n      - run: echo hello", jobName, i, step, jobName)
 		}
 		stepYAML, err := ConvertStepToYAML(stepMap)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert jobs.%s.steps[%d] to YAML: %w", jobName, i, err)
+			return nil, fmt.Errorf("failed to convert jobs.%s.steps[%d] to YAML (ensure the step is a valid GitHub Actions step object with 'name', 'uses', or 'run' fields): %w", jobName, i, err)
 		}
 		steps = append(steps, stepYAML)
 	}
@@ -727,7 +754,7 @@ func extractPreActivationJobOutputs(jobName string, configMap map[string]any) (m
 
 	outputsMap, ok := outputsValue.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("jobs.%s.outputs must be an object, got %T", jobName, outputsValue)
+		return nil, fmt.Errorf("jobs.%s.outputs must be an object mapping output names to expressions, got %T. Example:\njobs:\n  %s:\n    outputs:\n      result: ${{ steps.my_step.outputs.result }}", jobName, outputsValue, jobName)
 	}
 
 	// If the same output key is defined in both variants, the second one (pre_activation) wins.
@@ -735,7 +762,7 @@ func extractPreActivationJobOutputs(jobName string, configMap map[string]any) (m
 	for key, val := range outputsMap {
 		valStr, ok := val.(string)
 		if !ok {
-			return nil, fmt.Errorf("jobs.%s.outputs.%s must be a string, got %T", jobName, key, val)
+			return nil, fmt.Errorf("jobs.%s.outputs.%s must be a string, got %T. Example:\njobs:\n  %s:\n    outputs:\n      %s: ${{ steps.my_step.outputs.result }}", jobName, key, val, jobName, key)
 		}
 		result[key] = valStr
 	}
@@ -833,14 +860,14 @@ func extractOnSteps(frontmatter map[string]any) ([]map[string]any, error) {
 
 	stepsList, ok := stepsValue.([]any)
 	if !ok {
-		return nil, fmt.Errorf("on.steps must be an array, got %T", stepsValue)
+		return nil, fmt.Errorf("on.steps must be an array of step objects, got %T. Example:\non:\n  steps:\n    - run: echo hello", stepsValue)
 	}
 
 	result := make([]map[string]any, 0, len(stepsList))
 	for i, step := range stepsList {
 		stepMap, ok := step.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("on.steps[%d] must be an object, got %T", i, step)
+			return nil, fmt.Errorf("on.steps[%d] must be an object, got %T. Example:\non:\n  steps:\n    - run: echo hello", i, step)
 		}
 		result = append(result, stepMap)
 	}
@@ -911,7 +938,7 @@ func extractOnRestoreMemory(frontmatter map[string]any) (bool, error) {
 
 	restoreMemory, ok := restoreMemoryValue.(bool)
 	if !ok {
-		return false, fmt.Errorf("on.restore-memory must be a boolean, got %T", restoreMemoryValue)
+		return false, fmt.Errorf("on.restore-memory must be a boolean, got %T. Example:\non:\n  restore-memory: true", restoreMemoryValue)
 	}
 
 	return restoreMemory, nil
@@ -929,14 +956,14 @@ func parseOnNeedsValues(onMap map[string]any) ([]string, error) {
 
 	needsList, ok := needsValue.([]any)
 	if !ok {
-		return nil, fmt.Errorf("on.needs must be an array, got %T", needsValue)
+		return nil, fmt.Errorf("on.needs must be an array of job names, got %T. Example:\non:\n  needs: [\"build\"]", needsValue)
 	}
 
 	result := make([]string, 0, len(needsList))
 	for i, need := range needsList {
 		needStr, ok := need.(string)
 		if !ok {
-			return nil, fmt.Errorf("on.needs[%d] must be a string, got %T", i, need)
+			return nil, fmt.Errorf("on.needs[%d] must be a string job name, got %T. Example:\non:\n  needs: [\"build\"]", i, need)
 		}
 		result = append(result, needStr)
 	}

@@ -8,41 +8,34 @@ import (
 	"go/ast"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/coverage"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the append-byte-string analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "appendbytestring",
-	Doc:      "reports append(b, []byte(s)...) calls where s is a string that can be simplified to append(b, s...)",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/appendbytestring",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
+var Analyzer = analyzerutil.New("appendbytestring", "reports append(b, []byte(s)...) calls where s is a string that can be simplified to append(b, s...)", run)
+
+// hotThreshold gates findings on coverage data; see coverage package docs.
+var hotThreshold *int
+
+func init() {
+	hotThreshold = coverage.RegisterHotThresholdFlag(Analyzer)
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeAppendByteString(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeAppendByteString checks whether a call is an append(b, []byte(s)...)
@@ -93,6 +86,9 @@ func analyzeAppendByteString(pass *analysis.Pass, n ast.Node, generatedFiles fil
 
 	sText := astutil.NodeText(pass.Fset, strArg)
 	if sText == "" {
+		return
+	}
+	if !coverage.ShouldApply(pass, call.Pos(), *hotThreshold) {
 		return
 	}
 

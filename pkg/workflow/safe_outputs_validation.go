@@ -1,7 +1,9 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -10,9 +12,11 @@ import (
 
 var safeOutputsDomainsValidationLog = logger.New("workflow:safe_outputs_domains_validation")
 
+type SafeOutputsURLsPolicy string
+
 const (
-	SafeOutputsURLsPolicyAllowedOnly         = "allowed-only"
-	SafeOutputsURLsPolicyAllowedOrCodeRegion = "allowed-or-code-region"
+	SafeOutputsURLsPolicyAllowedOnly         SafeOutputsURLsPolicy = "allowed-only"
+	SafeOutputsURLsPolicyAllowedOrCodeRegion SafeOutputsURLsPolicy = "allowed-or-code-region"
 )
 
 // validateSafeOutputsURLs validates the urls policy in safe-outputs.
@@ -26,10 +30,11 @@ func validateSafeOutputsURLs(config *SafeOutputsConfig) error {
 		return nil
 	default:
 		return fmt.Errorf(
-			"safe-outputs.urls: invalid value %q (expected one of: %q, %q)",
+			"safe-outputs.urls: invalid value %q. Expected one of: %q, %q. Example:\n  safe-outputs:\n    urls: %q",
 			config.URLs,
 			SafeOutputsURLsPolicyAllowedOnly,
 			SafeOutputsURLsPolicyAllowedOrCodeRegion,
+			SafeOutputsURLsPolicyAllowedOnly,
 		)
 	}
 }
@@ -203,12 +208,17 @@ func validateTargetValue(configName, target string) error {
 	if target == "event" || strings.Contains(target, "github.event") {
 		suggestion = "\n\nDid you mean to use \"${{ github.event.issue.number }}\" instead of \"" + target + "\"?"
 	}
+	exampleTargetKey := configName
+	if idx := strings.LastIndex(exampleTargetKey, "."); idx >= 0 {
+		exampleTargetKey = exampleTargetKey[idx+1:]
+	}
 
 	// Invalid target value
 	return fmt.Errorf(
-		"invalid target value for %s: %q\n\nValid target values are:\n  - \"triggering\" (default) - targets the triggering issue/PR/discussion\n  - \"*\" - targets any item specified in the output\n  - A positive integer (e.g., \"123\")\n  - A GitHub Actions expression (e.g., \"${{ github.event.issue.number }}\")%s",
+		"invalid target value for %s: %q. Expected one of: \"triggering\", \"*\", a positive integer like \"123\", or a GitHub Actions expression like \"${{ github.event.issue.number }}\".\n\nExample:\n  safe-outputs:\n    %s:\n      target: \"triggering\"%s",
 		configName,
 		target,
+		exampleTargetKey,
 		suggestion,
 	)
 }
@@ -229,7 +239,7 @@ func validateSafeOutputsMergePullRequest(config *SafeOutputsConfig) error {
 	validateNonEmptyStringList := func(field string, values []string) error {
 		for i, value := range values {
 			if strings.TrimSpace(value) == "" {
-				return fmt.Errorf("safe-outputs.merge-pull-request.%s[%d] cannot be empty", field, i)
+				return fmt.Errorf("safe-outputs.merge-pull-request.%s[%d] cannot be empty. Expected a non-empty string value. Example:\n  safe-outputs:\n    merge-pull-request:\n      %s:\n        - \"safe-to-merge\"", field, i, field)
 			}
 		}
 		return nil
@@ -237,7 +247,7 @@ func validateSafeOutputsMergePullRequest(config *SafeOutputsConfig) error {
 
 	validateRefGlobList := func(field string, patterns []string) error {
 		return validateGlobPatternList(patterns, validateRefGlob, func(i int, pat string, msgs []string) error {
-			return fmt.Errorf("invalid glob pattern %q in safe-outputs.merge-pull-request.%s[%d]: %s", pat, field, i, strings.Join(msgs, "; "))
+			return fmt.Errorf("invalid glob pattern %q in safe-outputs.merge-pull-request.%s[%d]: %s. Expected a valid ref glob pattern. Example:\n  safe-outputs:\n    merge-pull-request:\n      %s:\n        - \"feature/*\"", pat, field, i, strings.Join(msgs, "; "), field)
 		})
 	}
 
@@ -296,4 +306,44 @@ func validateSafeOutputsAllowWorkflows(safeOutputs *SafeOutputsConfig) error {
 
 	safeOutputsAllowWorkflowsValidationLog.Print("allow-workflows validation passed")
 	return nil
+}
+
+func normalizeApproveWorkflowRunAllowedWorkflowPattern(pattern string) string {
+	extension := path.Ext(pattern)
+	if strings.EqualFold(extension, ".yaml") {
+		return strings.TrimSuffix(pattern, extension) + ".yml"
+	}
+	return pattern
+}
+
+// validateSafeOutputsApproveWorkflowRun requires an explicitly configured external
+// token or GitHub App because github.token cannot approve workflow runs for fork PRs.
+func validateSafeOutputsApproveWorkflowRun(safeOutputs *SafeOutputsConfig) error {
+	if safeOutputs == nil || safeOutputs.ApproveWorkflowRun == nil {
+		return nil
+	}
+
+	config := safeOutputs.ApproveWorkflowRun
+	if len(config.AllowedWorkflows) == 0 {
+		return errors.New("safe-outputs.approve-workflow-run: requires a non-empty allowed-workflows list")
+	}
+	for _, pattern := range config.AllowedWorkflows {
+		if path.Base(pattern) != pattern {
+			return fmt.Errorf("safe-outputs.approve-workflow-run.allowed-workflows: %q must match a workflow filename, not a path", pattern)
+		}
+		if _, err := path.Match(normalizeApproveWorkflowRunAllowedWorkflowPattern(pattern), ""); err != nil {
+			return fmt.Errorf("safe-outputs.approve-workflow-run.allowed-workflows: invalid wildcard pattern %q: %w", pattern, err)
+		}
+	}
+	if templatableBoolIsTrue(safeOutputs.Staged) || templatableBoolIsTrue(config.Staged) {
+		return nil
+	}
+	if config.GitHubToken != "" || config.GitHubApp != nil || safeOutputs.GitHubToken != "" || safeOutputs.GitHubApp != nil {
+		return nil
+	}
+
+	return errors.New(
+		"safe-outputs.approve-workflow-run: requires an external github-token or github-app because github.token cannot approve workflow runs requiring approval.\n\n" +
+			"Example:\n  safe-outputs:\n    approve-workflow-run:\n      github-token: ${{ secrets.APPROVE_WORKFLOW_RUN_TOKEN }}",
+	)
 }

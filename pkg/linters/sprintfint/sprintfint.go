@@ -8,12 +8,11 @@ import (
 	"go/token"
 	"go/types"
 
-	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
-
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"golang.org/x/tools/go/analysis"
 )
 
 const (
@@ -22,33 +21,18 @@ const (
 )
 
 // Analyzer is the sprintfint analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "sprintfint",
-	Doc:      `reports fmt.Sprintf("%d", x) calls where x is a single int value; use strconv.Itoa(x) instead`,
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/sprintfint",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("sprintfint", `reports fmt.Sprintf("%d", x) calls where x is a single int value; use strconv.Itoa(x) instead`, run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 	seenImportFiles := make(map[token.Pos]bool)
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeSprintfInt(pass, n, generatedFiles, noLintIndex, seenImportFiles)
 	})
-	return nil, nil
 }
 
 // analyzeSprintfInt checks whether a call expression is fmt.Sprintf("%d", x)
@@ -158,32 +142,15 @@ func buildImportEdits(pass *analysis.Pass, file *ast.File, seenImportFiles map[t
 		return nil
 	}
 
-	_, strconvImported := astutil.ImportedAs(file, pass.TypesInfo, strconvPkg)
-	_, fmtImported := astutil.ImportedAs(file, pass.TypesInfo, fmtPkg)
-
 	// If the flagged call is the only "fmt" reference in the file the "fmt"
 	// import will become unused after the fix and must be removed.
+	_, fmtImported := astutil.ImportedAs(file, pass.TypesInfo, fmtPkg)
 	orphanFmt := fmtImported && astutil.CountPkgUsesInFile(pass, file, fmtPkg) == 1
 
-	needStrconv := !strconvImported
-	needRemoveFmt := orphanFmt
-
-	if !needStrconv && !needRemoveFmt {
+	edits, needed := astutil.SwapPkgImportEdits(pass, file, strconvPkg, fmtPkg, orphanFmt)
+	if !needed {
 		return nil
 	}
 	seenImportFiles[file.Pos()] = true
-
-	switch {
-	case needStrconv && needRemoveFmt:
-		return astutil.SwapImportEdits(pass.Fset, file, strconvPkg, fmtPkg)
-	case needStrconv:
-		if edit, ok := astutil.AddImportEdit(pass, file, strconvPkg); ok {
-			return []analysis.TextEdit{edit}
-		}
-	case needRemoveFmt:
-		if edit, ok := astutil.RemoveImportEdit(pass.Fset, file, fmtPkg); ok {
-			return []analysis.TextEdit{edit}
-		}
-	}
-	return nil
+	return edits
 }

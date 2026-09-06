@@ -30,6 +30,7 @@ tools:
     - "mkdir -p /tmp/gh-aw/cache-memory"
     - "python3 *"
 safe-outputs:
+  steer: true
   create-pull-request:
     title-prefix: "[evoskill] "
     labels: [automation, prompt-quality]
@@ -48,6 +49,8 @@ evals:
     question: Did the workflow create or refine exactly one focused skill without changing files outside .github/skills?
   - id: evidence_based_selection
     question: Was the candidate accepted only when its validation score exceeded the baseline without a regression?
+imports:
+  - shared/reporting.md
 ---
 
 # EvoSkill Evolver

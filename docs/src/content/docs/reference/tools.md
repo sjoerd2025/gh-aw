@@ -38,6 +38,83 @@ tools:
 
 See **[GitHub Tools Reference](/gh-aw/reference/github-tools/)** for complete configuration options.
 
+### Linear Tools (`linear:`)
+
+Connect to [Linear's official hosted MCP server](https://linear.app/docs/mcp) using the well-known `LINEAR_API_KEY` GitHub Actions secret:
+
+```yaml wrap
+tools:
+  linear: {}
+```
+
+Set `token` to use a different secret containing a Linear API key or OAuth access token. The integration uses Streamable HTTP through the MCP gateway and always uses Linear's server-enforced read-only endpoint. Use `allowed` to restrict tool names and `required: false` to make Linear connectivity best-effort:
+
+```yaml wrap
+tools:
+  linear:
+    token: ${{ secrets.CUSTOM_LINEAR_TOKEN }}
+    allowed: ["*"]
+    required: true
+```
+
+Use `toolsets` to enable related groups of tools without maintaining individual tool names:
+
+```yaml wrap
+tools:
+  linear:
+    toolsets: [issues, projects]
+```
+
+Supported toolsets are `all`, `attachments`, `comments`, `customers`, `cycles`, `diffs`, `documentation`, `documents`, `initiatives`, `issues`, `milestones`, `projects`, `status_updates`, `teams`, and `users`. The compiler expands toolsets into the gateway's allowed-tool list. If `allowed` is also set, each name or wildcard must match a tool in the selected toolsets.
+
+The Linear credential is passed to the gateway as an environment variable and sent as an `Authorization: Bearer` header. It is not embedded in MCP configuration. Linear works with `tools.cli-proxy: true` like other remote MCP servers.
+### Jira Tools (`jira:`)
+
+Connect to Atlassian's official remote Rovo MCP endpoint from non-interactive GitHub Actions workloads. Browser OAuth, device login, and user-consent flows are not supported.
+
+Use an Atlassian service account API key:
+
+```yaml wrap
+tools:
+  jira:
+    auth:
+      type: service-account
+      token: ${{ secrets.ATLASSIAN_SERVICE_ACCOUNT_API_KEY }}
+    allowed:
+      - getJiraIssue
+      - searchJiraIssuesUsingJql
+```
+
+Or use an Atlassian account email and API token:
+
+```yaml wrap
+tools:
+  jira:
+    auth:
+      type: api-token
+      email: ${{ secrets.ATLASSIAN_EMAIL }}
+      token: ${{ secrets.ATLASSIAN_API_TOKEN }}
+    allowed:
+      - getJiraIssue
+      - searchJiraIssuesUsingJql
+```
+
+The `allowed` list is required and accepts only these read-only Jira tools:
+
+- `getIssueLinkTypes`
+- `getJiraIssue`
+- `getJiraIssueRemoteIssueLinks`
+- `getJiraIssueTypeMetaWithFields`
+- `getJiraProjectIssueTypesMetadata`
+- `getTransitionsForJiraIssue`
+- `getVisibleJiraProjects`
+- `lookupJiraAccountId`
+- `searchJiraIssuesUsingJql`
+
+`allowed: ["*"]` is also accepted as shorthand for enabling all nine tools above; it is expanded to that fixed list at compile time and never grants access to the full, unrestricted MCP tool set. Omitting `allowed` or naming a write-capable tool is rejected.
+
+The endpoint defaults to `https://mcp.atlassian.com/v1/mcp`. Set `url` only when your organization uses another HTTPS Atlassian MCP endpoint. Credentials must be direct GitHub Actions secret expressions; service account keys use the HTTP bearer scheme while API tokens use HTTP Basic authentication generated at runtime.
+
 ### Bash Tool (`bash:`)
 
 Enables shell command execution in the workspace. Defaults to safe commands (`echo`, `printf`, `ls`, `pwd`, `cat`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `date`, `yq`).
@@ -89,6 +166,15 @@ tools:
 
 See **[Cache Memory Reference](/gh-aw/reference/cache-memory/)** for complete configuration options and usage examples.
 
+### Drive Memory (`drive-memory:`) — Private Preview
+
+Drive memory is an experimental, feature-gated GitHub Drives integration. Do not
+configure it unless GitHub has explicitly enrolled the repository in the private
+preview.
+
+The [Drive Memory Reference](/gh-aw/experimental/drive-memory/) records the preview
+behavior for enrolled repositories; it is not a recommendation for general use.
+
 ### Repo Memory (`repo-memory:`)
 
 Repository-specific memory storage for maintaining context across executions.
@@ -111,7 +197,7 @@ tools:
       - pattern: "docs/**/*.md"
 ```
 
-See **[QMD Reference](/gh-aw/reference/qmd/)** for complete configuration options, checkout support, GitHub search integration, and cache key usage.
+See **[QMD Documentation Search](/gh-aw/experimental/qmd/)** for complete configuration options, checkout support, GitHub search integration, and cache key usage.
 
 ### Introspection on Agentic Workflows (`agentic-workflows:`)
 
@@ -149,6 +235,18 @@ The MCP gateway configuration is unchanged — servers still start as normal. On
 This reduces token consumption from large MCP tool schemas and can simplify workflow prompts when shell-style invocation is preferred.
 
 Defaults to `false`.
+
+CLI mounting requires shell access: the wrappers are ordinary executables invoked from bash. GitHub `gh-proxy` mode is also shell-backed because GitHub reads are performed with the `gh` CLI. When `tools.bash` is disabled (`bash: false` or `bash: []`), `cli-proxy: true` and `tools.github.mode: gh-proxy` are rejected at compile time, and strict mode requires `cli-proxy: false` to be stated explicitly:
+
+```yaml wrap
+tools:
+  bash: false
+  cli-proxy: false
+  github:
+    mode: local
+```
+
+With `cli-proxy: false` and an MCP-backed GitHub mode (`local` or `remote`), MCP servers (including `safeoutputs`) remain available through the MCP protocol, and the CLI-only instructions are omitted from the generated prompt. Run `gh aw fix` to add the explicit setting to existing workflows.
 
 ## Tool Timeout Configuration
 
@@ -195,7 +293,21 @@ mcp-servers:
     allowed: ["send_message", "get_channel_history"]
 ```
 
-**Options**: `command` + `args` (process-based), `container` (Docker image), `url` + `headers` (HTTP endpoint), `registry` (MCP registry URI), `env` (environment variables), `allowed` (tool restrictions). See [MCPs Guide](/gh-aw/guides/mcps/) for setup.
+**Options**: `command` + `args` (process-based), `container` (Docker image), `url` + `headers` (HTTP endpoint), `registry` (MCP registry URI), `env` (environment variables), `allowed` (tool restrictions), `required` (startup criticality). See [MCPs Guide](/gh-aw/guides/mcps/) for setup.
+
+### Required Field
+
+MCP servers must pass a startup connectivity check before the agent starts. By default every server is startup-critical: if it cannot be reached, the workflow fails. Set `required: false` to mark a server as best-effort, so an unreachable server logs a warning and the workflow continues without it:
+
+```yaml wrap
+mcp-servers:
+  datadog:
+    type: http
+    url: "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
+    required: false
+```
+
+Use this for optional integrations whose transient outages (for example an HTTP 503 from a hosted endpoint) should not take down the other configured servers. At least one server must still connect successfully for startup to proceed.
 
 ### Registry Field
 
@@ -209,14 +321,11 @@ mcp-servers:
     args: ["-y", "@modelcontextprotocol/server-filesystem"]
 ```
 
-## Related Documentation
+## Learn More
 
 - [GitHub Tools](/gh-aw/reference/github-tools/) - GitHub API operations, toolsets, and modes
 - [Playwright](/gh-aw/reference/playwright/) - Browser automation and testing configuration
 - [Cache Memory](/gh-aw/reference/cache-memory/) - Persistent memory across workflow runs
 - [Repo Memory](/gh-aw/reference/repo-memory/) - Repository-specific memory storage
-- [QMD Documentation Search](/gh-aw/reference/qmd/) - Vector similarity search over documentation files
 - [MCP Scripts](/gh-aw/reference/mcp-scripts/) - Define custom inline tools with JavaScript or shell scripts
-- [Frontmatter](/gh-aw/reference/frontmatter/) - All frontmatter configuration options
-- [Network Permissions](/gh-aw/reference/network/) - Network access control for AI engines
 - [MCPs](/gh-aw/guides/mcps/) - Complete Model Context Protocol setup and usage

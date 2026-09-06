@@ -7,13 +7,19 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/github/gh-aw/pkg/logger"
 )
+
+var consoleWasmLog = logger.New("console:console_wasm")
 
 func isTTY() bool {
 	return false
 }
 
 func FormatError(err CompilerError) string {
+	consoleWasmLog.Printf("FormatError: type=%s, file=%s, line=%d", err.Type, err.Position.File, err.Position.Line)
+
 	var output strings.Builder
 
 	var prefix string
@@ -38,6 +44,7 @@ func FormatError(err CompilerError) string {
 	output.WriteString("\n")
 
 	if len(err.Context) > 0 && err.Position.Line > 0 {
+		consoleWasmLog.Printf("FormatError: rendering %d lines of source context", len(err.Context))
 		maxLineNum := err.Position.Line + len(err.Context)/2
 		lineNumWidth := len(strconv.Itoa(maxLineNum))
 		for i, line := range err.Context {
@@ -65,6 +72,8 @@ func FormatError(err CompilerError) string {
 	return output.String()
 }
 
+func FormatErrorStderr(err CompilerError) string { return FormatError(err) }
+
 func FormatSuccessMessage(message string) string       { return "✓ " + message }
 func FormatSuccessMessageStderr(message string) string { return "✓ " + message }
 func FormatInfoMessage(message string) string          { return "i " + message }
@@ -78,14 +87,17 @@ func FormatLocationMessage(message string) string      { return "~ " + message }
 func FormatCommandMessage(command string) string       { return "$ " + command }
 func FormatCommandMessageStderr(command string) string { return "$ " + command }
 func FormatProgressMessage(message string) string      { return "▸ " + message }
-func FormatPromptMessage(message string) string        { return "? " + message }
-func FormatCountMessage(message string) string         { return "# " + message }
-func FormatVerboseMessage(message string) string       { return "» " + message }
-func FormatListHeader(header string) string            { return header }
-func FormatListItem(item string) string                { return "  • " + item }
-func FormatListItemStderr(item string) string          { return "  • " + item }
-func FormatSectionHeader(header string) string         { return header }
-func FormatSectionHeaderStderr(header string) string   { return header }
+func FormatProgressMessageStderr(message string) string {
+	return "▸ " + message
+}
+func FormatPromptMessage(message string) string      { return "? " + message }
+func FormatCountMessage(message string) string       { return "# " + message }
+func FormatVerboseMessage(message string) string     { return "» " + message }
+func FormatListHeader(header string) string          { return header }
+func FormatListItem(item string) string              { return "  • " + item }
+func FormatListItemStderr(item string) string        { return "  • " + item }
+func FormatSectionHeader(header string) string       { return header }
+func FormatSectionHeaderStderr(header string) string { return header }
 
 // FormatErrorChain formats an error and its full unwrapped chain.
 // In the WASM build there is no rich terminal styling; the top-level error
@@ -147,6 +159,7 @@ func RenderComposedSections(sections []string) {
 }
 
 func RenderTree(root TreeNode) string {
+	consoleWasmLog.Printf("RenderTree: rendering tree rooted at %q with %d children", root.Value, len(root.Children))
 	var render func(node TreeNode, prefix string, isLast bool) string
 	render = func(node TreeNode, prefix string, isLast bool) string {
 		var output strings.Builder

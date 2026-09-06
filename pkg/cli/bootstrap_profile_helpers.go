@@ -177,7 +177,7 @@ func profileSourcesUseActionsTokenCopilotAuth(ctx context.Context, sources []str
 	}
 	hasCopilot := false
 	for _, candidate := range resolved.Workflows {
-		if candidate == nil || candidate.IsActionWorkflow || candidate.IsPackageSkillFile || candidate.IsPackageAgentFile {
+		if candidate == nil || candidate.IsActionWorkflow || candidate.IsPackageSkillFile || candidate.IsPackageAgentFile || candidate.IsPackageResourceFile {
 			continue
 		}
 		engine := strings.TrimSpace(candidate.Engine)
@@ -358,6 +358,11 @@ func openBootstrapBrowser(url string) bool {
 		if err := cmd.Start(); err == nil {
 			bootstrapProfileHelpersLog.Printf("Launched browser via %q", args[0])
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						bootstrapProfileHelpersLog.Printf("Panic waiting for browser process (recovered): %v", r)
+					}
+				}()
 				_ = cmd.Wait()
 			}()
 			return true

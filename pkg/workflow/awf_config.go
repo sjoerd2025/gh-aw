@@ -25,7 +25,7 @@
 //	      "openai":    { "host": "api.openai.com" },
 //	      "anthropic": { "host": "api.anthropic.com" },
 //	      "copilot":   { "host": "api.githubcopilot.com" },
-//	      "antigravity":    { "host": "generativelanguage.googleapis.com" }
+//	      "gemini":        { "host": "generativelanguage.googleapis.com" }
 //	    },
 //	    "models": {
 //	      "sonnet": ["mygateway/*sonnet*"],
@@ -63,93 +63,6 @@
 
 package workflow
 
-import (
-	_ "embed"
-	"encoding/json"
-	"fmt"
-	"maps"
-	"slices"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-
-	"github.com/santhosh-tekuri/jsonschema/v6"
-
-	"github.com/github/gh-aw/pkg/constants"
-	"github.com/github/gh-aw/pkg/jsonutil"
-	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/setutil"
-	"github.com/github/gh-aw/pkg/workflow/compilerenv"
-)
-
-//go:embed schemas/awf-config.schema.json
-var awfConfigSchema string
-
-var awfConfigLog = logger.New("workflow:awf_config")
-
-// Cached compiled AWF config schema to avoid recompiling on every validation.
-var (
-	compiledAWFConfigSchemaOnce sync.Once
-	compiledAWFConfigSchema     *jsonschema.Schema
-	awfConfigSchemaCompileError error
-)
-
-// getCompiledAWFConfigSchema returns the compiled AWF config schema, compiling once and caching.
-func getCompiledAWFConfigSchema() (*jsonschema.Schema, error) {
-	compiledAWFConfigSchemaOnce.Do(func() {
-		awfConfigLog.Print("Compiling AWF config schema (first time)")
-		schemaURL := fmt.Sprintf("https://github.com/github/gh-aw-firewall/releases/download/%s/awf-config.schema.json", constants.DefaultFirewallVersion)
-		compiledAWFConfigSchema, awfConfigSchemaCompileError = compileSchema(awfConfigSchema, schemaURL)
-		if awfConfigSchemaCompileError == nil {
-			awfConfigLog.Print("AWF config schema compiled successfully")
-		}
-	})
-	return compiledAWFConfigSchema, awfConfigSchemaCompileError
-}
-
-// validateAWFConfigJSON validates the provided AWF config JSON string against the
-// embedded AWF config schema. Returns nil if validation passes.
-func validateAWFConfigJSON(configJSON string) error {
-	schema, err := getCompiledAWFConfigSchema()
-	if err != nil {
-		return err
-	}
-	var doc any
-	if err := json.Unmarshal([]byte(configJSON), &doc); err != nil {
-		return fmt.Errorf("failed to parse AWF config JSON: %w", err)
-	}
-	normalizeTemplatableModelFallbackEnabled(doc)
-	if err := schema.Validate(doc); err != nil {
-		return fmt.Errorf("AWF config schema validation failed: %w", err)
-	}
-	return nil
-}
-
-// normalizeTemplatableModelFallbackEnabled adjusts a generated AWF config document
-// for compile-time schema validation by coercing modelFallback.enabled GitHub Actions
-// expressions to a boolean placeholder. GitHub Actions resolves these expressions at
-// runtime before AWF consumes the config.
-func normalizeTemplatableModelFallbackEnabled(doc any) {
-	root, ok := doc.(map[string]any)
-	if !ok {
-		return
-	}
-	apiProxy, ok := root["apiProxy"].(map[string]any)
-	if !ok {
-		return
-	}
-	modelFallback, ok := apiProxy["modelFallback"].(map[string]any)
-	if !ok {
-		return
-	}
-	enabled, ok := modelFallback["enabled"].(string)
-	if !ok || !isExpression(enabled) {
-		return
-	}
-	modelFallback["enabled"] = true
-}
-
 // AWFConfigFile represents the AWF configuration file schema.
 // This is the top-level structure written to awf-config.json.
 type AWFConfigFile struct {
@@ -164,14 +77,23 @@ type AWFConfigFile struct {
 	// Network contains network egress control configuration.
 	Network *AWFNetworkConfig `json:"network,omitempty"`
 
+	// Filesystem contains host filesystem write-boundary configuration.
+	Filesystem *AWFFilesystemConfig `json:"filesystem,omitempty"`
+
 	// Platform contains GitHub deployment metadata used by AWF auth handling.
 	Platform *AWFPlatformConfig `json:"platform,omitempty"`
 
 	// APIProxy contains API proxy (LLM gateway) configuration.
 	APIProxy *AWFAPIProxyConfig `json:"apiProxy,omitempty"`
 
+	// Enclaves configures the unified AWF-owned script and agent enclave subsystem.
+	Enclaves []map[string]any `json:"enclaves,omitempty"`
+
 	// Container contains container execution configuration.
 	Container *AWFContainerConfig `json:"container,omitempty"`
+
+	// CloudHypervisor contains Cloud Hypervisor microVM execution configuration.
+	CloudHypervisor *AWFCloudHypervisorConfig `json:"cloudHypervisor,omitempty"`
 
 	// Logging contains logging and diagnostics configuration.
 	Logging *AWFLoggingConfig `json:"logging,omitempty"`
@@ -209,9 +131,19 @@ type AWFNetworkConfig struct {
 	// Maps to: --network-isolation
 	Isolation bool `json:"isolation,omitempty"`
 
+	// VerifySbxEgress enables fail-closed direct-egress verification for Docker sbx.
+	// Maps to: --verify-sbx-egress
+	VerifySbxEgress bool `json:"verifySbxEgress,omitempty"`
+
 	// TopologyAttach lists container names AWF should attach to awf-net.
 	// Maps to: --topology-attach <name> (repeatable)
 	TopologyAttach []string `json:"topologyAttach,omitempty"`
+}
+
+// AWFFilesystemConfig is the "filesystem" section of the AWF config file.
+type AWFFilesystemConfig struct {
+	// AllowWrite lists guest-visible absolute paths that may remain writable.
+	AllowWrite []string `json:"allowWrite"`
 }
 
 // AWFPlatformConfig is the "platform" section of the AWF config file.
@@ -230,7 +162,7 @@ type AWFAPIProxyConfig struct {
 	Enabled bool `json:"enabled"`
 
 	// EnableTokenSteering enables budget-warning system message injection near ET budget exhaustion.
-	EnableTokenSteering bool `json:"enableTokenSteering,omitempty"`
+	EnableTokenSteering *bool `json:"enableTokenSteering,omitempty"`
 
 	// MaxRuns is the maximum number of LLM invocations allowed for a run.
 	MaxRuns int `json:"maxRuns,omitempty"`
@@ -257,7 +189,6 @@ type AWFAPIProxyConfig struct {
 
 	// Targets holds per-provider API target overrides.
 	// Supported keys: "openai", "anthropic", "copilot", "gemini"
-	// The "gemini" target is also used for Antigravity engine routing.
 	Targets map[string]*AWFAPITargetConfig `json:"targets,omitempty"`
 
 	// Providers holds per-provider model pricing overlays used by the API proxy
@@ -277,6 +208,12 @@ type AWFAPIProxyConfig struct {
 	AllowedModels []string `json:"allowedModels,omitempty"`
 	// DisallowedModels is the explicit denylist policy for model names/patterns.
 	DisallowedModels []string `json:"disallowedModels,omitempty"`
+
+	// CACert is a host path to an additional CA certificate for api-proxy
+	// upstream TLS verification. Maps to frontmatter sandbox.agent.ca-cert.
+	// Only emitted for AWF v0.28.10+ (see AWFAPIProxyCACertMinVersion); older
+	// AWF strict config validation rejects the unknown property.
+	CACert string `json:"caCert,omitempty"`
 }
 
 // AWFModelFallbackConfig is the "apiProxy.modelFallback" section of the AWF config file.
@@ -291,7 +228,10 @@ type AWFModelFallbackConfig struct {
 // AWFAPITargetConfig is a single API proxy target entry.
 // Maps to: --<provider>-api-target <host>
 type AWFAPITargetConfig struct {
-	// Host is the hostname (and optional port) of the API endpoint.
+	// Host is the hostname (and optional port) of the API endpoint, or an
+	// explicit http:// URL when the effective AWF version supports HTTP targets.
+	// AWF currently normalizes explicit target ports to the scheme default, so
+	// custom ports are not supported for these targets.
 	Host string `json:"host,omitempty"`
 
 	// AuthHeader is the custom authentication header name sent with API requests.
@@ -328,7 +268,7 @@ type AWFContainerConfig struct {
 	ImageTag string `json:"imageTag,omitempty"`
 
 	// AgentTimeout is the maximum time (in minutes) the agent command may run.
-	// docker-sbx requires this so AWF passes a concrete timeout to sbx exec.
+	// MicroVM runtimes require this so AWF passes a concrete guest execution timeout.
 	AgentTimeout int `json:"agentTimeout,omitempty"`
 
 	// DockerHostPathPrefix prefixes bind-mount source paths so the Docker daemon can
@@ -341,6 +281,40 @@ type AWFContainerConfig struct {
 	// "gvisor" enables gVisor's runsc runtime for additional kernel-level isolation.
 	// AWF translates "gvisor" → "runsc" internally.
 	ContainerRuntime string `json:"containerRuntime,omitempty"`
+
+	// Images is the closed manifest of digest-pinned AWF infrastructure images,
+	// keyed by AWF image role (squid, agent, apiProxy, ...). Mapped from the
+	// sandbox.agent.images frontmatter field. When present, AWF fails closed
+	// instead of falling back to the official registry, and it cannot be combined
+	// with legacy image selectors such as imageTag or agentImage.
+	Images map[string]string `json:"images,omitempty"`
+}
+
+// AWFCloudHypervisorConfig is the "cloudHypervisor" section of the AWF config file.
+type AWFCloudHypervisorConfig struct {
+	PreviewEnabled                      bool                            `json:"previewEnabled,omitempty"`
+	MountPolicy                         string                          `json:"mountPolicy,omitempty"`
+	CloudHypervisorBinary               string                          `json:"cloudHypervisorBinary,omitempty"`
+	KernelPath                          string                          `json:"kernelPath,omitempty"`
+	RootfsPath                          string                          `json:"rootfsPath,omitempty"`
+	SupervisorPath                      string                          `json:"supervisorPath,omitempty"`
+	ArtifactManifestPath                string                          `json:"artifactManifestPath,omitempty"`
+	ArtifactManifestBundlePath          string                          `json:"artifactManifestBundlePath,omitempty"`
+	ArtifactReleaseTag                  string                          `json:"artifactReleaseTag,omitempty"`
+	DevelopmentAllowUnattestedArtifacts bool                            `json:"developmentAllowUnattestedArtifacts,omitempty"`
+	VCPUCount                           int                             `json:"vcpuCount,omitempty"`
+	MemoryMiB                           int                             `json:"memoryMib,omitempty"`
+	APITimeoutMs                        int                             `json:"apiTimeoutMs,omitempty"`
+	SHA256                              *AWFCloudHypervisorSHA256Config `json:"sha256,omitempty"`
+}
+
+// AWFCloudHypervisorSHA256Config contains development-only legacy artifact hashes.
+type AWFCloudHypervisorSHA256Config struct {
+	CloudHypervisor string `json:"cloudHypervisor,omitempty"`
+	Virtiofsd       string `json:"virtiofsd,omitempty"`
+	Kernel          string `json:"kernel,omitempty"`
+	Rootfs          string `json:"rootfs,omitempty"`
+	Supervisor      string `json:"supervisor,omitempty"`
 }
 
 // AWFLoggingConfig is the "logging" section of the AWF config file.
@@ -386,529 +360,4 @@ type AWFChrootIdentityConfig struct {
 
 	// Home is the home directory path to export inside chroot mode.
 	Home string `json:"home,omitempty"`
-}
-
-// buildAWFConfigSchemaURL returns the release-pinned JSON schema URL for the AWF config file.
-// The URL is versioned so that schema validation tools always reference the exact schema
-// that matches the AWF binary being used. When DefaultFirewallVersion is bumped the URL
-// automatically tracks the new release.
-//
-// If firewallConfig carries an explicit version (e.g. sandbox.agent.version) that version
-// is used; otherwise DefaultFirewallVersion is used.
-func buildAWFConfigSchemaURL(firewallConfig *FirewallConfig) string {
-	version := string(constants.DefaultFirewallVersion)
-	if firewallConfig != nil && firewallConfig.Version != "" {
-		version = firewallConfig.Version
-	}
-	// Special-case "latest": the GitHub Releases /latest/download/ shortcut serves
-	// assets from the most recent release without requiring a tag in the path.
-	if strings.EqualFold(version, "latest") {
-		return "https://github.com/github/gh-aw-firewall/releases/latest/download/awf-config.schema.json"
-	}
-	// Ensure version has the 'v' prefix required by GitHub release tag URLs.
-	if !strings.HasPrefix(version, "v") {
-		version = "v" + version
-	}
-	return fmt.Sprintf("https://github.com/github/gh-aw-firewall/releases/download/%s/awf-config.schema.json", version)
-}
-
-// BuildAWFConfigJSON generates a compact JSON config file for AWF from the provided
-// command configuration. The JSON is single-line (no indentation) for safe embedding
-// in a shell printf command.
-//
-// The caller is responsible for writing the returned JSON to disk at the path expected
-// by the AWF --config flag. See BuildAWFCommand for how this is wired together.
-func BuildAWFConfigJSON(config AWFCommandConfig) (string, error) {
-	awfConfigLog.Printf("Building AWF config JSON: engine=%s, allowed_domains=%q", config.EngineName, config.AllowedDomains)
-
-	// Resolve firewall config once — used for both the schema URL and the container image tag.
-	firewallConfig := getFirewallConfig(config.WorkflowData)
-
-	awfConfig := AWFConfigFile{
-		Schema: buildAWFConfigSchemaURL(firewallConfig),
-	}
-
-	// ── Runner section ──────────────────────────────────────────────────────
-	if topology := getRunnerTopology(config.WorkflowData); topology != "" {
-		awfConfig.Runner = &AWFRunnerConfig{Topology: topology}
-		awfConfigLog.Printf("Runner section: topology=%s", topology)
-	}
-
-	// ── Network section ──────────────────────────────────────────────────────
-	if config.AllowedDomains != "" {
-		allowList := splitDomainList(config.AllowedDomains)
-		awfConfig.Network = &AWFNetworkConfig{
-			AllowDomains: allowList,
-		}
-		awfConfigLog.Printf("Network section: %d allowed domains", len(allowList))
-
-		// Blocked domains (if configured in the workflow)
-		if config.WorkflowData != nil {
-			blockedDomainsStr := formatBlockedDomains(config.WorkflowData.NetworkPermissions)
-			if blockedDomainsStr != "" {
-				blockList := splitDomainList(blockedDomainsStr)
-				awfConfig.Network.BlockDomains = blockList
-				awfConfigLog.Printf("Network section: %d blocked domains", len(blockList))
-			}
-		}
-	}
-
-	if isAWFNetworkIsolationEnabled(config.WorkflowData) {
-		if awfConfig.Network == nil {
-			awfConfig.Network = &AWFNetworkConfig{}
-		}
-		awfConfig.Network.Isolation = true
-		awfConfig.Network.TopologyAttach = buildAWFTopologyAttachList(config.WorkflowData)
-		awfConfigLog.Printf("Network section: isolation enabled with %d topology attachments", len(awfConfig.Network.TopologyAttach))
-	}
-
-	// docker-sbx: the sbx microVM resolves host services via host.docker.internal
-	// (the Docker bridge gateway, 172.17.0.1). Allow this domain so AWF's network
-	// policy permits connections from the microVM to the api-proxy, MCP gateway, and
-	// Squid proxy that are all published on the host bridge.
-	if isDockerSbxRuntime(config.WorkflowData) {
-		if awfConfig.Network == nil {
-			awfConfig.Network = &AWFNetworkConfig{}
-		}
-		const hostDockerInternal = "host.docker.internal"
-		if !slices.Contains(awfConfig.Network.AllowDomains, hostDockerInternal) {
-			awfConfig.Network.AllowDomains = append(awfConfig.Network.AllowDomains, hostDockerInternal)
-			awfConfigLog.Printf("Network section: added %s for docker-sbx microVM routing", hostDockerInternal)
-		}
-	}
-
-	if platformType := extractPlatformType(config.WorkflowData); platformType != "" {
-		awfConfig.Platform = &AWFPlatformConfig{Type: platformType}
-		awfConfigLog.Printf("Platform section: type=%s", platformType)
-	}
-
-	// ── API proxy section ─────────────────────────────────────────────────────
-	// maxAICredits is taken from frontmatter/imports only; when unset (0) the
-	// runtime value is resolved from vars.GH_AW_DEFAULT_MAX_AI_CREDITS via a
-	// GitHub Actions expression injected directly into the JSON string in
-	// BuildAWFCommand (see injectMaxAICreditsExpression in awf_helpers.go).
-	maxAICredits := int64(0)
-	maxRuns := constants.DefaultMaxRuns
-	// GetMaxTurnCacheMisses handles nil receiver and env-var fallback, so pre-init
-	// via the nil receiver avoids a redundant os.Getenv when EngineConfig is set.
-	maxTurnCacheMisses := (*EngineConfig)(nil).GetMaxTurnCacheMisses()
-	if config.WorkflowData != nil && config.WorkflowData.EngineConfig != nil {
-		if config.WorkflowData.EngineConfig.MaxAICredits != 0 {
-			maxAICredits = config.WorkflowData.EngineConfig.MaxAICredits
-		}
-		maxRuns = config.WorkflowData.EngineConfig.GetMaxRuns()
-		maxTurnCacheMisses = config.WorkflowData.EngineConfig.GetMaxTurnCacheMisses()
-	}
-
-	// Token steering is enabled by default. Setting max-ai-credits to a negative
-	// value (-1) omits that budget from the AWF config and disables token steering.
-	// When maxAICredits is 0 (runtime default), token steering stays enabled here.
-	enableTokenSteering := maxAICredits >= 0
-	if maxAICredits < 0 {
-		// Negative signals "disabled" — omit the budget from the AWF config.
-		maxAICredits = 0
-	}
-
-	apiProxy := &AWFAPIProxyConfig{
-		Enabled:             true,
-		MaxRuns:             maxRuns,
-		MaxTurnCacheMisses:  maxTurnCacheMisses,
-		MaxAICredits:        maxAICredits,
-		EnableTokenSteering: enableTokenSteering && awfSupportsTokenSteering(firewallConfig),
-	}
-
-	if !enableTokenSteering {
-		awfConfigLog.Printf("Skipping apiProxy.enableTokenSteering: max-ai-credits is negative (disabled)")
-	} else if !awfSupportsTokenSteering(firewallConfig) {
-		awfConfigLog.Printf("Skipping apiProxy.enableTokenSteering: AWF version %q requires at least %s", getAWFImageTag(firewallConfig), constants.AWFTokenSteeringMinVersion)
-	}
-
-	if mf := extractModelFallback(config.WorkflowData); mf != nil {
-		apiProxy.ModelFallback = mf
-		enabledDisplay := "<unset>"
-		if mf.Enabled != nil {
-			enabledDisplay = mf.Enabled.String()
-		}
-		awfConfigLog.Printf("API proxy: modelFallback configured: enabled=%s", enabledDisplay)
-	}
-
-	if pricing := extractDefaultAiCreditsPricing(config.WorkflowData); pricing != nil {
-		apiProxy.DefaultAiCreditsPricing = pricing
-		awfConfigLog.Printf("API proxy: defaultAiCreditsPricing configured: input=%g, output=%g", pricing.Input, pricing.Output)
-	}
-
-	targets := map[string]*AWFAPITargetConfig{}
-
-	if openaiTarget := extractAPITargetHost(config.WorkflowData, "OPENAI_BASE_URL"); openaiTarget != "" {
-		targets["openai"] = &AWFAPITargetConfig{Host: openaiTarget}
-		awfConfigLog.Printf("API proxy: custom openai target=%s", openaiTarget)
-	}
-	if anthropicTarget := extractAPITargetHost(config.WorkflowData, "ANTHROPIC_BASE_URL"); anthropicTarget != "" {
-		targets["anthropic"] = &AWFAPITargetConfig{Host: anthropicTarget}
-		awfConfigLog.Printf("API proxy: custom anthropic target=%s", anthropicTarget)
-	}
-
-	// Apply authHeader overrides from sandbox.agent.targets frontmatter.
-	// These are independent of the host/env-var settings: authHeader can be set
-	// even when no custom host is configured.
-	for _, provider := range []string{"openai", "anthropic"} {
-		authHeader := extractAPITargetAuthHeader(config.WorkflowData, provider)
-		if authHeader == "" {
-			continue
-		}
-		if existing, ok := targets[provider]; ok {
-			existing.AuthHeader = authHeader
-		} else {
-			targets[provider] = &AWFAPITargetConfig{AuthHeader: authHeader}
-		}
-		awfConfigLog.Printf("API proxy: custom %s authHeader=%s", provider, authHeader)
-	}
-	if copilotTarget := GetCopilotAPITarget(config.WorkflowData); copilotTarget != "" {
-		targets["copilot"] = &AWFAPITargetConfig{Host: copilotTarget}
-		awfConfigLog.Printf("API proxy: custom copilot target=%s", copilotTarget)
-	}
-
-	// Apply BYOK supplemental fields from sandbox.agent.targets.copilot frontmatter.
-	// extraHeaders, extraBodyFields, and sessionId are Copilot-specific and map to
-	// AWF_BYOK_EXTRA_HEADERS, AWF_BYOK_EXTRA_BODY_FIELDS, and AWF_PROVIDER_SESSION_ID.
-	if copilotFrontmatter := extractCopilotTargetConfig(config.WorkflowData); copilotFrontmatter != nil {
-		existing, ok := targets["copilot"]
-		if !ok {
-			existing = &AWFAPITargetConfig{}
-			targets["copilot"] = existing
-		}
-		if copilotFrontmatter.AuthHeader != "" {
-			existing.AuthHeader = copilotFrontmatter.AuthHeader
-			awfConfigLog.Printf("API proxy: copilot authHeader=%s", copilotFrontmatter.AuthHeader)
-		}
-		if len(copilotFrontmatter.ExtraHeaders) > 0 {
-			existing.ExtraHeaders = copilotFrontmatter.ExtraHeaders
-			awfConfigLog.Printf("API proxy: copilot extraHeaders configured (%d header(s))", len(copilotFrontmatter.ExtraHeaders))
-		}
-		if len(copilotFrontmatter.ExtraBodyFields) > 0 {
-			existing.ExtraBodyFields = copilotFrontmatter.ExtraBodyFields
-			awfConfigLog.Printf("API proxy: copilot extraBodyFields configured (%d field(s))", len(copilotFrontmatter.ExtraBodyFields))
-		}
-		if copilotFrontmatter.SessionId != "" {
-			existing.SessionId = copilotFrontmatter.SessionId
-			awfConfigLog.Printf("API proxy: copilot sessionId configured")
-		}
-	}
-	if antigravityTarget := GetAntigravityAPITarget(config.WorkflowData, config.EngineName); antigravityTarget != "" {
-		// Route the Antigravity-resolved API target through the "gemini" provider key
-		// to match AWF's supported target providers.
-		awfConfigLog.Printf("API proxy: mapped antigravity target to gemini provider target=%s", antigravityTarget)
-		targets["gemini"] = &AWFAPITargetConfig{Host: antigravityTarget}
-	} else if geminiTarget := GetGeminiAPITarget(config.WorkflowData, config.EngineName); geminiTarget != "" {
-		awfConfigLog.Printf("API proxy: custom gemini target=%s", geminiTarget)
-		targets["gemini"] = &AWFAPITargetConfig{Host: geminiTarget}
-	}
-
-	if len(targets) > 0 {
-		apiProxy.Targets = targets
-		awfConfigLog.Printf("API proxy: %d custom targets configured", len(targets))
-	}
-
-	if providers := extractModelCostProviders(config.WorkflowData); len(providers) > 0 {
-		if awfSupportsAPIProxyProviders(firewallConfig) {
-			apiProxy.Providers = providers
-			awfConfigLog.Printf("API proxy: %d model-cost provider override(s) configured", len(providers))
-		} else {
-			awfConfigLog.Printf("Skipping apiProxy.providers: AWF version %q requires at least %s", getAWFImageTag(firewallConfig), constants.AWFAPIProxyProvidersMinVersion)
-		}
-	}
-
-	// ── Models section (nested under apiProxy per AWF config schema) ──────────
-	if config.WorkflowData != nil && len(config.WorkflowData.ModelMappings) > 0 {
-		apiProxy.Models = config.WorkflowData.ModelMappings
-		awfConfigLog.Printf("Models section: %d alias entries", len(config.WorkflowData.ModelMappings))
-	}
-	allowedModels, disallowedModels := resolveModelPolicyForAWFConfig(config.WorkflowData)
-	if len(allowedModels) > 0 {
-		apiProxy.AllowedModels = allowedModels
-		awfConfigLog.Printf("Models policy: %d allowed model pattern(s)", len(allowedModels))
-	}
-	if len(disallowedModels) > 0 {
-		apiProxy.DisallowedModels = disallowedModels
-		awfConfigLog.Printf("Models policy: %d disallowed model pattern(s)", len(disallowedModels))
-	}
-
-	awfConfig.APIProxy = apiProxy
-
-	// ── Container section ─────────────────────────────────────────────────────
-	awfImageTag := buildAWFImageTagWithDigests(getAWFImageTag(firewallConfig), config.WorkflowData)
-	agentRuntime := getAgentContainerRuntime(config.WorkflowData)
-	agentTimeout := 0
-	if isDockerSbxRuntime(config.WorkflowData) {
-		agentTimeout = resolveAWFContainerAgentTimeoutMinutes(config.WorkflowData)
-	}
-	// containerRuntime is only emitted when the effective AWF version supports it.
-	// Gate here to avoid sending an unrecognised field to older AWF binaries.
-	if !awfSupportsContainerRuntime(firewallConfig) {
-		if agentRuntime != "" {
-			awfConfigLog.Printf("Skipping containerRuntime: AWF version %q requires at least %s (gh-aw-firewall#6093)", getAWFImageTag(firewallConfig), constants.AWFContainerRuntimeMinVersion)
-		}
-		agentRuntime = ""
-	}
-	if awfImageTag != "" || isArcDindTopology(config.WorkflowData) || agentRuntime != "" || agentTimeout > 0 {
-		container := &AWFContainerConfig{
-			ImageTag:         awfImageTag,
-			AgentTimeout:     agentTimeout,
-			ContainerRuntime: agentRuntime,
-		}
-		// NOTE: dockerHostPathPrefix is intentionally NOT set for arc-dind topology.
-		// With sysroot-stage active, the Docker daemon can access all needed paths:
-		//  - Workspace & RUNNER_TEMP: on the shared work volume (/home/runner/_work/)
-		//  - System binaries: provided by the sysroot named volume (not bind mounts)
-		//  - Kernel VFS (/dev, /sys): daemon's own kernel
-		// Setting a prefix would incorrectly translate the workspace mount source to
-		// a non-existent path (e.g. /prefix/home/runner/_work/repo → empty dir),
-		// causing the agent to see an empty workspace. See gh-aw#34896.
-		awfConfig.Container = container
-		if awfImageTag != "" {
-			awfConfigLog.Printf("Container section: image_tag=%s", awfImageTag)
-		}
-		if agentRuntime != "" {
-			awfConfigLog.Printf("Container section: containerRuntime=%s", agentRuntime)
-		}
-		if agentTimeout > 0 {
-			awfConfigLog.Printf("Container section: agentTimeout=%d", agentTimeout)
-		}
-	}
-
-	// ── Logging section ──────────────────────────────────────────────────────
-	// Logging paths are set in config. For ARC/DinD, the config file is written at runtime,
-	// so ${RUNNER_TEMP} can be preserved for shell expansion before AWF reads the JSON.
-	awfConfig.Logging = &AWFLoggingConfig{
-		ProxyLogsDir: string(constants.AWFProxyLogsDir),
-		AuditDir:     string(constants.AWFAuditDir),
-	}
-	if isArcDindTopology(config.WorkflowData) {
-		awfConfig.Logging.ProxyLogsDir = awfArcDindProxyLogsDirExpr
-		awfConfig.Logging.AuditDir = awfArcDindAuditDirExpr
-	}
-	awfConfigLog.Printf("Logging section: proxyLogsDir=%s, auditDir=%s", awfConfig.Logging.ProxyLogsDir, awfConfig.Logging.AuditDir)
-
-	jsonStr, err := jsonutil.MarshalCompactNoHTMLEscape(awfConfig)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal AWF config to JSON: %w", err)
-	}
-
-	awfConfigLog.Printf("AWF config JSON generated: %d bytes", len(jsonStr))
-
-	if config.WorkflowData != nil && config.WorkflowData.ValidateAWFConfig {
-		if err := validateAWFConfigJSON(jsonStr); err != nil {
-			return "", fmt.Errorf("generated AWF config failed schema validation: %w", err)
-		}
-	}
-
-	return jsonStr, nil
-}
-
-func resolveAWFContainerAgentTimeoutMinutes(workflowData *WorkflowData) int {
-	// Reuse the workflow-level default timeout so docker-sbx inherits the same
-	// runtime ceiling when top-level timeout-minutes is omitted or non-numeric.
-	defaultTimeout := compilerenv.ResolveDefaultTimeoutMinutes(int(constants.DefaultAgenticWorkflowTimeout / time.Minute))
-	if workflowData == nil || workflowData.TimeoutMinutes == "" {
-		return defaultTimeout
-	}
-
-	rawTimeout := strings.TrimSpace(workflowData.TimeoutMinutes)
-	if after, ok := strings.CutPrefix(rawTimeout, "timeout-minutes:"); ok {
-		rawTimeout = strings.TrimSpace(after)
-	}
-
-	timeoutMinutes, err := strconv.Atoi(rawTimeout)
-	if err == nil && timeoutMinutes > 0 {
-		return timeoutMinutes
-	}
-
-	if rawTimeout != "" {
-		awfConfigLog.Printf("Container section: non-numeric timeout-minutes %q (e.g. a GitHub Actions expression) cannot be emitted in integer-only agentTimeout; using default %d", rawTimeout, defaultTimeout)
-	}
-	return defaultTimeout
-}
-
-// buildAWFTopologyAttachList returns container names that AWF should attach to
-// the internal awf-net network when network isolation mode is enabled.
-// The list always includes the MCP gateway and conditionally includes the
-// host-started CLI proxy sidecar when gh-proxy mode is active.
-func buildAWFTopologyAttachList(workflowData *WorkflowData) []string {
-	targets := []string{"awmg-mcpg"}
-	if isCliProxyNeeded(workflowData) {
-		targets = append(targets, "awmg-cli-proxy")
-	}
-	return targets
-}
-
-// splitDomainList splits a comma-separated domain string into a deduplicated
-// slice. Empty entries are ignored. The order of the original list is preserved for
-// non-duplicate entries; this keeps the allow-list deterministic.
-func splitDomainList(domains string) []string {
-	var result []string
-	seen := make(map[string]struct {
-	})
-	for d := range strings.SplitSeq(domains, ",") {
-		d = strings.TrimSpace(d)
-		if d != "" && !setutil.Contains(seen, d) {
-			seen[d] = struct {
-			}{}
-			result = append(result, d)
-		}
-	}
-	return result
-}
-
-// resolveModelPolicyForAWFConfig applies policy precedence independently per list:
-// allowed rules are narrowed using intersection with env policy, while blocked
-// rules are widened using union with env policy.
-func resolveModelPolicyForAWFConfig(workflowData *WorkflowData) ([]string, []string) {
-	envAllowed, hasAllowedOverride := compilerenv.ResolvePolicyModelsAllowed()
-	envBlocked, hasBlockedOverride := compilerenv.ResolvePolicyModelsBlocked()
-	var allowed []string
-	var blocked []string
-	if workflowData != nil {
-		allowed = workflowData.ModelPolicyAllowed
-		blocked = workflowData.ModelPolicyBlocked
-	}
-	if hasAllowedOverride {
-		allowed = intersectModelPolicyRules(allowed, envAllowed)
-	}
-	if hasBlockedOverride {
-		blocked = unionModelPolicyRules(blocked, envBlocked)
-	}
-	blockedSet := make(map[string]struct{}, len(blocked))
-	for _, model := range blocked {
-		blockedSet[model] = struct{}{}
-	}
-	allowed = filterAllowedModelConflictsWithSet(allowed, blockedSet)
-	return allowed, blocked
-}
-
-func intersectModelPolicyRules(local, override []string) []string {
-	if len(override) == 0 {
-		return append([]string(nil), local...)
-	}
-	// No local allow-list means no workflow restriction; keep the env allow-list.
-	if len(local) == 0 {
-		return append([]string(nil), override...)
-	}
-	localSet := make(map[string]struct{}, len(local))
-	for _, model := range local {
-		localSet[model] = struct{}{}
-	}
-	result := make([]string, 0, len(override))
-	for _, model := range override {
-		if _, ok := localSet[model]; ok {
-			result = append(result, model)
-		}
-	}
-	return result
-}
-
-func unionModelPolicyRules(local, override []string) []string {
-	result := make([]string, 0, len(local)+len(override))
-	seen := make(map[string]struct{}, len(local)+len(override))
-	for _, model := range local {
-		if _, ok := seen[model]; ok {
-			continue
-		}
-		seen[model] = struct{}{}
-		result = append(result, model)
-	}
-	for _, model := range override {
-		if _, ok := seen[model]; ok {
-			continue
-		}
-		seen[model] = struct{}{}
-		result = append(result, model)
-	}
-	return result
-}
-
-// extractPlatformType returns sandbox.agent.platform only for enabled AWF sandbox
-// agents, or an empty string to let AWF fall back to its default platform logic.
-func extractPlatformType(workflowData *WorkflowData) string {
-	if workflowData == nil || workflowData.SandboxConfig == nil || workflowData.SandboxConfig.Agent == nil {
-		return ""
-	}
-	if workflowData.SandboxConfig.Agent.Disabled {
-		return ""
-	}
-	if !isSupportedSandboxType(getAgentType(workflowData.SandboxConfig.Agent)) {
-		return ""
-	}
-	return workflowData.SandboxConfig.Agent.Platform
-}
-
-// extractModelFallback returns an AWFModelFallbackConfig if the workflow has configured
-// sandbox.agent.model-fallback, or nil if the field is absent (letting AWF use its default).
-func extractModelFallback(workflowData *WorkflowData) *AWFModelFallbackConfig {
-	if workflowData == nil {
-		return nil
-	}
-	if workflowData.SandboxConfig == nil {
-		return nil
-	}
-	if workflowData.SandboxConfig.Agent == nil {
-		return nil
-	}
-	mf := workflowData.SandboxConfig.Agent.ModelFallback
-	if mf == nil {
-		return nil
-	}
-	return &AWFModelFallbackConfig{
-		Enabled: mf,
-	}
-}
-
-// extractDefaultAiCreditsPricing returns an AiCreditsPricingConfig if the workflow has
-// configured models.default-ai-credits-pricing, or nil if the field is absent.
-// This fallback pricing is used when maxAiCredits is active and the requested model is not in
-// the built-in pricing table, preventing HTTP 400 unknown_model_ai_credits for BYOK/self-hosted models.
-func extractDefaultAiCreditsPricing(workflowData *WorkflowData) *AiCreditsPricingConfig {
-	if workflowData == nil {
-		return nil
-	}
-	p := workflowData.DefaultAiCreditsPricing
-	if p == nil {
-		return nil
-	}
-	return &AiCreditsPricingConfig{
-		Input:       p.Input,
-		Output:      p.Output,
-		CachedInput: p.CachedInput,
-		CacheWrite:  p.CacheWrite,
-	}
-}
-
-func extractModelCostProviders(workflowData *WorkflowData) map[string]any {
-	if workflowData == nil || len(workflowData.ModelCosts) == 0 {
-		return nil
-	}
-	providers, ok := workflowData.ModelCosts["providers"].(map[string]any)
-	if !ok {
-		awfConfigLog.Printf("API proxy: models.providers has unexpected type %T; skipping provider overlay", workflowData.ModelCosts["providers"])
-		return nil
-	}
-	if len(providers) == 0 {
-		return nil
-	}
-	clone := make(map[string]any, len(providers))
-	maps.Copy(clone, providers)
-	return clone
-}
-
-// getRunnerTopology extracts the runner topology string from WorkflowData.
-// Returns an empty string when no topology is configured.
-func getRunnerTopology(workflowData *WorkflowData) string {
-	if workflowData == nil || workflowData.RunnerConfig == nil {
-		return ""
-	}
-	return workflowData.RunnerConfig.Topology
-}
-
-// isArcDindTopology returns true when the workflow targets ARC/DinD runners.
-func isArcDindTopology(workflowData *WorkflowData) bool {
-	return getRunnerTopology(workflowData) == RunnerTopologyArcDind
 }

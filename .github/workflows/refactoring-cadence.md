@@ -12,12 +12,10 @@ permissions:
   actions: read
   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 tracker-id: refactoring-cadence
-engine: copilot
+engine: codex
+model: copilot/gpt-5.3-codex
 imports:
   - uses: shared/skip-if-issue-open.md
     with:

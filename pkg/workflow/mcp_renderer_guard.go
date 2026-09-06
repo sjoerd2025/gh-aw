@@ -37,7 +37,16 @@ const sinkVisibilityRuntimeExpr = "${" + sinkVisibilityEnvVar + "}"
 // Expressions are always of the form ${{ ... }} and must not contain double quotes
 // (our generated expressions use single-quoted strings inside the GitHub Actions expression,
 // so this invariant holds for all compiler-generated fallback values).
-var guardExprRE = regexp.MustCompile(`"` + regexp.QuoteMeta(guardExprSentinel) + `(\$\{\{[^"]+\}\})"`)
+var guardExprNeverMatchRE = regexp.MustCompile(`$^`)
+
+var guardExprRE = func() *regexp.Regexp {
+	//nolint:regexpcompileinfunction // The pattern is initialized once at package load.
+	re, err := regexp.Compile(`"` + regexp.QuoteMeta(guardExprSentinel) + `(\$\{\{[^"]+\}\})"`) //nolint:regexpdynamicpattern // The sentinel is quoted and the fixed suffix is valid.
+	if err != nil {
+		return guardExprNeverMatchRE
+	}
+	return re
+}()
 
 // renderGuardPoliciesJSON renders a "guard-policies" JSON field at the given indent level.
 // The policies map contains policy names (e.g., "allow-only") mapped to their configurations.
@@ -50,6 +59,7 @@ func renderGuardPoliciesJSON(yaml *strings.Builder, policies map[string]any, ind
 	if len(policies) == 0 {
 		return
 	}
+	mcpRendererLog.Printf("Rendering %d guard-policies entries as JSON", len(policies))
 
 	// Marshal to JSON with indentation, then re-indent to match the current indent level
 	jsonBytes, err := json.MarshalIndent(policies, indent, "  ")
@@ -74,6 +84,7 @@ func renderGuardPoliciesToml(yaml *strings.Builder, policies map[string]any, ser
 	if len(policies) == 0 {
 		return
 	}
+	mcpRendererLog.Printf("Rendering %d guard-policies entries as TOML for server %s", len(policies), serverID)
 
 	yaml.WriteString("          \n")
 	yaml.WriteString("          [mcp_servers." + serverID + ".\"guard-policies\"]\n")

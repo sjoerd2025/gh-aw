@@ -9,41 +9,30 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:mapdeletecheck")
+
 // Analyzer is the map-delete-check analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "mapdeletecheck",
-	Doc:      "reports redundant map membership checks before delete(m, k) calls since delete is already a no-op for missing keys",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/mapdeletecheck",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("mapdeletecheck", "reports redundant map membership checks before delete(m, k) calls since delete is already a no-op for missing keys", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.IfStmt)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeIfStmt(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeIfStmt checks whether an if statement is a redundant membership check
@@ -102,6 +91,7 @@ func analyzeIfStmt(pass *analysis.Pass, n ast.Node, generatedFiles filecheck.Gen
 			}},
 		}}
 	}
+	pkgLog.Printf("flagging redundant map delete check at %s", pos)
 	pass.Report(diag)
 }
 

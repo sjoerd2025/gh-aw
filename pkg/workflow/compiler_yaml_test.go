@@ -1702,6 +1702,104 @@ Test prompt.
 	}
 }
 
+func TestCompileWorkflowMetadataIncludesDocs(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "lock-metadata-docs")
+	workflowPath := filepath.Join(tmpDir, "docs.md")
+	workflowContent := `---
+engine: copilot
+metadata:
+  docs: https://docs.example.com/automation/repository-health
+on: issues
+---
+# Test Workflow
+
+Test prompt.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0o644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(strings.TrimSuffix(workflowPath, ".md") + ".lock.yml")
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	metadata, _, err := ExtractMetadataFromLockFile(string(lockContent))
+	if err != nil {
+		t.Fatalf("Failed to extract lock metadata: %v", err)
+	}
+	if metadata == nil {
+		t.Fatal("Expected lock metadata")
+	}
+	if metadata.Docs != "https://docs.example.com/automation/repository-health" {
+		t.Errorf("Docs = %q, want documentation URL", metadata.Docs)
+	}
+}
+
+func TestCompileWorkflowMetadataDocsImportPrecedence(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		mainMetadata string
+		want         string
+	}{
+		{name: "first import fallback", want: "https://docs.example.com/first"},
+		{name: "main workflow wins", mainMetadata: "metadata:\n  docs: https://docs.example.com/main\n", want: "https://docs.example.com/main"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := testutil.TempDir(t, "lock-metadata-docs-import")
+			for _, imported := range []struct {
+				name string
+				docs string
+			}{
+				{name: "first.md", docs: "https://docs.example.com/first"},
+				{name: "second.md", docs: "https://docs.example.com/second"},
+			} {
+				content := fmt.Sprintf("---\nmetadata:\n  docs: %s\n---\n\nImported prompt.\n", imported.docs)
+				if err := os.WriteFile(filepath.Join(tmpDir, imported.name), []byte(content), 0o644); err != nil {
+					t.Fatalf("Failed to write imported workflow: %v", err)
+				}
+			}
+
+			workflowPath := filepath.Join(tmpDir, "main.md")
+			workflowContent := fmt.Sprintf(`---
+engine: copilot
+imports:
+  - first.md
+  - second.md
+%son: issues
+---
+# Test Workflow
+
+Test prompt.
+`, tt.mainMetadata)
+			if err := os.WriteFile(workflowPath, []byte(workflowContent), 0o644); err != nil {
+				t.Fatalf("Failed to write workflow file: %v", err)
+			}
+			if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+				t.Fatalf("Failed to compile workflow: %v", err)
+			}
+
+			lockContent, err := os.ReadFile(strings.TrimSuffix(workflowPath, ".md") + ".lock.yml")
+			if err != nil {
+				t.Fatalf("Failed to read lock file: %v", err)
+			}
+			metadata, _, err := ExtractMetadataFromLockFile(string(lockContent))
+			if err != nil {
+				t.Fatalf("Failed to extract lock metadata: %v", err)
+			}
+			if metadata == nil {
+				t.Fatal("Expected lock metadata")
+			}
+			if metadata.Docs != tt.want {
+				t.Fatalf("Docs = %q, want %q", metadata.Docs, tt.want)
+			}
+		})
+	}
+}
+
 func TestCompileWorkflowMetadataIncludesEngineVersionsAndRunnerIdentifier(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "lock-metadata-engine-versions")
 
@@ -1762,6 +1860,9 @@ Test prompt.
 	if got := metadata.EngineVersions["copilot-sdk"]; got == "" {
 		t.Fatal("Expected copilot-sdk version in metadata engine_versions when copilot-sdk is enabled")
 	}
+	if metadata.EngineBaseURLCustomized {
+		t.Fatal("Expected engine_base_url_customized=false for default copilot configuration")
+	}
 	if metadata.AgentImageRunner != `["self-hosted","linux"]` {
 		t.Fatalf("Expected serialized array runner identifier, got: %q", metadata.AgentImageRunner)
 	}
@@ -1781,6 +1882,55 @@ Test prompt.
 	}
 	if _, exists := manifest["agent_image_runner"]; exists {
 		t.Fatal("gh-aw-manifest must not duplicate agent_image_runner metadata")
+	}
+}
+
+func TestCompileWorkflowMetadataMarksCopilotCustomConfig(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "lock-metadata-copilot-custom-config")
+
+	workflowContent := `---
+engine:
+  id: copilot
+  api-target: api.acme.ghe.com
+on: issues
+---
+# Test Workflow
+
+Test prompt.
+`
+	workflowPath := filepath.Join(tmpDir, "metadata-copilot-custom-config.md")
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0o644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockFile := strings.TrimSuffix(workflowPath, ".md") + ".lock.yml"
+	lockContent, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	var metadataLine string
+	for line := range strings.SplitSeq(string(lockContent), "\n") {
+		if trimmed, ok := strings.CutPrefix(line, "# gh-aw-metadata: "); ok {
+			metadataLine = trimmed
+		}
+	}
+	if metadataLine == "" {
+		t.Fatal("Could not find gh-aw-metadata in lock file")
+	}
+
+	var metadata LockMetadata
+	if err := json.Unmarshal([]byte(metadataLine), &metadata); err != nil {
+		t.Fatalf("Failed to parse lock metadata JSON: %v", err)
+	}
+
+	if !metadata.EngineBaseURLCustomized {
+		t.Fatal("Expected engine_base_url_customized=true when copilot api-target is customized")
 	}
 }
 
@@ -2094,5 +2244,69 @@ func TestAddCustomStepsAsIsTrimsStructuralTrailingSpaces(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestInterpolationStepPresentWithGitHubFalse verifies the bug fix for the scenario where
+// a workflow has tools.github: false (no GitHub MCP server), no template expressions, and no
+// {{#if}} blocks. Before the fix the compiler skipped the "Interpolate variables and render
+// templates" step because it didn't account for the {{#runtime-import}} self-import macro that
+// is always emitted in normal (non-inline) compilation mode. This caused the agent to receive
+// an unresolved macro and no effective instructions.
+func TestInterpolationStepPresentWithGitHubFalse(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "interpolation-step-github-false")
+	workflowDir := filepath.Join(tmpDir, ".github", "workflows")
+	if err := os.MkdirAll(workflowDir, 0755); err != nil {
+		t.Fatalf("failed to create workflow directory: %v", err)
+	}
+
+	// Minimal workflow that previously triggered the bug:
+	// - engine.id set (no GitHub tool inferred)
+	// - tools.github: false (hasGitHubContext == false)
+	// - no {{#if}} or ${{ }} in body (hasTemplatePattern == false, hasExpressions == false)
+	workflowContent := `---
+on: repository_dispatch
+permissions:
+  contents: read
+engine:
+  id: claude
+tools:
+  edit:
+  github: false
+safe-outputs:
+  create-pull-request:
+---
+
+Do some important work.
+`
+	workflowPath := filepath.Join(workflowDir, "test-workflow.md")
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("failed to write workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("compilation failed: %v", err)
+	}
+
+	lockPath := strings.TrimSuffix(workflowPath, ".md") + ".lock.yml"
+	lockBytes, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("failed to read lock file: %v", err)
+	}
+	lockContent := string(lockBytes)
+
+	// The compiled lock must contain a runtime-import macro (always emitted in normal mode).
+	if !strings.Contains(lockContent, "{{#runtime-import") {
+		t.Error("expected lock file to contain a {{#runtime-import}} macro")
+	}
+
+	// And it must contain the interpolation step to resolve that macro.
+	if !strings.Contains(lockContent, "Interpolate variables and render templates") {
+		t.Error("expected lock file to contain 'Interpolate variables and render templates' step, " +
+			"but it was absent; the {{#runtime-import}} macro will not be resolved at runtime")
+	}
+	if !strings.Contains(lockContent, "interpolate_prompt.cjs") {
+		t.Error("expected lock file to reference interpolate_prompt.cjs in the interpolation step")
 	}
 }

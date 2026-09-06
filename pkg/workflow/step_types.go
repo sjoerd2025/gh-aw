@@ -1,13 +1,13 @@
 package workflow
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
-	"reflect"
-	"sort"
+	"math"
+	"strconv"
 
+	"github.com/github/gh-aw/pkg/importinpututil"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -25,7 +25,7 @@ type WorkflowStep struct {
 	Shell            string            `yaml:"shell,omitempty"`
 	With             map[string]any    `yaml:"with,omitempty"`
 	Env              map[string]string `yaml:"env,omitempty"`
-	ContinueOnError  any               `yaml:"continue-on-error,omitempty"` // Can be bool or string expression
+	ContinueOnError  *TemplatableBool  `yaml:"continue-on-error,omitempty"` // Can be bool or string expression
 	TimeoutMinutes   int               `yaml:"timeout-minutes,omitempty"`
 }
 
@@ -67,7 +67,14 @@ func (s *WorkflowStep) ToMap() map[string]any {
 		result["env"] = s.Env
 	}
 	if s.ContinueOnError != nil {
-		result["continue-on-error"] = s.ContinueOnError
+		switch s.ContinueOnError.String() {
+		case "true":
+			result["continue-on-error"] = true
+		case "false":
+			result["continue-on-error"] = false
+		default:
+			result["continue-on-error"] = s.ContinueOnError.String()
+		}
 	}
 	if s.TimeoutMinutes > 0 {
 		result["timeout-minutes"] = s.TimeoutMinutes
@@ -111,26 +118,13 @@ func MapToStep(stepMap map[string]any) (*WorkflowStep, error) {
 		step.With = with
 	}
 	if env, ok := stepMap["env"].(map[string]any); ok {
-		// Convert map[string]any to map[string]string
-		step.Env = make(map[string]string)
-		for k, v := range env {
-			if strVal, ok := v.(string); ok {
-				step.Env[k] = strVal
-			} else if v != nil {
-				// Arrays and maps are serialized as JSON so that shell consumers
-				// (e.g. jq --argjson) receive valid JSON. This handles both the
-				// []any / map[string]any case returned by encoding/json and the
-				// typed-slice case (e.g. []string) returned by goccy/go-yaml.
-				step.Env[k] = marshalEnvValue(v)
-			}
-		}
+		step.Env = parseStepEnv(env)
 	}
 	if continueOnError, ok := stepMap["continue-on-error"]; ok {
-		// Preserve the original type (bool or string)
-		step.ContinueOnError = continueOnError
+		step.ContinueOnError = parseStepContinueOnError(continueOnError)
 	}
-	if timeoutMinutes, ok := stepMap["timeout-minutes"].(int); ok {
-		step.TimeoutMinutes = timeoutMinutes
+	if timeoutMinutesVal, ok := stepMap["timeout-minutes"]; ok {
+		step.TimeoutMinutes = parseStepTimeoutMinutes(timeoutMinutesVal)
 	}
 
 	stepType := "unknown"
@@ -143,6 +137,67 @@ func MapToStep(stepMap map[string]any) (*WorkflowStep, error) {
 	return step, nil
 }
 
+func parseStepEnv(env map[string]any) map[string]string {
+	result := make(map[string]string)
+	for k, v := range env {
+		if strVal, ok := v.(string); ok {
+			result[k] = strVal
+		} else if v != nil {
+			result[k] = marshalEnvValue(v)
+		}
+	}
+	return result
+}
+
+func parseStepContinueOnError(val any) *TemplatableBool {
+	switch value := val.(type) {
+	case bool:
+		templatableValue := TemplatableBool(strconv.FormatBool(value))
+		return &templatableValue
+	case string:
+		if value == "true" || value == "false" || isExpression(value) {
+			templatableValue := TemplatableBool(value)
+			return &templatableValue
+		}
+	}
+	return nil
+}
+
+// parseStepTimeoutMinutes converts a YAML `timeout-minutes` value into a positive
+// number of minutes. Values that are not positive integers within the platform int
+// range are ignored (returning 0, which omits the field from the rendered step).
+func parseStepTimeoutMinutes(val any) int {
+	switch v := val.(type) {
+	case int:
+		if v > 0 {
+			return v
+		}
+	case int64:
+		if v > 0 && v <= int64(math.MaxInt) {
+			return int(v)
+		}
+	case uint64:
+		if v > 0 && v <= uint64(math.MaxInt) {
+			return int(v)
+		}
+	case float64:
+		// float64 loses integer precision near MaxInt on 64-bit platforms, so treat
+		// values at or above the rounded float boundary as out of range. Only
+		// integral values are accepted so fractional timeouts are not truncated.
+		if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) {
+			return 0
+		}
+		if v >= 1 && v < float64(math.MaxInt) {
+			return int(v)
+		}
+	case string:
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
 // Clone creates a deep copy of the WorkflowStep
 func (s *WorkflowStep) Clone() *WorkflowStep {
 	clone := &WorkflowStep{
@@ -153,8 +208,12 @@ func (s *WorkflowStep) Clone() *WorkflowStep {
 		Run:              s.Run,
 		WorkingDirectory: s.WorkingDirectory,
 		Shell:            s.Shell,
-		ContinueOnError:  s.ContinueOnError,
 		TimeoutMinutes:   s.TimeoutMinutes,
+	}
+
+	if s.ContinueOnError != nil {
+		continueOnError := *s.ContinueOnError
+		clone.ContinueOnError = &continueOnError
 	}
 
 	if s.With != nil {
@@ -218,48 +277,16 @@ func StepsToSlice(steps []*WorkflowStep) []any {
 
 // marshalEnvValue serializes a non-string env var value to a string suitable
 // for use in a GitHub Actions step env block.
-// Arrays and maps are serialized as JSON (e.g. ["a","b"]) so that shell
-// consumers such as `jq --argjson` receive valid JSON.
-// Typed slices produced by goccy/go-yaml (e.g. []string instead of []any)
-// are normalized via reflection before marshaling.
-// Scalar values (int, bool, float64, etc.) fall back to fmt.Sprint.
+// Arrays and maps are serialized as JSON (e.g. ["a","b"]) via
+// importinpututil.FormatResolvedValue so import substitutions and env
+// serialization stay aligned. Scalar values (int, bool, float64, etc.)
+// fall back to fmt.Sprint.
 func marshalEnvValue(v any) string {
-	switch val := v.(type) {
-	case []any:
-		if b, err := json.Marshal(val); err == nil {
-			return string(b)
-		}
-	case map[string]any:
-		if b, err := json.Marshal(val); err == nil {
-			return string(b)
-		}
-	case nil:
+	if v == nil {
 		return ""
-	default:
-		rv := reflect.ValueOf(v)
-		switch rv.Kind() {
-		case reflect.Slice:
-			normalized := make([]any, rv.Len())
-			for i := range rv.Len() {
-				normalized[i] = rv.Index(i).Interface()
-			}
-			if b, err := json.Marshal(normalized); err == nil {
-				return string(b)
-			}
-		case reflect.Map:
-			keys := make([]string, 0, rv.Len())
-			for _, key := range rv.MapKeys() {
-				keys = append(keys, key.String())
-			}
-			sort.Strings(keys)
-			normalized := make(map[string]any, rv.Len())
-			for _, k := range keys {
-				normalized[k] = rv.MapIndex(reflect.ValueOf(k)).Interface()
-			}
-			if b, err := json.Marshal(normalized); err == nil {
-				return string(b)
-			}
-		}
+	}
+	if s, ok := importinpututil.FormatResolvedValue(v); ok {
+		return s
 	}
 	return fmt.Sprint(v)
 }

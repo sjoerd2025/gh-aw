@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 )
 
 func TestParseDefaultBranchFromLsRemote(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    string
@@ -87,6 +89,7 @@ func TestParseDefaultBranchFromLsRemote(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := parseDefaultBranchFromLsRemote(tt.input)
 			assert.Equal(t, tt.expected, result, "parsed branch should match expected")
 			// Ensure we never return something that looks like a git ref prefix
@@ -99,6 +102,7 @@ func TestParseDefaultBranchFromLsRemote(t *testing.T) {
 // TestParseDefaultBranchFromLsRemoteWithRealGit creates real git repositories
 // and runs actual `git ls-remote --symref` to verify parsing against real git output.
 func TestParseDefaultBranchFromLsRemoteWithRealGit(t *testing.T) {
+	t.Parallel()
 	// Skip if git is not available
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found in PATH")
@@ -116,6 +120,7 @@ func TestParseDefaultBranchFromLsRemoteWithRealGit(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Create a bare repo to serve as "origin"
 			bareDir := t.TempDir()
 			runGit(t, bareDir, "init", "--bare", "--initial-branch="+tt.defaultBranch)
@@ -179,4 +184,96 @@ func runGitIn(t *testing.T, dir string, args ...string) {
 	)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "git %s failed: %s", strings.Join(args, " "), string(out))
+}
+
+func TestBuildWorkingTreeResolutionOptions(t *testing.T) {
+	t.Run("offers overwrite first for overlapping unstaged files", func(t *testing.T) {
+		options := buildWorkingTreeResolutionOptions(true)
+		require.Len(t, options, 3)
+		assert.Equal(t, workingTreeOverwrite, options[0].Value)
+		assert.Equal(t, workingTreeCleaned, options[1].Value)
+		assert.Equal(t, workingTreeExit, options[2].Value)
+	})
+
+	t.Run("does not offer overwrite for staged changes", func(t *testing.T) {
+		options := buildWorkingTreeResolutionOptions(false)
+		require.Len(t, options, 2)
+		assert.Equal(t, workingTreeCleaned, options[0].Value)
+		assert.Equal(t, workingTreeExit, options[1].Value)
+	})
+}
+
+func TestFormatWorkingTreeBlockers(t *testing.T) {
+	t.Parallel()
+	description := formatWorkingTreeBlockers(addWorkingTreeBlockers{
+		staged:      []string{"notes.txt"},
+		overlapping: []string{".github/workflows/repo-assist.md", ".github/workflows/repo-assist.lock.yml"},
+	})
+
+	assert.Equal(t, "Staged changes:\n  • notes.txt\nChanges overlapping files the wizard will add:\n  • .github/workflows/repo-assist.md\n  • .github/workflows/repo-assist.lock.yml", description)
+}
+
+func TestIsAlreadyMergedGHError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil error", err: nil, want: false},
+		{name: "already merged phrase", err: errors.New("GraphQL: Pull request is already merged (mergePullRequest)"), want: true},
+		{name: "MERGED state literal", err: errors.New("pull request state is MERGED"), want: true},
+		{name: "unrelated error", err: errors.New("network timeout"), want: false},
+		{name: "merge failure wording", err: errors.New("GraphQL: Pull request could not be merged (mergePullRequest)"), want: false},
+		{name: "not merged wording", err: errors.New("pull request is not merged"), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := isAlreadyMergedGHError(tt.err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestBuildMergeOptions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		mergeFailed   bool
+		userReviewing bool
+		wantValues    []mergeAction
+	}{
+		{
+			name:          "default options",
+			mergeFailed:   false,
+			userReviewing: false,
+			wantValues:    []mergeAction{mergeActionAttempt, mergeActionReview, mergeActionExit},
+		},
+		{
+			name:          "merge failed adds edit title",
+			mergeFailed:   true,
+			userReviewing: false,
+			wantValues:    []mergeAction{mergeActionAttempt, mergeActionEditTitle, mergeActionReview, mergeActionExit},
+		},
+		{
+			name:          "user reviewing shows confirmation path",
+			mergeFailed:   false,
+			userReviewing: true,
+			wantValues:    []mergeAction{mergeActionAttempt, mergeActionConfirmed, mergeActionExit},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			options := buildMergeOptions(tt.mergeFailed, tt.userReviewing)
+			values := make([]mergeAction, 0, len(options))
+			for _, opt := range options {
+				values = append(values, opt.Value)
+			}
+			assert.Equal(t, tt.wantValues, values)
+		})
+	}
 }

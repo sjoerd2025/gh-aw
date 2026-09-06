@@ -30,21 +30,12 @@ func TestGetDefaultAgentModel(t *testing.T) {
 			expectedModel: constants.AgentDefaultModel,
 		},
 		{
-			engineID:      string(constants.OpenCodeEngine),
-			expectedModel: constants.AgentDefaultModel,
-		},
-		{
 			engineID:      string(constants.PiEngine),
 			expectedModel: constants.AgentDefaultModel,
 		},
 		{
 			engineID:      string(constants.CodexEngine),
 			expectedModel: constants.CodexDefaultModel,
-		},
-		{
-			// AntigravityEngine uses a built-in CLI default; no value is injected.
-			engineID:      string(constants.AntigravityEngine),
-			expectedModel: "",
 		},
 		{
 			engineID:      "unknown-engine",
@@ -89,15 +80,7 @@ func TestGetDefaultModelOverrideVar(t *testing.T) {
 			expectedVar: "",
 		},
 		{
-			engineID:    string(constants.OpenCodeEngine),
-			expectedVar: "",
-		},
-		{
 			engineID:    string(constants.PiEngine),
-			expectedVar: "",
-		},
-		{
-			engineID:    string(constants.AntigravityEngine),
 			expectedVar: "",
 		},
 		{

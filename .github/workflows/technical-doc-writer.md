@@ -31,9 +31,11 @@ imports:
   - shared/ai-coding-dictionary.md
 
   - shared/otlp.md
+  - shared/reporting.md
 safe-outputs:
   add-comment:
     max: 1
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[docs] "

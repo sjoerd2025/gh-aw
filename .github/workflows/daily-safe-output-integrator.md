@@ -9,10 +9,16 @@ permissions:
   pull-requests: read
   copilot-requests: write
 
+network:
+  allowed:
+    - defaults
+    - github
+    - proxy.golang.org
+    - sum.golang.org
+
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 imports:
 - uses: shared/daily-audit-base.md
   with:
@@ -20,6 +26,7 @@ imports:
     title-prefix: "[safe-output-integrator] "
 - shared/otlp.md
 safe-outputs:
+  steer: true
   create-pull-request:
     draft: false
     expires: 3d
@@ -71,6 +78,8 @@ evals:
     question: Did the agent inspect test workflows for safe-output coverage and detect any missing types?
   - id: pr_created_or_noop
     question: Was a PR created with new test workflows and compilation tests for missing safe-output types, or was noop used when coverage was complete?
+features:
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

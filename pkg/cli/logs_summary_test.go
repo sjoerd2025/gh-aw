@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -13,6 +14,78 @@ import (
 	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
+
+func TestRunSummaryAndDownloadResultEmbedRunAnalysis(t *testing.T) {
+	commonFields := map[string]struct{}{
+		"Run":                     {},
+		"Metrics":                 {},
+		"AwContext":               {},
+		"TaskDomain":              {},
+		"BehaviorFingerprint":     {},
+		"AgenticAssessments":      {},
+		"AccessAnalysis":          {},
+		"FirewallAnalysis":        {},
+		"RedactedDomainsAnalysis": {},
+		"MissingTools":            {},
+		"MissingData":             {},
+		"Noops":                   {},
+		"MCPFailures":             {},
+		"SkillActivations":        {},
+		"MCPToolUsage":            {},
+		"TokenUsage":              {},
+		"GitHubRateLimitUsage":    {},
+		"JobDetails":              {},
+	}
+
+	runAnalysisType := reflect.TypeFor[RunAnalysis]()
+	for fieldName := range commonFields {
+		if _, ok := runAnalysisType.FieldByName(fieldName); !ok {
+			t.Fatalf("RunAnalysis missing shared field %s", fieldName)
+		}
+	}
+
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[RunSummary](),
+		reflect.TypeFor[DownloadResult](),
+	} {
+		embedded, ok := typ.FieldByName("RunAnalysis")
+		if !ok || !embedded.Anonymous {
+			t.Fatalf("%s must embed RunAnalysis", typ.Name())
+		}
+		for field := range typ.Fields() {
+			if _, duplicated := commonFields[field.Name]; duplicated {
+				t.Fatalf("%s duplicates shared field %s outside RunAnalysis", typ.Name(), field.Name)
+			}
+		}
+		for fieldName := range commonFields {
+			if _, ok := typ.FieldByName(fieldName); !ok {
+				t.Fatalf("%s does not promote shared field %s", typ.Name(), fieldName)
+			}
+		}
+	}
+
+	jsonData, err := json.Marshal(RunSummary{
+		RunAnalysis: RunAnalysis{
+			Run:     WorkflowRun{DatabaseID: 123},
+			Metrics: workflow.LogMetrics{Turns: 2},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal RunSummary: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(jsonData, &fields); err != nil {
+		t.Fatalf("Unmarshal RunSummary JSON: %v", err)
+	}
+	if _, ok := fields["RunAnalysis"]; ok {
+		t.Fatal("RunSummary JSON should flatten embedded RunAnalysis")
+	}
+	for _, fieldName := range []string{"run", "metrics"} {
+		if _, ok := fields[fieldName]; !ok {
+			t.Fatalf("RunSummary JSON missing flattened field %q", fieldName)
+		}
+	}
+}
 
 func TestSaveAndLoadRunSummary(t *testing.T) {
 	// Create a temporary directory for testing
@@ -32,39 +105,41 @@ func TestSaveAndLoadRunSummary(t *testing.T) {
 		CLIVersion:  GetVersion(),
 		RunID:       12345,
 		ProcessedAt: time.Now(),
-		Run: WorkflowRun{
-			DatabaseID:   12345,
-			Number:       42,
-			WorkflowName: "Test Workflow",
-			Status:       "completed",
-			Conclusion:   "success",
-		},
-		Metrics: workflow.LogMetrics{
-			TokenUsage: 1000,
-			Turns:      5,
-		},
-		TaskDomain: &TaskDomainInfo{
-			Name:  "research",
-			Label: "Research",
-		},
-		BehaviorFingerprint: &BehaviorFingerprint{
-			ExecutionStyle:  "adaptive",
-			ToolBreadth:     "moderate",
-			ActuationStyle:  "selective_write",
-			ResourceProfile: "moderate",
-			DispatchMode:    "delegated",
-		},
-		AgenticAssessments: []AgenticAssessment{
-			{
-				Kind:     "delegated_context_present",
-				Severity: "info",
-				Summary:  "The run preserved upstream dispatch context.",
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID:   12345,
+				Number:       42,
+				WorkflowName: "Test Workflow",
+				Status:       "completed",
+				Conclusion:   "success",
 			},
-		},
-		MissingTools: []MissingToolReport{
-			{
-				Tool:   "test_tool",
-				Reason: "Tool not available",
+			Metrics: workflow.LogMetrics{
+				TokenUsage: 1000,
+				Turns:      5,
+			},
+			TaskDomain: &TaskDomainInfo{
+				Name:  "research",
+				Label: "Research",
+			},
+			BehaviorFingerprint: &BehaviorFingerprint{
+				ExecutionStyle:  "adaptive",
+				ToolBreadth:     "moderate",
+				ActuationStyle:  "selective_write",
+				ResourceProfile: "moderate",
+				DispatchMode:    "delegated",
+			},
+			AgenticAssessments: []AgenticAssessment{
+				{
+					Kind:     "delegated_context_present",
+					Severity: "info",
+					Summary:  "The run preserved upstream dispatch context.",
+				},
+			},
+			MissingTools: []MissingToolReport{
+				{
+					Tool:   "test_tool",
+					Reason: "Tool not available",
+				},
 			},
 		},
 		ArtifactsList: []string{
@@ -134,9 +209,11 @@ func TestLoadRunSummaryVersionMismatch(t *testing.T) {
 		CLIVersion:  GetVersion(),
 		RunID:       12345,
 		ProcessedAt: time.Now(),
-		Run: WorkflowRun{
-			DatabaseID: 12345,
-			Number:     42,
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID: 12345,
+				Number:     42,
+			},
 		},
 	}
 
@@ -213,6 +290,7 @@ func TestListArtifacts(t *testing.T) {
 		"workflow-logs/job-1.txt",
 		"workflow-logs/job-2.txt",
 		"agent_output/output.json",
+		jobsAPIResponseFileName,
 	}
 
 	for _, file := range testFiles {
@@ -231,18 +309,26 @@ func TestListArtifacts(t *testing.T) {
 		t.Fatalf("Failed to list artifacts: %v", err)
 	}
 
-	// Verify all test files are in the list
-	for _, expectedFile := range testFiles {
+	// Verify real artifact files are in the list
+	expectedFiles := []string{
+		"aw_info.json",
+		"agent-stdio.log",
+		"safe_output.jsonl",
+		"workflow-logs/job-1.txt",
+		"workflow-logs/job-2.txt",
+		"agent_output/output.json",
+	}
+	for _, expectedFile := range expectedFiles {
 		found := slices.Contains(artifacts, expectedFile)
 		if !found {
 			t.Errorf("Expected artifact %s not found in list: %v", expectedFile, artifacts)
 		}
 	}
 
-	// Verify the summary file itself is not in the list
+	// Verify synthesized cache/summary files are not in the list
 	for _, artifact := range artifacts {
-		if artifact == runSummaryFileName {
-			t.Errorf("Summary file %s should not be in artifacts list", runSummaryFileName)
+		if artifact == runSummaryFileName || artifact == jobsAPIResponseFileName {
+			t.Errorf("Synthesized file %s should not be in artifacts list", artifact)
 		}
 	}
 }
@@ -257,58 +343,70 @@ func TestRunSummaryJSONStructure(t *testing.T) {
 		CLIVersion:  GetVersion(),
 		RunID:       12345,
 		ProcessedAt: time.Now(),
-		Run: WorkflowRun{
-			DatabaseID:   12345,
-			Number:       42,
-			URL:          "https://github.com/test/repo/actions/runs/12345",
-			Status:       "completed",
-			Conclusion:   "success",
-			WorkflowName: "Test Workflow",
-			CreatedAt:    time.Now().Add(-1 * time.Hour),
-			StartedAt:    time.Now().Add(-50 * time.Minute),
-			UpdatedAt:    time.Now().Add(-10 * time.Minute),
-			Event:        "push",
-			HeadBranch:   "main",
-			HeadSha:      "abc123",
-			DisplayTitle: "Test Run",
-			Duration:     40 * time.Minute,
-			TokenUsage:   1000,
-			Turns:        5,
-			ErrorCount:   0,
-			WarningCount: 1,
-			LogsPath:     "/tmp/run-12345",
-		},
-		Metrics: workflow.LogMetrics{
-			TokenUsage: 1000,
-			Turns:      5,
-		},
-		AccessAnalysis: &DomainAnalysis{
-			AnalysisBase: AnalysisBase{
-				DomainBuckets: DomainBuckets{
-					AllowedDomains: []string{"github.com", "api.github.com"},
-					BlockedDomains: []string{},
-				},
-				TotalRequests:   10,
-				AllowedRequests: 10,
-				BlockedRequests: 0,
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID:   12345,
+				Number:       42,
+				URL:          "https://github.com/test/repo/actions/runs/12345",
+				Status:       "completed",
+				Conclusion:   "success",
+				WorkflowName: "Test Workflow",
+				CreatedAt:    time.Now().Add(-1 * time.Hour),
+				StartedAt:    time.Now().Add(-50 * time.Minute),
+				UpdatedAt:    time.Now().Add(-10 * time.Minute),
+				Event:        "push",
+				HeadBranch:   "main",
+				HeadSha:      "abc123",
+				DisplayTitle: "Test Run",
+				Duration:     40 * time.Minute,
+				TokenUsage:   1000,
+				Turns:        5,
+				ErrorCount:   0,
+				WarningCount: 1,
+				LogsPath:     "/tmp/run-12345",
 			},
-		},
-		MissingTools: []MissingToolReport{
-			{
-				Tool:         "test_tool",
-				Reason:       "Tool not available",
-				Alternatives: "alternative_tool",
-				ReportProvenance: ReportProvenance{
-					Timestamp: time.Now().Format(time.RFC3339),
+			Metrics: workflow.LogMetrics{
+				TokenUsage: 1000,
+				Turns:      5,
+			},
+			AccessAnalysis: &DomainAnalysis{
+				AnalysisBase: AnalysisBase{
+					DomainBuckets: DomainBuckets{
+						AllowedDomains: []string{"github.com", "api.github.com"},
+						BlockedDomains: []string{},
+					},
+					TotalRequests:   10,
+					AllowedRequests: 10,
+					BlockedRequests: 0,
 				},
 			},
-		},
-		MCPFailures: []MCPFailureReport{
-			{
-				ServerName: "test-server",
-				Status:     "failed",
-				ReportProvenance: ReportProvenance{
-					Timestamp: time.Now().Format(time.RFC3339),
+			MissingTools: []MissingToolReport{
+				{
+					Tool:         "test_tool",
+					Reason:       "Tool not available",
+					Alternatives: "alternative_tool",
+					ReportProvenance: ReportProvenance{
+						Timestamp: time.Now().Format(time.RFC3339),
+					},
+				},
+			},
+			MCPFailures: []MCPFailureReport{
+				{
+					ServerName: "test-server",
+					Status:     "failed",
+					ReportProvenance: ReportProvenance{
+						Timestamp: time.Now().Format(time.RFC3339),
+					},
+				},
+			},
+			JobDetails: []JobInfoWithDuration{
+				{
+					JobInfo: JobInfo{
+						Name:       "test-job",
+						Status:     "completed",
+						Conclusion: "success",
+					},
+					Duration: 5 * time.Minute,
 				},
 			},
 		},
@@ -316,16 +414,6 @@ func TestRunSummaryJSONStructure(t *testing.T) {
 			"aw_info.json",
 			"agent-stdio.log",
 			"safe_output.jsonl",
-		},
-		JobDetails: []JobInfoWithDuration{
-			{
-				JobInfo: JobInfo{
-					Name:       "test-job",
-					Status:     "completed",
-					Conclusion: "success",
-				},
-				Duration: 5 * time.Minute,
-			},
 		},
 	}
 
@@ -373,12 +461,14 @@ func TestSaveAndLoadRunSummary_SafeItemsCount(t *testing.T) {
 		CLIVersion:  GetVersion(),
 		RunID:       99999,
 		ProcessedAt: time.Now(),
-		Run: WorkflowRun{
-			DatabaseID:     99999,
-			WorkflowName:   "Plan Command",
-			Status:         "completed",
-			Conclusion:     "success",
-			SafeItemsCount: 4,
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID:     99999,
+				WorkflowName:   "Plan Command",
+				Status:         "completed",
+				Conclusion:     "success",
+				SafeItemsCount: 4,
+			},
 		},
 	}
 

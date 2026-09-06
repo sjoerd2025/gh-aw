@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,18 +16,23 @@ import (
 
 var experimentsLog = logger.New("workflow:compiler_experiments")
 
-// experimentsCacheDir is the runtime directory where the experiment state JSON is stored.
+// experimentsCacheDir is the runtime directory where the experiment state file is stored.
 const experimentsCacheDir = "/tmp/gh-aw/experiments"
 
-// experimentStateFile is the path to the experiment state JSON written by pick_experiment.cjs.
-const experimentStateFile = experimentsCacheDir + "/state.json"
+// experimentStateFile is the path to the experiment run-ledger JSONL file written by pick_experiment.cjs.
+const experimentStateFile = experimentsCacheDir + "/state.jsonl"
 
-// ExperimentsStorageCache uses GitHub Actions cache to persist experiment state.
-const ExperimentsStorageCache = "cache"
+// ExperimentStorageMode controls how experiment state is persisted across runs.
+type ExperimentStorageMode string
 
-// ExperimentsStorageRepo uses a git branch (repo-memory) to persist experiment state.
-// This is the default because experiment data is valuable and repo storage is more durable.
-const ExperimentsStorageRepo = "repo"
+const (
+	// ExperimentsStorageCache uses GitHub Actions cache to persist experiment state.
+	ExperimentsStorageCache ExperimentStorageMode = "cache"
+
+	// ExperimentsStorageRepo uses a git branch (repo-memory) to persist experiment state.
+	// This is the default because experiment data is valuable and repo storage is more durable.
+	ExperimentsStorageRepo ExperimentStorageMode = "repo"
+)
 
 // experimentsBranchPrefix is the git branch prefix used when storage: repo is selected.
 // Branches are named "experiments/{sanitizedWorkflowID}".
@@ -90,7 +96,7 @@ func extractExperimentConfigsFromFrontmatter(frontmatter map[string]any) map[str
 // extractExperimentsStorageFromFrontmatter reads the "storage" key from the experiments
 // map and returns the resolved storage mode.  Returns ExperimentsStorageRepo when the
 // key is absent or has an unrecognised value.
-func extractExperimentsStorageFromFrontmatter(frontmatter map[string]any) string {
+func extractExperimentsStorageFromFrontmatter(frontmatter map[string]any) ExperimentStorageMode {
 	raw, ok := frontmatter["experiments"]
 	if !ok || raw == nil {
 		return ExperimentsStorageRepo
@@ -101,9 +107,10 @@ func extractExperimentsStorageFromFrontmatter(frontmatter map[string]any) string
 	}
 	if storageRaw, ok := rawMap[experimentsStorageReservedKey]; ok {
 		if s, ok := storageRaw.(string); ok {
-			switch s {
+			storage := ExperimentStorageMode(s)
+			switch storage {
 			case ExperimentsStorageCache, ExperimentsStorageRepo:
-				return s
+				return storage
 			default:
 				experimentsLog.Printf("Unknown experiments storage %q; falling back to %q", s, ExperimentsStorageRepo)
 			}
@@ -125,17 +132,28 @@ func WorkflowStateBranchName(prefix, workflowID string) string {
 	if sanitized == "" {
 		sanitized = "default"
 	}
-	return prefix + "/" + sanitized
+	return path.Join(prefix, sanitized)
 }
 
 // extractOneExperimentConfig converts a single raw experiment value into an ExperimentConfig.
 // Returns nil when the value is invalid (e.g. fewer than two variants).
 func extractOneExperimentConfig(name string, val any) *ExperimentConfig {
 	switch v := val.(type) {
-	case []string:
-		if len(v) >= 2 {
-			return &ExperimentConfig{Variants: v}
+	case []string, []any:
+		variants := extractExperimentVariants(v)
+		if len(variants) >= 2 {
+			return &ExperimentConfig{Variants: variants}
 		}
+	case map[string]any:
+		return extractExperimentConfigObject(name, v)
+	}
+	return nil
+}
+
+func extractExperimentVariants(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		return v
 	case []any:
 		var variants []string
 		for _, item := range v {
@@ -143,87 +161,155 @@ func extractOneExperimentConfig(name string, val any) *ExperimentConfig {
 				variants = append(variants, s)
 			}
 		}
-		if len(variants) >= 2 {
-			return &ExperimentConfig{Variants: variants}
-		}
-	case map[string]any:
-		// New object form: extract variants and optional metadata fields.
-		cfg := &ExperimentConfig{}
-		varRaw, ok := v["variants"]
-		if !ok {
-			experimentsLog.Printf("Skipping experiment %q: object form requires 'variants' field", name)
-			return nil
-		}
-		switch vv := varRaw.(type) {
-		case []string:
-			cfg.Variants = vv
-		case []any:
-			for _, item := range vv {
-				if s, ok := item.(string); ok {
-					cfg.Variants = append(cfg.Variants, s)
-				}
-			}
-		}
-		if len(cfg.Variants) < 2 {
-			experimentsLog.Printf("Skipping experiment %q: must have at least 2 variants", name)
-			return nil
-		}
-		if d, ok := v["description"].(string); ok {
-			cfg.Description = d
-		}
-		if m, ok := v["metric"].(string); ok {
-			cfg.Metric = m
-		}
-		if sd, ok := v["start_date"].(string); ok {
-			cfg.StartDate = sd
-		}
-		if ed, ok := v["end_date"].(string); ok {
-			cfg.EndDate = ed
-		}
-		if n, ok := extractIntField(v["issue"]); ok {
-			cfg.Issue = n
-		}
-		if weightRaw, ok := v["weight"]; ok {
-			cfg.Weight = extractIntSlice(weightRaw)
-		}
-		if h, ok := v["hypothesis"].(string); ok {
-			cfg.Hypothesis = h
-		}
-		if smRaw, ok := v["secondary_metrics"]; ok {
-			cfg.SecondaryMetrics = parseStringSliceAny(smRaw, nil)
-		}
-		if gmRaw, ok := v["guardrail_metrics"]; ok {
-			cfg.GuardrailMetrics = extractGuardrailMetrics(gmRaw)
-		}
-		if n, ok := extractIntField(v["min_samples"]); ok {
-			cfg.MinSamples = n
-		}
-		if at, ok := v["analysis_type"].(string); ok {
-			cfg.AnalysisType = at
-		}
-		if tagsRaw, ok := v["tags"]; ok {
-			cfg.Tags = parseStringSliceAny(tagsRaw, nil)
-		}
-		if notifyRaw, ok := v["notify"]; ok {
-			if notifyMap, ok := notifyRaw.(map[string]any); ok {
-				notify := &ExperimentNotify{}
-				hasNotify := false
-				if n, ok := extractIntField(notifyMap["discussion"]); ok {
-					notify.Discussion = n
-					hasNotify = true
-				}
-				if n, ok := extractIntField(notifyMap["issue"]); ok {
-					notify.Issue = n
-					hasNotify = true
-				}
-				if hasNotify {
-					cfg.Notify = notify
-				}
-			}
-		}
-		return cfg
+		return variants
+	default:
+		return nil
+	}
+}
+
+func extractExperimentConfigObject(name string, raw map[string]any) *ExperimentConfig {
+	varRaw, ok := raw["variants"]
+	if !ok {
+		experimentsLog.Printf("Skipping experiment %q: object form requires 'variants' field", name)
+		return nil
+	}
+	cfg := &ExperimentConfig{Variants: extractExperimentVariants(varRaw)}
+	if len(cfg.Variants) < 2 {
+		experimentsLog.Printf("Skipping experiment %q: must have at least 2 variants", name)
+		return nil
+	}
+	applyExperimentConfigMetadata(cfg, raw)
+	return cfg
+}
+
+func applyExperimentConfigMetadata(cfg *ExperimentConfig, raw map[string]any) {
+	if d, ok := raw["description"].(string); ok {
+		cfg.Description = d
+	}
+	if m, ok := raw["metric"].(string); ok {
+		cfg.Metric = m
+	}
+	if sd, ok := raw["start_date"].(string); ok {
+		cfg.StartDate = sd
+	}
+	if ed, ok := raw["end_date"].(string); ok {
+		cfg.EndDate = ed
+	}
+	applyExperimentConfigAdvancedMetadata(cfg, raw)
+}
+
+func applyExperimentConfigAdvancedMetadata(cfg *ExperimentConfig, raw map[string]any) {
+	if n, ok := extractIntField(raw["issue"]); ok {
+		cfg.Issue = n
+	}
+	if weightRaw, ok := raw["weight"]; ok {
+		cfg.Weight = extractIntSlice(weightRaw)
+	}
+	if h, ok := raw["hypothesis"].(string); ok {
+		cfg.Hypothesis = h
+	}
+	if smRaw, ok := raw["secondary_metrics"]; ok {
+		cfg.SecondaryMetrics = parseStringSliceAny(smRaw, nil)
+	}
+	if gmRaw, ok := raw["guardrail_metrics"]; ok {
+		cfg.GuardrailMetrics = extractGuardrailMetrics(gmRaw)
+	}
+	applyExperimentConfigLifecycleMetadata(cfg, raw)
+}
+
+func applyExperimentConfigLifecycleMetadata(cfg *ExperimentConfig, raw map[string]any) {
+	if n, ok := extractIntField(raw["min_samples"]); ok {
+		cfg.MinSamples = n
+	}
+	if at, ok := raw["analysis_type"].(string); ok {
+		cfg.AnalysisType = at
+	}
+	if decisionRaw, ok := raw["decision"].(map[string]any); ok {
+		cfg.Decision = extractExperimentDecisionConfig(decisionRaw)
+	}
+	if tagsRaw, ok := raw["tags"]; ok {
+		cfg.Tags = parseStringSliceAny(tagsRaw, nil)
+	}
+	if notifyRaw, ok := raw["notify"].(map[string]any); ok {
+		cfg.Notify = extractExperimentNotify(notifyRaw)
+	}
+	if continualRaw, ok := raw["continual"].(map[string]any); ok {
+		cfg.Continual = extractContinualExperimentConfig(continualRaw)
+	}
+}
+
+func extractExperimentNotify(raw map[string]any) *ExperimentNotify {
+	notify := &ExperimentNotify{}
+	hasNotify := false
+	if n, ok := extractIntField(raw["discussion"]); ok {
+		notify.Discussion = n
+		hasNotify = true
+	}
+	if n, ok := extractIntField(raw["issue"]); ok {
+		notify.Issue = n
+		hasNotify = true
+	}
+	if hasNotify {
+		return notify
 	}
 	return nil
+}
+
+func extractExperimentDecisionConfig(raw map[string]any) *ExperimentDecisionConfig {
+	cfg := &ExperimentDecisionConfig{}
+	configured := false
+	if value, ok := extractNonNegativeFloat(raw["minimum_effect"]); ok {
+		cfg.MinimumEffect = value
+		configured = true
+	}
+	if value, ok := extractNonNegativeFloat(raw["regression_tolerance"]); ok {
+		cfg.RegressionTolerance = &value
+		configured = true
+	}
+	if value, ok := extractFloat(raw["confidence"]); ok && value > 0 && value < 1 {
+		cfg.Confidence = value
+		configured = true
+	}
+	if !configured {
+		return nil
+	}
+	return cfg
+}
+
+func extractNonNegativeFloat(raw any) (float64, bool) {
+	value, ok := extractFloat(raw)
+	return value, ok && value >= 0
+}
+
+func extractFloat(raw any) (float64, bool) {
+	var value float64
+	switch number := raw.(type) {
+	case float64:
+		value = number
+	case float32:
+		value = float64(number)
+	case int:
+		value = float64(number)
+	case int64:
+		value = float64(number)
+	case uint64:
+		value = float64(number)
+	default:
+		return 0, false
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	return value, true
+}
+
+func extractContinualExperimentConfig(raw map[string]any) *ContinualExperimentConfig {
+	seed, _ := raw["seed"].(string)
+	ramp := extractIntSlice(raw["ramp"])
+	if seed == "" || len(ramp) == 0 {
+		return nil
+	}
+	return &ContinualExperimentConfig{Seed: seed, Ramp: ramp}
 }
 
 // extractIntField converts a numeric any value to int.
@@ -276,7 +362,11 @@ func extractGuardrailMetrics(raw any) []GuardrailMetric {
 		if name == "" || threshold == "" {
 			continue
 		}
-		result = append(result, GuardrailMetric{Name: name, Direction: direction, Threshold: threshold})
+		result = append(result, GuardrailMetric{
+			Name:      name,
+			Direction: direction,
+			Threshold: threshold,
+		})
 	}
 	return result
 }
@@ -347,9 +437,34 @@ func ParseExperimentMetricEvalReference(metric string) (string, bool) {
 	return "", false
 }
 
+// ParseExperimentMetricGraderReference returns the referenced grader ID when metric
+// declares a grader-backed metric.
+// Supported forms:
+//   - grader:<id>
+//   - graders.<id>
+//   - graders.<id>.<suffix> (suffix reserved for future derived metrics)
+func ParseExperimentMetricGraderReference(metric string) (string, bool) {
+	trimmed := strings.TrimSpace(metric)
+	if trimmed == "" {
+		return "", false
+	}
+	if rest, ok := strings.CutPrefix(trimmed, "grader:"); ok {
+		return strings.TrimSpace(rest), true
+	}
+	if rest, ok := strings.CutPrefix(trimmed, "graders."); ok {
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			return "", true
+		}
+		parts := strings.SplitN(rest, ".", 2)
+		return parts[0], true
+	}
+	return "", false
+}
+
 // validateExperimentMetricReferences ensures experiment metrics that reference evals
-// point to declared eval question IDs.
-func validateExperimentMetricReferences(configs map[string]*ExperimentConfig, evals *EvalsConfig) error {
+// or graders point to declared IDs.
+func validateExperimentMetricReferences(configs map[string]*ExperimentConfig, evals *EvalsConfig, graders *GradersConfig) error {
 	if len(configs) == 0 {
 		return nil
 	}
@@ -362,26 +477,82 @@ func validateExperimentMetricReferences(configs map[string]*ExperimentConfig, ev
 			}
 		}
 	}
+	graderIDs := map[string]struct{}{}
+	if graders != nil {
+		for id, def := range graders.Graders {
+			if id == "" || def == nil || (def.Enabled != nil && !*def.Enabled) {
+				continue
+			}
+			graderIDs[id] = struct{}{}
+		}
+	}
 
 	for experimentName, cfg := range configs {
 		if cfg == nil {
 			continue
 		}
-		referencedEvalID, referencesEval := ParseExperimentMetricEvalReference(cfg.Metric)
-		if !referencesEval {
-			continue
-		}
-		if referencedEvalID == "" {
-			return fmt.Errorf("experiments.%s.metric: eval reference must include a non-empty eval id", experimentName)
-		}
-		if _, ok := evalIDs[referencedEvalID]; !ok {
-			if len(evalIDs) == 0 {
-				return fmt.Errorf("experiments.%s.metric: references eval %q but no evals are declared", experimentName, referencedEvalID)
+		if cfg.Continual != nil {
+			if len(cfg.Variants) != 2 {
+				return fmt.Errorf("experiments.%s.continual: exactly two variants are required (control, candidate)", experimentName)
 			}
-			return fmt.Errorf("experiments.%s.metric: references unknown eval %q", experimentName, referencedEvalID)
+			if err := validateContinualRamp(experimentName, cfg.Continual); err != nil {
+				return err
+			}
+		}
+		if err := validateExperimentMetricReference(experimentName, "metric", cfg.Metric, evalIDs, graderIDs); err != nil {
+			return err
+		}
+		for _, guardrail := range cfg.GuardrailMetrics {
+			if err := validateExperimentMetricReference(
+				experimentName, "guardrail_metrics", guardrail.Name, evalIDs, graderIDs,
+			); err != nil {
+				return err
+			}
 		}
 	}
 
+	return nil
+}
+
+func validateExperimentMetricReference(
+	experimentName, field, metric string,
+	evalIDs, graderIDs map[string]struct{},
+) error {
+	referencedEvalID, referencesEval := ParseExperimentMetricEvalReference(metric)
+	if referencesEval {
+		if referencedEvalID == "" {
+			return fmt.Errorf("experiments.%s.%s: expected eval reference format eval:<question_id>; provide a declared eval question id", experimentName, field)
+		}
+		if _, ok := evalIDs[referencedEvalID]; !ok {
+			if len(evalIDs) == 0 {
+				return fmt.Errorf("experiments.%s.%s: references eval %q but no evals are declared", experimentName, field, referencedEvalID)
+			}
+			return fmt.Errorf("experiments.%s.%s: references unknown eval %q", experimentName, field, referencedEvalID)
+		}
+	}
+	referencedGraderID, referencesGrader := ParseExperimentMetricGraderReference(metric)
+	if referencesGrader {
+		if referencedGraderID == "" {
+			return fmt.Errorf("experiments.%s.%s: expected grader reference format grader:<grader_id>; provide a declared grader id", experimentName, field)
+		}
+		if _, ok := graderIDs[referencedGraderID]; !ok {
+			if len(graderIDs) == 0 {
+				return fmt.Errorf("experiments.%s.%s: references grader %q but no graders are declared", experimentName, field, referencedGraderID)
+			}
+			return fmt.Errorf("experiments.%s.%s: references unknown grader %q", experimentName, field, referencedGraderID)
+		}
+	}
+	return nil
+}
+
+func validateContinualRamp(name string, cfg *ContinualExperimentConfig) error {
+	previous := 0
+	for _, percentage := range cfg.Ramp {
+		if percentage <= previous || percentage > 100 {
+			return fmt.Errorf("experiments.%s.continual.ramp: expected strictly increasing percentages in range 1..100, for example [10,25,50]", name)
+		}
+		previous = percentage
+	}
 	return nil
 }
 
@@ -389,13 +560,13 @@ func validateExperimentMetricReferences(configs map[string]*ExperimentConfig, ev
 //
 // When storage is "cache" (legacy) the steps are:
 //  1. Restore experiment cache   – actions/cache/restore keyed by workflow ID
-//  2. Pick variants              – pick_experiment.cjs (reads/writes state.json, sets step outputs,
+//  2. Pick variants              – pick_experiment.cjs (reads/writes state.jsonl/state.json, sets step outputs,
 //     writes a Markdown step summary); outputs: one per experiment (e.g. "caveman=yes") + "experiments" JSON blob
 //  3. Save experiment cache      – actions/cache/save keyed by workflow ID
 //  4. Upload experiment artifact – actions/upload-artifact named "{workflowID}-experiment"
 //
 // When storage is "repo" (default) the steps are:
-//  1. Restore experiment state from git – load_experiment_state_from_repo.cjs fetches state.json
+//  1. Restore experiment state from git – load_experiment_state_from_repo.cjs fetches state.jsonl/state.json
 //     from the "experiments/{sanitizedID}" branch via the GitHub API (read-only; falls back to
 //     empty state when the branch/file does not yet exist)
 //  2. Pick variants              – same as cache mode
@@ -486,6 +657,7 @@ func (c *Compiler) generateExperimentRepoSteps(data *WorkflowData, experimentNam
 // generatePickExperimentStep generates the "Pick experiment variants" step shared by both storage modes.
 func (c *Compiler) generatePickExperimentStep(data *WorkflowData, experimentNames []string) []string {
 	specJSON := buildExperimentSpecJSON(data.Experiments, data.ExperimentConfigs, experimentNames)
+	harnessVersion := experimentHarnessVersion(data)
 	return []string{
 		"      - name: Pick experiment variants\n",
 		"        id: pick-experiment\n",
@@ -494,12 +666,26 @@ func (c *Compiler) generatePickExperimentStep(data *WorkflowData, experimentName
 		fmt.Sprintf("          GH_AW_EXPERIMENT_SPEC: '%s'\n", strings.ReplaceAll(specJSON, "'", "''")),
 		fmt.Sprintf("          GH_AW_EXPERIMENT_STATE_FILE: %s\n", experimentStateFile),
 		fmt.Sprintf("          GH_AW_EXPERIMENT_STATE_DIR: %s\n", experimentsCacheDir),
+		fmt.Sprintf("          GH_AW_HARNESS_VERSION: %s\n", harnessVersion),
 		"        with:\n",
 		"          script: |\n",
 		"            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n",
 		"            setupGlobals(core, github, context, exec, io, getOctokit);\n",
 		"            const { main } = require('" + SetupActionDestination + "/pick_experiment.cjs');\n",
 		"            await main();\n",
+	}
+}
+
+func experimentHarnessVersion(data *WorkflowData) string {
+	switch {
+	case data.FrontmatterHash == "" && data.BodyHash == "":
+		return "unknown"
+	case data.FrontmatterHash == "":
+		return data.BodyHash
+	case data.BodyHash == "":
+		return data.FrontmatterHash
+	default:
+		return data.FrontmatterHash + ":" + data.BodyHash
 	}
 }
 
@@ -601,12 +787,12 @@ func sortedExperimentNames(experiments map[string][]string) []string {
 // the compiler always sets a non-empty WorkflowID before this function is called.
 func experimentArtifactUploadName(data *WorkflowData, sanitizedID string) string {
 	if hasWorkflowCallTrigger(data.On) {
-		return artifactPrefixExprForActivationJob(data) + constants.ExperimentArtifactName
+		return artifactPrefixExprForActivationJob(data) + constants.ExperimentArtifactName.String()
 	}
 	if sanitizedID == "" {
-		return constants.ExperimentArtifactName
+		return constants.ExperimentArtifactName.String()
 	}
-	return sanitizedID + "-" + constants.ExperimentArtifactName
+	return sanitizedID + "-" + constants.ExperimentArtifactName.String()
 }
 
 // experimentArtifactDownloadName returns the artifact name used when downloading the experiment
@@ -618,18 +804,18 @@ func experimentArtifactUploadName(data *WorkflowData, sanitizedID string) string
 // the compiler always sets a non-empty WorkflowID before this function is called.
 func experimentArtifactDownloadName(data *WorkflowData) string {
 	if hasWorkflowCallTrigger(data.On) {
-		return artifactPrefixExprForDownstreamJob(data) + constants.ExperimentArtifactName
+		return artifactPrefixExprForDownstreamJob(data) + constants.ExperimentArtifactName.String()
 	}
 	sanitizedID := SanitizeWorkflowIDForCacheKey(data.WorkflowID)
 	if sanitizedID == "" {
-		return constants.ExperimentArtifactName
+		return constants.ExperimentArtifactName.String()
 	}
-	return sanitizedID + "-" + constants.ExperimentArtifactName
+	return sanitizedID + "-" + constants.ExperimentArtifactName.String()
 }
 
 // buildExperimentArtifactDownloadSteps creates a download step for the experiment artifact.
 // The artifact is downloaded to experimentsCacheDir so the detection agent can read the
-// current variant assignments from state.json.
+// current variant assignments from state.jsonl/state.json.
 // The step is a no-op when no experiments are declared.
 // pinAction resolves the download-artifact action reference; pass c.getActionPin from Compiler methods.
 func buildExperimentArtifactDownloadSteps(data *WorkflowData, pinAction func(string) string) []string {
@@ -653,45 +839,67 @@ func (c *Compiler) buildPushExperimentsStateJob(data *WorkflowData) (*Job, error
 	}
 
 	experimentsLog.Printf("Building push_experiments_state job (branch=%s)", experimentsBranchName(data.WorkflowID))
+	return &Job{
+		Name:        pushExperimentsStateJobName,
+		RunsOn:      c.formatFrameworkJobRunsOn(data),
+		If:          pushExperimentsStateJobCondition(),
+		Permissions: "permissions:\n      contents: write",
+		Needs:       []string{string(constants.ActivationJobName)},
+		Steps:       c.buildPushExperimentsStateSteps(data),
+	}, nil
+}
 
+func (c *Compiler) buildPushExperimentsStateSteps(data *WorkflowData) []string {
 	var steps []string
-
-	// Setup step so the push_experiment_state.cjs script is available.
-	setupActionRef := c.resolveActionReference("./actions/setup", data)
-	if setupActionRef != "" || c.actionMode.IsScript() {
-		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
-		traceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-		parentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, traceID, parentSpanID)...)
+	steps = append(steps, c.buildPushExperimentsStateSetupSteps(data)...)
+	steps = append(steps, buildPushExperimentsStateCheckoutStep())
+	steps = append(steps, c.generateGitConfigurationSteps()...)
+	steps = append(steps, c.buildPushExperimentsStateDownloadStep(data))
+	steps = append(steps, buildPushExperimentsStateScriptStep(data))
+	if c.actionMode.IsDev() {
+		steps = append(steps, c.generateRestoreActionsSetupStep())
 	}
+	return steps
+}
 
-	// Checkout step – configure git credentials without downloading workspace files.
+func (c *Compiler) buildPushExperimentsStateSetupSteps(data *WorkflowData) []string {
+	setupActionRef := c.resolveActionReference("./actions/setup", data)
+	if setupActionRef == "" && !c.actionMode.IsScript() {
+		return nil
+	}
+	traceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
+	parentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+	steps := c.generateCheckoutActionsFolder(data)
+	return append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, traceID, parentSpanID)...)
+}
+
+func buildPushExperimentsStateCheckoutStep() string {
 	var checkoutStep strings.Builder
 	checkoutStep.WriteString("      - name: Checkout repository\n")
 	fmt.Fprintf(&checkoutStep, "        uses: %s\n", getActionPin("actions/checkout"))
 	checkoutStep.WriteString("        with:\n")
 	checkoutStep.WriteString("          persist-credentials: false\n")
 	checkoutStep.WriteString("          sparse-checkout: .\n")
-	steps = append(steps, checkoutStep.String())
+	return checkoutStep.String()
+}
 
-	// Git configuration (author, email).
-	steps = append(steps, c.generateGitConfigurationSteps()...)
-
-	// Download the experiment artifact uploaded by the activation job.
+func (c *Compiler) buildPushExperimentsStateDownloadStep(data *WorkflowData) string {
 	artifactName := experimentArtifactDownloadName(data)
+	downloadAction := c.getActionPin("actions/download-artifact")
 	var downloadStep strings.Builder
 	downloadStep.WriteString("      - name: Download experiment artifact\n")
-	fmt.Fprintf(&downloadStep, "        uses: %s\n", c.getActionPin("actions/download-artifact"))
+	fmt.Fprintf(&downloadStep, "        uses: %s\n", downloadAction)
 	downloadStep.WriteString("        continue-on-error: true\n")
 	downloadStep.WriteString("        with:\n")
-	fmt.Fprintf(&downloadStep, "          name: %s\n", artifactName)
+	for _, line := range downloadArtifactInputLines(artifactName, downloadAction) {
+		downloadStep.WriteString(line)
+	}
 	fmt.Fprintf(&downloadStep, "          path: %s\n", experimentsCacheDir)
-	steps = append(steps, downloadStep.String())
+	return downloadStep.String()
+}
 
-	// Push experiment state to the git branch via push_experiment_state.cjs.
-	// This helper uses pushSignedCommits to create verified (signed) commits.
+func buildPushExperimentsStateScriptStep(data *WorkflowData) string {
 	branchName := experimentsBranchName(data.WorkflowID)
-
 	var pushStep strings.Builder
 	pushStep.WriteString("      - name: Push experiment state to git\n")
 	pushStep.WriteString("        id: push_experiments_state\n")
@@ -709,30 +917,14 @@ func (c *Compiler) buildPushExperimentsStateJob(data *WorkflowData) (*Job, error
 	pushStep.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 	pushStep.WriteString("            const { main } = require('" + SetupActionDestination + "/push_experiment_state.cjs');\n")
 	pushStep.WriteString("            await main();\n")
-	steps = append(steps, pushStep.String())
+	return pushStep.String()
+}
 
-	// Restore the checkout in dev mode (same reason as push_repo_memory).
-	if c.actionMode.IsDev() {
-		steps = append(steps, c.generateRestoreActionsSetupStep())
-	}
-
-	// The push_experiments_state job runs after the activation job succeeds.
-	// It does not depend on the agent job because experiment state was fully resolved in activation.
+func pushExperimentsStateJobCondition() string {
 	activationSucceeded := BuildEquals(
 		BuildPropertyAccess(fmt.Sprintf("needs.%s.result", constants.ActivationJobName)),
 		BuildStringLiteral("success"),
 	)
 	notCancelled := &NotNode{Child: BuildFunctionCall("cancelled")}
-	jobCondition := RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), activationSucceeded))
-
-	job := &Job{
-		Name:        pushExperimentsStateJobName,
-		RunsOn:      c.formatFrameworkJobRunsOn(data),
-		If:          jobCondition,
-		Permissions: "permissions:\n      contents: write",
-		Needs:       []string{string(constants.ActivationJobName)},
-		Steps:       steps,
-	}
-
-	return job, nil
+	return RenderCondition(BuildAnd(BuildAnd(BuildFunctionCall("always"), notCancelled), activationSucceeded))
 }

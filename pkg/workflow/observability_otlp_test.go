@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"maps"
 	"strings"
 	"testing"
 
@@ -280,6 +281,17 @@ func TestGetOTLPGitHubApp(t *testing.T) {
 }
 
 func TestHasOTLPGitHubOIDCAuth(t *testing.T) {
+	assert.True(t, hasOTLPGitHubOIDCAuth(nil, map[string]any{
+		"observability": map[string]any{
+			"otlp": map[string]any{
+				"workload-identity": map[string]any{
+					"provider": "google",
+					"audience": "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/github",
+				},
+			},
+		},
+	}))
+
 	assert.True(t, hasOTLPGitHubOIDCAuth(&FrontmatterConfig{
 		Observability: &ObservabilityConfig{
 			OTLP: &OTLPConfig{
@@ -334,22 +346,26 @@ func TestGetOTLPGitHubAppTokenConfig(t *testing.T) {
 func TestInjectOTLPConfig(t *testing.T) {
 	newCompiler := func() *Compiler { return &Compiler{} }
 
-	t.Run("no-op when OTLP is not configured", func(t *testing.T) {
+	t.Run("falls back to enterprise defaults when OTLP is not configured", func(t *testing.T) {
 		c := newCompiler()
 		wd := &WorkflowData{
 			ParsedFrontmatter: &FrontmatterConfig{},
 		}
 		c.injectOTLPConfig(wd)
-		assert.Nil(t, wd.NetworkPermissions, "NetworkPermissions should remain nil")
-		assert.Empty(t, wd.Env, "Env should remain empty")
+		assert.Nil(t, wd.NetworkPermissions, "NetworkPermissions should remain nil for expression endpoints")
+		assert.True(t, wd.OTLPUsesEnterpriseDefaults, "enterprise defaults should be flagged")
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.GH_AW_DEFAULT_OTLP_ENDPOINT }}")
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.GH_AW_DEFAULT_OTLP_HEADERS }}")
+		assert.Contains(t, wd.Env, "GH_AW_OTLP_IF_MISSING: ignore", "unset enterprise defaults must be a no-op")
 	})
 
-	t.Run("no-op when ParsedFrontmatter is nil", func(t *testing.T) {
+	t.Run("falls back to enterprise defaults when ParsedFrontmatter is nil", func(t *testing.T) {
 		c := newCompiler()
 		wd := &WorkflowData{}
 		c.injectOTLPConfig(wd)
-		assert.Nil(t, wd.NetworkPermissions, "NetworkPermissions should remain nil")
-		assert.Empty(t, wd.Env, "Env should remain empty")
+		assert.Nil(t, wd.NetworkPermissions, "NetworkPermissions should remain nil for expression endpoints")
+		assert.True(t, wd.OTLPUsesEnterpriseDefaults, "enterprise defaults should be flagged")
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.GH_AW_DEFAULT_OTLP_ENDPOINT }}")
 	})
 
 	t.Run("injects env vars when endpoint is a secret expression", func(t *testing.T) {
@@ -406,6 +422,28 @@ func TestInjectOTLPConfig(t *testing.T) {
 		c.injectOTLPConfig(wd)
 		require.NotEmpty(t, wd.Env)
 		assert.Contains(t, wd.Env, "GH_AW_OTLP_IF_MISSING: warn")
+	})
+
+	t.Run("allows Google workload identity hosts even for expression endpoints", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{
+					"otlp": map[string]any{
+						"endpoint": "${{ secrets.OTLP_ENDPOINT }}",
+						"workload-identity": map[string]any{
+							"provider": "google",
+							"audience": "projects/123/locations/global/workloadIdentityPools/pool/providers/github",
+						},
+					},
+				},
+			},
+		}
+		c.injectOTLPConfig(wd)
+
+		require.NotNil(t, wd.NetworkPermissions, "NetworkPermissions should be created")
+		assert.Contains(t, wd.NetworkPermissions.Allowed, "sts.googleapis.com")
+		assert.Contains(t, wd.NetworkPermissions.Allowed, "iamcredentials.googleapis.com")
 	})
 
 	t.Run("adds domain to new NetworkPermissions and injects env vars for static URL", func(t *testing.T) {
@@ -600,6 +638,37 @@ func TestInjectOTLPConfig(t *testing.T) {
 		assert.Contains(t, wd.Env, "OTEL_SERVICE_NAME: my-service", "user-defined service name should be preserved")
 		assert.Equal(t, 1, strings.Count(wd.Env, "OTEL_SERVICE_NAME:"), "OTEL_SERVICE_NAME should appear exactly once")
 		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: https://traces.example.com", "endpoint should still be injected")
+	})
+
+	t.Run("preserves user-defined OTEL_EXPORTER_OTLP_ENDPOINT and does not inject duplicate", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: "https://traces.example.com"},
+				},
+			},
+			Env: "env:\n  OTEL_EXPORTER_OTLP_ENDPOINT: https://user-collector.example.com",
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: https://user-collector.example.com", "user-defined endpoint should be preserved")
+		assert.Equal(t, 1, strings.Count(wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT:"), "OTEL_EXPORTER_OTLP_ENDPOINT should appear exactly once")
+	})
+
+	t.Run("preserves user-defined GH_AW_OTLP_ENDPOINTS and does not inject duplicate", func(t *testing.T) {
+		c := newCompiler()
+		wd := &WorkflowData{
+			ParsedFrontmatter: &FrontmatterConfig{
+				Observability: &ObservabilityConfig{
+					OTLP: &OTLPConfig{Endpoint: "https://traces.example.com"},
+				},
+			},
+			Env: "env:\n  GH_AW_OTLP_ENDPOINTS: '[]'",
+		}
+		c.injectOTLPConfig(wd)
+
+		assert.Equal(t, 1, strings.Count(wd.Env, "GH_AW_OTLP_ENDPOINTS:"), "GH_AW_OTLP_ENDPOINTS should appear exactly once")
 	})
 
 	t.Run("OTEL_SERVICE_NAME includes sanitized workflow ID when available", func(t *testing.T) {
@@ -820,13 +889,13 @@ func TestInjectOTLPConfig_RawFrontmatterFallback(t *testing.T) {
 		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.GH_AW_OTEL_HEADERS }}", "headers should be injected from raw")
 	})
 
-	t.Run("no-op when neither raw nor parsed frontmatter has OTLP", func(t *testing.T) {
+	t.Run("uses enterprise defaults when neither raw nor parsed frontmatter has OTLP", func(t *testing.T) {
 		wd := &WorkflowData{
 			ParsedFrontmatter: nil,
 			RawFrontmatter:    map[string]any{"name": "my-workflow"},
 		}
 		c.injectOTLPConfig(wd)
-		assert.Empty(t, wd.Env, "Env should remain empty")
+		assert.Contains(t, wd.Env, "OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.GH_AW_DEFAULT_OTLP_ENDPOINT }}")
 		assert.Nil(t, wd.NetworkPermissions, "NetworkPermissions should remain nil")
 	})
 }
@@ -1067,12 +1136,13 @@ func TestInjectOTLPConfig_OTLPEndpointField(t *testing.T) {
 		assert.Equal(t, "https://traces.example.com:4318", wd.OTLPEndpoint, "OTLPEndpoint should be set to the resolved endpoint")
 	})
 
-	t.Run("does not set OTLPEndpoint when OTLP is not configured", func(t *testing.T) {
+	t.Run("sets OTLPEndpoint from enterprise defaults when OTLP is not configured", func(t *testing.T) {
 		wd := &WorkflowData{
 			RawFrontmatter: map[string]any{"name": "no-otlp"},
 		}
 		c.injectOTLPConfig(wd)
-		assert.Empty(t, wd.OTLPEndpoint, "OTLPEndpoint should remain empty when OTLP is not configured")
+		assert.Equal(t, "${{ vars.GH_AW_DEFAULT_OTLP_ENDPOINT }}", wd.OTLPEndpoint, "OTLPEndpoint should fall back to the enterprise default variable")
+		assert.Equal(t, "${{ secrets.GH_AW_DEFAULT_OTLP_HEADERS }}", wd.OTLPHeaders, "OTLPHeaders should fall back to the enterprise default secret")
 	})
 
 	t.Run("sets OTLPEndpoint from imported observability merged into RawFrontmatter", func(t *testing.T) {
@@ -2170,5 +2240,63 @@ func TestEncodeOTLPCustomAttributes(t *testing.T) {
 		assert.NotEmpty(t, encoded)
 		assert.Contains(t, encoded, "langfuse.session.id")
 		assert.True(t, strings.HasPrefix(encoded, "{"), "should be a JSON object")
+	})
+}
+
+// TestValidateOTLPWorkloadIdentity verifies the workload identity configuration validation.
+func TestValidateOTLPWorkloadIdentity(t *testing.T) {
+	newData := func(workloadIdentity map[string]any, extra map[string]any) *WorkflowData {
+		otlp := map[string]any{}
+		if workloadIdentity != nil {
+			otlp["workload-identity"] = workloadIdentity
+		}
+		maps.Copy(otlp, extra)
+		return &WorkflowData{
+			RawFrontmatter: map[string]any{
+				"observability": map[string]any{"otlp": otlp},
+			},
+		}
+	}
+
+	t.Run("no workload identity is valid", func(t *testing.T) {
+		assert.NoError(t, validateOTLPWorkloadIdentity(newData(nil, nil)))
+	})
+
+	t.Run("valid configuration", func(t *testing.T) {
+		assert.NoError(t, validateOTLPWorkloadIdentity(newData(map[string]any{
+			"provider": "google",
+			"audience": "projects/123/locations/global/workloadIdentityPools/pool/providers/github",
+		}, nil)))
+	})
+
+	t.Run("unsupported provider is rejected", func(t *testing.T) {
+		err := validateOTLPWorkloadIdentity(newData(map[string]any{
+			"provider": "aws",
+			"audience": "some-audience",
+		}, nil))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "provider must be google")
+	})
+
+	t.Run("missing audience is rejected", func(t *testing.T) {
+		err := validateOTLPWorkloadIdentity(newData(map[string]any{
+			"provider": "google",
+		}, nil))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "audience is required")
+	})
+
+	t.Run("combining with github app credentials is rejected", func(t *testing.T) {
+		err := validateOTLPWorkloadIdentity(newData(map[string]any{
+			"provider": "google",
+			"audience": "projects/123/locations/global/workloadIdentityPools/pool/providers/github",
+		}, map[string]any{
+			"github-app": map[string]any{
+				"app-id":      "123",
+				"private-key": "${{ secrets.APP_KEY }}",
+			},
+		}))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot be combined")
 	})
 }

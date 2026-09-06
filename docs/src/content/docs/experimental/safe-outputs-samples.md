@@ -43,6 +43,13 @@ Compile with the hidden flag:
 gh aw compile --use-samples .github/workflows/my-workflow.md
 ```
 
+Alternatively, a single workflow can opt itself in with the `features.samples: true` flag, which has exactly the same effect as `--use-samples` but applies only to that workflow. Use it for workflows that are designed around `samples:` (such as this repository's own smoke tests) so a plain `gh aw compile` — and therefore `make recompile` — keeps producing the samples-mode lock file:
+
+```yaml
+features:
+  samples: true
+```
+
 The generated `.lock.yml` replaces the agentic step with:
 
 ```yaml
@@ -95,9 +102,11 @@ Trivial workflow exercising create-pull-request via --use-samples.
 
 Even without `--use-samples`, every `samples:` entry on every enabled handler is validated at compile time against the corresponding MCP tool's `inputSchema`. Sidecar keys are stripped first. Any `${{ ... }}` runtime expression inside a sample string is substituted with a schema-aware placeholder for validation only (e.g. an enum value for `severity`, `true` for a boolean, `aw_sample` for a generic `aw_*` temporary-id pattern); the original expression is preserved verbatim in the emitted YAML.
 
+When samples replay is enabled, the compiler also warns about each enabled non-builtin handler that supports `samples:` but declares no entries. Those handlers are never called by the replay driver, so the run succeeds without performing the configured operation — add a `samples:` list to each one you expect the suite to exercise.
+
 ## Interaction with other features
 
-- **Threat detection is force-disabled** under `--use-samples`. The replay driver bypasses the agent entirely, so threat scanning over the (nonexistent) prompt and tool log would always produce a clean signal and add noise to the deterministic baseline. Setting `safe-outputs.threat-detection: true` explicitly is overridden with a warning.
+- **Threat detection is force-disabled** under `--use-samples` (and under `features.samples: true`). The replay driver bypasses the agent entirely, so threat scanning over the (nonexistent) prompt and tool log would always produce a clean signal and add noise to the deterministic baseline. Setting `safe-outputs.threat-detection: true` explicitly is overridden with a warning.
 - **`staged:`** is honored normally — `staged: true` handlers still emit step-summary stubs instead of GitHub API calls.
 - **All other safe-output features** (`max:`, `github-token:`, `github-app:`, `normalize-closing-keywords:`) behave identically to a real agentic run.
 
@@ -106,6 +115,7 @@ Even without `--use-samples`, every `samples:` entry on every enabled handler is
 | Field | Type | Description |
 |---|---|---|
 | `samples` | `array` | Per-handler list of MCP `tools/call` argument objects. Each entry is validated against the tool's `inputSchema` at compile time. |
+| `features.samples` | `boolean` | Workflow-level opt-in to samples replay, equivalent to compiling that workflow with `--use-samples`. |
 
 Recognized sidecar keys (stripped before schema validation; consumed by the replay driver only):
 

@@ -3,6 +3,7 @@
 package agentdrain
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -31,6 +32,7 @@ func anomalyScore(isNew, lowSim, rare bool) float64 {
 }
 
 func TestAnomalyDetector_Analyze(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name              string
 		simThreshold      float64
@@ -286,6 +288,12 @@ func TestNewAnomalyDetector_ThresholdBoundaries(t *testing.T) {
 			wantErr:       "simThreshold must be in [0,1]",
 		},
 		{
+			name:          "NaN similarity threshold is rejected",
+			simThreshold:  math.NaN(),
+			rareThreshold: 1,
+			wantErr:       "simThreshold must be in [0,1]",
+		},
+		{
 			name:          "negative rare cluster threshold is rejected",
 			simThreshold:  0.4,
 			rareThreshold: -1,
@@ -485,6 +493,7 @@ func TestAnalyzeEvent(t *testing.T) {
 
 // TestAnalyzeEvent_Variants covers edge-case event shapes: empty stage and nil/empty fields.
 func TestAnalyzeEvent_Variants(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		evt        AgentEvent
@@ -569,6 +578,7 @@ func TestAnalyze_NilResult(t *testing.T) {
 }
 
 func TestAnalyze_FlagMutualExclusivity(t *testing.T) {
+	t.Parallel()
 	d, err := NewAnomalyDetector(0.4, 2)
 	require.NoError(t, err, "NewAnomalyDetector should succeed")
 

@@ -71,6 +71,7 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
       target-repo: org/other-repo         # Optional: cross-repo dispatch target (owner/repo or expression)
       allowed-repos: [org/*]              # Optional: allowlist for cross-repo dispatch targets
       target-ref: main                    # Optional: ref to dispatch against (overrides caller's GITHUB_REF)
+      allowed-refs: ["release/*"]         # Optional: glob allowlist for agent-provided per-call ref overrides (default: caller's ref only)
   ```
 
   Triggers other agentic workflows using workflow_dispatch. Agent output includes `workflow_name` (without .md extension) and optional `inputs` (key-value pairs). Cross-repo dispatch is supported via `target-repo` plus an `allowed-repos` allowlist; cross-repo targets require a token with `actions: write` on the target repository.
@@ -141,6 +142,7 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
   safe-outputs:
     create-check-run:
       name: "Security Analysis"       # Optional: check run name (defaults to workflow name)
+      target: "triggering"            # Optional: "triggering" (default), "*" (any PR), or explicit PR number
       max: 1                          # Optional: max check runs per workflow run (default: 1)
       output:                         # Optional: static fallback values used when the agent omits the field
         title: "Pending analysis"     # Fallback title (max 256 chars)
@@ -215,6 +217,7 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
         - outdated
         - resolved
       target-repo: "owner/repo"       # Optional: cross-repository
+      discussions: true               # Optional: opt-in to discussions:write permission for hiding discussion comments (default: false)
   ```
 
   Allowed reasons: `spam`, `abuse`, `off_topic`, `outdated`, `resolved`, `low_quality`.
@@ -243,6 +246,19 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
   ```
 
   Agent calls `set_issue_field` with `value` plus either `field_name` (preferred) or `field_node_id`. `issue_number` is optional and defaults to the triggering issue.
+- `approve-workflow-run:` - Approve a pending workflow run in the "action required" state
+
+  ```yaml
+  safe-outputs:
+    approve-workflow-run:
+      allowed-workflows: [ci.yml]     # Required: workflow filenames eligible for approval (no paths)
+      allowed-repos: [org/fork]       # Optional: fork repositories allowed for approval (default: current repository only)
+      allowed-pull-requests: ["123"]  # Optional: restrict to specific PR numbers
+      protected-files: blocked        # Optional: "blocked" (default), "fallback-to-issue", or "allowed"
+      github-token: ${{ secrets.APPROVE_WORKFLOW_RUN_TOKEN }}  # Required: external token/app (github.token cannot approve runs requiring approval)
+  ```
+
+  Requires `actions: write` (added automatically) plus an external `github-token` or `github-app` — the default `github.token` is not permitted to approve workflow runs requiring approval.
 - `noop:` - Log completion message for transparency (auto-enabled)
 
   ```yaml

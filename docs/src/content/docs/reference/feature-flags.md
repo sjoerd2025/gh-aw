@@ -91,6 +91,16 @@ features:
   awf-diagnostic-logs: true
 ```
 
+## External Threat Detection (`features.gh-aw-detection`)
+
+Threat detection uses the external `threat-detect` binary by default. Set
+`features.gh-aw-detection: false` to use the legacy inline engine path.
+
+```yaml wrap
+features:
+  gh-aw-detection: false
+```
+
 ## Reaction-based Trust Signals (`features.integrity-reactions`)
 
 Enables maintainers to promote or demote content past the integrity filter using GitHub reactions (👍, ❤️, 👎, 😕), without adding labels or modifying issue state. Available from gh-aw v0.68.2.
@@ -117,7 +127,7 @@ tools:
 
 Without `min-integrity`, `integrity-proxy` has no effect. When both are configured, the proxy enforces network-boundary integrity filtering in addition to the MCP gateway-level filtering. Set `integrity-proxy: false` when you only need gateway-level filtering.
 
-## Related Documentation
+## Learn More
 
 - [Frontmatter Reference](/gh-aw/reference/frontmatter/) — Complete frontmatter field reference
 - [AI Engines](/gh-aw/reference/engines/) — Engine configuration including Copilot BYOK

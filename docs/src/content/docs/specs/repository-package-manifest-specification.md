@@ -7,7 +7,7 @@ sidebar:
 
 # aw.yml Repository Package Manifest Specification
 
-**Version**: 0.2.0  
+**Version**: 0.3.0
 **Status**: Draft
 
 ## Abstract
@@ -45,9 +45,16 @@ The manifest document MUST be a YAML mapping. Unknown top-level fields MUST be r
 | `min-version` | string | No | Minimum supported `gh-aw` version. |
 | `name` | string | Yes | Human-readable package name. |
 | `emoji` | string | No | Optional package emoji for display in package metadata. |
+| `icon` | string | No | Optional package icon: an emoji, a GitHub primer octicon name (`:...:`), or an SVG resource path. |
 | `description` | string | No | Human-readable package description. |
 | `license` | string | No | SPDX license identifier or license name for the package. |
-| `files` | array of strings | No | Explicit installable workflow file list. |
+| `private` | boolean | No | Whether the package is unavailable for installation. Defaults to `false`. |
+| `experimental` | boolean | No | Whether the package is experimental. Defaults to `false`. |
+| `imports` | array of strings | No | Paths to package manifests included recursively in the install set. |
+| `files` | array of strings | No | Deprecated. Explicit installable workflow file list. Use `includes` instead. |
+| `includes` | array of strings or mappings | No | Explicit installable package entries. String entries use path conventions; mapping entries declare an explicit source-to-destination install path. |
+| `resources` | array of mappings | No | Declarative repository assets copied as-is to allowlisted destinations. |
+| `config` | array of mappings | No | Ordered repository setup actions applied by the interactive installer. |
 
 ### 4.2 `manifest-version`
 
@@ -71,6 +78,14 @@ If the running compiler version is lower than `min-version`, validation MUST fai
 
 If present, `emoji` MUST be a string.
 
+### 4.5.1 `icon`
+
+If present, `icon` MUST be a non-empty string that matches one of the following formats:
+
+1. **Emoji**: A single or sequence of Unicode emoji characters.
+2. **GitHub Primer Octicon**: A GitHub Primer octicon name enclosed in colons using `:name:` format (for example, `:check-circle:`).
+3. **SVG Package Resource**: A path to an `.svg` file that is declared as a package resource in the `resources` section of `aw.yml`.
+
 ### 4.6 `description`
 
 If present, `description` MUST be a string.
@@ -81,7 +96,15 @@ Implementations SHOULD warn if `description` exceeds 255 characters.
 
 If present, `license` MUST be a string. Use an [SPDX license identifier](https://spdx.org/licenses/) such as `MIT` or `Apache-2.0`, or a license name. Non-string values MUST be rejected.
 
-### 4.8 `files`
+### 4.8 `private`
+
+If omitted, `private` defaults to `false`. When `private` is `true`, `gh aw add` MUST refuse to install the package.
+
+### 4.9 `experimental`
+
+If omitted, `experimental` defaults to `false`. When `experimental` is `true`, `gh aw add` MUST warn before installing the package.
+
+### 4.10 `files`
 
 If present, `files` MUST be an array of strings.
 
@@ -94,6 +117,91 @@ Duplicate entries SHOULD be ignored after normalization.
 
 **Path-traversal safety**: Each entry in `files` MUST NOT contain a path-traversal sequence. Specifically, any entry that contains `../` (or `..\` on Windows-style paths), begins with `../`, or resolves to a path outside the package root after normalization MUST be rejected with a validation error. Implementations MUST NOT follow symlinks that would escape the package root during file resolution. This rule applies regardless of the number of traversal components in the path (e.g., `../../etc/passwd` and `workflows/../../hidden` are both prohibited).
 
+### 4.10.1 `imports`
+
+If present, `imports` MUST be an array of strings. Each entry MUST resolve relative to the
+manifest containing it, MUST name an `aw.yml` file, and MUST remain within the top-level
+package root after normalization. Absolute paths and paths that escape that root MUST be
+rejected.
+
+Imports are recursive. Implementations MUST detect import cycles and report the manifest
+path chain forming the cycle. Each manifest MUST be parsed and validated before its package
+assets are added to a unified install list. Imported workflows, resources, skills, and
+agents MUST retain paths relative to the directory containing their manifest. Top-level
+package metadata and `config` MUST NOT be replaced by imported manifest values.
+
+The unified install list MUST be checked before installation. Two files that resolve to the
+same case-insensitive destination MUST cause resolution to fail. A manifest that declares
+imports but no direct installable files MUST NOT trigger workflow auto-discovery in its own
+directory.
+
+### 4.11 `includes`
+
+If present, `includes` MUST be an array whose entries are either strings or mappings.
+
+**String entries** follow the same rules as `files` (§4.10), with one special case that MUST be preserved for backward compatibility: a string entry beginning with `.github/` is resolved relative to the **consuming repository root**, not relative to the package root, even for nested packages. All other string entries (for example `workflows/review.md`) are resolved relative to the package root.
+
+String entries MAY use one wildcard as their final path segment (for example, `workflows/*`). The wildcard MUST be exactly `*`, MUST be preceded by `/`, and MUST NOT appear elsewhere in the path. It matches supported direct children of the named directory and MUST NOT recurse into nested directories. Implementations MUST apply the same workflow, skill, and agent path validation used for explicit string entries to every match, MUST ignore unsupported matches, and MUST preserve deterministic lexical ordering. A `.github/` wildcard retains the repository-root-relative behavior described above.
+
+**Mapping entries** declare an explicit source-to-destination install mapping and MUST contain:
+
+| Key | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `source` | string | Yes | Path of the file to install, always resolved relative to the package root, including for nested packages. The `.github/` special case of string entries MUST NOT apply. |
+| `destination` | string | Yes | Install path, resolved relative to the consuming repository root. |
+| `kind` | string | No | Either `agentic-workflow` or `action-workflow`. When present, it MUST match the file extension of `source`. |
+
+Mapping entries let a distribution repository keep executable workflow assets inert outside its own `.github/workflows/` directory and still install them into the consuming repository's `.github/workflows/`.
+
+Implementations MUST reject a mapping entry when any of the following holds:
+
+- `source` or `destination` is empty, absolute, or contains a path-traversal sequence that escapes its root;
+- `source` resolves to a symbolic link or to a path outside the package root;
+- `source` or `destination` does not end in `.md` or `.yml`, or ends in `.lock.yml`;
+- `destination` is not a direct child of `.github/workflows/`;
+- the file extension of `destination` differs from the file extension of `source`;
+- `kind` is present and does not match the kind implied by the `source` extension.
+
+Implementations MUST detect two entries that resolve to the same `destination` and MUST fail before writing any file.
+
+Mapping entries follow the same install semantics as string entries: `.md` sources are compiled under their destination file name, and `.yml` sources are copied verbatim. Package-provided post-install shell code MUST NOT be executed.
+
+`gh aw add`, `gh aw add-wizard`, and `gh aw update` MUST use identical mapping semantics, and `gh aw update` MUST continue to track the manifest source of installed files.
+
+### 4.12 `resources`
+
+If present, `resources` MUST be an array of mappings. Each mapping MUST contain:
+
+| Key | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `source` | string | Yes | Package-relative path of the asset to copy. |
+| `destination` | string | Yes | Repository-root-relative destination path. |
+
+Resource `source` and `destination` values MUST NOT be absolute paths and MUST NOT escape their roots through path traversal. Local package sources MUST NOT be symbolic links, directories, or other non-regular file replacements.
+
+Resource destinations are restricted to non-hook repository asset namespaces:
+
+- `.github/ISSUE_TEMPLATE/*.yml`
+- `.github/ISSUE_TEMPLATE/*.yaml`
+- `.github/CODEOWNERS`
+- `.github/aw/**`
+
+Implementations MUST reject duplicate or case-insensitive duplicate resource destinations before writing files. Resources are copied as inert content from the selected package ref; installers MUST NOT execute package-provided scripts or expose configured secrets to package content during installation.
+
+For each package installation, implementations MUST record package-scoped ownership metadata under `.github/aw/packages/`. The record MUST identify the package source, resolved immutable commit/ref, installed destination paths, source paths, and SHA-256 content digests. Implementations MUST refuse to overwrite existing resource files unless they are unchanged files owned by the same package, or unless the user explicitly passes `--force`.
+
+### 4.13 `config`
+
+The experimental `config` field MAY contain `repo-label` actions. A `repo-label`
+action MUST contain a non-empty `name` string of at most 50 characters, a
+non-empty `description` string of at most 100 characters, and a `color` matching
+exactly six hexadecimal characters without a leading `#`.
+
+When applied, the installer MUST create a missing label. If a label with the
+same name already exists, the installer MUST update its description or color
+when either differs. If all declared values already match, the action MUST have
+no effect.
+
 ## 5. Installable file resolution
 
 Supported installable paths are:
@@ -101,6 +209,8 @@ Supported installable paths are:
 - `workflows/<name>.md`
 - `.github/workflows/<name>.md`
 - `.github/workflows/<name>.yml` (raw GitHub Actions YAML; direct children only, `.lock.yml` excluded)
+
+Mapping entries in `includes` (§4.11) may declare any package-relative `source`; their `destination` MUST be a direct child of `.github/workflows/`.
 
 Nested descendants under the markdown directories are also valid when referenced explicitly in `files`. Raw `.yml` action workflows MUST be direct children of `.github/workflows/`; nested `.yml` files are rejected.
 
@@ -115,7 +225,7 @@ If `files` is omitted, or if no valid entries remain after filtering, the implem
 
 Auto-discovery considers only agentic workflow markdown (`.md`); raw `.yml` action workflows MUST be referenced explicitly in `files` to be installed.
 
-If no installable workflow files are resolved, package validation MUST fail.
+If no installable package assets are resolved (workflows, resources, skills, or agents), package validation MUST fail.
 
 ### 5.1 Install
 
@@ -125,7 +235,8 @@ The install lifecycle (invoked by `gh aw add`) MUST proceed in the following ord
 2. **Resolve** the installable file list per §5.
 3. **Download** each resolved file from the remote package source.
 4. **Compile** each agentic workflow markdown file into the target repository's workflow directory. Raw `.yml` files are copied verbatim without compilation.
-5. **Write** all output files atomically before reporting success.
+5. **Copy** declared `resources` as inert repository assets without executing them.
+6. **Write** all output files and package ownership metadata atomically before reporting success.
 
 If any step fails, the implementation MUST abort and MUST NOT leave partial output files in the target directory. The implementation SHOULD emit an actionable error identifying the failing step. See §10 (Safeguards) for the normative rollback and permission-error requirements that apply to this lifecycle (R-PKG-003, R-PKG-004, R-PKG-006, R-PKG-007).
 
@@ -135,7 +246,7 @@ The update lifecycle re-installs a package at a newer (or specified) version, ov
 
 **R-PKG-U001**: `gh aw add` with a version specifier (e.g., `owner/repo@v2.0.0`) MUST overwrite previously installed files from the same package with the new version's files, following the same install ordering defined in §5.1.
 
-**R-PKG-U002**: Files that were present in the previous installation but are absent from the new version's resolved file list MUST be left in place. The implementation SHOULD emit a warning for each such orphaned file, identifying the file by path and noting that it was not present in the new version.
+**R-PKG-U002**: Files that were present in the previous installation but are absent from the new version's resolved package-managed file list MUST be removed only when all of the following hold: (a) they are owned by the same package, (b) they are unchanged from the recorded digest, and (c) no replacement from the new version maps to the same path. When a new version entry maps to the same path, overwrite behavior is governed by R-PKG-U001. Implementations SHOULD warn when stale files are preserved because they were modified or ownership cannot be proven.
 
 **R-PKG-U003**: If overwriting a file fails (for example, due to a filesystem permission error or a locked file), the implementation MUST abort the update and MUST NOT leave the target directory in a mixed state combining old and new file versions. The implementation MUST emit an error identifying the file that could not be overwritten and the reason.
 
@@ -179,7 +290,7 @@ Validation MUST fail for at least the following conditions:
 - current compiler version is lower than `min-version`;
 - unknown top-level fields, including `docs`; or
 - missing required `README.md`; or
-- no installable workflow files resolved.
+- no installable package assets (workflows, resources, skills, or agents) resolved.
 
 Implementations SHOULD emit warnings for at least the following conditions:
 
@@ -283,8 +394,8 @@ This section provides a normative reference table for all MUST/SHALL requirement
 | — | §4.2 | `manifest-version` MUST equal `"1"`; any other value MUST be rejected |
 | — | §4.3 | `min-version` MUST use `vMAJOR.minor.patch` form; MUST fail if compiler version is lower |
 | — | §4.4 | `name` MUST be present and non-empty after trimming whitespace |
-| — | §4.7 | Each `files` entry MUST be resolved relative to the package root and MUST match a supported installable path |
-| — | §4.8 | Each `files` entry MUST NOT contain a path-traversal sequence (`../`); entries that escape the package root MUST be rejected |
+| — | §4.10 | Each `files` entry MUST be resolved relative to the package root and MUST match a supported installable path |
+| — | §4.10 | Each `files` entry MUST NOT contain a path-traversal sequence (`../`); entries that escape the package root MUST be rejected |
 | — | §4 (preamble) | Unknown top-level fields MUST be rejected |
 
 ### 11.2 File Resolution Norms (§5)

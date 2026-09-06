@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 
+	lipgloss "charm.land/lipgloss/v2"
+
 	"github.com/github/gh-aw/pkg/colorwriter"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/styles"
@@ -245,7 +247,7 @@ func displayScheduleCalendar(statsList []*WorkflowStats) {
 
 	// Title
 	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Schedule Heatmap (UTC)"))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr("Schedule Heatmap (UTC)"))
 	fmt.Fprintln(os.Stderr)
 
 	// Hour header row: each cell is 3 chars wide ("XX ").
@@ -266,7 +268,7 @@ func displayScheduleCalendar(statsList []*WorkflowStats) {
 		cronDay := calendarDayIndex[calendarIndex]
 
 		var row strings.Builder
-		label := fmt.Sprintf("%-*s", dayLabelWidth, dayLabel)
+		label := lipgloss.NewStyle().Width(dayLabelWidth).Render(dayLabel)
 		row.WriteString(console.FormatTableHeaderStderr(label))
 
 		for h := range 24 {

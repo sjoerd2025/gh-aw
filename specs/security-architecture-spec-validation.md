@@ -2,6 +2,7 @@
 
 **Document**: Validation of `security-architecture-spec.md` against compiled `.lock.yml` files  
 **Date**: July 6, 2026  
+**Last validated**: v1.0.0 / 2026-07-15
 **Validator**: GitHub Copilot Agent  
 **Scope**: Cross-reference specification requirements with actual implementation
 
@@ -370,6 +371,61 @@ activation:
 
 ---
 
+### 7a. workflow_dispatch + aw_context PR Checkout Validation (Section 11.3 - RS-05a)
+
+**Specification Claim**:
+> **RS-05a**: For `workflow_dispatch` triggers where the `aw_context` input encodes a pull request context, the implementation MUST enforce: repository scope check, actor trust, parse resilience, and ref isolation.
+
+**Implementation Validation** (`actions/setup/js/checkout_pr_branch.cjs`, lines 200–230):
+
+```js
+// Parse aw_context from workflow_dispatch input
+if (!pullRequest && eventName === "workflow_dispatch") {
+  const awContextStr = context.payload.inputs?.aw_context;
+  if (awContextStr) {
+    try {
+      const awContext = JSON.parse(awContextStr);               // parse resilience: catch block below
+      if (awContext.item_type === "pull_request" && awContext.item_number) {
+        if (awContext.repo) {
+          const currentRepo = `${context.repo.owner}/${context.repo.repo}`;
+          if (awContext.repo !== currentRepo) {
+            core.warning(`Cross-repository workflow_dispatch is not supported: aw_context.repo ` +
+              `(${awContext.repo}) does not match current repository (${currentRepo}), skipping checkout`);
+            // pullRequest remains null — checkout skipped (repository scope check)
+          } else {
+            pullRequest = { number: awContext.item_number, state: "open" };
+          }
+        } else {
+          pullRequest = { number: awContext.item_number, state: "open" };
+        }
+      }
+    } catch (e) {
+      core.warning(`Failed to parse aw_context: ${getErrorMessage(e)}`);  // parse resilience
+    }
+  }
+}
+```
+
+Actor trust and ref isolation are provided by the shared `assertTrustedCheckoutRuntime()` call (lines 247–248) and the `exec.exec("git", [...])` array invocation (lines 305–310) that apply to all PR checkout paths.
+
+**Unit test coverage** (`actions/setup/js/checkout_pr_branch.test.cjs`):
+
+| Test | RS-05a property |
+|------|-----------------|
+| successful checkout via `aw_context` | actor trust + ref isolation |
+| non-PR `item_type` → skip | parse validation |
+| no `aw_context` input → skip | parse resilience |
+| no `inputs` at all → skip | parse resilience |
+| invalid JSON → warn + skip | parse resilience |
+| missing `item_number` → skip | item_number guard |
+| `aw_context.repo` matches current repo → checkout | repository scope |
+| `aw_context.repo` mismatches → warn + skip | repository scope |
+| successful checkout → output `true` | ref isolation |
+
+**Status**: ✅ **VERIFIED** — all four RS-05a properties (repository scope, actor trust, parse resilience, ref isolation) are implemented and covered by unit tests.
+
+---
+
 ### 8. Network Isolation (Section 6 - Claims)
 
 **Specification References Network Isolation** but actual enforcement is engine-specific. Let me check for AWF references:
@@ -512,6 +568,7 @@ concurrency:
 | **9.1** | Threat Detection (TD-01) | ✅ Verified | `detection:` job |
 | **10.6** | Action Pinning (CS-10) | ✅ Verified | All `uses:` statements |
 | **11.1** | Timestamp Validation (RS-01, RS-02) | ✅ Verified | `activation.steps` |
+| **11.3** | workflow_dispatch PR Checkout (RS-05a) | ✅ Verified | `checkout_pr_branch.cjs` lines 200–230 |
 | **11.8** | Concurrency Control (RS-16 to RS-22) | ✅ Verified | `concurrency:` blocks |
 
 ---
@@ -524,7 +581,7 @@ concurrency:
 
 **Clarification**: `pre_activation` handles role-based access control before activation. This is an implementation detail that doesn't contradict the specification - it's an additional security layer.
 
-**Recommendation**: Consider adding a note about role validation occurring in a separate pre-activation step.
+**Status**: ✅ **CLOSED** — Appendix D of `specs/security-architecture-spec.md` (Example 5) now shows `pre_activation` as a separate job gating `activation` on role membership.
 
 ### 2. Detection Job Naming
 
@@ -532,7 +589,7 @@ concurrency:
 
 **Clarification**: The `detection` job is the runtime manifestation of the threat detection layer described in Section 9.
 
-**Recommendation**: Add example job structure showing `detection` as a separate job in Appendix D.
+**Status**: ✅ **CLOSED** — Appendix D of `specs/security-architecture-spec.md` (Example 5) now shows `detection` as a separate job between `agent` and `safe_outputs`.
 
 ### 3. Conclusion Job
 
@@ -540,7 +597,7 @@ concurrency:
 
 **Clarification**: The `conclusion` job is an implementation detail for workflow cleanup and summary generation.
 
-**Recommendation**: Consider adding a note about optional cleanup/reporting jobs.
+**Status**: ✅ **CLOSED** — Appendix D of `specs/security-architecture-spec.md` (Example 5) now shows `conclusion` as the terminal `always()` job for cleanup/status reporting.
 
 ---
 
@@ -556,6 +613,14 @@ A conforming maintainer MUST re-run this validation when any of the following oc
 4. Validation evidence files, example workflows, or implementation locations cited in the Detailed Validation table move or change substantially.
 
 For each re-validation pass, reviewers MUST rerun the Detailed Validation procedure above, refresh the evidence-location table, update the Minor Discrepancies section, and revise the validation grade if any claim is no longer fully verified.
+
+### Trigger #3 Decision Log
+
+**2026-08-13 — `repos` vs `allowed-repos` field-naming divergence (deferred, no re-validation needed)**
+
+`scratchpad/github-mcp-access-control-specification.md`'s Divergence Audit (§Sync Notes) flagged that §4.4.1 historically used `repos` as the field name while §4.1 and the guard-policies spec used `allowed-repos`. This was investigated as a potential trigger-#3 event (companion guard-policy spec revision).
+
+**Decision: Defer — no re-validation of this report required.** The companion spec's own Divergence Audit already marked the item **Resolved**: `allowed-repos` is the canonical frontmatter key, `repos` is a documented deprecated alias for backward compatibility (`pkg/workflow/mcp_github_config.go` lines ~322-335), and `pkg/workflow/tools_validation_github.go` validates both spellings identically via the shared `AllowedRepos` field. This is a terminology/alias clarification, not a change to guard-policy *behavior*, job structure, or security guarantees. It does not affect the §3.2 Security Guarantees or §9 Threat Detection claims in `specs/security-architecture-spec.md`, so the Specification Accuracy Summary table below requires no update. `go test ./pkg/workflow/ -run TestValidateGitHubGuardPolicy` already exercises both the `repos` alias and `allowed-repos` field name (see `pkg/workflow/tools_validation_test.go`) and passes.
 
 ### Failure Escalation
 
@@ -604,7 +669,7 @@ This section audits the compliance test matrix defined in `security-architecture
 | Sandbox Isolation | T-SI-001 to T-SI-007 | ⚠️ PARTIALLY EVIDENCED | §8c adds compiled-workflow and runtime-script evidence for AWF chrooting, docker-host indirection, environment filtering, MCP/tool mounts, and composed sandbox/firewall operation; direct runtime host-visibility proof remains outstanding (tracked in [#48686](https://github.com/github/gh-aw/issues/48686)) |
 | Threat Detection | T-TD-001 to T-TD-007 | ⚠️ PARTIALLY EVIDENCED | TD-01 (automatic threat detection) verified via `detection:` job; T-TD-002 (prompt injection), T-TD-003 (secret leaks), T-TD-004 (malicious patches), T-TD-005 (custom prompt), T-TD-006 (engine override), T-TD-007 (workflow failure on detection) lack dedicated evidence entries |
 | Compilation-Time Security | T-CS-001 to T-CS-006, T-SG07-001, T-SG07-002 | ✅ EVIDENCED | T-CS-001 via `TestFormalCS001_SchemaValidationRejectsUnknownField`; T-CS-002 via `TestFormalCS002_ExpressionSafetyRejectsUnauthorizedExpression`; T-CS-003 via `TestFormalSG02_AgentJobHasNoWritePermissions`; T-CS-004 via `TestFormal_P9_CompilationValidatesBeforeEmit`; T-CS-005 via CS-10 evidence in §10; T-CS-006 via `TestStrictModeDeprecatedFields`; T-SG07-001/T-SG07-002 via `TestFormalSG07_FailSecureOnSecurityError` and `TestFormal_P9_CompilationValidatesBeforeEmit`. |
-| Runtime Security | T-RS-001 to T-RS-011 | ✅ EVIDENCED | RS-01/RS-02 (timestamp validation) and RS-16 to RS-22 (concurrency control) remain evidenced; T-RS-003 via `TestFormalRS003_WorkflowRunRepositoryValidation`; T-RS-004 via `TestFormalRS004_RuntimeRoleValidation`; T-RS-005 via `TestFormalRS005_RuntimeTokenValidation`; T-RS-006 via `TestFormalRS006_AWFNetworkPolicyValidation`; T-RS-007 via `TestFormalRS007_MCPNetworkPolicyValidation`; T-RS-008 via `TestFormalRS008_OutputTargetValidation`. |
+| Runtime Security | T-RS-001 to T-RS-011 | ✅ EVIDENCED | RS-01/RS-02 (timestamp validation) and RS-16 to RS-22 (concurrency control) remain evidenced; RS-05a (`workflow_dispatch` + `aw_context` PR checkout) evidenced in §7a; T-RS-003 via `TestFormalRS003_WorkflowRunRepositoryValidation`; T-RS-004 via `TestFormalRS004_RuntimeRoleValidation`; T-RS-005 via `TestFormalRS005_RuntimeTokenValidation`; T-RS-006 via `TestFormalRS006_AWFNetworkPolicyValidation`; T-RS-007 via `TestFormalRS007_MCPNetworkPolicyValidation`; T-RS-008 via `TestFormalRS008_OutputTargetValidation`. |
 | Companion MCP Access-Control | T-GH-047 to T-GH-060 | ⚠️ PARTIALLY EVIDENCED | Deferred to companion specifications (`scratchpad/github-mcp-access-control-specification.md`, `scratchpad/guard-policies-specification.md`); not directly evidenced in this document |
 
 ### Gap Summary

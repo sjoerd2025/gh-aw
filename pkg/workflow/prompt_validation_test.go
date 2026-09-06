@@ -76,6 +76,94 @@ func TestGitHubMCPToolsPromptHasFieldSelectionGuidance(t *testing.T) {
 	}
 }
 
+// TestGitHubMCPToolsPromptHasPartialFileReadGuidance verifies that both prompt
+// files steer agents away from unbounded single-file get_file_contents calls.
+func TestGitHubMCPToolsPromptHasPartialFileReadGuidance(t *testing.T) {
+	promptFiles := []string{
+		filepath.Join("..", "..", "actions", "setup", "md", "github_mcp_tools_prompt.md"),
+		filepath.Join("..", "..", "actions", "setup", "md", "github_mcp_tools_with_safeoutputs_prompt.md"),
+	}
+
+	for _, promptPath := range promptFiles {
+		t.Run(filepath.Base(promptPath), func(t *testing.T) {
+			data, err := os.ReadFile(promptPath)
+			require.NoError(t, err, "should be able to read %s", promptPath)
+
+			content := string(data)
+
+			assert.Contains(t, content, "`fields` only reduces directory listings",
+				"prompt should clarify get_file_contents fields do not reduce single-file content")
+			assert.Contains(t, content, "fields: [name, type, size, path]",
+				"prompt should recommend metadata-only directory listings before file reads")
+			assert.Contains(t, content, "Partial file reads",
+				"prompt should include explicit partial-content guidance")
+			assert.Contains(t, content, "bounded excerpt",
+				"prompt should recommend bounded excerpts for headers or sections")
+		})
+	}
+}
+
+// TestSafeOutputsPromptDoesNotRequireCLI verifies that the base safe-output
+// guidance remains transport-neutral. Some workflows expose safeoutputs as MCP
+// tools rather than CLI commands, so CLI-only guidance can cause agents to
+// finish without emitting any safe-output items.
+func TestSafeOutputsPromptDoesNotRequireCLI(t *testing.T) {
+	promptPath := filepath.Join("..", "..", "actions", "setup", "md", "safe_outputs_prompt.md")
+	data, err := os.ReadFile(promptPath)
+	require.NoError(t, err, "should be able to read safe_outputs_prompt.md")
+
+	content := string(data)
+
+	assert.Contains(t, content, "Call the tool names listed in `<safe-output-tools>` directly",
+		"safe-output prompt should instruct agents to call configured safe-output tools")
+	assert.Contains(t, content, "if a separate `<mcp-clis>` section says `safeoutputs` is available on `PATH`, you may use that CLI form instead",
+		"safe-output prompt should describe CLI usage as optional because CLI mounting is optional")
+}
+
+// TestComposedPromptSafeOutputsGuidanceStaysTransportNeutral verifies that
+// later prompt fragments (like mcp_cli_tools_prompt.md) do not override direct
+// safe-output tool guidance in the final composed prompt.
+func TestComposedPromptSafeOutputsGuidanceStaysTransportNeutral(t *testing.T) {
+	compiler := &Compiler{}
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			NoOp: &NoOpConfig{},
+		},
+	}
+
+	sections := compiler.collectPromptSections(data)
+	require.NotEmpty(t, sections, "should collect prompt sections")
+
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	promptDir := filepath.Clean(filepath.Join(wd, "..", "..", "actions", "setup", "md"))
+
+	var composed strings.Builder
+	for _, section := range sections {
+		content := section.Content
+		if section.IsFile {
+			fileBytes, readErr := os.ReadFile(filepath.Clean(filepath.Join(promptDir, section.Content)))
+			require.NoError(t, readErr, "should read prompt fragment %s", section.Content)
+			content = string(fileBytes)
+		}
+
+		for key, value := range section.EnvVars {
+			content = strings.ReplaceAll(content, "__"+key+"__", value)
+		}
+
+		composed.WriteString(content)
+		composed.WriteString("\n")
+	}
+
+	finalPrompt := composed.String()
+	assert.Contains(t, finalPrompt, "Call the tool names listed in `<safe-output-tools>` directly",
+		"final composed prompt should preserve direct safe-output tool guidance")
+	assert.NotContains(t, finalPrompt, "For `safeoutputs` and `mcpscripts`, always use the CLI commands above.",
+		"final composed prompt should not require safeoutputs CLI usage unconditionally")
+	assert.Contains(t, finalPrompt, "For `safeoutputs`, call the tool names listed in `<safe-output-tools>` directly; the `safeoutputs` CLI commands above are an optional equivalent transport.",
+		"final composed prompt should keep safeoutputs CLI guidance optional when safe-output tools are available")
+}
+
 // TestGitHubMCPToolsPromptIncludedForCodeSecurityToolset verifies that when a
 // workflow uses the code_security GitHub toolset the generated lock file references
 // one of the github_mcp_tools prompt files (which carry the list_code_scanning_alerts

@@ -5,35 +5,20 @@ package fmterrorfnoverbs
 
 import (
 	"go/ast"
-	"go/token"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the fmterrorfnoverbs analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "fmterrorfnoverbs",
-	Doc:      "reports fmt.Errorf calls whose format string contains no verbs, preferring errors.New",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/fmterrorfnoverbs",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("fmterrorfnoverbs", "reports fmt.Errorf calls whose format string contains no verbs, preferring errors.New", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	nolintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	nolintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +27,7 @@ func run(pass *analysis.Pass) (any, error) {
 		(*ast.CallExpr)(nil),
 	}
 
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return
@@ -56,18 +41,12 @@ func run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		lit, ok := call.Args[0].(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
+		formatStr, ok := astutil.ResolveFormatString(call.Args[0])
+		if !ok {
 			return
 		}
 
-		// Unquote the string value
-		val := lit.Value
-		if len(val) >= 2 {
-			val = val[1 : len(val)-1]
-		}
-
-		if !hasRealFormatVerb(val) {
+		if !hasRealFormatVerb(formatStr) {
 			position := pass.Fset.PositionFor(call.Pos(), false)
 			if filecheck.ShouldSkipFilename(position.Filename, generatedFiles) {
 				return
@@ -75,11 +54,17 @@ func run(pass *analysis.Pass) (any, error) {
 			if nolint.HasDirectiveForLinter(position, nolintIndex, "fmterrorfnoverbs") {
 				return
 			}
-			pass.ReportRangef(call, "fmt.Errorf called with no format verbs; use errors.New(%s) instead", lit.Value)
+			if _, isPlainLit := call.Args[0].(*ast.BasicLit); isPlainLit {
+				pass.ReportRangef(call, "fmt.Errorf called with no format verbs; use errors.New(%q) instead", formatStr)
+				return
+			}
+			// The format string is built from concatenated pieces (e.g. a
+			// caller-supplied prefix plus literal text), so formatStr doesn't
+			// correspond to a single source literal; suggest errors.New
+			// generically instead of proposing a synthetic replacement.
+			pass.ReportRangef(call, "fmt.Errorf called with no format verbs; use errors.New instead")
 		}
 	})
-
-	return nil, nil
 }
 
 // hasRealFormatVerb reports whether val (the raw content between the surrounding

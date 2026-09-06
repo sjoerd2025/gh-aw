@@ -4,6 +4,8 @@ package workflow
 
 import (
 	"encoding/json"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +27,7 @@ func TestGetValidationConfigJSON(t *testing.T) {
 	expectedTypes := []string{
 		"create_issue",
 		"create_agent_session",
+		"approve_workflow_run",
 		"add_comment",
 		"create_pull_request",
 		"add_labels",
@@ -67,6 +70,123 @@ func TestGetValidationConfigJSON(t *testing.T) {
 	// Verify JSON is indented (contains newlines)
 	if !containsNewline(jsonStr) {
 		t.Error("Expected indented JSON output with newlines")
+	}
+}
+
+func TestApproveWorkflowRunValidationConfig(t *testing.T) {
+	config, ok := ValidationConfig["approve_workflow_run"]
+	if !ok {
+		t.Fatal("approve_workflow_run not found in ValidationConfig")
+	}
+	if config.DefaultMax != 1 {
+		t.Errorf("approve_workflow_run DefaultMax = %d, want 1", config.DefaultMax)
+	}
+	if runID := config.Fields["run_id"]; !runID.Required || !runID.PositiveInteger {
+		t.Errorf("approve_workflow_run run_id = %+v, want required positive integer", runID)
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"approve_workflow_run"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+	parsedConfig, ok := parsed["approve_workflow_run"]
+	if len(parsed) != 1 || !ok || parsedConfig.DefaultMax != 1 {
+		t.Errorf("approve_workflow_run validation config = %#v, want defaultMax 1", parsedConfig)
+	}
+	if runID := parsedConfig.Fields["run_id"]; !runID.Required || !runID.PositiveInteger {
+		t.Errorf("approve_workflow_run generated run_id = %+v, want required positive integer", runID)
+	}
+}
+
+// TestCallWorkflowValidationConfigPreservesWorkflowName is a regression test for
+// samples-mode call-workflow replay dropping the workflow name (github/gh-aw#55176):
+// without a "call_workflow" entry in ValidationConfig, collect_ndjson_output.cjs
+// fell back to validateItemWithSafeJobConfig, which drops every field except
+// "type" because the call_workflow safe-outputs config has no "inputs" key. This
+// test verifies the compiler emits a validation config that declares
+// "workflow_name" (required) and "inputs" for call_workflow, mirroring
+// dispatch_workflow, so the field survives ingestion.
+func TestCallWorkflowValidationConfigPreservesWorkflowName(t *testing.T) {
+	config, ok := ValidationConfig["call_workflow"]
+	if !ok {
+		t.Fatal("call_workflow not found in ValidationConfig")
+	}
+	if config.DefaultMax != 1 {
+		t.Errorf("call_workflow DefaultMax = %d, want 1", config.DefaultMax)
+	}
+	workflowName, ok := config.Fields["workflow_name"]
+	if !ok || !workflowName.Required || workflowName.Type != "string" {
+		t.Errorf("call_workflow workflow_name = %+v, want required string", workflowName)
+	}
+	inputs, ok := config.Fields["inputs"]
+	if !ok || inputs.Type != "object" {
+		t.Errorf("call_workflow inputs = %+v, want object", inputs)
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"call_workflow"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+	parsedConfig, ok := parsed["call_workflow"]
+	if len(parsed) != 1 || !ok || parsedConfig.DefaultMax != 1 {
+		t.Errorf("call_workflow validation config = %#v, want defaultMax 1", parsedConfig)
+	}
+	if workflowName := parsedConfig.Fields["workflow_name"]; !workflowName.Required || workflowName.Type != "string" {
+		t.Errorf("generated call_workflow workflow_name = %+v, want required string", workflowName)
+	}
+}
+
+func TestDismissPullRequestReviewValidationConfigSupportsAutoReviewID(t *testing.T) {
+	config, ok := ValidationConfig["dismiss_pull_request_review"]
+	if !ok {
+		t.Fatal("dismiss_pull_request_review not found in ValidationConfig")
+	}
+	if reviewID := config.Fields["review_id"]; !reviewID.OptionalPositiveInteger || !reviewID.AllowAuto || reviewID.Required || reviewID.PositiveInteger {
+		t.Errorf("dismiss_pull_request_review review_id = %+v, want optional positive integer or auto", reviewID)
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"dismiss_pull_request_review"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+	if reviewID := parsed["dismiss_pull_request_review"].Fields["review_id"]; !reviewID.OptionalPositiveInteger || !reviewID.AllowAuto {
+		t.Errorf("generated dismiss_pull_request_review review_id = %+v, want optional positive integer or auto", reviewID)
+	}
+}
+
+func TestUpdatePullRequestValidationConfigSupportsReplaceIsland(t *testing.T) {
+	config, ok := ValidationConfig["update_pull_request"]
+	if !ok {
+		t.Fatal("update_pull_request not found in ValidationConfig")
+	}
+	operation := config.Fields["operation"]
+	if !slices.Contains(operation.Enum, "replace-island") {
+		t.Fatalf("update_pull_request operation enum = %v, want replace-island", operation.Enum)
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"update_pull_request"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+	parsedOperation := parsed["update_pull_request"].Fields["operation"]
+	if !slices.Contains(parsedOperation.Enum, "replace-island") {
+		t.Fatalf("generated update_pull_request operation enum = %v, want replace-island", parsedOperation.Enum)
 	}
 }
 
@@ -305,6 +425,28 @@ func TestUpdatePullRequestValidationConfig(t *testing.T) {
 	}
 }
 
+func TestUpdateProjectAcceptsProjectURLOrTemporaryID(t *testing.T) {
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"update_project"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSON() error = %v", err)
+	}
+
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+
+	project := parsed["update_project"].Fields["project"]
+	for _, expected := range []string{
+		"https://[^/]+/(orgs|users)/[^/]+/projects/\\d+",
+		"#?aw_[A-Za-z0-9_]{3,12}",
+	} {
+		if !strings.Contains(project.Pattern, expected) {
+			t.Fatalf("update_project.project pattern %q does not contain %q", project.Pattern, expected)
+		}
+	}
+}
+
 func TestUpdateIssueValidationConfig(t *testing.T) {
 	config, ok := ValidationConfig["update_issue"]
 	if !ok {
@@ -382,16 +524,18 @@ func TestStripOnErrorOnlyOnOptionalFields(t *testing.T) {
 func TestValidationConfigConsistency(t *testing.T) {
 	// Verify that all types with customValidation have valid validation rules
 	validCustomValidations := map[string]bool{
-		"requiresOneOf:status,title,body,labels,assignees,milestone": true,
-		"requiresOneOf:title,body":                                   true,
-		"requiresOneOf:title,body,update_branch":                     true,
-		"requiresOneOf:title,body,labels":                            true,
-		"requiresOneOf:issue_number,pull_number":                     true,
-		"requiresOneOf:milestone_number,milestone_title":             true,
-		"requiresOneOf:field_name,field_node_id":                     true,
-		"requiresOneOf:reviewers,team_reviewers":                     true,
-		"startLineLessOrEqualLine":                                   true,
-		"parentAndSubDifferent":                                      true,
+		"requiresOneOf:status,title,body,labels,assignees,milestone":            true,
+		"requiresOneOf:summary,description":                                     true,
+		"requiresOneOf:title,body":                                              true,
+		"requiresOneOf:title,body,update_branch":                                true,
+		"requiresOneOf:title,body,labels":                                       true,
+		"requiresOneOf:issue_number,pull_number":                                true,
+		"requiresOneOf:milestone_number,milestone_title":                        true,
+		"requiresOneOf:field_name,field_node_id":                                true,
+		"requiresOneOf:reviewers,team_reviewers":                                true,
+		"requiresOneOf:title,body,state,area_path,iteration_path,assignee,tags": true,
+		"startLineLessOrEqualLine":                                              true,
+		"parentAndSubDifferent":                                                 true,
 	}
 
 	for typeName, config := range ValidationConfig {
@@ -409,6 +553,36 @@ func TestValidationConfigConsistency(t *testing.T) {
 		// Verify defaultMax is positive
 		if config.DefaultMax <= 0 {
 			t.Errorf("Type %q has invalid defaultMax: %d", typeName, config.DefaultMax)
+		}
+	}
+}
+
+func TestValidationConfigCoversToolInputSchemas(t *testing.T) {
+	var tools []struct {
+		Name        string `json:"name"`
+		InputSchema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"inputSchema"`
+	}
+	if err := json.Unmarshal([]byte(safeOutputsToolsJSONContent), &tools); err != nil {
+		t.Fatalf("failed to parse safe outputs tool schema: %v", err)
+	}
+
+	metadataFields := map[string]bool{"secrecy": true, "integrity": true}
+	for _, tool := range tools {
+		typeName := strings.ReplaceAll(tool.Name, "-", "_")
+		config, ok := ValidationConfig[typeName]
+		if !ok {
+			t.Errorf("%s tool is missing from ValidationConfig", tool.Name)
+			continue
+		}
+		for fieldName := range tool.InputSchema.Properties {
+			if metadataFields[fieldName] {
+				continue
+			}
+			if _, ok := config.Fields[fieldName]; !ok {
+				t.Errorf("%s tool input %q is missing from ValidationConfig", tool.Name, fieldName)
+			}
 		}
 	}
 }

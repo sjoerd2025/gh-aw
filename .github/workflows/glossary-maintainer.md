@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
   actions: read
 
@@ -29,9 +30,10 @@ imports:
   - ../agents/technical-doc-writer.agent.md
   - shared/ai-coding-dictionary.md
   - shared/mcp/serena-go.md
-
   - shared/otlp.md
+  - shared/reporting.md
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[docs] "
@@ -45,7 +47,7 @@ tools:
     wiki: true
     description: "Project glossary and terminology reference"
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [repos, pull_requests]  # scoped to avoid search_repositories (in default); repos covers commits/files, pull_requests covers PRs
   edit:
   bash: true
@@ -87,14 +89,14 @@ steps:
       echo "$SCOPE" > /tmp/gh-aw/agent/scan-scope.txt
 
 
-sandbox:
-  agent:
-    sudo: false
 evals:
   - id: glossary_reviewed
     question: Did the agent review the glossary and identify gaps or stale entries relative to recent codebase changes?
   - id: pr_created_or_noop
     question: Was a pull request created with glossary updates, or was noop used when the glossary required no changes?
+sandbox:
+  agent:
+    runtime: cloud-hypervisor
 ---
 
 # Glossary Maintainer
