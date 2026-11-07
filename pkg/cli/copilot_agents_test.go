@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -281,6 +282,7 @@ func TestDeleteOldTemplateFiles(t *testing.T) {
 }
 
 func TestBuildAgenticWorkflowsAgentContent(t *testing.T) {
+	t.Parallel()
 	tempDir := testutil.TempDir(t, "test-*")
 
 	content, err := buildAgenticWorkflowsAgentContent(tempDir)
@@ -300,6 +302,7 @@ func TestBuildAgenticWorkflowsAgentContent(t *testing.T) {
 }
 
 func TestCheckedInAgenticWorkflowsAgentMatchesGeneratedContent(t *testing.T) {
+	t.Parallel()
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("Failed to locate test file")
@@ -342,6 +345,81 @@ func TestBuildAgenticWorkflowsSkillContent(t *testing.T) {
 		t.Fatalf("expected generated skill content to avoid agent cross-references:\n%s", content)
 	}
 	assert.Contains(t, content, "Design workflows from scratch via interview: `.github/aw/designer.md`")
+	assert.Contains(t, content, "Diagnose, patch, audit, or actively debug workflows: `.github/aw/debug-agentic-workflow.md`")
+	assert.Contains(t, content, "Analyze existing runs, logs, or recurring failures: `.github/aw/analyzing-runs.md`")
+	assert.Contains(t, content, "General repository-wide debugging or optimization requests start here with failure clustering")
+	assert.NotContains(t, content, "local-debug.md")
+	assert.NotContains(t, content, "Debug, audit, or investigate workflows: `.github/aw/debug-agentic-workflow.md`")
+	assert.Contains(t, content, agenticWorkflowsOTELSkillParagraph)
+}
+
+func TestUnifiedDebuggingInstructions(t *testing.T) {
+	t.Parallel()
+	_, file, _, ok := runtime.Caller(0)
+	require.True(t, ok, "failed to locate test file")
+	awDir := filepath.Join(filepath.Dir(file), "..", "..", ".github", "aw")
+	content, err := os.ReadFile(filepath.Join(awDir, "debug-agentic-workflow.md"))
+	require.NoError(t, err)
+	for _, section := range []string{
+		"## Choose the Mode",
+		"## Strategy",
+		"## Live Debug Loop",
+		"## 403 and Codespaces Credential Triage",
+		"## Development Compilation",
+		"## Collect Existing Evidence",
+		"## Identify the First Failing Boundary",
+		"## Fix and Report",
+	} {
+		assert.Contains(t, string(content), section)
+	}
+	assert.Contains(t, string(content), "gh aw mcp inspect WORKFLOW --server NAME")
+	assert.Contains(t, string(content), "gh aw audit RUN_ID RUN_ID_2 RUN_ID_3 --repo HOST/OWNER/REPO --group --json")
+	assert.Contains(t, string(content), "Explicit no-dispatch rules")
+	for _, guide := range []struct {
+		file     string
+		contains []string
+	}{
+		{
+			file: "debug-live-testing.md",
+			contains: []string{
+				"## Live Debug Loop",
+				"No automatic dispatch retries",
+			},
+		},
+		{
+			file: "debug-compilation.md",
+			contains: []string{
+				"## Development Compilation",
+				"Docker-based scanners and `--validate-images` are opt-in",
+				"gh aw validate WORKFLOW",
+				"gh aw compile WORKFLOW --dry-run --zizmor --actionlint --poutine",
+				"`validate` uses `--no-emit`, which skips zizmor, actionlint and poutine",
+			},
+		},
+	} {
+		t.Run(guide.file, func(t *testing.T) {
+			assert.Contains(t, string(content), "]("+guide.file)
+			guideContent, err := os.ReadFile(filepath.Join(awDir, guide.file))
+			require.NoError(t, err)
+			for _, expected := range guide.contains {
+				assert.Contains(t, string(guideContent), expected)
+			}
+		})
+	}
+	_, err = os.Stat(filepath.Join(awDir, "local-debug.md"))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestBuildAgenticWorkflowsSkillContentEnsuresOTELParagraph(t *testing.T) {
+	withMockAWMarkdownFileList(t, []string{"workflow-a.md"}, nil)
+
+	originalTemplate := agenticWorkflowsSkillTemplate
+	t.Cleanup(func() { agenticWorkflowsSkillTemplate = originalTemplate })
+	agenticWorkflowsSkillTemplate = strings.ReplaceAll(agenticWorkflowsSkillTemplate, "\n"+agenticWorkflowsOTELSkillParagraph, "")
+
+	content, err := buildAgenticWorkflowsSkillContent()
+	require.NoError(t, err)
+	assert.Contains(t, content, agenticWorkflowsOTELSkillParagraph)
 }
 
 func TestBuildAgenticWorkflowsSkillContentWithoutAWDirectory(t *testing.T) {
@@ -373,6 +451,11 @@ func TestBuildAgenticWorkflowsSkillContentFallsBackToEmbeddedFileList(t *testing
 	assert.NotContains(t, content, agenticWorkflowsSkillFileListPlaceholder, "expected generated skill content to replace the file-list placeholder")
 	assert.Contains(t, content, "- `.github/aw/create-agentic-workflow.md`\n", "expected embedded fallback markdown file list to be used")
 	assert.Contains(t, content, "- `.github/aw/designer.md`\n", "expected generated skill content to include designer instruction file")
+	assert.Contains(t, content, "- `.github/aw/doctor.md`\n", "expected doctor guidance to remain discoverable without remote access")
+	assert.Contains(t, content, "- `.github/aw/debug-agentic-workflow.md`\n", "expected unified debugging to remain discoverable without remote access")
+	assert.Contains(t, content, "- `.github/aw/debug-model-engine-misconfiguration.md`\n", "expected model and engine misconfiguration debugging to remain discoverable without remote access")
+	assert.Contains(t, content, "- `.github/aw/analyzing-runs.md`\n", "expected run analysis to remain discoverable without remote access")
+	assert.NotContains(t, content, "local-debug.md")
 }
 
 func TestCheckedInAgenticWorkflowsSkillMatchesGeneratedContent(t *testing.T) {
@@ -399,17 +482,22 @@ func TestCheckedInAgenticWorkflowsSkillMatchesGeneratedContent(t *testing.T) {
 		t.Fatalf("buildAgenticWorkflowsSkillContent() returned error: %v", err)
 	}
 
-	actual, err := os.ReadFile(filepath.Join(gitRoot, ".github", "skills", "agentic-workflows", "SKILL.md"))
+	skillPath := filepath.Join(gitRoot, ".github", "skills", "agentic-workflows", "SKILL.md")
+	actual, err := os.ReadFile(skillPath)
 	if err != nil {
 		t.Fatalf("Failed to read checked-in skill file: %v", err)
 	}
 
 	if strings.TrimSpace(string(actual)) != strings.TrimSpace(expected) {
-		t.Fatalf("Checked-in skill file is out of sync with generated content\nexpected:\n%s\nactual:\n%s", expected, string(actual))
+		if writeErr := os.WriteFile(skillPath, []byte(strings.TrimRight(expected, "\n")+"\n"), 0644); writeErr != nil {
+			t.Fatalf("Checked-in skill file is out of sync and auto-update failed (%v)\nexpected:\n%s\nactual:\n%s", writeErr, expected, string(actual))
+		}
+		t.Fatalf("Checked-in skill file was out of sync and has been regenerated; commit %s and re-run", skillPath)
 	}
 }
 
 func TestCheckedInInteractiveAgentDesignerMentionsRepoOverlay(t *testing.T) {
+	t.Parallel()
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("Failed to locate test file")
@@ -429,6 +517,7 @@ func TestCheckedInInteractiveAgentDesignerMentionsRepoOverlay(t *testing.T) {
 // added or removed from .github/aw/, the fallback list is kept in sync so that offline
 // compilation still produces an accurate SKILL.md.
 func TestFallbackAWFilesMatchesLocalAWDirectory(t *testing.T) {
+	t.Parallel()
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("Failed to locate test file")
@@ -450,8 +539,21 @@ func TestFallbackAWFilesMatchesLocalAWDirectory(t *testing.T) {
 	fallbackFiles := embeddedFallbackAWMarkdownFiles()
 	sort.Strings(fallbackFiles)
 
-	assert.Equal(t, localFiles, fallbackFiles,
-		"embedded fallback file list (pkg/cli/data/agentic_workflows_fallback_aw_files.json) is out of sync with .github/aw/*.md — update the JSON to match")
+	if !assert.Equal(t, localFiles, fallbackFiles,
+		"embedded fallback file list (pkg/cli/data/agentic_workflows_fallback_aw_files.json) is out of sync with .github/aw/*.md") {
+		// Auto-update the fallback JSON so the developer only needs to commit the change.
+		fallbackPath := filepath.Join(gitRoot, "pkg", "cli", "data", "agentic_workflows_fallback_aw_files.json")
+		updated, encErr := json.MarshalIndent(localFiles, "", "  ")
+		if encErr != nil {
+			t.Logf("Auto-update failed (could not encode JSON): %v", encErr)
+			return
+		}
+		if writeErr := os.WriteFile(fallbackPath, append(updated, '\n'), 0644); writeErr != nil {
+			t.Logf("Auto-update failed (could not write file): %v", writeErr)
+			return
+		}
+		t.Logf("Auto-updated %s; commit the file and re-run tests", fallbackPath)
+	}
 }
 
 func withMockAWMarkdownFileList(t *testing.T, files []string, err error) {

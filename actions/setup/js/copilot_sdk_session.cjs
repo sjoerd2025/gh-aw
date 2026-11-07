@@ -5,24 +5,17 @@
  *
  * Runs a single Copilot agentic session using the @github/copilot-sdk.
  * Serializes all SDK session events to a JSONL file so that
- * unified_timeline.cjs can render them in the step summary.
+ * unified_session.cjs can collect them for the unified session step summary.
  *
- * Event mapping:
- *   SDK "user.message"            → JSONL "user.message"
- *   SDK "tool.execution_start"    → JSONL "tool.execution_start"  (toolName, mcpServerName, command?)
- *   SDK "tool.execution_complete" → JSONL "tool.execution_complete" (toolName, mcpServerName, success, result)
- *   SDK "assistant.message"       → JSONL "assistant.message"     (content)
- *   SDK "assistant.turn_start"    → watchdog disarmed (inAssistantTurn = true)
- *   SDK "assistant.turn_end"      → watchdog re-enabled (inAssistantTurn = false)
- *   SDK "session.task_complete"   → JSONL "session.task_complete" (success, summary)
- *   SDK "subagent.started"        → JSONL "subagent.started"      (agentName, agentDisplayName, toolCallId)
- *   SDK "subagent.completed"      → JSONL "subagent.completed"    (agentName, toolCallId)
- *   SDK "subagent.failed"         → JSONL "subagent.failed"       (agentName, toolCallId, error)
+ * Retains native non-ephemeral events and selected ephemeral conversation,
+ * accounting, failure and workflow observations. Tool enrichment and canonical
+ * conversion are performed by copilot_session.cjs, not the native capture.
+ * Assistant turn events also control the idle watchdog.
  *
  * The JSONL file is written to:
  *   /tmp/gh-aw/sandbox/agent/logs/copilot-session-state/{sessionId}/events.jsonl
  * which mirrors the path that copy_copilot_session_state.sh produces and that
- * unified_timeline.cjs reads.
+ * unified_session.cjs reads.
  *
  * Consumed directly by copilot_sdk_driver.cjs (the built-in gh-aw driver) and
  * available to any custom driver that wants the same session lifecycle and JSONL
@@ -35,9 +28,19 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { openDurableSession } = require("./durable_native_session.cjs");
+const { isDeepStrictEqual } = require("node:util");
 const { buildCopilotSDKPermissionHandler, getEnvPositiveIntOrDefault, parseMaxToolDenialsLimit, MAX_TOOL_DENIALS_DEFAULT } = require("./copilot_sdk_permissions.cjs");
+const { buildCopilotSDKSessionToolConfig } = require("./copilot_sdk_tool_config.cjs");
+const { buildCopilotSDKToolCallBudget } = require("./copilot_sdk_tool_budget.cjs");
 const { resolveModelWithFallback } = require("./model_fallback.cjs");
-const { extractShellCommandFromToolData } = require("./tool_call_details.cjs");
+const { COPILOT_WORKFLOW_EVENT_TYPES } = require("./copilot_workflow_events.cjs");
+const { copilotSessionContext, getCopilotMessageRefusal } = require("./copilot_session.cjs");
+const { loadCopilotSDKCustomAgents } = require("./extract_inline_sub_agents.cjs");
+const { qualifyModelForMultiProvider, parseMultiProviderJson } = require("./copilot_sdk_multi_provider.cjs");
+const { COPILOT_MODEL_VERIFICATION_EXIT_CODE, createCopilotSDKModelObserver, copilotSessionStateDirectories } = require("./copilot_model_selection.cjs");
+
+const CAPTURED_EPHEMERAL_EVENTS = new Set([...COPILOT_WORKFLOW_EVENT_TYPES, "assistant.usage", "assistant.message_delta", "assistant.reasoning_delta", "model.call_failure", "model.call_final_result", "model.call_finished"]);
 
 // Default timeout for a single sendAndWait call: 10 minutes.
 // This is intentionally generous — the headless Copilot CLI has its own internal
@@ -50,6 +53,14 @@ const SDK_SEND_TIMEOUT_MS_DEFAULT = 10 * 60 * 1000;
 // "Timeout after <N>ms waiting for session.idle" produced by the Copilot SDK.
 // Keep in sync with SDK_SESSION_IDLE_TIMEOUT_PATTERN in copilot_harness.cjs.
 const SDK_IDLE_TIMEOUT_PATTERN = /Timeout after \d+ms waiting for session\.idle/;
+
+// Bounded interval, in milliseconds, that the driver waits after the tool-denial
+// guard (guard.tool_denials_exceeded) fires before forcing sendAndWait to settle,
+// even if session.disconnect() or the in-flight SDK request never resolves on its
+// own. Without this, a stalled disconnect/sendAndWait leaves the process hanging
+// until the surrounding job's own timeout kicks in (observed up to ~49 minutes).
+// Override via the GH_AW_DENIAL_GUARD_TIMEOUT_MS environment variable.
+const DENIAL_GUARD_FORCE_EXIT_MS_DEFAULT = 15 * 1000;
 
 // Default idle period for the post-completion watchdog: 30 seconds.
 // When the agent has produced output and all tracked tool calls have completed,
@@ -65,11 +76,15 @@ const SDK_IDLE_TIMEOUT_PATTERN = /Timeout after \d+ms waiting for session\.idle/
 // Override via the GH_AW_SDK_IDLE_MS environment variable.
 const SDK_POST_COMPLETION_IDLE_MS_DEFAULT = 30 * 1000;
 
+function contentFilterError() {
+  return Object.assign(new Error("Copilot model response blocked by content filtering; task completion could not be confirmed."), { code: "content_filter" });
+}
+
 /**
  * Extract the prompt text from a resolved args array.
  * Looks for the first occurrence of "-p <value>" or "--prompt <value>".
  *
- * @param {string[]} args - Resolved args (after resolvePromptFileArgs has run).
+ * @param {string[]} args - Resolved CLI arguments.
  * @returns {string | null} The prompt text, or null if not found.
  */
 function extractPromptFromArgs(args) {
@@ -81,6 +96,37 @@ function extractPromptFromArgs(args) {
   return null;
 }
 
+/** @param {string | undefined} serverArgs @param {(message: string) => void} [logger] @returns {boolean} */
+function isCopilotSDKBareMode(serverArgs, logger = message => process.stderr.write(`[copilot-sdk] ${message}\n`)) {
+  try {
+    const args = JSON.parse(serverArgs || "[]");
+    if (!Array.isArray(args) || args.some(arg => typeof arg !== "string")) throw new Error("expected a string array");
+    return args.includes("--no-custom-instructions");
+  } catch (error) {
+    logger(`warning: Invalid GH_AW_COPILOT_SDK_SERVER_ARGS: ${getErrorMessage(error)}; using sidecar default args`);
+    return false;
+  }
+}
+
+/** @returns {string} */
+function resolveCopilotSDKWorkingDirectory() {
+  return path.resolve(process.env.GITHUB_WORKSPACE || process.cwd(), process.env.GH_AW_ENGINE_CWD || ".");
+}
+
+/**
+ * Parse GH_AW_COPILOT_SDK_SUBAGENT_MODELS: custom agent name → model resolved by the harness.
+ * @param {string | undefined} value
+ * @returns {Record<string, string>}
+ */
+function parseSubagentModelsJson(value) {
+  if (!value) return {};
+  const parsed = JSON.parse(value);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Object.values(parsed).every(model => typeof model === "string")) {
+    throw new Error("GH_AW_COPILOT_SDK_SUBAGENT_MODELS must map custom agent names to models");
+  }
+  return parsed;
+}
+
 /**
  * Run a Copilot agentic session using the @github/copilot-sdk.
  *
@@ -90,7 +136,7 @@ function extractPromptFromArgs(args) {
  * both modes uniformly.
  *
  * All SDK events are serialised to a JSONL file under the session state directory
- * so that unified_timeline.cjs can render them in the step summary.
+ * so that unified_session.cjs can collect them for the step summary.
  *
  * @param {{
  *   sdkUri: string,
@@ -98,6 +144,7 @@ function extractPromptFromArgs(args) {
  *   logger: (msg: string) => void,
  *   attempt?: number,
  *   model?: string,
+ *   reasoningEffort?: string,
  *   connectionToken?: string,
  *   providers?: import("@github/copilot-sdk").NamedProviderConfig[],
  *   models?: import("@github/copilot-sdk").ProviderModelConfig[],
@@ -106,20 +153,67 @@ function extractPromptFromArgs(args) {
  *     allowAllTools?: boolean,
  *     allowedTools?: string[],
  *   },
+ *   toolConfig?: import("./copilot_sdk_tool_config.cjs").CopilotSDKToolConfig,
+ *   mcpServers?: Record<string, import("@github/copilot-sdk").MCPServerConfig>,
+ *   webFetchOptions?: {fetchImpl?: typeof fetch, timeoutMs?: number, maxRedirects?: number},
  *   coreLogger?: import("./copilot_sdk_permissions.cjs").CopilotSDKCoreLogger,
  *   sdkModule?: {
  *     CopilotClient: typeof import("@github/copilot-sdk").CopilotClient,
  *     RuntimeConnection: typeof import("@github/copilot-sdk").RuntimeConnection,
- *     approveAll: typeof import("@github/copilot-sdk").approveAll
+ *     approveAll: typeof import("@github/copilot-sdk").approveAll,
+ *     ToolSet?: typeof import("@github/copilot-sdk").ToolSet,
+ *     BuiltInTools?: typeof import("@github/copilot-sdk").BuiltInTools,
+ *     defineTool?: typeof import("@github/copilot-sdk").defineTool,
  *   },
  *   sessionStateBaseDir?: string,
+ *   workingDirectory?: string,
+ *   agentsBaseDir?: string,
+ *   bare?: boolean,
  * }} options
  * @returns {Promise<{exitCode: number, output: string, hasOutput: boolean, durationMs: number}>}
  */
-async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, connectionToken, providers, models: providerModels, maxToolDenials, permissionConfig, coreLogger, sdkModule, sessionStateBaseDir }) {
+async function runWithCopilotSDK(options) {
+  /** @type {{ modelObserver: ReturnType<typeof createCopilotSDKModelObserver> | null, sessionId: string }} */
+  const verification = { modelObserver: null, sessionId: "" };
+  const result = await runCopilotSDKSession({ ...options, verification });
+  // Native shutdown records arrive while disconnecting, after the session result is known.
+  const verificationFailure = verification.modelObserver && verification.sessionId ? verification.modelObserver.finalize(verification.sessionId) : "";
+  if (!verificationFailure) return result;
+  // Any verification failure (substitution or unverifiable evidence) is reported with a dedicated exit code so the harness does not retry.
+  return { ...result, exitCode: COPILOT_MODEL_VERIFICATION_EXIT_CODE, output: result.output.includes(verificationFailure) ? result.output : `${result.output}\n${verificationFailure}` };
+}
+
+/**
+ * @param {Parameters<typeof runWithCopilotSDK>[0] & { verification: { modelObserver: ReturnType<typeof createCopilotSDKModelObserver> | null, sessionId: string } }} options
+ * @returns {Promise<{exitCode: number, output: string, hasOutput: boolean, durationMs: number}>}
+ */
+async function runCopilotSDKSession({
+  sdkUri,
+  prompt,
+  logger,
+  attempt = 0,
+  model,
+  reasoningEffort,
+  connectionToken,
+  providers,
+  models: providerModels,
+  maxToolDenials,
+  permissionConfig,
+  toolConfig,
+  mcpServers,
+  webFetchOptions,
+  coreLogger,
+  sdkModule,
+  sessionStateBaseDir,
+  workingDirectory = resolveCopilotSDKWorkingDirectory(),
+  agentsBaseDir = path.join(os.tmpdir(), "gh-aw"),
+  bare = isCopilotSDKBareMode(process.env.GH_AW_COPILOT_SDK_SERVER_ARGS, logger),
+  verification,
+}) {
   // Lazy-require to avoid loading the SDK when it is not needed.
   // The SDK is large and has side-effects on import (worker threads, etc.).
-  const { CopilotClient, RuntimeConnection, approveAll } = sdkModule ?? require("@github/copilot-sdk");
+  const sdk = sdkModule ?? require("@github/copilot-sdk");
+  const { CopilotClient, RuntimeConnection, approveAll } = sdk;
 
   const startTime = Date.now();
   let output = "";
@@ -135,7 +229,7 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
   }
   log(`max-tool-denials threshold: ${maxToolDenialsLimit}`);
 
-  // Session state directory — mirrors the target path used by unified_timeline.cjs.
+  // Session state directory — mirrors the source path used by unified_session.cjs.
   // /tmp/gh-aw/sandbox/agent/logs/copilot-session-state/{sessionId}/events.jsonl
   // GH_AW_SESSION_STATE_BASE_DIR may be set in tests to redirect writes to an isolated directory.
   const defaultSessionStateBase = path.join(os.tmpdir(), "gh-aw", "sandbox", "agent", "logs", "copilot-session-state");
@@ -161,7 +255,7 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
   });
   const client = new CopilotClient({
     connection,
-    workingDirectory: process.env.GITHUB_WORKSPACE || process.cwd(),
+    workingDirectory,
     logLevel,
   });
   /** @type {any} */
@@ -171,16 +265,46 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
   let clientStarted = false;
   let toolDenialCount = 0;
   let assistantTurnCount = 0;
+  let contentFiltered = false;
   /** @type {any} */
   let catastrophicToolDenialsError = null;
   let catastrophicToolDenialsTriggered = false;
+  /** @type {Error | null} */
+  let modelSubstitutionError = null;
   /**
-   * Map from toolCallId → {toolName, mcpServerName} for enriching tool.execution_complete
-   * events and for tracking in-flight tool calls when the idle-timeout fires.
-   * Declared at function scope so the catch block can check pendingToolCalls.size.
-   * @type {Map<string, {toolName: string, mcpServerName: string}>}
+   * Rejects `denialGuardPromise` once the tool-denial threshold is exceeded and the
+   * bounded force-exit interval elapses. Declared here so `recordToolDenial` (defined
+   * below) can arm the forced settlement independent of whether `session.disconnect()`
+   * or the in-flight `sendAndWait()` call ever resolves on their own.
+   * @type {((reason: any) => void) | null}
    */
-  const pendingToolCalls = new Map();
+  let denialGuardReject = null;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let denialGuardTimer = null;
+  /**
+   * Settles (rejects) only when the tool-denial guard forces an early exit after
+   * `DENIAL_GUARD_FORCE_EXIT_MS_DEFAULT` (or `GH_AW_DENIAL_GUARD_TIMEOUT_MS`) elapses
+   * following `guard.tool_denials_exceeded`. Raced against `session.sendAndWait()` so
+   * the driver settles with a nonzero exit within a bounded interval even when
+   * disconnect or the in-flight SDK request stalls.
+   * @type {Promise<never>}
+   */
+  const denialGuardPromise = new Promise((_resolve, reject) => {
+    denialGuardReject = reject;
+  });
+  // Prevent an unhandled-rejection warning when the guard never fires (the common
+  // case): the promise is still raced below, but Node considers a promise
+  // "handled" only once a rejection handler has actually been attached, and the
+  // race only attaches one when sendAndWait settles first. The rejection reason
+  // is already logged and handled via the Promise.race() result below, so this
+  // is an intentional no-op (safe to ignore).
+  denialGuardPromise.catch(() => {});
+  /**
+   * Scoped toolCallIds for tracking in-flight tool calls when the idle-timeout fires.
+   * Declared at function scope so the catch block can check pendingToolCalls.size.
+   * @type {Set<string>}
+   */
+  const pendingToolCalls = new Set();
 
   // Post-completion idle watchdog.
   // When the agent has produced output and all tracked tool calls have completed,
@@ -198,6 +322,7 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
   // pendingToolCalls may legitimately be empty before the model dispatches its
   // first tool call of the new turn.
   let inAssistantTurn = false;
+  const activeAssistantTurns = new Set();
 
   /**
    * Best-effort write of a driver-level event to events.jsonl and stderr.
@@ -235,6 +360,17 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
         // best-effort early stop
       });
     }
+    // Force sendAndWait to settle within a bounded interval even if disconnect()
+    // or the in-flight SDK request never resolves on its own (observed hosted
+    // failure: the process remained stalled for ~49 minutes after this guard
+    // fired, until the surrounding job's own timeout cancelled it).
+    const denialGuardTimeoutMs = getEnvPositiveIntOrDefault("GH_AW_DENIAL_GUARD_TIMEOUT_MS", DENIAL_GUARD_FORCE_EXIT_MS_DEFAULT);
+    denialGuardTimer = setTimeout(() => {
+      if (denialGuardReject) {
+        log(`warning: denial guard force-exit fired after ${denialGuardTimeoutMs}ms — sendAndWait did not settle on its own`);
+        denialGuardReject(catastrophicToolDenialsError);
+      }
+    }, denialGuardTimeoutMs);
   }
 
   try {
@@ -250,93 +386,162 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
       coreLogger,
       logger: log,
       onDenied: requestSummary => recordToolDenial(`permission denied: ${requestSummary}`),
-      workspaceRoot: process.env.GITHUB_WORKSPACE,
+      workspaceRoot: workingDirectory,
+    });
+    const toolCallBudget = buildCopilotSDKToolCallBudget(toolConfig?.maxToolCalls, event => {
+      writeDriverEvent(event.exhausted ? "guard.tool_call_budget_exceeded" : "guard.tool_call_budget_debit", event);
     });
 
     // Build session config using the multi-provider surface.
+    /** @type {any} */
+    const sdkReasoningEffort = reasoningEffort;
+    const reflectedConfig = parseMultiProviderJson(process.env.GH_AW_COPILOT_SDK_MULTI_PROVIDER_JSON);
+    providers ??= reflectedConfig?.providers;
+    providerModels ??= reflectedConfig?.models;
+    const envModel = process.env.GH_AW_MODEL_ROUTING === "1" ? process.env.COPILOT_MODEL : resolveModelWithFallback(process.env, "COPILOT_MODEL");
+    const requestedModel = model || envModel || reflectedConfig?.model || undefined;
+    const providerConfig = providers && providerModels ? { providers, models: providerModels } : null;
+    const sessionModel = providerConfig ? qualifyModelForMultiProvider(requestedModel, providerConfig) : requestedModel;
+    if (providerConfig && !sessionModel) throw new Error(`Cannot qualify session model "${requestedModel || "(none)"}" against the configured provider models`);
+    // The harness resolves sub-agent models (aliases included) before the driver starts and
+    // stops the run when a workflow-declared sub-agent fails. A repository agent whose model
+    // the harness could not resolve is absent from the map and inherits the session model.
+    const resolvedSubagentModels = parseSubagentModelsJson(process.env.GH_AW_COPILOT_SDK_SUBAGENT_MODELS);
+    const unavailableModels = [];
+    const customAgents = loadCopilotSDKCustomAgents(workingDirectory, agentsBaseDir, log).map(agent => {
+      if (!agent.model || agent.model.trim().toLowerCase() === "inherited") return { ...agent, model: sessionModel || undefined };
+      if (Object.prototype.hasOwnProperty.call(resolvedSubagentModels, agent.name)) {
+        const resolved = resolvedSubagentModels[agent.name];
+        const qualified = providerConfig ? qualifyModelForMultiProvider(resolved, providerConfig) : resolved;
+        if (!qualified) throw new Error(`Cannot qualify custom agent "${agent.name}" model "${resolved}" against the configured provider models`);
+        return { ...agent, model: qualified };
+      }
+      const qualified = providerConfig ? qualifyModelForMultiProvider(agent.model, providerConfig) : agent.model;
+      if (qualified) return { ...agent, model: qualified };
+      log(`warning: custom agent "${agent.name}" model "${agent.model}" is not in the configured provider models; using session model "${sessionModel || "(none)"}"`);
+      unavailableModels.push({ agentName: agent.name, declaredModel: agent.model, model: sessionModel || undefined });
+      return { ...agent, model: sessionModel || undefined };
+    });
+    // The harness supplies the requested model (`auto` on routed runs); the session model is the expectation.
+    const durableSession = openDurableSession("copilot");
+    const restoredSessionId = durableSession?.id;
+    const durableSessionId = durableSession?.copilotSession();
+    const modelObserver = createCopilotSDKModelObserver({
+      configuredModel: process.env.GH_AW_COPILOT_CONFIGURED_MODEL || "",
+      expectedModel: sessionModel || "",
+      providerConfig,
+      sessionId: restoredSessionId,
+      sessionDirs: [...new Set([sessionStateBase, ...copilotSessionStateDirectories()])],
+      logger: log,
+    });
+    verification.modelObserver = modelObserver;
+    const skillsDirectory = path.resolve(agentsBaseDir, ".github", "skills");
+    const skillsStat = fs.lstatSync(skillsDirectory, { throwIfNoEntry: false });
+    if (skillsStat && !skillsStat.isDirectory()) throw new Error(`Staged Copilot skills must be a directory: ${skillsDirectory}`);
+    const skillDirectories = skillsStat ? [skillsDirectory] : [];
     /** @type {import("@github/copilot-sdk").SessionConfig} */
     const sessionConfig = {
-      model: model || resolveModelWithFallback(process.env, "COPILOT_MODEL") || undefined,
+      model: sessionModel || undefined,
+      ...(sdkReasoningEffort ? { reasoningEffort: sdkReasoningEffort } : {}),
       providers,
       models: providerModels,
+      workingDirectory,
+      skipCustomInstructions: bare,
+      customAgents,
+      enableConfigDiscovery: false,
+      skillDirectories,
+      ...(skillDirectories.length ? { enableSkills: true } : {}),
+      ...(mcpServers === undefined ? {} : { mcpServers }),
       onPermissionRequest,
+      ...(toolCallBudget ? { hooks: { onPreToolUse: toolCallBudget.onPreToolUse } } : {}),
+      ...buildCopilotSDKSessionToolConfig(toolConfig, sdk, webFetchOptions),
     };
     log(`creating session with model="${sessionConfig.model || "(none)"}" providers=${providers?.length ?? 0} models=${providerModels?.length ?? 0}`);
-    session = await client.createSession(sessionConfig);
+    session = restoredSessionId
+      ? await client.resumeSession(restoredSessionId, { ...sessionConfig, allowTranscriptRecovery: false })
+      : await client.createSession({ ...sessionConfig, ...(durableSessionId ? { sessionId: durableSessionId } : {}) });
+    durableSession?.save(session.sessionId);
     log(`session created: sessionId=${session.sessionId}`);
+    verification.sessionId = session.sessionId;
+    modelObserver.setSessionId(session.sessionId);
 
     // Prepare JSONL output file for this session.
     const sessionDir = path.join(sessionStateBase, session.sessionId);
     fs.mkdirSync(sessionDir, { recursive: true });
     const eventsPath = path.join(sessionDir, "events.jsonl");
     eventsStream = fs.createWriteStream(eventsPath, { flags: "a" });
+    for (const unavailable of unavailableModels) writeDriverEvent("subagent.model_unavailable", unavailable);
     // Snapshot to a non-null local for closure-safe writes (JSDoc nullability narrowing).
     const stream = eventsStream;
+    const assistantEvents = [];
     log(`serialising SDK events to ${eventsPath}`);
 
     /**
      * Write one JSONL entry to the events file and stderr.
-     * Uses the event's own ISO-8601 timestamp when available.
+     * Retains the native envelope, including an absent timestamp.
      *
      * @param {string} type
      * @param {any} data
      * @param {string | undefined} [timestamp]
+     * @param {Record<string, any>} [native]
      */
-    function writeEvent(type, data, timestamp) {
-      const entry = { type, timestamp: timestamp ?? new Date().toISOString(), data };
+    function writeEvent(type, data, timestamp, native = {}) {
+      const entry = { ...native, type, ...(timestamp !== undefined ? { timestamp } : {}), data };
       const jsonl = JSON.stringify(entry) + "\n";
       stream.write(jsonl);
       process.stderr.write(jsonl);
     }
 
-    // Subscribe to all session events and serialise the ones we care about.
     session.on(event => {
-      // Skip transient events that are not persisted by the server.
-      if (event.ephemeral) return;
+      // Observe the main-session model before capture so records delivered while disconnecting count too.
+      const modelDiagnostic = modelObserver.observe(event);
+      if (modelDiagnostic && !modelSubstitutionError) {
+        modelSubstitutionError = new Error(modelDiagnostic);
+        log("stopping SDK session: Copilot model verification failed");
+        if (session) {
+          void session.disconnect().catch(() => {
+            // best-effort early stop
+          });
+        }
+        if (denialGuardReject) denialGuardReject(modelSubstitutionError);
+      }
+      if (stream.writableEnded || stream.destroyed) return;
+      // Defer shell chunks until redaction can protect credentials spanning chunks.
+      // Background output must not extend the post-completion watchdog either.
+      if (event.type === "tool.shell_output") return;
+      if (event.ephemeral && !CAPTURED_EPHEMERAL_EVENTS.has(event.type)) return;
+      const data = { ...event.data };
+      if (event.type.startsWith("subagent.") && data.agentName && data.agentDisplayName) data.agentDisplayName = data.agentName;
+      if (data.agentMetrics) {
+        data.agentMetrics = Object.fromEntries(Object.entries(data.agentMetrics).map(([id, metric]) => [id, metric.agentName ? { ...metric, agentDisplayName: metric.agentName } : metric]));
+      }
+      const context = copilotSessionContext(event);
+      const scope = JSON.stringify([context.agentId, context.parentToolUseId]);
+      const toolKey = JSON.stringify([scope, data.toolCallId]);
 
       switch (event.type) {
-        case "user.message":
-          writeEvent("user.message", {}, event.timestamp);
-          break;
-
         case "tool.execution_start": {
-          const toolName = event.data?.toolName ?? "unknown";
-          const mcpServerName = event.data?.mcpServerName ?? "";
-          const toolCallId = event.data?.toolCallId;
-          const command = extractShellCommandFromToolData(event.data);
-          if (toolCallId) {
-            pendingToolCalls.set(toolCallId, { toolName, mcpServerName });
-          }
-          const eventData = command ? { toolName, mcpServerName, command } : { toolName, mcpServerName };
-          writeEvent("tool.execution_start", eventData, event.timestamp);
+          if (data.toolCallId !== undefined) pendingToolCalls.add(toolKey);
           break;
         }
 
         case "tool.execution_complete": {
-          const toolCallId = event.data?.toolCallId;
-          // Resolve toolName/mcpServerName from the matching start event when available.
-          const pending = toolCallId ? pendingToolCalls.get(toolCallId) : undefined;
-          const toolName = pending?.toolName ?? event.data?.toolDescription?.name ?? "unknown";
-          const mcpServerName = pending?.mcpServerName ?? "";
-          if (toolCallId) pendingToolCalls.delete(toolCallId);
-          const success = event.data?.success ?? !event.data?.error;
-          // Include result.content (concise LLM-facing output) so that the log
-          // parser can render tool output previews from events.jsonl directly.
-          const result = event.data?.result ?? undefined;
-          // max-tool-denials intentionally tracks permission denials only.
-          // Tool execution failures are still logged, but do not increment the guardrail counter.
-          writeEvent("tool.execution_complete", { toolName, mcpServerName, success, result }, event.timestamp);
+          if (data.toolCallId !== undefined) pendingToolCalls.delete(toolKey);
           break;
         }
 
         case "assistant.message": {
-          const content = event.data?.content ?? "";
-          if (content) {
+          assistantEvents.push(event);
+          const content = data.content;
+          if (getCopilotMessageRefusal(data)?.reason === "content_filter") {
+            if (context.agentId === undefined && !context.parentToolUseId) contentFiltered = true;
+            break;
+          }
+          if (typeof content === "string" && content && context.agentId === undefined && !context.parentToolUseId) {
             hasOutput = true;
             output += content;
             assistantTurnCount++;
           }
-          writeEvent("assistant.message", { content }, event.timestamp);
           break;
         }
 
@@ -344,6 +549,7 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
           // LLM inference started for a new turn. Disarm the watchdog — the model
           // may not have dispatched any tool calls yet, so pendingToolCalls can be
           // empty while real work is still in progress.
+          activeAssistantTurns.add(scope);
           inAssistantTurn = true;
           if (postCompletionWatchdog) {
             clearTimeout(postCompletionWatchdog);
@@ -354,45 +560,11 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
         case "assistant.turn_end":
           // LLM inference finished. Allow the watchdog to re-arm on the next event
           // that satisfies the completion conditions.
-          inAssistantTurn = false;
-          break;
-
-        case "session.task_complete":
-          writeEvent("session.task_complete", { success: event.data?.success, summary: event.data?.summary }, event.timestamp);
-          break;
-
-        case "subagent.started":
-          writeEvent(
-            "subagent.started",
-            {
-              agentName: event.data?.agentName,
-              agentDisplayName: event.data?.agentDisplayName,
-              toolCallId: event.data?.toolCallId,
-            },
-            event.timestamp
-          );
-          break;
-
-        case "subagent.completed":
-          writeEvent("subagent.completed", { agentName: event.data?.agentName, toolCallId: event.data?.toolCallId }, event.timestamp);
-          break;
-
-        case "subagent.failed":
-          writeEvent(
-            "subagent.failed",
-            {
-              agentName: event.data?.agentName,
-              toolCallId: event.data?.toolCallId,
-              error: event.data?.error,
-            },
-            event.timestamp
-          );
-          break;
-
-        default:
-          // Other event types are not consumed by unified_timeline.cjs; skip them.
+          activeAssistantTurns.delete(scope);
+          inAssistantTurn = activeAssistantTurns.size > 0;
           break;
       }
+      writeEvent(event.type, data, event.timestamp, event);
 
       // After processing each event, update the post-completion watchdog:
       // - Arm (or rearm) the watchdog when the session looks complete: output
@@ -401,14 +573,14 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
       //   tool call was just started, LLM inference is in progress, or no output yet).
       // The watchdog fires only if sendAndWait never resolves on its own after
       // the final tool result is returned — the common SDK post-completion hang.
-      if (hasOutput && pendingToolCalls.size === 0 && !inAssistantTurn) {
+      if (!contentFiltered && hasOutput && pendingToolCalls.size === 0 && !inAssistantTurn) {
         if (postCompletionWatchdog) clearTimeout(postCompletionWatchdog);
         postCompletionWatchdog = setTimeout(() => {
           postCompletionWatchdog = null;
           // Re-check conditions at fire time: a new tool call could have started
           // or a new turn could have begun between arming the watchdog and the
           // timer firing (race condition guard).
-          if (!hasOutput || pendingToolCalls.size !== 0 || inAssistantTurn || !session) return;
+          if (contentFiltered || !hasOutput || pendingToolCalls.size !== 0 || inAssistantTurn || !session) return;
           log(`warning: post-completion idle watchdog fired after ${postCompletionIdleMs}ms — force-disconnecting session`);
           postCompletionWatchdogTriggered = true;
           void session.disconnect().catch(err => {
@@ -425,17 +597,32 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
 
     log("sending prompt...");
     const sendTimeoutMs = getEnvPositiveIntOrDefault("COPILOT_SDK_SEND_TIMEOUT_MS", SDK_SEND_TIMEOUT_MS_DEFAULT);
-    const result = await session.sendAndWait({ prompt }, sendTimeoutMs);
+    // Race against denialGuardPromise so that if the tool-denial guard fires and
+    // session.disconnect()/sendAndWait then stall, the driver still settles with a
+    // nonzero exit within a bounded interval instead of hanging until the job's own
+    // timeout intervenes. denialGuardPromise never settles unless the guard fires.
+    const result = await Promise.race([session.sendAndWait({ prompt }, sendTimeoutMs), denialGuardPromise]);
 
     if (catastrophicToolDenialsError) {
       throw catastrophicToolDenialsError;
     }
+    if (result) modelObserver.observe(result);
+    if (modelSubstitutionError) throw modelSubstitutionError;
+
+    const resultContext = result ? copilotSessionContext(result) : {};
+    if (result && resultContext.agentId === undefined && !resultContext.parentToolUseId && getCopilotMessageRefusal(result.data)?.reason === "content_filter") {
+      contentFiltered = true;
+      if (!assistantEvents.some(event => isDeepStrictEqual(event, result))) writeEvent("assistant.message", result.data, result.timestamp, result);
+    }
+    if (contentFiltered) throw contentFilterError();
 
     // sendAndWait returns the last assistant.message event; capture its content
     // as a fallback in case the on() handler missed it.
     if (result && !hasOutput) {
-      const content = result.data?.content ?? "";
-      if (content) {
+      if (!assistantEvents.some(event => isDeepStrictEqual(event, result))) writeEvent("assistant.message", result.data, result.timestamp, result);
+      const context = copilotSessionContext(result);
+      const content = result.data?.content;
+      if (typeof content === "string" && content && context.agentId === undefined && !context.parentToolUseId) {
         output = content;
         hasOutput = true;
         assistantTurnCount++;
@@ -448,13 +635,13 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
     return { exitCode: 0, output, hasOutput, durationMs };
   } catch (err) {
     const durationMs = Date.now() - startTime;
-    const failure = catastrophicToolDenialsError ?? (err instanceof Error ? err : new Error(String(err)));
+    const failure = catastrophicToolDenialsError ?? modelSubstitutionError ?? (contentFiltered ? contentFilterError() : err instanceof Error ? err : new Error(String(err)));
     log(`error: ${failure.message}`);
 
     // When the post-completion idle watchdog force-disconnected the session, the
     // agent's work is done — the SDK simply failed to resolve sendAndWait after
     // the final tool result was returned.  Treat it as a successful completion.
-    if (postCompletionWatchdogTriggered && !catastrophicToolDenialsError && hasOutput && pendingToolCalls.size === 0) {
+    if (postCompletionWatchdogTriggered && !catastrophicToolDenialsError && !modelSubstitutionError && !contentFiltered && hasOutput && pendingToolCalls.size === 0) {
       log(`warning: post-completion watchdog triggered disconnect — treating as completed`);
       log(`session completed: hasOutput=${hasOutput} assistantTurns=${assistantTurnCount} durationMs=${durationMs}`);
       return { exitCode: 0, output, hasOutput, durationMs };
@@ -464,12 +651,14 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
     // output and all tracked tool calls have already completed, the session work is
     // done — the SDK simply failed to emit the idle signal.  Treat it as a successful
     // run so the harness does not classify it as a failure or waste retry attempts.
-    const isIdleTimeout = !catastrophicToolDenialsError && SDK_IDLE_TIMEOUT_PATTERN.test(failure.message);
+    const isIdleTimeout = !catastrophicToolDenialsError && !modelSubstitutionError && !contentFiltered && SDK_IDLE_TIMEOUT_PATTERN.test(failure.message);
     if (isIdleTimeout && hasOutput && pendingToolCalls.size === 0) {
       log(`warning: SDK idle-timeout with collected output and no pending tool calls — treating as completed`);
       log(`session completed: hasOutput=${hasOutput} assistantTurns=${assistantTurnCount} durationMs=${durationMs}`);
       return { exitCode: 0, output, hasOutput, durationMs };
     }
+
+    writeDriverEvent("session.error", { errorType: "sdk_driver", message: failure.message, ...("code" in failure ? { code: failure.code } : {}) });
 
     // Preserve any output collected before the error so the harness can use it
     // for retry decisions and diagnostics.
@@ -480,6 +669,10 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
       durationMs,
     };
   } finally {
+    if (denialGuardTimer) {
+      clearTimeout(denialGuardTimer);
+      denialGuardTimer = null;
+    }
     // Clear the post-completion watchdog if it has not already fired.
     if (postCompletionWatchdog) {
       clearTimeout(postCompletionWatchdog);
@@ -543,4 +736,4 @@ async function runWithCopilotSDK({ sdkUri, prompt, logger, attempt = 0, model, c
   }
 }
 
-module.exports = { SDK_SEND_TIMEOUT_MS_DEFAULT, SDK_POST_COMPLETION_IDLE_MS_DEFAULT, SDK_IDLE_TIMEOUT_PATTERN, extractPromptFromArgs, runWithCopilotSDK };
+module.exports = { SDK_SEND_TIMEOUT_MS_DEFAULT, SDK_POST_COMPLETION_IDLE_MS_DEFAULT, SDK_IDLE_TIMEOUT_PATTERN, extractPromptFromArgs, runWithCopilotSDK, isCopilotSDKBareMode, resolveCopilotSDKWorkingDirectory };

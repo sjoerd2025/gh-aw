@@ -4,9 +4,11 @@ package console
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
+	lipgloss "charm.land/lipgloss/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -33,6 +35,7 @@ type TestJob struct {
 }
 
 func TestRenderStruct_SimpleStruct(t *testing.T) {
+	t.Parallel()
 	data := TestOverview{
 		RunID:      12345,
 		Workflow:   "test-workflow",
@@ -52,7 +55,21 @@ func TestRenderStruct_SimpleStruct(t *testing.T) {
 	assert.NotContains(t, output, "should not appear", "output should not contain skipped field")
 }
 
+func TestRenderStruct_UnicodeFieldAlignment(t *testing.T) {
+	t.Parallel()
+	type unicodeFields struct {
+		Wide string `console:"header:名称"`
+		Long string `console:"header:Longest"`
+	}
+
+	output := RenderStruct(unicodeFields{Wide: "wide", Long: "long"})
+
+	assert.Contains(t, output, "  名称   : wide\n")
+	assert.Contains(t, output, "  Longest: long\n")
+}
+
 func TestRenderStruct_OmitEmpty(t *testing.T) {
+	t.Parallel()
 	data := TestMetrics{
 		TokenUsage: 1000,
 		Cost:       1.23,
@@ -78,6 +95,7 @@ func TestRenderStruct_OmitEmpty(t *testing.T) {
 }
 
 func TestRenderSlice_AsTable(t *testing.T) {
+	t.Parallel()
 	jobs := []TestJob{
 		{Name: "job-1", Status: "completed", Conclusion: "success"},
 		{Name: "job-2", Status: "in_progress", Conclusion: ""},
@@ -94,6 +112,7 @@ func TestRenderSlice_AsTable(t *testing.T) {
 }
 
 func TestRenderMap(t *testing.T) {
+	t.Parallel()
 	data := map[string]string{
 		"key1": "value1",
 		"key2": "value2",
@@ -108,7 +127,99 @@ func TestRenderMap(t *testing.T) {
 	assert.Contains(t, output, "value2", "map output should contain value2")
 }
 
+func TestRenderStruct_UnsupportedInputs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		input any
+	}{
+		{"nil", nil},
+		{"nil struct pointer", (*TestOverview)(nil)},
+		{"integer", 42},
+		{"string", "hello"},
+		{"boolean", true},
+		{"channel", make(chan int)},
+		{"function", func() {}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Empty(t, RenderStruct(tt.input))
+		})
+	}
+}
+
+func TestRenderStruct_RendersUnexportedFields(t *testing.T) {
+	t.Parallel()
+	data := struct {
+		name     string
+		count    int
+		enabled  bool
+		channel  chan int
+		callback func()
+	}{
+		name:     "hidden",
+		count:    42,
+		enabled:  true,
+		channel:  make(chan int),
+		callback: func() {},
+	}
+
+	output := RenderStruct(data)
+	for _, text := range []string{"name", "hidden", "count", "42", "enabled", "true"} {
+		assert.Contains(t, output, text)
+	}
+}
+
+func TestRenderStructWithOptions(t *testing.T) {
+	t.Parallel()
+	value := strings.Repeat("x", 180)
+	tests := []struct {
+		name string
+		data any
+	}{
+		{"slice of structs", []struct{ Path string }{{value}}},
+		{"map", map[string]string{"Path": value}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for _, destination := range []struct {
+				name   string
+				stderr bool
+				render func(any) string
+			}{
+				{"stdout", false, RenderStructStdout},
+				{"stderr", true, RenderStruct},
+			} {
+				t.Run(destination.name, func(t *testing.T) {
+					t.Parallel()
+					unbounded := RenderStructWithOptions(tt.data, RenderOptions{Stderr: destination.stderr})
+					assert.Equal(t, destination.render(tt.data), unbounded, "zero width should preserve default rendering")
+					assert.Contains(t, unbounded, value, "zero width should not wrap long values")
+
+					for _, width := range []int{24, 48} {
+						t.Run(strconv.Itoa(width), func(t *testing.T) {
+							t.Parallel()
+							output := RenderStructWithOptions(tt.data, RenderOptions{MaxWidth: width, Stderr: destination.stderr})
+							require.NotEmpty(t, output)
+							assert.Contains(t, output, "Path")
+							assert.Equal(t, len(value), strings.Count(output, "x"), "wrapping must preserve the value")
+							for line := range strings.SplitSeq(output, "\n") {
+								assert.LessOrEqual(t, lipgloss.Width(line), width, "line %q exceeds MaxWidth", line)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestParseConsoleTag(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		tag      string
@@ -173,6 +284,7 @@ func TestParseConsoleTag(t *testing.T) {
 }
 
 func TestIsZeroValue(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		value    any
@@ -199,6 +311,7 @@ func TestIsZeroValue(t *testing.T) {
 }
 
 func TestFormatFieldValue(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		value    any
@@ -221,6 +334,7 @@ func TestFormatFieldValue(t *testing.T) {
 }
 
 func TestRenderStruct_ComplexExample(t *testing.T) {
+	t.Parallel()
 	// Test a more complex nested structure
 	type Address struct {
 		Street string `console:"header:Street"`
@@ -256,6 +370,7 @@ func TestRenderStruct_ComplexExample(t *testing.T) {
 }
 
 func TestBuildTableConfig(t *testing.T) {
+	t.Parallel()
 	jobs := []TestJob{
 		{Name: "job-1", Status: "completed", Conclusion: "success"},
 		{Name: "job-2", Status: "in_progress", Conclusion: ""},
@@ -265,13 +380,15 @@ func TestBuildTableConfig(t *testing.T) {
 	config := buildTableConfig(val, "Test Jobs")
 
 	assert.Len(t, config.Headers, 3, "expected 3 headers (excluding omitempty empty fields)")
-	assert.Len(t, config.Rows, 2, "expected 2 rows in table output")
+	require.Len(t, config.Rows, 2, "expected 2 rows in table output")
 
 	// Check first row
+	require.Len(t, config.Rows[0], 3, "expected a cell for each header")
 	assert.Equal(t, "job-1", config.Rows[0][0], "first row name should be job-1")
 }
 
 func TestFormatTag_Number(t *testing.T) {
+	t.Parallel()
 	type TestMetrics struct {
 		TokenUsage int `console:"header:Token Usage,format:number"`
 		Errors     int `console:"header:Errors"`
@@ -292,6 +409,7 @@ func TestFormatTag_Number(t *testing.T) {
 }
 
 func TestFormatTag_Cost(t *testing.T) {
+	t.Parallel()
 	type TestBilling struct {
 		Cost float64 `console:"header:Estimated Cost,format:cost"`
 	}
@@ -307,6 +425,7 @@ func TestFormatTag_Cost(t *testing.T) {
 }
 
 func TestFormatTag_InTable(t *testing.T) {
+	t.Parallel()
 	type TestTool struct {
 		Name       string `console:"header:Tool"`
 		CallCount  int    `console:"header:Calls"`
@@ -328,12 +447,19 @@ func TestFormatTag_InTable(t *testing.T) {
 }
 
 func TestFormatNumber(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		input    int
 		expected string
 	}{
 		// Zero
 		{0, "0"},
+		// Negative numbers remain unabridged.
+		{-1, "-1"},
+		{-999, "-999"},
+		{-1000, "-1000"},
+		{-1000000, "-1000000"},
+		{-1000000000, "-1000000000"},
 		// Small numbers (under 1000)
 		{5, "5"},
 		{42, "42"},
@@ -375,13 +501,46 @@ func TestFormatNumber(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		result := FormatNumber(test.input)
-		assert.Equal(t, test.expected, result, "FormatNumber(%d) mismatch", test.input)
+		t.Run(strconv.Itoa(test.input), func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, test.expected, FormatNumber(test.input))
+		})
+	}
+}
+
+func TestFormatTokens(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		input    int
+		expected string
+	}{
+		{"zero", 0, "-"},
+		{"single token", 1, "1"},
+		{"below thousand", 999, "999"},
+		{"thousand", 1000, "1.0K"},
+		{"fractional thousand", 1500, "1.5K"},
+		{"rounded thousand", 9999, "10.0K"},
+		{"upper thousands", 999_400, "999.4K"},
+		{"million", 1_000_000, "1.0M"},
+		{"fractional million", 1_200_000, "1.2M"},
+		{"tens of millions", 12_300_000, "12.3M"},
+		{"negative single token", -1, "-1"},
+		{"negative thousand", -1000, "-1000"},
+		{"negative million", -1_000_000, "-1000000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, FormatTokens(tt.input))
+		})
 	}
 }
 
 // TestRenderStruct_PointerToStruct tests that pointer-to-struct fields are rendered as nested structs, not raw data
 func TestRenderStruct_PointerToStruct(t *testing.T) {
+	t.Parallel()
 	type Inner struct {
 		Name  string `console:"header:Name"`
 		Value int    `console:"header:Value"`
@@ -414,6 +573,7 @@ func TestRenderStruct_PointerToStruct(t *testing.T) {
 
 // TestRenderStruct_NilPointerToStruct tests that nil pointer-to-struct fields are handled gracefully
 func TestRenderStruct_NilPointerToStruct(t *testing.T) {
+	t.Parallel()
 	type Inner struct {
 		Name string `console:"header:Name"`
 	}
@@ -439,9 +599,15 @@ func TestRenderStruct_NilPointerToStruct(t *testing.T) {
 // TestRenderStruct_EmbeddedStruct tests that anonymous embedded struct fields are
 // inlined into the parent struct output rather than rendered as a nested section.
 func TestRenderStruct_EmbeddedStruct(t *testing.T) {
+	t.Parallel()
 	type Base struct {
 		Name   string `console:"header:Name"`
 		Engine string `console:"header:Engine"`
+	}
+
+	type OptionalBase struct {
+		Name   string `console:"header:Name"`
+		Engine string `console:"header:Engine,omitempty"`
 	}
 
 	type Extended struct {
@@ -449,46 +615,10 @@ func TestRenderStruct_EmbeddedStruct(t *testing.T) {
 		Status string `console:"header:Status"`
 	}
 
-	data := Extended{
-		Base:   Base{Name: "my-workflow", Engine: "copilot"},
-		Status: "active",
-	}
-
-	output := RenderStruct(data)
-
-	// Fields from the embedded struct should appear at the top level.
-	assert.Contains(t, output, "my-workflow", "output should contain Name from embedded struct")
-	assert.Contains(t, output, "copilot", "output should contain Engine from embedded struct")
-	assert.Contains(t, output, "active", "output should contain Status from outer struct")
-	// The embedded type name should NOT appear as a section title.
-	assert.NotContains(t, output, "Base", "output should not contain the embedded struct type name as a section")
-}
-
-func TestRenderStruct_EmbeddedStructOmitEmptyAndPointer(t *testing.T) {
-	type Base struct {
-		Name   string `console:"header:Name"`
-		Engine string `console:"header:Engine,omitempty"`
-	}
-
-	type Extended struct {
-		*Base
+	type WithPointer struct {
+		*OptionalBase
 		Status string `console:"header:Status"`
 	}
-
-	data := Extended{
-		Base:   &Base{Name: "wf"},
-		Status: "active",
-	}
-
-	output := RenderStruct(data)
-
-	assert.Contains(t, output, "wf", "output should contain Name from embedded pointer struct")
-	assert.Contains(t, output, "active", "output should contain Status from outer struct")
-	assert.NotContains(t, output, "Engine", "zero omitempty field in embed should be suppressed")
-	assert.NotContains(t, output, "Base", "output should not contain the embedded pointer type name as a section")
-}
-
-func TestRenderStruct_NestedEmbeddedStruct(t *testing.T) {
 	type Inner struct {
 		Name string `console:"header:Name"`
 	}
@@ -503,24 +633,58 @@ func TestRenderStruct_NestedEmbeddedStruct(t *testing.T) {
 		Status string `console:"header:Status"`
 	}
 
-	output := RenderStruct(Outer{
-		Middle: Middle{
-			Inner:  Inner{Name: "wf"},
-			Engine: "copilot",
+	tests := []struct {
+		name        string
+		data        any
+		contains    []string
+		notContains []string
+	}{
+		{
+			name:        "value",
+			data:        Extended{Base: Base{Name: "my-workflow", Engine: "copilot"}, Status: "active"},
+			contains:    []string{"my-workflow", "copilot", "active"},
+			notContains: []string{"Base"},
 		},
-		Status: "ok",
-	})
+		{
+			name:     "value with empty required field",
+			data:     Extended{Base: Base{Name: "wf"}, Status: "active"},
+			contains: []string{"wf", "Engine", "active"},
+		},
+		{
+			name:        "pointer with omitted empty field",
+			data:        WithPointer{OptionalBase: &OptionalBase{Name: "wf"}, Status: "active"},
+			contains:    []string{"wf", "active"},
+			notContains: []string{"Engine", "Base"},
+		},
+		{
+			name: "nested",
+			data: Outer{
+				Middle: Middle{Inner: Inner{Name: "wf"}, Engine: "copilot"},
+				Status: "ok",
+			},
+			contains:    []string{"wf", "copilot", "ok"},
+			notContains: []string{"Middle", "Inner"},
+		},
+	}
 
-	assert.Contains(t, output, "wf")
-	assert.Contains(t, output, "copilot")
-	assert.Contains(t, output, "ok")
-	assert.NotContains(t, output, "Middle")
-	assert.NotContains(t, output, "Inner")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			output := RenderStruct(tt.data)
+			for _, text := range tt.contains {
+				assert.Contains(t, output, text)
+			}
+			for _, text := range tt.notContains {
+				assert.NotContains(t, output, text)
+			}
+		})
+	}
 }
 
 // TestRenderSlice_EmbeddedStruct tests that a slice of structs with anonymous embedded
 // fields is rendered as a flat table with all promoted fields as columns.
 func TestRenderSlice_EmbeddedStruct(t *testing.T) {
+	t.Parallel()
 	type Base struct {
 		Name   string `console:"header:Name"`
 		Engine string `console:"header:Engine"`
@@ -531,58 +695,84 @@ func TestRenderSlice_EmbeddedStruct(t *testing.T) {
 		Status string `console:"header:Status"`
 	}
 
-	items := []Extended{
-		{Base: Base{Name: "wf-1", Engine: "copilot"}, Status: "active"},
-		{Base: Base{Name: "wf-2", Engine: "claude"}, Status: "disabled"},
+	type Skipped struct {
+		Base   `console:"-"`
+		Status string `console:"header:Status"`
 	}
-
-	output := RenderStruct(items)
-
-	// All columns (including those from the embedded struct) should appear as headers.
-	assert.Contains(t, output, "Name", "output should contain Name column header")
-	assert.Contains(t, output, "Engine", "output should contain Engine column header")
-	assert.Contains(t, output, "Status", "output should contain Status column header")
-	lines := strings.Split(output, "\n")
-	headerLine := ""
-	for _, line := range lines {
-		if strings.Contains(line, "Name") && strings.Contains(line, "Status") {
-			headerLine = line
-			break
-		}
-	}
-	require.NotEmpty(t, headerLine, "table output should include a header row")
-	assert.Less(t, strings.Index(headerLine, "Name"), strings.Index(headerLine, "Status"), "embedded Name column must appear before outer Status column in the header row")
-
-	// All values should be present in the table rows.
-	assert.Contains(t, output, "wf-1", "output should contain first workflow name")
-	assert.Contains(t, output, "copilot", "output should contain first engine")
-	assert.Contains(t, output, "active", "output should contain first status")
-	assert.Contains(t, output, "wf-2", "output should contain second workflow name")
-	assert.Contains(t, output, "claude", "output should contain second engine")
-	assert.Contains(t, output, "disabled", "output should contain second status")
-}
-
-func TestRenderSlice_EmbeddedPointerStruct(t *testing.T) {
-	type Base struct {
+	type PointerBase struct {
 		Name string `console:"header:Name"`
 	}
-
-	type Extended struct {
-		*Base
+	type WithPointer struct {
+		*PointerBase
 		Status string `console:"header:Status"`
 	}
 
-	items := []Extended{
-		{Base: &Base{Name: "wf-1"}, Status: "active"},
-		{Status: "missing"},
+	tests := []struct {
+		name        string
+		data        any
+		headers     []string
+		values      []string
+		notContains []string
+		emptyCell   bool
+	}{
+		{
+			name: "value",
+			data: []Extended{
+				{Base: Base{Name: "wf-1", Engine: "copilot"}, Status: "active"},
+				{Base: Base{Name: "wf-2", Engine: "claude"}, Status: "disabled"},
+			},
+			headers:     []string{"Name", "Engine", "Status"},
+			values:      []string{"wf-1", "copilot", "active", "wf-2", "claude", "disabled"},
+			notContains: []string{"Base"},
+		},
+		{
+			name:        "skipped",
+			data:        []Skipped{{Base: Base{Name: "wf-1"}, Status: "active"}},
+			headers:     []string{"Status"},
+			values:      []string{"active"},
+			notContains: []string{"Name", "Engine", "wf-1"},
+		},
+		{
+			name: "pointer including nil row",
+			data: []WithPointer{
+				{PointerBase: &PointerBase{Name: "wf-1"}, Status: "active"},
+				{Status: "missing"},
+			},
+			headers:     []string{"Name", "Status"},
+			values:      []string{"wf-1", "active", "missing"},
+			notContains: []string{"PointerBase"},
+			emptyCell:   true,
+		},
 	}
 
-	output := RenderStruct(items)
-
-	assert.Contains(t, output, "Name", "output should contain Name column header from embedded pointer struct")
-	assert.Contains(t, output, "Status", "output should contain Status column header")
-	assert.Contains(t, output, "wf-1", "output should contain first workflow name")
-	assert.Regexp(t, `(?m)^│\s*│missing│$`, output, "output should render an empty Name cell for rows with a nil embedded pointer")
-	assert.Contains(t, output, "missing", "output should contain second status")
-	assert.NotContains(t, output, "Base", "output should not contain the embedded pointer type name as a column")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			output := RenderStruct(tt.data)
+			headerLine := ""
+			for line := range strings.SplitSeq(output, "\n") {
+				if strings.Contains(line, tt.headers[0]) {
+					headerLine = line
+					break
+				}
+			}
+			require.NotEmpty(t, headerLine, "table output should include a header row")
+			previous := -1
+			for _, header := range tt.headers {
+				require.Contains(t, headerLine, header)
+				position := strings.Index(headerLine, header)
+				assert.Greater(t, position, previous, "columns should follow field declaration order")
+				previous = position
+			}
+			for _, text := range tt.values {
+				assert.Contains(t, output, text)
+			}
+			for _, text := range tt.notContains {
+				assert.NotContains(t, output, text)
+			}
+			if tt.emptyCell {
+				assert.Regexp(t, `(?m)^│\s*│missing│$`, output, "nil embedded pointer should render an empty Name cell")
+			}
+		})
+	}
 }

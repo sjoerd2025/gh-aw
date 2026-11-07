@@ -44,6 +44,13 @@ imports:
 
 `uses` is an alias for `path`; `with` is an alias for `inputs`.
 
+Nested local frontmatter imports in relative form (excluding `.github/...` and
+`/...`; see [Path Resolution](#path-resolution)) use the root workflow directory
+for qualified paths such as `shared/graders/recurrence-determinism.md`. Bare names such as
+`common.md` and paths beginning with `./` are relative to the importing file.
+Lock-file frontmatter and body hashes follow the same rules for these relative-form
+imports, so changes to those nested components invalidate the importing workflow's lock.
+
 Conditional frontmatter imports are not supported. If an experiment should vary shared prompt content, keep imports unconditional and gate `{{#runtime-import? ...}}` (optional form) inside your `{{#if experiments.<name> ...}}` block instead. The optional form is not promoted to unconditional lock-file macros, so the content is only injected when the condition is true at runtime.
 
 ### Single-import constraint
@@ -58,6 +65,8 @@ An imported workflow can only be imported once per workflow.
 ```
 
 In markdown, use `{{#runtime-import filepath}}` to inject the content of another file directly into the body at that position. This is useful for sharing reusable prompt snippets, tone instructions, or reference material across workflows.
+
+Repository-local imported markdown is an author source: it shares the main workflow's compiler-selected non-secret bindings, including `env.*`, compound expressions, and conditions. gh-aw validates available files across the nested local runtime-import tree at compile time. Job-output references must be available before activation, such as `${{ needs.pre_activation.outputs.activated }}`. Runtime imports accept only local files within `.github` or explicit `.agents/` paths and perform no network fetching. For external content, put the URL in ordinary prompt instructions for the agent to retrieve inside the AWF sandbox under the configured network policy. Frontmatter compile-time imports are unchanged.
 
 ```aw wrap
 ---
@@ -80,13 +89,15 @@ Use `{{#runtime-import? filepath}}` to silently skip a missing file instead of f
 {{#runtime-import? .github/shared/optional.md}}    # optional — skipped if missing
 ```
 
-Paths are resolved within the `.github` folder. You can specify paths with or without the `.github/` prefix — both `.github/shared/editorial.md` and `shared/editorial.md` refer to the same file. See [Runtime Imports](/gh-aw/reference/templating/#runtime-imports) for URLs, line ranges, and security details.
+Paths are resolved within the `.github` folder. You can specify paths with or without the `.github/` prefix — both `.github/shared/editorial.md` and `shared/editorial.md` refer to the same file. Local compile-time imports may follow symlinks only when the target remains within the allowed folder (`.github`, or `.agents` for `/.agents/` imports). The allowed folder itself must not be a symlink. Dangling symlinks and symlinked parent directories that escape that folder are rejected. File reads retain the allowed folder selected during resolution, including with `inlined-imports: true`, and remain confined to it if symlinks change after path validation. Nested folders named `.github` or `.agents` do not change that boundary. Runtime imports are local-only; external retrieval belongs to the agent inside the AWF sandbox. See [Runtime Imports](/gh-aw/reference/templating/#runtime-imports) for line ranges and security details.
 
 ## Shared Workflow Components
 
-Files without an `on` field are shared workflow components: they are validated, can be imported by other workflows, and are not compiled into standalone GitHub Actions. Shared components may also define import-safe `on` keys (`skip-if-match`, `skip-if-no-match`, `skip-roles`, `skip-bots`, `github-token`, `github-app`) for reuse through imports.
+Files without a trigger event are shared workflow components. They are validated, importable by other workflows, and not compiled into standalone GitHub Actions. Shared components may also define import-safe `on` keys (`skip-if-match`, `skip-if-no-match`, `skip-roles`, `skip-bots`, `github-token`, `github-app`) plus the top-level `ambient-folders` field.
 
-When you regularly import the same pair together, bundle them into one shared file:
+Comment-only frontmatter still counts as present, so the file parses as a shared component and produces an empty frontmatter map instead of failing with `no frontmatter found`. Only missing or whitespace-only frontmatter is rejected.
+
+If you often import the same pair together, bundle them into one shared file:
 
 ```aw wrap
 ---
@@ -101,6 +112,8 @@ imports:
 ```
 
 `shared/reporting-otlp.md` combines `shared/reporting.md` and `shared/otlp.md` for telemetry-enabled reporting workflows.
+
+Shared OTLP configuration can use whole-value `${{ github.aw.metadata.<key> }}` references in `observability.otlp.attributes` and `observability.otlp.resource-attributes`. These resolve at compile time against each importing root workflow's `metadata` map, so callers do not need to pass the values through import inputs. Only simple, existing metadata keys can be referenced, and only explicitly selected values are exported.
 
 ## Import Schema (`import-schema`)
 
@@ -129,7 +142,7 @@ import-schema:
     type: object
     description: Configuration object
     properties:
-      apiKey:
+      project:
         type: string
         required: true
       timeout:
@@ -143,7 +156,7 @@ mcp-servers:
 ---
 
 Deploy ${{ github.aw.import-inputs.count }} items to ${{ github.aw.import-inputs.region }}.
-API key: ${{ github.aw.import-inputs.config.apiKey }}.
+Project: ${{ github.aw.import-inputs.config.project }}.
 Languages: ${{ github.aw.import-inputs.languages }}.
 ```
 
@@ -162,7 +175,7 @@ Each field supports `required: true` and an optional `default` value.
 
 ### Accessing inputs in shared workflows
 
-Use `${{ github.aw.import-inputs.<key> }}` to substitute a top-level value; use dotted notation for object sub-fields (e.g. `${{ github.aw.import-inputs.config.apiKey }}`). Substitution applies to both frontmatter and body, so inputs can drive any field such as `mcp-servers` or `runtimes`.
+Use `${{ github.aw.import-inputs.<key> }}` to substitute a top-level value; use dotted notation for object sub-fields (e.g. `${{ github.aw.import-inputs.config.project }}`). Substitution applies to both frontmatter and body, so inputs can drive any field such as `mcp-servers` or `runtimes`. Values used in prompt bodies must be non-secret; environment filtering cannot identify credentials deliberately supplied as input text.
 
 ### Calling a parameterized shared workflow
 
@@ -180,7 +193,7 @@ imports:
       count: 5
       languages: ["go", "typescript"]
       config:
-        apiKey: my-secret-key
+        project: release-dashboard
         timeout: 60
 ---
 ```
@@ -189,7 +202,7 @@ The compiler validates `required` fields, `choice` options, array element types,
 
 ## Path Resolution
 
-Imports resolve in three ways depending on path format.
+Imports resolve by path format:
 
 ### Relative paths (default)
 
@@ -227,7 +240,7 @@ Use this form when workflows in different directories need the same stable impor
 
 ### Cross-repo imports
 
-Paths matching `owner/repo/path@ref` are fetched from GitHub at compile time. The `@ref` suffix can be a semantic tag (`@v1.0.0`), branch (`@main`), or commit SHA. Remote imports are cached in `.github/aw/imports/` by commit SHA to support offline compilation; local imports are never cached. See [Reusing Workflows](/gh-aw/guides/reusing-workflows/) for installation and update flows.
+Paths matching `owner/repo/path@ref` are fetched from GitHub at compile time. The `@ref` suffix can be a semantic tag (`@v1.0.0`), branch (`@main`), or commit SHA. Remote imports are cached in `.github/aw/imports/` by commit SHA to support offline compilation; local imports are never cached. See [Adding Existing Workflows](/gh-aw/setup/working-with-workflows/#adding-existing-workflows) for installation flows.
 
 ```aw wrap
 ---
@@ -297,36 +310,39 @@ Shared workflow files (without `on:` field) can define the fields below. Other f
 | `network` | Network permission specifications |
 | `permissions` | GitHub Actions permissions (validated, not merged) |
 | `runtimes` | Runtime version overrides (node, python, go, etc.) |
+| `plugins` | Agent Plugin references |
 | `secret-masking` | Secret masking steps |
 | `env` | Workflow-level environment variables |
 | `pre-agent-steps` | Steps that run after artifacts download, before engine execution |
 | `post-steps` | Steps that run after engine execution |
+| `jobs` | Additional jobs and supported built-in job customizations |
 | `github-app` | GitHub App credentials for token minting |
 | `checkout` | Checkout configuration for the agent job |
 | `engine.mcp` | MCP gateway settings (`tool-timeout`, `session-timeout`); engine identifier itself is always inherited from the importing workflow |
 
 ### Field-Specific Merge Semantics
 
-Imports are processed using breadth-first traversal: direct imports first, then nested. Earlier imports in the list take precedence; circular imports fail at compile time.
+Imported step fields use dependency order: a file's steps are processed after the steps from everything it imports and before the steps from anything that imports it. Ties retain declaration order, and circular imports fail at compile time. Other fields keep discovery order (direct imports first, then nested), so first-wins scalar precedence remains backward compatible.
 
 | Field | Merge strategy |
 |-------|---------------|
 | `tools:` | Deep merge; `allowed` arrays concatenate and deduplicate. MCP tool conflicts fail except on `allowed` arrays. |
 | `mcp-servers:` | Imported servers override same-named main servers; first-wins across imports. |
 | `network:` | `allowed` domains union (deduped, sorted). Main `mode` and `firewall` take precedence. |
-| `permissions:` | Validation only — not merged. Main must declare all imported permissions at sufficient levels (`write` ≥ `read` ≥ `none`). |
-| `safe-outputs:` | Each type defined once; main overrides imports. Duplicate types across imports fail. |
-| `runtimes:` | Main overrides imports; imported values fill in unspecified fields. |
-| `services:` | All services merged; duplicate names fail compilation. |
-| `github-app:` | Main workflow's `github-app` takes precedence; first imported value fills in if main does not define one. |
-| `checkout:` | Imported checkout entries are appended after the main workflow's entries. For duplicate (repository, path) pairs, the main workflow's entry takes precedence: first-seen wins for `ref`, and auth is mutually exclusive — once `github-token` or `github-app` is set by the main workflow, an imported duplicate cannot add the other auth method. `checkout: false` in the main workflow disables all checkout including imported entries. |
-| `engine.mcp` | First-wins across imports. Shared files may define `engine:` with only `mcp.tool-timeout` and/or `mcp.session-timeout` (no engine identifier). The importing workflow's own engine setting always takes precedence; the first imported value fills in if the main workflow does not set a value. |
-| `steps:` | Imported steps prepended to main; concatenated in import order. |
-| `pre-agent-steps:` | Imported pre-agent-steps prepended to main; concatenated in import order. |
-| `post-steps:` | Imported post-steps appended after main; concatenated in import order. |
-| `jobs:` | Not merged — define only in the main workflow. Use `safe-outputs.jobs` for importable jobs. |
-| `safe-outputs.jobs` | Names must be unique; duplicates fail. Order determined by `needs:` dependencies. |
-| `env:` | Main workflow env vars take precedence over imports. Duplicate keys across different imports fail compilation — move to the main workflow to override imported values. |
+| `permissions:` | Validation only. Main must declare all imported permissions at sufficient levels (`write` ≥ `read` ≥ `none`). |
+| `safe-outputs:` | Each type may be defined once; main overrides imports. Duplicate types across imports fail. |
+| `runtimes:` | Main overrides imports; imported values fill unspecified fields. |
+| `plugins:` | Union by plugin path. Identical refs are deduplicated; compatible semantic versions select the highest version. Incompatible major versions or conflicting non-semver refs fail. |
+| `services:` | All services merge; duplicate names fail compilation. |
+| `github-app:` | Main takes precedence; otherwise the first imported value is used. |
+| `checkout:` | Imported entries are appended after the main workflow's entries. For duplicate `(repository, path)` pairs, the main entry wins: first-seen wins for `ref`, auth is mutually exclusive, and `checkout: false` in the main workflow disables all checkout, including imported entries. |
+| `engine.mcp` | First-wins across imports. Shared files may define only `mcp.tool-timeout` and/or `mcp.session-timeout`; the importing workflow's engine identifier always wins. |
+| `steps:` | Imported steps are prepended to main in dependency order; prerequisites precede dependents and unrelated siblings retain declaration order. |
+| `pre-agent-steps:` | Imported pre-agent steps are prepended to main in dependency order; prerequisites precede dependents and unrelated siblings retain declaration order. |
+| `post-steps:` | Imported post-steps are appended after main in dependency order; prerequisites precede dependents and unrelated siblings retain declaration order. |
+| `jobs:` | Imported jobs are added; main job definitions take precedence. Same-named jobs combine injected step fields and merge `outputs` by name, with main output values winning. |
+| `safe-outputs.jobs` | Names must be unique; duplicates fail. Order is determined by `needs:` dependencies. |
+| `env:` | Main env vars take precedence. Duplicate keys across imports fail compilation; move the override to the main workflow. |
 
 Example — `tools.bash.allowed` merging:
 
@@ -374,7 +390,27 @@ steps:
 Process the issue using the rotated token from the imported step.
 ```
 
-Steps from imports run **before** steps defined in the main workflow, in import declaration order.
+Steps from imports run **before** steps defined in the main workflow. Imported prerequisites run before the files that depend on them, while unrelated sibling imports retain declaration order.
+
+### Importing Secret Masking Steps
+
+`secret-masking.steps` defines custom redaction hooks that run after built-in secret redaction and before artifact upload. Imported hooks are appended to the workflow's hooks.
+
+Built-in redaction scans supported text files under `/tmp/gh-aw` and `${RUNNER_TEMP}/gh-aw`. Files without secret matches are left unchanged unless `secret-masking.steps` configures custom redactors, which require writable files. When redaction or custom-hook preparation requires a write, a readable non-writable file, such as a container-owned log, is atomically replaced with a runner-owned copy with owner-only read/write permissions. If the parent directory is also read-only, such as a Go module cache directory, redaction instead makes the file owner-readable and writable in place without changing directory permissions. This requires permission to change the file's mode; it does not bypass file locks or inaccessible directories.
+
+Runtime-mask redaction handles multi-megabyte JSON strings and mixed log records without relying on recursive regular-expression matching or repeatedly scanning rejected quoted spans. If malformed quotes hide an encoded mask, conservative recovery replaces only matching source spans and represents the record as a JSON string. The decoded record preserves unrelated plain-text escapes, such as backslashes in Windows paths; records without additional matches retain their original bytes. Configured secrets, built-in token patterns, and runtime masks are matched together so overlapping credentials cannot evade redaction through fragmentation or encoding changes. This does not change GitHub's step-summary size limit.
+
+Malformed ordinary JSON artifacts are treated as text: raw and escaped credentials are matched together across the entire file, including multiline secrets and recoverable quoted spans. Unexpected decoding or write failures still remove the source before upload; malformed executable safe outputs follow the stricter rules below.
+
+Executable safe-output JSON/JSONL preserves public field names, aliases, and enum values declared by the action's bundled tool schemas, so short masks cannot rename `body` or change a review's message type. Free-form values and arbitrary nested keys are still redacted, even when they contain those same public words. The configuration and validation files consumed by the output collector also retain public protocol vocabulary; redaction must not rewrite their constraints or targets. Malformed executable records and mask conflicts with custom message types, custom top-level fields, or control data fail closed: the source is removed and redaction fails rather than publishing a corrupted message. Ordinary log artifacts do not receive these protocol exceptions.
+
+Custom hooks must tolerate absent optional files and files that disappear between discovery and reading (`ENOENT`). Earlier cleanup or redaction can remove files, including symbolic links and artifacts that could not be sanitized. Do not create empty placeholders for missing logs or outputs.
+
+Custom hooks run during workspace redaction in the agent job. Graders execute
+later in conclusion using the redacted in-memory unified session; they do not
+read source files or rerun custom hooks.
+
+Permission errors and other redaction failures are not equivalent to missing files. Report them explicitly and remove any unsanitized artifact source before upload; do not silently skip it or use `continue-on-error` as a workaround. For files outside the built-in scan, custom hooks are responsible for preparing writable files and avoiding symbolic links. Stop log writers before redaction so they cannot append sensitive content after sanitization.
 
 ### Importing MCP Servers
 
@@ -449,7 +485,7 @@ jobs:
     outputs:
       artifact_name: ${{ steps.build.outputs.artifact_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Build
         id: build
         run: |
@@ -488,6 +524,12 @@ Review the build output in /tmp/build-output and suggest improvements.
 
 In the compiled lock file, the `build` job appears alongside `activation` and `agent`, ordered by each job's `needs` declarations.
 
+When imports and the main workflow define the same job, `jobs.<job-id>.outputs` combines output names. The main workflow wins on duplicate output names; across imports, later-discovered values win. An output-only contribution (a job mapping whose sole field is `outputs`) preserves the existing job body, including its injected steps.
+
+Main workflow job fields retain precedence. Among imports, an injected-step merge uses the later job body; otherwise the earlier body is retained. Other scalar and map fields come from that selected body, not a deep merge. Regular steps from conflicting custom jobs are not concatenated.
+
+Compilation rejects final output expressions that reference regular step IDs discarded by job-body selection, using either dot or literal bracket notation. References satisfied by retained regular, setup, or pre-steps are allowed. Output precedence is applied first, so a main-workflow override can replace an unsafe imported expression. This check does not validate unrelated unknown step references.
+
 ### Importing Jobs via `safe-outputs.jobs`
 
 Jobs defined under `safe-outputs:` can be shared across workflows and become callable MCP tools during execution:
@@ -522,12 +564,12 @@ Consumers import it with `imports: [shared/notify.md]` and instruct the agent to
 
 Setting `inlined-imports: true` embeds all imported content directly into the compiled `.lock.yml` at compile time, producing a **self-contained** lock file that does not need file-system access or cross-repository checkout at runtime.
 
-Enable it when runtime import resolution would otherwise fail:
+Enable it when runtime import resolution would otherwise fail, especially for:
 
-- **Cross-organization `workflow_call`** — a trigger in Org A calling a workflow in Org B cannot check out Org B's `.github` folder with the caller's `GITHUB_TOKEN`, producing `fatal: repository '...' not found`.
-- **Repository rulesets** — workflows used as a [required status check](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets) run in a restricted context that cannot access other files in the repo, producing `ERR_SYSTEM: Runtime import file not found`.
+- **Cross-organization `workflow_call`** runs, where the caller's `GITHUB_TOKEN` cannot check out the callee repository's `.github` folder and Git returns `fatal: repository '...' not found`.
+- **Repository rulesets**, where workflows running as [required status checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets) cannot access other repo files and fail with `ERR_SYSTEM: Runtime import file not found`.
 
-Both cases are solved by bundling imports into the lock file at compile time:
+In both cases, bundling imports into the lock file at compile time avoids the runtime lookup:
 
 ```aw wrap
 ---
@@ -561,9 +603,9 @@ gh aw compile my-workflow
 >
 > `inlined-imports: true` cannot be combined with agent file imports (`.github/agents/` files). If your workflow imports a custom agent file, remove it before enabling inlined imports.
 
-## Related Documentation
+## Learn More
 
-- [Reusing Workflows](/gh-aw/guides/reusing-workflows/) - Adding and updating installed workflows with `gh aw add` and `gh aw update`
+- [Adding Existing Workflows](/gh-aw/setup/working-with-workflows/#adding-existing-workflows) - Installing workflows with `gh aw add`
 - [Frontmatter](/gh-aw/reference/frontmatter/) - Configuration options reference
 - [MCPs](/gh-aw/guides/mcps/) - Model Context Protocol setup
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Safe output configuration details

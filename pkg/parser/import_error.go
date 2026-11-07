@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -28,44 +27,20 @@ type ImportCycleError struct {
 
 // Error returns the error message for ImportCycleError
 func (e *ImportCycleError) Error() string {
-	if len(e.Chain) == 0 {
-		return "circular import detected"
+	if len(e.Chain) < 2 {
+		return "circular import detected. Imports must form a directed acyclic graph. Example: remove an import that completes the cycle"
 	}
-	return "circular import detected: " + strings.Join(e.Chain, " → ")
+	importer := e.Chain[len(e.Chain)-2]
+	imported := e.Chain[len(e.Chain)-1]
+	return fmt.Sprintf(
+		"circular import detected: %s. Imports must form a directed acyclic graph. Example: remove the import of %q from %q",
+		strings.Join(e.Chain, " → "), imported, importer)
 }
 
-// FormatImportCycleError formats an import cycle error with a delightful multiline indented display
+// FormatImportCycleError marks an import cycle error as ready for CLI display.
 func FormatImportCycleError(err *ImportCycleError) error {
 	importErrorLog.Printf("Formatting import cycle error: chain=%v, workflow=%s", err.Chain, err.WorkflowFile)
-
-	if len(err.Chain) < 2 {
-		return errors.New("circular import detected (invalid chain)")
-	}
-
-	// Build a multiline, indented representation of the import chain
-	var messageBuilder strings.Builder
-	messageBuilder.WriteString("Import cycle detected\n\n")
-	messageBuilder.WriteString("The following import chain creates a circular dependency:\n\n")
-
-	// Show each step in the chain with indentation to emphasize the flow
-	for i, file := range err.Chain {
-		indent := strings.Repeat("  ", i)
-		if i == 0 {
-			fmt.Fprintf(&messageBuilder, "%s%s (starting point)\n", indent, file)
-		} else if i == len(err.Chain)-1 {
-			// Last item is the back-edge - highlight it
-			fmt.Fprintf(&messageBuilder, "%s↳ %s ⚠️  cycles back to %s\n", indent, file, err.Chain[0])
-		} else {
-			fmt.Fprintf(&messageBuilder, "%s↳ imports %s\n", indent, file)
-		}
-	}
-
-	messageBuilder.WriteString("\nTo fix this issue:\n")
-	messageBuilder.WriteString("1. Review the import dependencies in the files listed above\n")
-	messageBuilder.WriteString("2. Remove one of the imports to break the cycle\n")
-	messageBuilder.WriteString("3. Consider restructuring your workflow imports to avoid circular dependencies\n")
-
-	return &FormattedParserError{formatted: messageBuilder.String(), cause: err}
+	return &FormattedParserError{formatted: err.Error(), cause: err}
 }
 
 // FormattedParserError is a sentinel error type returned by FormatImportError (and similar
@@ -78,7 +53,7 @@ func FormatImportCycleError(err *ImportCycleError) error {
 // helper can detect it via errors.As without creating a circular import.
 type FormattedParserError struct {
 	formatted string // The complete console-formatted error string ready for display.
-	cause     error  // The underlying error (e.g. ImportError.Cause) for errors.Is/As traversal.
+	cause     error  // Optional underlying error for formatters that preserve errors.Is/As traversal.
 }
 
 func (e *FormattedParserError) Error() string { return e.formatted }
@@ -91,7 +66,8 @@ func NewFormattedParserError(formatted string) *FormattedParserError {
 	return &FormattedParserError{formatted: formatted}
 }
 
-// FormatImportError formats an import error as a compilation error with source location
+// FormatImportError formats an import error as a compilation error with source location.
+// The formatted error does not expose the underlying import-resolution error chain.
 func FormatImportError(err *ImportError, yamlContent string) error {
 	importErrorLog.Printf("Formatting import error: path=%s, file=%s, line=%d", err.ImportPath, err.FilePath, err.Line)
 
@@ -141,7 +117,7 @@ func FormatImportError(err *ImportError, yamlContent string) error {
 	formattedErr := console.FormatError(compilerErr)
 	// Return a FormattedParserError so callers can detect that this error is already
 	// console-formatted and must not be re-wrapped with additional location context.
-	return &FormattedParserError{formatted: formattedErr, cause: err.Cause}
+	return NewFormattedParserError(formattedErr)
 }
 
 // buildImportErrorHint returns a tailored fix hint for an import error based on its message and path.

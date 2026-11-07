@@ -2,6 +2,8 @@
 /// <reference types="@actions/github-script" />
 // @safe-outputs-exempt SEC-004 — PR/issue body values in this handler are static internal templates (plus allowlisted changed-file paths), not untrusted user content.
 
+const { createReportIssue } = require("./issue_report.cjs");
+
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_CONFIG, ERR_SYSTEM } = require("./error_codes.cjs");
 
@@ -65,6 +67,7 @@ function formatTimestamp(date) {
  *   GH_TOKEN           - GitHub token for gh CLI auth and git push
  *   GH_AW_OPERATION    - 'update', 'upgrade', 'disable', or 'enable'
  *   GH_AW_CMD_PREFIX   - Command prefix: './gh-aw' (dev) or 'gh aw' (release)
+ *   GH_AW_UPGRADE_OPTIONS - JSON array of supported options passed to upgrade
  *
  * @returns {Promise<void>}
  */
@@ -159,6 +162,7 @@ async function main() {
   if (!token) {
     throw new Error(`${ERR_CONFIG}: Missing GitHub token: set GH_TOKEN or GITHUB_TOKEN to push changes and create a pull request for agentic workflow update/upgrade operations.`);
   }
+  core.setSecret(token);
   const githubServerUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
   let githubHost;
   try {
@@ -171,9 +175,9 @@ async function main() {
   try {
     await exec.exec("git", ["remote", "remove", "aw-push"]);
   } catch {
-    // Remote doesn't exist yet - that's fine
+    // Remote doesn't exist yet — removal failure is ignored, that's fine.
   }
-  await exec.exec("git", ["remote", "add", "aw-push", remoteUrl]);
+  await exec.exec("git", ["remote", "add", "aw-push", remoteUrl], { silent: true });
 
   try {
     await exec.exec("git", ["push", "aw-push", branchName]);
@@ -248,14 +252,23 @@ const AUTO_UPGRADE_ISSUE_MARKER = `<!-- gh-aw-workflow-id: ${AUTO_UPGRADE_WORKFL
 async function mainNotifyIssue() {
   const cmdPrefixStr = process.env.GH_AW_CMD_PREFIX || "gh aw";
   const [bin, ...prefixArgs] = cmdPrefixStr.split(" ").filter(Boolean);
+  let upgradeOptions;
+  try {
+    upgradeOptions = JSON.parse(process.env.GH_AW_UPGRADE_OPTIONS || "[]");
+  } catch (error) {
+    throw new Error(`${ERR_SYSTEM}: GH_AW_UPGRADE_OPTIONS is not valid JSON: ${getErrorMessage(error)}`, { cause: error });
+  }
+  if (!Array.isArray(upgradeOptions) || upgradeOptions.some(option => option !== "--pre-releases")) {
+    throw new Error(`${ERR_SYSTEM}: GH_AW_UPGRADE_OPTIONS contains an unsupported option`);
+  }
 
   const owner = context.repo.owner;
   const repo = context.repo.repo;
 
   // Run gh aw upgrade to apply changes locally
-  const fullCmd = [bin, ...prefixArgs, "upgrade"].join(" ");
+  const fullCmd = [bin, ...prefixArgs, "upgrade", ...upgradeOptions].join(" ");
   core.info(`Running: ${fullCmd}`);
-  const exitCode = await exec.exec(bin, [...prefixArgs, "upgrade"]);
+  const exitCode = await exec.exec(bin, [...prefixArgs, "upgrade", ...upgradeOptions]);
   if (exitCode !== 0) {
     throw new Error(`${ERR_SYSTEM}: Command '${fullCmd}' failed with exit code ${exitCode}`);
   }
@@ -269,7 +282,7 @@ async function mainNotifyIssue() {
         changedFiles.push(file);
       }
     } catch {
-      // file not in repo - skip
+      // File not in repo — ignored, skip it.
     }
   }
 
@@ -325,50 +338,67 @@ async function mainNotifyIssue() {
 
   // Build and create the new upgrade notification issue
   const issueTitle = "[aw] Upgrade available";
-  const fileList = changedFiles.map(f => `- \`${f}\``).join("\n");
-  const issueBody = `## Agentic Workflow Upgrade Available
-
-A new version of the agentic workflow tooling is available. Run \`gh aw upgrade\` to apply it.
-
-**Files that will be updated:**
-
-${fileList}
-
-### How to apply
-
-- **Via @copilot**: Add a comment \`@copilot upgrade agentic workflows\` on this issue
-- **Via CLI**: Run \`gh aw upgrade\` in your local checkout
-
-${AUTO_UPGRADE_ISSUE_MARKER}
-`;
+  /** @param {string} value @returns {import("./report_ast.cjs").ReportInline} */
+  const text = value => ({ type: "text", value, agentTainted: false });
+  /** @param {string} value @returns {import("./report_ast.cjs").ReportInline} */
+  const code = value => ({ type: "code", value, agentTainted: false });
+  /** @type {import("./report_ast.cjs").Report} */
+  const report = {
+    type: "report",
+    title: issueTitle,
+    agentTainted: false,
+    children: [
+      { type: "heading", level: 2, children: [text("Agentic Workflow Upgrade Available")] },
+      { type: "paragraph", children: [text("A new version of the agentic workflow tooling is available. Run "), code("gh aw upgrade"), text(" to apply it.")] },
+      { type: "paragraph", children: [{ type: "strong", children: [text("Files that will be updated:")] }] },
+      { type: "list", ordered: false, items: changedFiles.map(file => [{ type: "paragraph", children: [code(file)] }]) },
+      { type: "heading", level: 3, children: [text("How to apply")] },
+      {
+        type: "list",
+        ordered: false,
+        items: [
+          [{ type: "paragraph", children: [{ type: "strong", children: [text("Via @copilot")] }, text(": Add a comment "), code("@copilot upgrade agentic workflows"), text(" on this issue")] }],
+          [{ type: "paragraph", children: [{ type: "strong", children: [text("Via CLI")] }, text(": Run "), code("gh aw upgrade"), text(" in your local checkout")] }],
+        ],
+      },
+      { type: "xml_marker", name: "gh-aw-workflow-id", value: AUTO_UPGRADE_WORKFLOW_ID, agentTainted: false },
+    ],
+  };
 
   core.info(`Creating upgrade notification issue: "${issueTitle}"`);
   let createdIssue;
   try {
-    createdIssue = await github.rest.issues.create({
-      owner,
-      repo,
-      title: issueTitle,
-      body: issueBody,
-      labels: ["agentic-workflows"],
-    });
+    createdIssue = await createReportIssue(
+      github,
+      {
+        owner,
+        repo,
+        title: issueTitle,
+        labels: ["agentic-workflows"],
+      },
+      report
+    );
   } catch (error) {
     // Label may not exist when auto-upgrade is used without maintenance label creation.
     const errorAny = /** @type {any} */ error;
     if (errorAny?.status === 422) {
       core.warning("Failed to create issue with label 'agentic-workflows'; retrying without labels");
-      createdIssue = await github.rest.issues.create({
-        owner,
-        repo,
-        title: issueTitle,
-        body: issueBody,
-      });
+      createdIssue = await createReportIssue(
+        github,
+        {
+          owner,
+          repo,
+          title: issueTitle,
+        },
+        report
+      );
     } else {
       throw error;
     }
   }
 
   const issueUrl = createdIssue.data.html_url;
+  const fileList = changedFiles.map(f => `- \`${f}\``).join("\n");
   core.info(`✓ Created issue: ${issueUrl}`);
   core.notice(`Created upgrade notification issue: ${issueUrl}`);
 

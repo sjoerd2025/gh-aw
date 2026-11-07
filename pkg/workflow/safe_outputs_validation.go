@@ -1,7 +1,9 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -10,9 +12,11 @@ import (
 
 var safeOutputsDomainsValidationLog = logger.New("workflow:safe_outputs_domains_validation")
 
+type SafeOutputsURLsPolicy string
+
 const (
-	SafeOutputsURLsPolicyAllowedOnly         = "allowed-only"
-	SafeOutputsURLsPolicyAllowedOrCodeRegion = "allowed-or-code-region"
+	SafeOutputsURLsPolicyAllowedOnly         SafeOutputsURLsPolicy = "allowed-only"
+	SafeOutputsURLsPolicyAllowedOrCodeRegion SafeOutputsURLsPolicy = "allowed-or-code-region"
 )
 
 // validateSafeOutputsURLs validates the urls policy in safe-outputs.
@@ -26,10 +30,11 @@ func validateSafeOutputsURLs(config *SafeOutputsConfig) error {
 		return nil
 	default:
 		return fmt.Errorf(
-			"safe-outputs.urls: invalid value %q (expected one of: %q, %q)",
+			"safe-outputs.urls: invalid value %q. Expected one of: %q, %q. Example:\n  safe-outputs:\n    urls: %q",
 			config.URLs,
 			SafeOutputsURLsPolicyAllowedOnly,
 			SafeOutputsURLsPolicyAllowedOrCodeRegion,
+			SafeOutputsURLsPolicyAllowedOnly,
 		)
 	}
 }
@@ -71,6 +76,11 @@ func (c *Compiler) validateSafeOutputsAllowedDomains(config *SafeOutputsConfig) 
 
 var safeOutputsTargetValidationLog = logger.New("workflow:safe_outputs_target_validation")
 
+type safeOutputTargetConfig struct {
+	name   string
+	target string
+}
+
 // validateSafeOutputsTarget validates target fields in all safe-outputs configurations
 // Valid target values:
 //   - "" (empty/default) - uses "triggering" behavior
@@ -85,85 +95,9 @@ func validateSafeOutputsTarget(config *SafeOutputsConfig) error {
 
 	safeOutputsTargetValidationLog.Print("Validating safe-outputs target fields")
 
-	// List of configs to validate - each with a name for error messages
-	type targetConfig struct {
-		name   string
-		target string
-	}
+	configs := collectIssueTargetConfigs(config)
+	configs = append(configs, collectPullRequestTargetConfigs(config)...)
 
-	var configs []targetConfig
-
-	// Collect all target fields from various safe-output configurations
-	if config.UpdateIssues != nil {
-		configs = append(configs, targetConfig{"update-issue", config.UpdateIssues.Target})
-	}
-	if config.UpdateDiscussions != nil {
-		configs = append(configs, targetConfig{"update-discussion", config.UpdateDiscussions.Target})
-	}
-	if config.UpdatePullRequests != nil {
-		configs = append(configs, targetConfig{"update-pull-request", config.UpdatePullRequests.Target})
-	}
-	if config.CloseIssues != nil {
-		configs = append(configs, targetConfig{"close-issue", config.CloseIssues.Target})
-	}
-	if config.CloseDiscussions != nil {
-		configs = append(configs, targetConfig{"close-discussion", config.CloseDiscussions.Target})
-	}
-	if config.ClosePullRequests != nil {
-		configs = append(configs, targetConfig{"close-pull-request", config.ClosePullRequests.Target})
-	}
-	if config.AddLabels != nil {
-		configs = append(configs, targetConfig{"add-labels", config.AddLabels.Target})
-	}
-	if config.RemoveLabels != nil {
-		configs = append(configs, targetConfig{"remove-labels", config.RemoveLabels.Target})
-	}
-	if config.ReplaceLabel != nil {
-		configs = append(configs, targetConfig{"replace-label", config.ReplaceLabel.Target})
-	}
-	if config.AddReviewer != nil {
-		configs = append(configs, targetConfig{"add-reviewer", config.AddReviewer.Target})
-	}
-	if config.AssignMilestone != nil {
-		configs = append(configs, targetConfig{"assign-milestone", config.AssignMilestone.Target})
-	}
-	if config.AssignToAgent != nil {
-		configs = append(configs, targetConfig{"assign-to-agent", config.AssignToAgent.Target})
-	}
-	if config.AssignToUser != nil {
-		configs = append(configs, targetConfig{"assign-to-user", config.AssignToUser.Target})
-	}
-	if config.LinkSubIssue != nil {
-		configs = append(configs, targetConfig{"link-sub-issue", config.LinkSubIssue.Target})
-	}
-	if config.HideComment != nil {
-		configs = append(configs, targetConfig{"hide-comment", config.HideComment.Target})
-	}
-	if config.MarkPullRequestAsReadyForReview != nil {
-		configs = append(configs, targetConfig{"mark-pull-request-as-ready-for-review", config.MarkPullRequestAsReadyForReview.Target})
-	}
-	if config.DismissPullRequestReview != nil {
-		configs = append(configs, targetConfig{"dismiss-pull-request-review", config.DismissPullRequestReview.Target})
-	}
-	if config.AddComments != nil {
-		configs = append(configs, targetConfig{"add-comment", config.AddComments.Target})
-	}
-	if config.CreatePullRequestReviewComments != nil {
-		configs = append(configs, targetConfig{"create-pull-request-review-comment", config.CreatePullRequestReviewComments.Target})
-	}
-	if config.SubmitPullRequestReview != nil {
-		configs = append(configs, targetConfig{"submit-pull-request-review", config.SubmitPullRequestReview.Target})
-	}
-	if config.ReplyToPullRequestReviewComment != nil {
-		configs = append(configs, targetConfig{"reply-to-pull-request-review-comment", config.ReplyToPullRequestReviewComment.Target})
-	}
-	if config.PushToPullRequestBranch != nil {
-		configs = append(configs, targetConfig{"push-to-pull-request-branch", config.PushToPullRequestBranch.Target})
-	}
-	if config.MergePullRequest != nil {
-		configs = append(configs, targetConfig{"merge-pull-request", config.MergePullRequest.Target})
-	}
-	// Validate each target field
 	for _, cfg := range configs {
 		if err := validateTargetValue(cfg.name, cfg.target); err != nil {
 			return err
@@ -172,6 +106,97 @@ func validateSafeOutputsTarget(config *SafeOutputsConfig) error {
 
 	safeOutputsTargetValidationLog.Printf("Validated %d target fields", len(configs))
 	return nil
+}
+
+func collectIssueTargetConfigs(config *SafeOutputsConfig) []safeOutputTargetConfig {
+	var configs []safeOutputTargetConfig
+	if config.UpdateIssues != nil {
+		configs = append(configs, safeOutputTargetConfig{"update-issue", config.UpdateIssues.Target})
+	}
+	if config.UpdateDiscussions != nil {
+		configs = append(configs, safeOutputTargetConfig{"update-discussion", config.UpdateDiscussions.Target})
+	}
+	if config.CloseIssues != nil {
+		configs = append(configs, safeOutputTargetConfig{"close-issue", config.CloseIssues.Target})
+	}
+	if config.CloseDiscussions != nil {
+		configs = append(configs, safeOutputTargetConfig{"close-discussion", config.CloseDiscussions.Target})
+	}
+	if config.AddLabels != nil {
+		configs = append(configs, safeOutputTargetConfig{"add-labels", config.AddLabels.Target})
+	}
+	if config.RemoveLabels != nil {
+		configs = append(configs, safeOutputTargetConfig{"remove-labels", config.RemoveLabels.Target})
+	}
+	if config.ReplaceLabel != nil {
+		configs = append(configs, safeOutputTargetConfig{"replace-label", config.ReplaceLabel.Target})
+	}
+	if config.AssignMilestone != nil {
+		configs = append(configs, safeOutputTargetConfig{"assign-milestone", config.AssignMilestone.Target})
+	}
+	if config.AssignToAgent != nil {
+		configs = append(configs, safeOutputTargetConfig{"assign-to-agent", config.AssignToAgent.Target})
+	}
+	if config.AssignToUser != nil {
+		configs = append(configs, safeOutputTargetConfig{"assign-to-user", config.AssignToUser.Target})
+	}
+	if config.UnassignFromUser != nil {
+		configs = append(configs, safeOutputTargetConfig{"unassign-from-user", config.UnassignFromUser.Target})
+	}
+	if config.SetIssueType != nil {
+		configs = append(configs, safeOutputTargetConfig{"set-issue-type", config.SetIssueType.Target})
+	}
+	if config.SetIssueField != nil {
+		configs = append(configs, safeOutputTargetConfig{"set-issue-field", config.SetIssueField.Target})
+	}
+	if config.LinkSubIssue != nil {
+		configs = append(configs, safeOutputTargetConfig{"link-sub-issue", config.LinkSubIssue.Target})
+	}
+	if config.HideComment != nil {
+		configs = append(configs, safeOutputTargetConfig{"hide-comment", config.HideComment.Target})
+	}
+	return configs
+}
+
+func collectPullRequestTargetConfigs(config *SafeOutputsConfig) []safeOutputTargetConfig {
+	var configs []safeOutputTargetConfig
+	if config.UpdatePullRequests != nil {
+		configs = append(configs, safeOutputTargetConfig{"update-pull-request", config.UpdatePullRequests.Target})
+	}
+	if config.ClosePullRequests != nil {
+		configs = append(configs, safeOutputTargetConfig{"close-pull-request", config.ClosePullRequests.Target})
+	}
+	if config.AddReviewer != nil {
+		configs = append(configs, safeOutputTargetConfig{"add-reviewer", config.AddReviewer.Target})
+	}
+	if config.MarkPullRequestAsReadyForReview != nil {
+		configs = append(configs, safeOutputTargetConfig{"mark-pull-request-as-ready-for-review", config.MarkPullRequestAsReadyForReview.Target})
+	}
+	if config.DismissPullRequestReview != nil {
+		configs = append(configs, safeOutputTargetConfig{"dismiss-pull-request-review", config.DismissPullRequestReview.Target})
+	}
+	if config.ResolvePullRequestReviewThread != nil {
+		configs = append(configs, safeOutputTargetConfig{"resolve-pull-request-review-thread", config.ResolvePullRequestReviewThread.Target})
+	}
+	if config.AddComments != nil {
+		configs = append(configs, safeOutputTargetConfig{"add-comment", config.AddComments.Target})
+	}
+	if config.CreatePullRequestReviewComments != nil {
+		configs = append(configs, safeOutputTargetConfig{"create-pull-request-review-comment", config.CreatePullRequestReviewComments.Target})
+	}
+	if config.SubmitPullRequestReview != nil {
+		configs = append(configs, safeOutputTargetConfig{"submit-pull-request-review", config.SubmitPullRequestReview.Target})
+	}
+	if config.ReplyToPullRequestReviewComment != nil {
+		configs = append(configs, safeOutputTargetConfig{"reply-to-pull-request-review-comment", config.ReplyToPullRequestReviewComment.Target})
+	}
+	if config.PushToPullRequestBranch != nil {
+		configs = append(configs, safeOutputTargetConfig{"push-to-pull-request-branch", config.PushToPullRequestBranch.Target})
+	}
+	if config.MergePullRequest != nil {
+		configs = append(configs, safeOutputTargetConfig{"merge-pull-request", config.MergePullRequest.Target})
+	}
+	return configs
 }
 
 // validateTargetValue validates a single target value
@@ -203,12 +228,17 @@ func validateTargetValue(configName, target string) error {
 	if target == "event" || strings.Contains(target, "github.event") {
 		suggestion = "\n\nDid you mean to use \"${{ github.event.issue.number }}\" instead of \"" + target + "\"?"
 	}
+	exampleTargetKey := configName
+	if idx := strings.LastIndex(exampleTargetKey, "."); idx >= 0 {
+		exampleTargetKey = exampleTargetKey[idx+1:]
+	}
 
 	// Invalid target value
 	return fmt.Errorf(
-		"invalid target value for %s: %q\n\nValid target values are:\n  - \"triggering\" (default) - targets the triggering issue/PR/discussion\n  - \"*\" - targets any item specified in the output\n  - A positive integer (e.g., \"123\")\n  - A GitHub Actions expression (e.g., \"${{ github.event.issue.number }}\")%s",
+		"invalid target value for %s: %q. Expected one of: \"triggering\", \"*\", a positive integer like \"123\", or a GitHub Actions expression like \"${{ github.event.issue.number }}\".\n\nExample:\n  safe-outputs:\n    %s:\n      target: \"triggering\"%s",
 		configName,
 		target,
+		exampleTargetKey,
 		suggestion,
 	)
 }
@@ -229,7 +259,7 @@ func validateSafeOutputsMergePullRequest(config *SafeOutputsConfig) error {
 	validateNonEmptyStringList := func(field string, values []string) error {
 		for i, value := range values {
 			if strings.TrimSpace(value) == "" {
-				return fmt.Errorf("safe-outputs.merge-pull-request.%s[%d] cannot be empty", field, i)
+				return fmt.Errorf("safe-outputs.merge-pull-request.%s[%d] cannot be empty. Expected a non-empty string value. Example:\n  safe-outputs:\n    merge-pull-request:\n      %s:\n        - \"safe-to-merge\"", field, i, field)
 			}
 		}
 		return nil
@@ -237,7 +267,7 @@ func validateSafeOutputsMergePullRequest(config *SafeOutputsConfig) error {
 
 	validateRefGlobList := func(field string, patterns []string) error {
 		return validateGlobPatternList(patterns, validateRefGlob, func(i int, pat string, msgs []string) error {
-			return fmt.Errorf("invalid glob pattern %q in safe-outputs.merge-pull-request.%s[%d]: %s", pat, field, i, strings.Join(msgs, "; "))
+			return fmt.Errorf("invalid glob pattern %q in safe-outputs.merge-pull-request.%s[%d]: %s. Expected a valid ref glob pattern. Example:\n  safe-outputs:\n    merge-pull-request:\n      %s:\n        - \"feature/*\"", pat, field, i, strings.Join(msgs, "; "), field)
 		})
 	}
 
@@ -296,4 +326,44 @@ func validateSafeOutputsAllowWorkflows(safeOutputs *SafeOutputsConfig) error {
 
 	safeOutputsAllowWorkflowsValidationLog.Print("allow-workflows validation passed")
 	return nil
+}
+
+func normalizeApproveWorkflowRunAllowedWorkflowPattern(pattern string) string {
+	extension := path.Ext(pattern)
+	if strings.EqualFold(extension, ".yaml") {
+		return strings.TrimSuffix(pattern, extension) + ".yml"
+	}
+	return pattern
+}
+
+// validateSafeOutputsApproveWorkflowRun requires an explicitly configured external
+// token or GitHub App because github.token cannot approve workflow runs for fork PRs.
+func validateSafeOutputsApproveWorkflowRun(safeOutputs *SafeOutputsConfig) error {
+	if safeOutputs == nil || safeOutputs.ApproveWorkflowRun == nil {
+		return nil
+	}
+
+	config := safeOutputs.ApproveWorkflowRun
+	if len(config.AllowedWorkflows) == 0 {
+		return errors.New("safe-outputs.approve-workflow-run: requires a non-empty allowed-workflows list")
+	}
+	for _, pattern := range config.AllowedWorkflows {
+		if path.Base(pattern) != pattern {
+			return fmt.Errorf("safe-outputs.approve-workflow-run.allowed-workflows: %q must match a workflow filename, not a path", pattern)
+		}
+		if _, err := path.Match(normalizeApproveWorkflowRunAllowedWorkflowPattern(pattern), ""); err != nil {
+			return fmt.Errorf("safe-outputs.approve-workflow-run.allowed-workflows: invalid wildcard pattern %q: %w", pattern, err)
+		}
+	}
+	if templatableBoolIsTrue(safeOutputs.Staged) || templatableBoolIsTrue(config.Staged) {
+		return nil
+	}
+	if config.GitHubToken != "" || config.GitHubApp != nil || safeOutputs.GitHubToken != "" || safeOutputs.GitHubApp != nil {
+		return nil
+	}
+
+	return errors.New(
+		"safe-outputs.approve-workflow-run: requires an external github-token or github-app because github.token cannot approve workflow runs requiring approval.\n\n" +
+			"Example:\n  safe-outputs:\n    approve-workflow-run:\n      github-token: ${{ secrets.APPROVE_WORKFLOW_RUN_TOKEN }}",
+	)
 }

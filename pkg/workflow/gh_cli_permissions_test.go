@@ -32,6 +32,55 @@ func detectWriteCommandsInShellScriptsForTest(t *testing.T, scripts []string) []
 	return cmds
 }
 
+func TestInferGitHubAppTokenPermissionsFromShellScripts(t *testing.T) {
+	tests := []struct {
+		name         string
+		script       string
+		wantField    string
+		wantInferred bool
+	}{
+		{name: "known read command", script: "gh pr view 123", wantField: "permission-pull-requests", wantInferred: true},
+		{name: "known read API", script: "gh api /repos/owner/repo/issues", wantField: "permission-issues", wantInferred: true},
+		{name: "explicit GET API", script: "gh api --method GET /repos/owner/repo/issues", wantField: "permission-issues", wantInferred: true},
+		{name: "actions secrets API", script: "gh api /repos/owner/repo/actions/secrets", wantField: "permission-secrets", wantInferred: true},
+		{name: "write command", script: "gh pr create --title test", wantInferred: false},
+		{name: "unknown command", script: "gh pr custom", wantInferred: false},
+		{name: "write API", script: "gh api --method POST /repos/owner/repo/issues", wantInferred: false},
+		{name: "combined write API method", script: "gh api -XPOST /repos/owner/repo/issues", wantInferred: false},
+		{name: "quoted destructive method after endpoint", script: `gh api /repos/owner/repo/actions/runs/123 "--method=DELETE"`, wantInferred: false},
+		{name: "unknown actions subpath", script: "gh api /repos/owner/repo/actions/unknown", wantInferred: false},
+		{name: "API body fields", script: "gh api /repos/owner/repo/issues -f title=test", wantInferred: false},
+		{name: "API inline body fields", script: "gh api /repos/owner/repo/issues --field=title=test", wantInferred: false},
+		{name: "no GitHub CLI", script: "echo hello", wantInferred: false},
+		{name: "mixed token client", script: "gh pr view 123\ncurl -X POST https://api.github.com/repos/owner/repo/issues", wantInferred: false},
+		{name: "compound token use", script: "gh pr view 123 && curl https://api.github.com/repos/owner/repo/issues", wantInferred: false},
+		{name: "command substitution", script: "gh pr view 123 $(curl -X POST https://api.github.com/repos/owner/repo/issues)", wantInferred: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fields, inferred := InferGitHubAppTokenPermissionsFromShellScripts([]string{tt.script})
+			assert.Equal(t, tt.wantInferred, inferred)
+			if inferred {
+				assert.Equal(t, "read", fields[tt.wantField])
+			} else {
+				assert.Empty(t, fields)
+			}
+		})
+	}
+}
+
+func TestInferGitHubAppTokenPermissionsIgnoresCommentOnlyCommands(t *testing.T) {
+	t.Parallel()
+
+	fields, inferred := InferGitHubAppTokenPermissionsFromShellScripts([]string{
+		"gh pr view 123\n# gh api /orgs/acme/hooks",
+	})
+	require.True(t, inferred)
+	assert.Equal(t, "read", fields["permission-pull-requests"])
+	assert.NotContains(t, fields, "permission-organization-hooks")
+}
+
 // TestInferPermissionsFromShellScripts_GhPrDiff verifies that `gh pr diff` in a
 // shell script is recognized as requiring pull-requests: read.
 func TestInferPermissionsFromShellScripts_GhPrDiff(t *testing.T) {
@@ -900,15 +949,11 @@ Test agent post-steps write command triggers error.
 	require.ErrorContains(t, err, "gh pr close")
 }
 
-// TestActivationJobStepsNotScanned verifies that jobs.activation.steps is NOT scanned for
-// gh CLI calls because the activation job is a built-in job and applyBuiltinJobPreSteps
-// only injects jobs.<name>.pre-steps — steps/post-steps are silently ignored.
-func TestActivationJobStepsNotScanned(t *testing.T) {
-	tmpDir := testutil.TempDir(t, "activation-steps-not-scanned")
+// TestActivationJobStepsScanned verifies that jobs.activation.steps is scanned for
+// gh CLI calls because activation steps are injected into the built-in activation job.
+func TestActivationJobStepsScanned(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "activation-steps-scanned")
 	testFile := filepath.Join(tmpDir, "workflow.md")
-	// Note: jobs.activation.steps contains a write command (gh label create).
-	// If it were scanned this would produce a compile error; the absence of an error
-	// confirms that the section is intentionally skipped.
 	testContent := `---
 on:
   pull_request:
@@ -924,20 +969,12 @@ jobs:
           gh label create "reviewed" --color "#0075ca"
 ---
 
-# Workflow whose activation steps are silently ignored (only pre-steps are applied)
+# Workflow whose activation steps are scanned for permissions
 `
 	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
 
 	compiler := NewCompiler()
-	// Should compile without error — the write command in jobs.activation.steps is not
-	// executed so it must not trigger a validation error.
-	require.NoError(t, compiler.CompileWorkflow(testFile))
-
-	// The compiled activation job must not contain the label-create step because
-	// jobs.activation.steps is not injected into built-in jobs.
-	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
-	require.NoError(t, err)
-	activationSection := extractJobSection(string(lockContent), string(constants.ActivationJobName))
-	assert.NotContains(t, activationSection, "gh label create",
-		"jobs.activation.steps should not be injected into the compiled activation job")
+	err := compiler.CompileWorkflow(testFile)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "gh label create")
 }

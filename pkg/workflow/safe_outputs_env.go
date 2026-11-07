@@ -9,6 +9,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
 var safeOutputsEnvLog = logger.New("workflow:safe_outputs_env")
@@ -200,13 +201,30 @@ func buildEngineMetadataEnvVars(engineConfig *EngineConfig, model string) []stri
 	// Add engine model: prefer explicit compile-time config; fall back to the runtime model
 	// captured by the activation job so safe-output footers can show the actual model used
 	// (e.g. the value of the GH_AW_MODEL_AGENT_* variable) rather than showing nothing.
-	if model != "" {
+	if model != "" && engineConfig.ModelRouting == nil {
 		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_ENGINE_MODEL: %q\n", model))
 	} else {
 		customEnvVars = append(customEnvVars, fmt.Sprintf("          GH_AW_ENGINE_MODEL: ${{ needs.%s.outputs.model }}\n", string(constants.AgentJobName)))
 	}
+	if engineConfig.ModelRouting != nil {
+		customEnvVars = append(customEnvVars,
+			fmt.Sprintf("          GH_AW_ENGINE_MODEL_EFFORT: ${{ needs.%s.outputs.model_effort }}\n", string(constants.AgentJobName)),
+			fmt.Sprintf("          GH_AW_MODEL_ROUTING_STATUS: ${{ needs.%s.outputs.model_routing_status }}\n", string(constants.AgentJobName)),
+		)
+	}
 
 	return customEnvVars
+}
+
+func buildModelRoutingOutputEnvVars(engineConfig *EngineConfig, mainJobName string) []string {
+	if engineConfig == nil || engineConfig.ModelRouting == nil {
+		return nil
+	}
+	return []string{
+		fmt.Sprintf("          GH_AW_ENGINE_MODEL: ${{ needs.%s.outputs.model }}\n", mainJobName),
+		fmt.Sprintf("          GH_AW_ENGINE_MODEL_EFFORT: ${{ needs.%s.outputs.model_effort }}\n", mainJobName),
+		fmt.Sprintf("          GH_AW_MODEL_ROUTING_STATUS: ${{ needs.%s.outputs.model_routing_status }}\n", mainJobName),
+	}
 }
 
 // ========================================
@@ -216,13 +234,49 @@ func buildEngineMetadataEnvVars(engineConfig *EngineConfig, model string) []stri
 // addCustomSafeOutputEnvVars adds custom environment variables to safe output job steps
 func (c *Compiler) addCustomSafeOutputEnvVars(steps *[]string, data *WorkflowData) {
 	if data.SafeOutputs != nil && len(data.SafeOutputs.Env) > 0 {
-		for key, value := range data.SafeOutputs.Env {
-			*steps = append(*steps, fmt.Sprintf("          %s: %s\n", key, value))
+		ciTriggerTokenDisabled := isCITriggerTokenDisabled(data.SafeOutputs)
+		for _, key := range sliceutil.SortedKeys(data.SafeOutputs.Env) {
+			if key == "GH_AW_CI_TRIGGER_TOKEN" && ciTriggerTokenDisabled {
+				continue
+			}
+			if hasAnyJiraSafeOutputEnabled(data.SafeOutputs) && jiraSafeOutputDefaultEnv[key] != "" {
+				continue
+			}
+			if data.SafeOutputs.LinearCreateIssue != nil && (key == "LINEAR_TEAM_ID" || key == "LINEAR_PROJECT_ID") {
+				continue
+			}
+			*steps = append(*steps, fmt.Sprintf("          %s: %s\n", key, data.SafeOutputs.Env[key]))
 		}
 	}
 }
 
+func injectProcessorStepEnv(steps []string, env map[string]string) []string {
+	if len(env) == 0 {
+		return steps
+	}
+	processStepFound := false
+	for index, step := range steps {
+		if step == "      - name: Process Safe Outputs\n" {
+			processStepFound = true
+			continue
+		}
+		if processStepFound && step == "        env:\n" {
+			var inserted []string
+			for _, name := range sliceutil.SortedKeys(env) {
+				inserted = append(inserted, fmt.Sprintf("          %s: %s\n", name, env[name]))
+			}
+			tail := append([]string(nil), steps[index+1:]...)
+			return append(append(steps[:index+1], inserted...), tail...)
+		}
+	}
+	return steps
+}
+
 func (c *Compiler) addResolvedSafeOutputGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string, resolver func(string) string, allowGitHubApp bool) {
+	*steps = append(*steps, fmt.Sprintf("          github-token: %s\n", resolveSafeOutputGitHubTokenForConfig(data, configToken, resolver, allowGitHubApp)))
+}
+
+func resolveSafeOutputGitHubTokenForConfig(data *WorkflowData, configToken string, resolver func(string) string, allowGitHubApp bool) string {
 	var safeOutputsToken string
 	var githubApp *GitHubAppConfig
 	if data.SafeOutputs != nil {
@@ -230,23 +284,50 @@ func (c *Compiler) addResolvedSafeOutputGitHubTokenForConfig(steps *[]string, da
 		githubApp = data.SafeOutputs.GitHubApp
 	}
 
-	effectiveCustomToken := configToken
-	if effectiveCustomToken == "" {
-		effectiveCustomToken = safeOutputsToken
+	resolvedCustomToken := configToken
+	if resolvedCustomToken == "" {
+		resolvedCustomToken = safeOutputsToken
 	}
 
 	if allowGitHubApp && githubApp != nil {
-		if githubApp.shouldIgnoreMissingKey() {
-			fallbackToken := resolver(effectiveCustomToken)
-			*steps = append(*steps, fmt.Sprintf("          github-token: %s\n", combineTokenExpressions("${{ steps.safe-outputs-app-token.outputs.token }}", fallbackToken)))
-			return
+		// The global app-token minting step is not always emitted (ignore-if-missing, or
+		// no enabled handler consuming the global app, e.g. staged safe outputs). Emit a
+		// fallback in that case so github-token never resolves to an empty value.
+		if githubApp.shouldIgnoreMissingKey() || !safeOutputsGlobalAppTokenMinted(data.SafeOutputs) {
+			fallbackToken := resolver(resolvedCustomToken)
+			return combineTokenExpressions("${{ steps.safe-outputs-app-token.outputs.token }}", fallbackToken)
 		}
-		*steps = append(*steps, "          github-token: ${{ steps.safe-outputs-app-token.outputs.token }}\n")
-		return
+		return "${{ steps.safe-outputs-app-token.outputs.token }}"
 	}
 
-	effectiveToken := resolver(effectiveCustomToken)
-	*steps = append(*steps, fmt.Sprintf("          github-token: %s\n", effectiveToken))
+	return resolver(resolvedCustomToken)
+}
+
+func (c *Compiler) safeOutputGitHubTokenSource(data *WorkflowData) string {
+	if data.SafeOutputs == nil {
+		return `"github_actions"`
+	}
+
+	safeOutputs := data.SafeOutputs
+	if safeOutputs.GitHubApp == nil {
+		if safeOutputs.GitHubToken != "" {
+			if safeOutputs.GitHubToken == "${{ secrets.GITHUB_TOKEN }}" || safeOutputs.GitHubToken == "${{ github.token }}" {
+				return `"github_actions"`
+			}
+			return `"unknown"`
+		}
+		return "${{ secrets.GH_AW_GITHUB_TOKEN != '' && 'pat' || 'github_actions' }}"
+	}
+
+	if !safeOutputs.GitHubApp.shouldIgnoreMissingKey() && safeOutputsGlobalAppTokenMinted(safeOutputs) {
+		return `"app"`
+	}
+
+	fallbackSource := "secrets.GH_AW_GITHUB_TOKEN != '' && 'pat' || 'github_actions'"
+	if safeOutputs.GitHubToken != "" {
+		fallbackSource = "'unknown'"
+	}
+	return fmt.Sprintf("${{ steps.safe-outputs-app-token.outputs.token != '' && 'app' || %s }}", fallbackSource)
 }
 
 // addSafeOutputGitHubTokenForConfig adds github-token to the with section for standard safe-output operations.
@@ -255,7 +336,7 @@ func (c *Compiler) addResolvedSafeOutputGitHubTokenForConfig(steps *[]string, da
 //   - when safe-outputs.github-app ignores missing keys, the app token is primary and the resolved custom token is fallback
 //   - otherwise: config token > safe-outputs global github-token > GH_AW_GITHUB_TOKEN || GITHUB_TOKEN
 func (c *Compiler) addSafeOutputGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string) {
-	c.addResolvedSafeOutputGitHubTokenForConfig(steps, data, configToken, getEffectiveSafeOutputGitHubToken, true)
+	c.addResolvedSafeOutputGitHubTokenForConfig(steps, data, configToken, resolveSafeOutputGitHubToken, true)
 }
 
 // addSafeOutputCopilotGitHubTokenForConfig adds github-token to the with section for Copilot-related operations
@@ -275,7 +356,7 @@ func (c *Compiler) addSafeOutputCopilotGitHubTokenForConfig(steps *[]string, dat
 // The Copilot assignment API only accepts PATs (fine-grained or classic), not GitHub App
 // installation tokens. Callers must provide an explicit github-token or rely on GH_AW_AGENT_TOKEN.
 func (c *Compiler) addSafeOutputAgentGitHubTokenForConfig(steps *[]string, data *WorkflowData, configToken string) {
-	// Get effective token - falls back to ${{ secrets.GH_AW_AGENT_TOKEN || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+	// Get resolved token - falls back to ${{ secrets.GH_AW_AGENT_TOKEN || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
 	// when no explicit token is provided. GitHub App tokens are never used here because the
 	// Copilot assignment API rejects them.
 	c.addResolvedSafeOutputGitHubTokenForConfig(steps, data, configToken, getEffectiveCopilotCodingAgentGitHubToken, false)

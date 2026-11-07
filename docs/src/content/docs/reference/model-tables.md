@@ -7,6 +7,8 @@ sidebar:
 
 This page lists the built-in model aliases used by GitHub Agentic Workflows.
 
+Copilot catalogs can differ by organization and lag Copilot seats; an exact ID missing from a complete live catalog is not offered to this workflow, so prefer `opus` or `sonnet` aliases. Run `gh aw audit <run-url> --models` for detailed model information from that run; see [workflow-specific catalog availability](/gh-aw/reference/engines/#model-aliases).
+
 ## Model Aliases
 
 Model aliases let you write `engine: copilot` with a human-friendly model name such as `sonnet` or `mini`, and gh-aw resolves it to the best available concrete model at compile time. Each alias holds an ordered list of patterns; the first pattern that matches an available model wins.
@@ -26,6 +28,7 @@ Vendor aliases map a short name to one or more provider-scoped glob patterns. Th
 | `gpt-5` | `copilot/gpt-5*`, `openai/gpt-5*` |
 | `gpt-5.5` | `copilot/gpt-5.5*`, `openai/gpt-5.5*` |
 | `gpt-5.6` | `copilot/gpt-5.6*`, `openai/gpt-5.6*` |
+| `gpt-6` | `copilot/gpt-6*`, `openai/gpt-6*` |
 | `gpt-5.4` | `copilot/gpt-5.4*`, `openai/gpt-5.4*` |
 | `gpt-5.3` | `copilot/gpt-5.3*`, `openai/gpt-5.3*` |
 | `gpt-5.2` | `copilot/gpt-5.2*`, `openai/gpt-5.2*` |
@@ -35,7 +38,6 @@ Vendor aliases map a short name to one or more provider-scoped glob patterns. Th
 | `gpt-5-codex` | `copilot/gpt-5*codex*`, `openai/gpt-5*codex*` |
 | `coding` | `copilot/gpt-5*codex*`, `openai/gpt-5*codex*`, `gpt-5-codex`, `kimi` |
 | `mai-code` | `copilot/MAI-Code*`, `copilot/mai-code*`, `openai/MAI-Code*` |
-| `mai-code-1-flash-picker` | `copilot/MAI-Code-1-Flash-picker*`, `copilot/mai-code-1-flash-picker*`, `openai/MAI-Code-1-Flash-picker*` |
 | `kimi` | `copilot/kimi*`, `openai/kimi*` |
 | `kiwi` | `copilot/kiwi*`, `openai/kiwi*` |
 | `raptor-mini` | `copilot/raptor*`, `openai/raptor*` |
@@ -58,12 +60,15 @@ Vendor aliases map a short name to one or more provider-scoped glob patterns. Th
 | `gemini-3.1-flash` | `copilot/gemini-3.1*flash*`, `google/gemini-3.1*flash*`, `gemini/gemini-3.1*flash*` |
 | `gemini-3.5-flash` | `copilot/gemini-3.5*flash*`, `google/gemini-3.5*flash*`, `gemini/gemini-3.5*flash*` |
 | `gemini-3.6-flash` | `copilot/gemini-3.6*flash*`, `google/gemini-3.6*flash*`, `gemini/gemini-3.6*flash*` |
+| `gemini-3.7-flash` | `copilot/gemini-3.7*flash*`, `google/gemini-3.7*flash*`, `gemini/gemini-3.7*flash*` |
+| `gemini-3.8-flash` | `copilot/gemini-3.8*flash*`, `google/gemini-3.8*flash*`, `gemini/gemini-3.8*flash*` |
 | `antigravity` | `copilot/antigravity*`, `google/antigravity*`, `gemini/antigravity*` |
 | `nano-banana` | `copilot/nano-banana*`, `google/nano-banana*`, `gemini/nano-banana*` |
 | `computer-use` | `copilot/*computer-use*`, `google/*computer-use*`, `gemini/*computer-use*`, `openai/*computer-use*` |
 | `robotics` | `copilot/*robotics*`, `google/*robotics*`, `gemini/*robotics*` |
 | `veo` | `google/veo*`, `gemini/veo*` |
 | `lyria` | `google/lyria*`, `gemini/lyria*`, `copilot/lyria*` |
+| `grok` | `copilot/*grok*`, `openai/*grok*` |
 
 ### Meta-Aliases
 
@@ -73,9 +78,11 @@ Meta-aliases reference other aliases by name. They are resolved recursively unti
 |------------|------------|
 | `opusplan` | `opus?effort=high` |
 | `small` | `mini` |
+| `detection` | `small` → `copilot/gpt-*-luna` → `openai/gpt-*-luna` → `small-agent` → `agent` |
+| `evals` | `small` |
 | `mini` | `haiku` → `gpt-5-mini` → `gpt-5-nano` → `gemini-flash-lite` |
-| `large` | `fable` → `sonnet` → `gpt-5-pro` → `gpt-5` → `gemini-pro` |
-| `agent` | `sonnet-6x` → `gpt-5.4` → `gpt-5.5` → `gpt-5.6` → `gpt-5.3` → `gemini-pro` → `any` |
+| `large` | `sonnet` → `gpt-6` → `gpt-5-pro` → `gpt-5` → `gemini-pro` |
+| `agent` | `sonnet-6x` → `gpt-6` → `gpt-5.4` → `gpt-5.5` → `gpt-5.6` → `gpt-5.3` → `gemini-pro` → `any` |
 | `small-agent` | `haiku` → `gpt-5-mini` → `gemini-flash` |
 | `copilot` | `agent` |
 | `claude` | `agent` |

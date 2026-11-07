@@ -3,7 +3,8 @@ private: true
 emoji: "🧪"
 name: Smoke Project
 description: Smoke Project - Test project operations
-on: 
+on:
+  schedule: every 2 days
   slash_command:
     name: smoke-project
     strategy: centralized
@@ -30,6 +31,7 @@ tools:
   bash:
     - "*"
 safe-outputs:
+    steer: true
     allowed-domains: [default-safe-outputs]
     add-comment:
       hide-older-comments: true
@@ -90,6 +92,7 @@ experiments:
 imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
 features:
   gh-aw-detection: false
 evals:

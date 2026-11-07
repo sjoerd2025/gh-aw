@@ -7,6 +7,17 @@ function normalizeDotFolderExcludes(excludes) {
   return new Set((Array.isArray(excludes) ? excludes : []).map(exclude => String(exclude || "").replace(/\/+$/, "")).filter(Boolean));
 }
 
+/**
+ * @param {string[]} paths
+ * @param {string[]} excludes - Repository-root path globs
+ * @returns {string[]}
+ */
+function filterProtectedPaths(paths, excludes) {
+  const { globPatternToRegex } = require("./glob_pattern_helpers.cjs");
+  const patterns = excludes.map(pattern => globPatternToRegex(pattern));
+  return paths.filter(path => !patterns.some(pattern => pattern.test(path)));
+}
+
 function formatHeaderLineForError(headerLine) {
   const value = typeof headerLine === "string" ? headerLine : "";
   const truncated = value.length > 200 ? `${value.slice(0, 200)}…` : value;
@@ -88,15 +99,16 @@ function extractPathsFromPatch(patchContent) {
  *
  * @param {string} patchContent - The git patch content
  * @param {string[]} manifestFiles - List of manifest file names to check against (e.g. ["package.json", "go.mod"])
+ * @param {string[]} [pathExcludes] - Repository-root path globs to skip
  * @returns {{ hasManifestFiles: boolean, manifestFilesFound: string[] }}
  */
-function checkForManifestFiles(patchContent, manifestFiles) {
+function checkForManifestFiles(patchContent, manifestFiles, pathExcludes = []) {
   if (!manifestFiles || manifestFiles.length === 0) {
     return { hasManifestFiles: false, manifestFilesFound: [] };
   }
-  const changedFiles = extractFilenamesFromPatch(patchContent);
+  const changedFiles = filterProtectedPaths(extractPathsFromPatch(patchContent), pathExcludes).map(path => path.slice(path.lastIndexOf("/") + 1));
   const manifestFileSet = new Set(manifestFiles);
-  const manifestFilesFound = changedFiles.filter(f => manifestFileSet.has(f));
+  const manifestFilesFound = [...new Set(changedFiles.filter(f => manifestFileSet.has(f)))];
   return { hasManifestFiles: manifestFilesFound.length > 0, manifestFilesFound };
 }
 
@@ -107,13 +119,14 @@ function checkForManifestFiles(patchContent, manifestFiles) {
  *
  * @param {string} patchContent - The git patch content
  * @param {string[]} pathPrefixes - List of path prefixes to check (e.g. [".github/"])
+ * @param {string[]} [pathExcludes] - Repository-root path globs to skip
  * @returns {{ hasProtectedPaths: boolean, protectedPathsFound: string[] }}
  */
-function checkForProtectedPaths(patchContent, pathPrefixes) {
+function checkForProtectedPaths(patchContent, pathPrefixes, pathExcludes = []) {
   if (!pathPrefixes || pathPrefixes.length === 0) {
     return { hasProtectedPaths: false, protectedPathsFound: [] };
   }
-  const changedPaths = extractPathsFromPatch(patchContent);
+  const changedPaths = filterProtectedPaths(extractPathsFromPatch(patchContent), pathExcludes);
   const found = changedPaths.filter(p => pathPrefixes.some(prefix => p.startsWith(prefix)));
   return { hasProtectedPaths: found.length > 0, protectedPathsFound: found };
 }
@@ -184,10 +197,11 @@ function checkExcludedFiles(patchContent, excludedFilePatterns) {
  *
  * @param {string} patchContent - The git patch content
  * @param {string[]} [excludes] - Optional list of dot-folder prefixes to skip (e.g. [".agents/"])
+ * @param {string[]} [pathExcludes] - Repository-root path globs to skip
  * @returns {{ hasTopLevelDotFolders: boolean, topLevelDotFoldersFound: string[] }}
  */
-function checkForTopLevelDotFolders(patchContent, excludes) {
-  const changedPaths = extractPathsFromPatch(patchContent);
+function checkForTopLevelDotFolders(patchContent, excludes, pathExcludes = []) {
+  const changedPaths = filterProtectedPaths(extractPathsFromPatch(patchContent), pathExcludes);
   const excludeSet = normalizeDotFolderExcludes(excludes);
   const found = changedPaths.filter(p => {
     const slashIdx = p.indexOf("/");
@@ -237,9 +251,10 @@ function checkFileProtection(patchContent, config) {
 
   const manifestFiles = Array.isArray(config.protected_files) ? config.protected_files : [];
   const prefixes = Array.isArray(config.protected_path_prefixes) ? config.protected_path_prefixes : [];
-  const { manifestFilesFound } = checkForManifestFiles(patchContent, manifestFiles);
-  const { protectedPathsFound } = checkForProtectedPaths(patchContent, prefixes);
-  const { topLevelDotFoldersFound } = config.protect_top_level_dot_folders ? checkForTopLevelDotFolders(patchContent, config.protected_dot_folder_excludes) : { topLevelDotFoldersFound: [] };
+  const pathExcludes = Array.isArray(config.protected_files_path_exclude) ? config.protected_files_path_exclude : [];
+  const { manifestFilesFound } = checkForManifestFiles(patchContent, manifestFiles, pathExcludes);
+  const { protectedPathsFound } = checkForProtectedPaths(patchContent, prefixes, pathExcludes);
+  const { topLevelDotFoldersFound } = config.protect_top_level_dot_folders ? checkForTopLevelDotFolders(patchContent, config.protected_dot_folder_excludes, pathExcludes) : { topLevelDotFoldersFound: [] };
   const allFound = [...new Set([...manifestFilesFound, ...protectedPathsFound, ...topLevelDotFoldersFound])];
 
   if (allFound.length === 0) {
@@ -249,7 +264,7 @@ function checkFileProtection(patchContent, config) {
   if (config.protected_files_policy === "fallback-to-issue") {
     return { action: "fallback", files: allFound };
   }
-  if (config.protected_files_policy === "request_review") {
+  if (config.protected_files_policy === "request-review" || config.protected_files_policy === "request_review") {
     return { action: "request_review", files: allFound };
   }
   return { action: "deny", source: "protected", files: allFound };
@@ -295,11 +310,13 @@ function checkFileProtectionPostApply(actualFiles, config) {
   const manifestFiles = Array.isArray(config.protected_files) ? config.protected_files : [];
   const prefixes = Array.isArray(config.protected_path_prefixes) ? config.protected_path_prefixes : [];
   const dotFolderExcludes = normalizeDotFolderExcludes(config.protected_dot_folder_excludes);
+  const pathExcludes = Array.isArray(config.protected_files_path_exclude) ? config.protected_files_path_exclude : [];
+  const filesToCheck = filterProtectedPaths(actualFiles, pathExcludes);
 
   const allProtected = [];
 
   // Check manifest files (basename match)
-  for (const file of actualFiles) {
+  for (const file of filesToCheck) {
     const basename = file.split("/").pop() || "";
     if (manifestFiles.includes(basename) || manifestFiles.includes(file)) {
       allProtected.push(file);
@@ -307,7 +324,7 @@ function checkFileProtectionPostApply(actualFiles, config) {
   }
 
   // Check path prefixes
-  for (const file of actualFiles) {
+  for (const file of filesToCheck) {
     if (prefixes.some(prefix => file.startsWith(prefix))) {
       if (!allProtected.includes(file)) {
         allProtected.push(file);
@@ -317,7 +334,7 @@ function checkFileProtectionPostApply(actualFiles, config) {
 
   // Check top-level dot folders
   if (config.protect_top_level_dot_folders) {
-    for (const file of actualFiles) {
+    for (const file of filesToCheck) {
       if (file.startsWith(".") && file.includes("/")) {
         const topFolder = file.split("/")[0];
         if (!dotFolderExcludes.has(topFolder) && !allProtected.includes(file)) {
@@ -334,10 +351,20 @@ function checkFileProtectionPostApply(actualFiles, config) {
   if (config.protected_files_policy === "fallback-to-issue") {
     return { action: "fallback", files: allProtected };
   }
-  if (config.protected_files_policy === "request_review") {
+  if (config.protected_files_policy === "request-review" || config.protected_files_policy === "request_review") {
     return { action: "request_review", files: allProtected };
   }
   return { action: "deny", source: "protected", files: allProtected };
 }
 
-module.exports = { extractFilenamesFromPatch, extractPathsFromPatch, checkForManifestFiles, checkForProtectedPaths, checkForTopLevelDotFolders, checkAllowedFiles, checkExcludedFiles, checkFileProtection, checkFileProtectionPostApply };
+module.exports = {
+  extractFilenamesFromPatch,
+  extractPathsFromPatch,
+  checkForManifestFiles,
+  checkForProtectedPaths,
+  checkForTopLevelDotFolders,
+  checkAllowedFiles,
+  checkExcludedFiles,
+  checkFileProtection,
+  checkFileProtectionPostApply,
+};

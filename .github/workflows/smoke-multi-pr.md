@@ -4,6 +4,7 @@ emoji: "🧪"
 name: Smoke Multi PR
 description: Test creating multiple pull requests in a single workflow run
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-multi-pr
     strategy: centralized
@@ -30,6 +31,13 @@ tools:
     - "date"
     - "echo *"
     - "printf *"
+evals:
+  - id: distinct_pr_requests
+    question: Does the output contain exactly two pull-request requests with the distinct documentation and CRLF smoke-test changes?
+  - id: independent_branches
+    question: Does the output show the two test changes prepared on separate run-specific branches based on main rather than stacked together?
+  - id: crlf_evidence
+    question: Does the output include verification of CRLF endings for the second test file rather than only claiming Windows line endings were preserved?
 safe-outputs:
   allowed-domains: [default-safe-outputs]
   create-pull-request:
@@ -50,8 +58,12 @@ safe-outputs:
 timeout-minutes: 10
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Multiple Pull Request Creation

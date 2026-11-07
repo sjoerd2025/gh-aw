@@ -50,6 +50,29 @@ func TestParseMentionsConfig_Boolean(t *testing.T) {
 	}
 }
 
+func TestParseMentionsCredentials(t *testing.T) {
+	config := parseMentionsConfig(map[string]any{
+		"github-token": "${{ secrets.MENTIONS_PAT }}",
+		"github-app": map[string]any{
+			"client-id": "${{ vars.MENTIONS_APP_ID }}", "private-key": "${{ secrets.MENTIONS_APP_KEY }}",
+			"ignore-if-missing": true, "permissions": map[string]any{"members": "read"},
+		},
+	})
+	require.Equal(t, "${{ secrets.MENTIONS_PAT }}", config.GitHubToken)
+	require.NotNil(t, config.GitHubApp)
+	require.Equal(t, "${{ vars.MENTIONS_APP_ID }}", config.GitHubApp.AppID)
+	require.Equal(t, "${{ secrets.MENTIONS_APP_KEY }}", config.GitHubApp.PrivateKey)
+	require.True(t, config.GitHubApp.IgnoreIfMissing)
+	require.Equal(t, map[string]string{"members": "read"}, config.GitHubApp.Permissions)
+	runtimeConfig := buildMentionsHandlerConfig(config)
+	require.NotContains(t, runtimeConfig, "github-token")
+	require.NotContains(t, runtimeConfig, "github-app")
+	content, err := json.Marshal(config)
+	require.NoError(t, err)
+	require.NotContains(t, string(content), "MENTIONS_PAT")
+	require.NotContains(t, string(content), "MENTIONS_APP_KEY")
+}
+
 func TestParseMentionsConfig_Object(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -68,7 +91,7 @@ func TestParseMentionsConfig_Object(t *testing.T) {
 				AllowedCollaborators: boolPtr(true),
 				AllowContext:         boolPtr(false),
 				Allowed:              []string{"bot1", "bot2"},
-				Max:                  new(10),
+				Max:                  strPtr("10"),
 			},
 		},
 		{
@@ -79,7 +102,7 @@ func TestParseMentionsConfig_Object(t *testing.T) {
 			},
 			expected: &MentionsConfig{
 				Allowed: []string{"bot1"},
-				Max:     new(5),
+				Max:     strPtr("5"),
 			},
 		},
 		{
@@ -152,7 +175,7 @@ func TestParseMentionsConfig_Object(t *testing.T) {
 				AllowContext:         boolPtr(false),
 				Allowed:              []string{"bot1"},
 				AllowedTeams:         []string{"myorg/eng"},
-				Max:                  new(10),
+				Max:                  strPtr("10"),
 			},
 		},
 		{
@@ -161,7 +184,16 @@ func TestParseMentionsConfig_Object(t *testing.T) {
 				"max": 10.5,
 			},
 			expected: &MentionsConfig{
-				Max: new(10), // should be truncated
+				Max: strPtr("10"), // should be truncated
+			},
+		},
+		{
+			name: "max as expression",
+			input: map[string]any{
+				"max": "${{ inputs.max-mentions }}",
+			},
+			expected: &MentionsConfig{
+				Max: strPtr("${{ inputs.max-mentions }}"),
 			},
 		},
 		{
@@ -267,7 +299,7 @@ func TestGenerateSafeOutputsConfig_WithMentions(t *testing.T) {
 				AllowedCollaborators: boolPtr(false),
 				AllowContext:         boolPtr(true),
 				Allowed:              []string{"bot1", "bot2"},
-				Max:                  new(20),
+				Max:                  strPtr("20"),
 			},
 			expected: map[string]any{
 				"allowedCollaborators": false,
@@ -291,7 +323,7 @@ func TestGenerateSafeOutputsConfig_WithMentions(t *testing.T) {
 				AllowedCollaborators: boolPtr(false),
 				AllowedTeams:         []string{"myorg/eng"},
 				Allowed:              []string{"bot1"},
-				Max:                  new(30),
+				Max:                  strPtr("30"),
 			},
 			expected: map[string]any{
 				"allowedCollaborators": false,
@@ -406,7 +438,7 @@ func TestExtractSafeOutputsConfig_WithMentions(t *testing.T) {
 				AllowedCollaborators: boolPtr(false),
 				AllowContext:         boolPtr(true),
 				Allowed:              []string{"bot1"},
-				Max:                  new(15),
+				Max:                  strPtr("15"),
 			},
 		},
 		{

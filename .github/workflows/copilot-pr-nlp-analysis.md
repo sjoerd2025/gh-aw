@@ -30,7 +30,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 imports:
   - uses: shared/daily-audit-base.md
     with:
@@ -76,11 +75,31 @@ tools:
   cli-proxy: true
 features:
   gh-aw-detection: true
+experiments:
+  nlp_prompt_style:
+    variants: [concise, structured]
+    description: "Tests whether concise vs structured prompt wording improves NLP report usefulness and reliability"
+    hypothesis: "H0: no change in eval pass rate. H1: structured improves eval pass rate by >=10pp"
+    metric: eval:insights_report_produced
+    secondary_metrics: [eval:pr_conversations_analyzed, run_duration_ms, output_word_count]
+    guardrail_metrics:
+      - name: run_failure_rate
+        direction: min
+        threshold: 0.05
+      - name: empty_output_rate
+        direction: min
+        threshold: 0.02
+    min_samples: 30
+    weight: [50, 50]
+    start_date: "2026-09-24"
+    issue: 63156
 evals:
   - id: pr_conversations_analyzed
     question: Did the agent perform NLP analysis on Copilot PR conversations?
   - id: insights_report_produced
     question: Was a report produced with extracted insights and patterns from user interactions?
+  - id: prompt_style_applied
+    question: "Did the output clearly reflect the assigned prompt-style variant (concise or structured)?"
 ---
 
 # Copilot PR Conversation NLP Analysis
@@ -90,6 +109,16 @@ You are an AI analytics agent specialized in Natural Language Processing (NLP) a
 ## Mission
 
 Generate a weekly NLP-based analysis report of Copilot-created PRs merged within the last 7 days, focusing on conversation patterns, sentiment trends, and topic clustering. Post the findings with visualizations as a GitHub Discussion in the `audit` category.
+
+{{#if experiments.nlp_prompt_style == 'concise' }}
+## Prompt Style Variant: concise
+
+Use compact instruction execution. Prioritize brevity, top findings, and direct recommendations. Keep narrative commentary short, highlight the 3-5 highest-signal insights, and avoid exhaustive detail unless it is needed to explain a material result or edge case.
+{{else}}
+## Prompt Style Variant: structured
+
+Use explicit phase-based execution. Work through data loading, preprocessing, NLP analysis, visualization, report construction, and final verification in order. In the final discussion, preserve the required output sections and verify each success criterion with checklist-style constraints before posting.
+{{/if}}
 
 ## Current Context
 
@@ -106,7 +135,7 @@ Generate a weekly NLP-based analysis report of Copilot-created PRs merged within
 - Python analysis dependencies are already installed by pre-agent workflow steps.
 - **Do NOT run any `pip install` commands in agent turns.**
 - If an import unexpectedly fails, report the missing package in the output and continue with reduced analysis instead of installing dependencies in agent turns.
-- Run Python scripts with `/tmp/gh-aw/agent/venv/bin/python3` to use the preinstalled environment.
+- Run Python scripts with `/tmp/gh-aw/python/venv/bin/python3` to use the preinstalled environment.
 
 ## Task Overview
 

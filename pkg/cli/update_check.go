@@ -99,13 +99,7 @@ func getLastCheckFilePathImpl() string {
 
 // updateLastCheckTime updates the timestamp of the last update check
 func updateLastCheckTime() {
-	writeUpdateCheckTime(getLastCheckFilePath(), constants.FilePermPublic, "update check", updateCheckLog)
-}
-
-// checkForUpdates checks if a newer version of gh-aw is available
-// This function is non-blocking and ignores all errors (connectivity, API, etc.)
-func checkForUpdates(noCheckUpdate bool, verbose bool) {
-	checkForUpdatesWithContext(context.Background(), noCheckUpdate, verbose)
+	writeUpdateCheckTime(getLastCheckFilePath(), constants.FilePermSensitive, "update check", updateCheckLog)
 }
 
 func checkForUpdatesWithContext(ctx context.Context, noCheckUpdate bool, verbose bool) {

@@ -9,6 +9,9 @@ on:
         required: true
         type: string
         default: "-30d..-0d"
+
+imports:
+  - shared/graders.md
 permissions:
   contents: read
   actions: read
@@ -28,9 +31,6 @@ safe-outputs:
   upload-asset:
     max: 5
     allowed-exts: [.png, .jpg, .jpeg, .svg]
-sandbox:
-  agent:
-    sudo: false
 tools:
   agentic-workflows:
   bash:
@@ -39,7 +39,7 @@ features:
   gh-aw-detection: true
 steps:
   - name: Setup Python
-    uses: actions/setup-python@v7.0.0
+    uses: actions/setup-python@v7.1.0
     with:
       python-version: "3.12"
   - name: Setup local chart workspace
@@ -47,7 +47,7 @@ steps:
       mkdir -p /tmp/gh-aw/token-audit/charts /tmp/gh-aw/token-audit/site-packages
   - name: Install Python chart dependencies
     run: |
-      python3 -m pip install --quiet --target /tmp/gh-aw/token-audit/site-packages pandas matplotlib seaborn
+      python3 -m pip install --quiet --target /tmp/gh-aw/token-audit/site-packages pandas==3.0.6 matplotlib==3.11.2 seaborn==0.13.2
   - name: Download agentic workflow logs
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -94,6 +94,11 @@ evals:
     question: Did the agent analyze AIC usage for the user-specified date range?
   - id: trend_report_created
     question: Was a trend report created with per-workflow AIC data for the requested period?
+
+engine:
+  id: codex
+  model-provider: github
+model: copilot/gpt-6-sol
 ---
 
 # On-Demand Agentic Workflow AIC Trend Audit
@@ -129,7 +134,6 @@ Each element of `.runs` is a `RunData` object with (among others):
 | `workflow_path` | string | `.github/workflows/....lock.yml` |
 | `aic` | float | AI Credits (AIC); preferred cost metric |
 | `token_usage` | int | Historical raw token total (`omitempty`) |
-| `effective_tokens` | int | Legacy metric retained for compatibility (prefer AI Credits) |
 | `action_minutes` | float | Billable GitHub Actions minutes |
 | `turns` | int | Number of agent turns |
 | `duration` | string | Human-readable duration |
@@ -141,6 +145,7 @@ Each element of `.runs` is a `RunData` object with (among others):
 | `error_count` | int | Errors encountered |
 | `warning_count` | int | Warnings encountered |
 | `token_usage_summary` | object or null | Firewall-level breakdown by model |
+| `working_set` | object or null | Working-Set Rebuild Factor (WSRF) data: `measurement_state`, `rebuild_factor`, `cumulative_input_tokens`, `peak_input_tokens` |
 
 ## Phase 1 — Process Logs
 
@@ -150,9 +155,9 @@ Write a Python script to `/tmp/gh-aw/token-audit/process_audit.py` and run it. T
 2. Filter to `status == "completed"` runs only.
 3. Use each run's `aic` field as the preferred cost metric.
    - Treat missing/null `aic` as `0`.
-   - Keep `effective_tokens` only as a diagnostic legacy field when it is present in the logs.
+   - Extract `working_set.rebuild_factor` (WSRF) when `working_set.measurement_state == "measured"`; treat missing or `unavailable`/`partial` states as no data point (do not fabricate a value).
 4. Group by `workflow_name` and compute per-workflow aggregates:
-   - `run_count`, `total_aic`, `avg_aic`, `total_turns`, `avg_turns`, `total_action_minutes`, `error_count`, `warning_count`
+   - `run_count`, `total_aic`, `avg_aic`, `total_turns`, `avg_turns`, `total_action_minutes`, `error_count`, `warning_count`, `avg_wsrf` (mean of available `working_set.rebuild_factor` values; `null` when none available)
 5. Compute an overall summary: total runs, total AIC, total action minutes.
 6. Sort workflows descending by `total_aic`.
 7. Save the result to `/tmp/gh-aw/token-audit/audit_snapshot.json` with this shape:
@@ -177,6 +182,7 @@ Write a Python script to `/tmp/gh-aw/token-audit/process_audit.py` and run it. T
       "total_action_minutes": F,
       "error_count": N,
       "warning_count": N,
+      "avg_wsrf": F,
       "latest_run_url": "..."
     }
   ]
@@ -256,6 +262,7 @@ Summarize daily AIC movement across the requested range (up/down days, spikes, a
 - Identify any workflow with >30% of total AIC as a "heavy hitter"
 - Note workflows with high error/warning counts relative to runs
 - Flag any workflow whose avg AIC per run exceeds 10.00
+- Flag any workflow whose `avg_wsrf` is notably high relative to peers (context repeatedly rebuilt near peak size rather than growing incrementally turn over turn) when enough measured runs exist
 
 **Data snapshot**: `/tmp/gh-aw/token-audit/audit_snapshot.json`
 ```
@@ -263,6 +270,7 @@ Summarize daily AIC movement across the requested range (up/down days, spikes, a
 ## Important Notes
 
 - Use `// 0` (null coalescing) in jq and `.get(field, 0)` in Python for nullable numeric fields.
+- Treat `working_set.rebuild_factor` as unavailable (not `0`) when `measurement_state != "measured"` or the field is absent; average only over runs with a measured value and state the sample size when reporting `avg_wsrf`.
 - Distinguish between these two cases in the issue:
   - the raw `.runs` array is empty
   - the raw `.runs` array is non-empty but none of the runs are `status == "completed"`

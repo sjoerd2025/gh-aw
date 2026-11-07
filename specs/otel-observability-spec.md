@@ -1,21 +1,21 @@
 ---
 title: gh-aw OpenTelemetry Observability Specification
 description: Formal W3C-style specification for observability contract for GitHub Agentic Workflows using OpenTelemetry traces, metrics, logs, and OTLP export.
-version: 0.4.0
+version: 0.6.0
 status: Working Draft
 date: 2026-06-18
-last_updated: 2026-06-18
+last_updated: 2026-11-05
 editors:
   - GitHub gh-aw Team
 ---
 
 # gh-aw OpenTelemetry Observability Specification
 
-**Version**: 0.4.0
+**Version**: 0.6.0
 **Status**: Working Draft  
 **Publication Date**: June 18, 2026
 **Latest Version**: https://github.com/github/gh-aw/blob/main/specs/otel-observability-spec.md  
-**Previous Version**: 0.3.0
+**Previous Version**: 0.5.0
 **Editors**: GitHub gh-aw Team
 
 ---
@@ -28,13 +28,13 @@ This specification defines the compatibility-first OpenTelemetry observability c
 
 This document is a **Working Draft** maintained by the GitHub `gh-aw` Team. It may be changed, replaced, or made obsolete by subsequent versions.
 
-Version 0.4.0 is a non-breaking compatibility revision of the draft telemetry model in version 0.3.0. It clarifies which fields and files are stable, keeps the existing direct-export and local-mirror behavior, keeps already documented GenAI attributes, and identifies future OpenTelemetry-native improvements that MAY be added as aliases or extra records. Implementations MUST NOT remove, rename, or structurally replace the shipped contract solely to satisfy a newer OpenTelemetry convention.
+Version 0.6.0 clarifies fail-closed safeguards and required export, fan-out, and shutdown ordering without changing the shipped compatibility contract.
 
 Sections explicitly marked **Informative** are non-normative. All other sections are normative unless stated otherwise.
 
-Implementation mapping, validation requirements, and compatibility test expectations are defined in this specification so version 0.4.0 has one authoritative contract.
+Implementation mapping, validation requirements, and compatibility test expectations are defined in this specification so version 0.6.0 has one authoritative contract.
 
-Implementations claiming conformance MUST identify the version and conformance classes they implement. A conformance claim for version 0.4.0 is a compatibility claim: it MUST preserve externally observable behavior documented by this specification unless a later specification explicitly defines a migration period and compatibility alias.
+Implementations claiming conformance MUST identify the version and conformance classes they implement. A conformance claim for version 0.6.0 is a compatibility claim: it MUST preserve externally observable behavior documented by this specification unless a later specification explicitly defines a migration period and compatibility alias.
 
 ## Table of Contents
 
@@ -278,6 +278,18 @@ When an endpoint URL is statically resolvable, the compiler MUST extract its hos
 
 Expressions such as `${{ secrets.OTLP_ENDPOINT }}` MUST NOT produce a compile-time hostname allowlist entry.
 
+### 5.8 Default Fallback
+
+When a workflow declares no `observability.otlp` endpoint in its own frontmatter or in any imported workflow, the compiler MUST fall back to a repository- or organization-level default endpoint expressed as `${{ secrets.GH_AW_DEFAULT_OTLP_ENDPOINT || vars.GH_AW_DEFAULT_OTLP_ENDPOINT }}` with headers `${{ secrets.GH_AW_DEFAULT_OTLP_HEADERS }}`. The secret takes precedence when both endpoint values are configured; implementations MUST require clearing both endpoint values to disable export when both are present.
+
+An explicit `observability.otlp` endpoint from frontmatter or an import MUST take precedence over the default fallback; the fallback MUST only apply when no endpoint entry can be resolved from frontmatter or imports.
+
+The compiler MUST set the effective `if-missing` policy to `ignore` for the default fallback path when the workflow has not explicitly configured `if-missing`. This makes an unset `GH_AW_DEFAULT_OTLP_ENDPOINT` a silent no-op instead of a compile- or runtime-time failure.
+
+A default fallback endpoint that resolves to a non-empty URL without its configured headers MUST fail the default-credentials check with a diagnostic identifying the missing headers secret. When the effective `if-missing` policy is `ignore`, every runtime exporter MUST also omit the endpoint before any network call, including exporters in jobs that do not execute that check. The complete fail-closed behavior and ordering are specified in §16.6.
+
+The compiler MUST NOT emit an env-block mapping key that the workflow's own `env:` block already defines. When a user-defined key already exists (for example `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS`, `GH_AW_OTLP_ALL_HEADERS`, `GH_AW_OTLP_ENDPOINTS`, `GH_AW_OTLP_IF_MISSING`, or `GH_AW_OTLP_ATTRIBUTES`), the compiler MUST skip injecting that key rather than emit a duplicate mapping key.
+
 ---
 
 ## 6. Runtime Environment and Export
@@ -294,7 +306,7 @@ When observability is enabled, the compiler MUST make the following non-secret v
 | `GITHUB_AW_OTEL_PARENT_SPAN_ID` | MUST contain the active setup or parent span ID when available. |
 | `TRACEPARENT` | SHOULD be emitted or forwarded where child tools can consume W3C Trace Context. |
 | `GH_AW_OTLP_ENDPOINTS` | SHOULD contain a compact JSON array for multi-endpoint fan-out when more than one endpoint or endpoint-local header set is configured. |
-| `GH_AW_OTLP_IF_MISSING` | SHOULD contain the resolved policy when runtime setup needs it. |
+| `GH_AW_OTLP_IF_MISSING` | SHOULD contain the resolved policy when runtime setup needs it; MUST be `ignore` when the endpoint was resolved through the default fallback (§5.8) and the workflow did not explicitly configure `if-missing`. |
 
 Future variables such as `GH_AW_OTLP_MODE`, `GH_AW_OTEL_SIGNALS`, and `GH_AW_OTEL_CAPTURE_CONTENT` MAY be added only as additive extensions.
 
@@ -305,6 +317,12 @@ The trusted exporter process MAY receive `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EX
 The first normalized endpoint MUST remain the primary endpoint for compatibility variables.
 
 Compatibility variables containing credentials MUST NOT be injected into the environment of the agent command, arbitrary shell steps, generated code, or untrusted tool processes.
+
+The JavaScript traces exporter MUST honor a non-empty `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` before `OTEL_EXPORTER_OTLP_PROTOCOL`. When neither is set, it MUST preserve `http/json` as the compatibility default. `http/protobuf` MUST encode the existing sanitized trace payload as a binary OTLP `ExportTraceServiceRequest` with `Content-Type: application/x-protobuf`, without runtime package dependencies. The selected protocol applies to every endpoint in the JavaScript fan-out. Unsupported protocols or encoding failures MUST produce an exporter diagnostic without a JSON fallback. The local JSONL mirror MUST remain raw OTLP JSON for both protocols.
+
+`gh aw env get/update` MUST expose `default_otlp_protocol`, mapped to the standard `OTEL_EXPORTER_OTLP_PROTOCOL` Actions variable, with `http/json` and `http/protobuf` as the accepted non-null values. Null or omission MUST delete the variable at the selected scope, consistently with other managed defaults. Unless workflow `env` explicitly defines the protocol, the compiler MUST inject `${{ vars.OTEL_EXPORTER_OTLP_PROTOCOL }}` so variable changes resolve at runtime rather than compilation.
+
+The JavaScript exporter MUST preserve complete endpoint paths ending in `/v1/traces`, including Azure Monitor DCE/DCR traces paths and query parameters. Base endpoints MUST gain `/v1/traces` before any query parameters.
 
 ### 6.3 Collector Mode (Optional)
 
@@ -325,6 +343,7 @@ In direct mode:
 3. A failure at one endpoint MUST NOT suppress an attempt to another endpoint.
 4. Export retry MUST be bounded by duration and attempt count.
 5. Export failure MUST be reported through a structured diagnostic and `gh_aw.otlp.export.failures` when metrics are enabled.
+6. Endpoint filtering and missing-credential safeguards MUST follow §16.6 before any endpoint is passed to the exporter.
 
 ### 6.5 Gateway Export
 
@@ -336,9 +355,7 @@ When direct gateway export is explicitly configured, credentials MUST be scoped 
 
 ### 6.6 Flush and Shutdown
 
-At job completion, instrumentation MUST attempt to flush buffered telemetry within a bounded timeout.
-
-Failure to flush MUST NOT replace the workflow's functional result. It MUST produce an exporter diagnostic and SHOULD increment the exporter-failure metric.
+At job completion, instrumentation MUST follow the ordered finalization sequence in §16.5 and attempt to flush buffered telemetry within a bounded timeout. Failure to flush MUST NOT replace the workflow's functional result. It MUST produce an exporter diagnostic and SHOULD increment the exporter-failure metric.
 
 ---
 
@@ -472,8 +489,8 @@ RUN <workflow>                                  SERVER
 │   │   ├── chat <model>                       CLIENT
 │   │   └── execute_tool <tool>                INTERNAL or CLIENT
 │   └── gh-aw.job.finalize                     INTERNAL
-└── <job: outcome-collector>                   INTERNAL
-    ├── evaluate outcome                       INTERNAL
+└── <job: safe_outputs>                        INTERNAL
+    ├── apply safe outputs                     INTERNAL
     └── gh-aw.job.finalize                     INTERNAL
 ```
 
@@ -623,6 +640,22 @@ Event attributes MUST comply with the same privacy and cardinality rules as span
 
 When full content capture is enabled, content attributes MUST use the schemas required by the applicable GenAI convention, MUST be redacted before export, SHOULD be truncated according to a documented limit, MUST NOT contain credentials, and MUST NOT be copied into metric attributes.
 
+### 10.8 Eval Results
+
+Completed BinEval records MUST produce `eval.result` events on
+`gh-aw.evals.conclusion`, with `gh-aw.eval.id`, normalized `gh-aw.eval.answer`
+(`YES`, `NO`, or `UNKNOWN`), and the model when available. Summary attributes
+MUST include `gh-aw.evals.count`, `yes`, `no`, and `unknown` under the
+`gh-aw.evals.` prefix.
+
+A valid not-evaluated marker MUST instead emit `gh-aw.evals.status =
+not_evaluated` and the bounded `gh-aw.evals.reason_code`, both on the span and
+an `eval.status` event. When available, the marker's configured Decisions model
+ID MUST be included as `gh-aw.eval.model` on both the span and status event.
+It MUST NOT fabricate answer records or unknown-answer
+counts. Free-form questions, reasons, and error text MUST NOT be included in
+these result events.
+
 ---
 
 ## 11. Metrics Contract
@@ -695,13 +728,51 @@ Log bodies and attributes MUST NOT contain OTLP headers, tokens, credentials, co
 
 Log messages SHOULD use stable templates, with variable data placed in structured attributes after redaction.
 
+### 12.5 Opt-in Compact Unified Session Logs
+
+The compiler MUST inject `GH_AW_OTLP_LOGS_ENABLED` and
+`GH_AW_OTLP_LOGS_MAX_BYTES` from their same-named GitHub Actions variables.
+Session-log export MUST remain disabled unless the enable value is exactly
+`true`. An unset byte limit MUST default to 65536; a configured limit MUST be a
+positive safe integer. Invalid configuration MUST warn without exporting.
+
+The conclusion job MUST export only the persisted, publication-redacted compact
+unified session, with at most 128 events and 16 KiB of projected JSONL.
+Export MUST additionally omit repository, workflow/run/session/agent identity,
+refs, SHAs, memory identity, branches and filesystem paths. Current secret and
+exporter-header masks MUST be applied. Operational metadata and trace
+correlation MAY remain; this profile does not guarantee irreversible anonymity.
+Full session artifacts MUST remain unchanged.
+
+Each retained event MUST be an OTLP structured log body under instrumentation
+scope `gh-aw.session`, with `gh-aw.session.event_type` as a log attribute.
+Valid current trace/span IDs SHOULD be included. Export MUST use the existing
+endpoint list and isolated per-endpoint headers, posting to `/v1/logs` instead
+of `/v1/traces`. A trailing signal path MUST be replaced, not duplicated.
+
+The serialized UTF-8 JSON request MUST NOT exceed `GH_AW_OTLP_LOGS_MAX_BYTES`
+per endpoint. Whole low-priority records MUST be omitted to meet the limit,
+using the same retention ranking as the compact serializer: format/workflow
+metadata, final outcomes and promoted failures, guardrail/grader results,
+retry diagnostics, per-step usage, then successful memory updates.
+Equal-priority records MUST prefer earlier evidence, and retained records MUST
+remain in source order. The source serializer MUST consider late essential
+records within its scan budget even after compact output limits are reached.
+Resource attributes MUST report compact version, included/omitted event counts,
+oversized source lines, scan truncation and overall truncation, including
+size-induced omissions. When size or scan limits discard evidence, the exporter
+MUST issue a GitHub Actions warning explicitly identifying the export as partial.
+If no record fits, the exporter MUST warn and skip the
+request. Export failures MUST NOT fail the workflow, and unchanged credentials
+MUST NOT be retried after authorization failures.
+
 ---
 
 ## 13. Outcome Evaluation
 
 ### 13.1 Separate Evaluation Execution
 
-An outcome collector that evaluates pull requests, issues, discussions, or other durable outputs after the source workflow has completed SHOULD create its own trace when it emits OpenTelemetry records.
+Outcome evaluation runs through `gh aw logs --outcomes` after the source workflow. The command returns JSON and optional JSONL; it does not emit outcome spans. A downstream exporter that converts these records to OpenTelemetry SHOULD create its own trace.
 
 It MUST NOT extend the original workflow trace across hours or days when doing so would create false temporal containment.
 
@@ -709,13 +780,17 @@ It MUST NOT extend the original workflow trace across hours or days when doing s
 
 Each outcome-evaluation span SHOULD contain a span link to the originating workflow root context when that context was persisted.
 
-When a full span context is unavailable, the evaluation span SHOULD include `gh-aw.outcome.source_run_id`, `gh-aw.outcome.source_workflow`, and `gh-aw.outcome.repository`.
+When a full span context is unavailable, the evaluation span SHOULD include `gh-aw.outcome.source_run_id`, `gh-aw.outcome.source_workflow`, and `gh-aw.outcome.repo`.
+
+For compatibility with existing processors, implementations MAY additionally emit `gh-aw.outcome.repository` as an alias. New implementations SHOULD prefer `gh-aw.outcome.repo` for consistency with `specs/safe-output-outcome-evaluation.md`.
 
 ### 13.3 Evaluation Span and Metrics
 
 The span SHOULD be named `gh-aw.outcome.evaluate` and use `INTERNAL` span kind.
 
-It SHOULD include `gh-aw.outcome.type`, `gh-aw.outcome.result`, `gh-aw.outcome.source_run_id`, `gh-aw.outcome.source_workflow`, and `gh-aw.outcome.repository`.
+It SHOULD include `gh-aw.outcome.type`, `gh-aw.outcome.result`, `gh-aw.outcome.source_run_id`, `gh-aw.outcome.source_workflow`, and `gh-aw.outcome.repo`.
+
+`gh-aw.outcome.result` SHOULD use the canonical outcome taxonomy defined in `specs/safe-output-outcome-evaluation.md` (`accepted`, `rejected`, `ignored`, `pending`, `lifecycle`, `lifecycle_close`).
 
 URLs and item identifiers MUST NOT be metric dimensions.
 
@@ -749,7 +824,7 @@ Mirror-write failure MUST produce a structured diagnostic but SHOULD NOT fail th
 
 The mirror writer MUST create parent directories with restrictive permissions, MUST use append-safe writes, SHOULD tolerate concurrent writers, MUST NOT write exporter credentials, MUST apply the same content-capture and redaction policy as remote export, and SHOULD rotate or bound file size.
 
-When telemetry artifacts are uploaded, the artifact SHOULD contain `otel.jsonl`, runtime-specific companion files such as `copilot-otel.jsonl` when present, and no secret headers or credentials. A manifest containing schema version, signal counts, byte sizes, and redaction mode MAY be added as an optional companion file.
+When telemetry artifacts are uploaded, the artifact SHOULD contain `otel.jsonl` and no secret headers or credentials. As of the removal in PR #32280, gh-aw does not produce a runtime-specific companion mirror file for Copilot CLI spans; Copilot CLI is expected to export its spans directly to the configured OTLP backend using the injected `OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_EXPORTER_OTLP_HEADERS`/`OTEL_RESOURCE_ATTRIBUTES` environment variables (see ADR-34450). A manifest containing schema version, signal counts, byte sizes, and redaction mode MAY be added as an optional companion file.
 
 ---
 
@@ -758,6 +833,8 @@ When telemetry artifacts are uploaded, the artifact SHOULD contain `otel.jsonl`,
 ### 15.1 Secret Handling
 
 Exporter headers and credentials MUST be masked before any diagnostic output; MUST NOT appear in telemetry records, artifacts, generated gateway JSON, or job summaries; SHOULD be short-lived and least-privilege; and SHOULD be held by a Collector or trusted exporter helper rather than workflow-global environment variables.
+
+In direct-export mode (`observability.otlp.mode: direct`), implementations MUST treat `OTEL_EXPORTER_OTLP_HEADERS` and equivalent header sources as secret material, MUST redact header values before writing any mirror/artifact/diagnostic record, and MUST NOT copy raw header values or credential-bearing header keys into span attributes, span events, logs, or metric attributes.
 
 ### 15.2 Content Defaults and Redaction
 
@@ -817,9 +894,33 @@ Metrics and critical security logs SHOULD remain available even when traces are 
 
 ### 16.5 Shutdown Ordering
 
-Job finalization SHOULD finish functional work, record result attributes and events, end built-in child spans, write local mirror records, flush exporters within a bounded timeout, and emit final exporter diagnostics.
+Job finalization MUST use this sequence:
 
-When an additive pipeline root span is emitted, it SHOULD end only after the workflow result and all known job results are available.
+1. Finish functional work and record the workflow result.
+2. Record result attributes and events, then end built-in child spans.
+3. Sanitize and append eligible local mirror records before attempting remote delivery.
+4. Flush each eligible endpoint within the bounded retry and shutdown deadlines.
+5. Emit bounded exporter diagnostics, including partial fan-out and flush failures.
+
+When an additive pipeline root span is emitted, it SHOULD end only after the workflow result and all known job results are available. An exporter failure MUST NOT replace the functional result.
+
+### 16.6 Fail-Closed Safeguards
+
+The following requirements apply to every runtime span emitter that consumes `GH_AW_OTLP_ENDPOINTS`, including setup, conclusion, outcome, and MCP gateway spans:
+
+| Condition | Required behavior |
+|---|---|
+| Default endpoint is absent and `if-missing` resolves to `ignore` | Treat OTLP as unconfigured; do not make a network request. |
+| Default endpoint has a non-empty URL but its headers secret is empty | The default-credentials check MUST fail the workflow job with a diagnostic identifying the missing headers secret. Every runtime emitter MUST also omit the endpoint before network fan-out when the effective `if-missing` policy is `ignore`. |
+| Endpoint configuration is invalid or contains an empty URL | Exclude the entry before export; do not interpret an invalid entry as successful delivery. |
+| Payload is ready for export | Sanitize it and append the eligible local mirror record before remote delivery. |
+| Multiple endpoints are configured | Attempt each eligible endpoint independently; a failure at one endpoint MUST NOT suppress another endpoint's attempt or erase successful delivery. |
+| Export or bounded shutdown flush fails | Record a bounded diagnostic, do not report the failed delivery as successful, preserve prior mirror data, and do not fail already-completed functional work. |
+| Headers contain credentials | Keep credentials scoped to trusted exporters and out of mirrors, artifacts, diagnostics, and untrusted processes. |
+
+Endpoint resolution and credential filtering MUST complete before fan-out. Eligible endpoint requests MAY run concurrently; retries remain bounded per endpoint. The ordered export/fan-out/finalization contract is in §6.4 and §16.5.
+
+The CLI outcome evaluator currently emits JSON/JSONL and has no OTLP exporter. OTLP unavailability therefore MUST NOT change its classification or suppress its output; any downstream exporter is responsible for preserving those records on export failure. See the [Safe Output Outcome Evaluation Specification](safe-output-outcome-evaluation.md#otlp-backend-unavailability).
 
 ---
 
@@ -840,12 +941,31 @@ Level 1 and Level 2 compatibility validation MUST cover the following behaviors:
 | Frontmatter schema | `observability.otlp.endpoint`, `headers`, `if-missing`, `attributes`, `resource-attributes`, and `github-app` are accepted or rejected according to Section 5. |
 | Compiler environment | The compiler emits `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS` when configured, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `GH_AW_OTLP_ENDPOINTS`, `GITHUB_AW_OTEL_TRACE_ID`, `GITHUB_AW_OTEL_PARENT_SPAN_ID`, and `TRACEPARENT` according to Sections 6 and 7. |
 | Header secrecy | OTLP headers are masked before diagnostics and are absent from generated gateway JSON, job summaries, telemetry records, and artifacts. |
+| Default fallback credentials | A default endpoint without its headers secret fails the credential check, and runtime exporters do not send it unauthenticated when the effective `if-missing` policy is `ignore`. |
 | Endpoint fan-out | Multiple endpoints are preserved in declaration order, first endpoint compatibility is retained, and one endpoint failure does not suppress attempts to other endpoints. |
 | Local mirror | `/tmp/gh-aw/otel.jsonl` remains raw OTLP/HTTP JSON lines with `resourceSpans`; it is not replaced by an envelope-only format. |
 | Built-in spans | Setup, conclusion, and built-in agent spans preserve shipped names and stable `gh-aw.*`, `github.*`, and GenAI attributes. |
 | GenAI compatibility | Built-in gh-aw spans continue to emit `gen_ai.system` and `gen_ai.usage.total_tokens` when the underlying values are available. |
 | Privacy defaults | Raw prompts, model responses, system instructions, source content, tool arguments, and tool results are not captured by default. |
 | Non-fatal export | Telemetry export and mirror failures do not replace the workflow's functional result after valid setup. |
+
+### 17.1.A Required Coverage Map (current tests)
+
+The following table maps each required-coverage row above to concrete tests in the
+current repository.
+
+| Required coverage area | Named tests |
+|---|---|
+| Frontmatter schema | `pkg/parser/schema_test.go`: `TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPGitHubAppImplicitOIDC`, `TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPCustomAttributes`, `TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPResourceAttributes`, `TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLPGitHubAppPermissionsRejected` |
+| Compiler environment | `pkg/workflow/otel_observability_formal_test.go`: `TestFormal_EndpointFormNormalization`, `TestFormal_IfMissingPolicyValidation`, `TestFormal_ServiceNameFormation`; `pkg/workflow/observability_otlp_test.go`: `TestInjectOTLPConfig`, `TestInjectOTLPConfig_MultipleEndpoints`, `TestInjectOTLPConfig_OTLPHeadersField`, `TestInjectOTLPConfig_CustomAttributes` |
+| Header secrecy | `pkg/workflow/otel_observability_formal_test.go`: `TestFormal_SentryAuthHeaderRewrite`; `pkg/workflow/observability_otlp_mask_script_test.go`: `TestMaskOTLPHeadersScript`, `TestMaskOTLPAttributesScript` |
+| Default fallback credentials | `pkg/workflow/observability_otlp_default_credentials_script_test.go`: `TestCheckOTLPDefaultCredentialsScript` (including `endpoint without headers fails`); `actions/setup/js/send_otlp_span.test.cjs`: `it("drops an endpoint with a URL but no headers to avoid unauthenticated export", ...)` |
+| Endpoint fan-out | `pkg/workflow/otel_observability_formal_test.go`: `TestFormal_FanOutPreservesDeclarationOrder`; `actions/setup/js/send_otlp_span.test.cjs`: `it("continues to other endpoints when one fails", ...)` |
+| Local mirror | `pkg/workflow/otel_observability_formal_test.go`: `TestFormal_MirrorPathConstant`; `actions/setup/js/otel_contract.test.cjs`: `it("preserves customer-facing raw OTLP JSONL and GenAI compatibility attributes", ...)` |
+| Built-in spans | `actions/setup/js/otel_contract.test.cjs`: `it("preserves customer-facing raw OTLP JSONL and GenAI compatibility attributes", ...)` |
+| GenAI compatibility | `actions/setup/js/otel_contract.test.cjs`: `it("preserves customer-facing raw OTLP JSONL and GenAI compatibility attributes", ...)` |
+| Privacy defaults | `pkg/workflow/otel_observability_formal_test.go`: `TestFormal_SecretRefResourceAttributeRejected`; `actions/setup/js/send_otlp_span.test.cjs`: `it("redacts span attribute values whose keys match sensitive patterns", ...)`, `it("redacts sensitive keys in span event attributes", ...)` |
+| Non-fatal export | `actions/setup/js/send_otlp_span.test.cjs`: `it("warns (does not throw) when server returns non-2xx status on all retries", ...)`, `it("warns (does not throw) when fetch rejects on all retries", ...)`, `it("does not throw when appendFileSync fails", ...)` |
 
 The repository enforcement entry point for these checks is `make validate-otel-contract`. This target MUST remain focused on the customer-facing compatibility contract rather than all possible OTEL-related tests.
 
@@ -858,7 +978,7 @@ The following test IDs are stubs for Level 1 (Stable Configuration and Export) c
 | **T-OT-001** | Compiler config | Compiler accepts `observability.otlp.endpoint` with a valid HTTPS URL and emits `OTEL_EXPORTER_OTLP_ENDPOINT` in the generated workflow environment. |
 | **T-OT-002** | Compiler config | Compiler rejects `observability.otlp.endpoint` set to a non-HTTPS URL when `if-missing: block` is configured, producing a descriptive validation error. |
 | **T-OT-003** | Endpoint normalization | When multiple endpoints are declared, the compiler preserves them in declaration order and retains the first endpoint in the `OTEL_EXPORTER_OTLP_ENDPOINT` variable for backward compatibility. |
-| **T-OT-004** | OTLP export | The runtime JavaScript helper encodes span payloads as valid OTLP/HTTP protobuf-JSON and POSTs them to the configured endpoint; a successful 200 response is recognized as accepted. |
+| **T-OT-004** | OTLP export | The runtime JavaScript helper defaults to valid OTLP/HTTP JSON and supports binary OTLP/HTTP protobuf selected through the standard protocol environment variables. Both POST to the configured traces endpoint and recognize a successful 200 response as accepted. Protobuf conformance is compared with the official OpenTelemetry SDK in CI. |
 | **T-OT-005** | Trace context | The compiler injects `GITHUB_AW_OTEL_TRACE_ID`, `GITHUB_AW_OTEL_PARENT_SPAN_ID`, and `TRACEPARENT` into the generated workflow environment when OTLP observability is enabled. |
 | **T-OT-006** | Local mirrors | The runtime helper writes each exported span as a raw OTLP/HTTP JSON line with a `resourceSpans` key to `/tmp/gh-aw/otel.jsonl`; the file format MUST NOT be an envelope-only summary. |
 | **T-OT-007** | Compiler config | `observability.otlp.headers` entries are emitted as `OTEL_EXPORTER_OTLP_HEADERS` in `key=value,key=value` format and are masked in diagnostics, job summaries, and artifacts. |
@@ -872,7 +992,7 @@ attribute-level checks mapped directly to Section 10 requirements:
 |---------|------------------------|----------------|---------------------|
 | **T-OT-008** | §10.2 `gh-aw.job.name` on built-in job spans | The setup span includes `gh-aw.job.name` equal to the GitHub Actions job name | Decode `/tmp/gh-aw/otel.jsonl` or captured OTLP payloads and assert the setup span attribute value exactly matches the workflow job name |
 | **T-OT-009** | §10.3 `gen_ai.system` on built-in agent spans | A known engine emits a non-empty normalized provider/system value | Run a workflow with a built-in agent span, decode exported spans, and assert `gen_ai.system` is present whenever the engine mapping is known |
-| **T-OT-010** | §13.3 `gh-aw.outcome.type` on outcome-evaluation spans | Outcome-evaluation spans emit the safe-output type being evaluated | Execute the outcome collector, inspect the `gh-aw.outcome.evaluate` span, and assert `gh-aw.outcome.type` matches the evaluated manifest item type |
+| **T-OT-010** | §13.3 `gh-aw.outcome.type` on optional downstream outcome-evaluation spans | Exported outcome spans preserve the safe-output type being evaluated | Feed `.outcomes[].items[]` from `gh aw logs --outcomes --json` to the downstream exporter under test and assert `gh-aw.outcome.type` matches the evaluated manifest item type; not a built-in CLI export |
 | **T-OT-011** | §17 Backward-compatibility: v0.3.0 fields present in v0.4.0 export | All span attribute keys that were present in v0.3.0 (`gh-aw.*`, `github.*`, `gen_ai.system`, `gen_ai.usage.total_tokens`, `OTEL_EXPORTER_OTLP_ENDPOINT`, built-in setup/conclusion span names) **MUST** also be present in a v0.4.0 export at the same semantic positions | Produce a v0.4.0 compliant export from the current implementation; compare the set of attribute keys against the v0.3.0 attribute inventory (defined in Version 0.3.0 change-log entry in Section 19); assert no v0.3.0 attribute has been removed or renamed; assert no built-in span name has changed |
 
 
@@ -891,6 +1011,8 @@ The following implementation areas are authoritative for version 0.4.0 compatibi
 | Frontmatter schema | `pkg/parser/schemas/main_workflow_schema.json`, `pkg/parser/schema_test.go` |
 | Compiler normalization and env injection | `pkg/workflow/observability_otlp.go`, `pkg/workflow/observability_otlp_test.go`, `pkg/workflow/safe_output_helpers_test.go` |
 | Gateway credential scoping | `pkg/workflow/mcp_renderer.go`, `pkg/workflow/mcp_setup_generator.go`, `pkg/workflow/mcp_renderer_test.go` |
+| MCP access-control fixture contract | `specs/github-mcp-access-control-compliance/README.md` |
+| Replace-label fixture contract | `specs/replace-label-compliance/README.md` |
 | Runtime setup/conclusion spans and JSONL mirror | `actions/setup/js/send_otlp_span.cjs`, `actions/setup/js/send_otlp_span.test.cjs`, `actions/setup/js/otel_contract.test.cjs` |
 | Header and attribute masking | `actions/setup/sh/mask_otlp_headers.sh`, `actions/setup/sh/mask_otlp_attributes.sh`, `pkg/workflow/observability_otlp_mask_script_test.go` |
 | Local validation target | `Makefile` target `validate-otel-contract` |
@@ -927,14 +1049,32 @@ context is added to outcome spans or links.
 - `docs/src/content/docs/reference/open-telemetry.mdx`
 - `docs/src/content/docs/reference/frontmatter.md`
 - `docs/src/content/docs/reference/mcp-gateway.md`
-- `specs/aw-harness.md`
 - `specs/safe-output-outcome-evaluation.md`
 
 ---
 
 ## 19. Change Log
 
+### Unreleased
+
+- **Added**: A normative requirement (§10.8) that completed BinEval records MUST produce `eval.result` events on `gh-aw.evals.conclusion`; when a not-evaluated status marker is present it takes precedence and answers are not emitted.
+
+### Version 0.6.0 (Working Draft, November 5, 2026)
+
+- **Clarified**: Consolidated fail-closed endpoint, credential, mirror, fan-out, and shutdown safeguards in §16.6 and added a testable five-step finalization order in §16.5.
+- **Added**: Cross-reference to the safe-output outcome evaluation contract, clarifying that the CLI emits JSON/JSONL and does not currently export outcome spans.
+
+### Version 0.5.0 (Working Draft, August 27, 2026)
+
+- **Added**: §5.8 Default Fallback — the compiler falls back to `${{ secrets.GH_AW_DEFAULT_OTLP_ENDPOINT || vars.GH_AW_DEFAULT_OTLP_ENDPOINT }}` / `${{ secrets.GH_AW_DEFAULT_OTLP_HEADERS }}` when no `observability.otlp` endpoint is configured in frontmatter or an import, forcing `if-missing: ignore` so an unset default is a silent no-op.
+- **Added**: A normative requirement (§5.8, §6.4) that a default endpoint resolved with a URL but empty headers MUST be dropped by every span-emitting runtime path (job-setup, conclusion, outcome, MCP gateway), not only by whichever job performs credential validation, so no job ordering can allow unauthenticated export.
+- **Added**: A normative requirement (§5.8) that the compiler MUST NOT emit a duplicate env-block mapping key when the workflow already defines an OTLP-related key (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS`, `GH_AW_OTLP_ALL_HEADERS`, `GH_AW_OTLP_ENDPOINTS`, `GH_AW_OTLP_IF_MISSING`, `GH_AW_OTLP_ATTRIBUTES`).
+- **Clarified**: §6.1 table entry for `GH_AW_OTLP_IF_MISSING` now cross-references the default fallback.
+
 ### Version 0.4.0 (Working Draft, June 18, 2026)
+
+- **Removed** (documentation correction, August 2026): References to a `copilot-otel.jsonl` local mirror/companion artifact. PR #32280 removed the file-export pipeline that produced it (`COPILOT_OTEL_FILE_EXPORTER_PATH` injection, artifact inclusion, and forwarding script); Copilot CLI spans are now expected to be exported directly to the configured OTLP backend and queried there.
+- **Sync follow-up**: Keep the legacy local-mirror artifact name only as this historical note; repo-wide searches for that name SHOULD continue to return this changelog entry as the sole live reference after PR #32280.
 
 - **Changed**: Reframed 0.4.0 as a non-breaking compatibility revision rather than a replacement telemetry standard.
 - **Preserved**: `observability.otlp`, direct OTLP export, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `GITHUB_AW_OTEL_TRACE_ID`, `GITHUB_AW_OTEL_PARENT_SPAN_ID`, `TRACEPARENT` compatibility, built-in setup/conclusion spans, `gen_ai.system`, `gen_ai.usage.total_tokens`, and raw OTLP JSONL mirror behavior.
@@ -943,6 +1083,8 @@ context is added to outcome spans or links.
 - **Clarified**: A versioned mirror envelope may be added only as an additive format; `/tmp/gh-aw/otel.jsonl` remains raw OTLP/JSON lines for compatibility.
 - **Added**: Metric cardinality, privacy, redaction, and secret-handling guidance while preserving existing artifacts and query surfaces.
 - **Added**: Inlined compatibility validation requirements, optional extension tests, and the implementation map so this document is self-contained.
+- **Added**: Consolidated fail-closed safeguards for export, endpoint fan-out, and shutdown handling.
+- **See also**: `specs/safe-output-outcome-evaluation.md` (Change Log, Version 1.0.1) for aligned outcome-taxonomy and provenance rules.
 
 ### Version 0.3.0 (Working Draft, June 15, 2026)
 

@@ -50,10 +50,12 @@ If you're creating new issues and want to assign Copilot immediately, use `assig
 safe-outputs:
   assign-to-agent:
     name: "copilot"            # default agent (default: "copilot")
-    model: "claude-opus-4.6"   # default AI model (default: "auto")
+    model: "o3"                # default AI model (default: "auto")
+    reasoning-effort: "high"   # optional reasoning effort
     custom-agent: "agent-id"   # default custom agent ID (optional)
     custom-instructions: "..."  # default custom instructions (optional)
     allowed: [copilot]         # restrict to specific agents (optional)
+    required-labels: [copilot-ready] # assign only while all labels are present (optional)
     max: 1                     # max assignments (default: 1)
     target: "triggering"       # "triggering" (default), "*", or number
     target-repo: "owner/repo"  # where the issue lives (cross-repository)
@@ -64,6 +66,15 @@ safe-outputs:
 ```
 
 **Supported agents:** `copilot` (`copilot-swe-agent`)
+
+`reasoning-effort` accepts `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` and is forwarded as `agent_assignment.reasoning_effort` without enforcing model-specific capabilities. Invalid values produce a warning and are omitted without failing the assignment. The field also supports expressions:
+
+```yaml wrap
+safe-outputs:
+  assign-to-agent:
+    model: "o3"
+    reasoning-effort: ${{ inputs.reasoning_effort }}
+```
 
 ### Target Issue or Pull Request
 
@@ -88,6 +99,12 @@ When an `allowed` list is configured, existing agent assignees not in the list a
 Both safe outputs require a fine-grained PAT. The default `GITHUB_TOKEN` lacks the necessary permissions.
 
 See the [official GitHub Copilot cloud agent API documentation](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api#using-the-issues-api) for full details on token requirements.
+
+`assign-to-agent` checks the selected credential once with `GET /rate_limit` when the first assignment message is processed, except in staged mode. An authentication failure skips all assignments and records one warning, batch error diagnostic, and assignment summary without failing the safe-outputs step. With `ignore-if-error: true`, the hard-error count remains zero, but the diagnostic is still exported. Other preflight errors do not block assignment.
+
+Failed authentication or assignment attempts add credential diagnostics: the selected token source, dedicated credential presence, token format category, PAT permissions, and an authentication remedy link. The source identifies the selected magic secret (`GH_AW_AGENT_TOKEN`, `GH_AW_GITHUB_TOKEN`, or `GITHUB_TOKEN`), or reports a configured credential without exposing its expression or secret name. Older compiled workflows report that the selected source is unavailable; recompile to include source metadata. Format categories do not establish token validity or permissions. Diagnostics never include token values or retry assignment with a lower-priority credential, and remain visible in assignment error outputs even with `ignore-if-error: true`.
+
+If you see `Bad credentials`, replace or renew the selected user token and check its repository access and organization approval/SSO. The target checks and assignment API enforce repository permissions and Copilot availability; a green workflow conclusion alone does not prove that Copilot was assigned.
 
 ### Using a Personal Access Token (PAT)
 
@@ -133,7 +150,7 @@ gh aw secrets set GH_AW_AGENT_TOKEN --value "<your-pat-token>"
     silenced={true}
 />
 
-## Related Documentation
+## Learn More
 
 - [Safe Outputs Reference](/gh-aw/reference/safe-outputs/) - All safe output configurations
 - [Authentication Reference](/gh-aw/reference/auth/) - All tokens and secrets

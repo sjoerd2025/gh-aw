@@ -11,9 +11,11 @@ import (
 )
 
 func TestTopLevelEnvSecretsGuidedErrorCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getTopLevelEnvSecretsGuidedErrorCodemod()
 
 	t.Run("returns guided error when top-level env contains a secret", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:
@@ -43,12 +45,14 @@ env:
 			{name: "documentation_link", msg: "https://github.github.com/gh-aw/reference/engines/"},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
 				require.ErrorContains(t, codemodErr, tc.msg)
 			})
 		}
 	})
 
 	t.Run("returns deduplicated guided error with multiple secret references", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:
@@ -72,6 +76,7 @@ env:
 	})
 
 	t.Run("no-op when top-level env has no secrets", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:
@@ -96,6 +101,7 @@ env:
 	})
 
 	t.Run("no-op when there is no top-level env section", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 engine:
@@ -118,6 +124,7 @@ engine:
 	})
 
 	t.Run("no-op when env only uses vars not secrets", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:
@@ -140,6 +147,7 @@ env:
 	})
 
 	t.Run("does not modify content even when secret found", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:

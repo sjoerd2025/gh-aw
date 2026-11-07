@@ -38,7 +38,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 
 safe-outputs:
   create-discussion:
@@ -49,6 +48,7 @@ safe-outputs:
 
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
@@ -63,12 +63,11 @@ tools:
     max-file-size: 524288  # 512KB
     max-file-count: 50
   bash: [":*"]
-  web-fetch:
 
 jobs:
   post-issue:
-    needs: agent
-    if: failure()
+    needs: [agent, detection]
+    if: failure() && needs.detection.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       issues: write

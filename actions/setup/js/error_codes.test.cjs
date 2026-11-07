@@ -9,6 +9,8 @@ const {
   ERR_PARSE,
   ERR_SYSTEM,
   SAFE_OUTPUT_E001,
+  SAFE_OUTPUT_E002,
+  SAFE_OUTPUT_E007,
   SAFE_OUTPUT_E009,
   SAFE_OUTPUT_E010,
   SAFE_OUTPUT_E099,
@@ -27,6 +29,8 @@ describe("error_codes", () => {
       expect(ERR_PARSE).toBeDefined();
       expect(ERR_SYSTEM).toBeDefined();
       expect(SAFE_OUTPUT_E001).toBeDefined();
+      expect(SAFE_OUTPUT_E002).toBeDefined();
+      expect(SAFE_OUTPUT_E007).toBeDefined();
       expect(SAFE_OUTPUT_E009).toBeDefined();
       expect(SAFE_OUTPUT_E010).toBeDefined();
       expect(SAFE_OUTPUT_E099).toBeDefined();
@@ -35,7 +39,23 @@ describe("error_codes", () => {
     });
 
     it("exports string values only", () => {
-      const codes = [ERR_VALIDATION, ERR_PERMISSION, ERR_API, ERR_CONFIG, ERR_NOT_FOUND, ERR_PARSE, ERR_SYSTEM, SAFE_OUTPUT_E001, SAFE_OUTPUT_E009, SAFE_OUTPUT_E010, SAFE_OUTPUT_E099, CONFIG_HASH_MISMATCH, RATE_LIMIT_EXCEEDED];
+      const codes = [
+        ERR_VALIDATION,
+        ERR_PERMISSION,
+        ERR_API,
+        ERR_CONFIG,
+        ERR_NOT_FOUND,
+        ERR_PARSE,
+        ERR_SYSTEM,
+        SAFE_OUTPUT_E001,
+        SAFE_OUTPUT_E002,
+        SAFE_OUTPUT_E007,
+        SAFE_OUTPUT_E009,
+        SAFE_OUTPUT_E010,
+        SAFE_OUTPUT_E099,
+        CONFIG_HASH_MISMATCH,
+        RATE_LIMIT_EXCEEDED,
+      ];
       for (const code of codes) {
         expect(typeof code).toBe("string");
       }
@@ -77,6 +97,14 @@ describe("error_codes", () => {
       expect(SAFE_OUTPUT_E001).toBe("E001");
     });
 
+    it("SAFE_OUTPUT_E002 is 'E002'", () => {
+      expect(SAFE_OUTPUT_E002).toBe("E002");
+    });
+
+    it("SAFE_OUTPUT_E007 is 'E007'", () => {
+      expect(SAFE_OUTPUT_E007).toBe("E007");
+    });
+
     it("SAFE_OUTPUT_E009 is 'E009'", () => {
       expect(SAFE_OUTPUT_E009).toBe("E009");
     });
@@ -116,7 +144,23 @@ describe("error_codes", () => {
     });
 
     it("legacy codes are distinct from primary codes", () => {
-      const all = [ERR_VALIDATION, ERR_PERMISSION, ERR_API, ERR_CONFIG, ERR_NOT_FOUND, ERR_PARSE, ERR_SYSTEM, SAFE_OUTPUT_E001, SAFE_OUTPUT_E009, SAFE_OUTPUT_E010, SAFE_OUTPUT_E099, CONFIG_HASH_MISMATCH, RATE_LIMIT_EXCEEDED];
+      const all = [
+        ERR_VALIDATION,
+        ERR_PERMISSION,
+        ERR_API,
+        ERR_CONFIG,
+        ERR_NOT_FOUND,
+        ERR_PARSE,
+        ERR_SYSTEM,
+        SAFE_OUTPUT_E001,
+        SAFE_OUTPUT_E002,
+        SAFE_OUTPUT_E007,
+        SAFE_OUTPUT_E009,
+        SAFE_OUTPUT_E010,
+        SAFE_OUTPUT_E099,
+        CONFIG_HASH_MISMATCH,
+        RATE_LIMIT_EXCEEDED,
+      ];
       const unique = new Set(all);
       expect(unique.size).toBe(all.length);
     });

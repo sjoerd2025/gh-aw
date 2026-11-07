@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/setutil"
@@ -14,23 +15,102 @@ func (c *Compiler) generateGitConfigurationSteps() []string {
 	return c.generateGitConfigurationStepsWithToken("${{ github.token }}", "")
 }
 
+// generateGitConfigurationStepsForData generates git credential setup with awareness of the
+// workflow's checkout configuration. When a checkout is marked current: true and is located
+// in a subdirectory, the generated step targets that subdirectory via working-directory so
+// that git operations succeed even when the workspace root is no longer a git repository
+// (for example, after a pre-agent step that removes the private control-plane checkout).
+// Falls back to the standard workspace-root step when no current-checkout subdirectory is
+// configured.
+func (c *Compiler) generateGitConfigurationStepsForData(data *WorkflowData) []string {
+	token := "${{ github.token }}"
+
+	if data == nil || len(data.CheckoutConfigs) == 0 {
+		return c.generateGitConfigurationStepsWithToken(token, "")
+	}
+
+	checkoutMgr := NewCheckoutManager(data.CheckoutConfigs)
+	currentPath := checkoutMgr.GetCurrentCheckoutPath()
+	currentRepo := checkoutMgr.GetCurrentRepository()
+
+	if currentPath == "" {
+		// No current checkout in a subdirectory — use the standard workspace-root behaviour.
+		rootRepo := checkoutMgr.effectiveRootCheckoutRepository()
+		if c.trialMode && !checkoutMgr.HasExternalRootCheckout() {
+			rootRepo = c.trialLogicalRepoSlug
+		}
+		steps := c.generateGitConfigurationStepsWithToken(token, rootRepo)
+		candidates := checkoutMgr.runtimeRootCandidates()
+		if len(candidates) == 0 {
+			return steps
+		}
+		steps = steps[:len(steps)-1]
+		steps = append(steps, runtimeRootEnvironmentLines(candidates)...)
+		return append(steps, runtimeRootCredentialCommandLines(nil, candidates)...)
+	}
+	return generateCurrentCheckoutGitConfigurationSteps(checkoutMgr, token, currentPath, currentRepo)
+}
+
+func generateCurrentCheckoutGitConfigurationSteps(checkoutMgr *CheckoutManager, token, currentPath, currentRepo string) []string {
+	// current: true checkout is in a subdirectory. Emit the step with a working-directory
+	// so configure_git_credentials.sh runs from that directory. This ensures that
+	// `git remote set-url origin` targets the correct git repository even when the
+	// workspace root no longer contains a .git directory.
+	repoNameValue := "${{ github.repository }}"
+	if currentRepo != "" {
+		repoNameValue = fmt.Sprintf("%q", currentRepo)
+		gitConfigStepsLog.Print("Generating git config steps for current checkout: explicit_repository=true")
+	} else {
+		gitConfigStepsLog.Print("Generating git config steps for current checkout: explicit_repository=false")
+	}
+
+	steps := []string{
+		"      - name: Configure Git credentials\n",
+		fmt.Sprintf("        working-directory: %q\n", currentPath),
+		"        env:\n",
+		fmt.Sprintf("          GH_AW_GIT_REPOSITORY: %s\n", repoNameValue),
+		"          GITHUB_SERVER_URL: ${{ github.server_url }}\n",
+		// SECURITY: token moved to env mapping so the shell treats it as data,
+		// not syntax. Prevents shell injection if token value contains metacharacters.
+		fmt.Sprintf("          GITHUB_TOKEN: %s\n", token),
+		"        run: bash \"${RUNNER_TEMP}/gh-aw/actions/configure_git_credentials.sh\"\n",
+	}
+	if !strings.Contains(currentPath, "${{") {
+		return steps
+	}
+	candidates := checkoutMgr.runtimeRootCandidates()
+	steps = steps[:len(steps)-1]
+	steps = append(steps, runtimeRootEnvironmentLines(candidates)...)
+	steps = append(steps,
+		"        run: |\n",
+		"          GH_AW_WORKSPACE_DIRECTORY=$(cd -- \"$GITHUB_WORKSPACE\" && pwd -P)\n",
+		"          if [ \"$(pwd -P)\" = \"$GH_AW_WORKSPACE_DIRECTORY\" ]; then\n",
+	)
+	steps = append(steps, runtimeRootIdentityLines(candidates)...)
+	return append(steps,
+		"          fi\n",
+		"          bash \"${RUNNER_TEMP}/gh-aw/actions/configure_git_credentials.sh\"\n",
+	)
+}
+
 // generateGitConfigurationStepsWithToken generates git credential setup with a custom token
 // and optional target repository for cross-repo operations
 // Parameters:
 //   - token: GitHub token to use for authentication
 //   - targetRepoSlug: optional target repository (e.g., "org/repo") for cross-repo operations
-//     If empty, uses source repository (github.repository)
-//     If set, configures git remote to point to the target repository
+//     If empty, uses the trial logical repository or source repository (github.repository)
+//     If set, verifies that the checkout matches the target repository
 func (c *Compiler) generateGitConfigurationStepsWithToken(token string, targetRepoSlug string) []string {
-	// Determine which repository to configure git remote for
-	// Priority: targetRepoSlug > trialLogicalRepoSlug > default (source repo)
+	// An explicit checkout identity takes precedence over the trial fallback.
 	repoNameValue := "${{ github.repository }}"
 	if targetRepoSlug != "" {
-		repoNameValue = fmt.Sprintf("%q", targetRepoSlug)
-		gitConfigStepsLog.Printf("Generating git config steps with target repo: %s", targetRepoSlug)
+		if targetRepoSlug != repoNameValue {
+			repoNameValue = fmt.Sprintf("%q", targetRepoSlug)
+		}
+		gitConfigStepsLog.Print("Generating git config steps with explicit checkout identity")
 	} else if c.trialMode && c.trialLogicalRepoSlug != "" {
 		repoNameValue = fmt.Sprintf("%q", c.trialLogicalRepoSlug)
-		gitConfigStepsLog.Printf("Generating git config steps in trial mode with logical repo: %s", c.trialLogicalRepoSlug)
+		gitConfigStepsLog.Print("Generating git config steps with trial checkout identity")
 	} else {
 		gitConfigStepsLog.Print("Generating git config steps with default github.repository")
 	}
@@ -38,7 +118,7 @@ func (c *Compiler) generateGitConfigurationStepsWithToken(token string, targetRe
 	return []string{
 		"      - name: Configure Git credentials\n",
 		"        env:\n",
-		fmt.Sprintf("          GITHUB_REPOSITORY: %s\n", repoNameValue),
+		fmt.Sprintf("          GH_AW_GIT_REPOSITORY: %s\n", repoNameValue),
 		"          GITHUB_SERVER_URL: ${{ github.server_url }}\n",
 		// SECURITY: token moved to env mapping so the shell treats it as data,
 		// not syntax. Prevents shell injection if token value contains metacharacters.
@@ -71,12 +151,10 @@ func getGitIdentityEnvVars() map[string]string {
 // When envVars is empty the step runs only clean_git_credentials.sh.
 // When envVars is non-empty the env block is included and both scripts are run in sequence.
 //
-// The step always uses continue-on-error to remain resilient when no .git directory
-// exists (e.g. checkout: false) or when git is not installed.
+// Cleanup and its postcondition fail closed. With no checkout, both scripts are no-ops.
 func (c *Compiler) generateCredentialsCleanerStep(envVars map[string]struct{}) []string {
 	lines := []string{
 		"      - name: Clean credentials\n",
-		"        continue-on-error: true\n",
 	}
 
 	if len(envVars) > 0 {
@@ -87,16 +165,14 @@ func (c *Compiler) generateCredentialsCleanerStep(envVars map[string]struct{}) [
 				lines = append(lines, fmt.Sprintf("          %s: \"true\"\n", known.envVar))
 			}
 		}
-		lines = append(lines,
-			"        run: |\n",
-			"          bash \"${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials.sh\"\n",
-			"          bash \"${RUNNER_TEMP}/gh-aw/actions/clean_known_action_credentials.sh\"\n",
-		)
-	} else {
-		lines = append(lines,
-			"        run: bash \"${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials.sh\"\n",
-		)
 	}
-
+	lines = append(lines,
+		"        run: |\n",
+		"          bash \"${RUNNER_TEMP}/gh-aw/actions/clean_git_credentials.sh\"\n",
+	)
+	if len(envVars) > 0 {
+		lines = append(lines, "          bash \"${RUNNER_TEMP}/gh-aw/actions/clean_known_action_credentials.sh\"\n")
+	}
+	lines = append(lines, "          bash \"${RUNNER_TEMP}/gh-aw/actions/verify_git_credentials.sh\"\n")
 	return lines
 }

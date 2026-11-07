@@ -6,12 +6,42 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// TestBuildSafeOutputsSectionsCustomTools verifies that custom jobs, scripts, and actions
+func TestBuildSafeOutputsSectionsCodeCoverage(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		config   *UploadCodeCoverageConfig
+		expected string
+	}{
+		{name: "disabled"},
+		{name: "default budget", config: &UploadCodeCoverageConfig{}, expected: "upload_code_coverage"},
+		{name: "single upload", config: &UploadCodeCoverageConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")}}, expected: "upload_code_coverage"},
+		{name: "multiple uploads", config: &UploadCodeCoverageConfig{BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("3")}}, expected: "upload_code_coverage(max:3)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &SafeOutputsConfig{
+				NoOp:               &NoOpConfig{},
+				UploadCodeCoverage: tt.config,
+			}
+			sections := buildSafeOutputsSections(config, nil, nil)
+			require.NotEmpty(t, sections)
+			_, enabled := computeEnabledToolNames(&WorkflowData{SafeOutputs: config})["upload_code_coverage"]
+			assert.Equal(t, tt.config != nil, enabled)
+			if tt.expected == "" {
+				assert.NotContains(t, sections[0].Content, "upload_code_coverage")
+			} else {
+				assert.Equal(t, "<safe-output-tools>\nTools: "+tt.expected+", noop", sections[0].Content)
+			}
+		})
+	}
+}
+
+// TestBuildSafeOutputsSectionsCustomTools verifies that custom and workflow-derived tools
 // defined in safe-outputs are included in the compiled <safe-output-tools> prompt block.
 // This prevents silent drift between the runtime configuration surface and the
 // agent-facing compiled instructions.
@@ -108,6 +138,29 @@ func TestBuildSafeOutputsSectionsCustomTools(t *testing.T) {
 			expectedTools: []string{"add_comment", "create_issue", "noop", "deploy", "notify"},
 		},
 		{
+			name: "external issue tools appear in tools list",
+			safeOutputs: &SafeOutputsConfig{
+				LinearCreateIssue: &LinearCreateIssueConfig{},
+				LinearAddComment:  &LinearTargetConfig{},
+				LinearUpdateIssue: &LinearUpdateIssueConfig{},
+				JiraCreateIssue:   &JiraSafeOutputConfig{},
+				JiraUpdateIssue:   &JiraSafeOutputConfig{},
+				JiraAddComment:    &JiraSafeOutputConfig{},
+				JiraAddLabel:      &JiraSafeOutputConfig{},
+				NoOp:              &NoOpConfig{},
+			},
+			expectedTools: []string{
+				"linear_create_issue",
+				"linear_add_comment",
+				"linear_update_issue",
+				"jira_create_issue",
+				"jira_update_issue",
+				"jira_add_comment",
+				"jira_add_label",
+				"noop",
+			},
+		},
+		{
 			name: "mix of predefined tools, custom jobs, scripts, and actions all appear",
 			safeOutputs: &SafeOutputsConfig{
 				CreateIssues: &CreateIssuesConfig{},
@@ -124,11 +177,53 @@ func TestBuildSafeOutputsSectionsCustomTools(t *testing.T) {
 			},
 			expectedTools: []string{"create_issue", "noop", "custom_job", "custom_script", "custom_action"},
 		},
+		{
+			name: "workflow-derived tools appear instead of generic tool names",
+			safeOutputs: &SafeOutputsConfig{
+				DispatchWorkflow: &DispatchWorkflowConfig{
+					Workflows: []string{"my-fixer"},
+				},
+				DispatchRepository: &DispatchRepositoryConfig{
+					Tools: map[string]*DispatchRepositoryToolConfig{
+						"send-event": {},
+					},
+				},
+				CallWorkflow: &CallWorkflowConfig{
+					Workflows: []string{"my-worker"},
+				},
+				NoOp: &NoOpConfig{},
+			},
+			expectedTools: []string{"my_fixer", "send_event", "my_worker", "noop"},
+		},
+		{
+			name: "empty dispatch workflows fall back to generic tool name",
+			safeOutputs: &SafeOutputsConfig{
+				DispatchWorkflow: &DispatchWorkflowConfig{Workflows: []string{}},
+				NoOp:             &NoOpConfig{},
+			},
+			expectedTools: []string{"dispatch_workflow", "noop"},
+		},
+		{
+			name: "empty repository dispatch tools fall back to generic tool name",
+			safeOutputs: &SafeOutputsConfig{
+				DispatchRepository: &DispatchRepositoryConfig{Tools: map[string]*DispatchRepositoryToolConfig{}},
+				NoOp:               &NoOpConfig{},
+			},
+			expectedTools: []string{"dispatch_repository", "noop"},
+		},
+		{
+			name: "empty reusable workflows fall back to generic tool name",
+			safeOutputs: &SafeOutputsConfig{
+				CallWorkflow: &CallWorkflowConfig{Workflows: []string{}},
+				NoOp:         &NoOpConfig{},
+			},
+			expectedTools: []string{"call_workflow", "noop"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sections := buildSafeOutputsSections(tt.safeOutputs)
+			sections := buildSafeOutputsSections(tt.safeOutputs, nil, nil)
 
 			if tt.expectNil {
 				assert.Nil(t, sections, "Expected nil sections for empty/nil config")
@@ -143,6 +238,29 @@ func TestBuildSafeOutputsSectionsCustomTools(t *testing.T) {
 				"Tool names in <safe-output-tools> should match expected order and set")
 		})
 	}
+}
+
+func TestBuildSafeOutputsSectionsWorkflowBudgetsAreShared(t *testing.T) {
+	dispatchMax := "2"
+	callMax := "3"
+	sections := buildSafeOutputsSections(&SafeOutputsConfig{
+		DispatchWorkflow: &DispatchWorkflowConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{Max: &dispatchMax},
+			Workflows:            []string{"first-dispatch", "second-dispatch"},
+		},
+		CallWorkflow: &CallWorkflowConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{Max: &callMax},
+			Workflows:            []string{"first-call", "second-call"},
+		},
+		NoOp: &NoOpConfig{},
+	}, nil, nil)
+
+	require.NotNil(t, sections)
+	content := sections[0].Content
+	assert.Contains(t, content, "Tools: first_dispatch, second_dispatch, first_call, second_call, noop")
+	assert.Contains(t, content, "Shared budgets: dispatch-workflow [first_dispatch, second_dispatch](max:2 total); call-workflow [first_call, second_call](max:3 total)")
+	assert.NotContains(t, content, "first_dispatch(max:2)")
+	assert.NotContains(t, content, "first_call(max:3)")
 }
 
 // TestBuildSafeOutputsSectionsCustomToolsConsistency verifies that every custom
@@ -161,9 +279,20 @@ func TestBuildSafeOutputsSectionsCustomToolsConsistency(t *testing.T) {
 		Actions: map[string]*SafeOutputActionConfig{
 			"action-x": {Description: "Action X"},
 		},
+		DispatchWorkflow: &DispatchWorkflowConfig{
+			Workflows: []string{"dispatch-target"},
+		},
+		DispatchRepository: &DispatchRepositoryConfig{
+			Tools: map[string]*DispatchRepositoryToolConfig{
+				"repository-target": {},
+			},
+		},
+		CallWorkflow: &CallWorkflowConfig{
+			Workflows: []string{"call-target"},
+		},
 	}
 
-	sections := buildSafeOutputsSections(config)
+	sections := buildSafeOutputsSections(config, nil, nil)
 	require.NotNil(t, sections, "Expected non-nil sections")
 
 	actualToolNames := extractToolNamesFromSections(t, sections)
@@ -192,6 +321,30 @@ func TestBuildSafeOutputsSectionsCustomToolsConsistency(t *testing.T) {
 		assert.True(t, actualToolSet[normalized],
 			"Custom action %q (normalized: %q) should appear as an exact tool identifier in <safe-output-tools>", actionName, normalized)
 	}
+
+	for _, workflowName := range config.DispatchWorkflow.Workflows {
+		normalized := stringutil.NormalizeSafeOutputIdentifier(workflowName)
+		assert.True(t, actualToolSet[normalized],
+			"Dispatch workflow %q (normalized: %q) should appear as an exact tool identifier in <safe-output-tools>", workflowName, normalized)
+	}
+	assert.NotContains(t, actualToolSet, "dispatch_workflow",
+		"The untyped dispatch_workflow tool should not appear when typed workflow tools are configured")
+
+	for _, toolName := range sliceutil.SortedKeys(config.DispatchRepository.Tools) {
+		normalized := stringutil.NormalizeSafeOutputIdentifier(toolName)
+		assert.True(t, actualToolSet[normalized],
+			"Dispatch repository tool %q (normalized: %q) should appear as an exact tool identifier in <safe-output-tools>", toolName, normalized)
+	}
+	assert.NotContains(t, actualToolSet, "dispatch_repository",
+		"The generic dispatch_repository tool should not appear when typed repository tools are configured")
+
+	for _, workflowName := range config.CallWorkflow.Workflows {
+		normalized := stringutil.NormalizeSafeOutputIdentifier(workflowName)
+		assert.True(t, actualToolSet[normalized],
+			"Call workflow %q (normalized: %q) should appear as an exact tool identifier in <safe-output-tools>", workflowName, normalized)
+	}
+	assert.NotContains(t, actualToolSet, "call_workflow",
+		"The generic call_workflow tool should not appear when typed workflow tools are configured")
 }
 
 // TestBuildSafeOutputsSectionsMaxExpressionExtraction verifies that ${{ }} expressions
@@ -208,7 +361,7 @@ func TestBuildSafeOutputsSectionsMaxExpressionExtraction(t *testing.T) {
 			},
 		},
 		NoOp: &NoOpConfig{},
-	})
+	}, nil, nil)
 
 	require.NotNil(t, sections, "Expected non-nil sections")
 
@@ -245,10 +398,7 @@ func TestBuildSafeOutputsSectionsMaxExpressionExtraction(t *testing.T) {
 }
 
 func TestBuildSafeOutputsSections_IncludesCommentMemoryPromptFile(t *testing.T) {
-	sections := buildSafeOutputsSections(&SafeOutputsConfig{
-		CommentMemory: &CommentMemoryConfig{},
-		NoOp:          &NoOpConfig{},
-	})
+	sections := buildSafeOutputsSections(nil, &CommentMemoryConfig{}, nil)
 
 	require.NotNil(t, sections, "Expected non-nil sections")
 
@@ -262,8 +412,58 @@ func TestBuildSafeOutputsSections_IncludesCommentMemoryPromptFile(t *testing.T) 
 
 	assert.True(t, found, "Expected comment-memory guidance file to be included when comment_memory is enabled")
 
-	actualToolNames := extractToolNamesFromSections(t, sections)
-	assert.NotContains(t, actualToolNames, "comment_memory", "comment_memory should not be exposed as an agent tool when file-based sync is enabled")
+	for _, section := range sections {
+		if !section.IsFile {
+			assert.NotContains(t, section.Content, "comment_memory", "comment_memory should not be exposed as an agent tool when file-based sync is enabled")
+		}
+	}
+}
+
+func TestBuildSafeOutputsSections_IncludesSteerPromptFile(t *testing.T) {
+	sections := buildSafeOutputsSections(&SafeOutputsConfig{
+		Steer: true,
+	}, nil, nil)
+
+	require.NotNil(t, sections, "Expected non-nil sections")
+
+	found := false
+	for _, section := range sections {
+		if section.IsFile && section.Content == safeOutputsSteeringIssueFile {
+			found = true
+			break
+		}
+	}
+
+	assert.True(t, found, "Expected steering issue guidance file to be included when steering is enabled")
+}
+
+func TestBuildSafeOutputsSectionsLedgerTools(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		ledgers  []LedgerConfig
+		expected []string
+	}{
+		{name: "table", ledgers: []LedgerConfig{{Name: "history", Type: "table", Key: "run_id"}}, expected: []string{"ledger_append"}},
+		{name: "log", ledgers: []LedgerConfig{{Name: "history", Type: "log"}}, expected: []string{"ledger_append"}},
+		{name: "set", ledgers: []LedgerConfig{{Name: "history", Type: "set"}}, expected: []string{"ledger_append"}},
+		{name: "counter", ledgers: []LedgerConfig{{Name: "history", Type: "counter"}}, expected: []string{"ledger_append"}},
+		{name: "map", ledgers: []LedgerConfig{{Name: "cache", Type: "map"}}, expected: []string{"ledger_map_delete", "ledger_map_put"}},
+		{name: "notes", ledgers: []LedgerConfig{{Name: "notes", Type: "notes"}}, expected: []string{"ledger_note_add", "ledger_note_vote"}},
+		{name: "mixed", ledgers: []LedgerConfig{{Name: "history"}, {Name: "cache", Type: "map"}, {Name: "other-cache", Type: "map"}}, expected: []string{"ledger_append", "ledger_map_delete", "ledger_map_put"}},
+		{name: "compaction enabled", ledgers: []LedgerConfig{{Name: "history", Compaction: &LedgerCompactionConfig{}}}, expected: []string{"ledger_append", "ledger_request_compaction"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &LedgerToolConfig{Ledgers: tt.ledgers}
+			sections := buildSafeOutputsSections(nil, nil, config)
+			require.Equal(t, tt.expected, extractToolNamesFromSections(t, sections))
+
+			for _, safeOutputs := range []*SafeOutputsConfig{nil, {NoOp: &NoOpConfig{}}} {
+				data := &WorkflowData{SafeOutputs: safeOutputs, LedgerConfig: config}
+				names := extractToolNamesFromSections(t, NewCompiler().collectPromptSections(data))
+				require.Subset(t, names, tt.expected)
+			}
+		})
+	}
 }
 
 // the list of tool names in the order they appear, stripping any max-budget annotations
@@ -287,7 +487,6 @@ func extractToolNamesFromSections(t *testing.T, sections []PromptSection) []stri
 	toolsListLine := lines[1]
 	require.True(t, strings.HasPrefix(toolsListLine, "Tools: "),
 		"Second line should start with 'Tools: ', got: %q", toolsListLine)
-
 	toolsList := strings.TrimPrefix(toolsListLine, "Tools: ")
 	toolEntries := strings.Split(toolsList, ", ")
 

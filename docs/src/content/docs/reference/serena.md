@@ -47,6 +47,12 @@ imports:
 ---
 ```
 
+The Go wrapper installs pinned gopls v0.22.0 in the runner tool cache and exposes
+it to Serena through a read-only mount. Before the agent starts, Serena's native
+project health check exercises semantic symbol analysis in the configured
+container. Installation errors, language-server startup failures, and a
+four-minute health-check timeout fail preflight with an explicit error.
+
 ### Example: Code Analysis
 
 ```aw wrap
@@ -132,18 +138,21 @@ Pre-create the cache directory (`mkdir -p /tmp/gh-aw/cache-memory/serena`) for f
 
 ## Troubleshooting
 
-**Language server not found:** Install required dependencies (e.g., `go install golang.org/x/tools/gopls@latest` for Go).
+**Language server not found:** For Go, use `shared/mcp/serena-go.md` to install
+gopls and check semantic readiness before the agent starts. Inspect the
+`Expose Go to Serena container` and `Check Serena Go semantic analysis` step
+logs for installation or startup errors. Other language servers may require
+additional dependencies.
 
 **Memory permission issues:** Ensure cache directory exists with proper permissions: `mkdir -p /tmp/gh-aw/cache-memory/serena && chmod 755 /tmp/gh-aw/cache-memory/serena`
 
 **Slow initial analysis:** Expected behavior as language servers build indexes. Subsequent runs use cached data.
 
-## Related Documentation
+## Learn More
 
 - [Imports Reference](/gh-aw/reference/imports/) - Full imports and `import-schema` syntax
 - [Using MCPs](/gh-aw/guides/mcps/) - General MCP server configuration
 - [Tools Reference](/gh-aw/reference/tools/) - Complete tools configuration
-- [Using MCPs](/gh-aw/guides/mcps/) - MCP introduction
 - [Serena GitHub Repository](https://github.com/oraios/serena) — official repo and [documentation](https://oraios.github.io/serena/)
 - [Language Support](https://oraios.github.io/serena/01-about/020_programming-languages.html) - Supported languages and dependencies
 - [Serena Tools Reference](https://oraios.github.io/serena/01-about/035_tools.html) - Complete tool documentation

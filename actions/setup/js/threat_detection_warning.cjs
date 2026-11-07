@@ -21,25 +21,6 @@ function normalizeThreatKinds(reason) {
 }
 
 /**
- * Returns the XML marker used to identify threat-detected output.
- *
- * @param {string | undefined | null} reason
- * @returns {string}
- */
-function getThreatDetectedMarker(reason) {
-  return "<!-- gh-aw-threat-detected -->";
-}
-
-/**
- * Returns the marker template for configured message rendering.
- *
- * @returns {string}
- */
-function getThreatDetectedMarkerTemplate() {
-  return "<!-- gh-aw-threat-detected -->";
-}
-
-/**
  * Returns a human-readable reason text for detection warnings.
  *
  * @param {string | undefined | null} reason
@@ -69,10 +50,108 @@ function isToolingFailureReason(reason) {
   return normalized === "agent_failure" || normalized === "parse_error";
 }
 
+/**
+ * Returns the detection conclusion that safe-output consumers must act on.
+ *
+ * safe_outputs only runs when the detection job result is success, so a
+ * "failure" conclusion seen there was swallowed by the warn-mode step-level
+ * continue-on-error. When its reason is a tooling failure (agent_failure,
+ * parse_error) the detection engine failed without a verdict, and the warn-mode
+ * policy (WTD1a annotate, WTD2 convert, WTD3 abort) applies exactly as for
+ * "warning". Every other conclusion is returned unchanged.
+ *
+ * @param {string | undefined | null} conclusion
+ * @param {string | undefined | null} reason
+ * @returns {string}
+ */
+function getEffectiveDetectionConclusion(conclusion, reason) {
+  const normalized = String(conclusion || "").trim();
+  if (normalized === "failure" && isToolingFailureReason(reason)) {
+    return "warning";
+  }
+  return normalized;
+}
+
+/**
+ * Returns the XML marker used to identify threat-engine-error output.
+ * This marker is distinct from the real-threat marker so that automated tools
+ * can distinguish a tooling failure from an actual security finding.
+ *
+ * @returns {string}
+ */
+function getThreatEngineErrorMarker() {
+  return "<!-- gh-aw-threat-engine-error -->";
+}
+
+/**
+ * Returns the marker template for configured engine-error message rendering.
+ *
+ * @returns {string}
+ */
+function getThreatEngineErrorMarkerTemplate() {
+  return "<!-- gh-aw-threat-engine-error -->";
+}
+
+/**
+ * Returns the review-warning presentation associated with a detection reason.
+ * Centralizing these fields keeps admonition copy and marker routing in sync
+ * across status messages, footers, and fallback pull request bodies.
+ *
+ * @param {string | undefined | null} reason
+ * @returns {{admonition: string, title: string, summary: string, marker: string}}
+ */
+function getThreatWarningPresentation(reason) {
+  if (isToolingFailureReason(reason)) {
+    return {
+      admonition: "WARNING",
+      title: "Threat detection engine error",
+      summary: "Threat detection could not complete its analysis due to a tooling error. This is not a security finding.",
+      marker: getThreatEngineErrorMarker(),
+    };
+  }
+  return {
+    admonition: "CAUTION",
+    title: "agentic threat detected",
+    summary: "Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.",
+    marker: getThreatDetectedMarker(reason),
+  };
+}
+
+/**
+ * Returns the XML marker used to identify threat-detected output.
+ * When the reason indicates a tooling failure (agent_failure, parse_error) a
+ * distinct engine-error marker is returned so automated tools can distinguish
+ * "detection engine crashed" from "detection engine found something".
+ *
+ * @param {string | undefined | null} reason
+ * @returns {string}
+ */
+function getThreatDetectedMarker(reason) {
+  if (isToolingFailureReason(reason)) {
+    return getThreatEngineErrorMarker();
+  }
+  return "<!-- gh-aw-threat-detected -->";
+}
+
+/**
+ * Returns the marker template for configured message rendering.
+ * Always returns the real-threat marker; use getThreatEngineErrorMarkerTemplate()
+ * for tooling-failure templates where the reason is known at template-build time.
+ *
+ * @returns {string}
+ */
+function getThreatDetectedMarkerTemplate() {
+  return "<!-- gh-aw-threat-detected -->";
+}
+
 module.exports = {
   normalizeThreatKinds,
+  getThreatWarningPresentation,
   getThreatDetectedMarker,
   getThreatDetectedMarkerTemplate,
+  getThreatEngineErrorMarker,
+  getThreatEngineErrorMarkerTemplate,
   getDetectionReasonText,
   isToolingFailureReason,
+  getEffectiveDetectionConclusion,
 };

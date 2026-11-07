@@ -260,6 +260,20 @@ func TestEnhanceToolDescriptionNormalizeClosingKeywordsFalseAddComment(t *testin
 	}
 }
 
+func TestEnhanceToolDescriptionAddCommentDoesNotDuplicateConstraintsMarker(t *testing.T) {
+	description := enhanceToolDescription("add_comment", "Add a comment. CONSTRAINTS: Input is limited to 524288 characters.", &SafeOutputsConfig{
+		AddComments: &AddCommentsConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{Max: defaultIntStr(3)},
+		},
+	})
+	if strings.Count(description, "CONSTRAINTS:") != 1 {
+		t.Fatalf("expected a single constraints marker, got: %s", description)
+	}
+	if !strings.Contains(description, "Maximum 3 comment(s) can be added.") {
+		t.Fatalf("expected configured max constraint in description, got: %s", description)
+	}
+}
+
 func TestEnhanceToolDescriptionNormalizeClosingKeywordsCreatePullRequest(t *testing.T) {
 	description := enhanceToolDescription("create_pull_request", "Create a pull request.", &SafeOutputsConfig{
 		CreatePullRequests: &CreatePullRequestsConfig{
@@ -279,5 +293,19 @@ func TestEnhanceToolDescriptionNormalizeClosingKeywordsFalseCreatePullRequest(t 
 	})
 	if strings.Contains(description, "Backtick-wrapped issue-closing keyword references") {
 		t.Fatalf("did not expect normalize-closing-keywords note when disabled, got: %s", description)
+	}
+}
+
+func TestAddCommentConstraintsNilConfig(t *testing.T) {
+	constraints := addCommentConstraints(nil)
+
+	want := []string{"Supports reply_to_id for discussion threading."}
+	if len(constraints) != len(want) {
+		t.Fatalf("expected %d constraint(s), got %d: %v", len(want), len(constraints), constraints)
+	}
+	for i, expected := range want {
+		if constraints[i] != expected {
+			t.Fatalf("constraint %d: expected %q, got %q", i, expected, constraints[i])
+		}
 	}
 }

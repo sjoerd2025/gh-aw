@@ -16,7 +16,7 @@ sidebar:
 
 ## Abstract
 
-This specification defines the A/B experiment system for GitHub Agentic Workflows (gh-aw).
+This specification defines the A/B experiment system for GitHub Agentic Workflows.
 It covers the `experiments:` frontmatter schema, variant selection algorithms, state persistence
 backends, expression and template integration, activation job structure, audit CLI integration,
 and statistical analysis requirements. Conforming implementations provide operators with a
@@ -227,8 +227,9 @@ The same minimum-two-variants constraint from R-SCHEMA-005 applies.
 |---|---|---|
 | `description` | string | Human-readable explanation of what the experiment tests. |
 | `hypothesis` | string | Null and alternative hypothesis statements. |
-| `metric` | string | Primary metric name to observe (e.g., `aic`), or an eval reference (`eval:<id>` / `evals.<id>`) when using `evals:`. |
-| `secondary_metrics` | string[] | Additional metrics to collect. |
+| `metric` | string | Primary metric name to observe (e.g., `aic`), an eval reference (`eval:<id>` / `evals.<id>`) when using `evals:`, a grader reference (`grader:<id>` / `graders.<id>`) when using `graders:`, or `outcome:accepted` / `outcome:zero_touch`. |
+| `secondary_metrics` | string[] | Additional metric references, including outcome references. |
+| `outcome_window` | `"auto"` or positive duration string | Minimum run age for outcome observations. Defaults to `auto`, which learns a pooled per-experiment 95th-percentile decision time using Kaplan–Meier estimation, clamped to 24 hours–30 days. It falls back to `72h` until 20 outputs have known decision times. An explicit positive Go duration overrides learning; applies to primary, secondary, and guardrail outcome metrics. |
 | `guardrail_metrics` | object[] | Thresholds that must not degrade. Each object has `name` (string), `threshold` (string or number), and optional `direction` (`"min"`\|`"max"`) (see §4.4). |
 | `min_samples` | integer ≥ 1 | Minimum runs per variant before analysis is reliable. Defaults to 20. |
 | `weight` | integer[] | Per-variant probability weights (see §5.2). |
@@ -236,12 +237,13 @@ The same minimum-two-variants constraint from R-SCHEMA-005 applies.
 | `start_date` | string (YYYY-MM-DD) | Experiment is inactive before this date (see §6). |
 | `end_date` | string (YYYY-MM-DD) | Experiment is inactive after this date (see §6). |
 | `analysis_type` | string enum | Statistical test for automated reporting (see §11.2). |
+| `decision` | object | Deterministic interpretation policy (see §11.6). |
 | `tags` | string[] | Free-form labels for dashboard filtering. |
 | `notify` | object | Significance-alert destination (see §4.5). |
 
 **R-SCHEMA-009**: The `weight`, `issue`, `min_samples`, `start_date`, `end_date`, `analysis_type`,
-`tags`, and `notify` fields carry no effect on variant assignment outside their documented
-subsections. `description`, `hypothesis`, `metric`, `secondary_metrics`, and `tags` are
+`outcome_window`, `tags`, and `notify` fields carry no effect on variant assignment outside
+their documented subsections. `description`, `hypothesis`, `metric`, `secondary_metrics`, and `tags` are
 purely informative at runtime.
 
 **R-SCHEMA-010**: Implementations **MUST NOT** introduce additional properties in the object
@@ -661,7 +663,54 @@ use the specified test for significance analysis:
 
 **R-STAT-004**: When `analysis_type` is absent, reporting tools **SHOULD** default to the
 two-proportion z-test for binary outcomes (success/failure) and Welch's t-test for continuous
-metrics (e.g., duration).
+metrics (e.g., duration). For outcome-backed metrics, values are binary only when every
+usable per-run value is 0 or 1; fractional run values require Welch's t-test.
+
+#### Outcome-backed observations
+
+`outcome:accepted` and `outcome:zero_touch` **MUST** be accepted in `metric`,
+`secondary_metrics`, and `guardrail_metrics`. Unknown `outcome:` kinds **MUST** be
+rejected with an error identifying the supported kinds and an example.
+
+Outcome evaluation **MUST** run only when the CLI analyzes experiments with the
+explicit `--outcome` flag, using the
+assignment history for variant attribution and the existing deterministic safe-output
+outcome evaluators. Without the flag, the CLI **MUST NOT** fetch outcome evidence
+and **MUST** return an actionable error when a primary, secondary, or guardrail metric
+references an outcome. No scheduled collector is required.
+
+When `outcome_window` is `auto` or omitted, implementations **MUST** estimate the
+pooled 95th-percentile time to decision from the experiment's own outputs across all variants, treating still-open
+outputs as right-censored observations with Kaplan–Meier estimation. The selected
+window **MUST** be clamped to 24 hours–30 days and **MUST** fall back to `72h`
+until at least 20 outputs have known decision times. An explicit positive Go
+duration **MUST** override estimation. Reports **MUST** include the effective window,
+its source (`learned`, `default`, or `configured`), and the sample size used when
+learning or falling back.
+
+Runs younger than the effective `outcome_window` **MUST** be reported as `immature`
+and excluded from `min_samples`. Each mature run contributes at most one observation:
+accepted outputs divided by resolved outputs for `outcome:accepted`, or zero-touch
+outputs divided by resolved outputs for `outcome:zero_touch`. Resolved outputs comprise
+accepted, rejected, and stale pending outcomes. Pending outputs after the window **MUST**
+count in the denominator but not the numerator.
+
+Unknown and errored outcomes **MUST** be excluded as unavailable. Lifecycle,
+lifecycle-close, ignored, and skipped outputs **MUST NOT** contribute. Runs with no
+outcome-bearing outputs **MUST** be excluded as `no_op`, not scored as successes.
+Missing manifests **MUST** be unavailable evidence, not no-ops.
+
+Zero-touch is a subset of accepted outcomes: a merged PR without non-bot comments,
+reviews, or commits after creation. Its supporting evidence **MUST** be complete;
+accepted PR outputs with incomplete evidence **MUST** be excluded from this metric,
+not scored zero. Other resolved output types **MUST** remain in the denominator
+and contribute zero to the numerator.
+
+Reports **MUST** expose per-variant `immature`, `stale_pending`, `unavailable`, and
+`no_op` coverage in text and JSON for outcome-backed primary, secondary, and guardrail
+metrics. Outcome-backed secondary metrics **MUST** include per-variant observations
+and statistical comparisons in text and JSON.
+Only usable run observations count toward `min_samples`.
 
 ### 11.3 Multiple Comparison Correction
 
@@ -679,10 +728,12 @@ state the correction method and the adjusted α threshold in the report output.
 
 ### 11.4 Minimum Sample Size Gate
 
-**R-STAT-007**: Reporting tools **MUST NOT** issue a PROMOTE recommendation for any variant
-until all variants in the experiment have accumulated at least `min_samples` runs (or 20 if
-`min_samples` is not declared). When any variant is below threshold, the recommendation
-**MUST** be EXTEND.
+**R-STAT-007**: Reporting tools **MUST NOT** issue a PROMOTE decision for any variant
+until all variants in the experiment have accumulated at least `min_samples` usable observations
+(or 20 if `min_samples` is not declared). When any variant is below threshold, readiness **MUST**
+be `COLLECTING`. For an otherwise supported two-variant decision, the decision **MUST** be `EXTEND`.
+The multi-variant limitation in R-STAT-016 takes precedence for experiments with more than two
+variants.
 
 **R-STAT-008**: When weights are non-uniform (§5.2), the `min_samples` target applies to the
 **smallest expected group**. For a `weight: [70, 30]` experiment with `min_samples: 30`, the
@@ -691,9 +742,9 @@ even if the 70% arm has accumulated many more.
 
 ### 11.5 Guardrail Evaluation
 
-**R-STAT-009**: Reporting tools that evaluate `guardrail_metrics` **MUST** emit a `GUARDRAIL_FAILED`
-status for any variant that violates a declared threshold, and **MUST** override the
-recommendation to ABANDON regardless of the primary-metric p-value.
+**R-STAT-009**: Reporting tools that evaluate `guardrail_metrics` **MUST** emit a failed
+guardrail status for any variant that violates a declared threshold, and **MUST** override the
+decision to REJECT regardless of the primary-metric p-value.
 
 **R-STAT-010**: Multi-variant experiments **MUST** show guardrail pass/fail status per variant,
 not aggregated across the experiment.
@@ -715,7 +766,80 @@ and **MUST NOT** alter the comparison logic.
 > experiment configs programmatically (e.g. from a generator agent), because it separates the
 > numeric bound from the comparison direction, making both machine-readable and human-readable.
 
-### 11.6 Reporting Workflow Permissions
+### 11.6 Deterministic Decision Policy
+
+**R-STAT-014**: An experiment MAY declare a `decision` object with these fields:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `minimum_effect` | number ≥ 0 | `0` | Minimum absolute primary-metric improvement required for promotion. |
+| `regression_tolerance` | number ≥ 0 | `minimum_effect` | Maximum absolute primary-metric regression tolerated before rejection. |
+| `confidence` | number, 0 < value < 1 | `0.95` | Required evidence probability. |
+
+**R-STAT-015**: Decision effects are absolute and use the primary metric's units. Reporting tools
+MUST normalize direction so a positive normalized effect means the candidate is better. For
+frequentist methods, sufficient evidence means `p <= 1-confidence`. For `bayesian_ab`, tools
+MUST use the analyzer's probability of superiority and MUST NOT convert it to a p-value.
+
+**R-STAT-016**: A deterministic two-variant decision MUST apply this precedence:
+
+1. Fewer than `min_samples` usable observations: `EXTEND`.
+2. Missing or insufficient mandatory guardrail observations: `EXTEND`.
+3. Failed mandatory guardrail: `REJECT`.
+4. Material candidate regression with sufficient evidence: `REJECT`.
+5. Material candidate improvement with sufficient evidence: `PROMOTE`.
+6. Otherwise: `INCONCLUSIVE`.
+
+Statistical significance without the configured practical effect MUST NOT produce `PROMOTE`.
+Reporting tools MUST return `INCONCLUSIVE` with `unsupported_multi_variant` for automatic decisions
+with more than two variants, regardless of readiness. Statistical comparisons MAY still be reported
+with the multiple-comparison correction in §11.3, but the decision layer does not rank or select a
+winner.
+
+**R-STAT-017**: The decision layer MUST consume existing analysis results. It MUST NOT fetch
+observations, rerun statistical tests or graders, mutate experiment state, change traffic, or
+promote workflow sources.
+
+**R-STAT-018**: Structured analysis output MUST expose readiness independently from decision.
+Readiness is `COLLECTING` until every variant reaches `min_samples` usable observations, then
+`READY`. `READY` does not imply `PROMOTE`; a ready experiment may be `EXTEND`, `PROMOTE`, `REJECT`,
+or `INCONCLUSIVE`. The legacy `recommendation` field MAY remain `EXTEND` / `READY_FOR_ANALYSIS`
+for backward compatibility.
+
+**R-STAT-019**: The stable core decision values are `EXTEND`, `PROMOTE`, `REJECT`, and
+`INCONCLUSIVE`. `ABANDON`, `GUARDRAIL_FAILED`, and `READY_FOR_ANALYSIS` MUST NOT be emitted as core
+decision values. `READY_FOR_ANALYSIS` MAY be retained only in the legacy readiness-oriented
+`recommendation` field.
+
+**R-STAT-020**: The stable core reason codes and their meanings are:
+
+| Reason code | Meaning |
+|---|---|
+| `insufficient_samples` | One or more variants are below `min_samples`. |
+| `insufficient_observations` | Fewer than two variants, a primary comparison, or a mandatory guardrail lacks usable observations. |
+| `candidate_improved` | Sufficient evidence establishes a material candidate improvement. |
+| `candidate_regressed` | Sufficient evidence establishes a material candidate regression. |
+| `guardrail_failed` | A mandatory guardrail failed. |
+| `guardrail_unsupported` | A mandatory guardrail has no supported observation source. |
+| `effect_below_threshold` | Evidence is sufficient but practical effect is below policy. |
+| `evidence_insufficient` | The configured evidence threshold is not satisfied. |
+| `unsupported_multi_variant` | Automatic adjudication requires exactly two variants. |
+| `analysis_unavailable` | Required statistical effect or evidence cannot be computed. |
+
+**R-STAT-021**: Each structured analysis entry MUST emit `readiness`, `decision`, `reason_code`,
+`reason`, `samples`, `decision_guardrails`, and `decision_policy`. It MUST emit `control`,
+`candidate`, `direction`, `effect`, and `evidence` when those values are available for the decision
+path. The enclosing analysis contract also exposes the configured `metric`, `analysis_type`,
+`min_samples`, per-variant assignment and observation counts, comparisons, and detailed guardrail
+statuses. Consumers SHOULD depend on structured readiness, decision, and reason fields rather than
+human-readable prose.
+
+The `effect` object reports the raw absolute candidate-minus-control effect, an optional relative
+effect when the control mean is non-zero, and a direction-normalized absolute effect. The `evidence`
+object reports the analysis method, whether the configured evidence threshold was satisfied, and
+either a p-value or Bayesian probability of superiority when applicable.
+
+### 11.7 Reporting Workflow Permissions
 
 **R-STAT-011**: Any automated workflow that posts comments to issues (e.g., via `notify.issue`
 or step-based issue comment creation) **MUST** declare `permissions: issues: write` in its
@@ -761,6 +885,11 @@ assignment vector per run and evaluating whether each observed combination cell 
 sample coverage. If interaction effects cannot be bounded (for example, sparse cells below
 `min_samples`), the report **MUST** emit an explicit interaction-risk status and **MUST NOT**
 recommend PROMOTE for affected variants.
+
+The core decision engine does not currently consume interaction diagnostics. The bundled daily
+experiment report preserves a core `PROMOTE` decision but sets its presentation-level
+`report_action` to `EXTEND` with `interaction_underpowered` when this safety hold applies.
+`interaction_underpowered` is not a core decision reason code.
 
 ### 12.1 Conflict Resolution Norms
 
@@ -918,7 +1047,7 @@ Conformance at each level is verified by the following test categories.
 | T-STAT-001 | R-STAT-001 | Assignments derived from `state.runs`, not delta inference |
 | T-STAT-002 | R-STAT-005 | Bonferroni correction applied for K ≥ 3 variants |
 | T-STAT-003 | R-STAT-007 | PROMOTE withheld until all variants reach `min_samples` |
-| T-STAT-004 | R-STAT-009 | GUARDRAIL_FAILED forces ABANDON recommendation |
+| T-STAT-004 | R-STAT-009 | A failed mandatory guardrail forces a REJECT decision |
 | T-STAT-005 | R-STAT-011 | Reporting workflow declares `issues: write` |
 
 ### 14.2 Compliance Checklist

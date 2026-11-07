@@ -31,9 +31,11 @@ imports:
   - shared/ai-coding-dictionary.md
 
   - shared/otlp.md
+  - shared/reporting.md
 safe-outputs:
   add-comment:
     max: 1
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[docs] "
@@ -50,7 +52,7 @@ safe-outputs:
 
 steps:
   - name: Setup Node.js
-    uses: actions/setup-node@v7.0.0
+    uses: actions/setup-node@v7.1.0
     with:
       node-version: '24'
       cache: 'npm'

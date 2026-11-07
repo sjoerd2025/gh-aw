@@ -19,12 +19,14 @@ var githubExpressionWhitespaceReplacer = strings.NewReplacer("\r\n", " ", "\n", 
 
 // GitHubAppConfig holds configuration for GitHub App-based token minting
 type GitHubAppConfig struct {
-	AppID           string            `yaml:"client-id,omitempty"`         // GitHub App client ID (or legacy app ID) (e.g., "${{ vars.APP_ID }}")
-	PrivateKey      string            `yaml:"private-key,omitempty"`       // GitHub App private key (e.g., "${{ secrets.APP_PRIVATE_KEY }}")
-	IgnoreIfMissing bool              `yaml:"ignore-if-missing,omitempty"` // If true, skip token minting when client-id/private-key resolve empty
-	Owner           string            `yaml:"owner,omitempty"`             // Optional: owner of the GitHub App installation (defaults to checkout.repository owner when derivable, otherwise current repository owner)
-	Repositories    []string          `yaml:"repositories,omitempty"`      // Optional: comma or newline-separated list of repositories to grant access to
-	Permissions     map[string]string `yaml:"permissions,omitempty"`       // Optional: extra permission-* fields to merge into the minted token (nested wins over job-level)
+	// AppID holds the canonical "client-id" value. The deprecated "app-id" key is
+	// accepted on input and normalized to "client-id" on output.
+	AppID           string            `json:"client-id,omitempty" yaml:"client-id,omitempty"`                 // GitHub App client ID (or legacy app ID) (e.g., "${{ vars.APP_ID }}")
+	PrivateKey      string            `json:"private-key,omitempty" yaml:"private-key,omitempty"`             // GitHub App private key (e.g., "${{ secrets.APP_PRIVATE_KEY }}")
+	IgnoreIfMissing bool              `json:"ignore-if-missing,omitempty" yaml:"ignore-if-missing,omitempty"` // If true, skip token minting when client-id/private-key resolve empty
+	Owner           string            `json:"owner,omitempty" yaml:"owner,omitempty"`                         // Optional: owner of the GitHub App installation (defaults to checkout.repository owner when derivable, otherwise current repository owner)
+	Repositories    []string          `json:"repositories,omitempty" yaml:"repositories,omitempty"`           // Optional: comma or newline-separated list of repositories to grant access to
+	Permissions     map[string]string `json:"permissions,omitempty" yaml:"permissions,omitempty"`             // Optional: extra permission-* fields to merge into the minted token (nested wins over job-level)
 }
 
 // ========================================
@@ -73,7 +75,8 @@ func parseAppConfig(appMap map[string]any) *GitHubAppConfig {
 
 	// Parse repositories (optional)
 	if repos, exists := appMap["repositories"]; exists {
-		if reposArray, ok := repos.([]any); ok {
+		switch reposArray := repos.(type) {
+		case []any:
 			var repoStrings []string
 			for _, repo := range reposArray {
 				if repoStr, ok := repo.(string); ok {
@@ -81,12 +84,15 @@ func parseAppConfig(appMap map[string]any) *GitHubAppConfig {
 				}
 			}
 			appConfig.Repositories = repoStrings
+		case []string:
+			appConfig.Repositories = append([]string(nil), reposArray...)
 		}
 	}
 
 	// Parse permissions (optional) - extra permission-* fields to merge into the minted token
 	if perms, exists := appMap["permissions"]; exists {
-		if permsMap, ok := perms.(map[string]any); ok {
+		switch permsMap := perms.(type) {
+		case map[string]any:
 			appConfig.Permissions = make(map[string]string, len(permsMap))
 			for key, val := range permsMap {
 				if valStr, ok := val.(string); ok {
@@ -95,7 +101,9 @@ func parseAppConfig(appMap map[string]any) *GitHubAppConfig {
 					safeOutputsAppLog.Printf("Ignoring github-app.permissions[%q]: expected string value, got %T", key, val)
 				}
 			}
-		} else {
+		case map[string]string:
+			appConfig.Permissions = maps.Clone(permsMap)
+		default:
 			safeOutputsAppLog.Printf("Ignoring github-app.permissions: expected object, got %T", perms)
 		}
 	}
@@ -121,16 +129,10 @@ func (app *GitHubAppConfig) hasRequiredCredentials() bool {
 // `${{ ... }}` (for example, `${{ secrets.APP_ID }}` -> `secrets.APP_ID`).
 // It returns false for literals and malformed/empty wrappers.
 func extractWrappedGitHubExpression(value string) (string, bool) {
-	trimmed := strings.TrimSpace(value)
-	if !strings.HasPrefix(trimmed, "${{") || !strings.HasSuffix(trimmed, "}}") {
+	if !isExpression(value) {
 		return "", false
 	}
-	inner := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "${{"), "}}"))
-	// Reject wrappers with no usable expression body (e.g. `${{ }}`).
-	if inner == "" {
-		return "", false
-	}
-	return inner, true
+	return stripExpressionWrapper(value), true
 }
 
 // buildGitHubExpressionNonEmptyCheck renders a non-empty check node from wrapped
@@ -367,11 +369,56 @@ func (c *Compiler) buildGitHubAppTokenMintStep(app *GitHubAppConfig, permissions
 	return c.buildGitHubAppTokenMintStepWithMeta(app, permissions, fallbackRepoExpr, "", "Generate GitHub App token", "safe-outputs-app-token")
 }
 
-func (c *Compiler) buildGitHubAppTokenMintStepForRepository(app *GitHubAppConfig, permissions *Permissions, fallbackRepoExpr string, ownerSourceRepository string) []string {
-	return c.buildGitHubAppTokenMintStepWithMeta(app, permissions, fallbackRepoExpr, ownerSourceRepository, "Generate GitHub App token", "safe-outputs-app-token")
+func (c *Compiler) buildGitHubAppTokenMintStepForRepository(jobName string, app *GitHubAppConfig, permissions *Permissions, fallbackRepoExpr string, ownerSourceRepository string) []string {
+	return c.buildGitHubAppTokenMintStepForJob(jobName, app, permissions, fallbackRepoExpr, ownerSourceRepository, "Generate GitHub App token", "safe-outputs-app-token")
 }
 
-func (c *Compiler) buildGitHubAppTokenMintStepWithMeta(app *GitHubAppConfig, permissions *Permissions, fallbackRepoExpr string, ownerSourceRepository string, stepName string, stepID string) []string {
+func appTokenPermissionFields(app *GitHubAppConfig, permissions *Permissions) map[string]string {
+	if permissions == nil {
+		permissions = NewPermissionsContentsRead()
+	}
+	permissionFields := convertPermissionsToAppTokenFields(permissions)
+	for key, val := range app.Permissions {
+		scope := convertStringToPermissionScope(key)
+		if scope == "" {
+			safeOutputsAppLog.Printf("Skipping unknown permission scope %q in github-app.permissions", key)
+			continue
+		}
+		level := strings.ToLower(strings.TrimSpace(val))
+		tempPerms := NewPermissionsFromMap(map[PermissionScope]PermissionLevel{scope: PermissionLevel(level)})
+		maps.Copy(permissionFields, convertPermissionsToAppTokenFields(tempPerms))
+	}
+	if len(permissionFields) == 0 {
+		permissionFields["permission-contents"] = "none"
+	}
+	return permissionFields
+}
+
+func appendGitHubAppTokenRepositoryInput(steps []string, app *GitHubAppConfig, fallbackRepoExpr string) []string {
+	if len(app.Repositories) == 1 {
+		for _, repository := range app.Repositories {
+			if repository == "*" {
+				safeOutputsAppLog.Print("Using org-wide GitHub App token (repositories: *)")
+			} else {
+				steps = append(steps, fmt.Sprintf("          repositories: %s\n", repository))
+			}
+		}
+	} else if len(app.Repositories) > 1 {
+		steps = append(steps, "          repositories: |-\n")
+		for _, repository := range app.Repositories {
+			steps = append(steps, fmt.Sprintf("            %s\n", repository))
+		}
+	} else {
+		repoExpr := fallbackRepoExpr
+		if repoExpr == "" {
+			repoExpr = "${{ github.event.repository.name }}"
+		}
+		steps = append(steps, fmt.Sprintf("          repositories: %s\n", repoExpr))
+	}
+	return steps
+}
+
+func (c *Compiler) buildGitHubAppTokenMintStepWithMeta(app *GitHubAppConfig, permissions *Permissions, fallbackRepoExpr string, ownerSourceRepository string, stepName string, stepID string, conditions ...string) []string {
 	safeOutputsAppLog.Printf("Building GitHub App token mint step: owner=%s, repos=%d", app.Owner, len(app.Repositories))
 	var steps []string
 
@@ -379,84 +426,41 @@ func (c *Compiler) buildGitHubAppTokenMintStepWithMeta(app *GitHubAppConfig, per
 	steps = append(steps, ownerSteps...)
 	steps = append(steps, fmt.Sprintf("      - name: %s\n", stepName))
 	steps = append(steps, fmt.Sprintf("        id: %s\n", stepID))
+	condition := strings.Join(conditions, " && ")
+	if len(conditions) > 1 {
+		condition = combineGitHubIfExpressions(conditions...)
+	}
 	if app.shouldIgnoreMissingKey() {
 		guard := buildIgnoreIfMissingCondition(app)
 		steps = appendStepEnvAssignments(steps, guard.EnvAssignments)
-		if guard.Condition != "" {
-			steps = append(steps, fmt.Sprintf("        if: %s\n", guard.Condition))
+		if condition == "" {
+			condition = guard.Condition
+		} else if guard.Condition != "" {
+			condition = combineGitHubIfExpressions(condition, "("+stripExpressionWrapper(guard.Condition)+")")
 		}
+	}
+	if condition != "" {
+		steps = append(steps, fmt.Sprintf("        if: %s\n", condition))
 	}
 	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/create-github-app-token")))
 	steps = append(steps, "        with:\n")
 	steps = append(steps, fmt.Sprintf("          client-id: %s\n", app.AppID))
 	steps = append(steps, fmt.Sprintf("          private-key: %s\n", app.PrivateKey))
+	steps = append(steps, "          skip-token-revoke: false\n")
 
 	// Add owner - default to the derived checkout owner when available, otherwise current repository owner.
 	steps = append(steps, fmt.Sprintf("          owner: %s\n", owner))
 
-	// Add repositories - behavior depends on configuration:
-	// - If repositories is ["*"], omit the field to allow org-wide access
-	// - If repositories is a single value, use inline format
-	// - If repositories has multiple values, use block scalar format (newline-separated)
-	//   to ensure clarity and proper parsing by actions/create-github-app-token
-	// - If repositories is empty/not specified, default to fallbackRepoExpr or the current repository
-	if len(app.Repositories) == 1 && app.Repositories[0] == "*" {
-		// Org-wide access: omit repositories field entirely
-		safeOutputsAppLog.Print("Using org-wide GitHub App token (repositories: *)")
-	} else if len(app.Repositories) == 1 {
-		// Single repository: use inline format for clarity
-		steps = append(steps, fmt.Sprintf("          repositories: %s\n", app.Repositories[0]))
-	} else if len(app.Repositories) > 1 {
-		// Multiple repositories: use block scalar format (newline-separated)
-		// This format is more readable and avoids potential issues with comma-separated parsing
-		steps = append(steps, "          repositories: |-\n")
-		for _, repo := range app.Repositories {
-			steps = append(steps, fmt.Sprintf("            %s\n", repo))
-		}
-	} else {
-		// No explicit repositories: use fallback expression, or default to the triggering repo's name.
-		// For workflow_call relay scenarios the caller passes needs.activation.outputs.target_repo_name so
-		// the token is scoped to the platform (host) repo name rather than the full owner/repo slug.
-		repoExpr := fallbackRepoExpr
-		if repoExpr == "" {
-			repoExpr = "${{ github.event.repository.name }}"
-		}
-		steps = append(steps, fmt.Sprintf("          repositories: %s\n", repoExpr))
-	}
+	steps = appendGitHubAppTokenRepositoryInput(steps, app, fallbackRepoExpr)
 
 	// Always add github-api-url from environment variable
 	steps = append(steps, "          github-api-url: ${{ github.api_url }}\n")
 
-	// Add permission-* fields automatically computed from job permissions.
-	// Sort keys to ensure deterministic compilation order.
-	if permissions != nil {
-		permissionFields := convertPermissionsToAppTokenFields(permissions)
+	permissionFields := appTokenPermissionFields(app, permissions)
+	keys := sliceutil.SortedKeys(permissionFields)
 
-		// Apply app.Permissions overrides on top of handler-computed permissions.
-		// This allows workflows to add GitHub App-only scopes (e.g. members: read,
-		// organization-administration: read) that are not expressible via standard
-		// safe-output handler declarations.  The override wins over the computed value
-		// for any scope it declares.
-		for key, val := range app.Permissions {
-			scope := convertStringToPermissionScope(key)
-			if scope == "" {
-				safeOutputsAppLog.Printf("Skipping unknown permission scope %q in github-app.permissions", key)
-				continue
-			}
-			level := strings.ToLower(strings.TrimSpace(val))
-			// Map the scope back to a permission-* field name by running it through
-			// a single-entry Permissions object so the same mapping logic applies.
-			tempPerms := NewPermissionsFromMap(map[PermissionScope]PermissionLevel{scope: PermissionLevel(level)})
-			maps.Copy(permissionFields, convertPermissionsToAppTokenFields(tempPerms))
-		}
-
-		// Extract and sort keys for deterministic ordering
-		keys := sliceutil.SortedKeys(permissionFields)
-
-		// Add permissions in sorted order
-		for _, key := range keys {
-			steps = append(steps, fmt.Sprintf("          %s: %s\n", key, permissionFields[key]))
-		}
+	for _, key := range keys {
+		steps = append(steps, fmt.Sprintf("          %s: %s\n", key, permissionFields[key]))
 	}
 
 	return steps
@@ -550,6 +554,9 @@ func convertPermissionsToAppTokenFields(permissions *Permissions) map[string]str
 	}
 	if level, ok := permissions.GetExplicit(PermissionRepositoryCustomProperties); ok {
 		fields["permission-repository-custom-properties"] = string(level)
+	}
+	if level, ok := permissions.GetExplicit(PermissionSecretScanningAlerts); ok && level != PermissionNone {
+		fields["permission-secret-scanning-alerts"] = string(level)
 	}
 	// Organization-level
 	if level, ok := permissions.GetExplicit(PermissionOrganizationProj); ok {
@@ -654,6 +661,7 @@ func (c *Compiler) buildActivationAppTokenMintStep(app *GitHubAppConfig, permiss
 	steps = append(steps, "        with:\n")
 	steps = append(steps, fmt.Sprintf("          client-id: %s\n", app.AppID))
 	steps = append(steps, fmt.Sprintf("          private-key: %s\n", app.PrivateKey))
+	steps = append(steps, "          skip-token-revoke: false\n")
 
 	// Add owner - default to current repository owner if not specified
 	owner := app.Owner

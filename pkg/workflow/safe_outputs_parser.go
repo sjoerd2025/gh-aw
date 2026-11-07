@@ -12,12 +12,19 @@ type SafeOutputTargetConfig struct {
 	AllowedRepos   []string `yaml:"allowed-repos,omitempty"` // List of additional repositories that operations can target (additionally to the target-repo)
 }
 
+// SafeOutputAllowedLabelsConfig contains the shared allowed-labels field for safe output configurations.
+// Embed this in safe output config structs that restrict which labels may be used.
+type SafeOutputAllowedLabelsConfig struct {
+	AllowedLabels []string `yaml:"allowed-labels,omitempty"` // Optional list of allowed labels. If omitted, any labels are allowed (including creating new ones).
+}
+
 // SafeOutputFilterConfig contains common filtering fields for safe output configurations.
 // Embed this in safe output config structs that support filtering by labels or title prefix.
 type SafeOutputFilterConfig struct {
-	RequiredLabels      []string `yaml:"required-labels,omitempty"`       // Required labels for the operation (ALL must match)
-	RequiredTitlePrefix string   `yaml:"required-title-prefix,omitempty"` // Required title prefix for the operation
-	TitlePrefix         string   `yaml:"title-prefix,omitempty"`          // Deprecated alias for required-title-prefix
+	SafeOutputAllowedLabelsConfig `yaml:",inline"`
+	RequiredLabels                []string `yaml:"required-labels,omitempty"`       // Required labels for the operation (ALL must match)
+	RequiredTitlePrefix           string   `yaml:"required-title-prefix,omitempty"` // Required title prefix for the operation
+	TitlePrefix                   string   `yaml:"title-prefix,omitempty"`          // Deprecated alias for required-title-prefix
 }
 
 // SafeOutputDiscussionFilterConfig extends SafeOutputFilterConfig with discussion-specific fields.
@@ -53,11 +60,9 @@ func ParseTargetConfig(configMap map[string]any) (SafeOutputTargetConfig, bool) 
 	config := SafeOutputTargetConfig{}
 
 	// Parse target
-	if target, exists := configMap["target"]; exists {
-		if targetStr, ok := target.(string); ok {
-			config.Target = targetStr
-			safeOutputParserLog.Printf("Target set to: %s", targetStr)
-		}
+	if targetStr := extractTargetFromMap(configMap, safeOutputParserLog); targetStr != "" {
+		config.Target = targetStr
+		safeOutputParserLog.Printf("Target set to: %s", targetStr)
 	}
 
 	// Parse target-repo; wildcard "*" is allowed and means "any repository"

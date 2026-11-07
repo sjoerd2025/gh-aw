@@ -11,6 +11,7 @@ import (
 )
 
 func TestParseBootstrapBool(t *testing.T) {
+	t.Parallel()
 	t.Run("truthy", func(t *testing.T) {
 		truthy := []string{"1", "true", "yes", "on"}
 		for _, raw := range truthy {
@@ -45,6 +46,7 @@ func TestParseBootstrapBool(t *testing.T) {
 }
 
 func TestWorkflowGrantsCopilotRequestsWrite_UsesFrontmatterPermissions(t *testing.T) {
+	t.Parallel()
 	t.Run("requires structural permission", func(t *testing.T) {
 		content := []byte("---\nengine: copilot\npermissions:\n  contents: read\n---\n\ncopilot-requests: write\n")
 		if workflowGrantsCopilotRequestsWrite(content) {
@@ -61,6 +63,7 @@ func TestWorkflowGrantsCopilotRequestsWrite_UsesFrontmatterPermissions(t *testin
 }
 
 func TestBootstrapRepositoryInputEnvNames(t *testing.T) {
+	t.Parallel()
 	if got := bootstrapRepositoryVariableEnvName("CENTRAL_AGENTIC_OPS_MODE"); got != "GH_AW_BOOTSTRAP_VAR_CENTRAL_AGENTIC_OPS_MODE" {
 		t.Fatalf("unexpected variable env name: %s", got)
 	}
@@ -70,6 +73,7 @@ func TestBootstrapRepositoryInputEnvNames(t *testing.T) {
 }
 
 func TestProfileSourcesUseActionsTokenCopilotAuth(t *testing.T) {
+	t.Parallel()
 	workflowDir := t.TempDir()
 	workflowPath := filepath.Join(workflowDir, "copilot.md")
 
@@ -196,6 +200,7 @@ func TestResolveBootstrapSecretValue_NonInteractivePaths(t *testing.T) {
 }
 
 func TestBootstrapHelperUtilities(t *testing.T) {
+	t.Parallel()
 	if got := parseBootstrapNames([]byte("\nOMEGA\nALPHA\n\n")); !strings.EqualFold(strings.Join(got, ","), "ALPHA,OMEGA") {
 		t.Fatalf("unexpected parsed names: %#v", got)
 	}
@@ -237,6 +242,7 @@ func TestBootstrapHelperUtilities(t *testing.T) {
 }
 
 func TestBootstrapGitHubAppManifestHelpers(t *testing.T) {
+	t.Parallel()
 	manifest := buildBootstrapGitHubAppManifest(repositoryPackageBootstrapAction{}, "agentic-ops", "https://github.com/octo/platform-ops", "http://127.0.0.1/callback", "Bootstrap app")
 	if manifest["name"] != "agentic-ops" {
 		t.Fatalf("unexpected manifest name: %#v", manifest["name"])
@@ -251,5 +257,25 @@ func TestBootstrapGitHubAppManifestHelpers(t *testing.T) {
 	}
 	if !strings.Contains(page, `action="https://github.com/settings/apps/new?state=abc&amp;foo=bar"`) {
 		t.Fatalf("registration page did not contain escaped action URL: %s", page)
+	}
+}
+
+func TestRenderBootstrapGitHubAppRegistrationPageEscapesUntrustedValues(t *testing.T) {
+	t.Parallel()
+
+	registrationURL := `<script>alert(1)</script>`
+	manifest := map[string]any{"name": `<script>alert(1)</script>`}
+	page, err := renderBootstrapGitHubAppRegistrationPage(registrationURL, manifest)
+	if err != nil {
+		t.Fatalf("renderBootstrapGitHubAppRegistrationPage returned error: %v", err)
+	}
+	if !strings.Contains(page, `action="%3cscript%3ealert%281%29%3c/script%3e"`) {
+		t.Fatalf("registration URL was not escaped: %s", page)
+	}
+	if !strings.Contains(page, `\u003cscript\u003ealert(1)\u003c/script\u003e`) {
+		t.Fatalf("manifest value was not safely encoded: %s", page)
+	}
+	if strings.Contains(page, `<script>alert(1)</script>`) {
+		t.Fatalf("untrusted input was rendered as markup: %s", page)
 	}
 }

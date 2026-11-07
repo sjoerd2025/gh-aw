@@ -1,8 +1,10 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	actionpins "github.com/github/gh-aw/pkg/actionpins"
@@ -13,6 +15,11 @@ import (
 )
 
 var actionPinsLog = logger.New("workflow:action_pins")
+var pinnedUsesLine = regexp.MustCompile(`(?m)^( {8}uses: | {6}- uses: )(['"]?)([A-Za-z0-9._-]+/[A-Za-z0-9._/-]+@[a-fA-F0-9]{40})(['"]?)([ \t]*#[ \t]*[^\r\n]*)?$`)
+var plainActionPinReference = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+@[a-fA-F0-9]{40}$`)
+
+// Keep exact mappings distinct from ordinary uses of the same target until prefix rewriting finishes.
+const exactPinMappingMarker = "__gh_aw_exact_pin__"
 
 // Type aliases — callers within pkg/workflow use these names directly.
 
@@ -66,7 +73,15 @@ func getActionPin(repo string) string {
 		actionPinsLog.Printf("No embedded pins found for repo: %s", repo)
 		return ""
 	}
-	return actionpins.FormatPinnedActionReference(repo, pins[0].SHA, pins[0].Version)
+	pin := pins[0] //nolint:uncheckedsliceindex // The empty case returns above.
+	return actionpins.FormatPinnedActionReference(repo, pin.SHA, pin.Version)
+}
+
+func getActionPinForData(repo string, data *WorkflowData) string {
+	if data != nil {
+		return getCachedActionPin(repo, data)
+	}
+	return getActionPin(repo)
 }
 
 // getActionPin returns the pinned reference for the given repo.
@@ -78,6 +93,12 @@ func getActionPin(repo string) string {
 // any existing entry and mark it as "used" for orphan pruning. This ensures compiler-generated
 // action references (e.g., actions/cache/save in notify steps) are tracked.
 func (c *Compiler) getActionPin(repo string) string {
+	if c.ghesArtifactCompat {
+		if pin, ok := actionpins.ResolveGHESActionPin(repo); ok {
+			return pin
+		}
+	}
+
 	// Check the cache for any existing entry for this repo (regardless of version).
 	// Compiler-generated actions don't specify versions, so prefer a cached entry only
 	// when it is at least as new as the latest embedded pin.
@@ -119,6 +140,125 @@ func (c *Compiler) getActionPin(repo string) string {
 
 	// Fall back to embedded pins if no suitable cache entry exists
 	return getActionPin(repo)
+}
+
+// mapPinnedUsesInYAML covers standalone generators which build action steps
+// without a Compiler or WorkflowData. Only resolved uses references are changed.
+func mapPinnedUsesInYAML(content string, mappings, prefixes map[string]string, warnings map[string]bool, resolver SHAResolver) (string, error) {
+	if len(mappings) == 0 && len(prefixes) == 0 {
+		return content, nil
+	}
+	if warnings == nil {
+		warnings = make(map[string]bool)
+	}
+	ctx := &actionpins.PinContext{Mappings: mappings, PrefixMappings: prefixes, Warnings: warnings, Resolver: resolver}
+	var mappingErr error
+	exactMappedStep := false
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "      - ") {
+			exactMappedStep = false
+		}
+		if markerIndex := strings.Index(line, exactPinMappingMarker); markerIndex >= 0 {
+			exactMappedStep = true
+			line = strings.Replace(line, " "+exactPinMappingMarker, "", 1)
+			line = strings.Replace(line, exactPinMappingMarker, "", 1)
+			if strings.HasPrefix(strings.TrimSpace(line), "uses:") {
+				line = strings.TrimRight(line, " \t")
+				if withoutCommentMarker, ok := strings.CutSuffix(line, "#"); ok {
+					line = strings.TrimRight(withoutCommentMarker, " \t")
+				}
+			}
+			if strings.TrimSpace(strings.TrimPrefix(line, "name:")) == "" ||
+				strings.TrimSpace(strings.TrimPrefix(line, "      - name:")) == "" ||
+				strings.TrimSpace(strings.TrimPrefix(line, "        name:")) == "" {
+				if strings.HasPrefix(line, "      - name:") {
+					line = "      - name: \"\""
+				} else if strings.HasPrefix(line, "        name:") {
+					line = "        name: \"\""
+				} else {
+					line = "name: \"\""
+				}
+			}
+		}
+		if exactMappedStep {
+			lines[i] = line
+			continue
+		}
+		mappedLine, err := mapPinnedUsesLine(line, ctx)
+		if err != nil {
+			mappingErr = err
+			continue
+		}
+		lines[i] = mappedLine
+	}
+	return strings.Join(lines, "\n"), mappingErr
+}
+
+func mapPinnedUsesLine(line string, ctx *actionpins.PinContext) (string, error) {
+	matches := pinnedUsesLine.FindStringSubmatch(line)
+	if len(matches) >= 6 {
+		captures := [6]string(matches)
+		if captures[2] != captures[4] {
+			return line, nil
+		}
+		indentation := captures[1]
+		reference := captures[3] + captures[5]
+		comment := captures[5]
+		repo, version := pinnedUsesRepoAndSourceVersion(reference)
+		if _, ok := ctx.Mappings[actionpins.FormatCacheKey(repo, version)]; ok {
+			ref, err := actionpins.ResolveActionPin(repo, version, ctx)
+			if err != nil || ref == "" {
+				if err == nil {
+					err = errors.New("mapped target has no resolvable pin")
+				}
+				return line, fmt.Errorf("unable to resolve action pin mapping for %s@%s: %w", repo, version, err)
+			}
+			var hasComment bool
+			reference, comment, hasComment = strings.Cut(ref, " # ")
+			if hasComment {
+				comment = " # " + comment
+			}
+		} else {
+			reference = actionpins.ApplyResolvedActionPinPrefix(repo, captures[3], ctx)
+		}
+		if err := validateYAMLActionPin(reference); err != nil {
+			return line, fmt.Errorf("invalid action pin reference for %s@%s: %w", repo, version, err)
+		}
+		if err := validateYAMLActionPin(comment); err != nil {
+			return line, fmt.Errorf("invalid action pin comment for %s@%s: %w", repo, version, err)
+		}
+		if captures[2] != "" || !plainActionPinReference.MatchString(reference) {
+			return indentation + "'" + escapeYAMLSingleQuoted(reference) + "'" + comment, nil
+		}
+		return indentation + reference + comment, nil
+	}
+	return line, nil
+}
+
+func pinnedUsesRepoAndSourceVersion(reference string) (string, string) {
+	repo, suffix, _ := strings.Cut(reference, "@")
+	_, version, _ := strings.Cut(suffix, " # ")
+	version = strings.TrimSpace(version)
+	if _, sourceVersion, found := strings.Cut(version, " (source "); found && strings.HasSuffix(sourceVersion, ")") {
+		version = strings.TrimSuffix(sourceVersion, ")")
+	}
+	return repo, version
+}
+
+func actionPinWarningsForWorkflows(workflows []*WorkflowData) map[string]bool {
+	for _, data := range workflows {
+		if data != nil && data.ActionPinWarnings != nil {
+			return data.ActionPinWarnings
+		}
+	}
+	warnings := make(map[string]bool) //nolint:seenmapbool // PinContext.Warnings requires map[string]bool for shared deduplication.
+	for _, data := range workflows {
+		if data != nil {
+			data.ActionPinWarnings = warnings
+		}
+	}
+	return warnings
 }
 
 // getCachedActionPinFromResolver returns the pinned action reference for repo,
@@ -183,21 +323,14 @@ func resolveContainerImage(image string, data *WorkflowData) string {
 	return image
 }
 
-// resolveMCPGatewayContainerImage returns an MCP Gateway-compatible container
-// reference. MCP Gateway container fields accept image[:tag] but not digest
-// references, so digest-pinned images are normalized back to their base image.
+// resolveMCPGatewayContainerImage resolves container mappings and digest pins
+// for MCP Gateway server images.
 func resolveMCPGatewayContainerImage(image string, data *WorkflowData) string {
-	resolved := resolveContainerImage(image, data)
-	base, _, hasDigest := strings.Cut(resolved, "@")
-	if hasDigest {
-		return base
-	}
-	return resolved
+	return resolveContainerImage(image, data)
 }
 
 // resolveGatewayContainerFromMappings applies the container_pins redirect from
-// the provided mappings map and strips any digest component, returning an
-// MCP Gateway-compatible image reference (image[:tag] only).
+// the provided mappings map, preserving the replacement's digest.
 // When mappings is nil or the image is not present in the map, the original
 // image is returned unchanged.
 func resolveGatewayContainerFromMappings(image string, mappings map[string]string) string {
@@ -207,12 +340,7 @@ func resolveGatewayContainerFromMappings(image string, mappings map[string]strin
 	// Build a minimal PinContext with no warning tracking (deduplication occurs
 	// during pre-download collection; here we only need the redirect).
 	ctx := &actionpins.PinContext{ContainerMappings: mappings}
-	mapped := actionpins.ApplyContainerPinMapping(image, ctx)
-	base, _, hasDigest := strings.Cut(mapped, "@")
-	if hasDigest {
-		return base
-	}
-	return mapped
+	return actionpins.ApplyContainerPinMapping(image, ctx)
 }
 
 // applyContainerPinMappingFromData applies the container_pins redirect from aw.json
@@ -229,13 +357,90 @@ func applyContainerPinMappingFromData(image string, data *WorkflowData) string {
 // getActionPinWithData returns the pinned action reference for a given action@version,
 // delegating to pkg/actionpins with a PinContext built from WorkflowData.
 func getActionPinWithData(actionRepo, version string, data *WorkflowData) (string, error) {
-	return actionpins.ResolveActionPin(actionRepo, version, data.PinContext())
+	return resolveActionPinWithData(actionRepo, version, data, false)
+}
+
+func getGeneratedActionPinWithData(actionRepo, version string, data *WorkflowData) (string, error) {
+	return resolveActionPinWithData(actionRepo, version, data, true)
+}
+
+func resolveActionPinWithData(actionRepo, version string, data *WorkflowData, generated bool) (string, error) {
+	ctx := pinContextWithoutActionMappings(data)
+	if ctx != nil {
+		if generated {
+			ctx.RecordResolutionFailure = func(f actionpins.ResolutionFailure) {
+				data.ActionResolutionFailures = append(data.ActionResolutionFailures, GHAWManifestResolutionFailure{
+					Repo: f.Repo, Ref: f.Ref, ErrorType: string(f.ErrorType), compilerGenerated: true,
+				})
+			}
+		}
+		if _, mapped := data.ActionPinMappings[actionpins.FormatCacheKey(actionRepo, version)]; mapped {
+			ctx.GHES = false
+			ctx.Mappings = data.ActionPinMappings
+		}
+	}
+	ref, err := actionpins.ResolveActionPin(actionRepo, version, ctx)
+	if err == nil && ref != "" && hasExactActionPinMapping(actionRepo, version, data) {
+		if !strings.Contains(ref, " # ") {
+			ref += " #"
+		}
+		ref += " " + exactPinMappingMarker
+	}
+	return ref, err
+}
+
+func pinContextWithoutActionMappings(data *WorkflowData) *actionpins.PinContext {
+	ctx := data.PinContext()
+	if ctx != nil {
+		ctx.Mappings = nil
+		ctx.PrefixMappings = nil
+	}
+	return ctx
 }
 
 // getCachedActionPin returns the pinned action reference for a given repository,
 // preferring the dynamic resolver from WorkflowData over the embedded pins.
 func getCachedActionPin(repo string, data *WorkflowData) string {
-	return actionpins.ResolveLatestActionPin(repo, data.PinContext())
+	ctx := pinContextWithoutActionMappings(data)
+	if data != nil && data.ActionResolver != nil && data.ActionResolver.cache != nil {
+		latestEmbedded, hasEmbedded := getLatestActionPinByRepo(repo)
+		newestVersion := semverutil.ParseVersion(latestEmbedded.Version)
+		version := latestEmbedded.Version
+		if !hasEmbedded || newestVersion == nil {
+			actionPinsLog.Printf("No valid embedded version baseline for cached action pin selection for %s", repo)
+		} else {
+			actionPinsLog.Printf("Comparing cached action pins for %s against embedded version %s", repo, latestEmbedded.Version)
+			if _, entry, found := data.ActionResolver.cache.FindNewestEntryForRepo(repo); found {
+				cachedVersion := semverutil.ParseVersion(entry.Version)
+				if cachedVersion == nil {
+					actionPinsLog.Printf("Ignoring cached action pin with unparseable version for %s: cache=%s", repo, entry.Version)
+				} else if cachedVersion.IsNewer(newestVersion) {
+					actionPinsLog.Printf("Using newer cached action version for %s: cache=%s embedded=%s", repo, entry.Version, latestEmbedded.Version)
+					version = entry.Version
+				} else {
+					actionPinsLog.Printf("Ignoring cached action version that is not newer for %s: cache=%s embedded=%s", repo, entry.Version, latestEmbedded.Version)
+				}
+			} else {
+				actionPinsLog.Printf("No cached action pin found for %s", repo)
+			}
+			if version != latestEmbedded.Version {
+				actionPinsLog.Printf("Resolving selected cached action version for %s: %s", repo, version)
+				if ref, err := actionpins.ResolveActionPin(repo, version, ctx); err == nil && ref != "" {
+					actionPinsLog.Printf("Resolved cached action pin for %s@%s: %s", repo, version, ref)
+					return ref
+				} else if err != nil {
+					actionPinsLog.Printf("Failed to resolve cached action version for %s@%s; falling back: %v", repo, version, err)
+				} else {
+					actionPinsLog.Printf("Resolved cached action version for %s@%s to an empty pin; falling back", repo, version)
+				}
+			}
+		}
+	} else {
+		actionPinsLog.Printf("No workflow action cache available for %s; resolving the latest action pin", repo)
+	}
+	ref := actionpins.ResolveLatestActionPin(repo, ctx)
+	actionPinsLog.Printf("Using latest action pin for %s: %s", repo, ref)
+	return ref
 }
 
 // --------------------------------------------------------------------------
@@ -350,6 +555,12 @@ func applyActionPinToTypedStep(step *WorkflowStep, data *WorkflowData) (*Workflo
 
 	pinnedRef, err := getActionPinWithData(actionRepo, rawVersion, data)
 	if err != nil || pinnedRef == "" {
+		if hasExactActionPinMapping(actionRepo, rawVersion, data) {
+			if err == nil {
+				err = errors.New("mapped target has no resolvable pin")
+			}
+			return nil, fmt.Errorf("unable to resolve action pin mapping for %s@%s: %w", actionRepo, rawVersion, err)
+		}
 		actionPinsLog.Printf("Skipping pin for %s@%s: no pin available", actionRepo, rawVersion)
 		return step, nil
 	}
@@ -357,7 +568,16 @@ func applyActionPinToTypedStep(step *WorkflowStep, data *WorkflowData) (*Workflo
 	actionPinsLog.Printf("Pinned action: %s@%s -> %s", actionRepo, rawVersion, pinnedRef)
 	result := step.Clone()
 	result.Uses = pinnedRef
+	result.exactActionPinMapping = hasExactActionPinMapping(actionRepo, rawVersion, data)
 	return result, nil
+}
+
+func hasExactActionPinMapping(actionRepo, version string, data *WorkflowData) bool {
+	if data == nil {
+		return false
+	}
+	_, ok := data.ActionPinMappings[actionpins.FormatCacheKey(actionRepo, version)]
+	return ok
 }
 
 // applyActionPinsToTypedSteps applies SHA pinning to a slice of typed WorkflowStep pointers.

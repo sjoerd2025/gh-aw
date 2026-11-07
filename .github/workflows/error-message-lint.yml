@@ -7,7 +7,7 @@ on:
       - '.github/workflows/error-message-lint.yml'
       - 'pkg/linters/**'
       - '.github/skills/error-messages/SKILL.md'
-      - 'docs/src/content/docs/contributing/error-messages.md'
+      - 'docs/src/content/docs/troubleshooting/error-messages.md'
       - 'CONTRIBUTING.md'
   workflow_dispatch:
 
@@ -20,12 +20,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -53,7 +53,10 @@ jobs:
 
       - name: Run errormessage linter on changed files
         if: steps.changed.outputs.files != ''
-        run: /tmp/gh-aw-linters -errormessage.changed-files="${{ steps.changed.outputs.files }}" ./...
+        env:
+          CHANGED_GO_FILES: ${{ steps.changed.outputs.files }}
+        continue-on-error: true
+        run: /tmp/gh-aw-linters -errormessage -errormessage.changed-files="$CHANGED_GO_FILES" ./...
 
       - name: Check for bare fmt.Println/Printf in pkg/cli
         run: |

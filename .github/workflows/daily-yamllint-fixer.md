@@ -29,6 +29,7 @@ tools:
     - "*"
   edit:
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 7d
     title-prefix: "[yamllint-fixer] "
@@ -81,7 +82,7 @@ jobs:
             echo "has_warnings=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Upload yamllint results artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: yamllint-results
           path: /tmp/gh-aw/agent/yamllint/warnings-before.txt
@@ -89,7 +90,7 @@ jobs:
           retention-days: 3
 steps:
   - name: Download yamllint results artifact
-    uses: actions/download-artifact@v8.0.1
+    uses: actions/download-artifact@v8.0.2
     with:
       name: yamllint-results
       path: /tmp/gh-aw/agent/yamllint
@@ -102,12 +103,14 @@ imports:
   - shared/otlp.md
 sandbox:
   agent:
-    sudo: false
+    id: awf
 evals:
   - id: lint_issues_identified
     question: Does the agent output confirm that yamllint issues were identified and analyzed in the generated lock files?
   - id: pr_created_or_noop
     question: Was a pull request created with Go generator fixes for yamllint issues, or was noop used when no issues required changes?
+features:
+  gh-aw-detection: true
 ---
 
 # Daily yamllint Fixer

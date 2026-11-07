@@ -1,7 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { createLogger } = require("./mcp_logger.cjs");
+const { createLogger, debugEnabled } = require("./mcp_logger.cjs");
 const moduleLogger = createLogger("mcp_server_core");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 
@@ -31,14 +31,21 @@ const fs = require("fs");
 const path = require("path");
 
 const { ReadBuffer } = require("./read_buffer.cjs");
-const { validateRequiredFields, validateStringInputLengths, buildStringLengthValidationError, validateStringMinLengths, validateArgumentsAgainstSchema, formatSchemaValidationError } = require("./mcp_scripts_validation.cjs");
+const { validateRequiredFields, validateStringInputLengths, buildStringLengthValidationError, validateStringMinLengths, validateArgumentsAgainstSchema, formatSchemaValidationError } = require("./schema-validation.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { generateEnhancedErrorMessage } = require("./mcp_enhanced_errors.cjs");
 const { createDependencyInstallGate } = require("./mcp_dependencies_manager.cjs");
+const { normalizeSafeOutputName } = require("./safe_output_names.cjs");
+const { levenshteinDistance } = require("./levenshtein_distance.cjs");
 
 const encoder = new TextEncoder();
 const PARAMETER_SIMILARITY_DISTANCE_BONUS = 2;
 const UNKNOWN_PARAMETER_LIST_PREVIEW_MAX = 10;
+// Suggestion limits do not restrict valid registered identifiers. Charge all
+// logical matrix cells, including initialization, and one unit per visited
+// candidate (even when pruned) to one budget per error response.
+const SUGGESTION_IDENTIFIER_MAX_LENGTH = 128;
+const SUGGESTION_MATRIX_CELL_BUDGET = 65536;
 
 /**
  * @typedef {Object} ServerInfo
@@ -55,6 +62,7 @@ const UNKNOWN_PARAMETER_LIST_PREVIEW_MAX = 10;
  * @property {string} [handlerPath] - Optional file path to handler module (original path from config)
  * @property {number} [timeout] - Timeout in seconds for tool execution (default: 60)
  * @property {string[]} [dependencies] - Runtime dependencies to install before first invocation
+ * @property {string} [_rawName] - Original (pre-normalization) tool name, used internally for collision detection
  */
 
 /**
@@ -62,6 +70,7 @@ const UNKNOWN_PARAMETER_LIST_PREVIEW_MAX = 10;
  * @property {ServerInfo} serverInfo - Server information
  * @property {Object<string, Tool>} tools - Registered tools
  * @property {Function} debug - Debug logging function
+ * @property {Function} diagnostic - Required diagnostic logging function, independent of DEBUG
  * @property {Function} debugError - Debug logging function for errors (extracts message from Error objects)
  * @property {Function} writeMessage - Write message to stdout
  * @property {Function} replyResult - Send a result response
@@ -71,6 +80,7 @@ const UNKNOWN_PARAMETER_LIST_PREVIEW_MAX = 10;
  * @property {string} [logFilePath] - Optional log file path
  * @property {boolean} logFileInitialized - Whether log file has been initialized
  * @property {(toolName: string, args: any, tool?: Tool) => any} [normalizeArguments] - Optional tool argument normalizer
+ * @property {(message: string) => string} [redactLogMessage] - Optional diagnostic payload redactor
  */
 
 /**
@@ -93,16 +103,16 @@ function initLogFile(server) {
 }
 
 /**
- * Create a debug function for the server
+ * Create an unconditional diagnostic function for the server
  * @param {MCPServer} server - The MCP server instance
- * @returns {Function} Debug function
+ * @returns {Function} Diagnostic function
  */
-function createDebugFunction(server) {
+function createDiagnosticFunction(server) {
   return msg => {
     const timestamp = new Date().toISOString();
-    const formattedMsg = `[${timestamp}] [${server.serverInfo.name}] ${msg}\n`;
+    const safeMessage = server.redactLogMessage ? server.redactLogMessage(msg) : msg;
+    const formattedMsg = `[${timestamp}] [${server.serverInfo.name}] ${safeMessage}\n`;
 
-    // Always write to stderr
     process.stderr.write(formattedMsg);
 
     // Also write to log file if log directory is set (initialize on first use)
@@ -122,14 +132,26 @@ function createDebugFunction(server) {
 }
 
 /**
+ * @param {MCPServer} server
+ * @returns {Function}
+ */
+function createDebugFunction(server) {
+  const diagnostic = createDiagnosticFunction(server);
+  return msg => {
+    if (debugEnabled(server.serverInfo.name)) diagnostic(msg);
+  };
+}
+
+/**
  * Create a debugError function for the server that handles error casting
  * @param {MCPServer} server - The MCP server instance
  * @returns {Function} Debug error function that extracts message from Error objects
  */
 function createDebugErrorFunction(server) {
+  const diagnostic = createDiagnosticFunction(server);
   return (prefix, error) => {
     const errorMessage = getErrorMessage(error);
-    server.debug(`${prefix}${errorMessage}`);
+    diagnostic(`${prefix}${errorMessage}`);
     if (error instanceof Error && error.stack) {
       server.debug(`${prefix}Stack trace: ${error.stack}`);
     }
@@ -173,7 +195,7 @@ function createReplyErrorFunction(server) {
   return (id, code, message) => {
     // Don't send error responses for notifications (id is null/undefined)
     if (id === undefined || id === null) {
-      server.debug(`Error for notification: ${message}`);
+      server.diagnostic(`Error for notification: ${message}`);
       return;
     }
 
@@ -193,6 +215,7 @@ function createReplyErrorFunction(server) {
  * @param {Object} [options] - Optional server configuration
  * @param {string} [options.logDir] - Directory for log file (optional)
  * @param {(toolName: string, args: any, tool?: Tool) => any} [options.normalizeArguments] - Optional tool argument normalizer
+ * @param {(message: string) => string} [options.redactLogMessage] - Optional diagnostic payload redactor
  * @returns {MCPServer} The MCP server instance
  */
 function createServer(serverInfo, options = {}) {
@@ -204,6 +227,7 @@ function createServer(serverInfo, options = {}) {
     serverInfo,
     tools: {},
     debug: () => {}, // placeholder
+    diagnostic: () => {}, // placeholder
     debugError: () => {}, // placeholder
     writeMessage: () => {}, // placeholder
     replyResult: () => {}, // placeholder
@@ -213,10 +237,12 @@ function createServer(serverInfo, options = {}) {
     logFilePath,
     logFileInitialized: false,
     normalizeArguments: typeof options.normalizeArguments === "function" ? options.normalizeArguments : undefined,
+    redactLogMessage: options.redactLogMessage,
   };
 
   // Initialize functions with references to server
   server.debug = createDebugFunction(server);
+  server.diagnostic = createDiagnosticFunction(server);
   server.debugError = createDebugErrorFunction(server);
   server.writeMessage = createWriteMessageFunction(server);
   server.replyResult = createReplyResultFunction(server);
@@ -351,7 +377,7 @@ function loadToolHandlers(server, tools, basePath) {
         continue;
       }
     } else if (path.isAbsolute(handlerPath)) {
-      server.debug(`  [${toolName}] Using absolute path (bypasses basePath validation): ${handlerPath}`);
+      (server.diagnostic || server.debug)(`  [${toolName}] Using absolute path (bypasses basePath validation): ${handlerPath}`);
     }
 
     // Store the original handler path for reference
@@ -393,7 +419,7 @@ function loadToolHandlers(server, tools, basePath) {
         // Lazy-load shell handler module
         const { createShellHandler } = require("./mcp_handler_shell.cjs");
         const timeout = tool.timeout || 60; // Default to 60 seconds if not specified
-        const baseHandler = createShellHandler(server, toolName, resolvedPath, timeout);
+        const baseHandler = createShellHandler(server, toolName, resolvedPath, timeout, tool.env);
         const ensureDependenciesInstalled = createDependencyInstallGate(server, toolName, resolvedPath, tool.dependencies, basePath || process.cwd());
         tool.handler = async args => {
           await ensureDependenciesInstalled();
@@ -424,7 +450,7 @@ function loadToolHandlers(server, tools, basePath) {
         // Lazy-load Python handler module
         const { createPythonHandler } = require("./mcp_handler_python.cjs");
         const timeout = tool.timeout || 60; // Default to 60 seconds if not specified
-        const baseHandler = createPythonHandler(server, toolName, resolvedPath, timeout);
+        const baseHandler = createPythonHandler(server, toolName, resolvedPath, timeout, tool.env);
         const ensureDependenciesInstalled = createDependencyInstallGate(server, toolName, resolvedPath, tool.dependencies, basePath || process.cwd());
         tool.handler = async args => {
           await ensureDependenciesInstalled();
@@ -440,7 +466,7 @@ function loadToolHandlers(server, tools, basePath) {
         // Lazy-load Go handler module
         const { createGoHandler } = require("./mcp_handler_go.cjs");
         const timeout = tool.timeout || 60; // Default to 60 seconds if not specified
-        const baseHandler = createGoHandler(server, toolName, resolvedPath, timeout);
+        const baseHandler = createGoHandler(server, toolName, resolvedPath, timeout, tool.env);
         const ensureDependenciesInstalled = createDependencyInstallGate(server, toolName, resolvedPath, tool.dependencies, basePath || process.cwd());
         tool.handler = async args => {
           await ensureDependenciesInstalled();
@@ -456,7 +482,7 @@ function loadToolHandlers(server, tools, basePath) {
         // Lazy-load JavaScript handler module
         const { createJavaScriptHandler } = require("./mcp_handler_javascript.cjs");
         const timeout = tool.timeout || 60; // Default to 60 seconds if not specified
-        const baseHandler = createJavaScriptHandler(server, toolName, resolvedPath, timeout);
+        const baseHandler = createJavaScriptHandler(server, toolName, resolvedPath, timeout, tool.env);
         const ensureDependenciesInstalled = createDependencyInstallGate(server, toolName, resolvedPath, tool.dependencies, basePath || process.cwd());
         tool.handler = async args => {
           await ensureDependenciesInstalled();
@@ -486,49 +512,17 @@ function loadToolHandlers(server, tools, basePath) {
  * @param {Tool} tool - The tool to register
  */
 function registerTool(server, tool) {
-  const normalizedName = normalizeTool(tool.name);
+  const normalizedName = normalizeServerToolName(server, tool.name);
+  const existing = server.tools[normalizedName];
+  if (existing && existing._rawName !== tool.name) {
+    throw new Error(`${ERR_VALIDATION}: Tool name collision: '${existing._rawName}' and '${tool.name}' both normalize to '${normalizedName}'`);
+  }
   server.tools[normalizedName] = {
     ...tool,
     name: normalizedName,
+    _rawName: tool.name,
   };
   server.debug(`Registered tool: ${normalizedName}`);
-}
-
-/**
- * Calculate Levenshtein distance between two strings
- * @param {string} a - First string
- * @param {string} b - Second string
- * @returns {number} Edit distance
- */
-function levenshteinDistance(a, b) {
-  const matrix = [];
-
-  // Initialize first column
-  for (let i = 0; i <= b.length; i++) {
-    matrix[i] = [i];
-  }
-
-  // Initialize first row
-  for (let j = 0; j <= a.length; j++) {
-    matrix[0][j] = j;
-  }
-
-  // Fill in the rest of the matrix
-  for (let i = 1; i <= b.length; i++) {
-    for (let j = 1; j <= a.length; j++) {
-      if (b.charAt(i - 1) === a.charAt(j - 1)) {
-        matrix[i][j] = matrix[i - 1][j - 1];
-      } else {
-        matrix[i][j] = Math.min(
-          matrix[i - 1][j - 1] + 1, // substitution
-          matrix[i][j - 1] + 1, // insertion
-          matrix[i - 1][j] + 1 // deletion
-        );
-      }
-    }
-  }
-
-  return matrix[b.length][a.length];
 }
 
 /**
@@ -539,22 +533,7 @@ function levenshteinDistance(a, b) {
  * @returns {Array<{name: string, distance: number}>} Array of similar tool names with distances
  */
 function findSimilarTools(requestedTool, availableTools, maxSuggestions = 3) {
-  const normalizedRequested = normalizeTool(requestedTool);
-  const suggestions = [];
-
-  // Calculate distance for each available tool
-  for (const toolName of Object.keys(availableTools)) {
-    const distance = levenshteinDistance(normalizedRequested, toolName);
-    suggestions.push({ name: toolName, distance });
-  }
-
-  // Sort by distance (closest first) and take top N
-  suggestions.sort((a, b) => a.distance - b.distance);
-
-  // Only return suggestions that are reasonably similar
-  // (distance <= half the length of the requested tool name + 3)
-  const maxDistance = Math.floor(normalizedRequested.length / 2) + 3;
-  return suggestions.filter(s => s.distance <= maxDistance).slice(0, maxSuggestions);
+  return findSimilarNames(requestedTool, Object.keys(availableTools), 3, maxSuggestions);
 }
 
 /**
@@ -562,20 +541,70 @@ function findSimilarTools(requestedTool, availableTools, maxSuggestions = 3) {
  * @param {string} requestedParameter - The parameter name that was provided
  * @param {string[]} availableParameters - Available parameter names
  * @param {number} maxSuggestions - Maximum number of suggestions to return
+ * @param {{remainingCells: number}} [budget] - Shared work budget for an error response
  * @returns {Array<{name: string, distance: number}>} Similar parameter names
  */
-function findSimilarParameters(requestedParameter, availableParameters, maxSuggestions = 3) {
-  const normalizedRequested = normalizeTool(requestedParameter);
-  const suggestions = availableParameters.map(parameterName => ({
-    name: parameterName,
-    distance: levenshteinDistance(normalizedRequested, normalizeTool(parameterName)),
-  }));
+function findSimilarParameters(requestedParameter, availableParameters, maxSuggestions = 3, budget) {
+  return findSimilarNames(requestedParameter, availableParameters, PARAMETER_SIMILARITY_DISTANCE_BONUS, maxSuggestions, budget);
+}
 
+/**
+ * @param {string} requested
+ * @param {string[]} availableNames
+ * @param {number} distanceBonus
+ * @param {number} maxSuggestions
+ * @param {{remainingCells: number}} [budget]
+ * @returns {Array<{name: string, distance: number}>}
+ */
+function findSimilarNames(requested, availableNames, distanceBonus, maxSuggestions, budget = { remainingCells: SUGGESTION_MATRIX_CELL_BUDGET }) {
+  if (requested.length > SUGGESTION_IDENTIFIER_MAX_LENGTH || budget.remainingCells <= 0) {
+    return [];
+  }
+  const normalizedRequested = normalizeTool(requested);
+  if (normalizedRequested.length > SUGGESTION_IDENTIFIER_MAX_LENGTH) {
+    return [];
+  }
+  const maxDistance = Math.floor(normalizedRequested.length / 2) + distanceBonus;
+  const suggestions = [];
+  for (let i = 0; i < availableNames.length && budget.remainingCells > 0; i++) {
+    budget.remainingCells--;
+    const name = availableNames[i];
+    if (name.length > SUGGESTION_IDENTIFIER_MAX_LENGTH) {
+      continue;
+    }
+    const normalizedName = normalizeTool(name);
+    if (normalizedName.length > SUGGESTION_IDENTIFIER_MAX_LENGTH || Math.abs(normalizedName.length - normalizedRequested.length) > maxDistance) {
+      continue;
+    }
+    const cells = (normalizedRequested.length + 1) * (normalizedName.length + 1);
+    if (cells > budget.remainingCells) {
+      budget.remainingCells = 0;
+      break;
+    }
+    budget.remainingCells -= cells;
+    const distance = levenshteinDistance(normalizedRequested, normalizedName);
+    if (distance <= maxDistance) {
+      suggestions.push({ name, distance });
+    }
+  }
   suggestions.sort((a, b) => a.distance - b.distance);
-  // Parameter names are typically short; use a slightly tighter threshold than tool names
-  // so only clearly related misspellings are suggested.
-  const maxDistance = Math.floor(normalizedRequested.length / 2) + PARAMETER_SIMILARITY_DISTANCE_BONUS;
-  return suggestions.filter(s => s.distance <= maxDistance).slice(0, maxSuggestions);
+  return suggestions.slice(0, maxSuggestions);
+}
+
+/**
+ * @param {string} name
+ * @returns {string} Bounded display name for unknown identifiers
+ */
+function formatUnknownIdentifier(name) {
+  if (name.length > SUGGESTION_IDENTIFIER_MAX_LENGTH) {
+    let end = SUGGESTION_IDENTIFIER_MAX_LENGTH;
+    const lastCodeUnit = name.charCodeAt(end - 1);
+    if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
+      end--;
+    }
+    return `${name.slice(0, end)}... (identifier too long for suggestions: maximum ${SUGGESTION_IDENTIFIER_MAX_LENGTH} UTF-16 code units, got ${name.length})`;
+  }
+  return name;
 }
 
 /**
@@ -610,13 +639,15 @@ function validateUnknownParameters(args, inputSchema) {
  */
 function buildUnknownParameterError(unknownParameters, inputSchema) {
   const allowedParameters = inputSchema && inputSchema.properties && typeof inputSchema.properties === "object" ? Object.keys(inputSchema.properties) : [];
+  const budget = { remainingCells: SUGGESTION_MATRIX_CELL_BUDGET };
 
   const unknownDetails = unknownParameters.map(parameterName => {
-    const similar = findSimilarParameters(parameterName, allowedParameters);
+    const similar = findSimilarParameters(parameterName, allowedParameters, 3, budget);
+    const displayName = formatUnknownIdentifier(parameterName);
     if (!similar.length) {
-      return `'${parameterName}'`;
+      return `'${displayName}'`;
     }
-    return `'${parameterName}' (closest: ${similar.map(s => `'${s.name}'`).join(", ")})`;
+    return `'${displayName}' (closest: ${similar.map(s => `'${s.name}'`).join(", ")})`;
   });
 
   const preview = allowedParameters
@@ -635,6 +666,16 @@ function buildUnknownParameterError(unknownParameters, inputSchema) {
  */
 function normalizeTool(name) {
   return name.replace(/-/g, "_").toLowerCase();
+}
+
+/**
+ * @param {MCPServer} server
+ * @param {string} name
+ * @returns {string}
+ */
+function normalizeServerToolName(server, name) {
+  const normalized = normalizeTool(name);
+  return server.serverInfo?.name === "safeoutputs" ? normalizeSafeOutputName(normalized) : normalized;
 }
 
 /**
@@ -723,11 +764,11 @@ async function handleRequest(server, request, defaultHandler) {
           message: "Invalid params: 'name' must be a string",
         };
       }
-      const tool = server.tools[normalizeTool(name)];
+      const tool = server.tools[normalizeServerToolName(server, name)];
       if (!tool) {
         // Find similar tools to suggest
         const similarTools = findSimilarTools(name, server.tools);
-        let errorMessage = `Tool '${name}' not found`;
+        let errorMessage = `Tool '${formatUnknownIdentifier(name)}' not found`;
 
         if (similarTools.length > 0) {
           const suggestions = similarTools.map(s => s.name).join(", ");
@@ -788,7 +829,7 @@ async function handleRequest(server, request, defaultHandler) {
       if (schemaValidationError) {
         throw {
           code: -32602,
-          message: formatSchemaValidationError(name, args, schemaValidationError),
+          message: formatSchemaValidationError(name, args, schemaValidationError, tool.inputSchema),
         };
       }
 
@@ -908,11 +949,18 @@ async function handleMessage(server, req, defaultHandler) {
         server.replyError(id, -32602, "Invalid params: 'name' must be a string");
         return;
       }
-      const tool = server.tools[normalizeTool(name)];
+      const tool = server.tools[normalizeServerToolName(server, name)];
       if (!tool) {
         // Find similar tools to suggest
         const similarTools = findSimilarTools(name, server.tools);
-        let errorMessage = `Tool not found: ${name} (${normalizeTool(name)})`;
+        const displayName = formatUnknownIdentifier(name);
+        let errorMessage = `Tool not found: ${displayName}`;
+        if (name.length <= SUGGESTION_IDENTIFIER_MAX_LENGTH) {
+          const normalizedName = normalizeTool(name);
+          if (normalizedName.length <= SUGGESTION_IDENTIFIER_MAX_LENGTH) {
+            errorMessage += ` (${normalizedName})`;
+          }
+        }
 
         if (similarTools.length > 0) {
           const suggestions = similarTools.map(s => s.name).join(", ");
@@ -963,7 +1011,7 @@ async function handleMessage(server, req, defaultHandler) {
 
       const schemaValidationError = validateArgumentsAgainstSchema(args, tool.inputSchema);
       if (schemaValidationError) {
-        server.replyError(id, -32602, formatSchemaValidationError(name, args, schemaValidationError));
+        server.replyError(id, -32602, formatSchemaValidationError(name, args, schemaValidationError, tool.inputSchema));
         return;
       }
 
@@ -999,8 +1047,10 @@ async function handleMessage(server, req, defaultHandler) {
     // Use the error code only if it's a valid JSON-RPC error code (must be a negative integer).
     // Subprocess exit codes (positive integers like 1, 2, etc.) must not be used as JSON-RPC
     // error codes, as that would produce non-conformant responses (e.g. "code=1").
-    const code = e && typeof e === "object" && Number.isInteger(e.code) && e.code < 0 ? e.code : -32603;
-    server.replyError(id, code, e && e.message ? String(e.message) : "Internal error");
+    const code = typeof e === "object" && e !== null && "code" in e && Number.isInteger(e.code) && e.code < 0 ? e.code : -32603;
+    const hasMessage = typeof e === "object" && e !== null && "message" in e && Boolean(e.message);
+    const message = hasMessage ? getErrorMessage(e) : "Internal error";
+    server.replyError(id, code, message);
   }
 }
 
@@ -1043,13 +1093,19 @@ function start(server, options = {}) {
     throw new Error(`${ERR_VALIDATION}: No tools registered`);
   }
 
-  const onData = async chunk => {
+  let processingChain = Promise.resolve();
+  const onData = chunk => {
     server.readBuffer.append(chunk);
-    await processReadBuffer(server, defaultHandler);
+    processingChain = processingChain
+      .then(() => processReadBuffer(server, defaultHandler))
+      .catch(error => {
+        server.debug(`processReadBuffer error: ${getErrorMessage(error)}`);
+      });
+    return processingChain;
   };
 
   process.stdin.on("data", onData);
-  process.stdin.on("error", err => server.debug(`stdin error: ${err}`));
+  process.stdin.on("error", err => server.debug(`stdin error: ${getErrorMessage(err)}`));
   process.stdin.resume();
   server.debug(`listening...`);
 }

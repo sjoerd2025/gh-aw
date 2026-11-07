@@ -59,6 +59,17 @@ Debug workflow using script mode for custom actions.
 
 **Note:** The `action-mode` can also be overridden via the CLI flag `--action-mode` or the environment variable `GH_AW_ACTION_MODE`. The precedence is: CLI flag > feature flag > environment variable > auto-detection.
 
+## Unrestricted `pull_request_target` Forks
+
+Strict mode rejects `on.pull_request_target.forks: ["*"]` because it admits every fork. To explicitly permit this in strict mode, set the flag in the main workflow's top-level frontmatter (an imported feature does not enable the opt-in):
+
+```yaml wrap
+features:
+  dangerously-allow-pull-request-target-forks-all: true
+```
+
+The compiler still warns when unrestricted admission is enabled, including when this feature is set, `acknowledge-risk: true` is used, or checkout is disabled. Fork filtering does not make PR content trustworthy; event-actor authorization and checkout restrictions remain separate controls.
+
 ## Copilot BYOK Mode (Default for `engine: copilot`)
 
 Copilot offline Bring Your Own Key (BYOK) behavior is now the default for `engine: copilot`, bundling four behaviors:
@@ -91,6 +102,17 @@ features:
   awf-diagnostic-logs: true
 ```
 
+## External Threat Detection (`features.gh-aw-detection`)
+
+Threat detection uses the stable external `threat-detect` binary by default.
+Enabling `gh-aw-detection` does not emit an experimental-feature warning. Set
+`features.gh-aw-detection: false` to use the legacy inline engine path.
+
+```yaml wrap
+features:
+  gh-aw-detection: false
+```
+
 ## Reaction-based Trust Signals (`features.integrity-reactions`)
 
 Enables maintainers to promote or demote content past the integrity filter using GitHub reactions (👍, ❤️, 👎, 😕), without adding labels or modifying issue state. Available from gh-aw v0.68.2.
@@ -117,7 +139,7 @@ tools:
 
 Without `min-integrity`, `integrity-proxy` has no effect. When both are configured, the proxy enforces network-boundary integrity filtering in addition to the MCP gateway-level filtering. Set `integrity-proxy: false` when you only need gateway-level filtering.
 
-## Related Documentation
+## Learn More
 
 - [Frontmatter Reference](/gh-aw/reference/frontmatter/) — Complete frontmatter field reference
 - [AI Engines](/gh-aw/reference/engines/) — Engine configuration including Copilot BYOK

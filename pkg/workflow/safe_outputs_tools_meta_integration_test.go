@@ -70,8 +70,8 @@ Test workflow to verify tools_meta in compiled output.
 	meta := extractToolsMetaFromLockFile(t, yamlStr)
 
 	// Verify tools without constraints do NOT get description suffixes
-	_, hasMissingTool := meta.DescriptionSuffixes["missing_tool"]
-	assert.False(t, hasMissingTool, "missing_tool should not have a description suffix")
+	_, hasMissingTool := meta.DescriptionSuffixes["report_missing_tool"]
+	assert.False(t, hasMissingTool, "report_missing_tool should not have a description suffix")
 	_, hasNoop := meta.DescriptionSuffixes["noop"]
 	assert.False(t, hasNoop, "noop should not have a description suffix")
 }
@@ -116,6 +116,69 @@ func extractToolsMetaFromLockFile(t *testing.T, yamlStr string) ToolsMeta {
 	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(sb.String())), &meta),
 		"GH_AW_TOOLS_META_JSON from lock file should be valid JSON")
 	return meta
+}
+
+// TestToolsMetaJSONCompiledWorkflowZeroArgCustomJob verifies that a custom safe-output job
+// with no inputs compiles to a dynamic_tools entry with an empty properties schema and no
+// required key. This protects the compiler/bridge contract: the bridge must pass {} through
+// to MCP tools/call rather than treating it as a schema-discovery probe.
+func TestToolsMetaJSONCompiledWorkflowZeroArgCustomJob(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "zero-arg-job-compiled-test")
+
+	// Inputs are intentionally omitted — the supported way to declare a zero-input custom job.
+	testContent := `---
+on: push
+name: Test Zero-Arg Custom Job
+engine: copilot
+safe-outputs:
+  create-issue:
+    max: 1
+  jobs:
+    dispatch-code-factory:
+      description: "Record a dispatch code factory safe-output item"
+      runs-on: ubuntu-latest
+      steps:
+        - name: dispatch
+          run: echo "dispatched"
+---
+
+Test workflow to verify zero-argument custom job schema.
+`
+	testFile := filepath.Join(tmpDir, "test-zero-arg-job.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644), "should write test file")
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(testFile), "compilation should succeed")
+
+	lockFile := filepath.Join(tmpDir, "test-zero-arg-job.lock.yml")
+	yamlBytes, err := os.ReadFile(lockFile)
+	require.NoError(t, err, "should read lock file")
+
+	meta := extractToolsMetaFromLockFile(t, string(yamlBytes))
+
+	// Find the dispatch_code_factory entry in dynamic_tools
+	var dispatchTool map[string]any
+	for _, tool := range meta.DynamicTools {
+		if tool["name"] == "dispatch_code_factory" {
+			dispatchTool = tool
+			break
+		}
+	}
+	require.NotNil(t, dispatchTool, "dynamic_tools should contain dispatch_code_factory")
+
+	schema, ok := dispatchTool["inputSchema"].(map[string]any)
+	require.True(t, ok, "inputSchema should be a map")
+
+	assert.Equal(t, "object", schema["type"], "schema type should be object")
+
+	props, ok := schema["properties"].(map[string]any)
+	require.True(t, ok, "properties should be a map")
+	assert.Empty(t, props, "properties should be empty for a zero-input tool")
+
+	_, hasRequired := schema["required"]
+	assert.False(t, hasRequired, "required key must be absent for a zero-input tool")
+
+	assert.Equal(t, false, schema["additionalProperties"], "additionalProperties should be false")
 }
 
 // constraint-bearing configurations to ensure no tool type regresses silently.

@@ -17,14 +17,63 @@ const HANDLER_TYPE = "add_reviewer";
 
 const { processItems } = require("./safe_output_processor.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { getPullRequestNumber } = require("./pr_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
-const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
+const { isStagedMode, checkRequiredFilter, resolveTarget } = require("./safe_output_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { attachExecutionState, extractReviewStateFromData, fetchPullRequestReviewState } = require("./safe_output_execution_metadata.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { COPILOT_REVIEWER_BOT, COPILOT_REVIEWER_BOT_ID } = require("./constants.cjs");
 const { ERR_API } = require("./error_codes.cjs");
+
+/**
+ * Requests Copilot as a reviewer on a pull request via GraphQL (bot reviewers cannot use the REST API).
+ * Resolves the PR's node ID, then issues the requestReviews mutation with the Copilot bot ID.
+ * @param {{owner: string, repo: string}} repoParts - Repository owner/name
+ * @param {number} prNumber - Pull request number
+ * @param {{ githubClient: any, resolveCopilotBotNodeId: () => Promise<string> }} dependencies - Helper dependencies
+ * @returns {Promise<any>} The updated pull request data (REST shape), fetched after the mutation succeeds
+ */
+async function addCopilotReviewer(repoParts, prNumber, { githubClient, resolveCopilotBotNodeId }) {
+  const pullRequestQuery = `
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          id
+        }
+      }
+    }
+  `;
+  const pullRequestResponse = await githubClient.graphql(pullRequestQuery, {
+    owner: repoParts.owner,
+    repo: repoParts.repo,
+    number: prNumber,
+  });
+  const pullRequestId = pullRequestResponse?.repository?.pullRequest?.id;
+  if (!pullRequestId) {
+    throw new Error(`${ERR_API}: Could not resolve pull request node ID for ${repoParts.owner}/${repoParts.repo}#${prNumber}`);
+  }
+
+  const requestReviewsMutation = `
+    mutation($pullRequestId: ID!, $botIds: [ID!]!) {
+      requestReviews(input: { pullRequestId: $pullRequestId, botIds: $botIds, union: true }) {
+        pullRequest {
+          id
+        }
+      }
+    }
+  `;
+  await githubClient.graphql(requestReviewsMutation, {
+    pullRequestId,
+    botIds: [await resolveCopilotBotNodeId()],
+  });
+
+  const response = await githubClient.rest.pulls.get({
+    owner: repoParts.owner,
+    repo: repoParts.repo,
+    pull_number: prNumber,
+  });
+  return response?.data;
+}
 
 /**
  * Main handler factory for add_reviewer
@@ -35,6 +84,7 @@ async function main(config = {}) {
   const allowedReviewers = config.allowed ?? [];
   const allowedTeamReviewers = config.allowed_team_reviewers ?? [];
   const maxCount = config.max ?? 10;
+  const targetConfig = config.target || "triggering";
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const githubClient = await createAuthenticatedGitHubClient(config);
   const isStaged = isStagedMode(config);
@@ -102,21 +152,20 @@ async function main(config = {}) {
 
     processedCount++;
 
-    const { prNumber, error } = getPullRequestNumber(message, context);
-
-    if (error) {
-      core.warning(error);
+    const targetResult = resolveTarget({
+      targetConfig,
+      item: message,
+      context,
+      itemType: HANDLER_TYPE,
+    });
+    if (!targetResult.success) {
+      core.warning(targetResult.error);
       return {
         success: false,
-        error,
+        error: targetResult.error,
       };
     }
-    if (prNumber === null) {
-      return {
-        success: false,
-        error: "Pull request number is required",
-      };
-    }
+    const prNumber = targetResult.number;
 
     const repoResult = resolveAndValidateRepo(message, defaultTargetRepo, allowedRepos, "pull request reviewer");
     if (!repoResult.success) {
@@ -199,45 +248,11 @@ async function main(config = {}) {
       // Add copilot reviewer separately if requested
       if (hasCopilot) {
         try {
-          const pullRequestQuery = `
-            query($owner: String!, $repo: String!, $number: Int!) {
-              repository(owner: $owner, name: $repo) {
-                pullRequest(number: $number) {
-                  id
-                }
-              }
-            }
-          `;
-          const pullRequestResponse = await githubClient.graphql(pullRequestQuery, {
-            owner: repoParts.owner,
-            repo: repoParts.repo,
-            number: prNumber,
+          const copilotPullRequestData = await addCopilotReviewer(repoParts, prNumber, {
+            githubClient,
+            resolveCopilotBotNodeId,
           });
-          const pullRequestId = pullRequestResponse?.repository?.pullRequest?.id;
-          if (!pullRequestId) {
-            throw new Error(`${ERR_API}: Could not resolve pull request node ID for ${repoParts.owner}/${repoParts.repo}#${prNumber}`);
-          }
-
-          const requestReviewsMutation = `
-            mutation($pullRequestId: ID!, $botIds: [ID!]!) {
-              requestReviews(input: { pullRequestId: $pullRequestId, botIds: $botIds, union: true }) {
-                pullRequest {
-                  id
-                }
-              }
-            }
-          `;
-          await githubClient.graphql(requestReviewsMutation, {
-            pullRequestId,
-            botIds: [await resolveCopilotBotNodeId()],
-          });
-
-          const response = await githubClient.rest.pulls.get({
-            owner: repoParts.owner,
-            repo: repoParts.repo,
-            pull_number: prNumber,
-          });
-          latestPullRequest = response?.data || latestPullRequest;
+          latestPullRequest = copilotPullRequestData || latestPullRequest;
           core.info(`Successfully added copilot as reviewer to PR #${prNumber}`);
         } catch (copilotError) {
           core.warning(`Failed to add copilot as reviewer: ${getErrorMessage(copilotError)}`);

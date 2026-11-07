@@ -5,11 +5,17 @@ import (
 
 	"github.com/github/gh-aw/pkg/linters/appendbytestring"
 	"github.com/github/gh-aw/pkg/linters/appendoneelement"
+	"github.com/github/gh-aw/pkg/linters/blankassigncomma"
+	"github.com/github/gh-aw/pkg/linters/bufferresetbeforereuse"
+	"github.com/github/gh-aw/pkg/linters/bufioscannererunchecked"
 	"github.com/github/gh-aw/pkg/linters/bytesbufferstring"
 	"github.com/github/gh-aw/pkg/linters/bytescomparestring"
+	"github.com/github/gh-aw/pkg/linters/closeerrorunchecked"
+	"github.com/github/gh-aw/pkg/linters/consolestderr"
 	"github.com/github/gh-aw/pkg/linters/contextcancelnotdeferred"
 	"github.com/github/gh-aw/pkg/linters/ctxbackground"
 	"github.com/github/gh-aw/pkg/linters/deferinloop"
+	deferrerrorunchecked "github.com/github/gh-aw/pkg/linters/deferred-error-unchecked"
 	"github.com/github/gh-aw/pkg/linters/errorfwrapv"
 	"github.com/github/gh-aw/pkg/linters/errormessage"
 	"github.com/github/gh-aw/pkg/linters/errortypeassertion"
@@ -18,7 +24,13 @@ import (
 	"github.com/github/gh-aw/pkg/linters/execcommandwithoutcontext"
 	"github.com/github/gh-aw/pkg/linters/fileclosenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/fmterrorfnoverbs"
+	"github.com/github/gh-aw/pkg/linters/formatintitoa"
+	"github.com/github/gh-aw/pkg/linters/fprintferrorunchecked"
 	"github.com/github/gh-aw/pkg/linters/fprintlnsprintf"
+	"github.com/github/gh-aw/pkg/linters/generatedyamlheredoc"
+	"github.com/github/gh-aw/pkg/linters/globwalkignorederror"
+	"github.com/github/gh-aw/pkg/linters/goroutinemissingrecover"
+	"github.com/github/gh-aw/pkg/linters/goroutineresourceleak"
 	"github.com/github/gh-aw/pkg/linters/hardcodedfilepath"
 	"github.com/github/gh-aw/pkg/linters/httpnoctx"
 	"github.com/github/gh-aw/pkg/linters/httprespbodyclose"
@@ -30,17 +42,26 @@ import (
 	"github.com/github/gh-aw/pkg/linters/lenstringzero"
 	"github.com/github/gh-aw/pkg/linters/logfatallibrary"
 	"github.com/github/gh-aw/pkg/linters/manualmutexunlock"
+	"github.com/github/gh-aw/pkg/linters/manualpathconcat"
 	"github.com/github/gh-aw/pkg/linters/mapclearloop"
 	"github.com/github/gh-aw/pkg/linters/mapdeletecheck"
 	"github.com/github/gh-aw/pkg/linters/nilctxpassed"
 	"github.com/github/gh-aw/pkg/linters/osexitinlibrary"
 	"github.com/github/gh-aw/pkg/linters/osgetenvlibrary"
+	"github.com/github/gh-aw/pkg/linters/osisnotexist"
+	"github.com/github/gh-aw/pkg/linters/osopenreadallpreferreadfile"
 	"github.com/github/gh-aw/pkg/linters/ossetenvlibrary"
+	"github.com/github/gh-aw/pkg/linters/packagelevelmutableslicemap"
 	panicinlibrarycode "github.com/github/gh-aw/pkg/linters/panic-in-library-code"
 	"github.com/github/gh-aw/pkg/linters/rawloginlib"
+	"github.com/github/gh-aw/pkg/linters/readerstringconv"
+	reflectdeepequalusage "github.com/github/gh-aw/pkg/linters/reflect-deepequal-usage"
 	"github.com/github/gh-aw/pkg/linters/regexpcompileinfunction"
+	"github.com/github/gh-aw/pkg/linters/regexpdynamicpattern"
 	"github.com/github/gh-aw/pkg/linters/seenmapbool"
+	"github.com/github/gh-aw/pkg/linters/slicemakezerolength"
 	"github.com/github/gh-aw/pkg/linters/sortslice"
+	"github.com/github/gh-aw/pkg/linters/splitindexzero"
 	"github.com/github/gh-aw/pkg/linters/sprintfbool"
 	"github.com/github/gh-aw/pkg/linters/sprintferrdot"
 	"github.com/github/gh-aw/pkg/linters/sprintferrorsnew"
@@ -59,7 +80,14 @@ import (
 	"github.com/github/gh-aw/pkg/linters/timesleepnocontext"
 	"github.com/github/gh-aw/pkg/linters/tolowerequalfold"
 	"github.com/github/gh-aw/pkg/linters/trimleftright"
+	"github.com/github/gh-aw/pkg/linters/typeassertionnil"
+	"github.com/github/gh-aw/pkg/linters/typeassertionokdiscarded"
+	unchecked_deferredclose "github.com/github/gh-aw/pkg/linters/unchecked-deferred-close"
+	uncheckedsliceindex "github.com/github/gh-aw/pkg/linters/unchecked-slice-index"
+	"github.com/github/gh-aw/pkg/linters/uncheckedflushreturn"
 	"github.com/github/gh-aw/pkg/linters/uncheckedtypeassertion"
+	walkdirignoredeerror "github.com/github/gh-aw/pkg/linters/walk-dir-ignored-error"
+	"github.com/github/gh-aw/pkg/linters/walkfuncerrshadow"
 	"github.com/github/gh-aw/pkg/linters/wgdonenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/writebytestring"
 )
@@ -76,11 +104,17 @@ func All() []*analysis.Analyzer {
 var allAnalyzers = []*analysis.Analyzer{
 	appendbytestring.Analyzer,
 	appendoneelement.Analyzer,
+	blankassigncomma.Analyzer,
+	bufferresetbeforereuse.Analyzer,
+	bufioscannererunchecked.Analyzer,
 	bytesbufferstring.Analyzer,
 	bytescomparestring.Analyzer,
+	closeerrorunchecked.Analyzer,
+	consolestderr.Analyzer,
 	contextcancelnotdeferred.Analyzer,
 	ctxbackground.Analyzer,
 	deferinloop.Analyzer,
+	deferrerrorunchecked.Analyzer,
 	errormessage.Analyzer,
 	errortypeassertion.Analyzer,
 	fprintlnsprintf.Analyzer,
@@ -90,6 +124,12 @@ var allAnalyzers = []*analysis.Analyzer{
 	excessivefuncparams.Analyzer,
 	fileclosenotdeferred.Analyzer,
 	fmterrorfnoverbs.Analyzer,
+	formatintitoa.Analyzer,
+	fprintferrorunchecked.Analyzer,
+	generatedyamlheredoc.Analyzer,
+	globwalkignorederror.Analyzer,
+	goroutineresourceleak.Analyzer,
+	goroutinemissingrecover.Analyzer,
 	hardcodedfilepath.Analyzer,
 	httpnoctx.Analyzer,
 	httprespbodyclose.Analyzer,
@@ -98,18 +138,27 @@ var allAnalyzers = []*analysis.Analyzer{
 	largefunc.Analyzer,
 	logfatallibrary.Analyzer,
 	manualmutexunlock.Analyzer,
+	manualpathconcat.Analyzer,
 	mapclearloop.Analyzer,
 	mapdeletecheck.Analyzer,
 	nilctxpassed.Analyzer,
 	osexitinlibrary.Analyzer,
 	osgetenvlibrary.Analyzer,
+	osisnotexist.Analyzer,
+	osopenreadallpreferreadfile.Analyzer,
 	ossetenvlibrary.Analyzer,
+	packagelevelmutableslicemap.Analyzer,
 	panicinlibrarycode.Analyzer,
 	rawloginlib.Analyzer,
+	readerstringconv.Analyzer,
+	reflectdeepequalusage.Analyzer,
 	regexpcompileinfunction.Analyzer,
+	regexpdynamicpattern.Analyzer,
 	ssljson.Analyzer,
 	seenmapbool.Analyzer,
+	slicemakezerolength.Analyzer,
 	sortslice.Analyzer,
+	splitindexzero.Analyzer,
 	sprintferrdot.Analyzer,
 	sprintferrorsnew.Analyzer,
 	sprintfbool.Analyzer,
@@ -130,7 +179,14 @@ var allAnalyzers = []*analysis.Analyzer{
 	timenowsub.Analyzer,
 	tolowerequalfold.Analyzer,
 	trimleftright.Analyzer,
+	typeassertionnil.Analyzer,
+	typeassertionokdiscarded.Analyzer,
+	uncheckedsliceindex.Analyzer,
+	unchecked_deferredclose.Analyzer,
 	uncheckedtypeassertion.Analyzer,
+	uncheckedflushreturn.Analyzer,
+	walkdirignoredeerror.Analyzer,
+	walkfuncerrshadow.Analyzer,
 	wgdonenotdeferred.Analyzer,
 	writebytestring.Analyzer,
 }

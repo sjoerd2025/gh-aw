@@ -6,12 +6,12 @@ import (
 	"maps"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/syncutil"
 )
 
 var importsLog = logger.New("workflow:imports")
@@ -100,22 +100,24 @@ func (c *Compiler) MergeMCPServers(topMCPServers map[string]any, importedMCPServ
 	return result, nil
 }
 
-// MergeNetworkPermissions merges network permissions from imports with top-level network permissions
-// Combines allowed domains from both sources into a single list
+// MergeNetworkPermissions merges network permissions from imports with top-level network permissions.
+// Allowed and hosted-web domains are combined while top-level scalar configuration
+// takes precedence.
 func (c *Compiler) MergeNetworkPermissions(topNetwork *NetworkPermissions, importedNetworkJSON string) (*NetworkPermissions, error) {
 	importsLog.Print("Merging network permissions from imports")
 
 	// If no imported network config, return top-level network as-is
-	if importedNetworkJSON == "" || importedNetworkJSON == "{}" {
+	if importedNetworkJSON == "" {
 		importsLog.Print("No imported network permissions to merge")
 		return topNetwork, nil
 	}
 
-	// Start with top-level network or create a new one
+	// Start with top-level network or create a new one. Copy the struct first so
+	// fields other than Allowed (Blocked, HostedWeb, Firewall, ExplicitlyDefined,
+	// etc.) survive the merge instead of silently reverting to zero values.
 	result := &NetworkPermissions{}
 	if topNetwork != nil {
-		result.Allowed = make([]string, len(topNetwork.Allowed))
-		copy(result.Allowed, topNetwork.Allowed)
+		result = topNetwork.clone()
 		importsLog.Printf("Starting with %d top-level allowed domains", len(topNetwork.Allowed))
 	}
 
@@ -130,10 +132,18 @@ func (c *Compiler) MergeNetworkPermissions(topNetwork *NetworkPermissions, impor
 	// Split by newlines to handle multiple JSON objects from different imports
 	lines := strings.Split(importedNetworkJSON, "\n")
 	importsLog.Printf("Processing %d network permission lines", len(lines))
+	importedDenyAll := false
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" || line == "{}" {
+		if line == "" {
+			continue
+		}
+		if line == "{}" {
+			// An imported empty network object denies all network access. It takes
+			// precedence over all imported and top-level allow lists.
+			importedDenyAll = true
+			result.ExplicitlyDefined = true
 			continue
 		}
 
@@ -143,36 +153,90 @@ func (c *Compiler) MergeNetworkPermissions(topNetwork *NetworkPermissions, impor
 			continue // Skip invalid lines
 		}
 
-		// Merge allowed domains from imported network
-		for _, domain := range importedNetwork.Allowed {
-			if !setutil.Contains(domainSet, domain) {
-				result.Allowed = append(result.Allowed, domain)
-				domainSet[domain] = struct {
-				}{}
-			}
-		}
+		mergeImportedNetworkPermissions(result, importedNetwork, domainSet)
+	}
+	if importedDenyAll {
+		result.Allowed = nil
 	}
 
 	// Sort the final domain list for consistent output
 	sort.Strings(result.Allowed)
+	if result.HostedWeb != nil {
+		sort.Strings(result.HostedWeb.Allowed)
+		sort.Strings(result.HostedWeb.Blocked)
+	}
 
 	importsLog.Printf("Successfully merged network permissions with %d allowed domains", len(result.Allowed))
 	return result, nil
 }
 
+func mergeImportedNetworkPermissions(result *NetworkPermissions, imported NetworkPermissions, domainSet map[string]struct{}) {
+	for _, domain := range imported.Allowed {
+		if !setutil.Contains(domainSet, domain) {
+			result.Allowed = append(result.Allowed, domain)
+			domainSet[domain] = struct{}{}
+		}
+	}
+
+	result.Blocked = appendUniqueDomains(result.Blocked, imported.Blocked)
+	result.ExplicitlyDefined = true
+	mergeHostedWebPolicy(result, imported.HostedWeb)
+}
+
+// mergeHostedWebPolicy combines enabled imported domain lists with the top-level
+// policy. An explicit top-level disablement and its scalar settings take precedence.
+func mergeHostedWebPolicy(network *NetworkPermissions, imported *HostedWebPolicy) {
+	if imported == nil {
+		return
+	}
+	if network.HostedWeb == nil {
+		if !imported.Enabled {
+			return
+		}
+		policy := *imported
+		policy.Allowed = append([]string(nil), imported.Allowed...)
+		policy.Blocked = append([]string(nil), imported.Blocked...)
+		network.HostedWeb = &policy
+		return
+	}
+	// Object policies are normalized to Enabled during parsing; only
+	// hosted-web: false is disabled. An explicit top-level disablement must not be
+	// re-enabled by an import, and an imported disablement does not override an
+	// enabled top-level policy.
+	if !network.HostedWeb.Enabled || !imported.Enabled {
+		return
+	}
+
+	network.HostedWeb.Allowed = appendUniqueDomains(network.HostedWeb.Allowed, imported.Allowed)
+	network.HostedWeb.Blocked = appendUniqueDomains(network.HostedWeb.Blocked, imported.Blocked)
+}
+
+// appendUniqueDomains returns a fresh domain list with additions appended once.
+func appendUniqueDomains(domains, additions []string) []string {
+	if len(domains) == 0 && len(additions) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(domains)+len(additions))
+	seen := make(map[string]struct{}, len(domains)+len(additions))
+	for _, candidates := range [][]string{domains, additions} {
+		for _, domain := range candidates {
+			if _, exists := seen[domain]; !exists {
+				result = append(result, domain)
+				seen[domain] = struct{}{}
+			}
+		}
+	}
+	return result
+}
+
 // getSafeOutputTypeKeys returns the list of safe output type keys from the embedded schema.
 // This is a cached wrapper around parser.GetSafeOutputTypeKeys() to avoid parsing on every call.
-var (
-	safeOutputTypeKeys     []string
-	safeOutputTypeKeysOnce sync.Once
-	safeOutputTypeKeysErr  error
-)
+var safeOutputTypeKeysLoader syncutil.OnceLoader[[]string]
 
 func getSafeOutputTypeKeys() ([]string, error) {
-	safeOutputTypeKeysOnce.Do(func() {
-		safeOutputTypeKeys, safeOutputTypeKeysErr = parser.GetSafeOutputTypeKeys()
+	return safeOutputTypeKeysLoader.Get(func() ([]string, error) {
+		return parser.GetSafeOutputTypeKeys()
 	})
-	return safeOutputTypeKeys, safeOutputTypeKeysErr
 }
 
 // MergeSafeOutputs merges safe-outputs configurations from imports into the top-level safe-outputs.
@@ -185,7 +249,10 @@ func getSafeOutputTypeKeys() ([]string, error) {
 // configurations for types the user never explicitly configured.
 // When nil, the processed topSafeOutputs config fields are used to determine defined types
 // (legacy behavior used by unit tests that construct configs directly).
+//
+//nolint:largefunc // Existing import merge flow remains sequential to preserve conflict and precedence semantics.
 func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedSafeOutputsJSON []string, topRawSafeOutputs map[string]any) (*SafeOutputsConfig, error) {
+	topRawSafeOutputs = normalizeMissingReportKeys(topRawSafeOutputs)
 	importsLog.Print("Merging safe-outputs from imports")
 
 	if len(importedSafeOutputsJSON) == 0 {
@@ -243,6 +310,7 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 			importsLog.Printf("Skipping malformed safe-outputs config: %v", err)
 			continue
 		}
+		config = normalizeMissingReportKeys(config)
 
 		// Check for conflicts and remove types already defined in top-level config
 		// Main workflow definitions take precedence over imports (override behavior).
@@ -272,6 +340,11 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 				}{}
 			}
 		}
+		if topRawSafeOutputs != nil {
+			if _, exists := topRawSafeOutputs["steer"]; exists {
+				delete(config, "steer")
+			}
+		}
 
 		importedConfigs = append(importedConfigs, config)
 	}
@@ -292,10 +365,21 @@ func (c *Compiler) MergeSafeOutputs(topSafeOutputs *SafeOutputsConfig, importedS
 	// Merge each imported config
 	for _, config := range importedConfigs {
 		var err error
-		result, err = mergeSafeOutputConfig(result, config, c)
+		result, err = mergeSafeOutputConfig(result, config, topRawSafeOutputs, c)
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Recompute the implicit report-incomplete create-issue default now that imports are
+	// merged. The default is originally computed from only the main workflow's own
+	// safe-outputs block, before Linear (or other) handlers supplied by an import are
+	// visible. Without recomputing here, a main workflow that declares only global fields
+	// (e.g. linear-token) could inherit an implicit `create-issue: true` default meant for
+	// a GitHub-only configuration, even though the merged result is Linear-only.
+	if result.ReportIncomplete != nil && result.ReportIncomplete.Implicit {
+		recomputed := defaultReportIncompleteCreateIssue(result)
+		result.ReportIncomplete.CreateIssue = &recomputed
 	}
 
 	// Apply protected-files exclude lists accumulated from type-conflicting imports.
@@ -340,8 +424,20 @@ func hasSafeOutputType(config *SafeOutputsConfig, key string) bool {
 	return hasSafeOutputFieldSet(config, handler.StructField)
 }
 
+func mergeAutoDefaultedSafeOutput[T any](result **T, imported *T, config, topRawSafeOutputs map[string]any, key string) {
+	_, hasImported := config[key]
+	_, hasMain := topRawSafeOutputs[key]
+	if (hasImported || (*result == nil && !hasMain)) && imported != nil {
+		*result = imported
+	}
+}
+
 // mergeSafeOutputConfig merges a single imported config map into the result SafeOutputsConfig
-func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *Compiler) (*SafeOutputsConfig, error) {
+//
+//nolint:largefunc // Existing meta-field merge flow remains centralized for consistent import semantics.
+func mergeSafeOutputConfig(result *SafeOutputsConfig, config, topRawSafeOutputs map[string]any, c *Compiler) (*SafeOutputsConfig, error) {
+	config = normalizeMissingReportKeys(config)
+	topRawSafeOutputs = normalizeMissingReportKeys(topRawSafeOutputs)
 	importsLog.Printf("Merging imported safe-output config: key_count=%d", len(config))
 	// Create a frontmatter-like structure for extractSafeOutputsConfig
 	frontmatter := map[string]any{
@@ -353,6 +449,9 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 	if importedConfig == nil {
 		importsLog.Print("Imported safe-output config extracted no fields, skipping merge")
 		return result, nil
+	}
+	if importedConfig.CreateIssuesDisabled {
+		result.CreateIssuesDisabled = true
 	}
 
 	// Merge each safe output type (only set if nil in result).
@@ -400,23 +499,12 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 	// auto-default) even though the main workflow never explicitly set it. We therefore use
 	// the presence of the key in the raw imported config map as the authoritative signal:
 	// if the import explicitly carries the key, its value wins over any auto-default in result.
-	// The "|| result.X == nil" arm preserves the legacy path where result has no value at all.
-	_, hasMissingTool := config["missing-tool"]
-	if (hasMissingTool || result.MissingTool == nil) && importedConfig.MissingTool != nil {
-		result.MissingTool = importedConfig.MissingTool
-	}
-	_, hasMissingData := config["missing-data"]
-	if (hasMissingData || result.MissingData == nil) && importedConfig.MissingData != nil {
-		result.MissingData = importedConfig.MissingData
-	}
-	_, hasNoop := config["noop"]
-	if (hasNoop || result.NoOp == nil) && importedConfig.NoOp != nil {
-		result.NoOp = importedConfig.NoOp
-	}
-	_, hasReportIncomplete := config["report-incomplete"]
-	if (hasReportIncomplete || result.ReportIncomplete == nil) && importedConfig.ReportIncomplete != nil {
-		result.ReportIncomplete = importedConfig.ReportIncomplete
-	}
+	// The nil fallback applies only when the main workflow did not explicitly configure
+	// the type (an explicit false also produces nil in the parsed result).
+	mergeAutoDefaultedSafeOutput(&result.MissingTool, importedConfig.MissingTool, config, topRawSafeOutputs, "report-missing-tool")
+	mergeAutoDefaultedSafeOutput(&result.MissingData, importedConfig.MissingData, config, topRawSafeOutputs, "report-missing-data")
+	mergeAutoDefaultedSafeOutput(&result.NoOp, importedConfig.NoOp, config, topRawSafeOutputs, "noop")
+	mergeAutoDefaultedSafeOutput(&result.ReportIncomplete, importedConfig.ReportIncomplete, config, topRawSafeOutputs, "report-incomplete")
 	// ThreatDetection is also auto-defaulted by extractSafeOutputsConfig; apply the same
 	// pattern — the import's explicit threat-detection key takes precedence over the result's
 	// auto-default empty struct (which is not user-authored). If the main workflow explicitly
@@ -427,6 +515,9 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 	}
 
 	// Merge meta-configuration fields (only set if empty/zero in result)
+	if !result.Steer && importedConfig.Steer {
+		result.Steer = true
+	}
 	if len(result.AllowedDomains) == 0 && len(importedConfig.AllowedDomains) > 0 {
 		result.AllowedDomains = importedConfig.AllowedDomains
 	}
@@ -441,6 +532,9 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 	}
 	if result.GitHubToken == "" && importedConfig.GitHubToken != "" {
 		result.GitHubToken = importedConfig.GitHubToken
+	}
+	if result.LinearToken == "" && importedConfig.LinearToken != "" {
+		result.LinearToken = importedConfig.LinearToken
 	}
 	if result.GitHubApp == nil && importedConfig.GitHubApp != nil {
 		result.GitHubApp = importedConfig.GitHubApp
@@ -470,9 +564,11 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 	if result.Footer == nil && importedConfig.Footer != nil {
 		result.Footer = importedConfig.Footer
 	}
+	result.BodyFooter = appendBodyFooters(result.BodyFooter, importedConfig.BodyFooter)
 	if len(result.AllowGitHubReferences) == 0 && len(importedConfig.AllowGitHubReferences) > 0 {
 		result.AllowGitHubReferences = importedConfig.AllowGitHubReferences
 	}
+
 	if !result.GroupReports && importedConfig.GroupReports {
 		result.GroupReports = true
 	}
@@ -480,6 +576,9 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 		result.ReportFailureAsIssue = importedConfig.ReportFailureAsIssue
 		result.ReportFailureAsIssueCategories = importedConfig.ReportFailureAsIssueCategories
 		result.ReportFailureAsIssueExcludedCategories = importedConfig.ReportFailureAsIssueExcludedCategories
+	}
+	if result.ReportFailedJobs == nil && importedConfig.ReportFailedJobs != nil {
+		result.ReportFailedJobs = importedConfig.ReportFailedJobs
 	}
 	if result.FailureIssueRepo == "" && importedConfig.FailureIssueRepo != "" {
 		result.FailureIssueRepo = importedConfig.FailureIssueRepo
@@ -503,6 +602,16 @@ func mergeSafeOutputConfig(result *SafeOutputsConfig, config map[string]any, c *
 
 	importsLog.Print("Safe-output config merge completed")
 	return result, nil
+}
+
+func appendBodyFooters(bodyFooters ...string) string {
+	var nonEmpty []string
+	for _, bodyFooter := range bodyFooters {
+		if bodyFooter != "" {
+			nonEmpty = append(nonEmpty, bodyFooter)
+		}
+	}
+	return strings.Join(nonEmpty, "\n\n")
 }
 
 // mergeMessagesConfig merges two SafeOutputMessagesConfig structs at the field level.
@@ -684,7 +793,7 @@ func inlineWorkflowEnvReferences(value string, env map[string]any, resolved map[
 
 	var builder strings.Builder
 	for i := 0; i < len(inner); {
-		if inner[i] == '\'' {
+		if inner[i] == '\'' { //nolint:uncheckedsliceindex // i is bounded by the loop condition
 			next := consumeSingleQuotedGitHubExpressionString(inner, i)
 			builder.WriteString(inner[i:next])
 			i = next
@@ -692,23 +801,23 @@ func inlineWorkflowEnvReferences(value string, env map[string]any, resolved map[
 		}
 
 		if !isGitHubExpressionIdentifierStart(inner, i) {
-			builder.WriteByte(inner[i])
+			builder.WriteByte(inner[i]) //nolint:uncheckedsliceindex // i is bounded by the loop condition
 			i++
 			continue
 		}
 
 		start := i
-		for i < len(inner) && isGitHubExpressionIdentifierChar(inner[i]) {
+		for i < len(inner) && isGitHubExpressionIdentifierChar(inner[i]) { //nolint:uncheckedsliceindex // i is bounded by the loop condition
 			i++
 		}
-		if inner[start:i] != "env" || i >= len(inner) || inner[i] != '.' || i+1 >= len(inner) || !isGitHubExpressionIdentifierStart(inner, i+1) {
+		if inner[start:i] != "env" || i >= len(inner) || inner[i] != '.' || i+1 >= len(inner) || !isGitHubExpressionIdentifierStart(inner, i+1) { //nolint:uncheckedsliceindex // i is bounds-checked before indexing
 			builder.WriteString(inner[start:i])
 			continue
 		}
 
 		refStart := i + 1
 		refEnd := refStart + 1
-		for refEnd < len(inner) && isGitHubExpressionIdentifierChar(inner[refEnd]) {
+		for refEnd < len(inner) && isGitHubExpressionIdentifierChar(inner[refEnd]) { //nolint:uncheckedsliceindex // refEnd is bounded by the loop condition
 			refEnd++
 		}
 

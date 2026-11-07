@@ -35,6 +35,7 @@ func TestProtocolSpecificDomains(t *testing.T) {
 			name: "Mixed protocols",
 			network: &NetworkPermissions{
 				Allowed: []string{
+					"copilot",
 					"https://secure.example.com",
 					"http://legacy.example.com",
 					"example.org", // No protocol = both
@@ -94,6 +95,7 @@ func TestProtocolSpecificDomains(t *testing.T) {
 func TestGetCopilotAllowedDomainsWithProtocol(t *testing.T) {
 	network := &NetworkPermissions{
 		Allowed: []string{
+			"copilot",
 			"https://secure.example.com",
 			"http://legacy.example.com",
 		},
@@ -109,7 +111,7 @@ func TestGetCopilotAllowedDomainsWithProtocol(t *testing.T) {
 		t.Error("Expected result to contain http://legacy.example.com")
 	}
 
-	// Should also contain Copilot defaults (without protocol)
+	// Should also contain explicitly requested Copilot domain set (without protocol)
 	if !strings.Contains(result, "api.github.com") {
 		t.Error("Expected result to contain Copilot default domain api.github.com")
 	}
@@ -119,6 +121,7 @@ func TestGetCopilotAllowedDomainsWithProtocol(t *testing.T) {
 func TestGetClaudeAllowedDomainsWithProtocol(t *testing.T) {
 	network := &NetworkPermissions{
 		Allowed: []string{
+			"claude",
 			"https://api.example.com",
 		},
 	}
@@ -130,9 +133,9 @@ func TestGetClaudeAllowedDomainsWithProtocol(t *testing.T) {
 		t.Error("Expected result to contain https://api.example.com")
 	}
 
-	// Should also contain Claude defaults
-	if !strings.Contains(result, "anthropic.com") {
-		t.Error("Expected result to contain Claude default domain anthropic.com")
+	// The static Claude set excludes Anthropic's API; the engine adds it only for the default target.
+	if strings.Contains(result, "api.anthropic.com") {
+		t.Error("Expected static Claude domain set to exclude api.anthropic.com")
 	}
 }
 

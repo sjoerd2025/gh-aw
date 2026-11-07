@@ -23,16 +23,111 @@ import (
 // - TestStageWorkflowChanges (tests staging behavior during workflow compilation)
 // - TestStageGitAttributesIfChanged (tests conditional staging during compilation)
 
+func TestIsSafeGitRevisionArg(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		ref  string
+		want bool
+	}{
+		{"empty", "", false},
+		{"leading dash", "-oops", false},
+		{"leading double dash", "--upload-pack=evil", false},
+		{"newline", "origin/main\n--help", false},
+		{"unicode control character", "origin/main\u202e", false},
+		{"plain branch", "main", true},
+		{"remote branch", "origin/main", true},
+		{"contains dash not leading", "feature-branch", true},
+		{"short sha", "abc1234", true},
+		{"fully qualified ref", "refs/heads/main", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isSafeGitRevisionArg(tt.ref))
+		})
+	}
+}
+
+func TestValidateGitBranchArg(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		branchName  string
+		label       string
+		wantErr     bool
+		errContains string
+	}{
+		{"empty", "", "branch name", true, "must not be empty"},
+		{"leading dash", "-oops", "branch name", true, "must not start with '-' or contain control characters"},
+		{"option-like", "--upload-pack=evil", "branch name", true, "must not start with '-' or contain control characters"},
+		{"control character", "origin/main\n--help", "branch name", true, "must not start with '-' or contain control characters"},
+		{"valid branch", "main", "branch name", false, ""},
+		{"custom label", "", "default branch name", true, "invalid default branch name"},
+		{"custom label option-like", "--upload-pack=evil", "default branch name", true, "invalid default branch name \"--upload-pack=evil\": must not start with '-' or contain control characters"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateGitBranchArg(tt.branchName, tt.label)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tt.errContains)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestBranchOperationsRejectUnsafeRevisionArgs(t *testing.T) {
+	t.Parallel()
+
+	for name, operation := range map[string]func(string, bool) error{
+		"create and switch": createAndSwitchBranch,
+		"switch":            switchBranch,
+		"push":              pushBranch,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			assert.ErrorContains(t, operation("--upload-pack=evil", false), "invalid branch name")
+		})
+	}
+}
+
+func TestValidateRelPathForGit(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		relPath string
+		wantErr bool
+	}{
+		{"empty", "", true},
+		{"leading dash", "-oops", true},
+		{"leading double dash flag", "--upload-pack=evil", true},
+		{"parent traversal", "..", true},
+		{"parent traversal with subpath", "../secret.txt", true},
+		{"nested parent traversal", "sub/../../secret.txt", true},
+		{"absolute path", "/etc/passwd", true},
+		{"plain relative path", "workflow.md", false},
+		{"nested relative path", ".github/workflows/workflow.md", false},
+		{"dot prefixed but within repo", "./workflow.md", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateRelPathForGit(tt.relPath)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestGetCurrentBranch(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -66,29 +161,87 @@ func TestGetCurrentBranch(t *testing.T) {
 func TestGetCurrentBranchNotInRepo(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Don't initialize git - should error
-	_, err = getCurrentBranch()
+	_, err := getCurrentBranch()
 	assert.Error(t, err, "getCurrentBranch should return an error when not in a git repository")
+}
+
+func TestCheckCleanWorkingDirectoryIgnoring(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+
+	t.Chdir(tmpDir)
+	require.NoError(t, exec.Command("git", "init").Run())
+	require.NoError(t, exec.Command("git", "config", "user.name", "Test User").Run())
+	require.NoError(t, exec.Command("git", "config", "user.email", "test@example.com").Run())
+
+	generatedFile := filepath.Join(".github", "skills", "agentic-workflows", "SKILL.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(generatedFile), 0755))
+	require.NoError(t, os.WriteFile(generatedFile, []byte("generated"), 0644))
+
+	require.NoError(t, checkCleanWorkingDirectoryIgnoring(false, []string{generatedFile}))
+	require.ErrorContains(t, checkCleanWorkingDirectory(false), "working directory has uncommitted changes")
+
+	// Staged (but not committed) init file should also be excluded.
+	require.NoError(t, exec.Command("git", "add", generatedFile).Run())
+	require.NoError(t, checkCleanWorkingDirectoryIgnoring(false, []string{generatedFile}))
+	require.ErrorContains(t, checkCleanWorkingDirectory(false), "working directory has uncommitted changes")
+
+	require.NoError(t, exec.Command("git", "commit", "-m", "initial commit").Run())
+	require.NoError(t, os.WriteFile(generatedFile, []byte("updated"), 0644))
+
+	require.NoError(t, checkCleanWorkingDirectoryIgnoring(false, []string{generatedFile}))
+	require.ErrorContains(t, checkCleanWorkingDirectory(false), "working directory has uncommitted changes")
+
+	require.NoError(t, os.WriteFile("README.md", []byte("user file"), 0644))
+	require.ErrorContains(
+		t,
+		checkCleanWorkingDirectoryIgnoring(false, []string{generatedFile}),
+		"working directory has uncommitted changes",
+	)
+}
+
+// TestCheckCleanWorkingDirectoryIgnoringAbsolutePaths verifies that absolute
+// paths are accepted when the current directory is a subdirectory of the repo.
+// This is the case when the wizard is invoked from a nested directory and
+// ensureAddRepositoryInitializedWithDetails returns absolute paths.
+func TestCheckCleanWorkingDirectoryIgnoringAbsolutePaths(t *testing.T) {
+	repoDir := testutil.TempDir(t, "test-*")
+
+	t.Chdir(repoDir)
+	require.NoError(t, exec.Command("git", "init").Run())
+	require.NoError(t, exec.Command("git", "config", "user.name", "Test User").Run())
+	require.NoError(t, exec.Command("git", "config", "user.email", "test@example.com").Run())
+
+	// Create the init file at the repo root.
+	generatedFile := filepath.Join(".github", "skills", "agentic-workflows", "SKILL.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(generatedFile), 0755))
+	require.NoError(t, os.WriteFile(generatedFile, []byte("generated"), 0644))
+	absGenerated := filepath.Join(repoDir, generatedFile)
+
+	// Create a subdirectory and cd into it to simulate a nested invocation.
+	subDir := filepath.Join(repoDir, "subdir")
+	require.NoError(t, os.MkdirAll(subDir, 0755))
+	t.Chdir(subDir)
+
+	// Passing the absolute path from a nested CWD should still exclude the file.
+	require.NoError(t, checkCleanWorkingDirectoryIgnoring(false, []string{absGenerated}))
+	require.ErrorContains(t, checkCleanWorkingDirectory(false), "working directory has uncommitted changes")
+
+	// An unrelated untracked file must still be detected even when the init file is excluded.
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("user file"), 0644))
+	require.ErrorContains(
+		t,
+		checkCleanWorkingDirectoryIgnoring(false, []string{absGenerated}),
+		"working directory has uncommitted changes",
+	)
 }
 
 func TestCreateAndSwitchBranch(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -108,7 +261,7 @@ func TestCreateAndSwitchBranch(t *testing.T) {
 
 	// Create and switch to new branch
 	branchName := "test-branch"
-	err = createAndSwitchBranch(branchName, false)
+	err := createAndSwitchBranch(branchName, false)
 	require.NoError(t, err, "create and switch to new branch")
 
 	// Verify we're on the new branch
@@ -120,13 +273,7 @@ func TestCreateAndSwitchBranch(t *testing.T) {
 func TestSwitchBranch(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -165,13 +312,7 @@ func TestSwitchBranch(t *testing.T) {
 func TestCommitChanges(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -188,7 +329,7 @@ func TestCommitChanges(t *testing.T) {
 
 	// Commit changes
 	commitMessage := "Test commit"
-	err = commitChanges(commitMessage, false)
+	err := commitChanges(commitMessage, false)
 	require.NoError(t, err, "commit staged changes")
 
 	// Verify commit was created
@@ -206,13 +347,7 @@ func TestPushBranchNotImplemented(t *testing.T) {
 	// We skip actual push testing as it requires remote repository setup
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -220,7 +355,7 @@ func TestPushBranchNotImplemented(t *testing.T) {
 	}
 
 	// pushBranch will fail without a remote, which is expected
-	err = pushBranch("test-branch", false)
+	err := pushBranch("test-branch", false)
 	if err == nil {
 		t.Log("pushBranch() succeeded unexpectedly (might have remote configured)")
 	}
@@ -230,13 +365,7 @@ func TestPushBranchNotImplemented(t *testing.T) {
 func TestCheckWorkflowFileStatus(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -278,7 +407,34 @@ func TestCheckWorkflowFileStatus(t *testing.T) {
 		assert.False(t, status.HasUnpushedCommits, "clean file should not report unpushed commits")
 	})
 
-	// Test 3: Modified file (unstaged changes)
+	// Test 3: Configured upstream with local-only commits affecting the file
+	t.Run("configured_upstream_file_has_unpushed_commits", func(t *testing.T) {
+		remoteDir := filepath.Join(tmpDir, "origin.git")
+		require.NoError(t, exec.Command("git", "init", "--bare", remoteDir).Run(), "create bare remote repo")
+		require.NoError(t, exec.Command("git", "remote", "add", "origin", remoteDir).Run(), "configure upstream remote")
+		require.NoError(t, exec.Command("git", "push", "-u", "origin", "HEAD").Run(), "push initial branch to remote")
+
+		// A commit that doesn't touch the workflow should not trigger an unpushed-commit result.
+		unrelatedFile := "README.md"
+		require.NoError(t, os.WriteFile(unrelatedFile, []byte("notes\n"), 0644), "create unrelated file")
+		require.NoError(t, exec.Command("git", "add", unrelatedFile).Run())
+		require.NoError(t, exec.Command("git", "commit", "-m", "docs: add unrelated notes").Run(), "commit unrelated change")
+
+		status, err := checkWorkflowFileStatus(workflowFile)
+		require.NoError(t, err, "check workflow file status against configured upstream")
+		assert.False(t, status.HasUnpushedCommits, "unrelated commit should not count for workflow file")
+
+		// A commit that does affect the workflow should be reported when ahead of upstream.
+		require.NoError(t, os.WriteFile(workflowFile, []byte("# Updated Workflow\n"), 0644), "modify workflow file")
+		require.NoError(t, exec.Command("git", "add", workflowFile).Run())
+		require.NoError(t, exec.Command("git", "commit", "-m", "chore: update workflow").Run(), "commit workflow change")
+
+		status, err = checkWorkflowFileStatus(workflowFile)
+		require.NoError(t, err, "check workflow file status after local workflow commit")
+		assert.True(t, status.HasUnpushedCommits, "workflow change ahead of upstream should be reported")
+	})
+
+	// Test 4: Modified file (unstaged changes)
 	t.Run("modified_file", func(t *testing.T) {
 		require.NoError(t, os.WriteFile(workflowFile, []byte("# Modified Workflow\n"), 0644), "modify workflow file")
 
@@ -328,13 +484,7 @@ func TestCheckWorkflowFileStatus(t *testing.T) {
 func TestCheckWorkflowFileStatusNotInRepo(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		_ = os.Chdir(originalDir)
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Don't initialize git - should return empty status without error
 	status, err := checkWorkflowFileStatus("test.md")
@@ -345,6 +495,7 @@ func TestCheckWorkflowFileStatusNotInRepo(t *testing.T) {
 }
 
 func TestExtractHostFromRemoteURL(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		url      string
@@ -435,6 +586,26 @@ func TestExtractHostFromRemoteURL(t *testing.T) {
 			url:      "https://ghes.example.com:8443/org/repo.git",
 			expected: "ghes.example.com:8443",
 		},
+		{
+			name:     "malformed URL falls back to manual parsing with userinfo and path",
+			url:      "https://baduser%zz@example.com/path",
+			expected: "example.com",
+		},
+		{
+			name:     "malformed URL falls back to manual parsing with userinfo and no path",
+			url:      "https://baduser%zz@example.com",
+			expected: "example.com",
+		},
+		{
+			name:     "malformed URL falls back to manual parsing with no userinfo and no path",
+			url:      "https://%zz",
+			expected: "%zz",
+		},
+		{
+			name:     "SSH scp-like with slash before colon does not match and defaults to github.com",
+			url:      "some/path:notaport",
+			expected: "github.com",
+		},
 	}
 
 	for _, tt := range tests {
@@ -448,15 +619,7 @@ func TestExtractHostFromRemoteURL(t *testing.T) {
 func TestGetHostFromOriginRemote(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-get-host-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize a git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -506,15 +669,7 @@ func TestGetHostFromOriginRemote(t *testing.T) {
 func TestResolveRemoteURL(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-resolve-remote-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize a git repo
 	if err := exec.Command("git", "init").Run(); err != nil {
@@ -572,15 +727,7 @@ func TestResolveRemoteURL(t *testing.T) {
 func TestGetRepositorySlugFromRemotePreferringUpstream(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-slug-upstream-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	if err := exec.Command("git", "init").Run(); err != nil {
 		t.Skip("Git not available")
@@ -627,15 +774,7 @@ func TestGetRepositorySlugFromRemoteForPathPreferringUpstream(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-slug-upstream-path-*")
 	testFilePath := filepath.Join(tmpDir, "workflow.md")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	if err := exec.Command("git", "init").Run(); err != nil {
 		t.Skip("Git not available")
@@ -666,15 +805,7 @@ func TestGetRepositorySlugFromRemoteForPathPreferringUpstream(t *testing.T) {
 func TestGetRepositorySlugFromRemoteFallback(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "test-slug-fallback-*")
 
-	originalDir, err := os.Getwd()
-	require.NoError(t, err, "get current directory for test setup")
-	defer func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Logf("Warning: failed to restore directory: %v", err)
-		}
-	}()
-
-	require.NoError(t, os.Chdir(tmpDir), "change to temp directory for test setup")
+	t.Chdir(tmpDir)
 
 	// Initialize a git repo
 	if err := exec.Command("git", "init").Run(); err != nil {

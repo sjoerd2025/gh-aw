@@ -5,9 +5,36 @@ import path from "path";
 import { createRequire } from "module";
 const _require = createRequire(import.meta.url);
 const { AGENT_OUTPUT_FILENAME, TMP_GH_AW_PATH } = _require("./constants.cjs");
+const emptyOutputOutcome = _require("./empty_output_outcome.cjs");
+const { buildEmptyOutputOutcome } = emptyOutputOutcome;
+const { normalizeGeminiSession } = _require("./gemini_session.cjs");
+const incompleteOutput = JSON.stringify({
+  items: [
+    {
+      type: "report_incomplete",
+      reason: "missing_terminal_safe_output",
+      failureCause: "missing_terminal_safe_output",
+      retryCount: 0,
+      details:
+        "Failure classification: missing_terminal_safe_output\nSafe-output telemetry: not recorded\nNo terminal safe output was recorded. These observations do not establish why the agent omitted it; inspect the agent artifact (agent-session.jsonl and agent-stdio.log) for the final actions, then ensure the workflow emits a terminal safe output.",
+    },
+  ],
+  errors: [],
+  collectorEmptyOutputCause: "missing_terminal_safe_output",
+  collectorFailureCause: "missing_terminal_safe_output",
+  collectorRetryCount: 0,
+});
 describe("collect_ndjson_output.cjs", () => {
-  let mockCore, collectScript;
+  let mockCore, collectScript, legacyPatchSpy, diagnosticRoot, outcomeSpy, sessionSpy;
   (beforeEach(() => {
+    vi.stubEnv("GITHUB_RUN_ID", "38401428490");
+    vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+    vi.stubEnv("GH_AW_ENGINE_ID", undefined);
+    diagnosticRoot = fs.mkdtempSync(path.join(os.tmpdir(), "collect-ndjson-diagnostics-"));
+    outcomeSpy = vi.spyOn(emptyOutputOutcome, "buildEmptyOutputOutcome").mockImplementation((errors, _rootDir, session) => buildEmptyOutputOutcome(errors, diagnosticRoot, session));
+    const collectOutcomeSession = emptyOutputOutcome.collectOutcomeSession;
+    sessionSpy = vi.spyOn(emptyOutputOutcome, "collectOutcomeSession").mockImplementation(() => collectOutcomeSession(diagnosticRoot));
+    fs.rmSync("/tmp/gh-aw/mcp-cli-audit", { recursive: true, force: true });
     (fs.existsSync("/tmp/gh-aw") || fs.mkdirSync("/tmp/gh-aw", { recursive: !0 }),
       (global.originalConsole = global.console),
       (global.console = { log: vi.fn(), error: vi.fn() }),
@@ -41,6 +68,8 @@ describe("collect_ndjson_output.cjs", () => {
       (global.core = mockCore),
       (global.context = { eventName: "issues", actor: "test-actor", repo: { owner: "test-owner", repo: "test-repo" }, payload: {} }),
       (global.github = { rest: { repos: { listCollaborators: vi.fn().mockResolvedValue({ data: [] }) }, users: { getByUsername: vi.fn() } } }));
+    const readDirectory = fs.readdirSync;
+    legacyPatchSpy = vi.spyOn(fs, "readdirSync").mockImplementation((directory, ...options) => (directory === "/tmp/gh-aw" ? [] : Reflect.apply(readDirectory, fs, [directory, ...options])));
     const scriptPath = path.join(__dirname, "collect_ndjson_output.cjs");
     ((collectScript = fs.readFileSync(scriptPath, "utf8")),
       (global.fs = fs),
@@ -61,6 +90,12 @@ describe("collect_ndjson_output.cjs", () => {
             },
           },
           add_comment: { defaultMax: 1, fields: { body: { required: !0, type: "string", sanitize: !0, maxLength: 65e3 }, item_number: { issueOrPRNumber: !0 } } },
+          add_labels: { defaultMax: 5, fields: { labels: { required: !0, type: "array" }, item_number: { issueNumberOrTemporaryId: !0 } } },
+          assign_milestone: {
+            defaultMax: 1,
+            customValidation: "requiresOneOf:milestone_number,milestone_title",
+            fields: { issue_number: { issueNumberOrTemporaryId: !0 }, milestone_number: { optionalPositiveInteger: !0 }, milestone_title: { type: "string", sanitize: !0, maxLength: 128 } },
+          },
           create_pull_request: {
             defaultMax: 1,
             fields: {
@@ -88,7 +123,7 @@ describe("collect_ndjson_output.cjs", () => {
           },
           link_sub_issue: { defaultMax: 5, customValidation: "parentAndSubDifferent", fields: { parent_issue_number: { required: !0, issueNumberOrTemporaryId: !0 }, sub_issue_number: { required: !0, issueNumberOrTemporaryId: !0 } } },
           noop: { defaultMax: 1, fields: { message: { required: !0, type: "string", sanitize: !0, maxLength: 65e3 } } },
-          missing_tool: {
+          report_missing_tool: {
             defaultMax: 20,
             fields: { tool: { required: !0, type: "string", sanitize: !0, maxLength: 128 }, reason: { required: !0, type: "string", sanitize: !0, maxLength: 256 }, alternatives: { type: "string", sanitize: !0, maxLength: 512 } },
           },
@@ -127,10 +162,22 @@ describe("collect_ndjson_output.cjs", () => {
               inputs: { type: "object" },
             },
           },
+          call_workflow: {
+            defaultMax: 1,
+            fields: {
+              workflow_name: { required: !0, type: "string", sanitize: !0, minLength: 1, maxLength: 256, pattern: ".*\\S.*", patternError: "must not be empty" },
+              inputs: { type: "object" },
+            },
+          },
         })
       ));
   }),
     afterEach(() => {
+      vi.unstubAllEnvs();
+      outcomeSpy.mockRestore();
+      sessionSpy.mockRestore();
+      fs.rmSync(diagnosticRoot, { recursive: true, force: true });
+      legacyPatchSpy.mockRestore();
       ["/tmp/gh-aw/test-ndjson-output.txt", "/tmp/gh-aw/agent_output.json"].forEach(file => {
         try {
           fs.existsSync(file) && fs.unlinkSync(file);
@@ -151,8 +198,8 @@ describe("collect_ndjson_output.cjs", () => {
     it("should handle missing GH_AW_SAFE_OUTPUTS environment variable", async () => {
       (delete process.env.GH_AW_SAFE_OUTPUTS,
         await eval(`(async () => { ${collectScript}; await main(); })()`),
-        expect(mockCore.setOutput).toHaveBeenCalledWith("output", ""),
-        expect(mockCore.setOutput).toHaveBeenCalledWith("output_types", ""),
+        expect(mockCore.setOutput).toHaveBeenCalledWith("output", incompleteOutput),
+        expect(mockCore.setOutput).toHaveBeenCalledWith("output_types", "report_incomplete"),
         expect(mockCore.setOutput).toHaveBeenCalledWith("has_patch", "false"),
         expect(mockCore.info).toHaveBeenCalledWith("GH_AW_SAFE_OUTPUTS not set, no output to collect"));
     }),
@@ -160,10 +207,10 @@ describe("collect_ndjson_output.cjs", () => {
       const missingFile = `${TMP_GH_AW_PATH}/nonexistent-file.txt`;
       ((process.env.GH_AW_SAFE_OUTPUTS = missingFile),
         await eval(`(async () => { ${collectScript}; await main(); })()`),
-        expect(mockCore.setOutput).toHaveBeenCalledWith("output", '{"items":[],"errors":[]}'),
-        expect(mockCore.setOutput).toHaveBeenCalledWith("output_types", ""),
+        expect(mockCore.setOutput).toHaveBeenCalledWith("output", incompleteOutput),
+        expect(mockCore.setOutput).toHaveBeenCalledWith("output_types", "report_incomplete"),
         expect(mockCore.setOutput).toHaveBeenCalledWith("has_patch", "false"),
-        expect(mockCore.info).toHaveBeenCalledWith(`Output file does not exist: ${missingFile} — no safe-output items were emitted; treating as empty collection (graceful no-op)`),
+        expect(mockCore.info).toHaveBeenCalledWith(`Output file does not exist: ${missingFile}`),
         expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_AGENT_OUTPUT", path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME)));
     }),
     it("should fail with infra error when safeoutputs gateway-empty flag exists and outputs file is missing", async () => {
@@ -182,7 +229,10 @@ describe("collect_ndjson_output.cjs", () => {
         const failedMessage = failedCalls[0][0];
         expect(failedMessage).toContain("safeoutputs MCP gateway registered 0 tools");
         expect(failedMessage).toContain("gateway infrastructure failure");
-        expect(mockCore.setOutput).not.toHaveBeenCalledWith("output", expect.anything());
+        const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+        expect(output.items[0].type).toBe("report_incomplete");
+        expect(output.items[0].details).toContain("Safe-output tools: unavailable (gateway registered zero tools)");
+        expect(fs.existsSync(path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME))).toBe(true);
       } finally {
         if (originalRunnerTemp === undefined) {
           delete process.env.RUNNER_TEMP;
@@ -201,8 +251,8 @@ describe("collect_ndjson_output.cjs", () => {
         ((process.env.GH_AW_SAFE_OUTPUTS = `${TMP_GH_AW_PATH}/nonexistent-file.txt`),
           await eval(`(async () => { ${collectScript}; await main(); })()`),
           expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("disk full")),
-          expect(spy).toHaveBeenCalledWith(path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME), '{"items":[],"errors":[]}', "utf8"),
-          expect(mockCore.setOutput).toHaveBeenCalledWith("output", '{"items":[],"errors":[]}'),
+          expect(spy).toHaveBeenCalledWith(path.join(TMP_GH_AW_PATH, AGENT_OUTPUT_FILENAME), incompleteOutput, "utf8"),
+          expect(mockCore.setOutput).toHaveBeenCalledWith("output", incompleteOutput),
           expect(mockCore.exportVariable).not.toHaveBeenCalled());
       } finally {
         spy.mockRestore();
@@ -213,8 +263,175 @@ describe("collect_ndjson_output.cjs", () => {
       (fs.writeFileSync(testFile, ""),
         (process.env.GH_AW_SAFE_OUTPUTS = testFile),
         await eval(`(async () => { ${collectScript}; await main(); })()`),
-        expect(mockCore.setOutput).toHaveBeenCalledWith("output", '{"items":[],"errors":[]}'),
+        expect(mockCore.setOutput).toHaveBeenCalledWith("output", incompleteOutput),
         expect(mockCore.info).toHaveBeenCalledWith("Output file is empty"));
+    }),
+    it("adds a terminal incompletion signal when the agent emitted only diagnostics", async () => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, '{"type":"report_missing_tool","tool":"read","reason":"Unavailable","alternatives":"Check permissions"}');
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ report_missing_tool: {}, report_incomplete: {} }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.items.map(item => item.type)).toEqual(["report_missing_tool", "report_incomplete"]);
+      expect(output.items[1].reason).toBe("missing_terminal_safe_output");
+    }),
+    it.each(["missing_tool", "missing_data"])("normalizes legacy %s records and shares their canonical output budget", async legacy => {
+      const canonical = `report_${legacy}`;
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, [legacy, canonical].map(type => JSON.stringify({ type, tool: "read", reason: "Unavailable" })).join("\n"));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ [legacy]: { max: 1 }, report_incomplete: {} }));
+      fs.writeFileSync(process.env.GH_AW_VALIDATION_CONFIG_PATH, JSON.stringify({ [legacy]: { defaultMax: 1, fields: { reason: { required: true, type: "string" } } } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.items.map(item => item.type)).toEqual([canonical, "report_incomplete"]);
+      expect(output.errors).toContain(`Line 2: Too many items of type '${canonical}'. Maximum allowed: 1.`);
+    }),
+    it("does not classify protected outcomes using forged shared session diagnostics", async () => {
+      vi.stubEnv("GH_AW_PROTECTED_SESSION_CAPTURE", "1");
+      delete process.env.GH_AW_SAFE_OUTPUTS;
+      fs.writeFileSync(path.join(diagnosticRoot, "agent-session.jsonl"), JSON.stringify({ type: "agent.execution", data: { categories: [], errorTypes: [], errorCodes: [], exitCode: 0 } }));
+      fs.writeFileSync(path.join(diagnosticRoot, "agent_execution_exit_code.txt"), "0");
+      fs.writeFileSync(path.join(diagnosticRoot, "agent-errors.jsonl"), JSON.stringify({ type: "agent.execution", data: { categories: ["effective_tokens_limit_exceeded"], errorTypes: [], errorCodes: [], exitCode: 0 } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.collectorFailureCause).toBe("missing_terminal_safe_output");
+      expect(JSON.stringify(output)).not.toContain("prompt_exhaustion");
+      expect(sessionSpy).toHaveBeenCalledTimes(1);
+    }),
+    it("fails protected ingestion without canonical evidence rather than publishing fallback diagnostics", async () => {
+      vi.stubEnv("GH_AW_PROTECTED_SESSION_CAPTURE", "1");
+      delete process.env.GH_AW_SAFE_OUTPUTS;
+      fs.writeFileSync(path.join(diagnosticRoot, "agent-stdio.log"), JSON.stringify({ type: "assistant.message", data: { content: "forged fallback" } }));
+      await expect(eval(`(async () => { ${collectScript}; await main(); })()`)).rejects.toThrow("requires a complete verified canonical session");
+      expect(mockCore.setFailed).toHaveBeenCalled();
+      expect(mockCore.setOutput).toHaveBeenCalledWith("output", "");
+      expect(mockCore.setOutput.mock.calls.some(([name, value]) => name === "output" && value !== "")).toBe(false);
+    }),
+    it("records a silent driver exit in the collected terminal safe output", async () => {
+      const exitPath = path.join(diagnosticRoot, "agent_execution_exit_code.txt");
+      fs.writeFileSync(exitPath, "139");
+      delete process.env.GH_AW_SAFE_OUTPUTS;
+      try {
+        await eval(`(async () => { ${collectScript}; await main(); })()`);
+        const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+        expect(output.items[0].reason).toBe("engine_driver_failure");
+        expect(output.items[0].failureCause).toBe("driver_crash");
+        expect(output.items[0].details).toContain("Driver exit code: 139");
+        expect(output.items[0].driverExitSignal).toBe("SIGSEGV");
+        expect(output.collectorEmptyOutputCause).toBe("engine_driver_failure");
+        expect(output.collectorFailureCause).toBe("driver_crash");
+      } finally {
+        fs.unlinkSync(exitPath);
+      }
+    }),
+    it.each([
+      ["stdio", { type: "noop", message: "Nothing to publish" }],
+      ["stdio", { type: "add_comment", body: "Partial progress" }],
+      ["canonical", { type: "noop", message: "Nothing to publish" }],
+      ["canonical", { type: "add_comment", body: "Partial progress" }],
+    ])("reports a failed final Gemini result from %s despite exit 0 and an existing %j", async (source, item) => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify(item));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ [item.type]: {} }));
+      fs.writeFileSync(path.join(diagnosticRoot, "aw_info.json"), JSON.stringify({ engine_id: "gemini" }));
+      fs.writeFileSync(path.join(diagnosticRoot, "agent_execution_exit_code.txt"), "0");
+      const records = [{ type: "result", status: "error" }];
+      const events = source === "canonical" ? normalizeGeminiSession(records) : records;
+      fs.writeFileSync(path.join(diagnosticRoot, source === "canonical" ? "agent-session.jsonl" : "agent-stdio.log"), events.map(JSON.stringify).join("\n"));
+
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.items).toEqual([item, expect.objectContaining({ type: "report_incomplete", reason: "engine_driver_failure", driverExitCode: 0 })]);
+      expect(output.collectorEmptyOutputCause).toBe("engine_driver_failure");
+      expect(output.collectorFailureCause).toBe("unknown");
+      expect(output.items[1].details).toContain("The engine's final result reported an error");
+      expect(output.items[1].details).not.toContain("without emitting a terminal safe output");
+      expect(output.items[1].details).not.toContain("exited before a terminal safe output");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("output_types", `${item.type},report_incomplete`);
+    }),
+    it("uses the Aider engine hint and one collected session for a failed final result", async () => {
+      const item = { type: "noop", message: "Nothing to publish" };
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      vi.stubEnv("GH_AW_ENGINE_ID", "aider");
+      fs.writeFileSync(testFile, JSON.stringify(item));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ noop: {} }));
+      fs.writeFileSync(path.join(diagnosticRoot, "agent_execution_exit_code.txt"), "0");
+      fs.writeFileSync(path.join(diagnosticRoot, "agent-session.jsonl"), `${JSON.stringify({ type: "session.result", data: { errors: [{ status: "error" }] } })}\n`);
+
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.items).toEqual([item, expect.objectContaining({ type: "report_incomplete", reason: "engine_driver_failure", driverExitCode: 0 })]);
+      expect(sessionSpy).toHaveBeenCalledTimes(1);
+      expect(output.collectorEmptyOutputCause).toBe("engine_driver_failure");
+    }),
+    it("preserves final Gemini failure over an earlier CLI error with valid output and nonzero exit", async () => {
+      const item = { type: "noop", message: "Nothing to publish" };
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify(item));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ noop: {} }));
+      fs.writeFileSync(path.join(diagnosticRoot, "aw_info.json"), JSON.stringify({ engine_id: "gemini" }));
+      fs.writeFileSync(path.join(diagnosticRoot, "agent_execution_exit_code.txt"), "1");
+      fs.writeFileSync(path.join(diagnosticRoot, "agent-stdio.log"), `${JSON.stringify({ type: "result", status: "error" })}\n`);
+      const auditPath = path.join(diagnosticRoot, "mcp-cli-audit/safeoutputs.audit.jsonl");
+      fs.mkdirSync(path.dirname(auditPath), { recursive: true });
+      fs.writeFileSync(auditPath, `${JSON.stringify({ event: "parse_args_error" })}\n`);
+
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.items).toEqual([item, expect.objectContaining({ type: "report_incomplete", reason: "engine_driver_failure", driverExitCode: 1 })]);
+      expect(output.items[1].details).toContain("The safeoutputs CLI failed.");
+      expect(output.items[1].details).toContain("The engine's final result reported an error");
+      expect(output.collectorEmptyOutputCause).toBe("engine_driver_failure");
+    }),
+    it.each([
+      [{ type: "result", status: "success" }],
+      [
+        { type: "result", status: "error" },
+        { type: "result", status: "success" },
+      ],
+      [
+        { type: "tool_result", tool_id: "call", status: "error", output: "Tool failed" },
+        { type: "result", status: "success" },
+      ],
+      [{ type: "message", role: "assistant", content: "Done" }],
+      [
+        { type: "result", status: "success" },
+        { type: "result", status: "error", parent_tool_use_id: "child" },
+      ],
+    ])("preserves terminal safe outputs without a failed final main-session result: %j", async (...records) => {
+      const item = { type: "noop", message: "Nothing to publish" };
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify(item));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH, JSON.stringify({ noop: {} }));
+      fs.writeFileSync(path.join(diagnosticRoot, "aw_info.json"), JSON.stringify({ engine_id: "gemini" }));
+      fs.writeFileSync(path.join(diagnosticRoot, "agent_execution_exit_code.txt"), "0");
+      fs.writeFileSync(path.join(diagnosticRoot, "agent-stdio.log"), records.map(JSON.stringify).join("\n"));
+
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.items).toEqual([item]);
+      expect(output).not.toHaveProperty("collectorEmptyOutputCause");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("output_types", "noop");
+    }),
+    it("preserves a pre-agent startup failure as collector-owned metadata", async () => {
+      const executionPath = path.join(diagnosticRoot, "agent_execution.json");
+      fs.writeFileSync(executionPath, JSON.stringify({ version: 1, component: "agent", run_id: 38401428490, run_attempt: 1, state: "not_started" }));
+      delete process.env.GH_AW_SAFE_OUTPUTS;
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+      expect(output.items[0]).toMatchObject({ type: "report_incomplete", reason: "agent_startup_failure", failureCause: "agent_startup_failure" });
+      expect(output.collectorEmptyOutputCause).toBe("agent_startup_failure");
+      expect(output.collectorFailureCause).toBe("agent_startup_failure");
     }),
     it("should validate and parse valid JSONL content", async () => {
       const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -255,10 +472,64 @@ describe("collect_ndjson_output.cjs", () => {
       const parsedOutput = JSON.parse(outputCall[1]);
       expect(parsedOutput.errors).toHaveLength(1);
     }),
+    it("should preserve call_workflow workflow_name and inputs during ingestion (regression for github/gh-aw#55176)", async () => {
+      // Samples-mode replay (and the live dynamic call_workflow MCP tool) emits a
+      // canonical message with both workflow_name and inputs set. Before the fix,
+      // call_workflow had no ValidationConfig entry, so ingestion fell back to
+      // validateItemWithSafeJobConfig, which dropped every field except "type"
+      // because the call_workflow safe-outputs config lacks an "inputs" key.
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
+        ndjsonContent = '{"type": "call_workflow", "workflow_name": "test-copilot-call-worker", "inputs": {"sentinel": "hello-sentinel"}}';
+      (fs.writeFileSync(testFile, ndjsonContent), (process.env.GH_AW_SAFE_OUTPUTS = testFile));
+      const __config = '{"call_workflow":{"max":1,"workflows":["test-copilot-call-worker"],"workflow_files":{"test-copilot-call-worker":"./.github/workflows/test-copilot-call-worker.lock.yml"}}}',
+        configPath = "/tmp/gh-aw/safeoutputs/config.json";
+      (fs.mkdirSync("/tmp/gh-aw/safeoutputs", { recursive: !0 }), fs.writeFileSync(configPath, __config), await eval(`(async () => { ${collectScript}; await main(); })()`));
+      const setOutputCalls = mockCore.setOutput.mock.calls,
+        outputCall = setOutputCalls.find(call => "output" === call[0]);
+      expect(outputCall).toBeDefined();
+      const parsedOutput = JSON.parse(outputCall[1]);
+      (expect(parsedOutput.items).toHaveLength(1),
+        expect(parsedOutput.items[0].type).toBe("call_workflow"),
+        expect(parsedOutput.items[0].workflow_name).toBe("test-copilot-call-worker"),
+        expect(parsedOutput.items[0].inputs).toEqual({ sentinel: "hello-sentinel" }),
+        expect(parsedOutput.errors).toHaveLength(0));
+    }),
+    it.each(["depends-on", "depends_on"])("preserves %s metadata for inline custom outputs", async key => {
+      const outputId = "so_AAAAAAAAAAAA";
+      const prerequisite = "so_BBBBBBBBBBBB";
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type: "publish_report", text: "Report", output_id: outputId, [key]: prerequisite }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ publish_report: { inputs: { text: { type: "string" } } } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(fs.readFileSync("/tmp/gh-aw/agent_output.json", "utf8"));
+      expect(output.errors).toHaveLength(0);
+      expect(output.items).toEqual([{ type: "publish_report", text: "Report", output_id: outputId, "depends-on": prerequisite }]);
+    }),
+    it.each([null, "aw_issue1", "so_BBBBBBBBBBBB"])("rejects malformed or unsupported custom job dependencies: %j", async dependency => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type: "deploy", "depends-on": dependency }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ deploy: { supports_dependencies: false } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(fs.readFileSync("/tmp/gh-aw/agent_output.json", "utf8"));
+      expect(output.items.some(item => item.type === "deploy")).toBe(false);
+      expect(output.errors.join("\n")).toContain("depends-on");
+    }),
+    it.each(["report_incomplete", "report_missing_tool", "report_missing_data"])("rejects dependencies for out-of-band %s during ingestion", async type => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type, "depends-on": "so_BBBBBBBBBBBB" }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ [type]: { max: 1 } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const output = JSON.parse(fs.readFileSync("/tmp/gh-aw/agent_output.json", "utf8"));
+      expect(output.items.some(item => item["depends-on"] === "so_BBBBBBBBBBBB")).toBe(false);
+      expect(output.errors.join("\n")).toContain("depends-on is not supported");
+    }),
     it("should preserve Slack mrkdwn links in custom safe-job string inputs", async () => {
       const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
       const slackText = "Tracking issue: <https://github.com/octo-org/octo-repo/issues/123|Build failure — Build github/gh-aw#456>";
-      const ndjsonContent = JSON.stringify({ type: "post_to_slack", text: slackText });
+      const ndjsonContent = JSON.stringify({ type: "post_to_slack", text: slackText, channel: "security-alerts" });
       fs.writeFileSync(testFile, ndjsonContent);
       process.env.GH_AW_SAFE_OUTPUTS = testFile;
       fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ post_to_slack: { inputs: { text: { type: "string", required: true } } } }));
@@ -268,6 +539,33 @@ describe("collect_ndjson_output.cjs", () => {
       expect(outputCall).toBeDefined();
       const parsedOutput = JSON.parse(outputCall[1]);
       (expect(parsedOutput.errors).toHaveLength(0), expect(parsedOutput.items).toEqual([{ type: "post_to_slack", text: slackText }]));
+      expect(parsedOutput.items[0]).not.toHaveProperty("channel");
+    }),
+    it("preserves explicitly length-limited large strings in agent_output.json", async () => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      const payload = `${"😀".repeat(100000)}${"x\n".repeat(66000)}${"x".repeat(300000)}`;
+      const item = { type: "publish_report", payload };
+      fs.writeFileSync(testFile, JSON.stringify(item));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ publish_report: { inputs: { payload: { type: "string", maxLength: 600000 } } } }));
+
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+      const output = JSON.parse(fs.readFileSync("/tmp/gh-aw/agent_output.json", "utf8"));
+      expect(output.errors).toHaveLength(0);
+      expect(output.items).toEqual([item]);
+    }),
+    it("should preserve zero-valued defaults in custom safe-job inputs", async () => {
+      const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+      fs.writeFileSync(testFile, JSON.stringify({ type: "process_batch" }));
+      process.env.GH_AW_SAFE_OUTPUTS = testFile;
+      fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ process_batch: { inputs: { count: { type: "number", default: 0 } } } }));
+      await eval(`(async () => { ${collectScript}; await main(); })()`);
+      const outputCall = mockCore.setOutput.mock.calls.find(call => "output" === call[0]);
+      expect(outputCall).toBeDefined();
+      const parsedOutput = JSON.parse(outputCall[1]);
+      expect(parsedOutput.errors).toHaveLength(0);
+      expect(parsedOutput.items).toEqual([{ type: "process_batch", count: 0 }]);
     }),
     it("should reject items with unexpected output types", async () => {
       const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -297,7 +595,7 @@ describe("collect_ndjson_output.cjs", () => {
         outputCall = setOutputCalls.find(call => "output" === call[0]);
       expect(outputCall).toBeDefined();
       const parsedOutput = JSON.parse(outputCall[1]);
-      (expect(parsedOutput.items).toHaveLength(0),
+      (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
         expect(parsedOutput.errors.length).toBeGreaterThan(0),
         expect(parsedOutput.errors.some(e => e.includes("requires a 'body' field (string)"))).toBe(!0),
         expect(parsedOutput.errors.some(e => e.includes("requires a 'title' field (string)"))).toBe(!0));
@@ -652,7 +950,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("JSON parsing failed"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("JSON parsing failed"))).toBe(!0));
         }),
         it("should preserve valid JSON without modification", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -704,7 +1004,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          parsedOutput.items.length > 0
+          parsedOutput.errors.length === 0
             ? (expect(parsedOutput.items[0].type).toBe("add_labels"), expect(parsedOutput.items[0].labels).toEqual(["bug", "feature"]), expect(parsedOutput.errors).toHaveLength(0))
             : (expect(mockCore.setFailed).not.toHaveBeenCalled(), expect(mockCore.warning).toHaveBeenCalled(), expect(parsedOutput.errors.length).toBeGreaterThan(0));
         }),
@@ -881,9 +1181,9 @@ describe("collect_ndjson_output.cjs", () => {
           const parsedOutput = JSON.parse(outputCall[1]);
           (expect(parsedOutput.items).toHaveLength(1),
             expect(parsedOutput.items[0].type).toBe("create_issue"),
-            expect(parsedOutput.items[0].priority).toBe(5),
-            expect(parsedOutput.items[0].urgent).toBe(!0),
-            expect(parsedOutput.items[0].assignee).toBe(null),
+            expect(parsedOutput.items[0]).not.toHaveProperty("priority"),
+            expect(parsedOutput.items[0]).not.toHaveProperty("urgent"),
+            expect(parsedOutput.items[0]).not.toHaveProperty("assignee"),
             expect(parsedOutput.errors).toHaveLength(0));
         }),
         it("should attempt repair but fail gracefully with excessive malformed JSON", async () => {
@@ -901,7 +1201,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("JSON parsing failed"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("JSON parsing failed"))).toBe(!0));
         }),
         it("should repair very long strings with multiple issues", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -928,12 +1230,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(1),
-            expect(parsedOutput.items[0].type).toBe("create_issue"),
-            expect(parsedOutput.items[0].metadata).toBeDefined(),
-            expect(parsedOutput.items[0].metadata.project).toBe("test"),
-            expect(parsedOutput.items[0].metadata.tags).toEqual(["important", "urgent"]),
-            expect(parsedOutput.errors).toHaveLength(0));
+          (expect(parsedOutput.items).toHaveLength(1), expect(parsedOutput.items[0].type).toBe("create_issue"), expect(parsedOutput.items[0]).not.toHaveProperty("metadata"), expect(parsedOutput.errors).toHaveLength(0));
         }),
         it("should handle complex backslash scenarios with graceful failure", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -946,9 +1243,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          1 === parsedOutput.items.length
+          parsedOutput.errors.length === 0
             ? (expect(parsedOutput.items[0].type).toBe("create_issue"), expect(parsedOutput.items[0].title).toContain("quotes"), expect(parsedOutput.errors).toHaveLength(0))
-            : (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors).toHaveLength(1), expect(parsedOutput.errors[0]).toContain("JSON parsing failed"));
+            : (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]), expect(parsedOutput.errors).toHaveLength(1), expect(parsedOutput.errors[0]).toContain("JSON parsing failed"));
         }),
         it("should repair JSON with carriage returns and form feeds", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -978,7 +1275,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("JSON parsing failed"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("JSON parsing failed"))).toBe(!0));
         }),
         it("should handle repair of JSON with missing property separators", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -995,7 +1294,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("JSON parsing failed"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("JSON parsing failed"))).toBe(!0));
         }),
         it("should repair arrays with mixed bracket types in complex structures", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -1021,7 +1322,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          parsedOutput.items.length > 0
+          parsedOutput.errors.length === 0
             ? (expect(parsedOutput.items[0].type).toBe("create_issue"), expect(parsedOutput.items[0].title).toBe("Test"), expect(parsedOutput.errors).toHaveLength(0))
             : (expect(mockCore.setFailed).not.toHaveBeenCalled(), expect(mockCore.warning).toHaveBeenCalled(), expect(parsedOutput.errors.length).toBeGreaterThan(0));
         }),
@@ -1052,7 +1353,7 @@ describe("collect_ndjson_output.cjs", () => {
           (expect(parsedOutput.items).toHaveLength(1),
             expect(parsedOutput.items[0].type).toBe("create_issue"),
             expect(parsedOutput.items[0].title).toBe("Combined issues"),
-            expect(parsedOutput.items[0].priority).toBe(1),
+            expect(parsedOutput.items[0]).not.toHaveProperty("priority"),
             expect(parsedOutput.errors).toHaveLength(0));
         }));
     }),
@@ -1132,7 +1433,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0),
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
             expect(parsedOutput.errors.length).toBeGreaterThan(0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert requires a 'file' field (string)"))).toBe(!0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert 'line' is required"))).toBe(!0),
@@ -1155,7 +1456,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0),
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
             expect(parsedOutput.errors.length).toBeGreaterThan(0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert requires a 'file' field (string)"))).toBe(!0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert 'line' is required"))).toBe(!0),
@@ -1178,7 +1479,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0),
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
             expect(parsedOutput.errors.length).toBeGreaterThan(0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert 'severity' must be one of: error, warning, info, note"))).toBe(!0));
         }),
@@ -1198,7 +1499,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0),
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
             expect(parsedOutput.errors.length).toBeGreaterThan(0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert 'column' must be a valid positive integer (got: invalid)"))).toBe(!0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert 'ruleIdSuffix' must be a string"))).toBe(!0),
@@ -1238,7 +1539,7 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0),
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
             expect(parsedOutput.errors.length).toBeGreaterThan(0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert 'line' must be a valid positive integer (got: invalid)"))).toBe(!0),
             expect(parsedOutput.errors.some(e => e.includes("create_code_scanning_alert 'line' must be a valid positive integer (got: 0)"))).toBe(!0),
@@ -1307,7 +1608,7 @@ describe("collect_ndjson_output.cjs", () => {
             parsedOutput = JSON.parse(outputCall[1]);
           expect(parsedOutput.items[0].body).toBe("GitHub URLs: https://github.com/repo, https://api.github.com/users, https://githubusercontent.com/file. External: (example.com/redacted)");
         }),
-        it("should handle @mentions neutralization", async () => {
+        it("should defer mention filtering for trusted output processing", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
             ndjsonContent = '{"type": "create_issue", "title": "@mention Test", "body": "Hey @username and @org/team, check this out! But preserve email@domain.com"}';
           (fs.writeFileSync(testFile, ndjsonContent), (process.env.GH_AW_SAFE_OUTPUTS = testFile));
@@ -1316,7 +1617,105 @@ describe("collect_ndjson_output.cjs", () => {
           (fs.mkdirSync("/tmp/gh-aw/safeoutputs", { recursive: !0 }), fs.writeFileSync(configPath, __config), await eval(`(async () => { ${collectScript}; await main(); })()`));
           const outputCall = mockCore.setOutput.mock.calls.find(call => "output" === call[0]),
             parsedOutput = JSON.parse(outputCall[1]);
-          expect(parsedOutput.items[0].body).toBe("Hey `@username` and `@org/team`, check this out! But preserve email@domain.com");
+          expect(parsedOutput.items[0].body).toBe("Hey @username and @org/team, check this out! But preserve email@domain.com");
+          expect(global.github.rest.repos.listCollaborators).not.toHaveBeenCalled();
+        }),
+        it("does not query collaborators during untrusted ingestion", async () => {
+          global.context.payload.issue = { user: { login: "alice", type: "User" } };
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+          fs.writeFileSync(testFile, [JSON.stringify({ type: "add_comment", repo: "target-org/first", body: "Hello @alice" }), JSON.stringify({ type: "add_comment", repo: "target-org/second", body: "Hello @alice" })].join("\n"));
+          process.env.GH_AW_SAFE_OUTPUTS = testFile;
+          fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ add_comment: { "target-repo": "*", max: 2 } }));
+
+          await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+          expect(global.github.rest.repos.listCollaborators).not.toHaveBeenCalled();
+          const parsed = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+          expect(parsed.items.map(item => item.body)).toEqual(["Hello @alice", "Hello @alice"]);
+        }),
+        it("does not query target issue authors during untrusted ingestion", async () => {
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+          fs.writeFileSync(
+            testFile,
+            [
+              JSON.stringify({ type: "add_comment", repo: "target-org/first", item_number: 7, body: "Hello @first-author" }),
+              JSON.stringify({ type: "add_comment", repo: "target-org/second", item_number: 7, body: "Hello @first-author" }),
+            ].join("\n")
+          );
+          process.env.GH_AW_SAFE_OUTPUTS = testFile;
+          fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ add_comment: { "target-repo": "*", max: 2 } }));
+          global.github.rest.issues = {
+            get: vi.fn(async ({ repo }) => ({ data: { user: { login: repo === "first" ? "first-author" : "second-author", type: "User" } } })),
+          };
+
+          await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+          const parsed = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+          expect(parsed.items.map(item => item.body)).toEqual(["Hello @first-author", "Hello @first-author"]);
+          expect(global.github.rest.issues.get).not.toHaveBeenCalled();
+        }),
+        it("does not look up explicit issue authors during untrusted ingestion", async () => {
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+          fs.writeFileSync(testFile, JSON.stringify({ type: "add_comment", item_number: 7, body: "Hello @target-author" }));
+          process.env.GH_AW_SAFE_OUTPUTS = testFile;
+          fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ add_comment: { "target-repo": "target-org/target-repo" } }));
+          global.github.rest.issues = { get: vi.fn().mockResolvedValue({ data: { user: { login: "target-author", type: "User" } } }) };
+
+          await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+          expect(global.github.rest.issues.get).not.toHaveBeenCalled();
+          const parsed = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+          expect(parsed.items[0].body).toBe("Hello @target-author");
+        }),
+        it("does not query repositories for per-item overrides during untrusted ingestion", async () => {
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+          fs.writeFileSync(testFile, JSON.stringify({ type: "add_comment", repo: "unauthorized/repo", body: "Hello @alice" }));
+          process.env.GH_AW_SAFE_OUTPUTS = testFile;
+          fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", JSON.stringify({ add_comment: { "target-repo": "target-org/target-repo" } }));
+          global.context.payload.issue = { user: { login: "alice", type: "User" } };
+
+          await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+          expect(global.github.rest.repos.listCollaborators).not.toHaveBeenCalled();
+          const parsed = JSON.parse(mockCore.setOutput.mock.calls.find(call => call[0] === "output")[1]);
+          expect(parsed.items[0].body).toBe("Hello @alice");
+        }),
+        it("should preserve allowed aliases after max when no more than max occur", async () => {
+          const allowed = Array.from({ length: 60 }, (_, i) => `user${i}`);
+          const validationPath = "/tmp/gh-aw/safeoutputs/validation.json";
+          const validationConfig = JSON.parse(fs.readFileSync(validationPath, "utf8"));
+          validationConfig.mentions = { allowContext: false, allowed, max: 3 };
+          fs.writeFileSync(validationPath, JSON.stringify(validationConfig));
+
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+          const ndjsonContent = '{"type":"create_issue","title":"Late allowlist entries","body":"Thanks @user57, @user58, and @user59"}';
+          fs.writeFileSync(testFile, ndjsonContent);
+          process.env.GH_AW_SAFE_OUTPUTS = testFile;
+          fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", '{"create_issue":true}');
+
+          await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+          const outputCall = mockCore.setOutput.mock.calls.find(call => call[0] === "output");
+          const parsedOutput = JSON.parse(outputCall[1]);
+          expect(parsedOutput.items[0].body).toBe("Thanks @user57, @user58, and @user59");
+        }),
+        it("should defer mention limits across all fields to trusted output processing", async () => {
+          const validationPath = "/tmp/gh-aw/safeoutputs/validation.json";
+          const validationConfig = JSON.parse(fs.readFileSync(validationPath, "utf8"));
+          validationConfig.mentions = { allowContext: false, allowed: ["user1", "user2", "user3", "user4"], max: 3 };
+          fs.writeFileSync(validationPath, JSON.stringify(validationConfig));
+
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt";
+          fs.writeFileSync(testFile, '{"type":"create_issue","title":"@user1 @user2","body":"@user3 @user4 @user1"}');
+          process.env.GH_AW_SAFE_OUTPUTS = testFile;
+          fs.writeFileSync("/tmp/gh-aw/safeoutputs/config.json", '{"create_issue":true}');
+
+          await eval(`(async () => { ${collectScript}; await main(); })()`);
+
+          const outputCall = mockCore.setOutput.mock.calls.find(call => call[0] === "output");
+          const parsedOutput = JSON.parse(outputCall[1]);
+          expect(parsedOutput.items[0].title).toBe("@user1 @user2");
+          expect(parsedOutput.items[0].body).toBe("@user3 @user4 @user1");
         }),
         it("should neutralize bot trigger phrases", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -1512,7 +1911,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors).toHaveLength(1), expect(parsedOutput.errors[0]).toContain("Too few items of type 'create_issue'. Minimum required: 1, found: 0."));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors).toHaveLength(1),
+            expect(parsedOutput.errors[0]).toContain("Too few items of type 'create_issue'. Minimum required: 1, found: 0."));
         }),
         it("should work with different safe output types", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -1557,7 +1958,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("noop requires a 'message' field (string)"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("noop requires a 'message' field (string)"))).toBe(!0));
         }),
         it("should reject noop with non-string message", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -1574,7 +1977,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("noop requires a 'message' field (string)"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("noop requires a 'message' field (string)"))).toBe(!0));
         }),
         it("should sanitize noop message content", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -1605,6 +2010,19 @@ describe("collect_ndjson_output.cjs", () => {
             expect(parsedOutput.items[1].message).toBe("Second message"),
             expect(parsedOutput.items[2].message).toBe("Third message"),
             expect(parsedOutput.errors).toHaveLength(0));
+        }),
+        it("should ignore probing noop messages without counting against the budget", async () => {
+          const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
+            ndjsonContent = '{"type": "noop", "message": "test"}\n{"type": "noop", "message": "probe"}\n{"type": "noop", "message": "Analysis complete - no issues found"}';
+          (fs.writeFileSync(testFile, ndjsonContent), (process.env.GH_AW_SAFE_OUTPUTS = testFile));
+          const config = '{"noop": true}',
+            configPath = "/tmp/gh-aw/safeoutputs/config.json";
+          (fs.mkdirSync("/tmp/gh-aw/safeoutputs", { recursive: !0 }), fs.writeFileSync(configPath, config), await eval(`(async () => { ${collectScript}; await main(); })()`));
+          const setOutputCalls = mockCore.setOutput.mock.calls,
+            outputCall = setOutputCalls.find(call => "output" === call[0]);
+          expect(outputCall).toBeDefined();
+          const parsedOutput = JSON.parse(outputCall[1]);
+          (expect(parsedOutput.items).toHaveLength(1), expect(parsedOutput.items[0].message).toBe("Analysis complete - no issues found"), expect(parsedOutput.errors).toHaveLength(0));
         }),
         it("should validate assign_milestone with required fields", async () => {
           const testFile = "/tmp/gh-aw/test-ndjson-output.txt",
@@ -1673,7 +2091,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("assign_to_agent requires at least one of"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("assign_to_agent requires at least one of"))).toBe(!0));
         }));
     }),
     describe("link_sub_issue temporary ID validation", () => {
@@ -1741,7 +2161,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("must be a positive integer or temporary ID"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("must be a positive integer or temporary ID"))).toBe(!0));
         }),
         it("should reject same temporary ID for parent and sub", async () => {
           const sameId = "aw_abc123",
@@ -1756,7 +2178,9 @@ describe("collect_ndjson_output.cjs", () => {
             outputCall = setOutputCalls.find(call => "output" === call[0]);
           expect(outputCall).toBeDefined();
           const parsedOutput = JSON.parse(outputCall[1]);
-          (expect(parsedOutput.items).toHaveLength(0), expect(parsedOutput.errors.length).toBeGreaterThan(0), expect(parsedOutput.errors.some(e => e.includes("must be different"))).toBe(!0));
+          (expect(parsedOutput.items).toEqual([expect.objectContaining({ type: "report_incomplete" })]),
+            expect(parsedOutput.errors.length).toBeGreaterThan(0),
+            expect(parsedOutput.errors.some(e => e.includes("must be different"))).toBe(!0));
         }));
     }));
 });

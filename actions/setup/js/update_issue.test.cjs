@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { useExecutionProvenanceFixture } from "./test_execution_provenance.js";
+
+useExecutionProvenanceFixture();
 
 // Mock the global objects that GitHub Actions provides
 const mockCore = {
@@ -759,6 +762,26 @@ describe("update_issue.cjs - cross-repo and operation integration", () => {
     vi.resetModules();
     process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
     process.env.GH_AW_WORKFLOW_ID = "test-workflow";
+  });
+
+  it.each([{ milestone: null }, { milestone: 1 }, { title: "Updated title" }])("sends explicit milestone clears and assignments without changing omitted milestones: %j", async update => {
+    mockGithub.rest.issues.get.mockResolvedValue({
+      data: { number: 42, title: "Test Issue", milestone: { number: 1 }, html_url: "https://github.com/testowner/testrepo/issues/42" },
+    });
+    mockGithub.rest.issues.update.mockResolvedValue({
+      data: { number: 42, title: "Test Issue", html_url: "https://github.com/testowner/testrepo/issues/42" },
+    });
+    const { main } = await import("./update_issue.cjs");
+    const handler = await main({ target: "*" });
+    const result = await handler({ type: "update_issue", issue_number: 42, ...update }, {});
+
+    expect(result.success).toBe(true);
+    expect(mockGithub.rest.issues.update).toHaveBeenCalledExactlyOnceWith({
+      owner: "testowner",
+      repo: "testrepo",
+      issue_number: 42,
+      ...update,
+    });
   });
 
   it("should route API calls to the cross-repo target when repo field is provided", async () => {

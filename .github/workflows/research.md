@@ -11,11 +11,16 @@ on:
         type: string
 
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
 
-engine: copilot
+engine:
+  id: pi
+  durable:
+    retention-days: 7
+model: copilot/gpt-6-sol
 
 network:
   allowed:
@@ -25,7 +30,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 imports:
   - shared/mcp/tavily.md
   - shared/reporting.md

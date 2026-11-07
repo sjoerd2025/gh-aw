@@ -9,9 +9,9 @@ sidebar:
 
 ## Quick Start
 
-Get your first MCP integration running in under 5 minutes.
+Get your first MCP integration running in a few minutes.
 
-### Step 1: Add GitHub Tools
+### 1. Add GitHub Tools
 
 Create a workflow file at `.github/workflows/my-workflow.md`:
 
@@ -37,7 +37,7 @@ Analyze the issue and provide a summary of similar existing issues.
 
 The `toolsets: [default]` configuration gives your agentic workflow access to repository, issue, and pull request tools.
 
-### Step 2: Compile and Test
+### 2. Compile and Test
 
 ```bash
 gh aw compile my-workflow
@@ -46,12 +46,12 @@ gh aw mcp inspect my-workflow
 
 ## GitHub MCP Server
 
-The GitHub MCP server is built into agentic workflows and provides comprehensive access to GitHub's API.
+The GitHub MCP server is built into agentic workflows and provides read-only access to GitHub's API. Write actions still go through [safe outputs](/gh-aw/reference/safe-outputs/).
 
 ### Available Toolsets
 
-| Toolset | Description | Tools |
-|---------|-------------|-------|
+| Toolset | Purpose | Example tools |
+|---------|---------|---------------|
 | `context` | User and team information | `get_teams`, `get_team_members` |
 | `repos` | Repository operations | `get_repository`, `get_file_contents`, `list_commits` |
 | `issues` | Issue management | `list_issues`, `create_issue`, `update_issue` |
@@ -61,24 +61,15 @@ The GitHub MCP server is built into agentic workflows and provides comprehensive
 | `code_security` | Security alerts | `list_code_scanning_alerts` |
 | `users` | User profiles | `get_me` ⚠️, `get_user`, `list_users` |
 
+The `default` toolset includes `context`, `repos`, `issues`, and `pull_requests`. It expands to the toolsets supported by GitHub Actions tokens, so `users` is excluded.
+
 When calling `list_code_scanning_alerts` from workflow prompts, always bound the request with `state: open` and `severity: critical,high`.
-
-The `default` toolset includes: `context`, `repos`, `issues`, `pull_requests`. When used in workflows, `[default]` expands to action-friendly toolsets that work with GitHub Actions tokens. Note: The `users` toolset is not included by default as GitHub Actions tokens do not support user operations.
-
-> [!WARNING]
-> **`get_me` is not usable under the integration token.** It returns HTTP 403 in all standard gh-aw runs. Do not call `get_me` to discover the agent's identity. Instead, read identity fields directly from the `<github-context>` block that is injected into every workflow prompt — it contains `actor`, `repository`, `run_id`, and other context values.
 
 ### Operating Modes
 
-Remote mode (`mode: remote`) connects to a hosted server with no Docker required. Local mode (`mode: local`) runs in Docker, enabling version pinning for offline or restricted environments. See [Remote vs Local Mode](/gh-aw/reference/github-tools/#github-tools-access-modes).
-
-The GitHub MCP server always operates read-only. Write operations are handled through [safe outputs](/gh-aw/reference/safe-outputs/), which run in a separate permission-controlled job.
+Use `mode: remote` to connect to the hosted server with no Docker requirement. Use `mode: local` to run in Docker when you need local version pinning or support for restricted environments. See [Remote vs Local Mode](/gh-aw/reference/github-tools/#github-tools-access-modes).
 
 ## Manually Configuring a Custom MCP Server
-
-> [!IMPORTANT]
->
-> Custom MCP servers should be **read-only**. Write operations must go through [safe outputs](/gh-aw/reference/safe-outputs/) or [Custom Safe Outputs](/gh-aw/reference/custom-safe-outputs/). Ensure your MCP server implements authentication and authorization to prevent unauthorized write access.
 
 Add MCP servers to your workflow's frontmatter using the `mcp-servers:` section:
 
@@ -108,11 +99,43 @@ mcp-servers:
 # Your workflow content here
 ```
 
+Custom MCP servers should be **read-only**. Write operations must go through [safe outputs](/gh-aw/reference/safe-outputs/) or [Custom Safe Outputs](/gh-aw/reference/custom-safe-outputs/). Ensure your MCP server implements authentication and authorization to prevent unauthorized write access.
+
+### Migrate dynamic configuration values
+
+Treat MCP URLs, arguments, mounts, headers and environment values as data, not shell scripts. Actions expressions such as `${{ steps.setup.outputs.port }}` are transported through environment bindings and resolved after JSON parsing. This also applies to entrypoints, container versions, registry metadata, proxy arguments, allowed tools and built-in GitHub custom arguments. CA paths retain their restricted workspace/temp expression support; unsupported expressions fail before lock emission. Simple runner `$NAME` and `${NAME}` references remain supported.
+
+Replace shell computations such as `$(...)`, backticks and `${NAME:-default}` with a setup-step output or an equivalent Actions expression. For example, when `WORKSPACE_FALLBACK` is available in the Actions `env` context, replace `${WORKSPACE_FALLBACK:-/tmp}` with:
+
+```yaml wrap
+mcp-servers:
+  service:
+    url: https://example.com/mcp
+    headers:
+      X-Workspace: "${{ env.WORKSPACE_FALLBACK || '/tmp' }}"
+```
+
+Compilation warns at configuration paths containing unsupported shell computations. These computations remain literal in both JSON configuration and mount allowlist exports. Former heredoc escapes such as `\$(printf literal)` and escaped backticks retain their literal payload without the shell-escape backslash. Compilation rejects a value that combines transported expressions or runner variables with an explicitly deferred gateway reference such as `\${TOKEN}`. When all inputs are available to the runner, combine them in a single Actions expression; otherwise keep gateway-only references in a separate configuration value. Do not assume a gateway variable is available in the runner's environment.
+
+> [!CAUTION]
+> Startup also rejects transported runtime values containing `${NAME}`, even when intended as literal template text. The pinned gateway expands that syntax again and cannot distinguish literal data from credential references. These runtime failures cannot all be predicted at compilation, and adding a backslash is not a supported escape for literal placeholder data.
+
+For inline expressions in shell steps, preview source migrations with `gh aw fix <workflow>`, review the diff after applying `--write`, and recompile. The codemod migrates expanding heredoc bodies, including hash-prefixed lines, but preserves proven quoted bodies and shell comments. CTR-006 still rejects prohibited expressions in those preserved regions because Actions interpolates them before Bash parses the script; remove expressions from comments, and manually move heredoc values to `env:` and use an unquoted heredoc so Bash expands the shell variable. An unproven heredoc boundary requires a manual fix before any changes to that workflow are written. Ordinary single-quoted shell strings still require manual quote review; quoted heredocs are not a safe transport for arbitrary multiline Actions values.
+
+Deploy regenerated locks with the matching setup runtime. Recompilation does not repair earlier runs, and compiler-owned `GH_AW_MCP_*` placeholders are not authored configuration.
+
 ## Custom MCP Server Types
+
+Choose the transport that matches how the server runs:
+
+- `command` for local executables over stdio
+- `container` for packaged local servers
+- `url` for remote HTTP endpoints
+- `registry` when you want to attach registry metadata to a server definition
 
 ### Stdio MCP Servers
 
-Execute commands with stdin/stdout communication for Python modules, Node.js scripts, and local executables:
+Use stdin/stdout communication for Python modules, Node.js scripts, and local executables:
 
 ```yaml wrap
 mcp-servers:
@@ -142,7 +165,7 @@ network:
     - api.example.com
 ```
 
-The `container` field generates `docker run --rm -i <args> <image> <entrypointArgs>`. 
+The `container` field generates `docker run --rm -i <args> <image> <entrypointArgs>`.
 
 ### HTTP MCP Servers
 
@@ -197,7 +220,7 @@ mcp-servers:
 
 ## MCP Tool Filtering
 
-Use `allowed:` to specify which tools are available, or `["*"]` to allow all:
+Use `allowed:` to expose only the tools a workflow needs, or `["*"]` to allow all:
 
 ```yaml wrap
 mcp-servers:
@@ -210,7 +233,7 @@ The `allowed:` filter is enforced at the **MCP gateway level** — the gateway o
 
 ## Shared MCP Configurations
 
-Pre-configured MCP server specifications are available in [`.github/workflows/shared/mcp/`](https://github.com/github/gh-aw/tree/main/.github/workflows/shared/mcp) and can be copied or imported directly. Examples include:
+Pre-configured MCP server specifications are available in [`.github/workflows/shared/mcp/`](https://github.com/github/gh-aw/tree/main/.github/workflows/shared/mcp) and can be copied or imported directly:
 
 | MCP Server | Import Path | Key Capabilities |
 |------------|-------------|------------------|
@@ -260,24 +283,13 @@ mcp-servers:
 ---
 ```
 
-`shared/azure-auth.md` sets `AZURE_CONFIG_DIR=/tmp/gh-aw/agent/.azure` and runs
-`az login` in a pre-agent step. This bridges the runner process to the agent
-sandbox process, so `DefaultAzureCredential` can resolve `AzureCliCredential`
-inside the sandbox.
+`shared/azure-auth.md` sets `AZURE_CONFIG_DIR=/tmp/gh-aw/agent/.azure` and runs `az login` in a pre-agent step so `DefaultAzureCredential` can resolve `AzureCliCredential` inside the sandbox.
 
-Azure DevOps MCP support (`shared/mcp/azure-devops.md`) is still experimental;
-interfaces and required configuration may change in future releases.
+Azure DevOps MCP support (`shared/mcp/azure-devops.md`) is still experimental, and its interfaces and required configuration may change. Set `ADO_MCP_AUTH_TOKEN` to the full `Authorization` header value, such as a bearer token string. In diagnostics and inspect output, the header is masked as `Authorization: ******`; this is expected.
 
-For `shared/mcp/azure-devops.md`, set `ADO_MCP_AUTH_TOKEN` to the full
-`Authorization` header value (for example, a bearer token string). In
-diagnostics and inspect output, the header is masked as
-`Authorization: ******`; this is expected.
+This shared Azure DevOps configuration also requires `*.dev.azure.com`, `*.visualstudio.com`, and `*.microsoftonline.com` in the network allowlist.
 
-This shared Azure DevOps configuration also requires these network domains:
-`*.dev.azure.com`, `*.visualstudio.com`, and `*.microsoftonline.com`.
-
-Keep the command-based Azure MCP variant read-only and keep an explicit
-`allowed` list. Do not switch to `allowed: ["*"]`.
+Keep the command-based Azure MCP variant read-only with an explicit `allowed` list; do not switch to `allowed: ["*"]`.
 
 ## Adding MCP Servers from the Registry
 
@@ -346,19 +358,24 @@ Review code scanning alerts and create weekly security discussions with findings
 
 ## Debugging and Troubleshooting
 
-Inspect MCP configurations with CLI commands: `gh aw mcp inspect my-workflow` (add `--server <name> --verbose` for details) or `gh aw mcp list-tools <server> my-workflow`.
+Inspect MCP configurations with `gh aw mcp inspect my-workflow` or `gh aw mcp list-tools <server> my-workflow`. Add `--server <name> --verbose` when you need per-server details.
 
-For advanced debugging, import `shared/mcp-debug.md` to access diagnostic tools and the `report_diagnostics_to_pull_request` custom safe-output.
+For deeper diagnostics, import `shared/mcp-debug.md` to access diagnostic tools and the `report_diagnostics_to_pull_request` custom safe-output.
 
-**Common issues**: Connection failures (verify syntax, env vars, network) or tool not found (check toolsets configuration or `allowed` list with `gh aw mcp inspect`).
+Most failures fall into two buckets:
 
-## Related Documentation
+- connection problems caused by syntax, environment variable, or network issues
+- missing tools caused by the configured toolsets or `allowed` list
 
-- [MCP Scripts](/gh-aw/reference/mcp-scripts/) - Define custom inline tools without external MCP servers
-- [Tools](/gh-aw/reference/tools/) - Complete tools reference
-- [CLI Commands](/gh-aw/setup/cli/) - CLI commands including `mcp inspect`
-- [Imports](/gh-aw/reference/imports/) - Modularizing workflows with includes
-- [Frontmatter](/gh-aw/reference/frontmatter/) - All configuration options
-- [Workflow Structure](/gh-aw/reference/workflow-structure/) - Directory organization
+In both cases, `gh aw mcp inspect` is the fastest way to confirm what the workflow exposes.
+
+## Learn More
+
+- [MCP Scripts](/gh-aw/reference/mcp-scripts/) for inline tools without external MCP servers
+- [Tools](/gh-aw/reference/tools/) for the full tools reference
+- [CLI Commands](/gh-aw/setup/cli/) for commands such as `mcp inspect`
+- [Imports](/gh-aw/reference/imports/) for modular workflow composition
+- [Frontmatter](/gh-aw/reference/frontmatter/) for configuration details
+- [Workflow Structure](/gh-aw/reference/workflow-structure/) for directory layout
 - [Model Context Protocol Specification](https://github.com/modelcontextprotocol/specification)
 - [GitHub MCP Server](https://github.com/github/github-mcp-server)

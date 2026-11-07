@@ -58,6 +58,7 @@ func TestActionsCleanCommand_NoActionsDir(t *testing.T) {
 }
 
 func TestGetActionDirectories(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		setup       func(string) error
@@ -111,6 +112,7 @@ func TestGetActionDirectories(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmpDir := t.TempDir()
 			err := tt.setup(tmpDir)
 			require.NoError(t, err, "Setup should not fail")
@@ -129,6 +131,7 @@ func TestGetActionDirectories(t *testing.T) {
 }
 
 func TestGetActionDirectories_SortedOutput(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	actionsDir := filepath.Join(tmpDir, "actions")
 	// Create directories in reverse-alphabetical order to verify sorting
@@ -142,6 +145,7 @@ func TestGetActionDirectories_SortedOutput(t *testing.T) {
 }
 
 func TestValidateActionYml(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		actionYmlContent string
@@ -149,11 +153,11 @@ func TestValidateActionYml(t *testing.T) {
 		errorContains    string
 	}{
 		{
-			name: "valid node20 action",
+			name: "valid node24 action with double quotes",
 			actionYmlContent: `name: Test Action
 description: A test action
 runs:
-  using: 'node20'
+  using: "node24"
   main: 'index.js'`,
 			expectError: false,
 		},
@@ -176,7 +180,7 @@ runs:
 			name: "missing name field",
 			actionYmlContent: `description: A test action
 runs:
-  using: 'node20'`,
+  using: 'node24'`,
 			expectError:   true,
 			errorContains: "missing required field 'name'",
 		},
@@ -184,7 +188,7 @@ runs:
 			name: "missing description field",
 			actionYmlContent: `name: Test Action
 runs:
-  using: 'node20'`,
+  using: 'node24'`,
 			expectError:   true,
 			errorContains: "missing required field 'description'",
 		},
@@ -217,6 +221,7 @@ runs:
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmpDir := t.TempDir()
 			actionPath := filepath.Join(tmpDir, "test-action")
 			err := os.MkdirAll(actionPath, 0755)
@@ -243,6 +248,7 @@ runs:
 }
 
 func TestGetActionDependencies(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		actionName string
@@ -262,6 +268,7 @@ func TestGetActionDependencies(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			deps := getActionDependencies(tt.actionName)
 			assert.GreaterOrEqual(t, len(deps), tt.minDeps, "Should return at least minimum dependencies")
 		})
@@ -326,6 +333,7 @@ func TestActionsCleanCommand_EmptyActionsDir(t *testing.T) {
 }
 
 func TestIsCompositeAction(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		actionYmlContent string
@@ -355,11 +363,11 @@ runs:
 			expectError:     false,
 		},
 		{
-			name: "node20 action",
+			name: "node24 action",
 			actionYmlContent: `name: Test Action
 description: A test action
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'index.js'`,
 			expectComposite: false,
 			expectError:     false,
@@ -373,6 +381,7 @@ runs:
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmpDir := t.TempDir()
 			actionPath := filepath.Join(tmpDir, "test-action")
 			err := os.MkdirAll(actionPath, 0755)

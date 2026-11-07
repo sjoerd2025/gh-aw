@@ -37,9 +37,9 @@ import (
 
 var compileWorkflowProcessorLog = logger.New("cli:compile_workflow_processor")
 
-func appendValidationErrors(dst []CompileValidationError, errorType string, err error) []CompileValidationError {
+func appendValidationErrors(dst []ValidationIssue, errorType string, err error) []ValidationIssue {
 	for _, message := range workflow.ExpandErrorMessages(err) {
-		dst = append(dst, CompileValidationError{
+		dst = append(dst, ValidationIssue{
 			Type:    errorType,
 			Message: message,
 		})
@@ -57,13 +57,14 @@ type compileWorkflowFileResult struct {
 
 // compileWorkflowFileOptions holds flags for compileWorkflowFile.
 type compileWorkflowFileOptions struct {
-	verbose    bool
-	jsonOutput bool
-	noEmit     bool
-	zizmor     bool
-	poutine    bool
-	strict     bool
-	validate   bool
+	verbose        bool
+	jsonOutput     bool
+	noEmit         bool
+	zizmor         bool
+	poutine        bool
+	strict         bool
+	validate       bool
+	failOnWarnings bool
 }
 
 // compileWorkflowFile compiles a single workflow file (not a campaign spec)
@@ -80,8 +81,8 @@ func compileWorkflowFile(
 		validationResult: ValidationResult{
 			Workflow: filepath.Base(resolvedFile),
 			Valid:    true,
-			Errors:   []CompileValidationError{},
-			Warnings: []CompileValidationError{},
+			Errors:   []ValidationIssue{},
+			Warnings: []ValidationIssue{},
 		},
 		success: false,
 	}
@@ -93,26 +94,7 @@ func compileWorkflowFile(
 	// Parse workflow file to get data
 	compileWorkflowProcessorLog.Printf("Parsing workflow file: %s", resolvedFile)
 
-	// Set workflow identifier for schedule scattering (use repository-relative path for stability)
-	relPath, err := getRepositoryRelativePath(resolvedFile)
-	if err != nil {
-		compileWorkflowProcessorLog.Printf("Warning: failed to get repository-relative path for %s: %v", resolvedFile, err)
-		// Fallback to basename if we can't get relative path
-		relPath = filepath.Base(resolvedFile)
-	}
-	compiler.SetWorkflowIdentifier(relPath)
-
-	// Set repository slug for this specific file (may differ from CWD's repo)
-	// Uses SetRepositorySlugIfUnlocked so that an explicit --schedule-seed flag is never overridden.
-	fileRepoSlug := getRepositorySlugFromRemoteForPath(resolvedFile)
-	if fileRepoSlug != "" {
-		if compiler.IsRepositorySlugLocked() {
-			compileWorkflowProcessorLog.Printf("Repository slug from file remote (%s) ignored: overridden via --schedule-seed (%s)", fileRepoSlug, compiler.GetRepositorySlug())
-		} else {
-			compiler.SetRepositorySlugIfUnlocked(fileRepoSlug)
-			compileWorkflowProcessorLog.Printf("Repository slug for file set: %s", fileRepoSlug)
-		}
-	}
+	setWorkflowFileContext(compiler, resolvedFile)
 
 	// Parse the workflow
 	workflowData, err := compiler.ParseWorkflowFile(resolvedFile)
@@ -122,11 +104,11 @@ func compileWorkflowFile(
 		if errors.As(err, &sharedErr) {
 			if !opts.jsonOutput {
 				// Print info message instead of error
-				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(sharedErr.Error()))
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr(sharedErr.Error()))
 			}
 			// Mark as valid but skipped
 			result.validationResult.Valid = true
-			result.validationResult.Warnings = append(result.validationResult.Warnings, CompileValidationError{
+			result.validationResult.Warnings = append(result.validationResult.Warnings, ValidationIssue{
 				Type:    "shared_workflow",
 				Message: "Skipped: Shared workflow component (missing 'on' field)",
 			})
@@ -139,11 +121,11 @@ func compileWorkflowFile(
 		if errors.As(err, &redirectErr) {
 			if !opts.jsonOutput {
 				// Print info message instead of error
-				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(redirectErr.Error()))
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr(redirectErr.Error()))
 			}
 			// Mark as valid but skipped
 			result.validationResult.Valid = true
-			result.validationResult.Warnings = append(result.validationResult.Warnings, CompileValidationError{
+			result.validationResult.Warnings = append(result.validationResult.Warnings, ValidationIssue{
 				Type:    "redirect_only_workflow",
 				Message: "Skipped: Redirect-only workflow (missing 'on' field, has redirect)",
 			})
@@ -165,10 +147,12 @@ func compileWorkflowFile(
 	// Per-file actionlint is always disabled here; actionlint runs in batch after all files are compiled.
 	if err := CompileWorkflowDataWithValidation(ctx, compiler, workflowData, resolvedFile, CompileValidationOptions{
 		Verbose:            opts.verbose && !opts.jsonOutput,
+		NoEmit:             opts.noEmit,
 		RunZizmorPerFile:   opts.zizmor && !opts.noEmit,
 		RunPoutinePerFile:  opts.poutine && !opts.noEmit,
 		Strict:             opts.strict,
 		ValidateActionSHAs: opts.validate && !opts.noEmit,
+		FailOnWarnings:     opts.failOnWarnings,
 	}); err != nil {
 		// Don't print error here - it will be displayed in the compilation summary
 		// The error is stored in ValidationResult for JSON output and summary display
@@ -184,6 +168,12 @@ func compileWorkflowFile(
 
 	// Collect labels for JSON output (used by create-labels maintenance operation)
 	result.validationResult.Labels = extractSafeOutputLabels(workflowData)
+	result.validationResult.WebhookSubscriptions = workflowData.WebhookSubscriptions
+
+	// Emit a compile-time guard-policy dry-run report in --strict mode.
+	if !opts.jsonOutput {
+		printGuardPolicyDryRunReport(filepath.Base(resolvedFile), workflowData, opts.strict)
+	}
 
 	compileWorkflowProcessorLog.Printf("Successfully processed workflow file: %s", resolvedFile)
 	return result

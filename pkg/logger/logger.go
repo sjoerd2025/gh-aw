@@ -26,7 +26,7 @@ type Logger struct {
 
 var (
 	// DEBUG environment variable value, read once at initialization.
-	// If DEBUG is not set but ACTIONS_RUNNER_DEBUG=true, all loggers are enabled.
+	// GitHub Actions debug mode enables all loggers unless DEBUG is set.
 	debugEnv = initDebugEnv()
 
 	// DEBUG_COLORS environment variable to control color output.
@@ -52,19 +52,20 @@ func buildColorPalette() []lipgloss.Style {
 	order := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 3}
 	palette := make([]lipgloss.Style, 0, len(order))
 	for _, idx := range order {
-		palette = append(palette, lipgloss.NewStyle().Foreground(basePaletteColors[idx]))
+		baseColor := basePaletteColors[idx]
+		palette = append(palette, lipgloss.NewStyle().Foreground(baseColor))
 	}
 	return palette
 }
 
 // initDebugEnv resolves the effective debug pattern.
-// If DEBUG is set, it takes precedence. Otherwise, if ACTIONS_RUNNER_DEBUG=true,
+// If DEBUG is set, it takes precedence. Otherwise, if ACTIONS_RUNNER_DEBUG=true or RUNNER_DEBUG=1,
 // all loggers are enabled (equivalent to DEBUG=*).
 func initDebugEnv() string {
 	if d := os.Getenv("DEBUG"); d != "" { //nolint:osgetenvlibrary
 		return d
 	}
-	if os.Getenv("ACTIONS_RUNNER_DEBUG") == "true" { //nolint:osgetenvlibrary
+	if os.Getenv("ACTIONS_RUNNER_DEBUG") == "true" || os.Getenv("RUNNER_DEBUG") == "1" { //nolint:osgetenvlibrary
 		return "*"
 	}
 	return ""
@@ -93,7 +94,7 @@ func New(namespace string) *Logger {
 
 // selectNamespaceLabel renders the namespace label with a hash-selected style.
 func selectNamespaceLabel(namespace string) string {
-	if !debugColors {
+	if !debugColors || len(colorPalette) == 0 {
 		return namespace
 	}
 
@@ -107,7 +108,7 @@ func selectNamespaceLabel(namespace string) string {
 	hash := h.Sum32()
 
 	// Select color from palette based on hash and render namespace with it.
-	return colorPalette[hash%uint32(len(colorPalette))].Render(namespace)
+	return colorPalette[int(hash%uint32(len(colorPalette)))].Render(namespace)
 }
 
 // Enabled returns whether this logger is enabled
@@ -198,9 +199,7 @@ func matchPattern(namespace, pattern string) bool {
 			return strings.HasSuffix(namespace, suffix)
 		}
 		// Middle wildcard: split and check both parts
-		parts := strings.SplitN(pattern, "*", 2)
-		if len(parts) == 2 {
-			prefix, suffix := parts[0], parts[1]
+		if prefix, suffix, ok := strings.Cut(pattern, "*"); ok {
 			return len(namespace) >= len(prefix)+len(suffix) &&
 				strings.HasPrefix(namespace, prefix) &&
 				strings.HasSuffix(namespace, suffix)

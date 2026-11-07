@@ -15,13 +15,12 @@ import (
 	"github.com/github/gh-aw/pkg/testutil"
 )
 
-// TestWebSearchValidationForCopilot tests that when a Copilot workflow uses web-search,
-// compilation succeeds but emits a warning with documentation link
+// TestWebSearchValidationForCopilot verifies compilation rejects unavailable native search.
 func TestWebSearchValidationForCopilot(t *testing.T) {
 	// Create a temporary directory for the test
 	tmpDir := testutil.TempDir(t, "test-*")
 
-	// Create a test workflow that uses web-search with Copilot engine (which doesn't support web-search)
+	// Create a test workflow that uses web-search with Copilot engine
 	workflowContent := `---
 on: workflow_dispatch
 permissions:
@@ -29,6 +28,114 @@ permissions:
   issues: read
   pull-requests: read
 engine: copilot
+tools:
+  web-search:
+---
+
+# Test Workflow
+
+Search the web for information.
+`
+
+	workflowPath := filepath.Join(tmpDir, "test-workflow.md")
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow: %v", err)
+	}
+
+	// Capture stderr to verify no unsupported-engine warning is emitted
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	// Create a compiler
+	compiler := NewCompiler()
+
+	// Compile the workflow - unavailable native search is rejected.
+	err := compiler.CompileWorkflow(workflowPath)
+
+	// Restore stderr
+	w.Close()
+	os.Stderr = oldStderr
+
+	// Read captured stderr
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	stderrOutput := buf.String()
+
+	if err == nil || !strings.Contains(err.Error(), "offline BYOK mode") {
+		t.Fatalf("Expected unavailable native search error, got: %v (stderr: %s)", err, stderrOutput)
+	}
+
+	// Failed compilation must not create a misleading lock file.
+	lockFile := stringutil.MarkdownToLockFile(workflowPath)
+	if _, err := os.Stat(lockFile); !os.IsNotExist(err) {
+		t.Fatalf("Expected no lock file, got: %v", err)
+	}
+}
+
+// TestWebSearchValidationForCopilotPinnedOldVersion tests that Copilot workflows
+// pinned to older CLI versions also reject unavailable native search.
+func TestWebSearchValidationForCopilotPinnedOldVersion(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+
+	workflowContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine:
+  id: copilot
+  version: 1.0.86
+tools:
+  web-search:
+---
+
+# Test Workflow
+
+Search the web for information.
+`
+
+	workflowPath := filepath.Join(tmpDir, "test-workflow.md")
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("Failed to write test workflow: %v", err)
+	}
+
+	oldStderr := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+
+	compiler := NewCompiler()
+	err := compiler.CompileWorkflow(workflowPath)
+
+	w.Close()
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	stderrOutput := buf.String()
+
+	if err == nil || !strings.Contains(err.Error(), "offline BYOK mode") {
+		t.Fatalf("Expected unavailable native search error, got: %v (stderr: %s)", err, stderrOutput)
+	}
+
+	if _, err := os.Stat(stringutil.MarkdownToLockFile(workflowPath)); !os.IsNotExist(err) {
+		t.Fatalf("Expected no lock file, got: %v", err)
+	}
+}
+
+// TestWebSearchValidationForGemini tests that when a Gemini workflow uses web-search,
+// compilation succeeds but emits a warning with documentation link
+func TestWebSearchValidationForGemini(t *testing.T) {
+	// Create a temporary directory for the test
+	tmpDir := testutil.TempDir(t, "test-*")
+
+	// Create a test workflow that uses web-search with Gemini engine (which doesn't support web-search)
+	workflowContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+engine: gemini
 tools:
   web-search:
 ---
@@ -64,7 +171,7 @@ Search the web for information.
 	stderrOutput := buf.String()
 
 	if err != nil {
-		t.Fatalf("Expected compilation to succeed for Copilot engine with web-search tool (with warning), but got error: %v", err)
+		t.Fatalf("Expected compilation to succeed for Gemini engine with web-search tool (with warning), but got error: %v", err)
 	}
 
 	// Verify the warning message includes the documentation link

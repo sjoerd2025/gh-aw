@@ -14,6 +14,7 @@ const { parseRepoSlug, validateTargetRepo, parseAllowedRepos } = require("./repo
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { buildAwContext } = require("./aw_context.cjs");
+const { redactWebhookPayloads } = require("./webhook_context.cjs");
 const { SAFE_OUTPUT_E001, SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
 
 /**
@@ -23,7 +24,6 @@ const { SAFE_OUTPUT_E001, SAFE_OUTPUT_E099 } = require("./error_codes.cjs");
  */
 async function main(config = {}) {
   const tools = config.tools || {};
-  const githubClient = await createAuthenticatedGitHubClient(config);
   const isStaged = isStagedMode(config);
 
   const contextRepoSlug = `${context.repo.owner}/${context.repo.repo}`;
@@ -32,6 +32,13 @@ async function main(config = {}) {
   // Per-tool dispatch counters for max enforcement
   /** @type {Record<string, number>} */
   const dispatchCounts = {};
+
+  // Per-tool authenticated clients, cached by tool name. A tool's own github-token/github-app
+  // override (resolved by the compiler into toolConfig["github-token"]) must be used instead of
+  // the handler-level credential so permission exclusions computed for per-tool credentials
+  // (GP5b rule 1) hold true at runtime (GP5b rule 4).
+  /** @type {Map<string, any>} */
+  const toolClients = new Map();
 
   /**
    * Message handler function that processes a single dispatch_repository message
@@ -138,7 +145,7 @@ async function main(config = {}) {
 
     // If in staged mode, preview without executing
     if (isStaged || isStagedMode(toolConfig)) {
-      logStagedPreviewInfo(`Would dispatch repository_dispatch event: event_type="${eventType}" to ${targetRepoSlug}, client_payload=${JSON.stringify(clientPayload)}`);
+      logStagedPreviewInfo(`Would dispatch repository_dispatch event: event_type="${eventType}" to ${targetRepoSlug}, client_payload=${JSON.stringify({ ...clientPayload, aw_context: redactWebhookPayloads(clientPayload.aw_context) })}`);
       dispatchCounts[toolName] = currentCount + 1;
       return {
         success: true,
@@ -151,7 +158,19 @@ async function main(config = {}) {
     }
 
     try {
-      await githubClient.rest.repos.createDispatchEvent({
+      let toolClient = toolClients.get(toolName);
+      if (!toolClient) {
+        if (Object.hasOwn(toolConfig, "github-token") && !toolConfig["github-token"]) {
+          return {
+            success: false,
+            error: `${SAFE_OUTPUT_E099}: Failed to dispatch repository_dispatch event "${eventType}" to ${targetRepoSlug}: github-token for tool "${toolName}" resolved to an empty value`,
+          };
+        }
+        toolClient = await createAuthenticatedGitHubClient(toolConfig);
+        toolClients.set(toolName, toolClient);
+      }
+
+      await toolClient.rest.repos.createDispatchEvent({
         owner: parsedRepo.owner,
         repo: parsedRepo.repo,
         event_type: eventType,

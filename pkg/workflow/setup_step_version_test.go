@@ -79,7 +79,7 @@ func TestGetVersionForSetup(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getVersionForSetup(tt.data)
+			result := getVersionForSetup(tt.data, GetGlobalEngineRegistry())
 			if result != tt.expectedVersion {
 				t.Errorf("getVersionForSetup() = %q, want %q", result, tt.expectedVersion)
 			}
@@ -138,6 +138,49 @@ func TestGenerateSetupStepIncludesVersion(t *testing.T) {
 				t.Errorf("expected setup step to contain %q, got:\n%s", expectedLine, combined)
 			}
 		})
+	}
+}
+
+func TestGenerateSetupStepIncludesAWContextForCallAndDispatchTriggers(t *testing.T) {
+	tests := []struct {
+		name        string
+		on          string
+		wantContext bool
+	}{
+		{
+			name:        "workflow_dispatch",
+			on:          "\"on\":\n  workflow_dispatch:\n",
+			wantContext: true,
+		},
+		{
+			name:        "workflow_call",
+			on:          "\"on\":\n  workflow_call:\n",
+			wantContext: true,
+		},
+		{
+			name: "schedule only",
+			on: "\"on\":\n  schedule:\n" +
+				"    - cron: '0 0 * * *'\n",
+			wantContext: false,
+		},
+	}
+
+	for _, mode := range []ActionMode{ActionModeRelease, ActionModeScript} {
+		for _, tt := range tests {
+			t.Run(string(mode)+"/"+tt.name, func(t *testing.T) {
+				c := NewCompiler()
+				c.SetActionMode(mode)
+				data := &WorkflowData{Name: "my-workflow", On: tt.on}
+
+				combined := strings.Join(c.generateSetupStep(data, "github/gh-aw/actions/setup@abc123", "${{ runner.temp }}/gh-aw", false, "", ""), "")
+				if tt.wantContext && !strings.Contains(combined, "GH_AW_SETUP_AW_CONTEXT: ${{ inputs.aw_context }}") {
+					t.Fatalf("expected setup step to pass aw_context, got:\n%s", combined)
+				}
+				if !tt.wantContext && strings.Contains(combined, "GH_AW_SETUP_AW_CONTEXT") {
+					t.Fatalf("expected setup step not to pass aw_context, got:\n%s", combined)
+				}
+			})
+		}
 	}
 }
 
@@ -353,5 +396,92 @@ func TestGenerateSetupStepIncludesOTLPOIDCTokenInScriptMode(t *testing.T) {
 	}
 	if !strings.Contains(combined, "INPUT_OTLP_OIDC_TOKEN: ${{ steps.mint-otlp-oidc-token.outputs.token }}") {
 		t.Fatalf("expected setup.sh env to include minted OTLP OIDC token, got:\n%s", combined)
+	}
+}
+
+func TestGenerateSetupStepExchangesGoogleOTLPWorkloadIdentityToken(t *testing.T) {
+	c := NewCompiler()
+	data := &WorkflowData{
+		Name: "my-workflow",
+		RawFrontmatter: map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"workload-identity": map[string]any{
+						"provider":        "google",
+						"audience":        "projects/123/locations/global/workloadIdentityPools/pool/providers/github",
+						"service-account": "otlp@example.iam.gserviceaccount.com",
+					},
+				},
+			},
+		},
+	}
+
+	combined := strings.Join(c.generateSetupStep(data, "github/gh-aw/actions/setup@abc123", "${{ runner.temp }}/gh-aw", false, "", ""), "")
+
+	if !strings.Contains(combined, "id: exchange-otlp-workload-identity-token") {
+		t.Fatalf("expected setup step to include Google workload identity exchange, got:\n%s", combined)
+	}
+	if !strings.Contains(combined, "https://sts.googleapis.com/v1/token") || !strings.Contains(combined, "iamcredentials.googleapis.com") {
+		t.Fatalf("expected setup step to include Google STS and service account exchange, got:\n%s", combined)
+	}
+	if !strings.Contains(combined, "otlp-oidc-token: ${{ steps.exchange-otlp-workload-identity-token.outputs.token }}") {
+		t.Fatalf("expected setup action to receive the exchanged access token, got:\n%s", combined)
+	}
+	// The provider resource is normalized into the two canonical audience forms Google expects.
+	if !strings.Contains(combined, `GH_AW_OTLP_OIDC_AUDIENCE: "https://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/github"`) {
+		t.Fatalf("expected GitHub OIDC audience to use the https://iam.googleapis.com/ form, got:\n%s", combined)
+	}
+	if !strings.Contains(combined, `GH_AW_OTLP_WIF_AUDIENCE: "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/providers/github"`) {
+		t.Fatalf("expected STS audience to use the //iam.googleapis.com/ form, got:\n%s", combined)
+	}
+	// Exchange failures must surface the HTTP status so misconfiguration is diagnosable.
+	if !strings.Contains(combined, "response.status") || !strings.Contains(combined, "impersonationResponse.status") {
+		t.Fatalf("expected exchange errors to include HTTP status, got:\n%s", combined)
+	}
+}
+
+func TestGenerateSetupStepExchangesGoogleOTLPWorkloadIdentityTokenWithoutServiceAccount(t *testing.T) {
+	c := NewCompiler()
+	data := &WorkflowData{
+		Name: "my-workflow",
+		RawFrontmatter: map[string]any{
+			"observability": map[string]any{
+				"otlp": map[string]any{
+					"workload-identity": map[string]any{
+						"provider": "google",
+						"audience": "projects/123/locations/global/workloadIdentityPools/pool/providers/github",
+					},
+				},
+			},
+		},
+	}
+
+	combined := strings.Join(c.generateSetupStep(data, "github/gh-aw/actions/setup@abc123", "${{ runner.temp }}/gh-aw", false, "", ""), "")
+
+	if !strings.Contains(combined, "id: exchange-otlp-workload-identity-token") {
+		t.Fatalf("expected setup step to include Google workload identity exchange, got:\n%s", combined)
+	}
+	if strings.Contains(combined, "GH_AW_OTLP_WIF_SERVICE_ACCOUNT:") {
+		t.Fatalf("expected no service account env var when service-account is omitted, got:\n%s", combined)
+	}
+}
+
+func TestGoogleWIFAudiences(t *testing.T) {
+	const resource = "projects/123/locations/global/workloadIdentityPools/pool/providers/github"
+	for _, input := range []string{
+		resource,
+		"https://iam.googleapis.com/" + resource,
+		"//iam.googleapis.com/" + resource,
+	} {
+		githubAudience, stsAudience := googleWIFAudiences(input)
+		if githubAudience != "https://iam.googleapis.com/"+resource {
+			t.Fatalf("unexpected GitHub audience for %q: %s", input, githubAudience)
+		}
+		if stsAudience != "//iam.googleapis.com/"+resource {
+			t.Fatalf("unexpected STS audience for %q: %s", input, stsAudience)
+		}
+	}
+	if githubAudience, stsAudience := googleWIFAudiences("  "); githubAudience != "" || stsAudience != "" {
+		t.Fatalf("expected empty audiences for blank provider, got %q and %q", githubAudience, stsAudience)
 	}
 }

@@ -73,6 +73,8 @@ description: GitHub context expression variables and Handlebars-style template c
 - **`${{ steps.* }}`** - Any outputs from previous steps (e.g., `${{ steps.my-step.outputs.result }}`)
 - **`${{ github.event.inputs.* }}`** - Any workflow inputs when triggered by workflow_dispatch (e.g., `${{ github.event.inputs.environment }}`)
 
+`aw_context` is reserved and injected by the compiler into supported dispatch and reusable-workflow triggers; do not declare it as a user input. Workflows with `tools.work-queue` receive a compiler-managed `work_queue_assignment` dispatch input. It is a version-3 immutable assignment containing a `claims` array; do not declare or construct it as a user input.
+
 All other expressions are disallowed.
 
 ### Sanitized Context Text (`steps.sanitized.outputs.text`)
@@ -173,6 +175,7 @@ When `experiments:` is set in frontmatter, the selected variant is substituted i
 
 ### Notes
 
-- **Fenced code blocks are preserved** — `{{#if}}` tags inside `` ``` `` blocks appear verbatim.
+- **Malformed conditions fail compilation** — comparisons need an operator (`==`, `!=`, `===`, `!==`); invalid active conditions in the main workflow, imports, or local runtime imports block lock-file generation.
+- **Code regions** — only syntactically invalid implicit conditions inside inline code or fenced blocks stay literal; valid conditions and explicit GitHub Actions expressions there are still bound and validated.
 - **No nested conditionals** — inner tags become literal text.
 - **Tags are stripped before the agent runs** — never visible in the final prompt.

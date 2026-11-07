@@ -4,6 +4,11 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '23 4 * * 1'
+  push:
+    branches:
+      - main
+    paths:
+      - 'actions/setup/js/Dockerfile.safe-outputs-mcp'
 
 permissions:
   contents: read
@@ -24,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -98,7 +103,7 @@ jobs:
           echo "hash=$hash" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -157,6 +162,7 @@ jobs:
           EXISTING_DOCKERFILE_HASH: ${{ steps.published.outputs.dockerfile_hash }}
           IMAGE_EXISTS: ${{ steps.published.outputs.image_exists }}
           IN_COOLDOWN: ${{ steps.upstream.outputs.in_cooldown }}
+          TRIGGER_EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
@@ -170,7 +176,12 @@ jobs:
           echo "--- Evaluating conditions ---"
 
           should_push=false
+          force_refresh=false
           reason="No changes detected"
+
+          if [ "$TRIGGER_EVENT" = "schedule" ] || [ "$TRIGGER_EVENT" = "workflow_dispatch" ]; then
+            force_refresh=true
+          fi
 
           if [ "$IN_COOLDOWN" = "true" ] && { [ "$IMAGE_EXISTS" != "true" ] || [ "$EXISTING_BASE_DIGEST" != "$CURRENT_BASE_DIGEST" ]; }; then
             reason="node:lts-alpine is still within the ${COOLDOWN_DAYS}-day cooldown window"
@@ -183,31 +194,37 @@ jobs:
           elif [ "$EXISTING_DOCKERFILE_HASH" != "$CURRENT_DOCKERFILE_HASH" ]; then
             should_push=true
             reason="Container Dockerfile changed"
+          elif [ "$force_refresh" = "true" ]; then
+            should_push=true
+            reason="Refresh runtime packages on scheduled or manual publish"
           fi
 
           echo "Decision: should_push=${should_push}"
           echo "Reason: ${reason}"
 
           echo "should_push=$should_push" >> "$GITHUB_OUTPUT"
+          echo "force_refresh=$force_refresh" >> "$GITHUB_OUTPUT"
           echo "reason=$reason" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         if: steps.decision.outputs.should_push == 'true'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
         if: steps.decision.outputs.should_push == 'true'
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build and push gh-aw-node
         if: steps.decision.outputs.should_push == 'true'
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: actions/setup/js/Dockerfile.safe-outputs-mcp
           platforms: linux/amd64,linux/arm64
           pull: true
           push: true
+          # Scheduled/manual refreshes pick up apk/npm fixes even with unchanged inputs.
+          no-cache: ${{ steps.decision.outputs.force_refresh == 'true' }}
           build-args: |
             NODE_IMAGE=${{ steps.upstream.outputs.base_image }}
             NODE_IMAGE_DIGEST=${{ steps.upstream.outputs.digest }}
@@ -215,7 +232,7 @@ jobs:
             DOCKERFILE_HASH=${{ steps.source.outputs.hash }}
           tags: |
             ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:node-lts-alpine-${{ steps.upstream.outputs.short_digest }}
+            ${{ env.IMAGE_NAME }}:node-lts-alpine-${{ steps.upstream.outputs.short_digest }}-${{ github.run_id }}-${{ github.run_attempt }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.description=Node LTS Alpine with git for the local safe-outputs MCP runtime

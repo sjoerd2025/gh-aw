@@ -19,13 +19,18 @@ require("./shim.cjs");
  * - MCP_GATEWAY_DOMAIN: Domain for MCP server URLs (e.g., host.docker.internal)
  * - MCP_GATEWAY_PORT: Port for MCP gateway (e.g., 80)
  * - HOME: User home directory (standard POSIX env var inherited by the runner)
+ * - RUNNER_TEMP: Per-run directory for the separate SDK MCP configuration
+ * - GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_JOB: Catalog integrity scope
+ * - GITHUB_ENV: Trusted environment file for publishing catalog integrity
  *
  * Optional:
  * - GH_AW_MCP_CLI_SERVERS: JSON array of server names to exclude from agent config
  */
 
 const path = require("path");
-const { rewriteUrl, normalizeGatewayEntry, loadGatewayContext, logCLIFilters, filterAndTransformServers, logServerStats, writeSecureOutput } = require("./convert_gateway_config_shared.cjs");
+const { rewriteUrl, normalizeGatewayEntry, runGatewayConversion } = require("./convert_gateway_config_shared.cjs");
+const { publishCopilotSDKMCPConfig } = require("./copilot_sdk_mcp_config.cjs");
+const { resolveCopilotSDKMCPConfigPath } = require("./copilot_sdk_mcp_config_path.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 
 /**
@@ -56,6 +61,13 @@ function resolveCopilotConfigOutputPath() {
  */
 function transformCopilotEntry(entry, urlPrefix) {
   return normalizeGatewayEntry(entry, urlPrefix, transformed => {
+    // The gateway expresses backend tool timeouts in seconds, while Copilot
+    // expects its client-side per-server timeout in milliseconds.
+    if (transformed.timeout === undefined && typeof transformed.toolTimeout === "number" && Number.isFinite(transformed.toolTimeout) && transformed.toolTimeout > 0) {
+      transformed.timeout = transformed.toolTimeout * 1000;
+    }
+    delete transformed.toolTimeout;
+
     // Add tools field if not present
     if (!transformed.tools) {
       transformed.tools = ["*"];
@@ -67,31 +79,23 @@ function main() {
   let outputPath;
   try {
     outputPath = resolveCopilotConfigOutputPath();
+    resolveCopilotSDKMCPConfigPath();
   } catch (err) {
     core.setFailed(`ERROR: ${getErrorMessage(err)}`);
     return;
   }
 
-  const { gatewayOutput, domain, port, urlPrefix, cliServers, servers } = loadGatewayContext();
-
-  core.info("Converting gateway configuration to Copilot format...");
-  core.info(`Input: ${gatewayOutput}`);
-  core.info(`Target domain: ${domain}:${port}`);
-  logCLIFilters(cliServers);
-  const result = filterAndTransformServers(servers, cliServers, (_name, entry) => transformCopilotEntry(entry, urlPrefix));
-
-  const output = JSON.stringify({ mcpServers: result }, null, 2);
-  logServerStats(servers, Object.keys(result).length);
-
-  // Write with owner-only permissions (0o600) to protect the gateway bearer token.
-  // An attacker who reads mcp-config.json could bypass --allowed-tools by issuing
-  // raw JSON-RPC calls directly to the gateway.
-  writeSecureOutput(outputPath, output);
-
-  core.info(`Copilot configuration written to ${outputPath}`);
-  core.info("");
-  core.info("Converted configuration:");
-  core.info(output);
+  return runGatewayConversion({
+    format: "Copilot",
+    engine: "Copilot",
+    outputPath,
+    transformServer: (_name, entry, urlPrefix) => transformCopilotEntry(entry, urlPrefix),
+    serialize: servers => {
+      const output = JSON.stringify({ mcpServers: servers }, null, 2);
+      publishCopilotSDKMCPConfig(output);
+      return output;
+    },
+  });
 }
 
 if (require.main === module) {

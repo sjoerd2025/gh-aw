@@ -18,7 +18,7 @@ vi.mock("./error_helpers.cjs", () => ({
   getErrorMessage: vi.fn(err => (err instanceof Error ? err.message : String(err))),
 }));
 
-const { resolveAllowedMentionsFromPayload, extractKnownAuthorsFromPayload, fetchTeamMembers, pushNonBotUser, pushNonBotAssignees } = await import("./resolve_mentions_from_payload.cjs");
+const { getMentionsGithubClient, resolveAllowedMentionsFromPayload, extractKnownAuthorsFromPayload, fetchTeamMembers, pushNonBotUser, pushNonBotAssignees } = await import("./resolve_mentions_from_payload.cjs");
 
 /** @returns {{ info: ReturnType<typeof vi.fn>, warning: ReturnType<typeof vi.fn>, error: ReturnType<typeof vi.fn> }} */
 function makeMockCore() {
@@ -29,6 +29,33 @@ function makeMockCore() {
 function makeMockGithub() {
   return {};
 }
+
+describe("getMentionsGithubClient", () => {
+  it("uses the configured mention token instead of the handler client", () => {
+    const fallback = makeMockGithub();
+    const mentionClient = makeMockGithub();
+    const originalToken = process.env.GH_AW_MENTIONS_GITHUB_TOKEN;
+    const originalGetOctokit = global.getOctokit;
+    process.env.GH_AW_MENTIONS_GITHUB_TOKEN = "mention-token";
+    global.getOctokit = vi.fn(token => (token === "mention-token" ? mentionClient : fallback));
+
+    try {
+      expect(getMentionsGithubClient(fallback)).toBe(mentionClient);
+      expect(global.getOctokit).toHaveBeenCalledWith("mention-token");
+    } finally {
+      if (originalToken === undefined) {
+        delete process.env.GH_AW_MENTIONS_GITHUB_TOKEN;
+      } else {
+        process.env.GH_AW_MENTIONS_GITHUB_TOKEN = originalToken;
+      }
+      if (originalGetOctokit === undefined) {
+        delete global.getOctokit;
+      } else {
+        global.getOctokit = originalGetOctokit;
+      }
+    }
+  });
+});
 
 describe("pushNonBotUser", () => {
   it("pushes a regular user login", () => {
@@ -275,6 +302,19 @@ describe("resolveAllowedMentionsFromPayload", () => {
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("disabled"));
   });
 
+  it("returns empty array when mentions is false", async () => {
+    const context = { eventName: "issues", payload: {}, repo: { owner: "o", repo: "r" } };
+    expect(await resolveAllowedMentionsFromPayload(context, mockGithub, mockCore, false)).toEqual([]);
+  });
+
+  it("does not query collaborators without a concrete default target", async () => {
+    const { resolveDefaultMentions } = await import("./resolve_mentions_from_payload.cjs");
+    const context = { eventName: "issues", payload: {}, repo: { owner: "workflow-org", repo: "workflow-repo" } };
+    mockGithub.rest = { repos: { listCollaborators: vi.fn() } };
+    expect(await resolveDefaultMentions(context, mockGithub, mockCore, {}, "*")).toEqual([]);
+    expect(mockGithub.rest.repos.listCollaborators).not.toHaveBeenCalled();
+  });
+
   it("respects allowContext: false by skipping payload extraction", async () => {
     const context = {
       eventName: "issues",
@@ -309,6 +349,32 @@ describe("resolveAllowedMentionsFromPayload", () => {
     expect(result).toContain("alice");
   });
 
+  it("checks collaborators in the target repository instead of the workflow repository", async () => {
+    const context = {
+      eventName: "issues",
+      payload: { issue: { user: { login: "alice", type: "User" } } },
+      repo: { owner: "workflow-org", repo: "workflow-repo" },
+    };
+    mockGithub.rest = { repos: { listCollaborators: vi.fn().mockResolvedValue({ data: [] }) } };
+    await resolveAllowedMentionsFromPayload(context, mockGithub, mockCore, undefined, undefined, { owner: "target-org", repo: "target-repo" });
+    expect(mockGithub.rest.repos.listCollaborators).toHaveBeenCalledWith(expect.objectContaining({ owner: "target-org", repo: "target-repo" }));
+    expect(mockGithub.rest.repos.listCollaborators).not.toHaveBeenCalledWith(expect.objectContaining({ owner: "workflow-org", repo: "workflow-repo" }));
+  });
+
+  it("does not fetch team members without a caller-resolved target repository", async () => {
+    const context = {
+      eventName: "issues",
+      payload: {},
+      repo: { owner: "workflow-org", repo: "workflow-repo" },
+    };
+    const listMembersInOrg = vi.fn();
+    mockGithub.rest = { teams: { listMembersInOrg } };
+
+    await resolveAllowedMentionsFromPayload(context, mockGithub, mockCore, { allowedTeams: ["engineering"] });
+
+    expect(listMembersInOrg).not.toHaveBeenCalled();
+  });
+
   it("includes extra known authors", async () => {
     const context = {
       eventName: "issues",
@@ -321,7 +387,7 @@ describe("resolveAllowedMentionsFromPayload", () => {
     expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("extra known author"));
   });
 
-  it("applies max limit when allowTeamMembers is false", async () => {
+  it("does not truncate known authors to max when allowTeamMembers is false", async () => {
     const context = {
       eventName: "issues",
       payload: {
@@ -336,38 +402,36 @@ describe("resolveAllowedMentionsFromPayload", () => {
       allowTeamMembers: false,
       max: 3,
     });
-    expect(result.length).toBeLessThanOrEqual(3);
+    expect(result).toEqual(["alice", "user0", "user1", "user2", "user3", "user4"]);
   });
 
-  it("warns when mention limit is exceeded with team members disabled", async () => {
+  it("does not truncate resolved aliases to max", async () => {
     const context = {
-      eventName: "issues",
-      payload: {
-        issue: {
-          user: null,
-          assignees: Array.from({ length: 5 }, (_, i) => ({ login: `user${i}`, type: "User" })),
-        },
-      },
+      eventName: "workflow_dispatch",
+      payload: {},
       repo: { owner: "o", repo: "r" },
     };
-    await resolveAllowedMentionsFromPayload(context, mockGithub, mockCore, {
-      allowTeamMembers: false,
-      max: 2,
+    const allowed = Array.from({ length: 60 }, (_, i) => `user${i}`);
+    const result = await resolveAllowedMentionsFromPayload(context, mockGithub, mockCore, {
+      allowContext: false,
+      allowed,
+      max: 3,
     });
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Mention limit exceeded"));
+    expect(result).toEqual(allowed);
   });
 
-  it("returns empty array and logs warning on error", async () => {
-    // Passing a context with a missing `repo` property causes the internal
-    // destructuring to throw, exercising the catch branch.
+  it("does not fall back to the workflow repository when no target repository is supplied", async () => {
     const context = {
       eventName: "issues",
       payload: { issue: { user: { login: "alice", type: "User" }, assignees: [] } },
-      repo: null, // will cause "Cannot destructure property 'owner'" error
+      repo: { owner: "workflow-org", repo: "workflow-repo" },
     };
+    const listCollaborators = vi.fn().mockResolvedValue({ data: [] });
+    mockGithub.rest = { repos: { listCollaborators } };
+
     const result = await resolveAllowedMentionsFromPayload(context, mockGithub, mockCore);
-    expect(result).toEqual([]);
-    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to resolve mentions"));
+    expect(result).toEqual(["alice"]);
+    expect(listCollaborators).not.toHaveBeenCalled();
   });
 
   it("includes allowed list from config regardless of context", async () => {
@@ -417,11 +481,18 @@ describe("resolveAllowedMentionsFromPayload", () => {
         },
       },
     };
-    const result = await resolveAllowedMentionsFromPayload(context, mockGithubWithTeams, mockCore, {
-      allowedTeams: ["myorg/eng"],
-      allowContext: false,
-      allowTeamMembers: false,
-    });
+    const result = await resolveAllowedMentionsFromPayload(
+      context,
+      mockGithubWithTeams,
+      mockCore,
+      {
+        allowedTeams: ["myorg/eng"],
+        allowContext: false,
+        allowTeamMembers: false,
+      },
+      undefined,
+      { owner: "myorg", repo: "repo" }
+    );
     expect(result).toContain("alice");
     expect(result).toContain("bob");
     expect(mockGithubWithTeams.rest.teams.listMembersInOrg).toHaveBeenCalledWith({
@@ -432,12 +503,12 @@ describe("resolveAllowedMentionsFromPayload", () => {
     });
   });
 
-  it("allowed-teams with team-slug-only uses context owner", async () => {
+  it("allowed-teams with team-slug-only uses the target repository owner", async () => {
     const context = {
       eventName: "workflow_dispatch",
       actor: "actor",
       payload: {},
-      repo: { owner: "contextorg", repo: "repo" },
+      repo: { owner: "workfloworg", repo: "repo" },
     };
     const mockGithubWithTeams = {
       rest: {
@@ -448,18 +519,45 @@ describe("resolveAllowedMentionsFromPayload", () => {
         },
       },
     };
-    const result = await resolveAllowedMentionsFromPayload(context, mockGithubWithTeams, mockCore, {
-      allowedTeams: ["eng-team"],
-      allowContext: false,
-      allowTeamMembers: false,
-    });
+    const result = await resolveAllowedMentionsFromPayload(
+      context,
+      mockGithubWithTeams,
+      mockCore,
+      {
+        allowedTeams: ["eng-team"],
+        allowContext: false,
+        allowTeamMembers: false,
+      },
+      undefined,
+      { owner: "targetorg", repo: "target-repo" }
+    );
     expect(result).toContain("charlie");
     expect(mockGithubWithTeams.rest.teams.listMembersInOrg).toHaveBeenCalledWith({
-      org: "contextorg",
+      org: "targetorg",
       team_slug: "eng-team",
       per_page: 100,
       page: 1,
     });
+  });
+
+  it("without a target repository only allows context and explicit aliases", async () => {
+    const context = {
+      eventName: "issues",
+      payload: { issue: { user: { login: "author", type: "User" } } },
+      repo: { owner: "workfloworg", repo: "workflow-repo" },
+    };
+    const listCollaborators = vi.fn().mockResolvedValue({ data: [{ login: "workflow-collaborator", type: "User" }] });
+    const listMembersInOrg = vi.fn().mockResolvedValue({ data: [{ login: "team-member", type: "User" }] });
+    mockGithub.rest = { repos: { listCollaborators }, teams: { listMembersInOrg } };
+
+    const result = await resolveAllowedMentionsFromPayload(context, mockGithub, mockCore, {
+      allowed: ["explicit-user"],
+      allowedTeams: ["eng"],
+    });
+
+    expect(result).toEqual(["author", "explicit-user"]);
+    expect(listCollaborators).not.toHaveBeenCalled();
+    expect(listMembersInOrg).not.toHaveBeenCalled();
   });
 
   it("allowed-teams skips bots from team members", async () => {
@@ -481,11 +579,18 @@ describe("resolveAllowedMentionsFromPayload", () => {
         },
       },
     };
-    const result = await resolveAllowedMentionsFromPayload(context, mockGithubWithTeams, mockCore, {
-      allowedTeams: ["myorg/eng"],
-      allowContext: false,
-      allowTeamMembers: false,
-    });
+    const result = await resolveAllowedMentionsFromPayload(
+      context,
+      mockGithubWithTeams,
+      mockCore,
+      {
+        allowedTeams: ["myorg/eng"],
+        allowContext: false,
+        allowTeamMembers: false,
+      },
+      undefined,
+      { owner: "myorg", repo: "repo" }
+    );
     expect(result).toContain("alice");
     expect(result).not.toContain("bot-user");
   });
@@ -506,11 +611,18 @@ describe("resolveAllowedMentionsFromPayload", () => {
         },
       },
     };
-    const result = await resolveAllowedMentionsFromPayload(context, mockGithubWithTeams, mockCore, {
-      allowedTeams: ["myorg/eng"],
-      allowContext: false,
-      allowTeamMembers: false,
-    });
+    const result = await resolveAllowedMentionsFromPayload(
+      context,
+      mockGithubWithTeams,
+      mockCore,
+      {
+        allowedTeams: ["myorg/eng"],
+        allowContext: false,
+        allowTeamMembers: false,
+      },
+      undefined,
+      { owner: "myorg", repo: "repo" }
+    );
     expect(result).toEqual([]);
     expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to fetch members for team"));
   });

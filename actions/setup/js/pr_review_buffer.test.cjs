@@ -18,6 +18,7 @@ const mockGithub = {
       createReview: vi.fn(),
       listFiles: vi.fn(),
       listReviews: vi.fn(),
+      listCommentsForReview: vi.fn(),
       dismissReview: vi.fn(),
     },
   },
@@ -81,6 +82,19 @@ describe("createPrReviewBufferRegistry", () => {
     expect(entries.map(e => e.prNumber)).toEqual([3, 1, 2]);
   });
 
+  it("drains each batch once and creates a fresh buffer for the same PR", () => {
+    const registry = createPrReviewBufferRegistry();
+    const buffer = registry.getOrCreate("o/r", 1);
+    buffer.setReviewMetadata("First batch", "APPROVE");
+    expect(registry.drainEntries()).toEqual([{ repo: "o/r", prNumber: 1, buffer }]);
+    expect(registry.drainEntries()).toEqual([]);
+    expect(registry.hasAnyContent()).toBe(false);
+    const next = registry.getOrCreate("o/r", 1);
+    expect(next).not.toBe(buffer);
+    expect(next.hasReviewMetadata()).toBe(false);
+    expect(next.hasBufferedComments()).toBe(false);
+  });
+
   it("hasAnyContent returns false when all buffers are empty", () => {
     const registry = createPrReviewBufferRegistry();
     registry.getOrCreate("o/r", 1);
@@ -133,6 +147,7 @@ describe("pr_review_buffer (factory pattern)", () => {
     });
     mockGithub.rest.pulls.listFiles.mockResolvedValue({ data: [] });
     mockGithub.rest.pulls.listReviews.mockResolvedValue({ data: [] });
+    mockGithub.rest.pulls.listCommentsForReview.mockResolvedValue({ data: [] });
 
     // Create a fresh buffer instance for each test (no shared global state)
     buffer = createReviewBuffer();
@@ -327,6 +342,13 @@ describe("pr_review_buffer (factory pattern)", () => {
       expect(result.success).toBe(true);
       expect(result.event).toBe("COMMENT");
       expect(result.comment_count).toBe(1);
+      expect(result.review_comments).toEqual([
+        {
+          repo: "owner/repo",
+          pull_request_number: 42,
+          metadata: { path: "src/index.js", line: 10, side: undefined, review_id: 100 },
+        },
+      ]);
       expect(mockGithub.rest.pulls.createReview).toHaveBeenCalledWith({
         owner: "owner",
         repo: "repo",
@@ -335,6 +357,41 @@ describe("pr_review_buffer (factory pattern)", () => {
         event: "COMMENT",
         comments: [{ path: "src/index.js", line: 10, body: "Fix this" }],
       });
+    });
+
+    it("should capture created review comment identities", async () => {
+      buffer.addComment({ path: "src/index.js", line: 10, body: "Fix this", side: "RIGHT" });
+      buffer.setReviewContext({
+        repo: "owner/repo",
+        repoParts: { owner: "owner", repo: "repo" },
+        pullRequestNumber: 42,
+        pullRequest: { head: { sha: "abc123" } },
+      });
+      mockGithub.rest.pulls.createReview.mockResolvedValue({
+        data: { id: 100, html_url: "https://github.com/owner/repo/pull/42#pullrequestreview-100" },
+      });
+      mockGithub.rest.pulls.listCommentsForReview.mockResolvedValue({
+        data: [{ id: 200, node_id: "PRRC_200", html_url: "https://github.com/owner/repo/pull/42#discussion_r200", path: "src/index.js", line: 10, side: "RIGHT" }],
+      });
+
+      const result = await buffer.submitReview();
+
+      expect(mockGithub.rest.pulls.listCommentsForReview).toHaveBeenCalledWith({
+        owner: "owner",
+        repo: "repo",
+        pull_number: 42,
+        review_id: 100,
+        per_page: 100,
+      });
+      expect(result.review_comments).toEqual([
+        {
+          id: 200,
+          url: "https://github.com/owner/repo/pull/42#discussion_r200",
+          repo: "owner/repo",
+          pull_request_number: 42,
+          metadata: { review_id: 100, node_id: "PRRC_200", path: "src/index.js", line: 10, side: "RIGHT" },
+        },
+      ]);
     });
 
     it("should continue when before-state capture is rate-limited", async () => {
@@ -551,7 +608,7 @@ describe("pr_review_buffer (factory pattern)", () => {
 
       const callArgs = mockGithub.rest.pulls.createReview.mock.calls[0][0];
       expect(callArgs.event).toBe("APPROVE");
-      expect(callArgs.body).toContain("LGTM! Approving this change.");
+      expect(callArgs.body).toContain("LGTM\\! Approving this change.");
       // No comments array when empty
       expect(callArgs.comments).toBeUndefined();
     });
@@ -730,7 +787,83 @@ describe("pr_review_buffer (factory pattern)", () => {
       expect(callArgs.body).toContain("test-workflow");
     });
 
-    it("should append workflow-call-id marker to review body when available", async () => {
+    it("should append body footer independently after the generated footer", async () => {
+      buffer.addComment({ path: "test.js", line: 1, body: "comment" });
+      buffer.setReviewMetadata("Review body", "COMMENT");
+      buffer.setReviewContext({
+        repo: "owner/repo",
+        repoParts: { owner: "owner", repo: "repo" },
+        pullRequestNumber: 42,
+        pullRequest: { head: { sha: "abc123" } },
+      });
+      buffer.setFooterContext({
+        workflowName: "test-workflow",
+        runUrl: "https://github.com/owner/repo/actions/runs/123",
+        bodyFooter: "Policy for {workflow_name}",
+      });
+
+      mockGithub.rest.pulls.createReview.mockResolvedValue({
+        data: { id: 406, html_url: "https://github.com/owner/repo/pull/42#pullrequestreview-406" },
+      });
+      const result = await buffer.submitReview();
+
+      expect(result.success).toBe(true);
+      const body = mockGithub.rest.pulls.createReview.mock.calls[0][0].body;
+      expect(body).toContain("Policy for test-workflow");
+      expect(body.indexOf("Generated by")).toBeLessThan(body.indexOf("Policy for"));
+    });
+
+    it("fits large review summaries without shortening generated or configured footers", async () => {
+      const policy = "POLICY-START " + "f".repeat(1000) + " POLICY-END";
+      buffer.setReviewMetadata("x".repeat(100000), "COMMENT");
+      buffer.setReviewContext({ repo: "owner/repo", repoParts: { owner: "owner", repo: "repo" }, pullRequestNumber: 42, pullRequest: { head: { sha: "abc123" } } });
+      buffer.setFooterContext({ workflowName: "test-workflow", runUrl: "https://github.com/owner/repo/actions/runs/123", bodyFooter: policy });
+      mockGithub.rest.pulls.createReview.mockResolvedValue({ data: { id: 407, html_url: "review-url" } });
+      expect((await buffer.submitReview()).success).toBe(true);
+      const body = mockGithub.rest.pulls.createReview.mock.calls[0][0].body;
+      expect(body.length).toBeLessThanOrEqual(65000);
+      expect(body).toContain("Content redacted to fit size limit.");
+      expect(body).toContain("> Generated by [test-workflow]");
+      expect(body).toContain("<!-- gh-aw-agentic-workflow:");
+      expect(body).toContain(policy);
+    });
+
+    it("preserves complete review and inline footers plus caller marker in size-limited fallbacks", async () => {
+      const previousCallerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/CallerA";
+      try {
+        const policy = "REVIEW-POLICY-START " + "f".repeat(1000) + " REVIEW-POLICY-END";
+        const commentFooter = "\n\nINLINE-POLICY-START " + "f".repeat(1000) + " INLINE-POLICY-END";
+        buffer.addComment({ path: "file.js", line: 5, body: "agent-comment-" + "x".repeat(1000) + commentFooter, bodyFooter: commentFooter });
+        buffer.setReviewMetadata("x".repeat(64980), "COMMENT");
+        buffer.setReviewContext({ repo: "owner/repo", repoParts: { owner: "owner", repo: "repo" }, pullRequestNumber: 42, pullRequest: { head: { sha: "abc123" } } });
+        buffer.setFooterContext({ workflowName: "test-workflow", runUrl: "https://github.com/owner/repo/actions/runs/123", bodyFooter: policy });
+        mockGithub.rest.pulls.createReview.mockRejectedValueOnce(new Error("Line could not be resolved")).mockResolvedValueOnce({ data: { id: 408, html_url: "review-url" } });
+        expect((await buffer.submitReview()).success).toBe(true);
+        const body = mockGithub.rest.pulls.createReview.mock.calls[1][0].body;
+        expect(body.length).toBeLessThanOrEqual(65000);
+        expect(body).toContain("Content redacted to fit size limit.");
+        expect(body).toContain("agent-comment-" + "x".repeat(486) + "...");
+        expect(body).not.toContain("x".repeat(1000));
+        expect(body).toContain(policy);
+        expect(body).toContain(commentFooter);
+        expect(body).toContain('[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerA"');
+        expect(mockGithub.rest.pulls.createReview.mock.calls[0][0].comments[0]).not.toHaveProperty("bodyFooter");
+      } finally {
+        if (previousCallerWorkflowId === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = previousCallerWorkflowId;
+      }
+    });
+
+    it("rejects protected review overflow before submitting anything", async () => {
+      buffer.setReviewMetadata("Normal summary", "COMMENT");
+      buffer.setReviewContext({ repo: "owner/repo", repoParts: { owner: "owner", repo: "repo" }, pullRequestNumber: 42, pullRequest: { head: { sha: "abc123" } } });
+      buffer.setFooterContext({ workflowName: "test-workflow", runUrl: "https://github.com/owner/repo/actions/runs/123", bodyFooter: "f".repeat(65000) });
+      await expect(buffer.submitReview()).rejects.toThrow("protected markers, footers, and framework content");
+      expect(mockGithub.rest.pulls.createReview).not.toHaveBeenCalled();
+    });
+
+    it("should append durable workflow-call-id marker to review body when available", async () => {
       const previousCallerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID;
       process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/CallerA";
       try {
@@ -760,13 +893,35 @@ describe("pr_review_buffer (factory pattern)", () => {
         expect(result.success).toBe(true);
 
         const callArgs = mockGithub.rest.pulls.createReview.mock.calls[0][0];
-        expect(callArgs.body).toContain("<!-- gh-aw-workflow-call-id: owner/repo/CallerA -->");
+        expect(callArgs.body).toContain('[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerA"');
       } finally {
         if (previousCallerWorkflowId === undefined) {
           delete process.env.GH_AW_CALLER_WORKFLOW_ID;
         } else {
           process.env.GH_AW_CALLER_WORKFLOW_ID = previousCallerWorkflowId;
         }
+      }
+    });
+
+    it("should retain caller provenance when the visible footer is disabled", async () => {
+      const previousCallerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/CallerA";
+      try {
+        buffer.setReviewMetadata("Clean review", "COMMENT");
+        buffer.setReviewContext({
+          repo: "owner/repo",
+          repoParts: { owner: "owner", repo: "repo" },
+          pullRequestNumber: 42,
+          pullRequest: { head: { sha: "abc123" } },
+        });
+        buffer.setFooterMode("none");
+        mockGithub.rest.pulls.createReview.mockResolvedValue({ data: { id: 406, html_url: "review-url" } });
+
+        expect((await buffer.submitReview()).success).toBe(true);
+        expect(mockGithub.rest.pulls.createReview.mock.calls[0][0].body).toBe('Clean review\n\n[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerA"');
+      } finally {
+        if (previousCallerWorkflowId === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = previousCallerWorkflowId;
       }
     });
 
@@ -831,6 +986,39 @@ describe("pr_review_buffer (factory pattern)", () => {
       const callArgs = mockGithub.rest.pulls.createReview.mock.calls[0][0];
       // Footer should still be added to track which workflow submitted the review
       expect(callArgs.body).toContain("test-workflow");
+    });
+
+    it("should separate body from footer with a blank line for proper markdown rendering", async () => {
+      buffer.addComment({ path: "test.js", line: 1, body: "comment" });
+      buffer.setReviewMetadata("Review body content", "COMMENT");
+      buffer.setReviewContext({
+        repo: "owner/repo",
+        repoParts: { owner: "owner", repo: "repo" },
+        pullRequestNumber: 42,
+        pullRequest: { head: { sha: "abc123" } },
+      });
+      buffer.setFooterContext({
+        workflowName: "test-workflow",
+        runUrl: "https://github.com/owner/repo/actions/runs/123",
+        workflowSource: "owner/repo/workflows/test.md@v1",
+        workflowSourceURL: "https://github.com/owner/repo/blob/main/test.md",
+      });
+
+      mockGithub.rest.pulls.createReview.mockResolvedValue({
+        data: {
+          id: 403,
+          html_url: "https://github.com/owner/repo/pull/42#pullrequestreview-403",
+        },
+      });
+
+      const result = await buffer.submitReview();
+
+      expect(result.success).toBe(true);
+      const callArgs = mockGithub.rest.pulls.createReview.mock.calls[0][0];
+      // The footer blockquote must be preceded by at least one blank line
+      // so Markdown parses the "> Generated by" quote section correctly.
+      expect(callArgs.body).toMatch(/\n\n> /);
+      expect(callArgs.body).not.toMatch(/[^\n]\n> /);
     });
 
     it("should retry with COMMENT when APPROVE is rejected on own PR", async () => {
@@ -1124,20 +1312,20 @@ describe("pr_review_buffer (factory pattern)", () => {
         });
 
         const lockedError = Object.assign(new Error("lock prevents review"), { status: 422 });
-        const otherError = Object.assign(new Error("internal server error"), { status: 500 });
+        const otherError = Object.assign(new Error("bad request"), { status: 400 });
         mockGithub.rest.pulls.createReview.mockRejectedValueOnce(lockedError).mockRejectedValueOnce(otherError);
 
         const result = await buffer.submitReview();
 
         expect(result.success).toBe(false);
-        expect(result.error).toContain("internal server error");
+        expect(result.error).toContain("bad request");
         expect(mockGithub.rest.pulls.createReview).toHaveBeenCalledTimes(2);
       } finally {
         setTimeoutSpy.mockRestore();
       }
     });
 
-    it("should dismiss older reviews matching workflow-call-id when supersede mode is enabled", async () => {
+    it("should dismiss only older same-workflow blocking reviews after a clean replacement", async () => {
       const previousWorkflowId = process.env.GH_AW_WORKFLOW_ID;
       const previousCallerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID;
       process.env.GH_AW_WORKFLOW_ID = "test-workflow";
@@ -1160,11 +1348,12 @@ describe("pr_review_buffer (factory pattern)", () => {
         });
         mockGithub.rest.pulls.listReviews.mockResolvedValue({
           data: [
-            { id: 100, state: "CHANGES_REQUESTED", user: { login: "github-actions[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/CallerA -->\nOld blocking review" },
+            { id: 100, state: "CHANGES_REQUESTED", user: { login: "github-actions[bot]", type: "Bot" }, body: '[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerA"\nOld blocking review' },
             { id: 101, state: "CHANGES_REQUESTED", user: { login: "human-user", type: "User" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/CallerA -->" },
             { id: 102, state: "APPROVED", user: { login: "github-actions[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/CallerA -->" },
-            { id: 103, state: "CHANGES_REQUESTED", user: { login: "github-actions[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/CallerB -->" },
+            { id: 103, state: "CHANGES_REQUESTED", user: { login: "github-actions[bot]", type: "Bot" }, body: '[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerB"' },
             { id: 104, state: "CHANGES_REQUESTED", user: { login: "github-actions[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-id: test-workflow -->" },
+            { id: 901, state: "CHANGES_REQUESTED", user: { login: "github-actions[bot]", type: "Bot" }, body: '[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerA"' },
           ],
         });
         mockGithub.rest.pulls.dismissReview.mockResolvedValue({ data: {} });
@@ -1194,6 +1383,152 @@ describe("pr_review_buffer (factory pattern)", () => {
         } else {
           process.env.GH_AW_CALLER_WORKFLOW_ID = previousCallerWorkflowId;
         }
+      }
+    });
+
+    it("should supersede a persisted blocking review without dismissing another workflow's review", async () => {
+      const previousCallerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      const previousWorkflowId = process.env.GH_AW_WORKFLOW_ID;
+      process.env.GH_AW_WORKFLOW_ID = "shared-workflow";
+      const reviews = [];
+      mockGithub.rest.pulls.createReview.mockImplementation(async params => {
+        const review = {
+          id: reviews.length + 1,
+          html_url: `review-${reviews.length + 1}`,
+          state: params.event === "REQUEST_CHANGES" ? "CHANGES_REQUESTED" : "COMMENTED",
+          user: { type: "Bot" },
+          // GitHub does not retain HTML comments in review bodies.
+          body: (params.body || "").replace(/<!--[\s\S]*?-->/g, "").trim(),
+        };
+        reviews.push(review);
+        return { data: review };
+      });
+      mockGithub.rest.pulls.listReviews.mockImplementation(async () => ({ data: reviews }));
+      mockGithub.rest.pulls.dismissReview.mockImplementation(async ({ review_id }) => {
+        reviews.find(review => review.id === review_id).state = "DISMISSED";
+        return { data: {} };
+      });
+      try {
+        for (const caller of ["owner/repo/CallerA", "owner/repo/CallerB"]) {
+          process.env.GH_AW_CALLER_WORKFLOW_ID = caller;
+          const blocking = createReviewBuffer();
+          blocking.setReviewMetadata("Blocking finding", "REQUEST_CHANGES");
+          blocking.setReviewContext({
+            repo: "owner/repo",
+            repoParts: { owner: "owner", repo: "repo" },
+            pullRequestNumber: 42,
+            pullRequest: { head: { sha: "abc123" } },
+          });
+          blocking.setFooterMode("none");
+          expect((await blocking.submitReview()).success).toBe(true);
+        }
+
+        process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/CallerA";
+        const replacement = createReviewBuffer();
+        replacement.setReviewMetadata("No findings", "COMMENT");
+        replacement.setReviewContext({
+          repo: "owner/repo",
+          repoParts: { owner: "owner", repo: "repo" },
+          pullRequestNumber: 42,
+          pullRequest: { head: { sha: "abc123" } },
+        });
+        replacement.setFooterMode("none");
+        replacement.setSupersedeOlderReviews(true);
+        expect((await replacement.submitReview()).success).toBe(true);
+        expect(reviews.map(review => review.state)).toEqual(["DISMISSED", "CHANGES_REQUESTED", "COMMENTED"]);
+        expect(mockGithub.rest.pulls.dismissReview).toHaveBeenCalledOnce();
+        expect(reviews[0].body).toContain('[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerA"');
+      } finally {
+        if (previousCallerWorkflowId === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = previousCallerWorkflowId;
+        if (previousWorkflowId === undefined) delete process.env.GH_AW_WORKFLOW_ID;
+        else process.env.GH_AW_WORKFLOW_ID = previousWorkflowId;
+      }
+    });
+
+    it.each([
+      ["REQUEST_CHANGES", false],
+      ["COMMENT", true],
+    ])("should not supersede a blocking review after %s with inline findings=%s", async (event, withComment) => {
+      const previousCallerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/CallerA";
+      try {
+        buffer.setSupersedeOlderReviews(true);
+        buffer.setReviewMetadata("Finding remains", event);
+        if (withComment) buffer.addComment({ path: "test.js", line: 1, body: "Finding" });
+        buffer.setReviewContext({
+          repo: "owner/repo",
+          repoParts: { owner: "owner", repo: "repo" },
+          pullRequestNumber: 42,
+          pullRequest: { head: { sha: "abc123" } },
+        });
+        mockGithub.rest.pulls.createReview.mockResolvedValue({ data: { id: 901, html_url: "review-url" } });
+        mockGithub.rest.pulls.listReviews.mockResolvedValue({
+          data: [{ id: 100, state: "CHANGES_REQUESTED", user: { type: "Bot" }, body: '[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerA"' }],
+        });
+
+        expect((await buffer.submitReview()).success).toBe(true);
+        expect(mockGithub.rest.pulls.dismissReview).not.toHaveBeenCalled();
+      } finally {
+        if (previousCallerWorkflowId === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = previousCallerWorkflowId;
+      }
+    });
+
+    it.each([
+      ["", false],
+      ["Updated review", true],
+    ])("does not treat dropped inline findings as a clean review with body %j", async (reviewBody, shouldSubmit) => {
+      const previousCallerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/CallerA";
+      try {
+        buffer.setSupersedeOlderReviews(true);
+        buffer.setFooterMode("none");
+        buffer.setReviewMetadata(reviewBody, "COMMENT");
+        buffer.addComment({ path: "missing.js", line: 1, body: "Finding" });
+        buffer.setReviewContext({
+          repo: "owner/repo",
+          repoParts: { owner: "owner", repo: "repo" },
+          pullRequestNumber: 42,
+          pullRequest: { head: { sha: "abc123" } },
+        });
+        mockGithub.rest.pulls.listFiles.mockResolvedValue({ data: [{ filename: "changed.js" }] });
+        mockGithub.rest.pulls.createReview.mockResolvedValue({ data: { id: 901, html_url: "review-url" } });
+        mockGithub.rest.pulls.listReviews.mockResolvedValue({
+          data: [{ id: 100, state: "CHANGES_REQUESTED", user: { type: "Bot" }, body: '[gh-aw-workflow-call-id]: # "owner%2Frepo%2FCallerA"' }],
+        });
+
+        expect((await buffer.submitReview()).success).toBe(shouldSubmit);
+        expect(mockGithub.rest.pulls.createReview).toHaveBeenCalledTimes(shouldSubmit ? 1 : 0);
+        expect(mockGithub.rest.pulls.dismissReview).not.toHaveBeenCalled();
+      } finally {
+        if (previousCallerWorkflowId === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = previousCallerWorkflowId;
+      }
+    });
+
+    it.each(["   ", " \n\t "])("does not submit or supersede for whitespace-only review body %j", async body => {
+      const previousCallerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/CallerA";
+      try {
+        buffer.setSupersedeOlderReviews(true);
+        buffer.setReviewMetadata(body, "COMMENT");
+        buffer.setReviewContext({
+          repo: "owner/repo",
+          repoParts: { owner: "owner", repo: "repo" },
+          pullRequestNumber: 42,
+          pullRequest: { head: { sha: "abc123" } },
+        });
+
+        const result = await buffer.submitReview();
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Empty review");
+        expect(mockGithub.rest.pulls.createReview).not.toHaveBeenCalled();
+        expect(mockGithub.rest.pulls.dismissReview).not.toHaveBeenCalled();
+      } finally {
+        if (previousCallerWorkflowId === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = previousCallerWorkflowId;
       }
     });
 
@@ -1315,11 +1650,11 @@ describe("pr_review_buffer (factory pattern)", () => {
       const retryArgs = mockGithub.rest.pulls.createReview.mock.calls[1][0];
       expect(retryArgs.comments).toBeUndefined();
       expect(retryArgs.body).toContain("### Comments that could not be inline-anchored");
-      expect(retryArgs.body).toContain("<details><summary>.changeset/some-file.md:1</summary>");
+      expect(retryArgs.body).toContain("<details>\n<summary>.changeset/some-file.md:1</summary>");
       expect(retryArgs.body).toContain("Review comment on line 1");
-      expect(retryArgs.body).toContain("<details><summary>.github/workflows/ace-editor.lock.yml:1</summary>");
+      expect(retryArgs.body).toContain("<details>\n<summary>.github/workflows/ace-editor.lock.yml:1</summary>");
       expect(retryArgs.body).toContain("Another review comment");
-      expect(retryArgs.body).toContain("<details><summary>src/new_file.js:42</summary>");
+      expect(retryArgs.body).toContain("<details>\n<summary>src/new_file.js:42</summary>");
       expect(retryArgs.body).toContain("A third inline comment that should be preserved in the fallback body");
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Line could not be resolved"));
     });
@@ -1352,12 +1687,17 @@ describe("pr_review_buffer (factory pattern)", () => {
       expect(result.success).toBe(true);
       expect(result.review_id).toBe(803);
       expect(result.comment_count).toBe(2);
+      // The manifest must reflect the actually-submitted (resolvable) comments, not an
+      // arbitrary first-N slice of the original buffered comments — the removed index
+      // was in the middle (index 1), so a first-N slice would wrongly report the
+      // unresolved comment as submitted and drop the second resolvable one.
+      expect(result.review_comments.map(c => c.metadata.path)).toEqual(["src/valid-one.js", "src/valid-two.js"]);
       expect(mockGithub.rest.pulls.createReview).toHaveBeenCalledTimes(2);
       const retryArgs = mockGithub.rest.pulls.createReview.mock.calls[1][0];
       expect(retryArgs.comments).toHaveLength(2);
       expect(retryArgs.comments.map(comment => comment.path)).toEqual(["src/valid-one.js", "src/valid-two.js"]);
       expect(retryArgs.body).toContain("### Comments that could not be inline-anchored");
-      expect(retryArgs.body).toContain("<details><summary>src/unresolved.js:99</summary>");
+      expect(retryArgs.body).toContain("<details>\n<summary>src/unresolved.js:99</summary>");
       expect(retryArgs.body).toContain("This one cannot be anchored");
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Retrying with 2 resolvable inline comment(s)"));
     });
@@ -1395,7 +1735,7 @@ describe("pr_review_buffer (factory pattern)", () => {
       expect(retryArgs.comments).toHaveLength(2);
       expect(retryArgs.comments.map(comment => comment.path)).toEqual(["src/valid-one.js", "src/valid-two.js"]);
       expect(retryArgs.body).toContain("### Comments that could not be inline-anchored");
-      expect(retryArgs.body).toContain("<details><summary>src/missing.js:99</summary>");
+      expect(retryArgs.body).toContain("<details>\n<summary>src/missing.js:99</summary>");
       expect(retryArgs.body).toContain("This path is not in the diff");
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Retrying with 2 resolvable inline comment(s)"));
     });
@@ -1474,9 +1814,9 @@ describe("pr_review_buffer (factory pattern)", () => {
       const retryArgs = mockGithub.rest.pulls.createReview.mock.calls[1][0];
       expect(retryArgs.comments).toBeUndefined();
       expect(retryArgs.body).toContain("### Comments that could not be inline-anchored");
-      expect(retryArgs.body).toContain("<details><summary>.changeset/some-file.md:1</summary>");
+      expect(retryArgs.body).toContain("<details>\n<summary>.changeset/some-file.md:1</summary>");
       expect(retryArgs.body).toContain("Review comment on line 1");
-      expect(retryArgs.body).toContain("<details><summary>src/new_file.js:42</summary>");
+      expect(retryArgs.body).toContain("<details>\n<summary>src/new_file.js:42</summary>");
       expect(retryArgs.body).toContain("A second inline comment");
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Path could not be resolved"));
     });
@@ -1598,13 +1938,13 @@ describe("pr_review_buffer (factory pattern)", () => {
 
       expect(result.success).toBe(true);
       const retryArgs = mockGithub.rest.pulls.createReview.mock.calls[1][0];
-      expect(retryArgs.body).toContain("src/&lt;unsafe&gt;&amp;&quot;&#39;.js:9");
+      expect(retryArgs.body).toContain("src/&lt;unsafe&gt;&amp;\"'.js:9");
       expect(retryArgs.body).toContain("&lt;b&gt;tag&lt;/b&gt;");
-      expect(retryArgs.body).toContain("&amp; &quot;quote&quot; &#39;single&#39;");
+      expect(retryArgs.body).toContain("&amp; \"quote\" 'single'");
       expect(retryArgs.body).not.toContain("</summary><b>tag</b>");
     });
 
-    it("should avoid appending large inline bodies when fallback has no excerpt budget", async () => {
+    it("bounds inline excerpts and fits the complete fallback when the review consumes the budget", async () => {
       for (let i = 0; i < 8; i++) {
         buffer.addComment({ path: `src/file-${i}.js`, line: i + 1, body: `comment-${i}-` + "z".repeat(600) });
       }
@@ -1628,12 +1968,9 @@ describe("pr_review_buffer (factory pattern)", () => {
       expect(result.success).toBe(true);
       const retryArgs = mockGithub.rest.pulls.createReview.mock.calls[1][0];
       expect(retryArgs.body.length).toBeLessThanOrEqual(65000);
-      expect(retryArgs.body).not.toContain("comment-0-");
-      expect(
-        retryArgs.body.includes("_(empty comment body)_") ||
-          retryArgs.body.includes("_(Unanchored comment details omitted to fit GitHub length limits.)_") ||
-          retryArgs.body.includes("_(Fallback review body truncated to fit GitHub length limits.)_")
-      ).toBe(true);
+      expect(retryArgs.body).toContain("comment-0-");
+      expect(retryArgs.body).not.toContain("z".repeat(501));
+      expect(retryArgs.body).toContain("Content redacted to fit size limit.");
     });
 
     it("should submit multiple comments in a single review", async () => {
@@ -1682,7 +2019,7 @@ describe("pr_review_buffer (factory pattern)", () => {
         expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Empty review"));
       });
 
-      it("should NOT block review when body is whitespace-only (truthy string passes guard)", async () => {
+      it("should block review when body is whitespace-only", async () => {
         buffer.setReviewMetadata("   \n  ", "COMMENT");
         buffer.setReviewContext({
           repo: "owner/repo",
@@ -1690,17 +2027,15 @@ describe("pr_review_buffer (factory pattern)", () => {
           pullRequestNumber: 42,
           pullRequest: { head: { sha: "abc123" } },
         });
-        // Whitespace body is truthy so guard should NOT trigger; POST proceeds.
-
         mockGithub.rest.pulls.createReview.mockResolvedValue({
           data: { id: 999, html_url: "https://github.com/owner/repo/pull/42#pullrequestreview-999" },
         });
 
         const result = await buffer.submitReview();
 
-        // Whitespace body is truthy so should still POST (GitHub may accept or reject it)
-        expect(result.success).toBe(true);
-        expect(mockGithub.rest.pulls.createReview).toHaveBeenCalledTimes(1);
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Empty review");
+        expect(mockGithub.rest.pulls.createReview).not.toHaveBeenCalled();
       });
 
       it("should return failure when metadata has no body and footerContext is null (body stays empty)", async () => {
@@ -2157,9 +2492,7 @@ describe("pr_review_buffer (factory pattern)", () => {
       expect(result.success).toBe(true);
       const callArgs = mockGithub.rest.pulls.createReview.mock.calls[0][0];
       // Footer should NOT be included because body is whitespace-only (trimmed length is 0)
-      // Original whitespace body is preserved in the API call
-      expect(callArgs.body).toBe("   \n  ");
-      expect(callArgs.body).not.toContain("test-workflow");
+      expect(callArgs.body).toBeUndefined();
     });
 
     it("should normalize boolean false to 'none' mode", async () => {

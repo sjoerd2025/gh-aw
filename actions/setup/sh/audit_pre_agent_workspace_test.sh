@@ -108,6 +108,61 @@ assert "node_modules excluded from listing" "! grep -q 'node_modules/some-pkg' /
 assert "agent.md still listed despite node_modules sibling" "grep -q 'agent.md' /tmp/gh-aw/pre-agent-audit.txt"
 echo ""
 
+# ── Test 8: Collapsed step summary tree is rendered ─────────────────────────
+echo "Test 8: Step summary contains a collapsed tree"
+WORKSPACE="${TEST_ROOT}/workspace-8"
+mkdir -p "${WORKSPACE}/.github/agents"
+echo "agent" > "${WORKSPACE}/.github/agents/agent.md"
+TMPDIR="${TEST_ROOT}/tmp8"
+mkdir -p "${TMPDIR}/gh-aw"
+GH_OUT8="${TEST_ROOT}/github_output8"
+SUMMARY8="${TEST_ROOT}/step_summary8"
+FENCE='```'
+touch "${GH_OUT8}" "${SUMMARY8}"
+GITHUB_WORKSPACE="${WORKSPACE}" HOME="${TEST_ROOT}/home8" RUNNER_TEMP="${TMPDIR}" GITHUB_OUTPUT="${GH_OUT8}" GITHUB_STEP_SUMMARY="${SUMMARY8}" bash "${SCRIPT_PATH}" >/dev/null 2>&1
+assert "Summary uses a text code fence" "grep -Fq \"\${FENCE}text\" '${SUMMARY8}'"
+assert "Summary closes the code fence" "grep -Fq \"\${FENCE}\" '${SUMMARY8}'"
+assert "Summary uses details" "grep -Fq '<details>' '${SUMMARY8}'"
+assert "Summary closes details" "grep -Fq '</details>' '${SUMMARY8}'"
+assert "Summary title is in the details summary" "grep -Fq '<summary>Pre-agent workspace audit</summary>' '${SUMMARY8}'"
+assert "Summary contains tree branches" "grep -Fq '├── Copilot engine' '${SUMMARY8}'"
+assert "Summary lists agent.md in the tree" "grep -Fq '└── ${WORKSPACE}/.github/agents/agent.md' '${SUMMARY8}'"
+assert "Summary does not use a table" "! grep -Fq '| Section | Path | Size |' '${SUMMARY8}'"
+assert "Summary does not use ASCII branches" "! grep -Fq '|-- Copilot engine' '${SUMMARY8}'"
+echo ""
+
+# ── Test 9: Works without GITHUB_STEP_SUMMARY set ──────────────────────────
+echo "Test 9: Script succeeds when GITHUB_STEP_SUMMARY is unset"
+TMPDIR="${TEST_ROOT}/tmp9"
+mkdir -p "${TMPDIR}/gh-aw"
+GH_OUT9="${TEST_ROOT}/github_output9"
+touch "${GH_OUT9}"
+if GITHUB_WORKSPACE="${TEST_ROOT}/workspace-8" HOME="${TEST_ROOT}/home9" RUNNER_TEMP="${TMPDIR}" GITHUB_OUTPUT="${GH_OUT9}" bash "${SCRIPT_PATH}" >/dev/null 2>&1; then
+  assert "Script succeeds without GITHUB_STEP_SUMMARY" "true"
+else
+  assert "Script succeeds without GITHUB_STEP_SUMMARY" "false"
+fi
+echo ""
+
+# ── Test 10: Excludes large installed tool caches ────────────────────────────
+echo "Test 10: Installed tool-cache trees are excluded"
+TMPDIR="${TEST_ROOT}/tmp10"
+mkdir -p "${TMPDIR}/gh-aw/tool-cache/dotnet" "${TMPDIR}/gh-aw/tool-cache/node"
+touch "${TMPDIR}/gh-aw/tool-cache/dotnet/installed-toolchain-library-with-a-long-name-for-summary-size-regression-"{1..5000}.dll
+touch "${TMPDIR}/gh-aw/tool-cache/node/installed-toolchain-module-with-a-long-name-for-summary-size-regression-"{1..5000}.js
+touch "${TMPDIR}/gh-aw/agent-config.json"
+GH_OUT10="${TEST_ROOT}/github_output10"
+SUMMARY10="${TEST_ROOT}/step_summary10"
+touch "${GH_OUT10}" "${SUMMARY10}"
+GITHUB_WORKSPACE="${TEST_ROOT}/workspace-8" HOME="${TEST_ROOT}/home10" RUNNER_TEMP="${TMPDIR}" GITHUB_OUTPUT="${GH_OUT10}" GITHUB_STEP_SUMMARY="${SUMMARY10}" bash "${SCRIPT_PATH}" >/dev/null 2>&1
+assert "tool-cache excluded from audit listing" "! grep -q '/tool-cache' /tmp/gh-aw/pre-agent-audit.txt"
+assert "tool-cache excluded from summary" "! grep -q '/tool-cache' '${SUMMARY10}'"
+assert "Sibling file still listed in audit" "grep -Fq '${TMPDIR}/gh-aw/agent-config.json' /tmp/gh-aw/pre-agent-audit.txt"
+assert "Sibling file still listed in summary" "grep -Fq '${TMPDIR}/gh-aw/agent-config.json' '${SUMMARY10}'"
+assert "Summary remains below the 1 MiB limit" "[ \"\$(wc -c < '${SUMMARY10}')\" -lt 1048576 ]"
+assert "Reported line count matches audit" "grep -Fxq \"pre-agent-audit-line-count=\$(wc -l < /tmp/gh-aw/pre-agent-audit.txt | tr -d ' ')\" '${GH_OUT10}'"
+echo ""
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo "Results: ${TESTS_PASSED} passed, ${TESTS_FAILED} failed"
 if [ "${TESTS_FAILED}" -gt 0 ]; then

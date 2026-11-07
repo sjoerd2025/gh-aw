@@ -3,6 +3,9 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"slices"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
@@ -28,10 +31,66 @@ import (
 // custom safe-jobs, dispatch_workflow targets, and call_workflow targets.
 // These tools are not in safe_outputs_tools.json and must be generated from
 // the workflow configuration at compile time.
+//
+//nolint:largefunc // Dynamic tool generation is intentionally kept as one exhaustive flow.
 func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string]any, error) {
 	var dynamicTools []map[string]any
 
+	if data.LedgerConfig != nil {
+		ledgerNamesByType := make(map[string][]string)
+		for _, ledger := range data.LedgerConfig.Ledgers {
+			ledgerNamesByType[ledger.Type] = append(ledgerNamesByType[ledger.Type], ledger.Name)
+		}
+		for ledgerType := range ledgerNamesByType {
+			slices.Sort(ledgerNamesByType[ledgerType])
+		}
+		for _, spec := range []struct {
+			name, ledgerType, operation, field string
+			required                           bool
+		}{
+			{"ledger_map_put", "map", "put", "value", true},
+			{"ledger_map_delete", "map", "delete", "", false},
+		} {
+			ledgerNames := ledgerNamesByType[spec.ledgerType]
+			if len(ledgerNames) == 0 {
+				continue
+			}
+			properties := map[string]any{
+				"ledger":  map[string]any{"type": "string", "description": "Target ledger name; optional when there is only one ledger of this type, required otherwise.", "enum": ledgerNames},
+				"temp_id": map[string]any{"type": "string", "description": "Optional temporary ID for same-batch references."},
+			}
+			required := []string{}
+			if len(ledgerNames) > 1 {
+				required = append(required, "ledger")
+			}
+			if spec.ledgerType == "map" {
+				properties["key"] = map[string]any{"type": "string"}
+				required = append(required, "key")
+			}
+			if spec.field != "" {
+				fieldSchema := map[string]any{}
+				properties[spec.field] = fieldSchema
+				if spec.required {
+					required = append(required, spec.field)
+				}
+			}
+			dynamicTools = append(dynamicTools, map[string]any{
+				"name": spec.name, "description": fmt.Sprintf("%s a %s ledger entry. Persistence follows trusted validation.", spec.operation, spec.ledgerType),
+				"_ledger_type": spec.ledgerType, "_ledger_operation": spec.operation,
+				"inputSchema": map[string]any{"type": "object", "properties": properties, "required": required, "additionalProperties": false},
+			})
+		}
+		if noteLedgers := ledgerNamesByType["notes"]; len(noteLedgers) > 0 {
+			dynamicTools = append(dynamicTools, generateNoteLedgerTools(noteLedgers)...)
+		}
+	}
+
 	// Add custom job tools from SafeOutputs.Jobs
+	if isWorkQueueParticipant(data) && len(data.SafeOutputs.Steps) > 0 {
+		dynamicTools = append(dynamicTools, generateCustomJobToolDefinition("raw_steps", &SafeJobConfig{
+			Description: "Prepare the configured trusted custom steps for one immutable Claim; effects require independent declared delivery verification.",
+		}))
+	}
 	if len(data.SafeOutputs.Jobs) > 0 {
 		safeOutputsConfigLog.Printf("Adding %d custom job tools", len(data.SafeOutputs.Jobs))
 
@@ -88,7 +147,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 			fileResult, err := findWorkflowFile(workflowName, markdownPath)
 			if err != nil {
 				safeOutputsConfigLog.Printf("Warning: error finding workflow %s: %v", workflowName, err)
-				dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, make(map[string]any)))
+				dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, make(map[string]any), data.SafeOutputs.DispatchWorkflow.AllowedRefs, false))
 				continue
 			}
 
@@ -100,14 +159,14 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 				extension = ".lock.yml"
 			} else if fileResult.ymlExists {
 				workflowPath = fileResult.ymlPath
-				extension = ".yml"
+				extension = filepath.Ext(fileResult.ymlPath)
 			} else if fileResult.mdExists {
 				workflowPath = fileResult.mdPath
 				extension = ".lock.yml"
 				useMD = true
 			} else {
 				safeOutputsConfigLog.Printf("Warning: no workflow file found for %s (checked .lock.yml, .yml, .md)", workflowName)
-				dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, make(map[string]any)))
+				dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, make(map[string]any), data.SafeOutputs.DispatchWorkflow.AllowedRefs, false))
 				continue
 			}
 
@@ -125,7 +184,13 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 				workflowInputs = make(map[string]any)
 			}
 
-			dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, workflowInputs))
+			queueWorker := slices.Contains(data.SafeOutputs.DispatchWorkflow.WorkQueueWorkflows, workflowName)
+			if queueWorker {
+				// Queue targets are selected by the installed pool Policy, never an agent's
+				// target-specific dispatch tool. The queue MCP exposes dispatch_next.
+				continue
+			}
+			dynamicTools = append(dynamicTools, generateDispatchWorkflowTool(workflowName, workflowInputs, data.SafeOutputs.DispatchWorkflow.AllowedRefs, queueWorker))
 		}
 	}
 
@@ -166,7 +231,7 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 				extension = ".lock.yml"
 			} else if fileResult.ymlExists {
 				workflowPath = fileResult.ymlPath
-				extension = ".yml"
+				extension = filepath.Ext(fileResult.ymlPath)
 			} else if fileResult.mdExists {
 				workflowPath = fileResult.mdPath
 				extension = ".lock.yml"
@@ -199,6 +264,69 @@ func generateDynamicTools(data *WorkflowData, markdownPath string) ([]map[string
 	return dynamicTools, nil
 }
 
+func generateNoteLedgerTools(ledgerNames []string) []map[string]any {
+	ledger := map[string]any{
+		"type": "string", "enum": ledgerNames,
+		"description": "Target notes ledger; optional when only one notes ledger exists, required otherwise.",
+	}
+	fields := []struct {
+		name, operation string
+		properties      map[string]any
+		required        []string
+	}{
+		{
+			name: "ledger_note_add", operation: "note",
+			properties: map[string]any{
+				"temp_id": map[string]any{"type": "string", "description": "Optional temporary ID for same-batch references."},
+				"subject": map[string]any{"type": "string", "minLength": 1, "maxLength": 512},
+				"note":    map[string]any{"type": "string", "minLength": 1, "maxLength": 4096},
+				"reason":  map[string]any{"type": "string", "minLength": 1, "maxLength": 1024},
+				"citations": map[string]any{
+					"type": "array", "minItems": 1, "maxItems": 32,
+					"items": map[string]any{
+						"type": "object", "required": []string{"type", "path"}, "additionalProperties": false,
+						"properties": map[string]any{
+							"type":       map[string]any{"type": "string", "enum": []string{"repository"}},
+							"path":       map[string]any{"type": "string", "minLength": 1, "description": "Repository-relative file path without traversal or encoded separators."},
+							"start_line": map[string]any{"type": "integer", "minimum": 1},
+							"end_line":   map[string]any{"type": "integer", "minimum": 1},
+						},
+					},
+				},
+			},
+			required: []string{"subject", "note", "reason", "citations"},
+		},
+		{
+			name: "ledger_note_vote", operation: "vote",
+			properties: map[string]any{
+				"note_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 128},
+				"vote":    map[string]any{"type": "string", "enum": []string{"up", "down"}},
+				"reason":  map[string]any{"type": "string", "minLength": 1, "maxLength": 1024},
+			},
+			required: []string{"note_id", "vote"},
+		},
+	}
+	tools := make([]map[string]any, 0, len(fields))
+	actions := map[string]string{"note": "Add", "vote": "Vote on"}
+	for _, field := range fields {
+		properties := field.properties
+		properties["ledger"] = ledger
+		required := field.required
+		if len(ledgerNames) > 1 {
+			required = append(required, "ledger")
+		}
+		tools = append(tools, map[string]any{
+			"name":         field.name,
+			"description":  actions[field.operation] + " a note in a notes ledger. Persistence follows trusted validation.",
+			"_ledger_type": "notes", "_ledger_operation": field.operation,
+			"inputSchema": map[string]any{
+				"type": "object", "properties": properties, "required": required, "additionalProperties": false,
+			},
+		})
+	}
+	return tools
+}
+
 // ToolsMeta is the structure written to tools_meta.json at compile time and read
 // by generate_safe_outputs_tools.cjs at runtime. It avoids inlining the entire
 // safe_outputs_tools.json into the compiled workflow YAML.
@@ -212,7 +340,8 @@ type ToolsMeta struct {
 	// DynamicTools contains tool definitions for custom safe-jobs, dispatch_workflow
 	// targets, and call_workflow targets. These are workflow-specific and cannot be
 	// derived from the static safe_outputs_tools.json at runtime.
-	DynamicTools []map[string]any `json:"dynamic_tools"`
+	DynamicTools    []map[string]any `json:"dynamic_tools"`
+	WorkQueueScoped bool             `json:"work_queue_scoped,omitempty"`
 	// RequiredFieldRemovals maps tool name → list of field names to remove from the
 	// inputSchema.required array. Used when a field that is required in the static
 	// safe_outputs_tools.json should be optional for this specific workflow (e.g. when
@@ -228,6 +357,8 @@ type ToolsMeta struct {
 	// If the property already exists in the static schema its definition is replaced;
 	// otherwise it is added as a new optional property.
 	PropertyInjections map[string]map[string]any `json:"property_injections,omitempty"`
+	// ItemSchemas maps tool name → array property name → narrowed item schema.
+	ItemSchemas map[string]map[string]map[string]any `json:"item_schemas,omitempty"`
 }
 
 // computeRequiredFieldRemovals returns a map of tool name → required fields to remove
@@ -276,6 +407,11 @@ func computeRequiredFieldAdditions(safeOutputs *SafeOutputsConfig) map[string][]
 	if safeOutputs.AssignToAgent != nil && issueIntentRequired(safeOutputs.AssignToAgent.IssueIntent) {
 		additions["assign_to_agent"] = issueIntentRequiredFields
 	}
+	if safeOutputs.SubmitPullRequestReview != nil && len(safeOutputs.SubmitPullRequestReview.AllowedEvents) > 0 {
+		if !slices.Contains(safeOutputs.SubmitPullRequestReview.AllowedEvents, "COMMENT") {
+			additions["submit_pull_request_review"] = []string{"event"}
+		}
+	}
 	return additions
 }
 
@@ -293,6 +429,8 @@ var closeIssueStateReasonValues = []string{"completed", "not_planned", "duplicat
 //   - Omitted config (no state-reason): inject state_reason with all three supported values.
 //   - List config (state-reason: [...]): inject state_reason with the configured subset.
 //   - Scalar config (state-reason: "..."): no injection (fixed reason, agent cannot choose).
+//
+//nolint:largefunc // Property injection cases are intentionally kept together.
 func computePropertyInjections(safeOutputs *SafeOutputsConfig) map[string]map[string]any {
 	injections := make(map[string]map[string]any)
 	if safeOutputs == nil {
@@ -340,6 +478,22 @@ func computePropertyInjections(safeOutputs *SafeOutputsConfig) map[string]map[st
 		}
 	}
 
+	// submit_pull_request_review event: when allowed-events restricts the set of review
+	// decisions, narrow the tool schema's event enum to match so the agent cannot select
+	// an event that runtime policy will reject. This retains runtime enforcement as
+	// defense in depth while preventing the doomed call in the first place.
+	if safeOutputs.SubmitPullRequestReview != nil && len(safeOutputs.SubmitPullRequestReview.AllowedEvents) > 0 {
+		allowedEvents := safeOutputs.SubmitPullRequestReview.AllowedEvents
+		injections["submit_pull_request_review"] = map[string]any{
+			"event": map[string]any{
+				"type":        "string",
+				"enum":        allowedEvents,
+				"description": "Review decision. Restricted by allowed-events configuration to: " + strings.Join(allowedEvents, ", ") + ".",
+				"x-synonyms":  []string{"action"},
+			},
+		}
+	}
+
 	if safeOutputs.DataEnabled {
 		dataProperty := map[string]any{"$ref": "#/0/inputSchema/$defs/structured_data"}
 		if safeOutputs.NormalizedDataSchema != nil {
@@ -364,8 +518,10 @@ func computePropertyInjections(safeOutputs *SafeOutputsConfig) map[string]map[st
 // At runtime, generate_safe_outputs_tools.cjs reads safe_outputs_tools.json from
 // the actions folder, applies the meta overrides from tools_meta.json, and writes
 // the final ${RUNNER_TEMP}/gh-aw/safeoutputs/tools.json.
+//
+//nolint:largefunc // Tool metadata assembly is intentionally kept as one flow.
 func generateToolsMetaJSON(data *WorkflowData, markdownPath string) (string, error) {
-	if data.SafeOutputs == nil {
+	if data.SafeOutputs == nil && !data.LedgerConfig.Enabled() {
 		empty := ToolsMeta{
 			DescriptionSuffixes: map[string]string{},
 			RepoParams:          map[string]map[string]any{},
@@ -373,9 +529,12 @@ func generateToolsMetaJSON(data *WorkflowData, markdownPath string) (string, err
 		}
 		result, err := json.Marshal(empty)
 		if err != nil {
-			return "", fmt.Errorf("failed to marshal empty tools meta: %w", err)
+			return "", fmt.Errorf("unable to marshal empty tools meta to JSON; expected the empty ToolsMeta struct (with empty maps/slices) to be serializable: %w", err)
 		}
 		return string(result), nil
+	}
+	if data.SafeOutputs == nil {
+		data.SafeOutputs = &SafeOutputsConfig{}
 	}
 
 	safeOutputsConfigLog.Print("Generating tools meta JSON for workflow")
@@ -417,20 +576,33 @@ func generateToolsMetaJSON(data *WorkflowData, markdownPath string) (string, err
 
 	// Compute property injections (e.g. state_reason enum for close_issue).
 	propertyInjections := computePropertyInjections(data.SafeOutputs)
+	itemSchemas := make(map[string]map[string]map[string]any)
+	if data.SafeOutputs.AddLabels != nil && data.SafeOutputs.AddLabels.ItemSchema != nil {
+		itemSchema, itemSchemaErr := normalizedAddLabelsItemSchema(
+			data.SafeOutputs.AddLabels.ItemSchema,
+			issueIntentRequired(data.SafeOutputs.AddLabels.IssueIntent),
+		)
+		if itemSchemaErr != nil {
+			return "", itemSchemaErr
+		}
+		itemSchemas["add_labels"] = map[string]map[string]any{"labels": itemSchema}
+	}
 
 	meta := ToolsMeta{
+		WorkQueueScoped:        isWorkQueueWorker(data),
 		DescriptionSuffixes:    descriptionSuffixes,
 		RepoParams:             repoParams,
 		DynamicTools:           dynamicTools,
 		RequiredFieldRemovals:  requiredFieldRemovals,
 		RequiredFieldAdditions: requiredFieldAdditions,
 		PropertyInjections:     propertyInjections,
+		ItemSchemas:            itemSchemas,
 	}
 
 	result, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
-		safeOutputsConfigLog.Printf("Failed to marshal tools meta: %v", err)
-		return "", fmt.Errorf("failed to marshal tools meta: %w", err)
+		safeOutputsConfigLog.Printf("Error marshaling tools meta: %v", err)
+		return "", fmt.Errorf("unable to marshal tools meta to JSON; expected all computed fields (description suffixes, repo params, dynamic tools) to be serializable: %w", err)
 	}
 
 	safeOutputsConfigLog.Printf("Successfully generated tools meta JSON: %d description suffixes, %d repo params, %d dynamic tools",

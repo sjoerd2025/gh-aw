@@ -12,14 +12,14 @@ permissions:
   actions: read
   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 tracker-id: linter-miner
 engine:
   id: copilot
   copilot-sdk: true
+  model-routing:
+    goal: cost
+    mode: economy
 max-tool-denials: 3
 network:
   allowed:
@@ -28,7 +28,7 @@ network:
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default, discussions, issues, repos]
   cache-memory:
     key: linter-miner-state-${{ github.workflow }}
@@ -38,6 +38,7 @@ tools:
 imports:
   - shared/mcp/serena-go.md
   - shared/otlp.md
+  - shared/reporting.md
 pre-agent-steps:
   - name: Preload linter source and cache context
     run: |
@@ -64,6 +65,7 @@ pre-agent-steps:
         echo "[]" > /tmp/gh-aw/agent/prior-linters.json
       fi
 safe-outputs:
+  steer: true
   create-pull-request:
     title-prefix: "[linter-miner] "
     labels: [automation, go-linters, cookie]
@@ -178,16 +180,37 @@ Call the `create-pull-request` safe output with:
 ## agent: `discussion-miner`
 ---
 description: Mines GitHub Discussions and Issues for recurring Go code patterns, anti-patterns, and bugs that could be caught by a static linter
-model: kiwi
+model: copilot/claude-sonnet-5.5
 ---
 You are a Go code-review analyst. Your job is to search GitHub Discussions and Issues in the current repository for evidence of recurring Go code patterns or errors that could benefit from automatic static analysis.
 
-Search the last 14 days of Discussions and Issues using `gh` CLI. Count relevant matches in that 14-day slice. If fewer than 5 relevant items are found, rerun with a 30-day window:
+Access GitHub only through the `github` CLI bridge on `PATH`, invoked from bash. It is backed by the workflow's configured GitHub MCP server. Do **not** use `gh` (it is not authenticated in this sandbox), do not set or request a `GH_TOKEN`, and do not assume a native GitHub MCP function-call tool exists.
+
+First discover the available tools and their exact parameter schemas:
 
 ```bash
-gh discussion list --limit 100 --json number,title,body,comments,labels,createdAt
-gh issue list --limit 100 --state all --json number,title,body,labels,createdAt
+github --help
+github search_issues --help
+github list_issues --help
+github list_discussions --help
+github get_discussion --help
+github get_discussion_comments --help
 ```
+
+Then query the `github/gh-aw` repository using only the parameters each `--help` output documents (pass them as `--param value`). Search the last 14 days of Discussions and Issues. Count relevant matches in that 14-day slice. If fewer than 5 relevant items are found, rerun with a 30-day window. For example (adjust names, pagination, and filters to the actual schemas):
+
+```bash
+SINCE="$(date -u -d '14 days ago' +%Y-%m-%d)"   # use '30 days ago' for the fallback window
+github search_issues --owner github --repo gh-aw --query "repo:github/gh-aw is:issue created:>=${SINCE}" --perPage 100
+github list_issues --owner github --repo gh-aw --since "${SINCE}T00:00:00Z" --perPage 100
+github list_discussions --owner github --repo gh-aw --orderBy CREATED_AT --direction DESC --perPage 100
+github get_discussion --owner github --repo gh-aw --discussionNumber <number>
+github get_discussion_comments --owner github --repo gh-aw --discussionNumber <number>
+```
+
+Keep only items created within the active window (filter discussions by `createdAt`), follow pagination cursors/pages until the window is covered, and read bodies/comments of promising items before citing them. If a bridge call fails, run `github <tool> --help` and correct the arguments; do not fall back to `gh`.
+
+Read budget (hard limits, including the 30-day fallback): fetch at most 3 pages (of up to 100 items each) per list or search query, and make at most 10 `get_discussion` / `get_discussion_comments` reads in total, choosing the most relevant items from the list results. Count relevant items from the list results, not only from items you read in full. When the budget runs out, stop reading and build candidates from what was read, and say in one sentence outside the JSON block that the read budget was reached.
 
 Look for:
 - Review comments mentioning specific Go constructs (e.g. "forgot defer", "ignored error", "nil check", "context not passed")
@@ -206,12 +229,12 @@ Output a JSON array of candidate linter ideas:
 ]
 ```
 
-Be concise. List at most 5 candidates.
+Be concise. List at most 5 candidates. Only include candidates backed by items you actually read; never invent candidates. If GitHub data could not be retrieved, output exactly `[]` as the JSON block and put the bridge error in one separate sentence outside the JSON block.
 
 ## agent: `code-pattern-scanner`
 ---
 description: Scans the Go source with Serena and grep to find error-prone patterns that would benefit from a custom linter
-model: inherited
+model: copilot/claude-sonnet-5.5
 ---
 You are a Go static-analysis expert. Scan the non-test Go files under `pkg/` and `cmd/` of this repository for recurring error-prone patterns that are not already caught by existing linters.
 
@@ -228,7 +251,7 @@ Output a JSON array of candidate linter ideas (same schema as discussion-miner).
 ## agent: `linter-writer`
 ---
 description: Implements a new Go analysis linter package following the pkg/linters/largefunc conventions
-model: inherited
+model: copilot/claude-sonnet-5.5
 ---
 You are a Go engineer implementing a custom `go/analysis` linter.
 

@@ -9,29 +9,43 @@ import (
 
 var reactionsLog = logger.New("workflow:reactions")
 
+type ReactionType string
+
+const (
+	ReactionTypePlusOne  ReactionType = "+1"
+	ReactionTypeMinusOne ReactionType = "-1"
+	ReactionTypeLaugh    ReactionType = "laugh"
+	ReactionTypeConfused ReactionType = "confused"
+	ReactionTypeHeart    ReactionType = "heart"
+	ReactionTypeHooray   ReactionType = "hooray"
+	ReactionTypeRocket   ReactionType = "rocket"
+	ReactionTypeEyes     ReactionType = "eyes"
+	ReactionTypeNone     ReactionType = "none"
+)
+
 // validReactions defines the set of valid reaction values
-var validReactions = map[string]bool{
-	"+1":       true,
-	"-1":       true,
-	"laugh":    true,
-	"confused": true,
-	"heart":    true,
-	"hooray":   true,
-	"rocket":   true,
-	"eyes":     true,
-	"none":     true,
+var validReactions = map[ReactionType]bool{
+	ReactionTypePlusOne:  true,
+	ReactionTypeMinusOne: true,
+	ReactionTypeLaugh:    true,
+	ReactionTypeConfused: true,
+	ReactionTypeHeart:    true,
+	ReactionTypeHooray:   true,
+	ReactionTypeRocket:   true,
+	ReactionTypeEyes:     true,
+	ReactionTypeNone:     true,
 }
 
 // isValidReaction checks if a reaction value is valid according to the schema
 func isValidReaction(reaction string) bool {
-	return validReactions[reaction]
+	return validReactions[ReactionType(reaction)]
 }
 
 // getValidReactions returns the list of valid reaction entries
 func getValidReactions() []string {
 	reactions := make([]string, 0, len(validReactions))
 	for reaction := range validReactions {
-		reactions = append(reactions, reaction)
+		reactions = append(reactions, string(reaction))
 	}
 	return reactions
 }
@@ -61,25 +75,25 @@ func parseReactionValue(value any) (string, error) {
 	case uint64:
 		if v == 1 {
 			reactionsLog.Print("Parsed uint64 reaction: +1")
-			return "+1", nil
+			return string(ReactionTypePlusOne), nil
 		}
 		reactionsLog.Printf("Invalid uint64 reaction value: %d", v)
-		return "", fmt.Errorf("invalid reaction value '%d': must be one of %v", v, getValidReactions())
+		return "", fmt.Errorf("reaction value '%d' is not supported, expected one of %v. Example: reaction: eyes", v, getValidReactions())
 	case float64:
 		// YAML may parse +1 and -1 as float64
 		if v == 1.0 {
 			reactionsLog.Print("Parsed float64 reaction: +1")
-			return "+1", nil
+			return string(ReactionTypePlusOne), nil
 		}
 		if v == -1.0 {
 			reactionsLog.Print("Parsed float64 reaction: -1")
-			return "-1", nil
+			return string(ReactionTypeMinusOne), nil
 		}
 		reactionsLog.Printf("Invalid float64 reaction value: %f", v)
-		return "", fmt.Errorf("invalid reaction value '%v': must be one of %v", v, getValidReactions())
+		return "", fmt.Errorf("reaction value '%v' is not supported, expected one of %v. Example: reaction: eyes", v, getValidReactions())
 	default:
 		reactionsLog.Printf("Invalid reaction type: %T", value)
-		return "", fmt.Errorf("invalid reaction type: expected string, got %T", value)
+		return "", fmt.Errorf("reaction has type %T, expected a string or integer value. Example: reaction: eyes", value)
 	}
 }
 
@@ -89,7 +103,7 @@ func parseReactionValue(value any) (string, error) {
 // - object: {type, issues, pull-requests, discussions}
 func parseReactionConfig(value any) (string, *bool, *bool, *bool, error) {
 	if reactionMap, ok := value.(map[string]any); ok {
-		reactionType := "eyes"
+		reactionType := string(ReactionTypeEyes)
 		if typeValue, hasType := reactionMap["type"]; hasType {
 			parsedType, err := parseReactionValue(typeValue)
 			if err != nil {
@@ -114,7 +128,7 @@ func parseReactionConfig(value any) (string, *bool, *bool, *bool, error) {
 		}
 
 		if !reactionIssues && !reactionPullRequests && !reactionDiscussions {
-			return "", nil, nil, nil, errors.New("reaction object requires at least one target to be enabled (issues, pull-requests, or discussions)")
+			return "", nil, nil, nil, errors.New("reaction object has all targets disabled, expected at least one of issues, pull-requests, or discussions to be enabled. Example: reaction:\n  type: eyes\n  issues: true")
 		}
 
 		return reactionType, &reactionIssues, &reactionPullRequests, &reactionDiscussions, nil
@@ -136,7 +150,7 @@ func parseBoolReactionField(m map[string]any, key string) (bool, error) {
 	}
 	b, ok := v.(bool)
 	if !ok {
-		return false, fmt.Errorf("reaction.%s must be a boolean value, got %T", key, v)
+		return false, fmt.Errorf("reaction.%s has type %T, expected a boolean value. Example: reaction:\n  %s: true", key, v, key)
 	}
 	return b, nil
 }
@@ -146,10 +160,10 @@ func parseBoolReactionField(m map[string]any, key string) (bool, error) {
 func intToReactionString(v int64) (string, error) {
 	switch v {
 	case 1:
-		return "+1", nil
+		return string(ReactionTypePlusOne), nil
 	case -1:
-		return "-1", nil
+		return string(ReactionTypeMinusOne), nil
 	default:
-		return "", fmt.Errorf("invalid reaction value '%d': must be one of %v", v, getValidReactions())
+		return "", fmt.Errorf("reaction value '%d' is not supported, expected one of %v. Example: reaction: eyes", v, getValidReactions())
 	}
 }

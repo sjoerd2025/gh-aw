@@ -77,6 +77,30 @@ func TestGenerateKnownNeedsExpressions(t *testing.T) {
 			},
 		},
 		{
+			name: "with custom job before activation and explicit outputs",
+			data: &WorkflowData{
+				Jobs: map[string]any{
+					"select": map[string]any{
+						"runs-on": "ubuntu-latest",
+						"needs":   "pre_activation",
+						"outputs": map[string]any{
+							"issue_numbers": "${{ steps.values.outputs.issue_numbers }}",
+							"marker":        "${{ steps.values.outputs.marker }}",
+						},
+					},
+				},
+			},
+			preActivationJobCreated: true,
+			checkExpressions: []string{
+				"needs.pre_activation.outputs.activated",
+				"needs.select.outputs.issue_numbers",
+				"needs.select.outputs.marker",
+			},
+			notExpectedExprs: []string{
+				"needs.select.outputs.output",
+			},
+		},
+		{
 			name: "with custom job without explicit needs",
 			data: &WorkflowData{
 				Jobs: map[string]any{
@@ -663,6 +687,10 @@ Release tag: ${{ needs.config.outputs.release_tag }}
 	}
 	assert.Contains(t, substSection, "GH_AW_NEEDS_PRECOMPUTE_OUTPUTS_ACTION",
 		"Substitution step should reference precompute's output (it runs before activation)")
-	assert.NotContains(t, substSection, "GH_AW_NEEDS_CONFIG_OUTPUTS_RELEASE_TAG",
-		"Substitution step should NOT reference config's output (it runs after activation)")
+	assert.Contains(t, substSection, "GH_AW_NEEDS_CONFIG_OUTPUTS_RELEASE_TAG: __GH_AW_DEFERRED_",
+		"Activation should stage a late binding for config's output")
+	assert.NotContains(t, substSection, "${{ needs.config.outputs.release_tag }}",
+		"Activation cannot evaluate config's output")
+	assert.Contains(t, extractJobSection(lockStr, "agent"), "${{ needs.config.outputs.release_tag }}",
+		"The agent resolves config's output after its producer completes")
 }

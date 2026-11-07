@@ -18,14 +18,14 @@ permissions:
   security-events: read
   vulnerability-alerts: read
 
-sandbox:
-  agent:
-    sudo: false
 
 network:
   allowed:
     - defaults
     - go
+    # Required for the Playwright CLI npm version check (registry.npmjs.org).
+    # Engine defaults no longer grant package registry access implicitly.
+    - node
 
 safe-outputs:
   close-issue:
@@ -58,7 +58,7 @@ experiments:
     description: "Tests whether the current exhaustive multi-phase prompt can be trimmed without losing categorization accuracy or issue quality."
     hypothesis: "H0: no change in issue categorization accuracy across prompt styles. H1: concise style reduces token cost by ≥15% with <5% drop in accuracy."
     metric: issue_categorization_accuracy
-    secondary_metrics: [effective_token_count, run_duration_ms, issues_created_count]
+    secondary_metrics: [aic, run_duration_ms, issues_created_count]
     guardrail_metrics:
       - name: empty_output_rate
         threshold: "<=0.05"
@@ -74,7 +74,14 @@ evals:
     question: Did the agent analyze open Dependabot PRs or available dependency updates for the Go modules?
   - id: issue_created_or_noop
     question: Was an issue created for dependency updates, or was noop used when no actionable updates were found?
+features:
+  gh-aw-detection: true
+engine:
+  id: codex
+  model-provider: github
+model: copilot/gpt-6-luna
 ---
+
 # Dependabot Dependency Checker
 
 ## Objective
@@ -85,7 +92,7 @@ Close any existing open dependency update issues with the `[deps]` prefix, then 
 ## Current Context
 - **Repository**: ${{ github.repository }}
 - **Go Module File**: `go.mod` in repository root
-- **NPM Packages**: Check for `@playwright/mcp` updates in constants.go
+- **NPM Packages**: Check for `@playwright/cli` updates in `pkg/constants/version_constants.go`
 
 {{#if experiments.prompt_style == 'concise' }}
 ## Your Tasks
@@ -97,7 +104,7 @@ Close any existing open dependency update issues with the `[deps]` prefix, then 
 2. Query Dependabot toolset; discard alerts not in that list.
 3. Per alert: record current version, proposed version, update type, security info; web-fetch changelog.
 
-**Phase 1.5 — Playwright NPM**: Read `DefaultPlaywrightVersion` from `pkg/constants/constants.go`; fetch `https://registry.npmjs.org/@playwright/mcp` for latest version; determine update type.
+**Phase 1.5 — Playwright NPM**: Read `DefaultPlaywrightCLIVersion` from `pkg/constants/version_constants.go`; fetch `https://registry.npmjs.org/@playwright/cli` for latest version; determine update type.
 
 **Phase 2 — Categorize** (three-tier):
 
@@ -148,11 +155,11 @@ Close any existing open dependency update issues with the `[deps]` prefix, then 
 
 ### Step 2: Check Playwright NPM Package
 
-1. Read `pkg/constants/constants.go` → find `DefaultPlaywrightVersion` constant.
-2. Fetch `https://registry.npmjs.org/@playwright/mcp` → read `latest` field.
+1. Read `pkg/constants/version_constants.go` → find `DefaultPlaywrightCLIVersion` constant.
+2. Fetch `https://registry.npmjs.org/@playwright/cli` → read `latest` field.
 3. Compare current vs. latest: note patch/minor/major update type and any release notes.
 
-✅ **Done when**: You know the current and latest `@playwright/mcp` version and update type.
+✅ **Done when**: You know the current and latest `@playwright/cli` version and update type.
 
 ---
 
@@ -239,11 +246,11 @@ close_issue(issue_number=123, body="Closing this issue as a new dependency check
    - Changelog or release notes (if available via web-fetch)
 
 ### Phase 1.5: Check Playwright NPM Package Updates
-1. Check the current `@playwright/mcp` version in `pkg/constants/constants.go`:
-   - Look for `DefaultPlaywrightVersion` constant
+1. Check the current `@playwright/cli` version in `pkg/constants/version_constants.go`:
+   - Look for `DefaultPlaywrightCLIVersion` constant
    - Extract the current version number
 2. Check for newer versions on NPM:
-   - Use web-fetch to query `https://registry.npmjs.org/@playwright/mcp`
+   - Use web-fetch to query `https://registry.npmjs.org/@playwright/cli`
    - Compare the latest version with the current version in constants.go
    - Get release information and changelog if available
 3. Evaluate the update:
@@ -365,7 +372,7 @@ Before creating issues, determine the actual source repository for each Go modul
 
 ### Example 1: Consolidated Issue for Safe Patches (Category A)
 
-```markdown
+````markdown
 ## Summary
 This issue groups together multiple safe patch updates that can be applied together. All updates are single-version patch increments with bug fixes only and no breaking changes.
 
@@ -400,11 +407,11 @@ go mod tidy
 - Run all tests: `make test`
 - Verify no regression in functionality
 - Check for any deprecation warnings
-```
+````
 
 ### Example 2: Individual Issue for Minor Update (Category B)
 
-```markdown
+````markdown
 ## Summary
 Update `github.com/spf13/cast` dependency from v1.7.0 to v1.8.0
 
@@ -450,11 +457,11 @@ go mod tidy
 - Test type conversion functions
 - Verify time parsing works correctly
 - Check for any behavior changes in existing code
-```
+````
 
 ### Example 3: Individual Issue for Multi-Version Jump (Category B)
 
-```markdown
+````markdown
 ## Summary
 Update `github.com/cli/go-gh` dependency from v2.10.0 to v2.12.0
 
@@ -507,11 +514,11 @@ go mod tidy
 - Verify authentication still works
 - Check API integration points
 - Test error handling
-```
+````
 
 ### Example 4: golang.org/x Package Update (Category B)
 
-```markdown
+````markdown
 ## Summary
 Update `golang.org/x/sys` dependency from v0.15.0 to v0.16.0
 
@@ -559,18 +566,18 @@ go mod tidy
 - Test system-specific functionality
 - Verify cross-platform compatibility
 - Test on Linux, macOS, and Windows if possible
-```
+````
 
 ### Example 5: Playwright NPM Package Update (Category B)
 
-```markdown
+````markdown
 ## Summary
-Update `@playwright/mcp` package from 1.56.1 to 1.57.0
+Update `@playwright/cli` package from 0.1.18 to 0.1.19
 
 ## Current State
-- **Package**: @playwright/mcp
-- **Current Version**: 1.56.1 (in pkg/constants/constants.go - DefaultPlaywrightVersion)
-- **Proposed Version**: 1.57.0
+- **Package**: @playwright/cli
+- **Current Version**: 0.1.18 (in pkg/constants/version_constants.go - DefaultPlaywrightCLIVersion)
+- **Proposed Version**: 0.1.19
 - **Update Type**: Minor
 
 ## Why Separate Issue
@@ -594,15 +601,15 @@ Update `@playwright/mcp` package from 1.56.1 to 1.57.0
 - Performance improvements
 
 ## Links
-- [NPM Package](https://www.npmjs.com/package/@playwright/mcp)
-- [Release Notes](https://github.com/microsoft/playwright/releases/tag/v1.57.0)
-- [Source Repository](https://github.com/microsoft/playwright)
+- [NPM Package](https://www.npmjs.com/package/@playwright/cli)
+- [Release Notes](https://github.com/microsoft/playwright-cli/releases)
+- [Source Repository](https://github.com/microsoft/playwright-cli)
 
 ## Recommended Action
 ```bash
-# Update the constant in pkg/constants/constants.go
-# Change: const DefaultPlaywrightVersion = "1.56.1"
-# To:     const DefaultPlaywrightVersion = "1.57.0"
+# Update the constant in pkg/constants/version_constants.go
+# Change: const DefaultPlaywrightCLIVersion Version = "0.1.18"
+# To:     const DefaultPlaywrightCLIVersion Version = "0.1.19"
 
 # Then run tests to verify
 make test-unit
@@ -610,10 +617,10 @@ make test-unit
 
 ## Testing Notes
 - Run unit tests: `make test-unit`
-- Verify Playwright MCP configuration generation
+- Verify Playwright CLI installation step generation
 - Test browser automation workflows with playwright tool
 - Check that version is correctly used in compiled workflows
 - Test on multiple browsers if possible
-```
+````
 
 {{#endif}}

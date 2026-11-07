@@ -1,11 +1,13 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/setutil"
@@ -16,28 +18,77 @@ var orchestratorToolsLog = logger.New("workflow:compiler_orchestrator_tools")
 
 // toolsProcessingResult holds the results of tools and markdown processing
 type toolsProcessingResult struct {
-	tools                 map[string]any
-	resolvedMCPServers    map[string]any // fully merged mcp-servers from main workflow and all imports
-	runtimes              map[string]any
-	runInstallScripts     bool // true when runtimes.node.run-install-scripts: true is set (from main + imports)
-	toolsTimeout          string
-	toolsStartupTimeout   string
-	markdownContent       string
-	importedMarkdown      string   // Only imports WITH inputs (for compile-time substitution)
-	importPaths           []string // Import paths for runtime-import macro generation (imports without inputs)
-	promptImports         []parser.PromptImportEntry
-	mainWorkflowMarkdown  string // main workflow markdown without imports (for runtime-import)
-	rawMainMarkdown       string // raw main markdown before include expansion, without inline sub-agent sections
-	allIncludedFiles      []string
-	workflowName          string
-	frontmatterName       string
-	frontmatterEmoji      string
-	needsTextOutput       bool
-	trackerID             string
-	safeOutputs           *SafeOutputsConfig
-	secretMasking         *SecretMaskingConfig
-	parsedFrontmatter     *FrontmatterConfig
-	hasExplicitGitHubTool bool // true if tools.github was explicitly configured in frontmatter
+	tools                   map[string]any
+	resolvedMCPServers      map[string]any // fully merged mcp-servers from main workflow and all imports
+	runtimes                map[string]any
+	runInstallScripts       bool // true when runtimes.node.run-install-scripts: true is set (from main + imports)
+	toolsTimeout            string
+	toolsStartupTimeout     string
+	markdownContent         string
+	importedMarkdown        string   // Only imports WITH inputs (for compile-time substitution)
+	importPaths             []string // Import paths for runtime-import macro generation (imports without inputs)
+	promptImports           []parser.PromptImportEntry
+	mainWorkflowMarkdown    string // main workflow markdown without imports (for runtime-import)
+	rawMainMarkdown         string // raw main markdown before include expansion, without inline sub-agent sections
+	allIncludedFiles        []string
+	workflowName            string
+	frontmatterName         string
+	frontmatterEmoji        string
+	needsTextOutput         bool
+	trackerID               string
+	safeOutputs             *SafeOutputsConfig
+	secretMasking           *SecretMaskingConfig
+	explicitlyDisabledTools map[string]struct{}
+	parsedFrontmatter       *FrontmatterConfig
+	subAgentModels          []parser.SubAgentModel
+	hasExplicitGitHubTool   bool // true if tools.github was explicitly configured in frontmatter
+}
+
+// toolsAndConfigData holds the pre-markdown-expansion configuration resolved
+// from frontmatter: safe outputs, secret masking, tools/mcp-servers, and
+// runtimes. It is an intermediate result used by processToolsAndMarkdown.
+type toolsAndConfigData struct {
+	effectiveMarkdown string
+	safeOutputs       *SafeOutputsConfig
+	secretMasking     *SecretMaskingConfig
+	toolsData         *mergedToolsData
+	runtimes          map[string]any
+	runInstallScripts bool
+}
+
+// resolveToolsAndConfig resolves safe outputs, secret masking, tools/mcp-servers,
+// and runtimes configuration ahead of markdown include expansion.
+func (c *Compiler) resolveToolsAndConfig(result *parser.FrontmatterResult, markdownDir string,
+	agenticEngine CodingAgentEngine, engineSetting string, importsResult *parser.ImportsResult) (*toolsAndConfigData, error) {
+	effectiveMarkdown, err := c.extractEffectiveMarkdown(importsResult, result.Markdown)
+	if err != nil {
+		return nil, err
+	}
+	c.warnDeprecatedFrontmatterFields(result.Frontmatter)
+	safeOutputs := c.extractSafeOutputsConfig(result.Frontmatter)
+	if safeOutputs != nil && safeOutputs.claimAdaptersParseError != nil {
+		return nil, safeOutputs.claimAdaptersParseError
+	}
+	secretMasking, err := c.resolveSecretMasking(result.Frontmatter, importsResult)
+	if err != nil {
+		return nil, err
+	}
+	toolsData, err := c.resolveToolsConfiguration(result, effectiveMarkdown, markdownDir, importsResult, agenticEngine, engineSetting)
+	if err != nil {
+		return nil, err
+	}
+	runtimes, runInstallScripts, err := c.resolveRuntimes(result.Frontmatter, importsResult)
+	if err != nil {
+		return nil, err
+	}
+	return &toolsAndConfigData{
+		effectiveMarkdown: effectiveMarkdown,
+		safeOutputs:       safeOutputs,
+		secretMasking:     secretMasking,
+		toolsData:         toolsData,
+		runtimes:          runtimes,
+		runInstallScripts: runInstallScripts,
+	}, nil
 }
 
 // processToolsAndMarkdown processes tools configuration, runtimes, and markdown content.
@@ -52,25 +103,14 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 	agenticEngine CodingAgentEngine, engineSetting string, importsResult *parser.ImportsResult) (*toolsProcessingResult, error) {
 	orchestratorToolsLog.Printf("Processing tools and markdown")
 	workflowLog.Print("Processing tools and includes...")
-	effectiveMarkdown, err := c.extractEffectiveMarkdown(importsResult, result.Markdown)
+
+	explicitlyDisabledTools := collectExplicitlyDisabledTools(extractToolsMapFromFrontmatter(result.Frontmatter))
+	config, err := c.resolveToolsAndConfig(result, markdownDir, agenticEngine, engineSetting, importsResult)
 	if err != nil {
 		return nil, err
 	}
-	c.warnDeprecatedFrontmatterFields(result.Frontmatter)
-	safeOutputs := c.extractSafeOutputsConfig(result.Frontmatter)
-	secretMasking, err := c.resolveSecretMasking(result.Frontmatter, importsResult)
-	if err != nil {
-		return nil, err
-	}
-	toolsData, err := c.resolveToolsConfiguration(result, effectiveMarkdown, markdownDir, importsResult, agenticEngine)
-	if err != nil {
-		return nil, err
-	}
-	runtimes, runInstallScripts, err := c.resolveRuntimes(result.Frontmatter, importsResult)
-	if err != nil {
-		return nil, err
-	}
-	markdownData, err := c.resolveMarkdownArtifacts(effectiveMarkdown, markdownDir, cleanPath, result, importsResult, toolsData.includedToolFiles)
+
+	markdownData, err := c.resolveMarkdownArtifacts(config.effectiveMarkdown, markdownDir, cleanPath, result, importsResult, config.toolsData.includedToolFiles)
 	if err != nil {
 		return nil, err
 	}
@@ -80,30 +120,33 @@ func (c *Compiler) processToolsAndMarkdown(result *parser.FrontmatterResult, cle
 		return nil, err
 	}
 	parsedFrontmatter := c.tryParseFrontmatterConfig(result.Frontmatter)
+	subAgentModels := parser.ExtractSubAgentModels(result.Markdown)
 
 	return &toolsProcessingResult{
-		tools:                 toolsData.tools,
-		resolvedMCPServers:    toolsData.resolvedMCPServers,
-		runtimes:              runtimes,
-		runInstallScripts:     runInstallScripts,
-		toolsTimeout:          toolsData.toolsTimeout,
-		toolsStartupTimeout:   toolsData.toolsStartupTimeout,
-		markdownContent:       markdownData.markdownContent,
-		importedMarkdown:      markdownData.importedMarkdown,
-		importPaths:           markdownData.importPaths,
-		promptImports:         markdownData.promptImports,
-		mainWorkflowMarkdown:  markdownData.mainWorkflowMarkdown,
-		rawMainMarkdown:       effectiveMarkdown,
-		allIncludedFiles:      markdownData.allIncludedFiles,
-		workflowName:          markdownData.workflowName,
-		frontmatterName:       markdownData.frontmatterName,
-		frontmatterEmoji:      markdownData.frontmatterEmoji,
-		needsTextOutput:       needsTextOutput,
-		trackerID:             trackerID,
-		safeOutputs:           safeOutputs,
-		secretMasking:         secretMasking,
-		parsedFrontmatter:     parsedFrontmatter,
-		hasExplicitGitHubTool: toolsData.hasExplicitGitHubTool,
+		tools:                   config.toolsData.tools,
+		resolvedMCPServers:      config.toolsData.resolvedMCPServers,
+		runtimes:                config.runtimes,
+		runInstallScripts:       config.runInstallScripts,
+		toolsTimeout:            config.toolsData.toolsTimeout,
+		toolsStartupTimeout:     config.toolsData.toolsStartupTimeout,
+		markdownContent:         markdownData.markdownContent,
+		importedMarkdown:        markdownData.importedMarkdown,
+		importPaths:             markdownData.importPaths,
+		promptImports:           markdownData.promptImports,
+		mainWorkflowMarkdown:    markdownData.mainWorkflowMarkdown,
+		rawMainMarkdown:         config.effectiveMarkdown,
+		allIncludedFiles:        markdownData.allIncludedFiles,
+		workflowName:            markdownData.workflowName,
+		frontmatterName:         markdownData.frontmatterName,
+		frontmatterEmoji:        markdownData.frontmatterEmoji,
+		needsTextOutput:         needsTextOutput,
+		trackerID:               trackerID,
+		safeOutputs:             config.safeOutputs,
+		secretMasking:           config.secretMasking,
+		explicitlyDisabledTools: explicitlyDisabledTools,
+		parsedFrontmatter:       parsedFrontmatter,
+		subAgentModels:          subAgentModels,
+		hasExplicitGitHubTool:   config.toolsData.hasExplicitGitHubTool,
 	}, nil
 }
 
@@ -174,12 +217,13 @@ func (c *Compiler) resolveToolsConfiguration(
 	markdownDir string,
 	importsResult *parser.ImportsResult,
 	agenticEngine CodingAgentEngine,
+	engineSetting string,
 ) (*mergedToolsData, error) {
 	topTools := extractToolsMapFromFrontmatter(result.Frontmatter)
 	if err := ValidateToolsSection(topTools); err != nil {
 		return nil, err
 	}
-	includedTools, includedToolFiles, err := parser.ExpandIncludesWithManifest(effectiveMarkdown, markdownDir, true)
+	includedTools, includedToolFiles, err := parser.ExpandIncludesWithManifest(effectiveMarkdown, markdownDir, true, c.getSharedImportCache())
 	if err != nil {
 		orchestratorToolsLog.Printf("Failed to expand includes for tools: %v", err)
 		return nil, fmt.Errorf("failed to expand includes for tools: %w", err)
@@ -196,18 +240,35 @@ func (c *Compiler) resolveToolsConfiguration(
 		orchestratorToolsLog.Printf("Tools merge failed: %v", err)
 		return nil, fmt.Errorf("failed to merge tools: %w", err)
 	}
+	if err := expandLinearTool(tools); err != nil {
+		return nil, err
+	}
 	githubToolExplicit := hasExplicitGitHubTool(tools, topTools)
 	toolsTimeout, toolsStartupTimeout, err := c.extractToolTimeouts(tools)
 	if err != nil {
 		return nil, err
 	}
 	c.warnDeprecatedAPMImports(result.Frontmatter)
-	if err := ValidateMCPConfigs(tools); err != nil {
+	mcpWarnings, err := validateMCPConfigsWithWarnings(tools)
+	if err != nil {
 		orchestratorToolsLog.Printf("MCP configuration validation failed: %v", err)
 		return nil, err
 	}
-	tools = c.adjustToolsForEngineCapabilities(result.Frontmatter, agenticEngine, tools)
+	for _, warning := range mcpWarnings {
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warning))
+		c.IncrementWarningCount()
+	}
+	tools, err = enforceMCPProxyTools(agenticEngine, tools)
+	if err != nil {
+		return nil, err
+	}
+	// Validate authored restrictions before capability normalization can discard them.
 	if err := c.validateEngineToolRequirements(result.Frontmatter, agenticEngine, tools); err != nil {
+		return nil, err
+	}
+	tools = c.adjustToolsForEngineCapabilities(result.Frontmatter, agenticEngine, tools)
+	tools, err = enforceMCPProxyTools(agenticEngine, tools)
+	if err != nil {
 		return nil, err
 	}
 	return &mergedToolsData{
@@ -218,6 +279,47 @@ func (c *Compiler) resolveToolsConfiguration(
 		toolsStartupTimeout:   toolsStartupTimeout,
 		hasExplicitGitHubTool: githubToolExplicit,
 	}, nil
+}
+
+// enforceMCPProxyTools exposes MCP-backed tools through CLI proxies for engines
+// that do not have an MCP client.
+func enforceMCPProxyTools(engine MCPProxyEngine, tools map[string]any) (map[string]any, error) {
+	if engine == nil || engine.GetCapabilities().MCP {
+		return tools, nil
+	}
+
+	if githubValue, exists := tools["github"]; exists {
+		switch github := githubValue.(type) {
+		case bool:
+			if !github {
+				return nil, fmt.Errorf("engine '%s' does not support MCP; tools.github cannot be disabled because gh-proxy is required", engine.GetID())
+			}
+		case map[string]any:
+			if modeValue, hasMode := github["mode"]; hasMode {
+				mode, ok := modeValue.(string)
+				if !ok || (mode != string(GitHubMCPModeGHProxy) && mode != string(GitHubMCPModeCLI)) {
+					return nil, fmt.Errorf("engine '%s' does not support MCP; tools.github.mode must be gh-proxy", engine.GetID())
+				}
+			}
+			github["mode"] = string(GitHubMCPModeGHProxy)
+		case nil, string:
+			tools["github"] = map[string]any{"mode": string(GitHubMCPModeGHProxy)}
+		}
+	}
+
+	if _, exists := tools["github"]; !exists {
+		tools["github"] = map[string]any{"mode": string(GitHubMCPModeGHProxy)}
+	} else if enabled, ok := tools["github"].(bool); ok && enabled {
+		tools["github"] = map[string]any{"mode": string(GitHubMCPModeGHProxy)}
+	}
+
+	if cliProxy, exists := tools["cli-proxy"]; exists {
+		if enabled, ok := cliProxy.(bool); ok && !enabled {
+			return nil, fmt.Errorf("engine '%s' does not support MCP; tools.cli-proxy cannot be disabled", engine.GetID())
+		}
+	}
+	tools["cli-proxy"] = true
+	return tools, nil
 }
 
 func nonEmptyStrings(values ...string) []string {
@@ -291,32 +393,76 @@ func (c *Compiler) warnDeprecatedAPMImports(frontmatter map[string]any) {
 }
 
 func (c *Compiler) adjustToolsForEngineCapabilities(frontmatter map[string]any, agenticEngine CodingAgentEngine, tools map[string]any) map[string]any {
-	if agenticEngine.GetCapabilities().ToolsAllowlist {
+	capabilities := agenticEngine.GetCapabilities()
+	// Engines without native MCP use CLI proxies, which retain their own tool configuration.
+	if capabilities.ToolsAllowlist || !capabilities.MCP {
 		return tools
 	}
-	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Using experimental %s support (engine: %s)", agenticEngine.GetDisplayName(), agenticEngine.GetID())))
-	c.IncrementWarningCount()
+	// Agy's gateway enforces MCP configuration independently of its fixed
+	// native permission profile. Unsupported native restrictions fail below.
+	if agenticEngine.GetID() == string(constants.AgyEngine) {
+		return tools
+	}
+	fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Using experimental %s support (engine: %s)", agenticEngine.GetDisplayName(), agenticEngine.GetID())))
+	c.IncrementExperimentalWarningCount()
+	// Atomic's gateway enforces MCP policies independently of its fixed native tools.
+	if agenticEngine.GetID() == "atomic" {
+		return tools
+	}
 	if _, hasTools := frontmatter["tools"]; hasTools {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("'tools' section ignored when using engine: %s (%s doesn't support MCP tool allow-listing)", agenticEngine.GetID(), agenticEngine.GetDisplayName())))
+		message := fmt.Sprintf("'tools' section ignored when using engine: %s (%s doesn't support MCP tool allow-listing)", agenticEngine.GetID(), agenticEngine.GetDisplayName())
+		if _, hasQueue := tools["work-queue"]; hasQueue {
+			message = fmt.Sprintf("Native tool allow-list ignored for engine: %s; work-queue controls and CLI transport remain enabled", agenticEngine.GetID())
+		}
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(message))
 		c.IncrementWarningCount()
 	}
-	return map[string]any{"github": map[string]any{}}
+	// Queue assignment and CLI transport are framework controls, not native
+	// engine tool allow-list entries. Preserve them for dispatch-only workers.
+	fallback := map[string]any{"github": map[string]any{}}
+	if github, ok := tools["github"]; ok {
+		fallback["github"] = github
+	}
+	if queue, ok := tools["work-queue"]; ok {
+		fallback["work-queue"] = queue
+	}
+	if proxy, ok := tools["cli-proxy"]; ok {
+		fallback["cli-proxy"] = proxy
+	}
+	return fallback
 }
 
 func (c *Compiler) validateEngineToolRequirements(frontmatter map[string]any, agenticEngine CodingAgentEngine, tools map[string]any) error {
+	if agenticEngine.GetID() == "atomic" {
+		if disabled, ok := tools["edit"].(bool); ok && !disabled {
+			return errors.New("experimental atomic cannot enforce tools.edit: false; its native tool profile enables file editing inside the outer sandbox")
+		}
+	}
+	if agenticEngine.GetID() == string(constants.AgyEngine) {
+		for _, name := range []string{"edit", "web-fetch", "web-search"} {
+			if disabled, ok := tools[name].(bool); ok && !disabled {
+				return fmt.Errorf("experimental agy cannot enforce tools.%s: false; its native permission profile enables tools inside the outer sandbox", name)
+			}
+		}
+	}
+	parsedTools := NewTools(tools)
+	if err := parsedTools.ParseError(); err != nil {
+		return err
+	}
 	validators := []func() error{
 		func() error { return c.validateMaxTurnsSupport(frontmatter, agenticEngine) },
 		func() error { return c.validateMaxContinuationsSupport(frontmatter, agenticEngine) },
 		func() error { return c.validateMaxToolDenialsSupport(frontmatter, agenticEngine) },
+		func() error { return c.validateMaxToolCallsSupport(frontmatter, agenticEngine) },
 		func() error { return c.validateUniversalLLMConsumerModel(frontmatter, agenticEngine) },
-		func() error { return c.validatePiEngineRequirements(NewTools(tools), agenticEngine) },
+		func() error { return c.validateBashCommandAllowlistSupport(tools, agenticEngine) },
 	}
 	for _, validator := range validators {
 		if err := validator(); err != nil {
 			return err
 		}
 	}
-	c.validateWebSearchSupport(tools, agenticEngine)
+	c.validateWebSearchSupport(frontmatter, tools, agenticEngine)
 	c.validateBareModeSupport(frontmatter, agenticEngine)
 	return nil
 }
@@ -329,7 +475,7 @@ func (c *Compiler) resolveMarkdownArtifacts(
 	importsResult *parser.ImportsResult,
 	includedToolFiles []string,
 ) (*markdownArtifacts, error) {
-	markdownContent, includedMarkdownFiles, err := parser.ExpandIncludesWithManifest(effectiveMarkdown, markdownDir, false)
+	markdownContent, includedMarkdownFiles, err := parser.ExpandIncludesWithManifest(effectiveMarkdown, markdownDir, false, c.getSharedImportCache())
 	if err != nil {
 		return nil, fmt.Errorf("failed to expand includes in markdown: %w", err)
 	}
@@ -422,6 +568,8 @@ func (c *Compiler) tryParseFrontmatterConfig(frontmatter map[string]any) *Frontm
 	parsedFrontmatter, err := ParseFrontmatterConfig(frontmatter)
 	if err != nil {
 		orchestratorToolsLog.Printf("Failed to parse frontmatter config: %v", err)
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Failed to parse frontmatter config; some frontmatter settings may be ignored. Enable DEBUG=workflow:compiler_orchestrator_tools for details."))
+		c.IncrementWarningCount()
 		return nil
 	}
 	return parsedFrontmatter

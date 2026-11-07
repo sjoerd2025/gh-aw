@@ -3,7 +3,6 @@ private: true
 emoji: "🧪"
 description: Daily data science report analyzing evals feature adoption, per-question pass rates, and quality trends across agentic workflows
 on:
-  schedule: daily around 8:00
   workflow_dispatch:
 permissions:
   contents: read
@@ -11,17 +10,26 @@ permissions:
   issues: read
   pull-requests: read
 max-daily-ai-credits: 3000
-model: gpt-5.4
+model: copilot/gpt-5.6-sol
 engine:
   id: codex
 tracker-id: daily-evals-report
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    memory: 4g
 features:
   gh-aw-detection: true
 timeout-minutes: 45
+tools:
+  work-queue:
+    worker: true
+    require-assignment: true
+  github:
+    mode: local
+
 imports:
+  - shared/daily-report-worker.md
   - uses: shared/meta-analysis-base.md
     with:
       toolsets: [default, actions]
@@ -33,12 +41,6 @@ safe-outputs:
   mentions: false
   allowed-github-references: []
   max-bot-mentions: 1
-  create-issue:
-    title-prefix: "[evals] "
-    labels: [evals, automated-analysis]
-    close-older-issues: true
-    expires: 7d
-    max: 1
 evals:
   - id: evals_data_analyzed
     question: Did the agent analyze evals feature adoption and per-question pass rates across agentic workflows?
@@ -59,7 +61,7 @@ artifacts per run and persisted to dedicated `evals/<workflow-id>` git branches.
 
 Analyze the last 7 days of workflow runs that use the `evals` feature. Compute per-question
 YES/NO pass rates, identify workflows with failing evals, and produce a data science summary.
-When the evals feature is degraded or broken, produce an actionable issue to guide investigation.
+When the evals feature is degraded or broken, include actionable investigation steps in the discussion.
 
 ## Context
 
@@ -95,9 +97,12 @@ For each downloaded run directory at `/tmp/gh-aw/aw-mcp/logs/run-<id>/`:
    - `workflow_name` (or `workflow.name`)
    - `conclusion` (success / failure / cancelled)
    - Whether evals were declared (check for an `evals` key or the presence of the evals job in the run)
-3. Note runs where the workflow declares evals but `evals.jsonl` is absent — these are **evals job failures**.
+3. Detect **evals job failures** by scanning job conclusions:
+   - runs where the workflow declares evals but `evals.jsonl` is absent (an `evals_status.json` with `status: not_evaluated` means the evals judge did not run or produced no response; report its `reason_code`, and never count it as `UNKNOWN` answers)
+   - runs where job `push_evals_state` exists and has a failed conclusion (`failure`, `timed_out`, or `cancelled`)
+   - if both conditions happen in the same run, count it once
 
-Cap analysis at **40 runs total**. Apply prioritization before capping: first include all runs that produced `evals.jsonl` (up to 40), then fill any remaining capacity with evals-failure runs (declared evals but no results). If there are more than 40 runs with evals results, use the most recent 40 and note in the report that analysis was capped. Evals failures are still recorded even if the 40-run cap is reached from results-only runs — count them but do not analyze their artifacts.
+Cap analysis at **40 runs total**. Apply prioritization before capping: first include all runs that produced `evals.jsonl` (up to 40), then fill any remaining capacity with evals-failure runs. If there are more than 40 runs with evals results, use the most recent 40 and note in the report that analysis was capped. Evals failures are still recorded even if the 40-run cap is reached from results-only runs — count them but do not analyze their artifacts.
 
 ## Phase 3: Parse Evals JSONL
 
@@ -118,7 +123,7 @@ Extract per-run:
 
 For each unique workflow:
 - `runs_with_evals_results` — runs that produced `evals.jsonl`
-- `runs_evals_job_failed` — runs that declared evals but produced no `evals.jsonl`
+- `runs_evals_job_failed` — runs that either declared evals but produced no `evals.jsonl`, or had a failed `push_evals_state` job
 - `evals_job_success_rate` = `runs_with_evals_results / (runs_with_evals_results + runs_evals_job_failed) * 100`
 - `run_pass_rate` = runs where all questions are YES / `runs_with_evals_results * 100`
 - Per-question: `yes_rate` = YES count / `runs_with_evals_results * 100`
@@ -129,7 +134,7 @@ For each unique workflow:
 - `total_workflows_with_evals` — unique workflow count
 - `total_runs_analyzed` — total runs checked
 - `total_evals_results` — runs with `evals.jsonl`
-- `total_evals_failures` — runs with evals declared but no results
+- `total_evals_failures` — runs with evals job failure conditions (missing results and/or failed `push_evals_state`)
 - `overall_evals_job_success_rate` = `total_evals_results / (total_evals_results + total_evals_failures) * 100`
 - `overall_yes_rate` — YES answers / total answers across all runs
 - `most_failing_questions` — top 3 questions (by NO rate) across all workflows
@@ -144,9 +149,9 @@ For each unique workflow:
 
 ## Phase 6: Generate Output
 
-### HEALTHY or DEGRADED — Create Issue with Data Science Summary
+### HEALTHY or DEGRADED — Create Discussion with Data Science Summary
 
-Create one GitHub issue.
+Create one GitHub discussion for the assigned completed UTC report date.
 
 **Title**: `[evals] Daily Evals Feature Report - YYYY-MM-DD` (date in UTC, ISO 8601 format, e.g. `2026-07-15`)
 
@@ -203,9 +208,9 @@ For each workflow, show a table:
 [Up to 3 run URLs as `[§<run-id>](<url>)` links]
 ```
 
-### BROKEN — Create Actionable Issue
+### BROKEN — Create Actionable Discussion
 
-When the evals feature is BROKEN (job success rate < 50% or zero results), the issue body
+When the evals feature is BROKEN (job success rate < 50% or zero results), the discussion body
 must include actionable investigation steps instead of the data science summary.
 
 > [!CAUTION]
@@ -233,15 +238,15 @@ noop("No evals-enabled workflow runs found in the last 7 days. The evals feature
 
 If workflows declared evals but zero results were produced:
 ```
-noop("Evals declared in N workflows but no evals.jsonl artifacts found. Use [evals-alert] issue.")
+noop("Evals declared in N workflows but no evals.jsonl artifacts found.")
 ```
-(Skip the noop and create the BROKEN issue instead in this case.)
+(Skip the noop and create the BROKEN discussion instead in this case.)
 
 ## Token Budget Guidelines
 
 - **One broad `logs` call** — do not enumerate workflows individually before calling logs.
 - **Cap at 40 runs** — stop analyzing once the cap is reached.
 - **Summarize, do not transcribe** — report statistics, not raw JSONL content.
-- **Stop after `create_issue` or `noop`** — no extra tool calls after publishing.
+- **Finish the original Claim after `create_discussion` or `noop`** — completed for a staged discussion, cancelled for a no-data report.
 
 Begin your analysis now. Download the logs, analyze evals results, and publish the report.

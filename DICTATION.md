@@ -11,6 +11,7 @@ gh-aw (GitHub Agentic Workflows) is a CLI extension for GitHub that compiles mar
 
 ## Project Glossary
 
+@copilot
 acceptEdits
 action_required
 actionlint
@@ -31,6 +32,7 @@ aic
 allow-action-refs
 allowed-branches
 allowed-domains
+allowed-files
 allowed-repos
 anthropic
 ANTHROPIC_API_KEY
@@ -54,6 +56,7 @@ call-workflow
 chat-ops
 checkout
 claude
+client-id
 close-issue
 close-pull-request
 codex
@@ -61,10 +64,8 @@ compilation
 compile
 compiler
 concurrency
-@copilot
 copilot
 COPILOT_GITHUB_TOKEN
-correction-ops
 create-issue
 create-pull-request
 create_issue
@@ -79,7 +80,6 @@ docker-host
 domains
 dry-run
 edit
-effective-tokens
 effort
 engine
 engine.api-target
@@ -106,9 +106,7 @@ frontmatter
 fuzzy-schedule
 gemini
 gemini-flash
-gemini-flash-lite
 GEMINI_API_KEY
-gemma
 gh-aw
 gh-aw-audit
 gh-aw-logs
@@ -137,14 +135,15 @@ label_command
 labels
 lock.yml
 logs
-mai-code
 markdown
+max-ai-credits
 max-daily-ai-credits
 max-turns
 mcp
 mcp-gateway
 mcp-scripts
 mcp-server
+mcp-servers
 memory-ops
 merge
 min-integrity
@@ -173,12 +172,12 @@ outputs.jsonl
 PAT
 paths-ignore
 permissions
-PermissionScope
 persist-credentials
 playwright
 pre-activation
 pre-agent
 pre-steps
+protected-files
 pull-request
 pull-requests
 pull_request
@@ -196,6 +195,7 @@ report-incomplete
 report_incomplete
 repository_dispatch
 required-labels
+required-title-prefix
 resolve-pull-request-review-thread
 run-failure
 run-name
@@ -207,6 +207,7 @@ runtime
 safe-output
 safe-outputs
 safe-rollout
+safe_outputs
 sandbox
 schedule
 secret-masking
@@ -215,10 +216,10 @@ self-hosted
 set-issue-type
 settings.json
 sink-visibility
+skip-if-match
 slash-command
 slash_command
 sonnet
-spec-ops
 staged
 start-date
 state.json
@@ -237,11 +238,10 @@ token-usage
 tool-timeout
 tools.bash
 tools.github
-tools.timeout
 toolsets
-trial-ops
 trigger
 trusted-users
+trustedBots
 ubuntu-latest
 update-discussion
 update-issue

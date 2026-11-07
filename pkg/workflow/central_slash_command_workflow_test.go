@@ -35,6 +35,7 @@ func TestGenerateCentralSlashCommandWorkflow_GeneratesWorkflow(t *testing.T) {
 			CommandEvents:      []string{"issue_comment", "issues"},
 			CommandCentralized: true,
 			AIReaction:         "eyes",
+			FrontmatterEmoji:   "🤖",
 			StatusComment:      &statusComment,
 		},
 		{
@@ -59,6 +60,7 @@ func TestGenerateCentralSlashCommandWorkflow_GeneratesWorkflow(t *testing.T) {
 			LabelCommandEvents:        []string{"pull_request"},
 			LabelCommandDecentralized: true,
 			AIReaction:                "eyes",
+			FrontmatterEmoji:          "🏷️",
 			StatusComment:             &statusComment,
 		},
 		{
@@ -99,7 +101,7 @@ func TestGenerateCentralSlashCommandWorkflow_GeneratesWorkflow(t *testing.T) {
 	require.Contains(t, text, "permissions: {}")
 	require.Contains(t, text, "runs-on: ubuntu-slim")
 	require.Contains(t, text, "timeout-minutes: 15")
-	require.Contains(t, text, "    permissions:\n      actions: write\n      contents: read\n      issues: write\n      pull-requests: write\n      discussions: write")
+	require.Contains(t, text, "    permissions:\n      actions: write # Create or update workflow runs and artifacts.\n      contents: read\n      issues: write # Create or update issues and comments.\n      pull-requests: write # Create or update pull requests and review comments.\n      discussions: write # Create or update discussions and comments.")
 	require.Contains(t, text, "      - name: Setup Scripts")
 	require.Contains(t, text, "        uses: ./actions/setup")
 	require.Contains(t, text, "          destination: ${{ runner.temp }}/gh-aw/actions")
@@ -107,22 +109,62 @@ func TestGenerateCentralSlashCommandWorkflow_GeneratesWorkflow(t *testing.T) {
 	require.Contains(t, text, "issue_comment:")
 	require.Contains(t, text, "pull_request:")
 	require.Contains(t, text, "discussion_comment:")
-	require.Contains(t, text, `"triage":[{"workflow":"triage-issue","events":["issue_comment","issues"],"ai_reaction":"eyes","status_comment":true},{"workflow":"triage-pr","events":["pull_request","pull_request_comment"],"ai_reaction":"rocket","status_comment":true}]`)
+	require.Contains(t, text, `"triage":[{"workflow":"triage-issue","events":["issue_comment","issues"],"ai_reaction":"eyes","emoji":"🤖","status_comment":true},{"workflow":"triage-pr","events":["pull_request","pull_request_comment"],"ai_reaction":"rocket","status_comment":true}]`)
 	require.Contains(t, text, `"cloclo":[{"workflow":"cloclo","events":["discussion_comment"],"ai_reaction":"heart","status_comment":true}]`)
-	require.Contains(t, text, `"ci-doctor":[{"workflow":"ci-doctor","events":["pull_request"],"ai_reaction":"eyes"}]`)
+	require.Contains(t, text, `"ci-doctor":[{"workflow":"ci-doctor","events":["pull_request"],"ai_reaction":"eyes","emoji":"🏷️","status_comment":true}]`)
 	require.Contains(t, text, `GH_AW_HELP_COMMANDS`)
 	require.Contains(t, text, `"command":"summary","description":"Summarize recent updates","centralized":false,"decentralized":true`)
 	require.Contains(t, text, `"command":"triage","centralized":true,"decentralized":false`)
 	require.Contains(t, text, `GH_AW_HELP_COMMAND_ENABLED: 'true'`)
 	require.Contains(t, text, `GH_AW_SLASH_COMMAND_DOCS_URL: 'https://github.github.com/gh-aw/reference/command-triggers/'`)
 	require.Contains(t, text, "GH_AW_LABEL_ROUTING")
-	require.Contains(t, text, `require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs')`)
+	require.Contains(t, text, `require(path.join(actionsDir, 'setup_globals.cjs'))`)
 	require.Contains(t, text, `setupGlobals(core, github, context, exec, io, getOctokit);`)
-	require.Contains(t, text, `require('${{ runner.temp }}/gh-aw/actions/route_slash_command.cjs')`)
+	require.Contains(t, text, `require(path.join(actionsDir, 'route_slash_command.cjs'))`)
 	require.NotContains(t, text, `const routeMap = JSON.parse(process.env.GH_AW_SLASH_ROUTING || "{}");`)
 	require.NotContains(t, text, `trustedAuthorAssociations`)
 	require.NotContains(t, text, `isForkBasedPullRequestEvent`)
 	require.NotContains(t, text, `workflow_id: route.workflow + ".lock.yml"`)
+}
+
+func TestGenerateCentralSlashCommandWorkflow_PinsSetupActionWithResolver(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "central-slash-workflow-action-pin-test")
+	t.Setenv("GH_AW_ACTION_MODE", "action")
+	originalVersion := compilerVersion
+	originalIsRelease := isReleaseBuild
+	t.Cleanup(func() {
+		compilerVersion = originalVersion
+		isReleaseBuild = originalIsRelease
+	})
+	SetVersion("v1.2.3")
+	SetIsRelease(true)
+
+	const setupSHA = "0123456789abcdef0123456789abcdef01234567"
+	cache := NewActionCache(tmpDir)
+	require.True(t, cache.Set("github/gh-aw-actions/setup", "v1.2.3", setupSHA))
+	resolver := NewActionResolver(cache)
+	data := []*WorkflowData{
+		{
+			WorkflowID:         "without-resolver",
+			Command:            []string{"triage"},
+			CommandEvents:      []string{"issue_comment"},
+			CommandCentralized: true,
+		},
+		{
+			WorkflowID:         "with-resolver",
+			Command:            []string{"triage"},
+			CommandEvents:      []string{"pull_request_comment"},
+			CommandCentralized: true,
+			ActionResolver:     resolver,
+		},
+	}
+
+	require.NoError(t, GenerateCentralSlashCommandWorkflow(context.Background(), data, tmpDir, nil))
+	content, err := os.ReadFile(filepath.Join(tmpDir, centralSlashCommandWorkflowFilename))
+	require.NoError(t, err)
+	text := string(content)
+	require.Contains(t, text, "        uses: github/gh-aw-actions/setup@"+setupSHA+" # v1.2.3")
+	require.NotContains(t, text, "        uses: github/gh-aw-actions/setup@v1.2.3")
 }
 
 func TestGenerateCentralSlashCommandWorkflow_DeletesWhenUnused(t *testing.T) {
@@ -492,10 +534,30 @@ func TestBuildHelpCommandEntries_ReservedHelpCommandName(t *testing.T) {
 	require.Equal(t, "help", entries[0].Command)
 }
 
-func typeSetKeys(typeSet map[string]bool) []string {
+func typeSetKeys(typeSet map[string]struct{}) []string {
 	out := make([]string, 0, len(typeSet))
 	for key := range typeSet {
 		out = append(out, key)
 	}
 	return out
+}
+
+func TestGenerateCentralSlashCommandWorkflow_CheckoutDoesNotPersistCredentials(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "central-slash-workflow-persist-creds")
+	data := []*WorkflowData{
+		{
+			WorkflowID:         "triage",
+			Command:            []string{"triage"},
+			CommandEvents:      []string{"issue_comment"},
+			CommandCentralized: true,
+		},
+	}
+
+	require.NoError(t, GenerateCentralSlashCommandWorkflow(context.Background(), data, tmpDir, nil))
+	content, err := os.ReadFile(filepath.Join(tmpDir, centralSlashCommandWorkflowFilename))
+	require.NoError(t, err)
+	text := string(content)
+
+	require.Contains(t, text, "      - name: Checkout repository\n        uses: "+getActionPin("actions/checkout")+"\n        with:\n          persist-credentials: false\n")
+	require.NotContains(t, text, "persist-credentials: true")
 }

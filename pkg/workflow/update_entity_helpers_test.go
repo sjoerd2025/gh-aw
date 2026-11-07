@@ -167,7 +167,7 @@ func TestParseUpdateEntityConfigWithFields(t *testing.T) {
 			wantNil: false,
 			validateFunc: func(t *testing.T, cfg *UpdateEntityConfig) {
 				if templatableIntValue(cfg.Max) != 2 {
-					t.Errorf("Expected max=2, got %d", cfg.Max)
+					t.Errorf("Expected max=2, got %v", cfg.Max)
 				}
 			},
 		},
@@ -195,7 +195,7 @@ func TestParseUpdateEntityConfigWithFields(t *testing.T) {
 			wantNil: false,
 			validateFunc: func(t *testing.T, cfg *UpdateEntityConfig) {
 				if templatableIntValue(cfg.Max) != 3 {
-					t.Errorf("Expected max=3, got %d", cfg.Max)
+					t.Errorf("Expected max=3, got %v", cfg.Max)
 				}
 			},
 		},
@@ -220,7 +220,7 @@ func TestParseUpdateEntityConfigWithFields(t *testing.T) {
 			wantNil: false,
 			validateFunc: func(t *testing.T, cfg *UpdateEntityConfig) {
 				if templatableIntValue(cfg.Max) != 1 {
-					t.Errorf("Expected max=1, got %d", cfg.Max)
+					t.Errorf("Expected max=1, got %v", cfg.Max)
 				}
 			},
 		},
@@ -284,7 +284,7 @@ func TestParseUpdateEntityConfigTyped(t *testing.T) {
 			wantNil:    false,
 			validateFunc: func(t *testing.T, cfg *UpdateIssuesConfig) {
 				if templatableIntValue(cfg.Max) != 2 {
-					t.Errorf("Expected max=2, got %d", cfg.Max)
+					t.Errorf("Expected max=2, got %v", cfg.Max)
 				}
 				if cfg.Title == nil {
 					t.Error("Expected title to be non-nil")
@@ -400,5 +400,91 @@ func TestParseUpdateEntityConfigTypedWithCustomParser(t *testing.T) {
 		if result.AllowedLabels[i] != expected {
 			t.Errorf("Expected allowed label[%d]='%s', got '%s'", i, expected, result.AllowedLabels[i])
 		}
+	}
+}
+
+// TestParseUpdateEntityConfigTypedBaseConfigAssignment verifies that the embedded
+// UpdateEntityConfig (max, target, target-repo) is populated for every entity type.
+func TestParseUpdateEntityConfigTypedBaseConfigAssignment(t *testing.T) {
+	compiler := NewCompiler()
+
+	// A fresh map is built per entity because footer pre-processing rewrites the value in place.
+	entityConfig := func() map[string]any {
+		return map[string]any{
+			"max":         3,
+			"target":      "*",
+			"target-repo": "owner/repo",
+			"footer":      false,
+		}
+	}
+
+	tests := []struct {
+		name string
+		base func() (*UpdateEntityConfig, *string)
+	}{
+		{
+			name: "update-issue",
+			base: func() (*UpdateEntityConfig, *string) {
+				cfg := compiler.parseUpdateIssuesConfig(map[string]any{"update-issue": entityConfig()})
+				if cfg == nil {
+					return nil, nil
+				}
+				return &cfg.UpdateEntityConfig, cfg.Footer
+			},
+		},
+		{
+			name: "update-discussion",
+			base: func() (*UpdateEntityConfig, *string) {
+				cfg := compiler.parseUpdateDiscussionsConfig(map[string]any{"update-discussion": entityConfig()})
+				if cfg == nil {
+					return nil, nil
+				}
+				return &cfg.UpdateEntityConfig, cfg.Footer
+			},
+		},
+		{
+			name: "update-pull-request",
+			base: func() (*UpdateEntityConfig, *string) {
+				cfg := compiler.parseUpdatePullRequestsConfig(map[string]any{"update-pull-request": entityConfig()})
+				if cfg == nil {
+					return nil, nil
+				}
+				return &cfg.UpdateEntityConfig, cfg.Footer
+			},
+		},
+		{
+			name: "update-release",
+			base: func() (*UpdateEntityConfig, *string) {
+				cfg := compiler.parseUpdateReleaseConfig(map[string]any{"update-release": entityConfig()})
+				if cfg == nil {
+					return nil, nil
+				}
+				return &cfg.UpdateEntityConfig, cfg.Footer
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base, footer := tt.base()
+			if base == nil {
+				t.Fatal("Expected non-nil config")
+			}
+			if templatableIntValue(base.Max) != 3 {
+				t.Errorf("Expected max=3, got %v", base.Max)
+			}
+			if base.Target != "*" {
+				t.Errorf("Expected target='*', got '%s'", base.Target)
+			}
+			if base.TargetRepoSlug != "owner/repo" {
+				t.Errorf("Expected target-repo='owner/repo', got '%s'", base.TargetRepoSlug)
+			}
+			if footer == nil {
+				t.Fatal("Expected footer to be non-nil")
+			}
+			if *footer != "false" {
+				t.Errorf("Expected footer='false', got '%s'", *footer)
+			}
+		})
 	}
 }

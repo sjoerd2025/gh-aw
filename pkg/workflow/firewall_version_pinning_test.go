@@ -3,11 +3,59 @@
 package workflow
 
 import (
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
 )
+
+func TestBootstrapReleasePinsMatchCompilerDefaults(t *testing.T) {
+	t.Parallel()
+	helper, err := filepath.Abs(filepath.Join("..", "..", "actions", "setup", "sh", "release_integrity.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, release := range []struct {
+		repository, version, manifest string
+	}{
+		{"github/gh-aw-firewall", string(constants.DefaultFirewallVersion), "checksums.txt"},
+		{"github/copilot-cli", string(constants.DefaultCopilotVersion), "SHA256SUMS.txt"},
+	} {
+		cmd := exec.Command("bash", "-c", `source "$1"; release_artifact_sha256 "$2" "$3" "$4"`,
+			"--", helper, release.repository, release.version, release.manifest)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("compiler default must have a reviewed bootstrap pin: %v: %s", err, output)
+		}
+		if release.repository == "github/copilot-cli" && strings.TrimSpace(string(output)) != constants.DefaultCopilotChecksumsSHA256 {
+			t.Fatal("compiler default Copilot checksum must match the reviewed bootstrap pin; run scripts/update-copilot-version.sh")
+		}
+	}
+}
+
+func TestDockerComposeBootstrapIntegrity(t *testing.T) {
+	t.Parallel()
+	step := strings.Join(generateDockerComposeInstallStep(), "\n")
+	for _, expected := range []string{
+		"        shell: bash\n        run: |",
+		`--proto '=https' --proto-redir '=https'`,
+		`if [[ "${actual%% *}" != "$digest" ]]; then`,
+		"9040bd35b2cc0783ce6c5de491de7e52e24d4137dbfc5de8a524f718fc23556c",
+		"d1148609319706a57b755ff0f61d604a63a8cf57adb24c17535baa766ff14b4f",
+	} {
+		if !strings.Contains(step, expected) {
+			t.Errorf("Compose install is missing %q", expected)
+		}
+	}
+	if strings.Index(step, `if [[ "${actual%% *}" != "$digest" ]]; then`) > strings.Index(step, "install -m 0755") {
+		t.Error("Compose digest verification must precede installation")
+	}
+	if strings.Contains(step, "release_integrity.sh") {
+		t.Error("generated Compose install must not source a job-writable verifier")
+	}
+}
 
 // TestAWFInstallationStepDefaultVersion verifies that AWF installation uses the default version when not specified
 func TestAWFInstallationStepDefaultVersion(t *testing.T) {
@@ -225,4 +273,98 @@ func TestCopilotEngineFirewallInstallation(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestCustomEngineCommandFirewallInstallation(t *testing.T) {
+	behaviorEngine, err := NewBehaviorDefinedEngine(newHarnessEngineDefinition())
+	if err != nil {
+		t.Fatalf("Failed to create behavior-defined engine: %v", err)
+	}
+
+	engines := []struct {
+		name   string
+		engine interface {
+			GetInstallationSteps(*WorkflowData) []GitHubActionStep
+		}
+		packageName string
+	}{
+		{name: "Claude", engine: NewClaudeEngine(), packageName: "@anthropic-ai/claude-code"},
+		{name: "Codex", engine: NewCodexEngine(), packageName: "@openai/codex"},
+		{name: "Copilot", engine: NewCopilotEngine(), packageName: "install_copilot_cli.sh"},
+		{name: "Gemini", engine: NewGeminiEngine(), packageName: "@google/gemini-cli"},
+		{name: "Pi", engine: NewPiEngine(), packageName: "@earendil-works/pi-coding-agent"},
+		{name: "behavior-defined", engine: behaviorEngine, packageName: "testharness-cli"},
+	}
+
+	for _, test := range engines {
+		t.Run(test.name, func(t *testing.T) {
+			const firewallVersion = "v0.99.0"
+			steps := test.engine.GetInstallationSteps(&WorkflowData{
+				Name: "custom-command",
+				EngineConfig: &EngineConfig{
+					Command: "/usr/local/bin/custom-engine",
+				},
+				NetworkPermissions: &NetworkPermissions{
+					Firewall: &FirewallConfig{
+						Enabled: true,
+						Version: firewallVersion,
+					},
+				},
+				RunnerConfig: &RunnerConfig{Topology: RunnerTopologyArcDind},
+			})
+			stepStr := strings.Join(flattenSteps(steps), "\n")
+
+			if !strings.Contains(stepStr, "install_awf_binary.sh") {
+				t.Fatalf("Expected custom command to retain AWF installation, got:\n%s", stepStr)
+			}
+			if !strings.Contains(stepStr, firewallVersion) {
+				t.Errorf("Expected AWF installation to use firewall version %s, got:\n%s", firewallVersion, stepStr)
+			}
+			if strings.Contains(stepStr, test.packageName) {
+				t.Errorf("Expected custom command to skip the %s engine installation, got:\n%s", test.name, stepStr)
+			}
+			if strings.Contains(stepStr, "Copy Copilot CLI to daemon-visible path") {
+				t.Errorf("Expected custom command not to stage the Copilot CLI, got:\n%s", stepStr)
+			}
+		})
+	}
+}
+
+func TestCustomEngineCommandWithoutFirewallDoesNotInstallAWF(t *testing.T) {
+	behaviorEngine, err := NewBehaviorDefinedEngine(newHarnessEngineDefinition())
+	if err != nil {
+		t.Fatalf("Failed to create behavior-defined engine: %v", err)
+	}
+
+	engines := []struct {
+		name   string
+		engine interface {
+			GetInstallationSteps(*WorkflowData) []GitHubActionStep
+		}
+		packageName string
+	}{
+		{name: "Claude", engine: NewClaudeEngine(), packageName: "@anthropic-ai/claude-code"},
+		{name: "Codex", engine: NewCodexEngine(), packageName: "@openai/codex"},
+		{name: "Copilot", engine: NewCopilotEngine(), packageName: "install_copilot_cli.sh"},
+		{name: "Gemini", engine: NewGeminiEngine(), packageName: "@google/gemini-cli"},
+		{name: "Pi", engine: NewPiEngine(), packageName: "@earendil-works/pi-coding-agent"},
+		{name: "behavior-defined", engine: behaviorEngine, packageName: "testharness-cli"},
+	}
+
+	for _, test := range engines {
+		t.Run(test.name, func(t *testing.T) {
+			steps := test.engine.GetInstallationSteps(&WorkflowData{
+				Name:         "custom-command",
+				EngineConfig: &EngineConfig{Command: "/usr/local/bin/custom-engine"},
+			})
+			stepStr := strings.Join(flattenSteps(steps), "\n")
+
+			if strings.Contains(stepStr, "install_awf_binary.sh") {
+				t.Errorf("Expected custom command without firewall not to install AWF, got:\n%s", stepStr)
+			}
+			if strings.Contains(stepStr, test.packageName) {
+				t.Errorf("Expected custom command to skip the %s engine installation, got:\n%s", test.name, stepStr)
+			}
+		})
+	}
 }

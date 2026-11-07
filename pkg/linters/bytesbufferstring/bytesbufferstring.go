@@ -9,41 +9,34 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/coverage"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the bytes-buffer-string analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "bytesbufferstring",
-	Doc:      "reports string(buf.Bytes()) calls where buf is a bytes.Buffer value and suggests buf.String() instead",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/bytesbufferstring",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
+var Analyzer = analyzerutil.New("bytesbufferstring", "reports string(buf.Bytes()) calls where buf is a bytes.Buffer value and suggests buf.String() instead", run)
+
+// hotThreshold gates findings on coverage data; see coverage package docs.
+var hotThreshold *int
+
+func init() {
+	hotThreshold = coverage.RegisterHotThresholdFlag(Analyzer)
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeStringBytesCall(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeStringBytesCall checks whether a call is a string(buf.Bytes()) that
@@ -84,19 +77,26 @@ func analyzeStringBytesCall(pass *analysis.Pass, n ast.Node, generatedFiles file
 	if receiverText == "" {
 		return
 	}
+	if !coverage.ShouldApply(pass, call.Pos(), *hotThreshold) {
+		return
+	}
 
-	pass.Report(analysis.Diagnostic{
-		Pos:     call.Pos(),
-		End:     call.End(),
-		Message: fmt.Sprintf("string(%s.Bytes()) can be simplified to %s.String()", receiverText, receiverText),
-		SuggestedFixes: []analysis.SuggestedFix{{
+	var fixes []analysis.SuggestedFix
+	if !astutil.HasOverlappingComment(pass.Files, call.Pos(), call.End()) {
+		fixes = []analysis.SuggestedFix{{
 			Message: fmt.Sprintf("Replace string(%s.Bytes()) with %s.String()", receiverText, receiverText),
 			TextEdits: []analysis.TextEdit{{
 				Pos:     call.Pos(),
 				End:     call.End(),
 				NewText: []byte(receiverText + ".String()"),
 			}},
-		}},
+		}}
+	}
+	pass.Report(analysis.Diagnostic{
+		Pos:            call.Pos(),
+		End:            call.End(),
+		Message:        fmt.Sprintf("string(%s.Bytes()) can be simplified to %s.String()", receiverText, receiverText),
+		SuggestedFixes: fixes,
 	})
 }
 
@@ -104,7 +104,9 @@ func analyzeStringBytesCall(pass *analysis.Pass, n ast.Node, generatedFiles file
 // buf is a bytes.Buffer value (not pointer). Returns the inner call, selector,
 // and ok=true when matched.
 func matchBufBytesArg(pass *analysis.Pass, call *ast.CallExpr) (*ast.CallExpr, *ast.SelectorExpr, bool) {
-	inner, ok := call.Args[0].(*ast.CallExpr)
+	// astutil.UnwrapParenExpr handles a parenthesized call, e.g.
+	// string((buf.Bytes())).
+	inner, ok := astutil.UnwrapParenExpr(call.Args[0]).(*ast.CallExpr)
 	if !ok {
 		return nil, nil, false
 	}

@@ -1,7 +1,8 @@
 package workflow
 
 import (
-	"fmt"
+	"net"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -61,6 +62,18 @@ func resolveEngineLLMProvider(workflowData *WorkflowData, defaultProvider LLMPro
 	return provider
 }
 
+func resolveEngineLLMProviderFromModel(workflowData *WorkflowData, defaultProvider LLMProvider) LLMProvider {
+	if workflowData != nil && workflowData.EngineConfig != nil && len(workflowData.EngineConfig.FallbackModels) > 0 &&
+		workflowData.EngineConfig.LLMProvider == "" {
+		return fallbackModelProvider(workflowData.Model, defaultProvider)
+	}
+	if workflowData != nil && (workflowData.EngineConfig == nil || workflowData.EngineConfig.LLMProvider == "") &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(workflowData.Model)), "copilot/") {
+		return LLMProviderGitHub
+	}
+	return resolveEngineLLMProvider(workflowData, defaultProvider)
+}
+
 func llmProviderProfileFor(provider LLMProvider) llmProviderProfile {
 	switch provider {
 	case LLMProviderGitHub:
@@ -87,6 +100,8 @@ func llmProviderSecretNames(provider LLMProvider) []string {
 		return []string{"COPILOT_GITHUB_TOKEN"}
 	case LLMProviderOpenAI:
 		return []string{"CODEX_API_KEY", "OPENAI_API_KEY"}
+	case "gemini":
+		return []string{"GEMINI_API_KEY"}
 	default:
 		return []string{"ANTHROPIC_API_KEY"}
 	}
@@ -103,14 +118,24 @@ func llmProviderSecretExpression(provider LLMProvider, workflowData *WorkflowDat
 		return "${{ secrets.COPILOT_GITHUB_TOKEN }}"
 	case LLMProviderOpenAI:
 		return "${{ secrets.CODEX_API_KEY || secrets.OPENAI_API_KEY }}"
+	case "gemini":
+		return "${{ secrets.GEMINI_API_KEY }}"
 	default:
 		return "${{ secrets.ANTHROPIC_API_KEY }}"
 	}
 }
 
-func llmProviderGatewayBaseURL(provider LLMProvider) string {
+func llmProviderGatewayBaseURL(provider LLMProvider, workflowData *WorkflowData) string {
 	profile := llmProviderProfileFor(provider)
-	return fmt.Sprintf("http://host.docker.internal:%d", profile.gatewayPort)
+	return llmGatewayBaseURL(profile.gatewayPort, workflowData)
+}
+
+func llmGatewayBaseURL(port int, workflowData *WorkflowData) string {
+	host := "host.docker.internal"
+	if isAWFAgentOnNetworkIsolationTopology(workflowData) {
+		host = constants.AWFAPIProxyHostname
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func llmProviderDocsURL(provider LLMProvider) string {

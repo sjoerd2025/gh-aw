@@ -3,6 +3,8 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -268,6 +270,94 @@ func TestJobManager_WriteJobsYAML(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRenderStepForRunner(t *testing.T) {
+	windowsStep := "      - name: Run script\n        run: \"${RUNNER_TEMP}/gh-aw/actions/setup.sh\" --verbose\n"
+	got := renderStepForRunner(windowsStep, "runs-on: windows-latest")
+	if !strings.Contains(got, "        run: bash \"${RUNNER_TEMP}/gh-aw/actions/setup.sh\" --verbose\n") {
+		t.Fatalf("Windows step did not invoke the shell script with Bash:\n%s", got)
+	}
+	if !strings.Contains(got, "        shell: bash\n") {
+		t.Fatalf("Windows step did not explicitly select Bash:\n%s", got)
+	}
+
+	quotedPath := "      - name: Run script\n        run: './my script.sh' --verbose\n"
+	got = renderStepForRunner(quotedPath, "windows-latest")
+	if !strings.Contains(got, "        run: bash './my script.sh' --verbose\n") {
+		t.Fatalf("Windows step did not invoke a quoted shell script with Bash:\n%s", got)
+	}
+
+	multiline := "      - name: Run script\n        run: |\n          SCRIPT=helper.sh\n          ./helper.sh\n          cat <<'EOF'\n          helper.sh\n          EOF\n"
+	got = renderStepForRunner(multiline, "windows-latest")
+	if strings.Contains(got, "bash SCRIPT=helper.sh") || strings.Contains(got, "bash helper.sh\n          EOF") {
+		t.Fatalf("Windows step rewrote an assignment or heredoc:\n%s", got)
+	}
+	if !strings.Contains(got, "          bash ./helper.sh\n") {
+		t.Fatalf("Windows step did not invoke the actual shell script with Bash:\n%s", got)
+	}
+
+	withShell := "      - name: Run script\n        run: ./script.sh\n        shell: pwsh\n"
+	got = renderStepForRunner(withShell, "runs-on: windows-latest")
+	if !strings.Contains(got, "        shell: pwsh\n") {
+		t.Fatalf("Windows step changed its explicit shell:\n%s", got)
+	}
+
+	ubuntuStep := "      - name: Run script\n        run: ./script.sh\n"
+	if got = renderStepForRunner(ubuntuStep, "runs-on: ubuntu-latest"); got != ubuntuStep {
+		t.Fatalf("Non-Windows step changed:\n%s", got)
+	}
+}
+
+func TestCompileWindowsRunnerUsesPosixArtifactPaths(t *testing.T) {
+	tmpDir := t.TempDir()
+	workflowFile := filepath.Join(tmpDir, "windows-artifacts.md")
+	workflowContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+  copilot-requests: write
+runs-on: windows-latest
+model: copilot/gpt-5.3-codex
+engine:
+  id: codex
+  model-provider: github
+network: {}
+tools:
+  bash:
+    - "*"
+safe-outputs:
+  create-issue:
+strict: false
+---
+
+# Windows artifact path regression
+
+Compile this workflow on a Windows runner.
+`
+	if err := os.WriteFile(workflowFile, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowFile); err != nil {
+		t.Fatalf("compile workflow: %v", err)
+	}
+
+	lockFile := filepath.Join(tmpDir, "windows-artifacts.lock.yml")
+	lockBytes, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("read lock file: %v", err)
+	}
+	fallbackStep := extractWorkflowStepByName(t, string(lockBytes), "Upload agent output fallback artifact")
+
+	wantPath := "/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl"
+	if !strings.Contains(fallbackStep, wantPath) {
+		t.Fatalf("compiled Windows artifact fallback did not include POSIX token usage path %q:\n%s", wantPath, fallbackStep)
+	}
+	if strings.Contains(fallbackStep, `\tmp\gh-aw\`) {
+		t.Fatalf("compiled Windows artifact fallback used Windows separators:\n%s", fallbackStep)
 	}
 }
 

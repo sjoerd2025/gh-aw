@@ -7,7 +7,7 @@ import (
 	"github.com/github/gh-aw/pkg/setutil"
 )
 
-// commentOutProcessedFieldsInOnSection comments out draft, fork, forks, names, labels, manual-approval, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, needs, restore-memory, and stale-check fields in the on section
+// commentOutProcessedFieldsInOnSection comments out draft, max-stack, fork, forks, names, labels, manual-approval, cooldown, stop-after, skip-if-match, skip-if-no-match, skip-roles, reaction, lock-for-agent, steps, permissions, needs, restore-memory, stale-check, report-blocked-version, and pull_request_target policy fields in the on section
 // These fields are processed separately and should be commented for documentation
 // Exception: names fields in sections with __gh_aw_native_label_filter__ marker in frontmatter are NOT commented out
 func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmatter map[string]any) string {
@@ -20,6 +20,7 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 
 	for _, line := range lines {
 		info := newOnSectionLine(line)
+		state.leaveSubsections(info)
 		if state.handleEventSectionEntry(info, &result) {
 			continue
 		}
@@ -28,12 +29,12 @@ func (c *Compiler) commentOutProcessedFieldsInOnSection(yamlStr string, frontmat
 			continue
 		}
 		state.enterSubsections(info)
-		state.leaveSubsections(info)
 		shouldComment, commentReason := state.determineComment(info, result, nativeLabelFilterSections)
 		result = state.appendLine(result, info, shouldComment, commentReason)
 	}
 
 	result = dedentTrailingOnCommentBlock(result)
+	frontmatterLog.Printf("Processed 'on' section: %d input lines, %d native label filter section(s)", len(lines), len(nativeLabelFilterSections))
 	return strings.Join(result, "\n")
 }
 
@@ -53,6 +54,8 @@ func newOnSectionLine(raw string) onSectionLine {
 
 type onSectionCleanupState struct {
 	inPullRequest                bool
+	inPullRequestTarget          bool
+	inPullRequestReview          bool
 	inIssues                     bool
 	inDiscussion                 bool
 	inIssueComment               bool
@@ -60,19 +63,25 @@ type onSectionCleanupState struct {
 	inWorkflowRun                bool
 	inWorkflowRunConclusionArray bool
 	inForksArray                 bool
+	forksIndent                  int
 	inSkipIfMatch                bool
 	inSkipIfNoMatch              bool
 	inSkipIfCheckFailing         bool
 	inSkipAuthorAssociations     bool
+	skipAuthorAssociationsIndent int
 	inSkipRolesArray             bool
 	inSkipBotsArray              bool
 	inRolesArray                 bool
 	inBotsArray                  bool
 	inLabelsArray                bool
 	inNeedsArray                 bool
+	inAllowedCheckouts           bool
+	allowedCheckoutsIndent       int
 	inGitHubApp                  bool
 	inOnSteps                    bool
+	onStepsIndent                int
 	inOnPermissions              bool
+	onPermissionsIndent          int
 	commentBlockIndent           string
 	inCommentBlock               bool
 	currentSection               string
@@ -86,6 +95,7 @@ func newOnSectionCleanupState() *onSectionCleanupState {
 		currentSectionIndent:   -1,
 		deploymentStatusIndent: -1,
 		workflowRunIndent:      -1,
+		allowedCheckoutsIndent: -1,
 	}
 }
 
@@ -119,7 +129,7 @@ func collectNativeLabelFilterSections(frontmatter map[string]any) map[string]str
 }
 
 func (s *onSectionCleanupState) inEventSection() bool {
-	return s.inPullRequest || s.inIssues || s.inDiscussion || s.inIssueComment
+	return s.inPullRequest || s.inPullRequestTarget || s.inPullRequestReview || s.inIssues || s.inDiscussion || s.inIssueComment
 }
 
 func (s *onSectionCleanupState) handleEventSectionEntry(info onSectionLine, result *[]string) bool {
@@ -140,7 +150,7 @@ func (s *onSectionCleanupState) detectEventSection(info onSectionLine) (string, 
 		return "", false
 	}
 	switch info.trimmed {
-	case "pull_request:", "issues:", "discussion:", "issue_comment:", "deployment_status:", "workflow_run:":
+	case "pull_request:", "pull_request_target:", "pull_request_review:", "issues:", "discussion:", "issue_comment:", "deployment_status:", "workflow_run:":
 		return strings.TrimSuffix(info.trimmed, ":"), true
 	default:
 		return "", false
@@ -148,10 +158,13 @@ func (s *onSectionCleanupState) detectEventSection(info onSectionLine) (string, 
 }
 
 func (s *onSectionCleanupState) activateEventSection(section string, indent int) {
+	frontmatterLog.Printf("Entering event section %q at indent %d", section, indent)
 	s.resetTopLevelExtensionState()
 	s.inCommentBlock = false
 	s.commentBlockIndent = ""
 	s.inPullRequest = section == "pull_request"
+	s.inPullRequestTarget = section == "pull_request_target"
+	s.inPullRequestReview = section == "pull_request_review"
 	s.inIssues = section == "issues"
 	s.inDiscussion = section == "discussion"
 	s.inIssueComment = section == "issue_comment"
@@ -159,6 +172,8 @@ func (s *onSectionCleanupState) activateEventSection(section string, indent int)
 	s.inWorkflowRun = section == "workflow_run"
 	s.inWorkflowRunConclusionArray = false
 	s.inForksArray = false
+	s.inAllowedCheckouts = false
+	s.allowedCheckoutsIndent = -1
 	s.currentSection, s.currentSectionIndent = "", -1
 	if s.inEventSection() {
 		s.currentSection, s.currentSectionIndent = section, indent
@@ -190,6 +205,7 @@ func (s *onSectionCleanupState) leaveEventSections(info onSectionLine) {
 	s.leaveCurrentEventSection(info)
 	s.leaveDeploymentStatusSection(info)
 	s.leaveWorkflowRunSection(info)
+	s.leaveAllowedCheckouts(info)
 }
 
 func (s *onSectionCleanupState) leaveCurrentEventSection(info onSectionLine) {
@@ -198,12 +214,26 @@ func (s *onSectionCleanupState) leaveCurrentEventSection(info onSectionLine) {
 	}
 	if s.currentSectionIndent >= 0 && info.indent <= s.currentSectionIndent {
 		s.inPullRequest = false
+		s.inPullRequestTarget = false
+		s.inPullRequestReview = false
 		s.inIssues = false
 		s.inDiscussion = false
 		s.inIssueComment = false
 		s.inForksArray = false
+		s.inAllowedCheckouts = false
+		s.allowedCheckoutsIndent = -1
 		s.currentSection = ""
 		s.currentSectionIndent = -1
+	}
+}
+
+func (s *onSectionCleanupState) leaveAllowedCheckouts(info onSectionLine) {
+	if !s.inAllowedCheckouts || info.trimmed == "" || strings.HasPrefix(info.trimmed, "#") {
+		return
+	}
+	if info.indent <= s.allowedCheckoutsIndent {
+		s.inAllowedCheckouts = false
+		s.allowedCheckoutsIndent = -1
 	}
 }
 
@@ -238,8 +268,9 @@ func (s *onSectionCleanupState) enterSubsections(info onSectionLine) {
 }
 
 func (s *onSectionCleanupState) enterArraySections(info onSectionLine) {
-	if s.inPullRequest && strings.HasPrefix(info.trimmed, "forks:") {
+	if (s.inPullRequest || s.inPullRequestTarget) && strings.HasPrefix(info.trimmed, "forks:") {
 		s.inForksArray = true
+		s.forksIndent = info.indent
 	}
 	if !s.inEventSection() && strings.HasPrefix(info.trimmed, "skip-roles:") {
 		s.inSkipRolesArray = true
@@ -261,9 +292,11 @@ func (s *onSectionCleanupState) enterArraySections(info onSectionLine) {
 	}
 	if !s.inEventSection() && strings.HasPrefix(info.trimmed, "steps:") {
 		s.inOnSteps = true
+		s.onStepsIndent = info.indent
 	}
 	if !s.inEventSection() && !s.inOnPermissions && strings.HasPrefix(info.trimmed, "permissions:") {
 		s.inOnPermissions = true
+		s.onPermissionsIndent = info.indent
 	}
 }
 
@@ -282,6 +315,7 @@ func (s *onSectionCleanupState) enterObjectSections(info onSectionLine) {
 	}
 	if !s.inEventSection() && !s.inSkipAuthorAssociations && strings.HasPrefix(info.trimmed, "skip-author-associations:") && info.trimmed == "skip-author-associations:" {
 		s.inSkipAuthorAssociations = true
+		s.skipAuthorAssociationsIndent = info.indent
 	}
 	if !s.inEventSection() && !s.inGitHubApp && ((strings.HasPrefix(info.trimmed, "github-app:") && info.trimmed == "github-app:") ||
 		(strings.HasPrefix(info.trimmed, "# github-app:") && strings.Contains(info.trimmed, "pre-activation job"))) {
@@ -296,25 +330,25 @@ func (s *onSectionCleanupState) leaveSubsections(info onSectionLine) {
 }
 
 func (s *onSectionCleanupState) leaveObjectSections(info onSectionLine) {
-	if s.inSkipIfMatch && isLeavingTopLevelObject(info, "skip-if-match:", "# skip-if-match:") {
+	if s.inSkipIfMatch && isLeavingTopLevelObject(info, "skip-if-match:", "# skip-if-match:", 2) {
 		s.inSkipIfMatch = false
 	}
-	if s.inSkipIfNoMatch && isLeavingTopLevelObject(info, "skip-if-no-match:", "# skip-if-no-match:") {
+	if s.inSkipIfNoMatch && isLeavingTopLevelObject(info, "skip-if-no-match:", "# skip-if-no-match:", 2) {
 		s.inSkipIfNoMatch = false
 	}
-	if s.inSkipIfCheckFailing && isLeavingTopLevelObject(info, "skip-if-check-failing:", "# skip-if-check-failing:") {
+	if s.inSkipIfCheckFailing && isLeavingTopLevelObject(info, "skip-if-check-failing:", "# skip-if-check-failing:", 2) {
 		s.inSkipIfCheckFailing = false
 	}
-	if s.inSkipAuthorAssociations && isLeavingTopLevelObject(info, "skip-author-associations:", "# skip-author-associations:") {
+	if s.inSkipAuthorAssociations && isLeavingTopLevelObject(info, "skip-author-associations:", "# skip-author-associations:", s.skipAuthorAssociationsIndent) {
 		s.inSkipAuthorAssociations = false
 	}
-	if s.inGitHubApp && isLeavingTopLevelObject(info, "github-app:", "# github-app:") {
+	if s.inGitHubApp && isLeavingTopLevelObject(info, "github-app:", "# github-app:", 2) {
 		s.inGitHubApp = false
 	}
 }
 
 func (s *onSectionCleanupState) leaveArraySections(info onSectionLine) {
-	if s.inForksArray && s.inPullRequest && isLeavingArray(info, "forks:", 4) {
+	if s.inForksArray && isLeavingArray(info, "forks:", s.forksIndent) {
 		s.inForksArray = false
 	}
 	if s.inSkipRolesArray && isLeavingArray(info, "skip-roles:", 2) {
@@ -338,19 +372,19 @@ func (s *onSectionCleanupState) leaveArraySections(info onSectionLine) {
 }
 
 func (s *onSectionCleanupState) leaveStepsAndPermissions(info onSectionLine) {
-	if s.inOnSteps && isLeavingArray(info, "steps:", 2) {
+	if s.inOnSteps && isLeavingArray(info, "steps:", s.onStepsIndent) {
 		s.inOnSteps = false
 	}
-	if s.inOnPermissions && isLeavingTopLevelObject(info, "permissions:", "# permissions:") {
+	if s.inOnPermissions && isLeavingTopLevelObject(info, "permissions:", "# permissions:", s.onPermissionsIndent) {
 		s.inOnPermissions = false
 	}
 }
 
-func isLeavingTopLevelObject(info onSectionLine, key, commentedKey string) bool {
+func isLeavingTopLevelObject(info onSectionLine, key, commentedKey string, indent int) bool {
 	return info.trimmed != "" &&
 		!strings.HasPrefix(info.trimmed, key) &&
 		!strings.HasPrefix(info.trimmed, commentedKey) &&
-		info.indent == 2 &&
+		info.indent == indent &&
 		!strings.HasPrefix(info.trimmed, "#")
 }
 
@@ -392,6 +426,8 @@ func (s *onSectionCleanupState) commentSimpleTopLevelField(info onSectionLine) (
 	switch {
 	case strings.HasPrefix(info.trimmed, "manual-approval:"):
 		return true, " # Manual approval processed as environment field in activation job"
+	case strings.HasPrefix(info.trimmed, "cooldown:"):
+		return true, " # Cooldown processed as run history check in pre-activation job"
 	case strings.HasPrefix(info.trimmed, "stop-after:"):
 		return true, " # Stop-after processed as stop-time check in pre-activation job"
 	case strings.HasPrefix(info.trimmed, "restore-memory:"):
@@ -402,6 +438,10 @@ func (s *onSectionCleanupState) commentSimpleTopLevelField(info onSectionLine) (
 		return true, " # GitHub token used for reactions and status comments in activation"
 	case strings.HasPrefix(info.trimmed, "stale-check:"):
 		return true, " # Stale-check processed as frontmatter hash check step in activation job"
+	case strings.HasPrefix(info.trimmed, "admission:"):
+		return true, " # Admission controls optional admission jobs"
+	case strings.HasPrefix(info.trimmed, "report-blocked-version:"):
+		return true, " # Report-blocked-version processed as activation-stage notification toggle"
 	default:
 		return false, ""
 	}
@@ -511,11 +551,21 @@ func (s *onSectionCleanupState) determineEventSectionComment(info onSectionLine,
 
 func (s *onSectionCleanupState) commentPullRequestAndTriggerField(info onSectionLine) (bool, string) {
 	switch {
+	case s.inAllowedCheckouts && info.indent > s.allowedCheckoutsIndent:
+		return true, ""
+	case s.inPullRequestTarget && info.indent == 4 && strings.HasPrefix(info.trimmed, "acknowledge-risk:"):
+		return true, " # Risk acknowledgment is compiler-only"
+	case s.inPullRequestTarget && info.indent == 4 && strings.HasPrefix(info.trimmed, "allowed-checkouts:"):
+		s.inAllowedCheckouts = true
+		s.allowedCheckoutsIndent = info.indent
+		return true, " # Trusted checkout policy is compiler-only"
 	case s.inPullRequest && strings.Contains(info.trimmed, "draft:"):
 		return true, " # Draft filtering applied via job conditions"
-	case s.inPullRequest && strings.HasPrefix(info.trimmed, "forks:"):
+	case (s.inPullRequest || s.inPullRequestReview) && strings.HasPrefix(info.trimmed, "max-stack:"):
+		return true, " # Stack filtering applied via job conditions"
+	case (s.inPullRequest || s.inPullRequestTarget) && strings.HasPrefix(info.trimmed, "forks:"):
 		return true, " # Fork filtering applied via job conditions"
-	case s.inForksArray && strings.HasPrefix(info.trimmed, "-"):
+	case s.inForksArray && (strings.HasPrefix(info.trimmed, "-") || info.indent > s.forksIndent):
 		return true, " # Fork filtering applied via job conditions"
 	case s.inDeploymentStatus && strings.HasPrefix(info.trimmed, "state:"):
 		return true, " # State filtering compiled into if condition"
@@ -663,6 +713,7 @@ func dedentTrailingOnCommentBlock(lines []string) []string {
 		}
 	}
 
+	frontmatterLog.Printf("Dedenting trailing 'on' comment block: lines %d-%d", start, last)
 	for i := start; i <= last; i++ {
 		lines[i] = strings.TrimLeft(lines[i], " \t")
 	}
@@ -702,7 +753,7 @@ func (c *Compiler) addZizmorIgnoreForWorkflowRun(yamlStr string) string {
 		// Match lines that are only 'workflow_run:' (possibly with trailing whitespace or a comment)
 		// e.g., 'workflow_run:', 'workflow_run: # comment', '  workflow_run:'
 		// But not 'someworkflow_run:', 'workflow_run: value', etc.
-		if idx := strings.Index(trimmedLine, "workflow_run:"); idx == 0 {
+		if strings.HasPrefix(trimmedLine, "workflow_run:") {
 			after := strings.TrimSpace(trimmedLine[len("workflow_run:"):])
 			// Only allow if nothing or only a comment follows
 			if after == "" || strings.HasPrefix(after, "#") {

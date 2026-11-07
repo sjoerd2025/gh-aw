@@ -3,7 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { ERR_PARSE, ERR_SYSTEM } = require("./error_codes.cjs");
+const { ERR_PARSE, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 
 const MAX_FRONTMATTER_HASH_INPUT_BYTES = 1 << 20; // 1 MiB
@@ -26,8 +26,20 @@ async function defaultFileReader(filePath) {
   try {
     return fs.readFileSync(filePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${filePath}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to read file ${filePath}: ${getErrorMessage(err)}`, { cause: err });
   }
+}
+
+/**
+ * @param {any} error - Reader error, possibly wrapped with a cause
+ * @returns {boolean} Whether the file is genuinely absent
+ */
+function isFileNotFound(error) {
+  if (!error) return false;
+  const status = error.status || error.response?.status;
+  if (status !== undefined) return status === HTTP_STATUS_NOT_FOUND;
+  if (error.code !== undefined) return error.code === "ENOENT";
+  return error.cause ? isFileNotFound(error.cause) : false;
 }
 
 /**
@@ -39,7 +51,8 @@ async function defaultFileReader(filePath) {
  * @returns {boolean}
  */
 function parseBoolFromFrontmatter(frontmatterText, key) {
-  const pattern = new RegExp(`^${key}:\\s*(true|false)\\s*$`, "m");
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^${escapedKey}:\\s*(true|false)\\s*$`, "m");
   const match = frontmatterText.match(pattern);
   return match !== null && match[1] === "true";
 }
@@ -51,8 +64,9 @@ function parseBoolFromFrontmatter(frontmatterText, key) {
  *
  * @param {string} workflowPath - Path to the workflow file
  * @param {Object} [options] - Optional configuration
- * @param {Function} [options.fileReader] - Custom file reader function (async (filePath) => content)
- *                                          If not provided, uses fs.readFileSync
+ * @param {Function} [options.fileReader] - Custom file reader function (async (filePath) => content); defaults to fs.readFileSync
+ * @param {(filePath: string, error: Error) => void} [options.onMissingImport] - Called when an import file is missing
+ * @param {"local"|"github-api"} [options.readerMode] - Reader source; set to "github-api" for API-backed readers, including wrappers
  * @param {boolean} [options.verbose] - When true, emits detailed debug logging via core.info()
  *                                      for every step of the computation. Useful when diagnosing
  *                                      unexpected hash mismatches.
@@ -60,6 +74,8 @@ function parseBoolFromFrontmatter(frontmatterText, key) {
  */
 async function computeFrontmatterHash(workflowPath, options = {}) {
   const fileReader = options.fileReader || defaultFileReader;
+  const onMissingImport = options.onMissingImport;
+  const readerMode = options.readerMode || "local";
   const verbose = options.verbose === true;
   // log is a thin helper that only emits when verbose mode is active.
   // It uses core.info when available (GitHub Actions environment) and falls back to
@@ -91,7 +107,7 @@ async function computeFrontmatterHash(workflowPath, options = {}) {
   log(`inlined-imports: ${inlinedImports}`);
 
   // Process imports using text-based parsing
-  const { importedFiles, importedFrontmatterTexts } = await processImportsTextBased(frontmatterText, baseDir, undefined, fileReader);
+  const { importedFiles, importedFrontmatterTexts } = await processImportsTextBased(frontmatterText, baseDir, undefined, fileReader, onMissingImport);
 
   log(`Imported files (${importedFiles.length}): ${JSON.stringify(importedFiles)}`);
 
@@ -129,7 +145,7 @@ async function computeFrontmatterHash(workflowPath, options = {}) {
     log(`canonical.body-text (inlined-imports): ${canonical["body-text"].substring(0, 200)}...`);
   } else {
     // Extract template expressions with env. or vars.
-    const expressions = extractRelevantTemplateExpressions(markdown);
+    const expressions = mergeSortedUniqueStrings(extractRelevantTemplateExpressions(markdown), await collectRuntimeImportTemplateExpressions(frontmatterText, markdown, baseDir, fileReader, readerMode));
     if (expressions.length > 0) {
       canonical["template-expressions"] = expressions;
       log(`canonical.template-expressions: ${JSON.stringify(expressions)}`);
@@ -189,9 +205,11 @@ function extractFrontmatterAndBody(content) {
  * @param {string} baseDir - Base directory for resolving imports
  * @param {Set<string>} visited - Set of visited files for cycle detection
  * @param {Function} fileReader - File reader function (async (filePath) => content)
+ * @param {(filePath: string, error: Error) => void} [onMissingImport] - Called when an import file is missing
+ * @param {string} [rootDir] - Directory of the root workflow, retained across nested imports
  * @returns {Promise<{importedFiles: string[], importedFrontmatterTexts: string[]}>}
  */
-async function processImportsTextBased(frontmatterText, baseDir, visited = new Set(), fileReader = defaultFileReader) {
+async function processImportsTextBased(frontmatterText, baseDir, visited = new Set(), fileReader = defaultFileReader, onMissingImport, rootDir = baseDir) {
   const importedFiles = [];
   const importedFrontmatterTexts = [];
 
@@ -207,7 +225,7 @@ async function processImportsTextBased(frontmatterText, baseDir, visited = new S
 
   for (const importPath of sortedImports) {
     // Join import path with base directory (preserves relative paths for GitHub API compatibility)
-    const fullPath = path.join(baseDir, importPath);
+    const fullPath = resolveHashImportPath(importPath, baseDir, rootDir);
 
     // Skip if already visited (cycle detection)
     if (visited.has(fullPath)) continue;
@@ -224,13 +242,14 @@ async function processImportsTextBased(frontmatterText, baseDir, visited = new S
 
       // Recursively process imports in the imported file
       const importBaseDir = path.dirname(fullPath);
-      const nestedResult = await processImportsTextBased(importFrontmatterText, importBaseDir, visited, fileReader);
+      const nestedResult = await processImportsTextBased(importFrontmatterText, importBaseDir, visited, fileReader, onMissingImport, rootDir);
 
       // Add nested imports
       importedFiles.push(...nestedResult.importedFiles);
       importedFrontmatterTexts.push(...nestedResult.importedFrontmatterTexts);
     } catch (err) {
-      // Skip files that can't be read
+      if (!isFileNotFound(err)) throw err;
+      onMissingImport?.(fullPath, /** @type {Error} */ err);
       continue;
     }
   }
@@ -320,7 +339,7 @@ function validateNormalizedFrontmatterHashInputSize(normalizedFrontmatterText, n
   }
 
   if (totalBytes > MAX_FRONTMATTER_HASH_INPUT_BYTES) {
-    throw new Error(`frontmatter hash input exceeds ${MAX_FRONTMATTER_HASH_INPUT_BYTES} bytes after normalization`);
+    throw new Error(`${ERR_VALIDATION}: frontmatter hash input exceeds ${MAX_FRONTMATTER_HASH_INPUT_BYTES} bytes after normalization`);
   }
 }
 
@@ -330,22 +349,262 @@ function validateNormalizedFrontmatterHashInputSize(normalizedFrontmatterText, n
  * @returns {string[]} Array of relevant expressions (sorted)
  */
 function extractRelevantTemplateExpressions(markdown) {
+  return [
+    ...new Set(
+      scanTemplateExpressions(markdown)
+        .filter(match => match.content.includes("env.") || match.content.includes("vars."))
+        .map(match => match.expression)
+    ),
+  ].sort();
+}
+
+/**
+ * Extract all GitHub Actions template expressions.
+ * @param {string} markdown
+ * @returns {string[]}
+ */
+function extractAllTemplateExpressions(markdown) {
+  return [
+    ...new Set(
+      scanTemplateExpressions(markdown)
+        .filter(match => match.content.trim())
+        .map(match => match.expression)
+    ),
+  ].sort();
+}
+
+/**
+ * Scan interpolation boundaries without interpreting Actions grammar.
+ * Single quotes protect closing braces; doubled quotes preserve quote state.
+ * Unclosed openings do not discard complete expressions before or after them.
+ * @param {string} source
+ * @returns {{expression: string, content: string}[]}
+ */
+function scanTemplateExpressions(source) {
   const expressions = [];
-  const regex = /\$\{\{([^}]+)\}\}/g;
-  let match;
-
-  while ((match = regex.exec(markdown)) !== null) {
-    const expr = match[0]; // Full expression including ${{ }}
-    const content = match[1].trim();
-
-    // Check if it contains env. or vars.
-    if (content.includes("env.") || content.includes("vars.")) {
-      expressions.push(expr);
+  let offset = 0;
+  while (offset < source.length) {
+    const start = source.indexOf("${{", offset);
+    if (start === -1) break;
+    let inString = false;
+    let end = start + 3;
+    for (; end < source.length; end++) {
+      if (source[end] === "'") {
+        inString = !inString;
+      } else if (!inString && source[end] === "}" && source[end + 1] === "}") {
+        break;
+      }
     }
+    if (end === source.length) {
+      offset = start + 3;
+      continue;
+    }
+    expressions.push({ expression: source.slice(start, end + 2), content: source.slice(start + 3, end) });
+    offset = end + 2;
+  }
+  return expressions;
+}
+
+/**
+ * @typedef {Object} RuntimeImportReference
+ * @property {string} path
+ * @property {number|null} startLine
+ * @property {number|null} endLine
+ */
+
+/**
+ * Collect template expressions from content that may be added to the prompt by
+ * runtime imports.
+ * @param {string} frontmatterText
+ * @param {string} markdown
+ * @param {string} baseDir
+ * @param {Function} fileReader
+ * @param {"local"|"github-api"} readerMode
+ * @returns {Promise<string[]>}
+ */
+async function collectRuntimeImportTemplateExpressions(frontmatterText, markdown, baseDir, fileReader, readerMode) {
+  const seen = new Set();
+  let expressions = await extractRuntimeImportTemplateExpressionsFromMarkdown(markdown, baseDir, seen, fileReader, readerMode);
+
+  const importedBodies = await collectImportedBodies(frontmatterText, baseDir, new Set(), fileReader);
+  for (const body of importedBodies) {
+    expressions = mergeSortedUniqueStrings(expressions, extractAllTemplateExpressions(body));
+    expressions = mergeSortedUniqueStrings(expressions, await extractRuntimeImportTemplateExpressionsFromMarkdown(body, baseDir, seen, fileReader, readerMode));
   }
 
-  // Remove duplicates and sort
-  return [...new Set(expressions)].sort();
+  return expressions;
+}
+
+/**
+ * @param {string} markdown
+ * @param {string} baseDir
+ * @param {Set<string>} seen
+ * @param {Function} fileReader
+ * @param {"local"|"github-api"} readerMode
+ * @returns {Promise<string[]>}
+ */
+async function extractRuntimeImportTemplateExpressionsFromMarkdown(markdown, baseDir, seen, fileReader, readerMode) {
+  const refs = extractRuntimeImportReferences(markdown);
+  let expressions = [];
+
+  for (const ref of refs) {
+    const body = await readRuntimeImportBodyForHash(ref, baseDir, seen, fileReader, readerMode);
+    if (body === null) continue;
+    expressions = mergeSortedUniqueStrings(expressions, extractAllTemplateExpressions(body));
+    expressions = mergeSortedUniqueStrings(expressions, await extractRuntimeImportTemplateExpressionsFromMarkdown(body, baseDir, seen, fileReader, readerMode));
+  }
+
+  return expressions;
+}
+
+/**
+ * @param {string} markdown
+ * @returns {RuntimeImportReference[]}
+ */
+function extractRuntimeImportReferences(markdown) {
+  if (!markdown) return [];
+
+  const refs = [];
+  const seen = new Set();
+  const regex = /\{\{#(?:runtime-import|import)\??(?:[ \t]+|[ \t]*:[ \t]*)([^{}]+?)\}\}/g;
+  let match;
+  while ((match = regex.exec(markdown)) !== null) {
+    const target = match[1].trim();
+    if (!target) continue;
+    const rangeMatch = target.match(/^(.+?):(\d+)-(\d+)$/);
+    const ref = rangeMatch ? { path: rangeMatch[1].trim(), startLine: Number.parseInt(rangeMatch[2], 10), endLine: Number.parseInt(rangeMatch[3], 10) } : { path: target, startLine: null, endLine: null };
+    if (/^https?:\/\//i.test(ref.path)) continue;
+    const key = `${ref.path.replace(/\\/g, "/")}:${ref.startLine ?? 0}-${ref.endLine ?? 0}`;
+    if (seen.has(key)) continue;
+    refs.push(ref);
+    seen.add(key);
+  }
+  return refs;
+}
+
+/**
+ * @param {RuntimeImportReference} ref
+ * @param {string} baseDir
+ * @param {Set<string>} seen
+ * @param {Function} fileReader
+ * @param {"local"|"github-api"} readerMode
+ * @returns {Promise<string|null>}
+ */
+async function readRuntimeImportBodyForHash(ref, baseDir, seen, fileReader, readerMode) {
+  let firstReadError;
+  for (const candidate of runtimeImportHashCandidatePaths(ref.path, baseDir)) {
+    const key = `${candidate}:${ref.startLine ?? 0}-${ref.endLine ?? 0}`;
+    if (seen.has(key)) return null;
+    // API candidates use the allowlisted paths below and the reader's remote symlink resolution; local realpath checks inspect the unrelated runner checkout.
+    if (readerMode !== "github-api" && fs.existsSync(candidate) && !runtimeImportHashRealPathAllowed(candidate, baseDir)) continue;
+    let content;
+    try {
+      content = await fileReader(candidate);
+    } catch (err) {
+      if (isFileNotFound(err)) continue;
+      firstReadError ||= err;
+      continue;
+    }
+
+    seen.add(key);
+    if (ref.startLine !== null || ref.endLine !== null) {
+      content = applyRuntimeImportLineRangeForHash(content, ref.startLine, ref.endLine);
+    }
+    const { markdown } = extractFrontmatterAndBody(content);
+    return markdown;
+  }
+  if (firstReadError) throw firstReadError;
+  return null;
+}
+
+function runtimeImportHashRealPathAllowed(candidate, baseDir) {
+  const workspaceRoot = runtimeImportHashWorkspaceRoot(baseDir);
+  for (const base of [path.join(workspaceRoot, ".github"), path.join(workspaceRoot, ".agents")]) {
+    if (realPathWithinBaseForHash(candidate, base)) return true;
+  }
+  return false;
+}
+
+function realPathWithinBaseForHash(pathToCheck, baseDir) {
+  try {
+    const realBase = fs.realpathSync(baseDir);
+    const realPath = fs.realpathSync(pathToCheck);
+    const relativePath = path.relative(realBase, realPath);
+    return relativePath !== ".." && !relativePath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePath);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @param {string} content
+ * @param {number|null} startLine
+ * @param {number|null} endLine
+ * @returns {string}
+ */
+function applyRuntimeImportLineRangeForHash(content, startLine, endLine) {
+  const lines = content.split("\n");
+  const start = startLine && startLine > 0 ? startLine : 1;
+  const end = endLine && endLine > 0 && endLine <= lines.length ? endLine : lines.length;
+  if (start > end || start > lines.length) return "";
+  return lines.slice(start - 1, end).join("\n");
+}
+
+/**
+ * @param {string} importPath
+ * @param {string} baseDir
+ * @returns {string[]}
+ */
+function runtimeImportHashCandidatePaths(importPath, baseDir) {
+  let normalized = String(importPath || "")
+    .trim()
+    .replace(/\\/g, "/");
+  if (normalized.startsWith("/")) {
+    normalized = normalized.replace(/^\/+/, "");
+    if (!normalized.startsWith(".github/") && !normalized.startsWith(".agents/")) {
+      return [];
+    }
+  }
+  if (normalized.startsWith("./")) {
+    normalized = normalized.substring(2);
+  }
+  if (!normalized || normalized.startsWith("../") || normalized.includes("/../")) {
+    return [];
+  }
+
+  const workspaceRoot = runtimeImportHashWorkspaceRoot(baseDir);
+  if (normalized.startsWith(".agents/") || normalized.startsWith(".github/")) {
+    return [path.join(workspaceRoot, normalized)];
+  }
+
+  return [path.join(workspaceRoot, ".github", normalized), path.join(workspaceRoot, ".github", "workflows", normalized), path.join(baseDir, normalized)].map(p => path.normalize(p)).filter((p, index, all) => all.indexOf(p) === index);
+}
+
+/**
+ * @param {string} baseDir
+ * @returns {string}
+ */
+function runtimeImportHashWorkspaceRoot(baseDir) {
+  const normalized = path.normalize(baseDir).replace(/\\/g, "/");
+  if (normalized === ".github" || normalized.startsWith(".github/")) {
+    return ".";
+  }
+  const markerIndex = normalized.indexOf("/.github/");
+  if (markerIndex >= 0) {
+    return normalized.substring(0, markerIndex);
+  }
+  if (normalized.endsWith("/.github")) {
+    return path.dirname(baseDir);
+  }
+  return baseDir;
+}
+
+/**
+ * @param  {...string[]} groups
+ * @returns {string[]}
+ */
+function mergeSortedUniqueStrings(...groups) {
+  return [...new Set(groups.flat().filter(Boolean))].sort();
 }
 
 /**
@@ -400,9 +659,10 @@ function marshalSorted(data) {
  * @param {string} baseDir - Base directory for resolving imports
  * @param {Set<string>} visited - Set of visited files for cycle detection
  * @param {Function} fileReader - File reader function (async (filePath) => content)
+ * @param {string} [rootDir] - Directory of the root workflow, retained across nested imports
  * @returns {Promise<string[]>} Array of imported body texts
  */
-async function collectImportedBodies(frontmatterText, baseDir, visited = new Set(), fileReader = defaultFileReader) {
+async function collectImportedBodies(frontmatterText, baseDir, visited = new Set(), fileReader = defaultFileReader, rootDir = baseDir) {
   const importedBodyTexts = [];
 
   const imports = extractImportsFromText(frontmatterText);
@@ -413,7 +673,7 @@ async function collectImportedBodies(frontmatterText, baseDir, visited = new Set
   const sortedImports = [...imports].sort();
 
   for (const importPath of sortedImports) {
-    const fullPath = path.join(baseDir, importPath);
+    const fullPath = resolveHashImportPath(importPath, baseDir, rootDir);
 
     if (visited.has(fullPath)) continue;
     visited.add(fullPath);
@@ -425,14 +685,28 @@ async function collectImportedBodies(frontmatterText, baseDir, visited = new Set
       importedBodyTexts.push(importBody);
 
       const importBaseDir = path.dirname(fullPath);
-      const nestedBodies = await collectImportedBodies(importFrontmatterText, importBaseDir, visited, fileReader);
+      const nestedBodies = await collectImportedBodies(importFrontmatterText, importBaseDir, visited, fileReader, rootDir);
       importedBodyTexts.push(...nestedBodies);
     } catch (err) {
+      if (!isFileNotFound(err)) throw err;
       continue;
     }
   }
 
   return importedBodyTexts;
+}
+
+/**
+ * Mirrors the compiler's nested local import resolution: bare names and ./ paths
+ * are file-relative; qualified paths are relative to the root workflow directory.
+ * @param {string} importPath
+ * @param {string} baseDir
+ * @param {string} rootDir
+ * @returns {string}
+ */
+function resolveHashImportPath(importPath, baseDir, rootDir) {
+  const fileRelative = !importPath.includes("/") || importPath.startsWith("./");
+  return path.join(fileRelative ? baseDir : rootDir, importPath);
 }
 
 /**
@@ -484,7 +758,7 @@ function extractBodyHashFromLockFile(lockFileContent) {
           return metadata.body_hash;
         }
       } catch (err) {
-        // Invalid JSON
+        // Invalid JSON metadata — ignored.
       }
     }
   }
@@ -511,7 +785,7 @@ function extractHashFromLockFile(lockFileContent) {
           return metadata.frontmatter_hash;
         }
       } catch (err) {
-        // Invalid JSON, continue to check old format
+        // Invalid JSON — ignored, continue to check old format.
       }
     }
 
@@ -716,7 +990,8 @@ function createGitHubFileReader(github, owner, repo, ref) {
       // This handles the case where an import path traverses a symlinked directory
       // (e.g. .github/agents → ../.ai/agents), which the GitHub Contents API cannot
       // follow automatically. Mirrors the Go logic in remote_download_file.go.
-      const status = error.status || (error.response && error.response.status);
+      const errorObject = typeof error === "object" && error !== null ? error : null;
+      const status = errorObject ? errorObject.status || (errorObject.response && errorObject.response.status) : undefined;
       if (status === HTTP_STATUS_NOT_FOUND) {
         if (symlinkDepth >= MAX_SYMLINK_DEPTH) {
           throw new Error(`${ERR_SYSTEM}: Failed to read file ${filePath} from GitHub: symlink chain exceeded maximum depth of ${MAX_SYMLINK_DEPTH}`);
@@ -728,7 +1003,8 @@ function createGitHubFileReader(github, owner, repo, ref) {
       }
 
       const errorMessage = getErrorMessage(error);
-      throw new Error(`${ERR_SYSTEM}: Failed to read file ${filePath} from GitHub: ${errorMessage}`);
+      const statusMessage = status !== undefined ? ` (HTTP ${status})` : "";
+      throw new Error(`${ERR_SYSTEM}: Failed to read file ${filePath} from GitHub${statusMessage}: ${errorMessage}`, { cause: error });
     }
   }
 
@@ -741,6 +1017,9 @@ module.exports = {
   extractFrontmatterAndBody,
   extractImportsFromText,
   extractRelevantTemplateExpressions,
+  extractAllTemplateExpressions,
+  collectRuntimeImportTemplateExpressions,
+  extractRuntimeImportReferences,
   marshalCanonicalJSON,
   marshalSorted,
   extractHashFromLockFile,

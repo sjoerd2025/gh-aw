@@ -7,11 +7,13 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestValidateArtifactSets(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		sets      []string
@@ -30,6 +32,11 @@ func TestValidateArtifactSets(t *testing.T) {
 		{
 			name:      "activation is valid",
 			sets:      []string{"activation"},
+			expectErr: false,
+		},
+		{
+			name:      "info is valid",
+			sets:      []string{"info"},
 			expectErr: false,
 		},
 		{
@@ -81,6 +88,7 @@ func TestValidateArtifactSets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := ValidateArtifactSets(tt.sets)
 			if tt.expectErr {
 				assert.Error(t, err, "Expected an error for sets: %v", tt.sets)
@@ -92,6 +100,7 @@ func TestValidateArtifactSets(t *testing.T) {
 }
 
 func TestResolveArtifactFilter(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		sets     []string
@@ -123,9 +132,14 @@ func TestResolveArtifactFilter(t *testing.T) {
 			expected: []string{"activation"},
 		},
 		{
-			name:     "agent resolves to agent artifact",
+			name:     "info resolves to info artifact",
+			sets:     []string{"info"},
+			expected: []string{"info"},
+		},
+		{
+			name:     "agent resolves to agent artifact and output fallback",
 			sets:     []string{"agent"},
-			expected: []string{"agent"},
+			expected: []string{constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
 		},
 		{
 			name:     "mcp resolves to agent artifact",
@@ -153,6 +167,11 @@ func TestResolveArtifactFilter(t *testing.T) {
 			expected: []string{"activation", "agent"},
 		},
 		{
+			name:     "experiment resolves to experiment and usage artifacts",
+			sets:     []string{"experiment"},
+			expected: []string{constants.ExperimentArtifactName.String(), constants.UsageArtifactName.String()},
+		},
+		{
 			name:     "usage resolves to usage artifact",
 			sets:     []string{"usage"},
 			expected: []string{"usage"},
@@ -163,19 +182,25 @@ func TestResolveArtifactFilter(t *testing.T) {
 			expected: []string{"usage"},
 		},
 		{
+			name:     "graders resolves to conclusion custom job and historical artifacts",
+			sets:     []string{"graders"},
+			expected: []string{constants.UsageArtifactName.String(), constants.GradersArtifactName.String(), constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
+		},
+		{
 			name:     "multiple sets are merged and deduplicated",
 			sets:     []string{"activation", "agent"},
-			expected: []string{"activation", "agent"},
+			expected: []string{constants.ActivationArtifactName.String(), constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
 		},
 		{
 			name:     "github-api and agent deduplicates agent",
 			sets:     []string{"github-api", "agent"},
-			expected: []string{"activation", "agent"},
+			expected: []string{constants.ActivationArtifactName.String(), constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := ResolveArtifactFilter(tt.sets)
 			assert.Equal(t, tt.expected, result, "ResolveArtifactFilter(%v)", tt.sets)
 		})
@@ -183,6 +208,7 @@ func TestResolveArtifactFilter(t *testing.T) {
 }
 
 func TestArtifactMatchesFilter(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		artifact string
@@ -247,6 +273,7 @@ func TestArtifactMatchesFilter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := artifactMatchesFilter(tt.artifact, tt.filter)
 			assert.Equal(t, tt.expected, result, "artifactMatchesFilter(%q, %v)", tt.artifact, tt.filter)
 		})
@@ -254,29 +281,54 @@ func TestArtifactMatchesFilter(t *testing.T) {
 }
 
 func TestValidArtifactSetNames(t *testing.T) {
+	t.Parallel()
 	names := ValidArtifactSetNames()
 	require.NotEmpty(t, names, "ValidArtifactSetNames should return non-empty slice")
 
-	expected := []string{"all", "activation", "agent", "detection", "evals", "experiment", "firewall", "github-api", "mcp", "usage"}
+	expected := []string{"all", "activation", "agent", "detection", "evals", "experiment", "firewall", "github-api", "graders", "info", "mcp", "outcomes", "usage", "work-queue"}
 	assert.ElementsMatch(t, expected, names, "ValidArtifactSetNames should contain all known sets")
 }
 
 func TestApplyEvalsArtifact(t *testing.T) {
+	t.Parallel()
 	t.Run("returns empty slice unchanged when artifact list is empty", func(t *testing.T) {
+		t.Parallel()
 		assert.Empty(t, applyEvalsArtifact(nil, true))
 		assert.Empty(t, applyEvalsArtifact([]string{}, true))
 	})
 
 	t.Run("appends evals when evals requested and artifact list narrowed", func(t *testing.T) {
+		t.Parallel()
 		assert.Equal(t, []string{"agent", "evals"}, applyEvalsArtifact([]string{"agent"}, true))
 	})
 
 	t.Run("does not append evals when usage already present", func(t *testing.T) {
+		t.Parallel()
 		assert.Equal(t, []string{"usage"}, applyEvalsArtifact([]string{"usage"}, true))
 	})
 }
 
+func TestApplyGradersArtifact(t *testing.T) {
+	t.Parallel()
+	t.Run("returns empty slice unchanged when artifact list is empty", func(t *testing.T) {
+		t.Parallel()
+		assert.Empty(t, applyGradersArtifact(nil, true))
+		assert.Empty(t, applyGradersArtifact([]string{}, true))
+	})
+
+	t.Run("appends graders when graders requested and artifact list narrowed", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, []string{"usage", "graders"}, applyGradersArtifact([]string{"usage"}, true))
+	})
+
+	t.Run("does not append graders when already present", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, []string{"graders"}, applyGradersArtifact([]string{"graders"}, true))
+	})
+}
+
 func TestIsEvalsArtifactRequested(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		evalsOnly    bool
@@ -305,12 +357,14 @@ func TestIsEvalsArtifactRequested(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.expected, isEvalsArtifactRequested(tt.evalsOnly, tt.artifactSets))
 		})
 	}
 }
 
 func TestIsUsageOnlyArtifactFilter(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		filter   []string
@@ -340,12 +394,83 @@ func TestIsUsageOnlyArtifactFilter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.expected, isUsageOnlyArtifactFilter(tt.filter))
 		})
 	}
 }
 
+func TestIsInfoOnlyArtifactFilter(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		filter   []string
+		expected bool
+	}{
+		{name: "info only", filter: []string{"info"}, expected: true},
+		{name: "info plus another artifact", filter: []string{"info", "agent"}, expected: false},
+		{name: "non-info only", filter: []string{"agent"}, expected: false},
+		{name: "empty filter", filter: nil, expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, isInfoOnlyArtifactFilter(tt.filter))
+		})
+	}
+}
+
+func TestIsInfoWithOptionalUsageArtifactFilter(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		filter   []string
+		expected bool
+	}{
+		{name: "info only", filter: []string{"info"}, expected: true},
+		{name: "info plus usage", filter: []string{"info", "usage"}, expected: true},
+		{name: "usage plus info reversed order", filter: []string{"usage", "info"}, expected: true},
+		{name: "info plus another artifact", filter: []string{"info", "agent"}, expected: false},
+		{name: "usage only", filter: []string{"usage"}, expected: false},
+		{name: "non-info only", filter: []string{"agent"}, expected: false},
+		{name: "empty filter", filter: nil, expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, isInfoWithOptionalUsageArtifactFilter(tt.filter))
+		})
+	}
+}
+
+func TestShouldDownloadWorkflowRunLogs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		filter   []string
+		expected bool
+	}{
+		{name: "all artifacts", filter: nil, expected: true},
+		{name: "usage only", filter: []string{"usage"}, expected: false},
+		{name: "info only", filter: []string{"info"}, expected: false},
+		{name: "activation and usage", filter: []string{"activation", "usage"}, expected: false},
+		{name: "outcome evidence only", filter: []string{"usage", "safe-outputs-items", "agent-output-fallback"}, expected: false},
+		{name: "agent", filter: []string{"agent"}, expected: true},
+		{name: "agent and usage", filter: []string{"agent", "usage"}, expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, shouldDownloadWorkflowRunLogs(tt.filter))
+		})
+	}
+}
+
 func TestFindMissingFilterEntries(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		filter       []string
@@ -383,6 +508,24 @@ func TestFindMissingFilterEntries(t *testing.T) {
 			expected:     []string{"agent"},
 		},
 		{
+			name:         "agent fallback satisfies agent transport filter",
+			filter:       []string{"agent", "agent-output-fallback"},
+			existingDirs: []string{"agent-output-fallback"},
+			expected:     nil,
+		},
+		{
+			name:         "prefixed agent fallback satisfies agent transport filter",
+			filter:       []string{"agent", "agent-output-fallback"},
+			existingDirs: []string{"abc123-agent-output-fallback"},
+			expected:     nil,
+		},
+		{
+			name:         "agent satisfies fallback transport filter",
+			filter:       []string{"agent", "agent-output-fallback"},
+			existingDirs: []string{"agent"},
+			expected:     nil,
+		},
+		{
 			name:         "any-suffix directory matches filter entry (mirrors artifactMatchesFilter behavior)",
 			filter:       []string{"agent"},
 			existingDirs: []string{"super-agent"},
@@ -401,6 +544,7 @@ func TestFindMissingFilterEntries(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			for _, d := range tt.existingDirs {
 				require.NoError(t, os.MkdirAll(filepath.Join(dir, d), 0755), "failed to create test dir")
@@ -409,4 +553,75 @@ func TestFindMissingFilterEntries(t *testing.T) {
 			assert.Equal(t, tt.expected, result, "findMissingFilterEntries(%v, dir)", tt.filter)
 		})
 	}
+}
+
+func TestFindMissingFilterEntriesUsesDownloadedMarkers(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	require.NoError(t, markArtifactDownloaded(dir, "activation"))
+	require.NoError(t, markArtifactDownloaded(dir, "abc123-usage"))
+
+	assert.Nil(t, findMissingFilterEntries([]string{"activation", "usage"}, dir))
+	assert.Equal(t, []string{"agent"}, findMissingFilterEntries([]string{"activation", "agent"}, dir))
+}
+
+func TestFindMissingFilterEntriesAllMarkerSatisfiesFiltered(t *testing.T) {
+	t.Parallel()
+	// A complete-download marker (ArtifactSetAll) should satisfy every filtered
+	// request even when individual artifact directories no longer exist (e.g. after
+	// flattenSingleFileArtifacts removes them).
+	dir := t.TempDir()
+	require.NoError(t, markArtifactDownloaded(dir, string(ArtifactSetAll)))
+
+	assert.Nil(t, findMissingFilterEntries([]string{"activation"}, dir))
+	assert.Nil(t, findMissingFilterEntries([]string{"activation", "usage"}, dir))
+	assert.Nil(t, findMissingFilterEntries([]string{string(ArtifactSetAll)}, dir))
+}
+
+func TestMarkArtifactDownloadedRejectsInvalidNames(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"../activation", `..\activation`, ".", ".."} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			err := markArtifactDownloaded(t.TempDir(), name)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid artifact name")
+		})
+	}
+}
+
+// TestFindMissingFilterEntriesIncrementalScenario validates the key scenario used by
+// the incremental unfiltered download: a previous filtered pass wrote per-artifact
+// markers with the full API artifact name (e.g. "abc123-activation"), and the
+// subsequent unfiltered pass supplies the same full names to findMissingFilterEntries
+// to determine which are still missing.
+func TestFindMissingFilterEntriesIncrementalScenario(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	// Simulate a previous filtered download that wrote markers with full API artifact names.
+	require.NoError(t, markArtifactDownloaded(dir, "abc123-activation"))
+	require.NoError(t, markArtifactDownloaded(dir, "abc123-usage"))
+
+	// The unfiltered incremental check passes full API names as the filter.
+	// activation and usage are found via their exact-match markers; agent is missing.
+	result := findMissingFilterEntries([]string{"abc123-activation", "abc123-usage", "abc123-agent"}, dir)
+	assert.Equal(t, []string{"abc123-agent"}, result)
+
+	// After downloading agent (marker written), nothing is missing.
+	require.NoError(t, markArtifactDownloaded(dir, "abc123-agent"))
+	assert.Nil(t, findMissingFilterEntries([]string{"abc123-activation", "abc123-usage", "abc123-agent"}, dir))
+}
+
+// TestFindMissingFilterEntriesAllMarkerSatisfiesFullNames verifies that the
+// complete-download marker satisfies a filter containing full API artifact names
+// (as used by the incremental unfiltered download check).
+func TestFindMissingFilterEntriesAllMarkerSatisfiesFullNames(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	require.NoError(t, markArtifactDownloaded(dir, string(ArtifactSetAll)))
+
+	// Full API artifact names — all satisfied by the 'all' marker.
+	assert.Nil(t, findMissingFilterEntries([]string{"abc123-activation", "abc123-usage", "abc123-agent"}, dir))
+	assert.Nil(t, findMissingFilterEntries([]string{"activation", "usage", "agent"}, dir))
 }

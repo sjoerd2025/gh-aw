@@ -42,6 +42,7 @@ network:
 	workflowContent := `---
 on: issues
 engine: copilot
+strict: false
 imports:
   - shared-playwright.md
 permissions:
@@ -73,14 +74,13 @@ Uses imported playwright tool.
 
 	workflowData := string(lockFileContent)
 
-	// Verify playwright is configured in the MCP config
-	if !strings.Contains(workflowData, `"playwright"`) {
-		t.Error("Expected compiled workflow to contain playwright tool")
+	// Verify the imported Playwright tool installs the CLI.
+	if !strings.Contains(workflowData, "npm install -g @playwright/cli@") {
+		t.Error("Expected compiled workflow to install Playwright CLI")
 	}
 
-	// Verify playwright Docker image
-	if !strings.Contains(workflowData, "mcr.microsoft.com/playwright/mcp") {
-		t.Error("Expected compiled workflow to contain playwright Docker image")
+	if strings.Contains(workflowData, "mcr.microsoft.com/playwright/mcp") {
+		t.Error("Expected compiled workflow not to contain the removed Playwright MCP image")
 	}
 }
 
@@ -169,8 +169,8 @@ Uses imported agentic-workflows tool.
 	}
 
 	// Verify DEBUG and GITHUB_TOKEN are present
-	if !strings.Contains(workflowData, `"DEBUG": "*"`) {
-		t.Error("Expected DEBUG set to literal '*' in env vars")
+	if !strings.Contains(workflowData, `"DEBUG": "\${DEBUG}"`) {
+		t.Error("Expected DEBUG forwarded from the environment")
 	}
 	if !strings.Contains(workflowData, `"GITHUB_TOKEN"`) {
 		t.Error("Expected GITHUB_TOKEN in env vars")
@@ -212,6 +212,7 @@ network:
 	workflowContent := `---
 on: issues
 engine: copilot
+strict: false
 imports:
   - shared-all.md
 permissions:
@@ -245,8 +246,8 @@ Uses all imported tools.
 	workflowData := string(lockFileContent)
 
 	// Verify tools are present
-	if !strings.Contains(workflowData, `"playwright"`) {
-		t.Error("Expected compiled workflow to contain playwright tool")
+	if !strings.Contains(workflowData, "npm install -g @playwright/cli@") {
+		t.Error("Expected compiled workflow to install Playwright CLI")
 	}
 	// Per MCP Gateway Specification v1.0.0, agentic-workflows uses containerized format
 	if !strings.Contains(workflowData, `"`+constants.AgenticWorkflowsMCPServerID.String()+`"`) {
@@ -254,83 +255,8 @@ Uses all imported tools.
 	}
 
 	// Verify specific configurations
-	if !strings.Contains(workflowData, "mcr.microsoft.com/playwright/mcp") {
-		t.Error("Expected compiled workflow to contain playwright Docker image")
-	}
-}
-
-// TestImportPlaywrightWithCustomArgs tests playwright with custom arguments
-func TestImportPlaywrightWithCustomArgs(t *testing.T) {
-	tempDir := testutil.TempDir(t, "test-*")
-
-	// Create a shared workflow with playwright tool with custom args
-	sharedPath := filepath.Join(tempDir, "shared-playwright-args.md")
-	sharedContent := `---
-description: "Shared playwright with custom args"
-tools:
-  playwright:
-    version: "v1.41.0"
-    args:
-      - "--custom-flag"
-      - "value"
-network:
-  allowed:
-    - playwright
----
-
-# Shared Playwright with Args
-`
-	if err := os.WriteFile(sharedPath, []byte(sharedContent), 0644); err != nil {
-		t.Fatalf("Failed to write shared file: %v", err)
-	}
-
-	// Create main workflow that imports playwright
-	workflowPath := filepath.Join(tempDir, "main-workflow.md")
-	workflowContent := `---
-on: issues
-engine: copilot
-imports:
-  - shared-playwright-args.md
-permissions:
-  contents: read
-  issues: read
-  pull-requests: read
----
-
-# Main Workflow
-
-Uses imported playwright with custom args.
-`
-	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
-		t.Fatalf("Failed to write workflow file: %v", err)
-	}
-
-	// Compile the workflow
-	compiler := workflow.NewCompiler()
-	if err := compiler.CompileWorkflow(workflowPath); err != nil {
-		t.Fatalf("CompileWorkflow failed: %v", err)
-	}
-
-	// Read the generated lock file
-	lockFilePath := stringutil.MarkdownToLockFile(workflowPath)
-	lockFileContent, err := os.ReadFile(lockFilePath)
-	if err != nil {
-		t.Fatalf("Failed to read lock file: %v", err)
-	}
-
-	workflowData := string(lockFileContent)
-
-	// Verify playwright is configured
-	if !strings.Contains(workflowData, `"playwright"`) {
-		t.Error("Expected compiled workflow to contain playwright tool")
-	}
-
-	// Verify custom args are present
-	if !strings.Contains(workflowData, "--custom-flag") {
-		t.Error("Expected compiled workflow to contain --custom-flag custom argument")
-	}
-	if !strings.Contains(workflowData, "value") {
-		t.Error("Expected compiled workflow to contain custom argument value")
+	if strings.Contains(workflowData, "mcr.microsoft.com/playwright/mcp") {
+		t.Error("Expected compiled workflow not to contain the removed Playwright MCP image")
 	}
 }
 
@@ -470,7 +396,9 @@ tools:
 	workflowPath := filepath.Join(tempDir, "main-workflow.md")
 	workflowContent := `---
 on: issues
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
   - shared-web-fetch.md
 permissions:
@@ -498,10 +426,9 @@ Uses imported web-fetch tool.
 		t.Fatalf("Failed to read lock file: %v", err)
 	}
 
-	// Verify compilation succeeded
-	// Note: Copilot has built-in web-fetch support, so no explicit MCP configuration is needed
-	// The test verifies that the workflow compiles successfully when web-fetch is imported
-	_ = lockFileContent // Compilation success is sufficient verification
+	if !strings.Contains(string(lockFileContent), `"webFetch":true`) {
+		t.Error("Expected imported web-fetch to enable the SDK custom tool")
+	}
 }
 
 // TestImportWebSearchTool tests that web-search tool can be imported from a shared workflow
@@ -714,7 +641,9 @@ tools:
 	workflowPath := filepath.Join(tempDir, "main-workflow.md")
 	workflowContent := `---
 on: issues
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
   - shared-neutral-tools.md
 permissions:
@@ -749,8 +678,9 @@ Uses all imported neutral tools.
 		t.Error("Expected compiled workflow to contain --allow-all-paths flag for edit tool")
 	}
 
-	// Note: web-fetch has built-in Copilot support, so no explicit MCP configuration is needed
-	// The test verifies that web-fetch compiles successfully when imported
+	if !strings.Contains(workflowData, `"webFetch":true`) {
+		t.Error("Expected imported web-fetch to enable the SDK custom tool")
+	}
 
 	// Verify timeout is configured (120 seconds)
 	hasTimeout := strings.Contains(workflowData, "120000") ||
@@ -803,7 +733,7 @@ permissions:
 tools:
   bash: true
 features:
-  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+  dangerously-disable-sandbox-agent: true
 sandbox:
   agent: false
 imports:
@@ -894,7 +824,7 @@ permissions:
   contents: read
   issues: read
 features:
-  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+  dangerously-disable-sandbox-agent: true
 sandbox:
   agent: false
 imports:
@@ -968,7 +898,7 @@ permissions:
 tools:
   github: false
 features:
-  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+  dangerously-disable-sandbox-agent: true
 sandbox:
   agent: false
 imports:

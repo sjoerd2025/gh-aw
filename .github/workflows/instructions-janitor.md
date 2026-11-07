@@ -7,13 +7,16 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 network:
   allowed:
   - defaults
   - github
 imports:
+- shared/reporting.md
 - shared/otlp.md
 safe-outputs:
+  steer: true
   create-pull-request:
     allowed-files:
     - .github/aw/**
@@ -27,7 +30,12 @@ safe-outputs:
     title-prefix: "[instructions] "
 description: Reviews and cleans up instruction files to ensure clarity, low duplication, and sub-400-line files for agentic consumption
 emoji: 🧹
-engine: claude
+engine:
+  id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: balanced
 name: Instructions Janitor
 strict: true
 timeout-minutes: 20
@@ -36,18 +44,24 @@ tools:
   - cat .github/aw/*.md
   - wc -l .github/aw/*.md
   - "git log --since=\"*\" --pretty=format:\"%h %s\" -- docs/ .github/aw/"
+  - "git log --since=\"*\" --name-only --pretty=format:\"%h %s\" -- docs/ .github/aw/"
+  - "git diff *..HEAD -- docs/ .github/aw/"
+  - "git show --stat *"
   - ls .github/aw/
   cache-memory: true
-  cli-proxy: true
+  cli-proxy: false
   edit: null
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
     - default
-sandbox:
-  agent:
-    sudo: false
+evals:
+  - id: edited-files-within-targets
+    question: For a proposed instruction-cleanup PR, do the resulting edited instruction files meet their applicable file-layout line targets? Return UNKNOWN when no PR is proposed.
+  - id: duplication-consolidated
+    question: When a patch addresses duplicated guidance, does it replace repeated rules with references to a single focused canonical location? Return UNKNOWN when no duplication cleanup is proposed.
 ---
+
 # Instructions Janitor
 
 Keep instruction files in `.github/aw/` synchronized with the product, compact enough for agentic loading, and free of avoidable duplication.
@@ -79,10 +93,26 @@ Use small, topic-focused files.
 
 ## Required Audits
 
+### Tool and permission boundaries
+
+- Use native GitHub MCP tools for release metadata and remote reads, and native read/search/edit tools for local files.
+- Bash is only for the declared audit commands. Invoke each separately from the existing workspace; do not add pipelines, command chains, redirection, substitutions, or helper scripts.
+- Use native `get_latest_release` for the latest release tag and publication date. If shallow checkout history cannot resolve the tag, use native GitHub commit/file reads; do not fetch or expand shell permissions.
+- Publish edits through the native `create_pull_request` safe-output tool with structured arguments following its discovered schema. Do not invoke the `safeoutputs` CLI, serialize a payload in Bash, or pipe a PR body through `jq`.
+- After a denied or unavailable required call, stop that operation and call native `report_incomplete` with the blocked tool, audit phase, and edited paths. Never repeat a denied write in another syntax or claim the PR was created.
+
 ### 1. Release and change audit
 
-- find the latest release
-- review docs and `.github/aw/` commits since that release
+- find the latest release tag
+- run a single bounded history pass:
+  ```bash
+  git log --since=<release-date> --name-only --pretty=format:"%h %s" -- docs/ .github/aw/
+  ```
+- if there are relevant changes, run one batched diff to review all affected content at once:
+  ```bash
+  git diff <release-tag>..HEAD -- docs/ .github/aw/
+  ```
+- inspect individual commits only when the diff alone is insufficient; cap detail inspection at **5 commits maximum**
 - inspect changed code when instruction accuracy depends on implementation details
 
 ### 2. Size audit
@@ -142,6 +172,8 @@ If you made changes, open a PR titled:
 
 `[instructions] Sync instruction files with release X.Y.Z`
 
+Call native `create_pull_request` once with the title and body as argument fields after completing the edits and checks. Follow its generated patch/commit instructions; do not push a branch or use `gh pr create`. If no edits are needed after the required audits, call native `noop` with the audit result before finishing.
+
 Include:
 
 - files changed
@@ -152,6 +184,7 @@ Include:
 
 ## Edge Cases
 
+- if the Release/Change audit finds no relevant docs or `.github/aw/` changes **and** the Size audit confirms all files are under their limits, exit immediately without running the Duplication or Accuracy audits
 - if no documentation changed, still run the size, duplication, and safe-output accuracy audits
 - if instructions are already current, exit without edits
 - if a file needs more than one new topic section to stay compact, create more than one focused sub-file instead of keeping one large catch-all file

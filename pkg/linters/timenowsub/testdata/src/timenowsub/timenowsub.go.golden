@@ -9,6 +9,18 @@ func bad(t time.Time) {
 	_ = time.Since(t) // want `time\.Now\(\)\.Sub\(t\) can be simplified to time\.Since\(t\)`
 }
 
+func badParenthesized(t time.Time) {
+	_ = time.Since(t) // want `time\.Now\(\)\.Sub\(t\) can be simplified to time\.Since\(t\)`
+}
+
+func badParenthesizedCallee(t time.Time) {
+	_ = time.Since(t) // want `time\.Now\(\)\.Sub\(t\) can be simplified to time\.Since\(t\)`
+}
+
+func badParenthesizedNow(t time.Time) {
+	_ = time.Since(t) // want `time\.Now\(\)\.Sub\(t\) can be simplified to time\.Since\(t\)`
+}
+
 func badAssign(start time.Time) time.Duration {
 	return time.Since(start) // want `time\.Now\(\)\.Sub\(start\) can be simplified to time\.Since\(start\)`
 }
@@ -23,6 +35,10 @@ func badSelector(s state) time.Duration {
 
 func badIndex(starts []time.Time, i int) time.Duration {
 	return time.Since(starts[i]) // want `time\.Now\(\)\.Sub\(starts\[i\]\) can be simplified to time\.Since\(starts\[i\]\)`
+}
+
+func badWithComments(start time.Time) time.Duration {
+	return time.Now().Sub(start /* measured from init */) // want `time\.Now\(\)\.Sub\(start\) can be simplified to time\.Since\(start\)`
 }
 
 func good(t time.Time) {

@@ -39,6 +39,7 @@ func ExtractJSONPathFromValidationError(err error) []JSONPathInfo {
 				Message:   cause.Error(),
 				Location:  cause.InstanceLocation,
 				ErrorKind: cause.ErrorKind,
+				Causes:    cause.Causes,
 			}
 			paths = append(paths, path)
 		}
@@ -49,10 +50,11 @@ func ExtractJSONPathFromValidationError(err error) []JSONPathInfo {
 
 // JSONPathInfo holds information about a validation error and its path
 type JSONPathInfo struct {
-	Path      string               // JSON path like "/tools/1" or "/age"
-	Message   string               // Error message
-	Location  []string             // Instance location from jsonschema (e.g., ["tools", "1"])
-	ErrorKind jsonschema.ErrorKind // Structural error kind; nil when built from a string-only context
+	Path      string                        // JSON path like "/tools/1" or "/age"
+	Message   string                        // Error message
+	Location  []string                      // Instance location from jsonschema (e.g., ["tools", "1"])
+	ErrorKind jsonschema.ErrorKind          // Structural error kind; nil when built from a string-only context
+	Causes    []*jsonschema.ValidationError // Nested validation errors from a composite error kind such as OneOf or Group
 }
 
 // convertInstanceLocationToJSONPath converts jsonschema InstanceLocation to JSON path string
@@ -105,22 +107,38 @@ func LocateJSONPathForPathInfo(yamlContent string, info JSONPathInfo) JSONPathLo
 }
 
 // additionalPropertyNamesFor returns the disallowed property names for a JSONPathInfo.
-// It checks ErrorKind first (structural, no string parsing) and falls back to regex on Message.
+// It checks ErrorKind first (structural, no string parsing) and falls back to regex on Message
+// only when no structural error kind is available.
 func additionalPropertyNamesFor(info JSONPathInfo) []string {
 	if info.ErrorKind != nil {
 		if ap, ok := info.ErrorKind.(*kind.AdditionalProperties); ok {
 			return ap.Properties
 		}
 		switch info.ErrorKind.(type) {
-		case *kind.OneOf, *kind.AnyOf, *kind.AllOf, *kind.Group:
-			// Composite errors may wrap an additional-properties leaf; regex fallback
-			// preserves the historical location behavior for these aggregate kinds.
-			return extractAdditionalPropertyNames(info.Message)
+		case *kind.OneOf, *kind.AnyOf, *kind.AllOf, *kind.Group, *kind.Reference:
+			return additionalPropertyNamesFromCauses(info.Causes)
 		default:
 			return nil
 		}
 	}
 	return extractAdditionalPropertyNames(info.Message)
+}
+
+func additionalPropertyNamesFromCauses(causes []*jsonschema.ValidationError) []string {
+	var names []string
+	for _, cause := range causes {
+		if cause == nil {
+			continue
+		}
+		if ap, ok := cause.ErrorKind.(*kind.AdditionalProperties); ok {
+			names = append(names, ap.Properties...)
+			continue
+		}
+		if len(cause.Causes) > 0 {
+			names = append(names, additionalPropertyNamesFromCauses(cause.Causes)...)
+		}
+	}
+	return names
 }
 
 func findPathInYAMLLines(yamlContent string, pathSegments []PathSegment) JSONPathLocation {
@@ -175,14 +193,13 @@ func matchesPathAtLevel(line string, pathSegments []PathSegment, level int, arra
 	// This is a simplified version - in a full implementation we'd need to track
 	// the complete path context as we traverse the YAML
 
-	if level < len(pathSegments) {
+	if level >= 0 && level < len(pathSegments) {
 		segment := pathSegments[level]
 
 		switch segment.Type {
 		case "key":
 			// Look for "key:" pattern
-			keyPattern := regexp.MustCompile(`^` + regexp.QuoteMeta(segment.Value) + `\s*:`)
-			if keyPattern.MatchString(trimmedLine) {
+			if matchesPathSegmentKey(trimmedLine, segment.Value) {
 				// Found the key - return position after the colon
 				colonIndex := strings.Index(line, ":")
 				if colonIndex != -1 {
@@ -249,12 +266,12 @@ func extractAdditionalPropertyNames(errorMessage string) []string {
 	}
 
 	// Extract all quoted property names from the matched string
-	propMatches := quotedPropertyPattern.FindAllStringSubmatch(match[1], -1)
+	propMatches := quotedPropertyPattern.FindAllStringSubmatch(match[1], -1) //nolint:uncheckedsliceindex // Capture group length is checked above.
 
 	var properties []string
 	for _, propMatch := range propMatches {
 		if len(propMatch) > 1 {
-			prop := strings.TrimSpace(propMatch[1])
+			prop := strings.TrimSpace(propMatch[1]) //nolint:uncheckedsliceindex // Capture group length is checked above.
 			if prop != "" {
 				properties = append(properties, prop)
 			}
@@ -279,8 +296,7 @@ func findFirstAdditionalProperty(yamlContent string, propertyNames []string) JSO
 		// Check if this line contains any of the additional properties
 		for _, propName := range propertyNames {
 			// Look for "propName:" pattern at the start of the trimmed line
-			keyPattern := regexp.MustCompile(`^` + regexp.QuoteMeta(propName) + `\s*:`)
-			if keyPattern.MatchString(trimmedLine) {
+			if matchesPathSegmentKey(trimmedLine, propName) {
 				// Found the property - return position of the property name
 				propIndex := strings.Index(line, propName)
 				if propIndex != -1 {
@@ -327,10 +343,8 @@ func extractNestedSubYAML(yamlContent string, nestedSection NestedSection) (stri
 	lines := strings.Split(yamlContent, "\n")
 	subYAMLLines := make([]string, 0, nestedSection.endLine-nestedSection.startLine+1)
 	var baseIndent = -1
-	for lineNum := nestedSection.startLine; lineNum <= nestedSection.endLine && lineNum < len(lines); lineNum++ {
-		line := lines[lineNum]
-
-		if lineNum == nestedSection.startLine {
+	for lineNum, line := range lines {
+		if lineNum <= nestedSection.startLine || lineNum > nestedSection.endLine {
 			continue
 		}
 
@@ -393,7 +407,7 @@ func findNestedSectionStart(lines []string, pathSegments []PathSegment) (int, in
 			continue
 		}
 		lineLevel := (len(line) - len(strings.TrimLeft(line, " \t"))) / 2
-		if currentLevel >= len(pathSegments) {
+		if currentLevel < 0 || currentLevel >= len(pathSegments) {
 			continue
 		}
 		segment := pathSegments[currentLevel]
@@ -409,16 +423,21 @@ func findNestedSectionStart(lines []string, pathSegments []PathSegment) (int, in
 }
 
 func matchesPathSegmentKey(trimmedLine, key string) bool {
-	keyPattern := regexp.MustCompile(`^` + regexp.QuoteMeta(key) + `\s*:`)
-	return keyPattern.MatchString(trimmedLine)
+	if !strings.HasPrefix(trimmedLine, key) {
+		return false
+	}
+	remainder := strings.TrimLeft(trimmedLine[len(key):], " \t\r\n\f")
+	return strings.HasPrefix(remainder, ":")
 }
 
 func findNestedSectionEnd(lines []string, foundLine, baseIndentLevel int) int {
 	endLine := len(lines) - 1          // Default to end of file
 	targetLevel := baseIndentLevel - 1 // The level of the key we found
 
-	for lineNum := foundLine + 1; lineNum < len(lines); lineNum++ {
-		line := lines[lineNum]
+	for lineNum, line := range lines {
+		if lineNum <= foundLine {
+			continue
+		}
 		trimmedLine := strings.TrimSpace(line)
 
 		if trimmedLine == "" || strings.HasPrefix(trimmedLine, "#") {

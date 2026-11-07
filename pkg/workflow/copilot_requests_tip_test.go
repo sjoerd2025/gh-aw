@@ -95,6 +95,7 @@ permissions:
 			const tipText = "Tip: set permissions.copilot-requests: write to use GitHub Actions token-based inference"
 			const tipLink = "https://github.github.com/gh-aw/reference/billing/"
 			const tipOrgNote = "requires that your organization has centralized Copilot billing enabled and may not be available"
+			const tipOptOut = "To suppress this tip when using a PAT, set permissions.copilot-requests: none"
 			if tt.expectTip && !strings.Contains(stderrOutput, tipText) {
 				t.Fatalf("Expected copilot-requests tip in stderr, got:\n%s", stderrOutput)
 			}
@@ -104,8 +105,60 @@ permissions:
 			if tt.expectTip && !strings.Contains(stderrOutput, tipOrgNote) {
 				t.Fatalf("Expected org billing note in copilot-requests tip, got:\n%s", stderrOutput)
 			}
+			if tt.expectTip && !strings.Contains(stderrOutput, tipOptOut) {
+				t.Fatalf("Expected PAT opt-out in copilot-requests tip, got:\n%s", stderrOutput)
+			}
 			if !tt.expectTip && strings.Contains(stderrOutput, tipText) {
 				t.Fatalf("Did not expect copilot-requests tip in stderr, got:\n%s", stderrOutput)
+			}
+		})
+	}
+}
+
+func TestCopilotRequestsEnableTipAcrossWorkflows(t *testing.T) {
+	dir := testutil.TempDir(t, "copilot-requests-tip-batch")
+	const content = `---
+on: workflow_dispatch
+engine: copilot
+permissions:
+  contents: read
+---
+
+# Test Workflow
+`
+	paths := []string{filepath.Join(dir, "first.md"), filepath.Join(dir, "second.md")}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, batch := range []bool{false, true} {
+		t.Run(map[bool]string{false: "verbose", true: "batch"}[batch], func(t *testing.T) {
+			compiler := NewCompiler(WithVerbose(!batch), WithNoEmit(true))
+			compiler.SetStrictMode(false)
+			compiler.SetBatchMode(batch)
+			compiler.SetQuiet(batch)
+
+			stderr := testutil.CaptureStderr(t, func() {
+				for _, path := range paths {
+					compiler.ResetWarningCount()
+					if err := compiler.CompileWorkflow(path); err != nil {
+						t.Fatalf("compile %s: %v", path, err)
+					}
+				}
+			})
+
+			const tip = "Tip: set permissions.copilot-requests: write"
+			expectedCount := 1
+			if batch {
+				expectedCount = 0
+			}
+			if count := strings.Count(stderr, tip); count != expectedCount {
+				t.Fatalf("expected %d inline tips, got %d:\n%s", expectedCount, count, stderr)
+			}
+			if compiler.CopilotRequestsTipNeeded() != batch {
+				t.Fatalf("batch tip needed = %t, want %t", compiler.CopilotRequestsTipNeeded(), batch)
 			}
 		})
 	}

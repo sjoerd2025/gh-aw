@@ -10,9 +10,10 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/coverage"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
@@ -28,11 +29,11 @@ const (
 //
 // Built once at package init so it can be reused across analysis passes.
 var writerIface = func() *types.Interface {
-	byteSlice := types.NewSlice(types.Typ[types.Byte])
+	byteSlice := types.NewSlice(types.Universe.Lookup("byte").Type())
 	errType := types.Universe.Lookup("error").Type()
 	params := types.NewTuple(types.NewVar(token.NoPos, nil, "p", byteSlice))
 	results := types.NewTuple(
-		types.NewVar(token.NoPos, nil, "n", types.Typ[types.Int]),
+		types.NewVar(token.NoPos, nil, "n", types.Universe.Lookup("int").Type()),
 		types.NewVar(token.NoPos, nil, "err", errType),
 	)
 	sig := types.NewSignatureType(nil, nil, nil, params, results, false)
@@ -43,34 +44,26 @@ var writerIface = func() *types.Interface {
 }()
 
 // Analyzer is the write-byte-string analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "writebytestring",
-	Doc:      "reports w.Write([]byte(s)) calls where s is a string that can be replaced with io.WriteString(w, s)",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/writebytestring",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
+var Analyzer = analyzerutil.New("writebytestring", "reports w.Write([]byte(s)) calls where s is a string that can be replaced with io.WriteString(w, s)", run)
+
+// hotThreshold gates findings on coverage data; see coverage package docs.
+var hotThreshold *int
+
+func init() {
+	hotThreshold = coverage.RegisterHotThresholdFlag(Analyzer)
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 	filesWithImportEdit := make(map[token.Pos]bool)
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeWriteCall(pass, n, generatedFiles, noLintIndex, filesWithImportEdit)
 	})
-	return nil, nil
 }
 
 // analyzeWriteCall checks whether a call expression is a w.Write([]byte(s))
@@ -81,8 +74,8 @@ func analyzeWriteCall(pass *analysis.Pass, n ast.Node, generatedFiles filecheck.
 		return
 	}
 
-	// Match <expr>.Write(<arg>)
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	// Match <expr>.Write(<arg>), including a parenthesized callee (w.Write)(...).
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Write" {
 		return
 	}
@@ -99,14 +92,28 @@ func analyzeWriteCall(pass *analysis.Pass, n ast.Node, generatedFiles filecheck.
 	}
 
 	// The single argument must be a []byte(s) conversion where s is a string.
-	conv, ok := call.Args[0].(*ast.CallExpr)
-	if !ok {
+	// astutil.UnwrapParenExpr handles a parenthesized conversion, e.g.
+	// w.Write(([]byte(s))).
+	var writeArg ast.Expr
+	for _, arg := range call.Args {
+		writeArg = arg
+		break
+	}
+	if writeArg == nil {
 		return
 	}
-	if !astutil.IsByteSliceConversion(pass, conv) {
+	conv, ok := astutil.UnwrapParenExpr(writeArg).(*ast.CallExpr)
+	if !ok || !astutil.IsByteSliceConversion(pass, conv) {
 		return
 	}
-	strArg := conv.Args[0]
+	var strArg ast.Expr
+	for _, arg := range conv.Args {
+		strArg = arg
+		break
+	}
+	if strArg == nil {
+		return
+	}
 	if !astutil.IsStringType(pass, strArg) {
 		return
 	}
@@ -116,14 +123,22 @@ func analyzeWriteCall(pass *analysis.Pass, n ast.Node, generatedFiles filecheck.
 		return
 	}
 
+	if !coverage.ShouldApply(pass, call.Pos(), *hotThreshold) {
+		return
+	}
+
+	reportWriteStringSuggestion(pass, call, sel.X, strArg, filesWithImportEdit)
+}
+
+func reportWriteStringSuggestion(pass *analysis.Pass, call *ast.CallExpr, receiver, strArg ast.Expr, filesWithImportEdit map[token.Pos]bool) {
 	sText := astutil.NodeText(pass.Fset, strArg)
-	wText := astutil.NodeText(pass.Fset, sel.X)
+	wText := astutil.NodeText(pass.Fset, receiver)
 	if sText == "" || wText == "" {
 		return
 	}
 
 	sExpr := buildStringExpr(pass, strArg, sText)
-	writerArg := buildWriterArg(pass, sel.X, wText)
+	writerArg := buildWriterArg(pass, receiver, wText)
 
 	pass.Report(analysis.Diagnostic{
 		Pos:            call.Pos(),
@@ -190,6 +205,9 @@ func implementsWriter(pass *analysis.Pass, expr ast.Expr) bool {
 // variable at the call site, no SuggestedFix is emitted (the diagnostic is
 // still reported).
 func buildFix(pass *analysis.Pass, call *ast.CallExpr, writerArg, sText string, filesWithImportEdit map[token.Pos]bool) []analysis.SuggestedFix {
+	if astutil.HasOverlappingComment(pass.Files, call.Pos(), call.End()) {
+		return nil
+	}
 	// Find the file containing this call.
 	file := astutil.FileForPos(pass.Files, call.Pos())
 
@@ -285,8 +303,14 @@ func buildIOImportTextEdit(pass *analysis.Pass, file *ast.File) (analysis.TextEd
 			singleDecl = genDecl
 		}
 	}
+
 	if importDeclCount == 1 && singleDecl != nil {
-		specText := astutil.NodeText(pass.Fset, singleDecl.Specs[0])
+		var singleSpec ast.Spec
+		for _, spec := range singleDecl.Specs {
+			singleSpec = spec
+			break
+		}
+		specText := astutil.NodeText(pass.Fset, singleSpec)
 		if specText != "" {
 			return analysis.TextEdit{
 				Pos:     singleDecl.Pos(),

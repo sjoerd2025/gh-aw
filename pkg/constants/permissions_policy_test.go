@@ -18,6 +18,7 @@ import (
 )
 
 func TestPermissionConstantsValues(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		got  fs.FileMode
@@ -27,16 +28,19 @@ func TestPermissionConstantsValues(t *testing.T) {
 		{name: "FilePermPublic", got: FilePermPublic, want: 0o644},
 		{name: "FilePermExecutable", got: FilePermExecutable, want: 0o755},
 		{name: "DirPermSensitive", got: DirPermSensitive, want: 0o750},
+		{name: "DirPermOwnerOnly", got: DirPermOwnerOnly, want: 0o700},
 		{name: "DirPermPublic", got: DirPermPublic, want: 0o755},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.want, tt.got)
 		})
 	}
 }
 
 func TestNoRawOctalPermissionLiteralsInOSCalls(t *testing.T) {
+	t.Parallel()
 	_, thisFile, _, ok := runtime.Caller(0)
 	require.True(t, ok, "runtime.Caller failed")
 

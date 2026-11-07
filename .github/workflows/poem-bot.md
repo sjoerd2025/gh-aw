@@ -27,30 +27,28 @@ permissions:
   pull-requests: read
 
 # AI engine configuration
-model: copilot/gpt-5.4
+model: copilot/gpt-5.6-sol
 engine:
-  id: pi
-  bare: true
+  id: codex
+  model-provider: github
 
 # Import shared reporting guidelines
 imports:
   - shared/reporting.md
+  - shared/otlp.md
 
 # Deny all network access
-  - shared/otlp.md
 network: {}
 
 # Tools configuration
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   edit:
   bash:
-    - "echo"
-    - "date"
-    - "git"
+    - "*"
   # Memory cache for persistent AI memory across runs
   cache-memory:
     key: poem-memory-${{ github.workflow }}
@@ -97,6 +95,7 @@ safe-outputs:
     max: 5
 
   # Pull request creation
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[🎨 POETRY] "
@@ -151,9 +150,6 @@ safe-outputs:
 # Global timeout
 timeout-minutes: 10
 strict: true
-sandbox:
-  agent:
-    sudo: false
 evals:
   - id: issue-created
     question: Did the agent create an issue containing a poem?

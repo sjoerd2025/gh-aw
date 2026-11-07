@@ -62,11 +62,17 @@ func (c *Compiler) validateDispatchWorkflow(data *WorkflowData, workflowPath str
 			githubDir := filepath.Dir(currentDir)
 			repoRoot := filepath.Dir(githubDir)
 			workflowsDir := filepath.Join(repoRoot, constants.GetWorkflowDir())
-			notFoundErr := fmt.Errorf("dispatch-workflow: workflow '%s' not found in %s\n\nChecked for: %s.md, %s.lock.yml, %s.yml\n\nTo fix:\n1. Verify the workflow file exists in %s/\n2. Ensure the filename matches exactly (case-sensitive)\n3. Use the filename without extension in your configuration", workflowName, workflowsDir, workflowName, workflowName, workflowName, workflowsDir)
+			notFoundErr := fmt.Errorf("dispatch-workflow: workflow '%s' not found in %s\n\nChecked for: %s.md, %s.lock.yml, %s.yml, %s.yaml\n\nTo fix:\n1. Verify the workflow file exists in %s/\n2. Ensure the filename matches exactly (case-sensitive)\n3. Use the filename without extension in your configuration", workflowName, workflowsDir, workflowName, workflowName, workflowName, workflowName, workflowsDir)
 			if returnErr := collector.Add(notFoundErr); returnErr != nil {
 				return returnErr
 			}
 			continue
+		}
+
+		if err := validateDispatchWorkQueueTarget(data, workflowName, fileResult); err != nil {
+			if returnErr := collector.Add(err); returnErr != nil {
+				return returnErr
+			}
 		}
 
 		var workflowContent []byte // #nosec G304 -- All file paths are validated via isPathWithinDir before use
@@ -145,6 +151,27 @@ func (c *Compiler) validateDispatchWorkflow(data *WorkflowData, workflowPath str
 	dispatchWorkflowValidationLog.Printf("Dispatch workflow validation completed: error_count=%d, total_workflows=%d", collector.Count(), len(config.Workflows))
 
 	return collector.FormattedError("dispatch-workflow")
+}
+
+func validateDispatchWorkQueueTarget(data *WorkflowData, workflowName string, fileResult *findWorkflowFileResult) error {
+	if !isWorkQueueEnabled(data) || !fileResult.mdExists {
+		return nil
+	}
+	queueEnabled, err := mdHasWorkQueueTools(fileResult.mdPath)
+	if err != nil {
+		return fmt.Errorf("dispatch-workflow: failed to inspect work-queue configuration for workflow '%s': %w", workflowName, err)
+	}
+	if !queueEnabled {
+		return nil
+	}
+	worker, err := mdHasWorkQueueWorker(fileResult.mdPath)
+	if err != nil {
+		return fmt.Errorf("dispatch-workflow: failed to inspect worker declaration for workflow '%s': %w", workflowName, err)
+	}
+	if !worker {
+		return fmt.Errorf("dispatch-workflow: workflow '%s' enables work-queue claims but is not declared as a worker; set tools.work-queue.worker: true", workflowName)
+	}
+	return nil
 }
 
 func (c *Compiler) shouldSkipLocalDispatchWorkflowValidation(targetRepoSlug string) bool {

@@ -81,16 +81,9 @@ func RunWorkflowInteractively(ctx context.Context, opts RunWorkflowOptions) erro
 
 	// Step 7: Execute the workflow
 	err = RunWorkflowOnGitHub(ctx, selectedWorkflow.Name, RunOptions{
-		Enable:         false,
-		EngineOverride: opts.EngineOverride,
-		RepoOverride:   opts.RepoOverride,
-		RefOverride:    opts.RefOverride,
-		AutoMergePRs:   opts.AutoMergePRs,
-		Push:           opts.Push,
-		Inputs:         inputValues,
-		Verbose:        opts.Verbose,
-		DryRun:         opts.DryRun,
-		Approve:        opts.Approve,
+		WorkflowRunFlags: opts.WorkflowRunFlags,
+		Enable:           false,
+		Inputs:           inputValues,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to run workflow: %w", err)
@@ -98,7 +91,7 @@ func RunWorkflowInteractively(ctx context.Context, opts RunWorkflowOptions) erro
 
 	// Show success message with command to run again
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Workflow dispatched successfully!"))
+	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Workflow dispatched successfully!"))
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("To run this workflow again, use:"))
 	fmt.Fprintln(os.Stderr, console.FormatCommandMessage(cmdStr))
@@ -362,17 +355,11 @@ func confirmExecution(ctx context.Context, wf *WorkflowOption, inputs []string) 
 	return confirm
 }
 
-// RunWorkflowOptions holds parameters for RunSpecificWorkflowInteractively.
+// RunWorkflowOptions holds parameters for interactive workflow runs.
 type RunWorkflowOptions struct {
-	WorkflowName   string
-	Verbose        bool
-	EngineOverride string
-	RepoOverride   string
-	RefOverride    string
-	AutoMergePRs   bool
-	Push           bool
-	DryRun         bool
-	Approve        bool
+	WorkflowRunFlags
+	WorkflowName       string
+	requiredInputsOnly bool
 }
 
 // RunSpecificWorkflowInteractively runs a specific workflow in interactive mode
@@ -397,18 +384,15 @@ func RunSpecificWorkflowInteractively(ctx context.Context, opts RunWorkflowOptio
 		// Continue without inputs - they might not be required
 		inputs = nil
 	}
-
-	// Create workflow option for display
-	wf := &WorkflowOption{
-		Name:        opts.WorkflowName,
-		Description: buildWorkflowDescription(inputs),
-		FilePath:    mdFile,
-		Inputs:      inputs,
+	if opts.requiredInputsOnly {
+		inputs = requiredWorkflowInputs(inputs)
 	}
 
-	// Show workflow info if there are inputs
-	if len(inputs) > 0 {
-		showWorkflowInfo(wf)
+	// Create the workflow option used to collect required inputs.
+	wf := &WorkflowOption{
+		Name:     opts.WorkflowName,
+		FilePath: mdFile,
+		Inputs:   inputs,
 	}
 
 	// Collect workflow inputs if needed
@@ -423,31 +407,28 @@ func RunSpecificWorkflowInteractively(ctx context.Context, opts RunWorkflowOptio
 		return nil
 	}
 
-	// Build command string for display
-	cmdStr := buildCommandString(opts.WorkflowName, inputValues, opts.RepoOverride, opts.RefOverride, opts.AutoMergePRs, opts.Push, opts.EngineOverride, opts.Approve)
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("\nRunning workflow..."))
-	fmt.Fprintln(os.Stderr, console.FormatCommandMessage("Equivalent command: "+cmdStr))
-	fmt.Fprintln(os.Stderr, "")
-
 	// Execute the workflow
 	err = RunWorkflowOnGitHub(ctx, opts.WorkflowName, RunOptions{
+		WorkflowRunFlags:  opts.WorkflowRunFlags,
 		Enable:            false,
-		EngineOverride:    opts.EngineOverride,
-		RepoOverride:      opts.RepoOverride,
-		RefOverride:       opts.RefOverride,
-		AutoMergePRs:      opts.AutoMergePRs,
-		Push:              opts.Push,
 		WaitForCompletion: true,
 		Inputs:            inputValues,
-		Verbose:           opts.Verbose,
-		DryRun:            opts.DryRun,
-		Approve:           opts.Approve,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to run workflow: %w", err)
 	}
 
 	return nil
+}
+
+func requiredWorkflowInputs(inputs map[string]*workflow.InputDefinition) map[string]*workflow.InputDefinition {
+	requiredInputs := make(map[string]*workflow.InputDefinition)
+	for name, definition := range inputs {
+		if definition != nil && definition.Required {
+			requiredInputs[name] = definition
+		}
+	}
+	return requiredInputs
 }
 
 // buildCommandString builds the equivalent command string for display

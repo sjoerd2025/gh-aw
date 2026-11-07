@@ -210,11 +210,148 @@ function sanitizeDomainName(domain) {
 }
 
 /**
+ * Character class (as a source fragment) for the delimiters that may introduce a
+ * protocol-relative URL. A "//" is only treated as the start of a URL when it
+ * sits at the start of the string or immediately after one of these, so that
+ * "//" segments inside the path of an absolute URL (e.g.
+ * "https://github.com//issues") are not misread as a new URL.
+ *
+ * Beyond whitespace/bracket/quote, this includes the delimiters that actually
+ * precede a URL in rendered contexts: "<" and "=" for HTML attributes and
+ * CommonMark angle-bracket link destinations (`<img src=//host/x>`,
+ * `[a](<//host/x>)`), and ",", ">", "|" and "`" which separate URLs in prose,
+ * tables and markup. Omitting these left renderable URLs unfiltered.
+ *
+ * Shared by the userinfo-stripping pre-pass and the protocol-relative filtering
+ * pass so the two cannot disagree about what counts as a URL start: if the
+ * strip pass recognized a URL the filter pass did not (or vice versa), a
+ * spoofed host could be normalized into a form that is then trusted.
+ */
+const URL_START_DELIMITERS = "[\\s([{\"'<=,>|`]";
+
+/**
+ * Character class (as a source fragment) matching one character of a URL
+ * authority (the "userinfo@host:port" component).
+ *
+ * The authority ends at the path/query/fragment ("/", "?", "#") and at
+ * whitespace, but it must ALSO end at the delimiters that terminate a URL in
+ * prose and markup. Consuming those was a bypass rather than a cosmetic issue:
+ * with a class of merely [^\s/?#], the authority of the first URL in
+ * "https://x.com,https://github.com@evil.com/" swallowed ",https:", so the
+ * global scan resumed past the second URL's scheme and never stripped its
+ * userinfo — leaving the spoofed host to be read as the allowlisted github.com.
+ * The same applied to adjacent markdown images "![a](//x.com)![b](//host@evil)".
+ */
+const URL_AUTHORITY_CHAR = "[^\\s/?#,()<>[\\]{}\"'`|\\\\]";
+
+/**
+ * Remove the ASCII tab, CR and LF characters that URL parsers discard.
+ *
+ * WHATWG URL parsing strips these from anywhere in a URL before parsing, so
+ * "//github.com\tA@evil.com/x" is fetched as host "evil.com" with the userinfo
+ * "github.comA" — while a regex that treats them as terminators sees only the
+ * allowlisted "github.com". Callers must therefore compare hosts on the
+ * stripped form to match what a browser will actually request.
+ *
+ * @param {string} authority - The raw authority text
+ * @returns {string} The authority with tab/CR/LF removed
+ */
+function stripUrlIgnorableWhitespace(authority) {
+  return authority.replace(/[\t\r\n]/g, "");
+}
+
+/**
+ * Strip URL userinfo (user:password@) from all scheme://... URLs in a string.
+ * This must run before any domain filtering so that credentials embedded in
+ * a URL authority are never passed to the allowlist check or returned to the
+ * caller.
+ *
+ * Examples:
+ *   https://user:REDACTED@example.com/repo.git  →  https://example.com/repo.git
+ *   git://user@example.com/repo.git          →  git://example.com/repo.git
+ *
+ * @param {string} s - The string to process
+ * @returns {string} The string with userinfo removed from all URLs
+ */
+function stripUrlUserinfo(s) {
+  // Capture the authority-like component right after scheme:// - everything
+  // up to the start of the path (/), query (?), fragment (#), or whitespace.
+  //
+  // The scheme quantifier is bounded ({0,30}) rather than unbounded (*). With
+  // an unbounded quantifier, a long run of characters that never resolves to
+  // "://" (e.g. hundreds of thousands of plain letters) forces the scheme
+  // group to greedily consume the whole remainder and then backtrack one
+  // character at a time before the match attempt fails at that start
+  // position - and this repeats at every subsequent start position, giving
+  // O(n^2) behavior on pathological input even though there is no nested
+  // quantifier. Real URL schemes are always short (RFC 3986 examples and IANA
+  // registrations top out well under 30 characters), so bounding the
+  // quantifier keeps this linear without affecting legitimate matches.
+  //
+  // Once captured, look for the LAST "@" within that authority component (in
+  // plain JS, not regex) and drop everything up to and including it. Using
+  // the last "@" ensures chained userinfo values (e.g. "a@b@c@host") are
+  // fully stripped, while stopping the authority match at "?"/"#" ensures an
+  // ordinary URL whose query string happens to contain "@" is left untouched.
+  //
+  // Tab/CR/LF are allowed *inside* the authority and then discarded, because
+  // URL parsers discard them too: without this, "https://github.com\tA@evil.com/"
+  // would present an authority of just the allowlisted "github.com" to the
+  // filter while a browser fetches evil.com. Tolerating them is safe because a
+  // rewrite only happens when the cleaned authority contains "@" — so an
+  // ordinary host that merely happens to be followed by a newline and more
+  // prose is left untouched.
+  const schemeUserinfoRegex = new RegExp(`([a-z][a-z0-9+.-]{0,30}://)((?:${URL_AUTHORITY_CHAR}|[\\t\\r\\n])*)`, "gi");
+  return s.replace(schemeUserinfoRegex, (match, scheme, authority) => {
+    const cleaned = stripUrlIgnorableWhitespace(authority);
+    const at = cleaned.lastIndexOf("@");
+    if (at === -1) return match;
+    return scheme + cleaned.slice(at + 1);
+  });
+}
+
+/**
+ * Strip URL userinfo (user:password@) from protocol-relative URLs (//host/path).
+ *
+ * Browsers on an HTTPS page resolve "//host/path" to "https://host/path", so a
+ * protocol-relative URL carries the same userinfo-spoofing risk as an explicit
+ * https:// URL: in "//github.com@evil.com/x" the real host is evil.com, but a
+ * host pattern that stops at "@" would read it as the allowlisted github.com.
+ * stripUrlUserinfo() cannot cover this form because it requires a scheme.
+ *
+ * The "//" is only treated as a protocol-relative URL when it appears at the
+ * start of the string or immediately after a URL-introducing delimiter (see
+ * URL_START_DELIMITERS) — the same anchoring used by the protocol-relative pass
+ * in sanitizeUrlDomains() — so "//" segments inside the path of an absolute URL
+ * (e.g. "https://github.com//issues") are left untouched.
+ *
+ * Backslashes are accepted in the separator position because URL parsers treat
+ * "\" as "/" for special schemes, so "\\github.com@evil.com/x" and
+ * "/\github.com@evil.com/x" both resolve to host evil.com in a browser.
+ *
+ * @param {string} s - The string to process
+ * @returns {string} The string with userinfo removed from protocol-relative URLs
+ */
+function stripProtocolRelativeUserinfo(s) {
+  const protoRelativeUserinfoRegex = new RegExp(`(^|${URL_START_DELIMITERS})([/\\\\]{2})((?:${URL_AUTHORITY_CHAR}|[\\t\\r\\n])*)`, "g");
+  return s.replace(protoRelativeUserinfoRegex, (match, prefix, _slashes, authority) => {
+    const cleaned = stripUrlIgnorableWhitespace(authority);
+    const at = cleaned.lastIndexOf("@");
+    if (at === -1) return match;
+    return prefix + "//" + cleaned.slice(at + 1);
+  });
+}
+
+/**
  * Sanitize URL protocols - replace non-https with <sanitized-domain>/redacted
  * @param {string} s - The string to process
  * @returns {string} The string with non-https protocols redacted
  */
 function sanitizeUrlProtocols(s) {
+  // Strip userinfo (user:password@) from all scheme:// URLs before any other
+  // processing so that credentials never appear in redaction summaries or logs.
+  s = stripUrlUserinfo(s);
+
   // Normalize percent-encoded colons before applying the protocol filter.
   // This prevents bypasses via javascript%3Aalert(1) (single-encoded),
   // javascript%253Aalert(1) (double-encoded), or deeper nesting.
@@ -255,7 +392,6 @@ function sanitizeUrlProtocols(s) {
       // remains useful without recording an empty-string entry.
       const truncated = fullMatch.length > 12 ? fullMatch.substring(0, 12) + "..." : fullMatch;
       core.info(`Redacted URL: ${truncated}`);
-      core.debug(`Redacted URL (full): ${fullMatch}`);
       addRedactedDomain(scheme.toLowerCase() + "://");
       return "(redacted)";
     }
@@ -263,7 +399,6 @@ function sanitizeUrlProtocols(s) {
     const sanitized = sanitizeDomainName(domainLower);
     const truncated = domainLower.length > 12 ? domainLower.substring(0, 12) + "..." : domainLower;
     core.info(`Redacted URL: ${truncated}`);
-    core.debug(`Redacted URL (full): ${fullMatch}`);
     addRedactedDomain(domainLower);
     return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
   });
@@ -278,7 +413,6 @@ function sanitizeUrlProtocols(s) {
       const protocol = protocolMatch[1] + ":";
       const truncated = match.length > 12 ? match.substring(0, 12) + "..." : match;
       core.info(`Redacted URL: ${truncated}`);
-      core.debug(`Redacted URL (full): ${match}`);
       addRedactedDomain(protocol);
     }
     return "(redacted)";
@@ -292,6 +426,14 @@ function sanitizeUrlProtocols(s) {
  * @returns {string} The string with unknown domains redacted
  */
 function sanitizeUrlDomains(s, allowed) {
+  // Strip userinfo (user:password@) from HTTPS URLs before any domain filtering
+  // so that credentials are never passed to the allowlist check or preserved
+  // in the output for an allowed domain. Protocol-relative URLs (//host/path)
+  // are stripped too, since browsers resolve them to https:// and they are
+  // subject to the same allowlist check below.
+  s = stripUrlUserinfo(s);
+  s = stripProtocolRelativeUserinfo(s);
+
   // Match HTTPS URLs with optional port and path
   // This regex is designed to:
   // 1. Match https:// URIs with explicit protocol
@@ -337,7 +479,6 @@ function sanitizeUrlDomains(s, allowed) {
       const sanitized = sanitizeDomainName(hostname);
       const truncated = hostname.length > 12 ? hostname.substring(0, 12) + "..." : hostname;
       core.info(`Redacted URL: ${truncated}`);
-      core.debug(`Redacted URL (full): ${match}`);
       addRedactedDomain(hostname);
       // Return sanitized domain format
       return sanitized ? `(${sanitized}/redacted)` : "(redacted)";
@@ -376,19 +517,65 @@ function sanitizeUrlDomains(s, allowed) {
   // The path stop-condition (?!\/\/) stops before the next protocol-relative URL
   // (analogous to how the httpsUrlRegex stops before the next https:// URL).
   // Capture groups:
+  // Second pass: handle protocol-relative URLs (//hostname/path).
+  // Browsers on HTTPS pages resolve these to https://, so they must be subject
+  // to the same domain allowlist check as explicit https:// URLs.
+  // We only treat // as a protocol-relative URL when it appears at the start of
+  // the string or immediately after a URL-introducing delimiter. The delimiter
+  // set is shared with the userinfo-stripping pre-pass (URL_START_DELIMITERS)
+  // so the two passes cannot disagree about where a URL begins. This avoids
+  // matching // segments inside the path of an allowed https:// URL, such as
+  // "https://github.com//issues".
+  // The separator accepts backslashes ("\\host", "/\host") because URL parsers
+  // treat "\" as "/" for special schemes, so those forms reach the same host.
+  // The path stop-condition (?!\/\/) stops before the next protocol-relative URL
+  // (analogous to how the httpsUrlRegex stops before the next https:// URL).
+  // Capture groups:
   //   1: prefix (start-of-string or delimiter)
-  //   2: full protocol-relative URL (starting with //)
+  //   2: separator (// or a backslash variant)
   //   3: hostname (and optional port)
   //   4: optional path
-  const protoRelativeUrlRegex = /(^|[\s([{"'])(\/\/([\w.-]+(?::\d+)?)(\/(?:(?!\/\/)[^\s,])*)?)/gi;
+  const protoRelativeUrlRegex = new RegExp(`(^|${URL_START_DELIMITERS})([/\\\\]{2})([\\w.-]+(?::\\d+)?)((?:/(?:(?![/\\\\]{2})[^\\s,])*)?)`, "gi");
 
-  s = s.replace(protoRelativeUrlRegex, (match, prefix, url, hostnameWithPort) => prefix + applyDomainFilter(url, hostnameWithPort));
+  s = s.replace(protoRelativeUrlRegex, (match, prefix, _separator, hostnameWithPort, path = "") => {
+    // Normalize the separator to "//" so a backslash form can never survive as
+    // an allowed URL in a shape the regex would not re-examine.
+    const url = `//${hostnameWithPort}${path}`;
+    return prefix + applyDomainFilter(url, hostnameWithPort);
+  });
 
   return s;
 }
 
 /**
- * Neutralizes commands at the start of text by wrapping them in backticks.
+ * Creates a code-span wrapper whose delimiter length does not occur in the input.
+ * This prevents surrounding attacker-controlled backticks from pairing with the
+ * sanitizer's delimiters and exposing the wrapped token in rendered Markdown.
+ * @param {string} s - The complete string being processed
+ * @returns {(text: string, before?: string, after?: string) => string} A render-safe inline-code wrapper
+ */
+function createRenderSafeCodeSpanWrapper(s) {
+  const usedDelimiterLengths = new Set(Array.from(s.matchAll(/`+/g), match => match[0].length));
+  let delimiterLength = 1;
+  while (usedDelimiterLengths.has(delimiterLength)) {
+    delimiterLength++;
+  }
+  // Do not let an attacker inflate every replacement by supplying progressively
+  // longer backtick runs. HTML code elements provide the same inert rendering
+  // without a delimiter whose length depends on the input.
+  if (delimiterLength > 16) {
+    return text => `<code>${text.replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character])}</code>`;
+  }
+  const delimiter = "`".repeat(delimiterLength);
+  return (text, before = "", after = "") => {
+    const leadingSeparator = before.endsWith("`") ? " " : "";
+    const trailingSeparator = after.startsWith("`") ? " " : "";
+    return `${leadingSeparator}${delimiter}${text}${delimiter}${trailingSeparator}`;
+  };
+}
+
+/**
+ * Neutralizes commands at the start of text by wrapping them in a render-safe code span.
  * Reads all command names from GH_AW_COMMANDS (JSON array).
  * @param {string} s - The string to process
  * @returns {string} The string with neutralized commands
@@ -405,7 +592,7 @@ function neutralizeCommands(s) {
         commandNames = parsed.filter(c => typeof c === "string" && c.length > 0);
       }
     } catch {
-      // invalid JSON, no commands to neutralize
+      // Invalid JSON — ignored, no commands to neutralize.
     }
   }
 
@@ -415,10 +602,11 @@ function neutralizeCommands(s) {
 
   const leadingWhitespace = s.match(/^\s*/)?.[0] ?? "";
   const remainder = s.slice(leadingWhitespace.length);
+  const wrapInCodeSpan = createRenderSafeCodeSpanWrapper(s);
   const matchedCommand = resolveMatchedCommand(remainder, commandNames);
   if (matchedCommand) {
     const escapedCommand = matchedCommand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return s.replace(new RegExp(`^(\\s*)/(${escapedCommand})\\b`, "i"), "$1`/$2`");
+    return s.replace(new RegExp(`^(\\s*)/(${escapedCommand})\\b`, "i"), (match, whitespace, command, offset, input) => `${whitespace}${wrapInCodeSpan(`/${command}`, "", input[offset + match.length])}`);
   }
 
   for (const name of commandNames) {
@@ -426,7 +614,7 @@ function neutralizeCommands(s) {
       continue;
     }
     const escapedCommand = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const result = s.replace(new RegExp(`^(\\s*)/(${escapedCommand})\\b`, "i"), "$1`/$2`");
+    const result = s.replace(new RegExp(`^(\\s*)/(${escapedCommand})\\b`, "i"), (match, whitespace, command, offset, input) => `${whitespace}${wrapInCodeSpan(`/${command}`, "", input[offset + match.length])}`);
     if (result !== s) {
       return result;
     }
@@ -436,20 +624,22 @@ function neutralizeCommands(s) {
 }
 
 /**
- * Neutralizes ALL @mentions by wrapping them in backticks
+ * Neutralizes ALL @mentions by wrapping them in render-safe code spans.
  * This is the core version without any filtering
  * @param {string} s - The string to process
  * @returns {string} The string with neutralized mentions
  */
 function neutralizeAllMentions(s) {
-  // Replace @name or @org/team outside code with `@name`
-  // No filtering - all mentions are neutralized
-  // Changed [^\w`] to [^A-Za-z0-9`] to include underscore as a valid preceding character
-  // This prevents bypass patterns like "test_@user" from escaping sanitization
-  return s.replace(/(^|[^A-Za-z0-9`])@([A-Za-z0-9](?:[A-Za-z0-9_-]{0,37}[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g, (m, p1, p2) => {
-    // Log when a mention is escaped to help debug issues
-    core.info(`Escaped mention: @${p2} (not in allowed list)`);
-    return `${p1}\`@${p2}\``;
+  const wrapInCodeSpan = createRenderSafeCodeSpanWrapper(s);
+  return applyToNonCodeRegions(s, (segment, regionBefore = "", regionAfter = "") => {
+    // No filtering - all mentions outside matched code regions are neutralized.
+    // Use an explicit ASCII class so underscores before mentions remain covered.
+    return segment.replace(/(^|[^A-Za-z0-9])@([A-Za-z0-9](?:[A-Za-z0-9_-]{0,37}[A-Za-z0-9])?(?:\/[A-Za-z0-9._-]+)?)/g, (match, prefix, alias, offset) => {
+      core.info(`Escaped mention: @${alias} (not in allowed list)`);
+      const before = prefix || (offset === 0 ? regionBefore : "");
+      const after = segment[offset + match.length] || (offset + match.length === segment.length ? regionAfter : "");
+      return `${prefix}${wrapInCodeSpan(`@${alias}`, before, after)}`;
+    });
   });
 }
 
@@ -481,8 +671,11 @@ function getFencedCodeRanges(s) {
     const lineEnd = i < lines.length - 1 ? lineContentEnd + 1 : lineContentEnd;
 
     if (!inBlock) {
-      const m = trimmed.match(/^(`{3,}|~{3,})/);
-      if (m) {
+      // CommonMark permits at most three leading spaces. Backtick fence info
+      // strings cannot contain backticks; such lines may instead contain an
+      // inline code span followed by prose that still requires sanitization.
+      const m = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (m && (m[1][0] !== "`" || !m[2].includes("`"))) {
         inBlock = true;
         blockStart = pos;
         fenceChar = m[1][0];
@@ -491,8 +684,9 @@ function getFencedCodeRanges(s) {
     } else {
       // A closing fence: same character, at least as long, only whitespace after
       const fc = fenceChar === "`" ? "\\`" : "~";
-      const closingRegex = new RegExp(`^[${fc}]{${fenceLen},}\\s*$`);
-      if (closingRegex.test(trimmed)) {
+      // eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- `fc` is an already regex-escaped fence character and `fenceLen` is a numeric quantifier
+      const closingRegex = new RegExp(`^ {0,3}[${fc}]{${fenceLen},}\\s*$`);
+      if (closingRegex.test(line)) {
         ranges.push([blockStart, lineEnd]);
         inBlock = false;
         blockStart = -1;
@@ -518,11 +712,14 @@ function getFencedCodeRanges(s) {
  * non-code text; inline code spans are preserved verbatim.
  *
  * @param {string} text - The text to process (should not contain fenced code blocks)
- * @param {(s: string) => string} fn - Transformation to apply to non-code portions
+ * @param {(s: string, before?: string, after?: string) => string} fn - Transformation to apply to non-code portions
+ * @param {string} [outerBefore] - Character immediately before this text segment
+ * @param {string} [outerAfter] - Character immediately after this text segment
+ * @param {(s: string) => string} [codeFn] - Transformation for code spans
  * @returns {string} The processed text
  */
-function applyFnOutsideInlineCode(text, fn) {
-  if (!text) return fn(text || "");
+function applyFnOutsideInlineCode(text, fn, outerBefore = "", outerAfter = "", codeFn = text => text) {
+  if (!text) return fn(text || "", outerBefore, outerAfter);
 
   const parts = [];
   let i = 0;
@@ -567,9 +764,10 @@ function applyFnOutsideInlineCode(text, fn) {
     if (closeIdx !== -1) {
       // Valid inline code span found: apply fn to the text before it, then keep the code span
       if (textStart < btStart) {
-        parts.push(fn(text.slice(textStart, btStart)));
+        const before = textStart > 0 ? text[textStart - 1] : outerBefore;
+        parts.push(fn(text.slice(textStart, btStart), before, text[btStart]));
       }
-      parts.push(text.slice(btStart, closeIdx + btCount));
+      parts.push(codeFn(text.slice(btStart, closeIdx + btCount)));
       textStart = closeIdx + btCount;
       i = textStart;
     }
@@ -578,7 +776,8 @@ function applyFnOutsideInlineCode(text, fn) {
 
   // Apply fn to any remaining non-code text
   if (textStart < text.length) {
-    parts.push(fn(text.slice(textStart)));
+    const before = textStart > 0 ? text[textStart - 1] : outerBefore;
+    parts.push(fn(text.slice(textStart), before, outerAfter));
   }
 
   return parts.join("");
@@ -589,13 +788,17 @@ function applyFnOutsideInlineCode(text, fn) {
  * Skips both fenced code blocks (``` / ~~~ delimited) and inline code spans (backtick
  * delimited) so that the transformation is not applied to code content.
  *
- * Falls back to applying fn to the entire string if any parsing error occurs.
+ * Falls back to applying fn to the entire string if any parsing error occurs,
+ * unless a code-region transformation was supplied, in which case errors propagate.
  *
  * @param {string} s - Markdown content to process
- * @param {(s: string) => string} fn - Transformation to apply outside code regions
+ * @param {(s: string, before?: string, after?: string) => string} fn - Transformation to apply outside code regions
+ * @param {(s: string) => string} [codeFn] - Optional transformation for code regions
  * @returns {string} The content with the transformation applied only outside code regions
  */
-function applyToNonCodeRegions(s, fn) {
+function applyToNonCodeRegions(s, fn, codeFn) {
+  const hasCodeFn = codeFn !== undefined;
+  codeFn = codeFn ?? (text => text);
   if (!s || typeof s !== "string") {
     return s || "";
   }
@@ -605,7 +808,7 @@ function applyToNonCodeRegions(s, fn) {
 
     if (codeRanges.length === 0) {
       // No fenced code blocks – still protect inline code spans
-      return applyFnOutsideInlineCode(s, fn);
+      return applyFnOutsideInlineCode(s, fn, "", "", codeFn);
     }
 
     const parts = [];
@@ -614,22 +817,23 @@ function applyToNonCodeRegions(s, fn) {
     for (const [start, end] of codeRanges) {
       if (pos < start) {
         // Non-code text before this code block: protect inline code spans
-        parts.push(applyFnOutsideInlineCode(s.slice(pos, start), fn));
+        parts.push(applyFnOutsideInlineCode(s.slice(pos, start), fn, pos > 0 ? s[pos - 1] : "", s[start], codeFn));
       }
       // Fenced code block: preserve verbatim
-      parts.push(s.slice(start, end));
+      parts.push(codeFn(s.slice(start, end)));
       pos = end;
     }
 
     // Non-code text after the last code block
     if (pos < s.length) {
-      parts.push(applyFnOutsideInlineCode(s.slice(pos), fn));
+      parts.push(applyFnOutsideInlineCode(s.slice(pos), fn, pos > 0 ? s[pos - 1] : "", "", codeFn));
     }
 
     return parts.join("");
   } catch (_e) {
+    if (hasCodeFn) throw _e;
     // Fallback: apply fn to the entire string (conservative – redacts more, never less)
-    return fn(s);
+    return fn(s, "", "");
   }
 }
 
@@ -692,29 +896,83 @@ function removeXmlComments(s) {
  * @returns {string} The string with markdown link titles neutralized
  */
 function neutralizeMarkdownLinkTitles(s) {
-  // Move title into link text for inline links: [text](url "title") → [text (title)](url)
-  // Capturing groups:
-  //   1: opening bracket  [
-  //   2: link text
-  //   3: ]( separator
-  //   4: angle-bracket URL  <url>  (mutually exclusive with group 5)
-  //   5: bare URL           (mutually exclusive with group 4)
-  //   6: double-quoted title text  (mutually exclusive with 7 and 8)
-  //   7: single-quoted title text  (mutually exclusive with 6 and 8)
-  //   8: parenthesized title text  (mutually exclusive with 6 and 7)
-  //   9: optional whitespace before closing )
-  s = s.replace(/(\[)([^\]]*)(\]\()(?:(<[^>]*>)|([^\s)]+))\s+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\))(\s*\))/g, (match, ob, linkText, mid, angUrl, bareUrl, dqT, sqT, pT, close) => {
-    const url = angUrl !== undefined ? angUrl : bareUrl;
-    const title = dqT !== undefined ? dqT : sqT !== undefined ? sqT : pT;
-    return `${ob}${linkText} (${title})${mid}${url}${close}`;
-  });
-
-  // Strip title from reference-style link definitions: [ref]: url "title" → [ref]: url
-  // These must appear at the start of a line (per CommonMark spec). The gm flag makes
-  // ^ match after each newline so the substitution works correctly on multi-line content.
-  s = s.replace(/^(\[[^\]]+\]:\s+\S+)\s+(?:"[^"]*"|'[^']*'|\([^)]*\))\s*$/gm, "$1");
-
-  return s;
+  /**
+   * Index boundaries before matching so failed titles cannot rescan overlapping
+   * labels, destinations, or quoted suffixes.
+   * @param {string} source
+   * @param {boolean} reference
+   */
+  function neutralize(source, reference) {
+    if (!source.includes("[")) return source;
+    /** @type {Record<string, number[]>} */
+    const positions = { "[": [], "]": [], ">": [], '"': [], "'": [], ")": [], whitespace: [], text: [], lineEnd: [] };
+    for (let index = 0; index < source.length; index++) {
+      const character = source[index];
+      if (Object.hasOwn(positions, character)) positions[character].push(index);
+      positions[/\s/.test(character) ? "whitespace" : "text"].push(index);
+      if (/[\r\n\u2028\u2029]/.test(character)) positions.lineEnd.push(index);
+    }
+    /** @param {number[]} indices @param {number} offset */
+    function lowerBound(indices, offset) {
+      let low = 0;
+      let high = indices.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (indices[middle] < offset) low = middle + 1;
+        else high = middle;
+      }
+      return low;
+    }
+    /** @param {string} boundary @param {number} offset */
+    function next(boundary, offset) {
+      const indices = positions[boundary];
+      return indices[lowerBound(indices, offset)] ?? source.length;
+    }
+    /** @param {number} urlEnd */
+    function titleAt(urlEnd) {
+      if (urlEnd >= source.length || !/\s/.test(source[urlEnd])) return undefined;
+      const start = next("text", urlEnd);
+      const opener = source[start];
+      if (opener !== '"' && opener !== "'" && opener !== "(") return undefined;
+      const closing = next(opener === "(" ? ")" : opener, start + 1);
+      if (closing === source.length) return undefined;
+      const after = next("text", closing + 1);
+      if (!reference) return source[after] === ")" ? { start, closing, end: after + 1 } : undefined;
+      const lineEnd = positions.lineEnd[lowerBound(positions.lineEnd, after) - 1];
+      const end = after === source.length ? after : lineEnd;
+      return end !== undefined && end >= closing + 1 ? { start, closing, end } : undefined;
+    }
+    const fragments = [];
+    let written = 0;
+    let cursor = 0;
+    for (const start of positions["["]) {
+      if (start < cursor || (reference && start > 0 && !/[\r\n\u2028\u2029]/.test(source[start - 1]))) continue;
+      const labelEnd = next("]", start + 1);
+      if (labelEnd === source.length) break;
+      cursor = labelEnd + 1;
+      if (source[labelEnd + 1] !== (reference ? ":" : "(") || (reference && labelEnd === start + 1)) continue;
+      let urlStart = labelEnd + 2;
+      if (reference) {
+        if (!/\s/.test(source[urlStart] || "")) continue;
+        urlStart = next("text", urlStart);
+      }
+      let urlEnd = source[urlStart] === "<" && !reference ? next(">", urlStart + 1) + 1 : source.length;
+      let title = titleAt(urlEnd);
+      if (!title) {
+        urlEnd = reference ? next("whitespace", urlStart) : Math.min(next("whitespace", urlStart), next(")", urlStart));
+        if (urlEnd === urlStart) continue;
+        title = titleAt(urlEnd);
+      }
+      if (!title) continue;
+      fragments.push(source.slice(written, start));
+      if (reference) fragments.push(source.slice(start, urlEnd));
+      else fragments.push(`${source.slice(start, labelEnd)} (${source.slice(title.start + 1, title.closing)})](${source.slice(urlStart, urlEnd)}${source.slice(title.closing + 1, title.end)}`);
+      written = cursor = title.end;
+    }
+    fragments.push(source.slice(written));
+    return fragments.join("");
+  }
+  return neutralize(neutralize(s, false), true);
 }
 
 /**
@@ -861,7 +1119,7 @@ function convertXmlTags(s) {
 const MAX_BOT_TRIGGER_REFERENCES = 10;
 
 /**
- * Neutralizes bot trigger phrases by wrapping them in backticks.
+ * Neutralizes bot trigger phrases by wrapping them in render-safe code spans.
  * The first `maxBotMentions` unquoted trigger references are left unchanged;
  * any occurrences beyond that threshold are wrapped in backticks.
  * Already-quoted entries are never re-quoted.
@@ -870,20 +1128,19 @@ const MAX_BOT_TRIGGER_REFERENCES = 10;
  * @returns {string} The string with excess bot triggers neutralized
  */
 function neutralizeBotTriggers(s, maxBotMentions = MAX_BOT_TRIGGER_REFERENCES) {
-  // Match unquoted bot trigger phrases like "fixes #123", "closes #asdfs", etc.
-  // The negative lookbehind (?<!`) skips already-quoted entries.
-  const pattern = /(?<!`)\b(fixes?|closes?|resolves?|fix|close|resolve)\s+#(\w+)/gi;
-  const matches = s.match(pattern);
-  if (!matches || matches.length <= maxBotMentions) {
-    return s;
-  }
+  const pattern = /\b(fixes?|closes?|resolves?|fix|close|resolve)\s+#(\w+)/gi;
   let count = 0;
-  return s.replace(pattern, (match, action, ref) => {
-    count++;
-    if (count <= maxBotMentions) {
-      return match;
-    }
-    return `\`${action} #${ref}\``;
+  const wrapInCodeSpan = createRenderSafeCodeSpanWrapper(s);
+  return applyToNonCodeRegions(s, (segment, regionBefore = "", regionAfter = "") => {
+    return segment.replace(pattern, (match, action, ref, offset) => {
+      count++;
+      if (count <= maxBotMentions) {
+        return match;
+      }
+      const before = segment[offset - 1] || (offset === 0 ? regionBefore : "");
+      const after = segment[offset + match.length] || (offset + match.length === segment.length ? regionAfter : "");
+      return wrapInCodeSpan(`${action} #${ref}`, before, after);
+    });
   });
 }
 
@@ -1026,7 +1283,8 @@ function getCurrentRepoSlug() {
 }
 
 /**
- * Neutralizes GitHub references (#123 or owner/repo#456) by wrapping them in backticks
+ * Neutralizes GitHub references (#123 or owner/repo#456) by wrapping them in
+ * render-safe code spans
  * if they reference repositories not in the allowed list.
  * Supports wildcard patterns (e.g., "myorg/*", "*") via isRepoAllowed().
  * @param {string} s - The string to process
@@ -1040,38 +1298,35 @@ function neutralizeGitHubReferences(s, allowedRepos) {
   }
 
   const currentRepo = getCurrentRepoSlug();
+  const wrapInCodeSpan = createRenderSafeCodeSpanWrapper(s);
 
   // Expand the special "repo" keyword to the current repo slug and build a Set for isRepoAllowed()
   const allowedSet = new Set(allowedRepos.map(r => (r === "repo" ? currentRepo : r)));
 
-  // Match GitHub references:
-  // - #123 (current repo reference)
-  // - owner/repo#456 (cross-repo reference)
-  // - GH-123 (GitHub shorthand)
-  // Must not be inside backticks or code blocks
-  return s.replace(/(^|[^\w`])(?:([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)\/([a-z0-9._-]+))?#(\w+)/gi, (match, prefix, owner, repo, issueNum) => {
-    let targetRepo;
+  return applyToNonCodeRegions(s, (segment, regionBefore = "", regionAfter = "") => {
+    // Match #123 and owner/repo#456 outside matched code regions.
+    return segment.replace(/(^|[^\w])(?:([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)\/([a-z0-9._-]+))?#(\w+)/gi, (match, prefix, owner, repo, issueNum, offset) => {
+      let targetRepo;
 
-    if (owner && repo) {
-      // Cross-repo reference: owner/repo#123
-      targetRepo = `${owner}/${repo}`.toLowerCase();
-    } else {
-      // Current repo reference: #123
-      targetRepo = currentRepo;
-    }
+      if (owner && repo) {
+        // Cross-repo reference: owner/repo#123
+        targetRepo = `${owner}/${repo}`.toLowerCase();
+      } else {
+        // Current repo reference: #123
+        targetRepo = currentRepo;
+      }
 
-    // Check if this repo is allowed using isRepoAllowed (supports wildcard patterns)
-    if (isRepoAllowed(targetRepo, allowedSet)) {
-      return match; // Keep the original reference
-    } else {
-      // Escape the reference
+      // Check if this repo is allowed using isRepoAllowed (supports wildcard patterns)
+      if (isRepoAllowed(targetRepo, allowedSet)) {
+        return match; // Keep the original reference
+      }
+
       const refText = owner && repo ? `${owner}/${repo}#${issueNum}` : `#${issueNum}`;
-
-      // Log when a reference is escaped
       core.info(`Escaped GitHub reference: ${refText} (not in allowed list)`);
-
-      return `${prefix}\`${refText}\``;
-    }
+      const before = prefix || (offset === 0 ? regionBefore : "");
+      const after = segment[offset + match.length] || (offset + match.length === segment.length ? regionAfter : "");
+      return `${prefix}${wrapInCodeSpan(refText, before, after)}`;
+    });
   });
 }
 
@@ -1079,12 +1334,13 @@ function neutralizeGitHubReferences(s, allowedRepos) {
  * Apply truncation limits to content
  * @param {string} content - The content to truncate
  * @param {number} [maxLength] - Maximum length of content (default: 524288)
+ * @param {number} [maxLines] - Maximum number of lines (default: 65000)
  * @returns {string} The truncated content
  */
-function applyTruncation(content, maxLength) {
+function applyTruncation(content, maxLength, maxLines) {
   maxLength = maxLength || 524288;
   const lines = content.split("\n");
-  const maxLines = 65000;
+  maxLines = maxLines || 65000;
 
   // If content has too many lines, truncate by lines (primary limit)
   if (lines.length > maxLines) {
@@ -1323,16 +1579,87 @@ function hardenUnicodeText(text) {
 }
 
 /**
+ * Preserve image-attribute boundaries while canonicalizing their data.
+ * Named quote entities stay inert until the importer has tokenized attributes.
+ * @param {string} text
+ */
+function preserveImageAttributeQuotes(text) {
+  const fragments = [];
+  let written = 0;
+  for (let index = text.indexOf("<"); index >= 0; index = text.indexOf("<", index + 1)) {
+    const opening = /^<img(?=[\s/>])/i.exec(text.slice(index));
+    if (!opening) continue;
+    let position = index + opening[0].length;
+    let quote = "";
+    let start = position;
+    for (; position < text.length && text[position] !== "\n" && text[position] !== "\r"; position++) {
+      const character = text[position];
+      if (quote) {
+        if (character !== quote) continue;
+        const value = canonicalizePublicationText(text.slice(start, position)).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+        fragments.push(text.slice(written, start), value);
+        written = position;
+        quote = "";
+      } else if (character === '"' || character === "'") {
+        quote = character;
+        start = position + 1;
+      } else if (character === "=") {
+        let valueStart = position + 1;
+        while (/[ \t]/.test(text[valueStart] || "")) valueStart++;
+        if (text[valueStart] === '"' || text[valueStart] === "'") continue;
+        let end = valueStart;
+        while (end < text.length && !/[\s<>]/.test(text[end])) end++;
+        const raw = text.slice(valueStart, end);
+        if (raw && !/["'`=]/.test(raw)) {
+          const value = canonicalizePublicationText(raw).replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+          if (value !== raw) {
+            fragments.push(text.slice(written, valueStart), `"${value}"`);
+            written = end;
+          }
+          position = end - 1;
+        }
+      } else if (character === "<" || character === ">") break;
+    }
+    index = position - (text[position] === "<" ? 1 : 0);
+  }
+  fragments.push(text.slice(written));
+  return fragments.join("");
+}
+
+/**
+ * Stabilize encodings before applying policies that downstream renderers must not bypass.
+ * @param {string} text
+ * @param {{preserveImageAttributes?: boolean}} [options]
+ * @returns {string}
+ */
+function canonicalizePublicationText(text, { preserveImageAttributes = false } = {}) {
+  for (let pass = 0; pass < 16; pass++) {
+    const normalized = hardenUnicodeText(preserveImageAttributes ? preserveImageAttributeQuotes(text) : text)
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+    if (normalized === text) return normalized;
+    text = normalized;
+  }
+  throw new TypeError("Publication text contains excessively nested encodings");
+}
+
+/**
  * Core sanitization function without mention filtering
  * @param {string} content - The content to sanitize
  * @param {number} [maxLength] - Maximum length of content (default: 524288)
  * @param {number} [maxBotMentions] - Max bot trigger references before filtering (default: MAX_BOT_TRIGGER_REFERENCES)
+ * @param {number} [maxLines] - Maximum number of lines (default: 65000)
  * @returns {string} The sanitized content
  */
-function sanitizeContentCore(content, maxLength, maxBotMentions) {
+function sanitizeContentCore(content, maxLength, maxBotMentions, maxLines) {
   if (!content || typeof content !== "string") {
     return "";
   }
+
+  // Apply truncation early to avoid running expensive operations on oversized inputs.
+  // This is a pre-pass truncation on raw content; a second truncation pass is applied
+  // later after normalization (which may reduce length via stripping invisible chars).
+  content = applyTruncation(content, maxLength, maxLines);
 
   // Build list of allowed domains from environment and GitHub context
   const allowedDomains = buildAllowedDomains();
@@ -1344,7 +1671,7 @@ function sanitizeContentCore(content, maxLength, maxBotMentions) {
 
   // Apply Unicode hardening first to normalize text representation
   // This prevents Unicode-based attacks and ensures consistent processing
-  sanitized = hardenUnicodeText(sanitized);
+  sanitized = canonicalizePublicationText(sanitized, { preserveImageAttributes: true });
 
   // Remove ANSI escape sequences and control characters early
   // This must happen before mention neutralization to avoid creating bare mentions
@@ -1368,9 +1695,6 @@ function sanitizeContentCore(content, maxLength, maxBotMentions) {
   // Must run before mention neutralization for the same ordering reason as removeXmlComments.
   sanitized = applyToNonCodeRegions(sanitized, neutralizeMarkdownLinkTitles);
 
-  // Neutralize ALL @mentions (no filtering in core version)
-  sanitized = neutralizeAllMentions(sanitized);
-
   // Convert XML tags to parentheses format – skip code blocks and inline code so that
   // type parameters (e.g. VBuffer<float32>) and code containing angle brackets are preserved
   sanitized = applyToNonCodeRegions(sanitized, convertXmlTags);
@@ -1379,7 +1703,11 @@ function sanitizeContentCore(content, maxLength, maxBotMentions) {
   sanitized = applyURLSanitizationPolicy(sanitized, allowedDomains);
 
   // Apply truncation limits
-  sanitized = applyTruncation(sanitized, maxLength);
+  sanitized = applyTruncation(sanitized, maxLength, maxLines);
+
+  // Neutralize ALL @mentions after truncation so a length boundary cannot split
+  // an inserted code-span delimiter and reactivate the mention.
+  sanitized = neutralizeAllMentions(sanitized);
 
   // Neutralize GitHub references if restrictions are configured
   sanitized = neutralizeGitHubReferences(sanitized, allowedGitHubRefs);
@@ -1436,6 +1764,8 @@ module.exports = {
   sanitizeUrlProtocols,
   sanitizeUrlDomains,
   applyURLSanitizationPolicy,
+  createRenderSafeCodeSpanWrapper,
+  getFencedCodeRanges,
   neutralizeCommands,
   neutralizeGitHubReferences,
   removeXmlComments,
@@ -1447,5 +1777,6 @@ module.exports = {
   neutralizeTemplateDelimiters,
   applyTruncation,
   hardenUnicodeText,
+  canonicalizePublicationText,
   decodeHtmlEntities,
 };

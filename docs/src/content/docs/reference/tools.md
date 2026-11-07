@@ -38,6 +38,67 @@ tools:
 
 See **[GitHub Tools Reference](/gh-aw/reference/github-tools/)** for complete configuration options.
 
+### Linear Tools (`linear:`)
+
+Connect to [Linear's official hosted MCP server](https://linear.app/docs/mcp) with the `LINEAR_API_KEY` GitHub Actions secret:
+
+```yaml wrap
+tools:
+  linear: {}
+```
+
+Set `token` to use a different secret, `toolsets` to enable groups such as `issues` and `projects`, `allowed` to further restrict tool names, and `required: false` to make connectivity best-effort:
+
+```yaml wrap
+tools:
+  linear:
+    token: ${{ secrets.CUSTOM_LINEAR_TOKEN }}
+    toolsets: [issues, projects]
+    allowed: ["*"]
+    required: true
+```
+
+Supported toolsets are `all`, `attachments`, `comments`, `customers`, `cycles`, `diffs`, `documentation`, `documents`, `initiatives`, `issues`, `milestones`, `projects`, `status_updates`, `teams`, and `users`. The compiler expands toolsets into the gateway's allowed-tool list, and any `allowed` names or wildcards must match a tool in the selected toolsets.
+
+Linear always uses Linear's server-enforced read-only endpoint. The credential is passed to the gateway as an environment variable and sent as an `Authorization: Bearer` header, not embedded in MCP configuration. Like other remote MCP servers, Linear also works with `tools.cli-proxy: true`.
+
+### Jira Tools (`jira:`)
+
+Connect to Atlassian's official remote Rovo MCP endpoint from non-interactive GitHub Actions workloads. Browser OAuth, device login, and user-consent flows are not supported.
+
+Use an Atlassian service account API key:
+
+```yaml wrap
+tools:
+  jira:
+    auth:
+      type: service-account
+      token: ${{ secrets.ATLASSIAN_SERVICE_ACCOUNT_API_KEY }}
+    allowed:
+      - getJiraIssue
+      - searchJiraIssuesUsingJql
+```
+
+Or use an Atlassian account email and API token:
+
+```yaml wrap
+tools:
+  jira:
+    auth:
+      type: api-token
+      email: ${{ secrets.ATLASSIAN_EMAIL }}
+      token: ${{ secrets.ATLASSIAN_API_TOKEN }}
+    allowed:
+      - getJiraIssue
+      - searchJiraIssuesUsingJql
+```
+
+The `allowed` list is required and accepts only these read-only Jira tools: `getIssueLinkTypes`, `getJiraIssue`, `getJiraIssueRemoteIssueLinks`, `getJiraIssueTypeMetaWithFields`, `getJiraProjectIssueTypesMetadata`, `getTransitionsForJiraIssue`, `getVisibleJiraProjects`, `lookupJiraAccountId`, and `searchJiraIssuesUsingJql`.
+
+`allowed: ["*"]` is shorthand for enabling that fixed list at compile time; it never grants access to the full, unrestricted MCP tool set. Omitting `allowed` or naming a write-capable tool is rejected.
+
+The endpoint defaults to `https://mcp.atlassian.com/v1/mcp`. Set `url` only when your organization uses another HTTPS Atlassian MCP endpoint. Credentials must be direct GitHub Actions secret expressions; service account keys use the HTTP bearer scheme while API tokens use HTTP Basic authentication generated at runtime.
+
 ### Bash Tool (`bash:`)
 
 Enables shell command execution in the workspace. Defaults to safe commands (`echo`, `printf`, `ls`, `pwd`, `cat`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `date`, `yq`).
@@ -64,7 +125,11 @@ tools:
 
 **Note:** Some engines require third-party Model Context Protocol (MCP) servers for web search. See [Using Web Search](/gh-aw/reference/web-search/).
 
-For the **Codex** engine, `web-search:` is disabled by default. Web search is only enabled when `web-search:` is explicitly declared in the `tools:` block. Without this declaration, Codex runs with `-c web_search="disabled"` and cannot access the web.
+Web search is disabled by default for **Codex** and **Claude**. Claude enables it only when `web-search:` is declared. Codex enables a shared native search/browsing tool when either `web-search:` or `web-fetch:` is declared; the two capabilities cannot be disabled independently. With neither tool, Codex runs with `-c web_search="disabled"`. Use `network.hosted-web` to restrict Codex's hosted retrieval.
+
+**Copilot** runs in offline BYOK mode, which disables its native web tools. Compilation rejects `web-search:` and, in CLI mode, `web-fetch:`. Use an MCP server for search or fetch. With `engine.copilot-sdk: true`, `web-fetch:` remains supported by a custom proxy-aware tool that follows `network.allowed`; this does not enable native web search.
+
+The **Gemini** and **Pi** engines have no built-in web search. Declaring `web-search:` with either engine has no effect, and `gh aw compile` prints a warning. To search the web with these engines, configure a third-party MCP server as described in [Using Web Search](/gh-aw/reference/web-search/).
 
 ### Playwright Tool (`playwright:`)
 
@@ -89,6 +154,15 @@ tools:
 
 See **[Cache Memory Reference](/gh-aw/reference/cache-memory/)** for complete configuration options and usage examples.
 
+### Drive Memory (`drive-memory:`) — Private Preview
+
+Drive memory is an experimental, feature-gated GitHub Drives integration. Do not
+configure it unless GitHub has explicitly enrolled the repository in the private
+preview.
+
+The [Drive Memory Reference](/gh-aw/experimental/drive-memory/) records the preview
+behavior for enrolled repositories; it is not a recommendation for general use.
+
 ### Repo Memory (`repo-memory:`)
 
 Repository-specific memory storage for maintaining context across executions.
@@ -111,7 +185,7 @@ tools:
       - pattern: "docs/**/*.md"
 ```
 
-See **[QMD Reference](/gh-aw/reference/qmd/)** for complete configuration options, checkout support, GitHub search integration, and cache key usage.
+See **[QMD Documentation Search](/gh-aw/experimental/qmd/)** for complete configuration options, checkout support, GitHub search integration, and cache key usage.
 
 ### Introspection on Agentic Workflows (`agentic-workflows:`)
 
@@ -126,35 +200,57 @@ tools:
 
 See [GH-AW as an MCP Server](/gh-aw/reference/gh-aw-as-mcp-server/) for available operations.
 
+The built-in container runs with the runner's UID and GID unless a container user is explicitly configured. This keeps downloaded logs runner-owned without widening their owner-only permissions, so the post-agent secret-redaction step can read them. Its default `HOME` is the backend container's ephemeral `/tmp`, not `/root`. Redaction failures still remove unsanitized sources and fail the step.
+
+The `compile` tool uses a dedicated read-only mode with `--no-emit` by default. Remote imports and nested body-level includes must already be cached; container validation does not pull missing Docker images. Ordinary CLI `--no-emit` compilation can still populate import caches. Workflow-writing tools (`add`, `update`, and `fix`), emitted compilation, dry-run compilation, and external scanners require an explicit opt-in at server startup:
+
+```aw wrap
+tools:
+  agentic-workflows:
+    allow-write-tools: true
+```
+
+This sets `--allow-write-tools` while preserving actor validation. It permits local workflow modifications and compiler scanner execution, not additional GitHub permissions or workflow dispatch. Enable it only for trusted clients and workflow sources.
+
 ### MCP CLI Mounting (`cli-proxy:`)
 
-Set `tools.cli-proxy: true` to mount each user-facing MCP server as a standalone CLI tool on `PATH`. When enabled, the agent can invoke MCP servers as shell commands rather than through the MCP protocol:
+Set `tools.cli-proxy: true` to mount each user-facing MCP server as a standalone CLI tool on `PATH`, so the agent can invoke it from shell instead of through the MCP protocol:
 
 ```yaml wrap
 tools:
   cli-proxy: true
 ```
 
-With CLI mounting enabled, MCP servers accessible to the workflow (such as `safeoutputs` and `mcpscripts`) are wrapped as executable commands. For example:
+With CLI mounting enabled, workflow-accessible servers such as `safeoutputs` and `mcpscripts` are wrapped as executables:
 
 ```bash
-safeoutputs add_comment --item_number 42 --body "Analysis complete"
+safeoutputs add_comment '{"item_number":42,"body":"### Result\n\nIt\u0027s ready.\nQuoted text: \"hello\".\nLiteral path: C:\\temp\\file.txt"}'
 mcpscripts mcpscripts-gh --args "issue list --limit 5"
 ```
 
-The safe-output `add_comment` tool uses `--item_number` (not `--issue_number`) to target the issue or pull request — passing `--issue_number` is silently stripped by schema validation.
+For `add_comment`, use `item_number` rather than `issue_number`; schema validation strips the latter. Prefer one single-quoted JSON object argument for safe outputs. Inside JSON strings, encode newlines as `\n`, double quotes as `\"`, backslashes as `\\`, and apostrophes as `\u0027`; Unicode can remain literal. Stdin is also supported: `safeoutputs <tool_name> .` reads a complete JSON object from stdin. This does not grant permission for helper commands or redirections. No auxiliary tools, pipelines, temporary files, or shell expansion are needed for inline JSON.
 
-The MCP gateway configuration is unchanged — servers still start as normal. Only the agent's view changes: servers registered for CLI mounting are removed from the MCP tool list and accessed via shell instead.
-
-This reduces token consumption from large MCP tool schemas and can simplify workflow prompts when shell-style invocation is preferred.
+CLI mounting changes only the agent-facing interface: the MCP gateway still starts normally, but mounted servers are removed from the MCP tool list and accessed via shell. This can reduce token use from large tool schemas and simplify prompts when shell-style invocation is preferred.
 
 Defaults to `false`.
+
+CLI mounting requires shell access because the wrappers are ordinary executables invoked from bash. GitHub `gh-proxy` mode is also shell-backed because GitHub reads are performed with the `gh` CLI. When `tools.bash` is disabled (`bash: false` or `bash: []`), `cli-proxy: true` and `tools.github.mode: gh-proxy` are rejected at compile time, and strict mode requires `cli-proxy: false` to be stated explicitly:
+
+```yaml wrap
+tools:
+  bash: false
+  cli-proxy: false
+  github:
+    mode: local
+```
+
+With `cli-proxy: false` and an MCP-backed GitHub mode (`local` or `remote`), MCP servers (including `safeoutputs`) remain available through the MCP protocol, and the CLI-only instructions are omitted from the generated prompt. Run `gh aw fix` to add the explicit setting to existing workflows.
 
 ## Tool Timeout Configuration
 
 ### Tool Operation Timeout (`tools.timeout`)
 
-Sets the per-operation timeout in seconds for tool and MCP server calls. Applies to all tools and MCP servers when supported by the engine. Defaults vary by engine (Claude: 60 s, Codex: 120 s).
+Sets the per-operation timeout in seconds when supported by the engine. Claude and Codex default to 60 seconds. For Codex, this configures native MCP tool calls, not shell-command duration; use `timeout-minutes` for the overall execution limit.
 
 ```yaml wrap
 tools:
@@ -179,7 +275,7 @@ tools:
 ```
 
 > [!NOTE]
-> Expression values are passed through environment variables in the compiled workflow. TOML-based engine configs (Codex MCP gateway) fall back to engine defaults when an expression is used, since TOML has no expression syntax.
+> Expression values are passed through environment variables and resolved before execution. Codex's configuration renderer converts the resolved values into numeric TOML settings; expressions do not fall back to defaults. An explicit per-server timeout in `engine.config` takes precedence over `tools.timeout` or `tools.startup-timeout`.
 
 ## Custom MCP Servers (`mcp-servers:`)
 
@@ -195,7 +291,49 @@ mcp-servers:
     allowed: ["send_message", "get_channel_history"]
 ```
 
-**Options**: `command` + `args` (process-based), `container` (Docker image), `url` + `headers` (HTTP endpoint), `registry` (MCP registry URI), `env` (environment variables), `allowed` (tool restrictions). See [MCPs Guide](/gh-aw/guides/mcps/) for setup.
+**Options**: `command` + `args` (process-based), `container` (Docker image), `url` + `headers` (HTTP endpoint), `ca-cert-file` (per-server HTTPS CA trust), `registry` (MCP registry URI), `env` (environment variables), `allowed` (tool restrictions), `required` (startup criticality). See [MCPs Guide](/gh-aw/guides/mcps/) for setup.
+
+### Custom CA Certificates
+
+`ca-cert-file` adds PEM CA certificates to system trust for one custom HTTPS MCP server. Other servers, the runner, and model-provider connections keep their existing trust. Certificate and hostname verification remain enabled. Requires MCP Gateway v0.4.35 or later; the default gateway includes support.
+
+```yaml wrap
+mcp-servers:
+  internal:
+    type: http
+    url: https://mcp.internal.example/mcp
+    ca-cert-file: .github/certs/internal-ca.pem
+```
+
+The path is relative to `GITHUB_WORKSPACE`, or an absolute Linux host path. For a custom checkout path such as `checkout: { path: target }`, include that directory: `ca-cert-file: target/.github/certs/internal-ca.pem`. The exact prefixes `${{ github.workspace }}/` and `${{ runner.temp }}/` are also supported. Paths may contain letters, digits, spaces, `_`, `.`, `/`, and `-`; parent-directory traversal, shell substitutions, and other expressions are rejected. The file must exist and be readable by the runner before the **Start MCP Gateway** step. The launcher resolves symlinks and mounts only that file read-only at a gateway-private path, including when `sandbox.mcp.mounts` overrides the defaults. No extra gateway mount configuration is needed.
+
+For PEM content stored in a secret, a reviewed setup step can provision the file through an environment variable; the server then uses `ca-cert-file: "${{ runner.temp }}/internal-ca.pem"`:
+
+```yaml wrap
+steps:
+  - name: Provision MCP CA
+    env:
+      MCP_CA_PEM: ${{ secrets.MCP_CA_PEM }}
+    run: |
+      umask 077
+      printf '%s\n' "$MCP_CA_PEM" > "$RUNNER_TEMP/internal-ca.pem"
+```
+
+Do not put a private key in this file. Missing or unreadable files fail startup; malformed PEM or files without valid CA certificates are rejected by the gateway without printing certificate contents. `ca-cert-file` is not supported for stdio servers or plain HTTP URLs. Local `gh aw mcp inspect` reports this gateway-only setting as unsupported rather than ignoring it. This setting does not replace the separate model-provider `sandbox.agent.ca-cert` configuration.
+
+### Required Field
+
+MCP servers must pass a startup connectivity check before the agent starts. By default every server is startup-critical: if it cannot be reached, the workflow fails. Set `required: false` to mark a server as best-effort, so an unreachable server logs a warning and the workflow continues without it:
+
+```yaml wrap
+mcp-servers:
+  datadog:
+    type: http
+    url: "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
+    required: false
+```
+
+Use this for optional integrations whose transient outages (for example an HTTP 503 from a hosted endpoint) should not take down the other configured servers. At least one server must still connect successfully for startup to proceed.
 
 ### Registry Field
 
@@ -209,14 +347,6 @@ mcp-servers:
     args: ["-y", "@modelcontextprotocol/server-filesystem"]
 ```
 
-## Related Documentation
+## Learn More
 
-- [GitHub Tools](/gh-aw/reference/github-tools/) - GitHub API operations, toolsets, and modes
-- [Playwright](/gh-aw/reference/playwright/) - Browser automation and testing configuration
-- [Cache Memory](/gh-aw/reference/cache-memory/) - Persistent memory across workflow runs
-- [Repo Memory](/gh-aw/reference/repo-memory/) - Repository-specific memory storage
-- [QMD Documentation Search](/gh-aw/reference/qmd/) - Vector similarity search over documentation files
-- [MCP Scripts](/gh-aw/reference/mcp-scripts/) - Define custom inline tools with JavaScript or shell scripts
-- [Frontmatter](/gh-aw/reference/frontmatter/) - All frontmatter configuration options
-- [Network Permissions](/gh-aw/reference/network/) - Network access control for AI engines
-- [MCPs](/gh-aw/guides/mcps/) - Complete Model Context Protocol setup and usage
+See [GitHub Tools](/gh-aw/reference/github-tools/) for GitHub API operations, toolsets, and modes; [Playwright](/gh-aw/reference/playwright/) for browser automation; [Cache Memory](/gh-aw/reference/cache-memory/) and [Repo Memory](/gh-aw/reference/repo-memory/) for persistent context; [MCP Scripts](/gh-aw/reference/mcp-scripts/) for custom inline tools; and [MCPs](/gh-aw/guides/mcps/) for end-to-end Model Context Protocol setup.

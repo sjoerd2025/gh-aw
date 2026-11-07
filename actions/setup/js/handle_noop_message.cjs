@@ -1,17 +1,50 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { createReportIssue } = require("./issue_report.cjs");
+
 const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { ERR_API } = require("./error_codes.cjs");
-const { sanitizeContent } = require("./sanitize_content.cjs");
-const { generateFooterWithExpiration } = require("./ephemerals.cjs");
-const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
-const { loadAgentOutput } = require("./load_agent_output.cjs");
+const { ERR_API, ERR_SYSTEM } = require("./error_codes.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
+const { getPromptPath } = require("./messages_core.cjs");
+const { loadAgentOutput, shouldIgnoreTaskCompleteRegistrationReports } = require("./load_agent_output.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
-const { formatAIC } = require("./model_costs.cjs");
-const { reduceModelNameToIdentifier } = require("./model_aliases.cjs");
+const { formatEstimatedAIC } = require("./model_costs.cjs");
+const { buildNoopConclusionSummary } = require("./conclusion_summary.cjs");
+
+/**
+ * A noop is an agent-reported outcome, not independent completion evidence.
+ * @param {string} agentConclusion
+ * @param {boolean} [hasIncompleteReport]
+ * @returns {{category: string, description: string}}
+ */
+function classifyNoopOutcome(agentConclusion, hasIncompleteReport = false) {
+  if (hasIncompleteReport) {
+    return {
+      category: "incomplete",
+      description: "The agent explicitly reported incomplete work. A no-op output does not establish task completion.",
+    };
+  }
+  if (agentConclusion === "failure") {
+    return {
+      category: "incomplete",
+      description: "The agent failed after emitting a no-op output. Task completion is unconfirmed; the no-op does not establish success or a transient failure.",
+    };
+  }
+  if (agentConclusion === "success") {
+    return {
+      category: "reported_no_action",
+      description: "The agent completed and reported no action. A no-op output alone does not verify that all required work was completed or that publication was possible.",
+    };
+  }
+  return {
+    category: "unconfirmed",
+    description: "The agent emitted a no-op output, but successful task completion is unconfirmed.",
+  };
+}
 /**
  * Search for or create the parent issue for all agentic workflow no-op runs
  * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
@@ -54,21 +87,24 @@ async function ensureAgentRunsIssue() {
   try {
     parentBodyContent = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
 
-  const parentBody = generateFooterWithExpiration({
-    footerText: parentBodyContent,
-    expiresHours: 24 * 30, // 30 days
-  });
-
-  const { data: newIssue } = await github.rest.issues.create({
-    owner,
-    repo,
-    title: parentTitle,
-    body: parentBody,
-    labels: [parentLabel],
-  });
+  const { data: newIssue } = await createReportIssue(
+    github,
+    {
+      owner,
+      repo,
+      title: parentTitle,
+      labels: [parentLabel],
+    },
+    {
+      type: "report",
+      title: parentTitle,
+      agentTainted: false,
+      children: [...parseReportMarkdown(parentBodyContent, { agentTainted: false }), { type: "expiration", expiresAt: new Date(Date.now() + 24 * 30 * 60 * 60 * 1000).toISOString(), agentTainted: false }],
+    }
+  );
 
   core.info(`✓ Created no-op runs issue #${newIssue.number}: ${newIssue.html_url}`);
   return {
@@ -78,24 +114,40 @@ async function ensureAgentRunsIssue() {
 }
 
 /**
- * Build the AIC suffix string for use in comment footers.
- * Includes agent, threat-detection, and evals AIC when available.
- * Returns a string like " · 0.001 AIC" or "" when not available.
+ * Parse a raw AIC environment variable value and return it as a positive number.
+ * Returns undefined when the value is absent, non-numeric, or non-positive.
+ * @param {string|undefined} raw
+ * @returns {number|undefined}
+ */
+function parsePositiveAIC(raw) {
+  const parsed = raw ? Number.parseFloat(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * @param {string} label
+ * @param {number|undefined} value
+ * @param {string|undefined} [modelAlias]
  * @returns {string}
  */
-function buildAICSuffix() {
-  const agentRaw = process.env.GH_AW_AIC;
-  const detectionRaw = process.env.GH_AW_THREAT_DETECTION_AIC;
-  const evalsRaw = process.env.GH_AW_EVALS_AIC;
-  const agentAIC = agentRaw ? Number.parseFloat(agentRaw) : NaN;
-  const detectionAIC = detectionRaw ? Number.parseFloat(detectionRaw) : NaN;
-  const evalsAIC = evalsRaw ? Number.parseFloat(evalsRaw) : NaN;
-  const compressedModelName = reduceModelNameToIdentifier(process.env.GH_AW_PRIMARY_MODEL || process.env.GH_AW_ENGINE_MODEL);
-  const totalAIC = (Number.isFinite(agentAIC) && agentAIC > 0 ? agentAIC : 0) + (Number.isFinite(detectionAIC) && detectionAIC > 0 ? detectionAIC : 0) + (Number.isFinite(evalsAIC) && evalsAIC > 0 ? evalsAIC : 0);
-  if (totalAIC <= 0) {
+function buildAICEntry(label, value, modelAlias) {
+  const formatted = typeof value === "number" ? formatEstimatedAIC(value) : "";
+  if (!formatted) {
     return "";
   }
-  return ` · ${compressedModelName ? `${compressedModelName} · ` : ""}${formatAIC(totalAIC)} AIC`;
+  const prefix = [label, modelAlias].filter(Boolean).join(" ");
+  return ` · ${prefix ? `${prefix}${modelAlias ? " · " : " "}` : ""}${formatted} AIC`;
+}
+
+function buildAICSuffix() {
+  const agentAIC = parsePositiveAIC(process.env.GH_AW_AIC);
+  const detectionAIC = parsePositiveAIC(process.env.GH_AW_THREAT_DETECTION_AIC);
+  const evalsAIC = parsePositiveAIC(process.env.GH_AW_EVALS_AIC);
+  const compressedModelName = require("./model_attribution.cjs").getEffectiveModelLabel();
+  const agentSuffix = buildAICEntry("", agentAIC, compressedModelName);
+  const detectionSuffix = buildAICEntry("⌖", detectionAIC);
+  const evalsSuffix = buildAICEntry("◇", evalsAIC);
+  return `${agentSuffix}${detectionSuffix}${evalsSuffix}`;
 }
 
 /**
@@ -115,14 +167,13 @@ function buildAmbientContextSuffix() {
 }
 
 /**
- * Build a markdown history link for use in comment footers.
- * Returns a string like " · [◷](url)" or "" when not available.
- * @returns {string}
+ * Build a history link for use in comment footers.
+ * @returns {import("./report_ast.cjs").ReportInline[]}
  */
 function buildHistoryLink() {
   const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
   if (!workflowId) {
-    return "";
+    return [];
   }
   const { owner, repo } = context.repo;
   const historyUrl = generateHistoryUrl({
@@ -132,7 +183,40 @@ function buildHistoryLink() {
     workflowId,
     serverUrl: context.serverUrl,
   });
-  return historyUrl ? ` · [◷](${historyUrl})` : "";
+  return historyUrl
+    ? [
+        { type: "text", value: " · ", agentTainted: false },
+        { type: "link", url: historyUrl, children: [{ type: "text", value: "◷", agentTainted: false }], agentTainted: false },
+      ]
+    : [];
+}
+
+/**
+ * Render the no-op comment body shared by the no-op runs issue comment and the
+ * comment posted on other run-scoped tracking items.
+ * @param {string} workflowName
+ * @param {string} agentConclusion
+ * @param {string} runUrl
+ * @param {boolean} hasIncompleteReport
+ * @returns {string}
+ */
+function buildNoopCommentBody(workflowName, agentConclusion, runUrl, hasIncompleteReport) {
+  const outcome = classifyNoopOutcome(agentConclusion, hasIncompleteReport);
+  const commentTemplatePath = getPromptPath("noop_comment.md");
+  const children = parseReportMarkdown(fs.readFileSync(commentTemplatePath, "utf8"), {
+    context: {
+      workflow_name: workflowName,
+      category: outcome.category,
+      description: outcome.description,
+      run_url: runUrl,
+      aic_suffix: buildAICSuffix(),
+      ambient_context_suffix: buildAmbientContextSuffix(),
+      history_link: { type: "inline_slot", children: buildHistoryLink() },
+    },
+    minimumHeadingLevel: 2,
+    agentTainted: false,
+  });
+  return renderSizedReport({ type: "report", title: "No-op run", children, agentTainted: false }, 65000).body;
 }
 
 /**
@@ -155,9 +239,13 @@ async function main() {
       return;
     }
 
-    const maxCount = parseInt(process.env.GH_AW_NOOP_MAX || "0", 10);
+    const maxCount = Number(process.env.GH_AW_NOOP_MAX || "0");
+    if (!Number.isFinite(maxCount) || !Number.isSafeInteger(maxCount) || maxCount < 0) {
+      throw new Error(`${ERR_SYSTEM}: GH_AW_NOOP_MAX must be a non-negative integer`);
+    }
+    const limitedMaxCount = maxCount;
     const allNoopItems = (result.items || []).filter(/** @param {any} item */ item => item.type === "noop");
-    const noopItems = maxCount > 0 ? allNoopItems.slice(0, maxCount) : allNoopItems;
+    const noopItems = limitedMaxCount > 0 ? allNoopItems.slice(0, limitedMaxCount) : allNoopItems;
 
     if (noopItems.length === 0) {
       core.info("No noop items found in agent output");
@@ -169,27 +257,20 @@ async function main() {
 
     // --- Staged mode: preview only, do not post ---
     if (isStagedMode()) {
-      let summaryContent = "## 🎭 Staged Mode: No-Op Messages Preview\n\n";
-      summaryContent += "The following messages would be logged if staged mode was disabled:\n\n";
-      for (let i = 0; i < noopItems.length; i++) {
-        const item = noopItems[i];
-        summaryContent += `### Message ${i + 1}\n`;
-        summaryContent += `${item.message}\n\n`;
-        summaryContent += "---\n\n";
-      }
+      const summaryContent = buildNoopConclusionSummary(
+        noopItems.map(item => item.message),
+        { runUrl: process.env.GH_AW_RUN_URL, staged: true }
+      );
       await core.summary.addRaw(summaryContent).write();
       core.info("📝 No-op message preview written to step summary");
       return;
     }
 
     // --- Write step summary ---
-    let summaryContent = "\n\n## No-Op Messages\n\n";
-    summaryContent += "The following messages were logged for transparency:\n\n";
-    for (let i = 0; i < noopItems.length; i++) {
-      const item = noopItems[i];
-      core.info(`No-op message ${i + 1}: ${item.message}`);
-      summaryContent += `- ${item.message}\n`;
-    }
+    const summaryContent = buildNoopConclusionSummary(
+      noopItems.map(item => item.message),
+      { runUrl: process.env.GH_AW_RUN_URL }
+    );
     await core.summary.addRaw(summaryContent).write();
 
     // Export for downstream steps/jobs
@@ -200,11 +281,21 @@ async function main() {
     const workflowName = process.env.GH_AW_WORKFLOW_NAME || "unknown";
     const runUrl = process.env.GH_AW_RUN_URL || "";
     const agentConclusion = process.env.GH_AW_AGENT_CONCLUSION || "";
+    const hasIncompleteReport = result.items.some(/** @param {any} item */ item => item.type === "report_incomplete") && !shouldIgnoreTaskCompleteRegistrationReports(result.items);
     const reportAsIssue = process.env.GH_AW_NOOP_REPORT_AS_ISSUE !== "false"; // Default to true
+
+    // Reuse this privacy-safe body in the run's completion status comment.
+    let commentBody = "";
+    try {
+      commentBody = buildNoopCommentBody(workflowName, agentConclusion, runUrl, hasIncompleteReport);
+      core.setOutput("noop_comment_body", commentBody);
+    } catch (error) {
+      core.warning(`Could not render no-op comment body: ${getErrorMessage(error)}`);
+    }
 
     core.info(`Workflow name: ${workflowName}`);
     core.info(`Run URL: ${runUrl}`);
-    core.info(`Agent conclusion: ${agentConclusion}`);
+    core.info(`No-op outcome: ${classifyNoopOutcome(agentConclusion, hasIncompleteReport).category}`);
     core.info(`Report as issue: ${reportAsIssue}`);
 
     if (!reportAsIssue) {
@@ -214,11 +305,11 @@ async function main() {
 
     // Only post to "agent runs" issue if:
     // 1. The agent succeeded (agentConclusion === "success"), OR
-    // 2. The agent failed but produced only noop outputs, which indicates a transient AI model
-    //    error after the meaningful work (noop) was already captured. Skipped/cancelled runs
+    // 2. The agent failed but produced only noop outputs; report it as incomplete.
+    //    Skipped/cancelled runs
     //    and other non-success/non-failure conclusions are always skipped.
     if (agentConclusion !== "success" && agentConclusion !== "failure") {
-      core.info(`Agent did not succeed (conclusion: ${agentConclusion}), skipping no-op message posting`);
+      core.info("Agent did not succeed or fail, skipping no-op message posting");
       return;
     }
 
@@ -230,7 +321,7 @@ async function main() {
     }
 
     if (agentConclusion === "failure") {
-      core.info("Agent failed but produced only noop outputs (transient AI model error after noop was captured) - posting noop message");
+      core.info("Agent failed with only noop outputs - reporting incomplete outcome");
     } else {
       core.info("Agent succeeded with only noop outputs - posting to no-op runs issue");
     }
@@ -247,26 +338,18 @@ async function main() {
       return;
     }
 
-    // Load and render comment template from file
-    const commentTemplatePath = getPromptPath("noop_comment.md");
-    const commentBody = renderTemplateFromFile(commentTemplatePath, {
-      workflow_name: workflowName,
-      message: noopMessage,
-      run_url: runUrl,
-      aic_suffix: buildAICSuffix(),
-      ambient_context_suffix: buildAmbientContextSuffix(),
-      history_link: buildHistoryLink(),
-    });
-
-    // Sanitize the full comment body
-    const fullCommentBody = sanitizeContent(commentBody, { maxLength: 65000 });
+    // Reuse the comment body rendered above; it is empty only when rendering failed.
+    if (!commentBody) {
+      core.warning("No-op comment body is unavailable, skipping no-op message posting");
+      return;
+    }
 
     try {
       await github.rest.issues.createComment({
         owner,
         repo,
         issue_number: noopRunsIssue.number,
-        body: fullCommentBody,
+        body: commentBody,
       });
 
       core.info(`✓ Posted no-op message to no-op runs issue #${noopRunsIssue.number}`);
@@ -280,4 +363,4 @@ async function main() {
   }
 }
 
-module.exports = { main, ensureAgentRunsIssue };
+module.exports = { main, ensureAgentRunsIssue, classifyNoopOutcome };

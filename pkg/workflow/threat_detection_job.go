@@ -16,7 +16,7 @@ import (
 // The job downloads the agent artifact to access output files, then runs all threat detection
 // steps. It outputs detection_success and detection_conclusion for downstream jobs.
 // Returns nil if threat detection is not configured.
-func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
+func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) { //nolint:largefunc // Keep detection job assembly and its ordered setup steps together.
 	threatLog.Print("Building separate detection job")
 	if data.SafeOutputs == nil || data.SafeOutputs.ThreatDetection == nil {
 		threatLog.Print("Threat detection not configured, skipping detection job")
@@ -42,13 +42,24 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
 		// Detection job depends on agent job; reuse the agent's trace ID so all jobs share one OTLP trace
 		detectionTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
 		detectionParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, detectionTraceID, detectionParentSpanID)...)
+		steps = append(steps, c.generateSetupStepForJob("detection", data, setupActionRef, SetupActionDestination, false, detectionTraceID, detectionParentSpanID, "")...)
 	}
 
-	// Download agent output artifact to access output files (prompt.txt, agent_output.json, patches).
+	// Download the activation artifact first because it is the durable source of the
+	// generated prompt files. The larger agent artifact also contains prompt files,
+	// but that upload is best-effort and may be unavailable when detection runs.
+	steps = append(steps, buildDetectionActivationArtifactDownloadSteps(data, c.getActionPin)...)
+
+	// Download agent output artifact to access output files (agent_output.json, patches).
 	// Use agent-downstream prefix since this job depends on the agent job.
 	agentArtifactPrefix := artifactPrefixExprForAgentDownstreamJob(data)
 	steps = append(steps, buildAgentOutputDownloadSteps(agentArtifactPrefix, c.getActionPin)...)
+	// Do not attribute the agent's usage to detection, even when its scan is skipped.
+	steps = append(steps,
+		"      - name: Clear agent token usage\n",
+		"        if: always()\n",
+		"        run: rm -f /tmp/gh-aw/agent_usage.json\n",
+	)
 
 	// Download experiment artifact so the detection agent can read the current variant assignments.
 	// The experiment artifact is uploaded by the activation job.
@@ -59,7 +70,7 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
 	steps = append(steps, c.buildWorkspaceCheckoutForDetectionStep(data)...)
 
 	// Add all threat detection steps
-	detectionStepsContent := c.buildDetectionJobSteps(data)
+	detectionStepsContent := c.buildDetectionJobSteps(data, steps...)
 	steps = append(steps, detectionStepsContent...)
 
 	// Build job outputs
@@ -67,39 +78,62 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
 		"detection_success":    "${{ steps.detection_conclusion.outputs.success }}",
 		"detection_conclusion": "${{ steps.detection_conclusion.outputs.conclusion }}",
 		"detection_reason":     "${{ steps.detection_conclusion.outputs.reason }}",
+		"run_detection":        "${{ steps.detection_guard.outputs.run_detection }}",
 		"aic":                  "${{ steps.parse_detection_token_usage.outputs.aic }}",
 	}
 
 	// Detection job depends on agent job and activation job (for trace ID)
 	needs := []string{string(constants.AgentJobName), string(constants.ActivationJobName)}
 
-	// Scan the effective detection engine env values for needs.<customJob>.outputs.*
+	// Scan the effective detection engine config for needs.<customJob>.outputs.*
 	// expressions and add the referenced custom jobs as direct dependencies of the
-	// detection job. Use the merged env (main + detection-specific overrides) so
-	// that expressions from the main engine.env are not missed when a detection
-	// engine config exists.
+	// detection job. Use the effective env (same-engine inheritance + detection-specific overrides)
+	// so expressions from the main engine.env are not missed when a detection engine config exists.
 	var detectionSpecificEnv map[string]string
 	if data.SafeOutputs != nil && data.SafeOutputs.ThreatDetection != nil && data.SafeOutputs.ThreatDetection.EngineConfig != nil {
 		detectionSpecificEnv = data.SafeOutputs.ThreatDetection.EngineConfig.Env
 	}
-	effectiveDetectionEnv := mergeThreatDetectionEngineEnv(data, detectionSpecificEnv)
-	if len(effectiveDetectionEnv) > 0 {
-		var engineEnvBuilder strings.Builder
-		for _, envValue := range effectiveDetectionEnv {
-			engineEnvBuilder.WriteByte('\n')
-			engineEnvBuilder.WriteString(envValue)
+	detectionEngineID := c.getThreatDetectionEngineID(data)
+	effectiveDetectionEnv := mergeThreatDetectionEngineEnv(data, detectionEngineID, detectionSpecificEnv)
+	var engineConfigBuilder strings.Builder
+	for _, envValue := range effectiveDetectionEnv {
+		engineConfigBuilder.WriteByte('\n')
+		engineConfigBuilder.WriteString(envValue)
+	}
+	if ResolveEngineID(data) == detectionEngineID {
+		if agentConfig := getAgentConfig(data); agentConfig != nil {
+			for _, targetName := range sliceutil.SortedKeys(agentConfig.Targets) {
+				target := agentConfig.Targets[targetName]
+				if target == nil {
+					continue
+				}
+				engineConfigBuilder.WriteByte('\n')
+				engineConfigBuilder.WriteString(target.AuthHeader)
+				engineConfigBuilder.WriteByte('\n')
+				engineConfigBuilder.WriteString(target.SessionId)
+				for _, key := range sliceutil.SortedKeys(target.ExtraHeaders) {
+					engineConfigBuilder.WriteByte('\n')
+					engineConfigBuilder.WriteString(target.ExtraHeaders[key])
+				}
+				for _, key := range sliceutil.SortedKeys(target.ExtraBodyFields) {
+					engineConfigBuilder.WriteByte('\n')
+					engineConfigBuilder.WriteString(target.ExtraBodyFields[key])
+				}
+			}
 		}
-		engineEnvContent := engineEnvBuilder.String()
-		hasNeedsReference := strings.Contains(engineEnvContent, "needs.")
+	}
+	engineConfigContent := engineConfigBuilder.String()
+	if engineConfigContent != "" {
+		hasNeedsReference := strings.Contains(engineConfigContent, "needs.")
 		if len(data.Jobs) > 0 {
-			engineEnvJobs := c.getReferencedCustomJobs(engineEnvContent, data.Jobs)
-			for _, jobName := range engineEnvJobs {
+			engineConfigJobs := c.getReferencedCustomJobs(engineConfigContent, data.Jobs)
+			for _, jobName := range engineConfigJobs {
 				if isBuiltinJobName(jobName) {
 					continue
 				}
 				if !slices.Contains(needs, jobName) {
 					needs = append(needs, jobName)
-					threatLog.Printf("Added custom job '%s' to detection needs because it's referenced in engine.env", jobName)
+					threatLog.Printf("Added custom job '%s' to detection needs because it's referenced in engine configuration", jobName)
 				}
 			}
 		}
@@ -108,9 +142,9 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
 				if slices.Contains(needs, builtinJobName) {
 					continue
 				}
-				if strings.Contains(engineEnvContent, fmt.Sprintf("needs.%s.", builtinJobName)) {
+				if strings.Contains(engineConfigContent, fmt.Sprintf("needs.%s.", builtinJobName)) {
 					warningMsg := fmt.Sprintf(
-						"engine.env references built-in job '%s' in a detection-job needs expression. "+
+						"Detection engine configuration references built-in job '%s' in a detection-job needs expression. "+
 							"Built-in jobs are managed by the compiler and cannot be added as direct detection dependencies; "+
 							"this expression will silently evaluate to an empty string at runtime.",
 						builtinJobName,
@@ -168,10 +202,20 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
 	//   api-proxy returns HTTP 401 on every request (mirrors validateOIDCPermissions logic).
 	// - When observability.otlp.github-app is configured without app-id/private-key
 	//   credentials, id-token: write is also needed (mirrors validateOIDCPermissions).
-	copilotRequestsEnabled := hasCopilotRequestsWritePermission(data)
+	detectionAuthData := buildExternalDetectorWorkflowData(data, detectionEngineID)
+	detectionAuthData.Model = inheritedDetectionModel(data, detectionEngineID)
+	if model := data.SafeOutputs.ThreatDetection.Model; model != "" {
+		detectionAuthData.Model = model
+	}
+	brokeredInference := usesTokenBrokerInference(detectionAuthData)
+	steps = append(steps, c.buildTokenBrokerInvalidationStep(detectionAuthData)...)
+	copilotRequestsEnabled := hasCopilotRequestsWritePermission(data) && !brokeredInference
 	perms := NewPermissionsContentsRead()
 	if copilotRequestsEnabled {
 		perms.Set(PermissionCopilotRequests, PermissionWrite)
+	}
+	if brokeredInference {
+		perms.Set(PermissionIdToken, PermissionWrite)
 	}
 	if data.EngineConfig != nil && data.EngineConfig.Auth != nil && data.EngineConfig.Auth.Type == "github-oidc" {
 		perms.Set(PermissionIdToken, PermissionWrite)
@@ -192,16 +236,25 @@ func (c *Compiler) buildDetectionJob(data *WorkflowData) (*Job, error) {
 	}
 
 	job := &Job{
-		Name:        string(constants.DetectionJobName),
-		Needs:       needs,
-		If:          jobCondition,
-		RunsOn:      c.indentYAMLLines(runsOn, "    "),
-		Environment: c.indentYAMLLines(environment, "    "),
-		Permissions: permissions,
-		Steps:       steps,
-		Outputs:     outputs,
+		Name:                     string(constants.DetectionJobName),
+		Needs:                    needs,
+		If:                       jobCondition,
+		RunsOn:                   c.indentYAMLLines(runsOn, "    "),
+		Environment:              c.indentYAMLLines(environment, "    "),
+		Permissions:              permissions,
+		Steps:                    steps,
+		Outputs:                  outputs,
+		TimeoutMinutesExpression: resolveDetectionJobTimeoutValue(data),
 	}
 
 	threatLog.Printf("Built detection job with %d steps, depends on: %v", len(steps), needs)
 	return job, nil
+}
+
+func buildDetectionActivationArtifactDownloadSteps(data *WorkflowData, pinAction func(string) string) []string {
+	return buildArtifactDownloadSteps(ArtifactDownloadConfig{
+		ArtifactName: artifactPrefixExprForDownstreamJob(data) + constants.ActivationArtifactName.String(),
+		DownloadPath: constants.TmpGhAwDir,
+		StepName:     "Download activation artifact",
+	}, pinAction)
 }

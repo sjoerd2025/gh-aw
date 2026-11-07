@@ -22,6 +22,7 @@ describe("upload_assets.cjs", () => {
   let mockExec;
   let tempBase;
   let cwdArtifacts;
+  let restoreDescriptorPaths;
 
   const getAssetsDir = () => path.join(tempBase, "safeoutputs", "assets");
 
@@ -55,6 +56,45 @@ describe("upload_assets.cjs", () => {
 
   const isGitCommand = (command, args, subcommand) => command === "git" && Array.isArray(args) && args[0] === subcommand;
 
+  // Publisher tests use real files, but do not exercise ancestor renames. On
+  // non-Linux hosts emulate only descriptor paths; production stays fail-closed.
+  const simulateDescriptorPaths = () => {
+    if (process.platform === "linux") return () => {};
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    const openedPaths = new Map();
+    const resolve = filename => {
+      if (typeof filename !== "string") return filename;
+      const match = /^\/proc\/self\/fd\/(\d+)(?:\/(.*))?$/.exec(filename);
+      if (!match) return filename;
+      const directory = openedPaths.get(Number(match[1]));
+      if (!directory) throw new Error(`Unknown descriptor path: ${filename}`);
+      return path.join(directory, match[2] || "");
+    };
+    const originalOpen = fs.openSync;
+    const originalClose = fs.closeSync;
+    const originalLstat = fs.lstatSync;
+    const originalMkdir = fs.mkdirSync;
+    const spies = [
+      vi.spyOn(fs, "openSync").mockImplementation((filename, ...args) => {
+        const resolved = resolve(filename);
+        const fd = originalOpen(resolved, ...args);
+        openedPaths.set(fd, resolved);
+        return fd;
+      }),
+      vi.spyOn(fs, "closeSync").mockImplementation(fd => {
+        openedPaths.delete(fd);
+        return originalClose(fd);
+      }),
+      vi.spyOn(fs, "lstatSync").mockImplementation((filename, ...args) => originalLstat(resolve(filename), ...args)),
+      vi.spyOn(fs, "mkdirSync").mockImplementation((filename, ...args) => originalMkdir(resolve(filename), ...args)),
+    ];
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    return () => {
+      for (const spy of spies) spy.mockRestore();
+      Object.defineProperty(process, "platform", platform);
+    };
+  };
+
   /** Configures mockExec so that rev-parse throws (branch missing) and all else succeeds. */
   const mockBranchMissing = onExec => {
     mockExec.exec.mockImplementation(async (command, args) => {
@@ -70,16 +110,24 @@ describe("upload_assets.cjs", () => {
     delete process.env.GH_AW_AGENT_OUTPUT;
     delete process.env.GH_AW_ASSETS_DIR;
     delete process.env.GH_AW_SAFE_OUTPUTS_STAGED;
+    delete process.env.GITHUB_SERVER_URL;
+    delete process.env.GITHUB_REPOSITORY;
 
-    tempBase = fs.mkdtempSync(path.join("/tmp", "test-gh-aw-"));
+    tempBase = path.join(process.cwd(), `.test-upload-assets-${crypto.randomUUID()}`);
+    fs.mkdirSync(tempBase);
     cwdArtifacts = new Set();
     process.env.GH_AW_ASSETS_DIR = getAssetsDir();
+    restoreDescriptorPaths = simulateDescriptorPaths();
 
     uploadAssetsScript = fs.readFileSync(path.join(__dirname, "upload_assets.cjs"), "utf8");
-    mockExec = { exec: vi.fn().mockResolvedValue(0) };
+    mockExec = {
+      exec: vi.fn().mockResolvedValue(0),
+      getExecOutput: vi.fn().mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" }),
+    };
   });
 
   afterEach(() => {
+    restoreDescriptorPaths?.();
     if (tempBase && fs.existsSync(tempBase)) {
       fs.rmSync(tempBase, { recursive: true, force: true });
     }
@@ -95,6 +143,150 @@ describe("upload_assets.cjs", () => {
       setAgentOutput({ items: [] });
       await executeScript();
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("GH_AW_ASSETS_BRANCH"));
+    });
+  });
+
+  describe("guarded staged asset access", () => {
+    it.each(["file", "dangling", "parent", "hardlink", "directory"])("rejects %s staged sources without publishing external sentinel content", async kind => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test";
+      const assets = getAssetsDir();
+      fs.mkdirSync(assets, { recursive: true });
+      const sentinel = path.join(tempBase, "sentinel.png");
+      fs.writeFileSync(sentinel, "harmless external sentinel");
+      const source = path.join(assets, "chart.png");
+      if (kind === "file") fs.symlinkSync(sentinel, source);
+      else if (kind === "dangling") fs.symlinkSync(path.join(tempBase, "missing"), source);
+      else if (kind === "parent") {
+        fs.rmdirSync(assets);
+        fs.symlinkSync(tempBase, assets, "dir");
+        fs.writeFileSync(path.join(tempBase, "chart.png"), "harmless external sentinel");
+      } else if (kind === "hardlink") fs.linkSync(sentinel, source);
+      else fs.mkdirSync(source);
+      const target = trackCwdArtifact(`${crypto.randomUUID()}.png`);
+      setAgentOutput({ items: [{ type: "upload_asset", fileName: "chart.png", targetFileName: path.basename(target), sha: crypto.createHash("sha256").update("harmless external sentinel").digest("hex") }] });
+
+      await executeScript();
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringMatching(/symlinks are not allowed|isolated regular file/));
+      expect(fs.existsSync(target)).toBe(false);
+      expect(mockExec.exec.mock.calls.some(([command, args]) => isGitCommand(command, args, "add"))).toBe(false);
+      expect(mockExec.getExecOutput).not.toHaveBeenCalled();
+      expect(fs.readFileSync(sentinel, "utf8")).toBe("harmless external sentinel");
+    });
+
+    it("publishes the verified bytes if staged content changes before writing", async () => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test";
+      const assets = getAssetsDir();
+      fs.mkdirSync(assets, { recursive: true });
+      const { assetPath, sha, size } = makeAsset(assets, "chart.png", "verified chart");
+      const target = trackCwdArtifact(`${crypto.randomUUID()}.png`);
+      setAgentOutput({ items: [{ type: "upload_asset", fileName: "chart.png", sha, size, targetFileName: path.basename(target) }] });
+      const originalWrite = fs.writeFileSync;
+      const spy = vi.spyOn(fs, "writeFileSync").mockImplementation((filename, ...args) => {
+        if (typeof filename === "number") originalWrite(assetPath, "replacement chart");
+        return originalWrite(filename, ...args);
+      });
+      try {
+        await executeScript();
+      } finally {
+        spy.mockRestore();
+      }
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(fs.readFileSync(target, "utf8")).toBe("verified chart");
+      expect(crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex")).toBe(sha);
+    });
+
+    it("rejects a symlink in the publication destination without changing its target", async () => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test";
+      const assets = getAssetsDir();
+      fs.mkdirSync(assets, { recursive: true });
+      const { sha, size } = makeAsset(assets, "chart.png");
+      const sentinel = path.join(tempBase, "sentinel.png");
+      fs.writeFileSync(sentinel, "unchanged sentinel");
+      const target = trackCwdArtifact(`${crypto.randomUUID()}.png`);
+      fs.symlinkSync(sentinel, target);
+      setAgentOutput({ items: [{ type: "upload_asset", fileName: "chart.png", sha, size, targetFileName: path.basename(target) }] });
+
+      await expect(executeScript()).resolves.toBeUndefined();
+
+      expect(mockCore.setFailed).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(`Failed to verify existing asset ${path.basename(target)}:`));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Asset symlinks are not allowed"));
+      expect(fs.readFileSync(sentinel, "utf8")).toBe("unchanged sentinel");
+      expect(mockExec.getExecOutput).not.toHaveBeenCalled();
+    });
+
+    it.each(["longer existing content", "short", "changed chart!"])("fails the whole publication for mismatched existing bytes: %s", async existingContent => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test";
+      const assets = getAssetsDir();
+      fs.mkdirSync(assets, { recursive: true });
+      const { sha } = makeAsset(assets, "chart.png", "verified chart");
+      const target = trackCwdArtifact(`${crypto.randomUUID()}.png`);
+      fs.writeFileSync(target, existingContent);
+      const { sha: firstSha } = makeAsset(assets, "first.png", "first chart");
+      const firstTarget = trackCwdArtifact(`${crypto.randomUUID()}.png`);
+      setAgentOutput({
+        items: [
+          { type: "upload_asset", fileName: "first.png", sha: firstSha, targetFileName: path.basename(firstTarget) },
+          { type: "upload_asset", fileName: "chart.png", sha, targetFileName: path.basename(target) },
+        ],
+      });
+
+      await expect(executeScript()).resolves.toBeUndefined();
+
+      expect(mockCore.setFailed).toHaveBeenCalledOnce();
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(path.basename(target)));
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(existingContent.length > "verified chart".length ? "Failed to verify existing asset" : "Existing asset content differs from staged content"));
+      if (existingContent.length > "verified chart".length) {
+        expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Asset exceeds maximum allowed size"));
+      }
+      expect(fs.readFileSync(target, "utf8")).toBe(existingContent);
+      expect(fs.readFileSync(firstTarget, "utf8")).toBe("first chart");
+      expect(mockExec.exec.mock.calls.some(([command, args]) => isGitCommand(command, args, "commit"))).toBe(false);
+      expect(mockExec.getExecOutput).not.toHaveBeenCalled();
+      expect(mockCore.setOutput).not.toHaveBeenCalled();
+      expect(mockCore.summary.write).not.toHaveBeenCalled();
+    });
+
+    it("skips an existing asset only when its bytes match", async () => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test";
+      const assets = getAssetsDir();
+      fs.mkdirSync(assets, { recursive: true });
+      const { sha } = makeAsset(assets, "chart.png", "verified chart");
+      const target = trackCwdArtifact(`${crypto.randomUUID()}.png`);
+      fs.writeFileSync(target, "verified chart");
+      setAgentOutput({ items: [{ type: "upload_asset", fileName: "chart.png", sha, targetFileName: path.basename(target) }] });
+
+      await executeScript();
+
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.setOutput).toHaveBeenCalledWith("upload_count", "0");
+      expect(mockCore.info).toHaveBeenCalledWith(`Asset ${path.basename(target)} already exists, skipping`);
+      expect(mockExec.exec.mock.calls.some(([command, args]) => isGitCommand(command, args, "add") || isGitCommand(command, args, "commit"))).toBe(false);
+      expect(mockExec.getExecOutput).not.toHaveBeenCalled();
+    });
+
+    it("classifies existing asset I/O failures as ERR_SYSTEM with destination context", async () => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test";
+      const assets = getAssetsDir();
+      fs.mkdirSync(assets, { recursive: true });
+      const { sha } = makeAsset(assets, "chart.png", "verified chart");
+      const target = trackCwdArtifact(`${crypto.randomUUID()}.png`);
+      fs.writeFileSync(target, "verified chart");
+      setAgentOutput({ items: [{ type: "upload_asset", fileName: "chart.png", sha, targetFileName: path.basename(target) }] });
+      const originalRead = fs.readSync;
+      let reads = 0;
+      const spy = vi.spyOn(fs, "readSync").mockImplementation((...args) => {
+        if (++reads === 2) throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        return originalRead(...args);
+      });
+      try {
+        await expect(executeScript()).resolves.toBeUndefined();
+      } finally {
+        spy.mockRestore();
+      }
+      expect(mockCore.setFailed).toHaveBeenCalledExactlyOnceWith(`ERR_SYSTEM: Failed to verify existing asset ${path.basename(target)}: permission denied`);
+      expect(mockExec.getExecOutput).not.toHaveBeenCalled();
+      expect(mockCore.setOutput).not.toHaveBeenCalled();
     });
   });
 
@@ -149,6 +341,10 @@ describe("upload_assets.cjs", () => {
       await executeScript();
       expect(orphanBranchCreated).toBe(true);
       expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(
+        `### Assets\n\nSuccessfully uploaded **1** asset to branch \`assets/test-workflow\`.\n\n<details>\n<summary>View 1 asset</summary>\n\n- [\`test.png\`](https://github.com/owner/repo/blob/assets/test-workflow/test.png?raw=true) → \`test.png\` (${size} bytes)\n\n</details>\n`
+      );
+      expect(mockCore.summary.write).toHaveBeenCalledOnce();
     });
 
     it("should fail when trying to create orphaned branch without 'assets/' prefix", async () => {
@@ -229,6 +425,58 @@ describe("upload_assets.cjs", () => {
       await executeScript();
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("missing required fields"));
     });
+
+    it("should derive trusted metadata from a validated asset path", async () => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test-workflow";
+      process.env.GH_AW_SAFE_OUTPUTS_STAGED = "false";
+      const assetDir = getAssetsDir();
+      fs.mkdirSync(assetDir, { recursive: true });
+      const declaredPath = "/workspace/test.png";
+      const stagedFileName = `${crypto.createHash("sha256").update(declaredPath).digest("hex")}.png`;
+      const { sha } = makeAsset(assetDir, stagedFileName, "actual content");
+      trackCwdArtifact(`${sha}.png`);
+      setAgentOutput({ items: [{ type: "upload_asset", path: declaredPath }] });
+      mockBranchMissing();
+
+      await executeScript();
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.setOutput).toHaveBeenCalledWith("upload_count", "1");
+    });
+
+    it("should derive GHES raw URLs from trusted metadata", async () => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test-workflow";
+      process.env.GH_AW_SAFE_OUTPUTS_STAGED = "false";
+      process.env.GITHUB_SERVER_URL = "https://ghe.example.com";
+      process.env.GITHUB_REPOSITORY = "octo/repo";
+      const assetDir = getAssetsDir();
+      fs.mkdirSync(assetDir, { recursive: true });
+      const declaredPath = "/workspace/test.png";
+      const stagedFileName = `${crypto.createHash("sha256").update(declaredPath).digest("hex")}.png`;
+      const { sha } = makeAsset(assetDir, stagedFileName, "actual content");
+      trackCwdArtifact(`${sha}.png`);
+      setAgentOutput({ items: [{ type: "upload_asset", path: declaredPath }] });
+      mockBranchMissing();
+
+      await executeScript();
+
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining(`https://ghe.example.com/octo/repo/raw/assets/test-workflow/${sha}.png`));
+    });
+
+    it("should reject target filenames outside the checkout root", async () => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test-workflow";
+      process.env.GH_AW_SAFE_OUTPUTS_STAGED = "false";
+      const assetDir = getAssetsDir();
+      fs.mkdirSync(assetDir, { recursive: true });
+      const { sha, size } = makeAsset(assetDir, "test.png", "actual content");
+      setAgentOutput({
+        items: [{ type: "upload_asset", fileName: "test.png", sha, size, targetFileName: "../../.git/config" }],
+      });
+      mockBranchMissing();
+
+      await executeScript();
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Invalid asset target filename"));
+    });
   });
 
   describe("missing asset handling", () => {
@@ -254,6 +502,9 @@ describe("upload_assets.cjs", () => {
       const uploadCountCall = mockCore.setOutput.mock.calls.find(call => call[0] === "upload_count");
       expect(uploadCountCall).toBeDefined();
       if (uploadCountCall) expect(uploadCountCall[1]).toBe("1");
+      const summary = mockCore.summary.addRaw.mock.calls.map(call => String(call[0])).join("\n");
+      expect(summary).toContain("present-uploaded.png");
+      expect(summary).not.toContain("missing-uploaded.png");
     });
 
     it("should fail when all declared assets are missing", async () => {
@@ -293,6 +544,75 @@ describe("upload_assets.cjs", () => {
       await executeScript();
       expect(pushCalled).toBe(false);
       expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.summary.addRaw).toHaveBeenCalledWith(
+        expect.stringContaining("### Assets\n\n🎭 Staged mode: **1** asset ready for publication to branch `assets/test-workflow` (not pushed).\n\n<details>\n<summary>View 1 asset</summary>\n\n")
+      );
+      expect(mockCore.summary.addRaw.mock.calls[0][0]).toContain("\n\n</details>\n");
+    });
+  });
+
+  describe("concurrent push recovery", () => {
+    const prepareAsset = () => {
+      process.env.GH_AW_ASSETS_BRANCH = "assets/test-workflow";
+      process.env.GH_AW_SAFE_OUTPUTS_STAGED = "false";
+      const assetDir = getAssetsDir();
+      fs.mkdirSync(assetDir, { recursive: true });
+      const { sha, size } = makeAsset(assetDir, "test.png", "fake png data");
+      setAgentOutput({
+        items: [{ type: "upload_asset", fileName: "test.png", sha, size, targetFileName: "test.png", url: "https://example.com/test.png" }],
+      });
+      trackCwdArtifact("test.png");
+    };
+
+    it("should fetch, rebase, and retry after a concurrent push", async () => {
+      prepareAsset();
+      mockExec.getExecOutput.mockResolvedValueOnce({ exitCode: 1, stdout: "! [rejected] assets/test-workflow -> assets/test-workflow (fetch first)", stderr: "" }).mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" });
+
+      await executeScript();
+
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockExec.getExecOutput).toHaveBeenCalledTimes(2);
+      expect(mockExec.exec).toHaveBeenCalledWith("git", ["fetch", "--no-tags", "origin", "+refs/heads/assets/test-workflow:refs/remotes/origin/assets/test-workflow"]);
+      expect(mockExec.exec).toHaveBeenCalledWith("git", ["rebase", "refs/remotes/origin/assets/test-workflow"]);
+    });
+
+    it("should stop after three failed push attempts", async () => {
+      prepareAsset();
+      mockExec.getExecOutput.mockResolvedValue({ exitCode: 1, stdout: "! [rejected] assets/test-workflow -> assets/test-workflow (non-fast-forward)", stderr: "" });
+
+      await executeScript();
+
+      expect(mockExec.getExecOutput).toHaveBeenCalledTimes(3);
+      expect(mockExec.exec.mock.calls.filter(call => isGitCommand(call[0], call[1], "fetch"))).toHaveLength(2);
+      expect(mockExec.exec.mock.calls.filter(call => isGitCommand(call[0], call[1], "rebase"))).toHaveLength(2);
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("non-fast-forward"));
+    });
+
+    it("should not retry a non-concurrent push failure", async () => {
+      prepareAsset();
+      mockExec.getExecOutput.mockResolvedValue({ exitCode: 1, stdout: "", stderr: "remote: permission denied" });
+
+      await executeScript();
+
+      expect(mockExec.getExecOutput).toHaveBeenCalledTimes(1);
+      expect(mockExec.exec.mock.calls.some(call => isGitCommand(call[0], call[1], "fetch"))).toBe(false);
+      expect(mockExec.exec.mock.calls.some(call => isGitCommand(call[0], call[1], "rebase"))).toBe(false);
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("permission denied"));
+    });
+
+    it("should abort the rebase and rethrow when rebase fails with conflicts", async () => {
+      prepareAsset();
+      mockExec.getExecOutput.mockResolvedValueOnce({ exitCode: 1, stdout: "! [rejected] assets/test-workflow -> assets/test-workflow (non-fast-forward)", stderr: "" });
+      mockExec.exec.mockImplementation(async (command, args) => {
+        if (isGitCommand(command, args, "rebase") && args[1] !== "--abort") {
+          throw new Error("CONFLICT (content): Merge conflict in test.png");
+        }
+      });
+
+      await executeScript();
+
+      expect(mockExec.exec.mock.calls.some(call => isGitCommand(call[0], call[1], "rebase") && call[1].includes("--abort"))).toBe(true);
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("CONFLICT"));
     });
   });
 
@@ -335,7 +655,8 @@ describe("upload_assets.cjs", () => {
     it("should read assets from the GH_AW_ASSETS_DIR directory", async () => {
       process.env.GH_AW_ASSETS_BRANCH = "assets/test-workflow";
       process.env.GH_AW_SAFE_OUTPUTS_STAGED = "false";
-      const customAssetsDir = fs.mkdtempSync(path.join("/tmp", "test-gh-aw-assets-"));
+      const customAssetsDir = path.join(tempBase, "custom-assets");
+      fs.mkdirSync(customAssetsDir);
       process.env.GH_AW_ASSETS_DIR = customAssetsDir;
       const { sha, size } = makeAsset(customAssetsDir, "chart.png", "chart content");
       const targetFile = "chart-uploaded.png";

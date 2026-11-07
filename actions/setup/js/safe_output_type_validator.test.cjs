@@ -13,6 +13,7 @@ const SAMPLE_VALIDATION_CONFIG = {
   create_issue: {
     defaultMax: 1,
     dataEnabled: true,
+    collapseData: true,
     fields: {
       title: { required: true, type: "string", sanitize: true, maxLength: 128 },
       body: { required: true, type: "string", sanitize: true, maxLength: 65000, minLength: 20 },
@@ -21,12 +22,20 @@ const SAMPLE_VALIDATION_CONFIG = {
       temporary_id: { type: "string" },
     },
   },
+  linear_create_issue: {
+    defaultMax: 1,
+    fields: {
+      title: { required: true, type: "string", sanitize: true, maxLength: 128, rejectIfOversized: true },
+      body: { required: true, type: "string", sanitize: true, maxLength: 65000, minLength: 20, rejectIfOversized: true },
+    },
+  },
   add_comment: {
     defaultMax: 1,
     dataEnabled: true,
     fields: {
       body: { required: true, type: "string", sanitize: true, maxLength: 65000 },
       item_number: { issueOrPRNumber: true },
+      comment_id: { optionalPositiveInteger: true },
     },
   },
   create_pull_request: {
@@ -61,7 +70,7 @@ const SAMPLE_VALIDATION_CONFIG = {
       body: { type: "string", sanitize: true, maxLength: 65000 },
       labels: { type: "array" },
       assignees: { type: "array", itemType: "string", itemSanitize: true, itemMaxLength: 39 },
-      milestone: { optionalPositiveInteger: true },
+      milestone: { optionalPositiveInteger: true, allowNull: true },
       issue_number: { issueOrPRNumber: true },
     },
   },
@@ -113,11 +122,47 @@ const SAMPLE_VALIDATION_CONFIG = {
       repo: { type: "string", maxLength: 256 },
     },
   },
+  reply_to_pull_request_review_comment: {
+    defaultMax: 10,
+    fields: {
+      comment_id: { required: true, positiveInteger: true },
+      body: { required: true, type: "string", sanitize: true, maxLength: 65000 },
+      pull_request_number: { optionalPositiveInteger: true },
+      repo: { type: "string", maxLength: 256 },
+    },
+  },
+  upload_asset: {
+    defaultMax: 10,
+    fields: {
+      path: { required: true, type: "string" },
+    },
+  },
+  close_issue: {
+    defaultMax: 1,
+    fields: {
+      issue_number: { optionalPositiveInteger: true },
+      duplicate_of: { issueOrPRNumber: true },
+      state_reason: { type: "string", enum: ["completed", "not_planned", "duplicate"] },
+    },
+  },
+  dismiss_pull_request_review: {
+    defaultMax: 10,
+    fields: {
+      review_id: { optionalPositiveInteger: true, allowAuto: true },
+      justification: { required: true, type: "string", sanitize: true, minLength: 20, maxLength: 65000 },
+    },
+  },
+  push_to_pull_request_branch: {
+    defaultMax: 1,
+    fields: {
+      message: { required: true, type: "string", sanitize: true, maxLength: 65000 },
+    },
+  },
   set_issue_type: {
     defaultMax: 5,
     fields: {
       issue_number: { issueOrPRNumber: true },
-      issue_type: { required: true, type: "string", sanitize: true, maxLength: 128 },
+      issue_type: { required: true, type: "string", sanitize: true, maxLength: 128, allowEmpty: true },
       rationale: { type: "string", sanitize: true, maxLength: 280, "x-strip-on-error": true },
       confidence: { type: "string", enum: ["LOW", "MEDIUM", "HIGH"], "x-strip-on-error": true },
       suggest: { type: "boolean" },
@@ -145,12 +190,12 @@ const SAMPLE_VALIDATION_CONFIG = {
     },
   },
   noop: {
-    defaultMax: 1,
+    defaultMax: 2,
     fields: {
       message: { required: true, type: "string", sanitize: true, maxLength: 65000 },
     },
   },
-  missing_tool: {
+  report_missing_tool: {
     defaultMax: 20,
     fields: {
       tool: { required: true, type: "string", sanitize: true, maxLength: 128 },
@@ -164,6 +209,7 @@ const SAMPLE_VALIDATION_CONFIG = {
       title: { required: true, type: "string", sanitize: true, maxLength: 128 },
       body: { required: true, type: "string", sanitize: true, maxLength: 65000, minLength: 64 },
       category: { type: "string", sanitize: true, maxLength: 128 },
+      temporary_id: { type: "string", pattern: "^#?aw_[A-Za-z0-9_]{3,12}$" },
     },
   },
   create_code_scanning_alert: {
@@ -270,6 +316,64 @@ describe("safe_output_type_validator", () => {
   });
 
   describe("validateItem", () => {
+    it.each(["depends-on", "depends_on"])("preserves validated dependency metadata from %s", async key => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const outputId = "so_AAAAAAAAAAAA";
+      const prerequisite = "so_BBBBBBBBBBBB";
+      const result = validateItem({ type: "add_comment", body: "A completed update.", output_id: outputId, [key]: [prerequisite], undeclared: "discard" }, "add_comment", 1);
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem).toEqual({ type: "add_comment", body: "A completed update.", output_id: outputId, "depends-on": [prerequisite] });
+    });
+
+    it.each([null, "", [], ["aw_resource"], ["so_invalid"], { id: "invalid" }])("rejects malformed dependencies rather than silently dropping them: %j", async dependency => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const result = validateItem({ type: "add_comment", body: "A completed update.", "depends-on": dependency }, "add_comment", 1);
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain("depends-on");
+    });
+
+    it("rejects resource temporary IDs as operation IDs", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      expect(validateItem({ type: "add_comment", body: "A completed update.", output_id: "aw_issue1" }, "add_comment", 1).isValid).toBe(false);
+    });
+
+    it.each(["upload_asset", "noop", "call_workflow", "push_repo_memory", "report_incomplete", "report_missing_tool"])("rejects dependencies on standalone %s requests during ingestion", async type => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const result = validateItem({ type, "depends-on": "so_AAAAAAAAAAAA" }, type, 1);
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain("outside the safe-output handler manager");
+    });
+
+    it.each(["aw_discuss", "#aw_Discuss"])("preserves discussion temporary ID %s during ingestion", async temporaryId => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const item = { type: "create_discussion", title: "Report", body: "Discussion report with enough detail to satisfy the minimum body length.", temporary_id: temporaryId };
+
+      const result = validateItem(item, "create_discussion", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem).toEqual(item);
+    });
+
+    it("preserves an agent-selected duplicate state reason in API casing", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "close_issue", issue_number: 2, duplicate_of: 1, state_reason: "DUPLICATE" }, "close_issue", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem).toEqual({ type: "close_issue", issue_number: 2, duplicate_of: 1, state_reason: "duplicate" });
+    });
+
+    it("preserves explicit JSON null for built-in ledger values", async () => {
+      const { validateItem, resetValidationConfigCache } = await import("./safe_output_type_validator.cjs");
+      process.env.GH_AW_VALIDATION_CONFIG = JSON.stringify({
+        ledger_append: { defaultMax: 100, fields: { ledger: { type: "string" }, operation: { type: "string" }, value: { allowNull: true } } },
+      });
+      resetValidationConfigCache();
+      const result = validateItem({ type: "ledger_append", ledger: "items", operation: "add", value: null }, "ledger_append", 1);
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.value).toBeNull();
+    });
+
     it("should validate create_issue with all required fields", async () => {
       const { validateItem } = await import("./safe_output_type_validator.cjs");
 
@@ -435,11 +539,86 @@ describe("safe_output_type_validator", () => {
       expect(result.normalizedItem.body).toContain("```json");
       expect(result.normalizedItem.body).toContain('"verdict": "APPROVE"');
       expect(result.normalizedItem.body).toContain('"marker": "<!-- [PIPELINE-VERDICT] APPROVE -->"');
+      expect(result.normalizedItem.body).not.toContain("<details>");
       expect(result.normalizedItem.data).toEqual({
         verdict: "APPROVE",
         marker: "<!-- [PIPELINE-VERDICT] APPROVE -->",
         criteria_passed: 5,
       });
+    });
+
+    it.each([
+      ["add_comment", {}],
+      ["create_pull_request", { title: "Report", branch: "report" }],
+      ["create_pull_request_review_comment", { path: "test.js", line: 10 }],
+      ["submit_pull_request_review", { event: "APPROVE" }],
+      ["reply_to_pull_request_review_comment", { comment_id: 42 }],
+    ])("should keep %s structured data flat", async (type, fields) => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const body = "Review complete.";
+      const data = { verdict: "APPROVE" };
+
+      const result = validateItem({ type, ...fields, body, data }, type, 1, { dataEnabled: true });
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.body).toBe(`${body}\n\nStructured data:\n\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``);
+      expect(result.normalizedItem.body).not.toContain("<details>");
+      expect(result.normalizedItem.data).toEqual(data);
+    });
+
+    it.each(["Hello @target-author and @other", "> Hello @target-author and @other"])("preserves deferred mentions with structured data in %s", async body => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const { sanitizeContent } = await import("./sanitize_content.cjs");
+      const result = validateItem({ type: "add_comment", body, data: {} }, "add_comment", 1, { dataEnabled: true, deferMentions: true, allowedAliases: [] });
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.body).toContain(body);
+      const published = sanitizeContent(result.normalizedItem.body, { allowedAliases: ["target-author"] });
+      expect(published).toContain("@target-author");
+      expect(published).not.toContain("`@target-author`");
+      expect(published).toContain("`@other`");
+    });
+
+    it.each([
+      ["create_issue", false],
+      ["add_comment", true],
+    ])("should honor the collapseData configuration for %s", async (type, collapseData) => {
+      const { validateItem, resetValidationConfigCache } = await import("./safe_output_type_validator.cjs");
+      const config = JSON.parse(JSON.stringify(SAMPLE_VALIDATION_CONFIG));
+      config[type].collapseData = collapseData;
+      process.env.GH_AW_VALIDATION_CONFIG = JSON.stringify(config);
+      resetValidationConfigCache();
+
+      const result = validateItem({ type, title: "Report", body: "Detailed issue body text.", data: {} }, type, 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.body.includes("<details>")).toBe(collapseData);
+      expect(result.normalizedItem.body.includes("Structured data:")).toBe(!collapseData);
+    });
+
+    it.each([{}, { status: "DEFECT_FOUND", totals: { defect: 1 }, rows: [{ number: 5 }] }])("should collapse create-issue structured data %j", async data => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const { sanitizeContent } = await import("./sanitize_content.cjs");
+      const body = "Detailed issue body text.";
+
+      const result = validateItem({ type: "create_issue", title: "Report", body, data }, "create_issue", 1);
+
+      expect(result.isValid).toBe(true);
+      const expectedBody = `${body}\n\n<details>\n<summary>Structured data</summary>\n\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\`\n\n</details>`;
+      expect(result.normalizedItem.body).toBe(expectedBody);
+      expect(result.normalizedItem.data).toEqual(data);
+      expect(sanitizeContent(result.normalizedItem.body)).toBe(expectedBody);
+    });
+
+    it("should leave create-issue bodies without structured data unchanged", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const body = "Detailed issue body text.";
+
+      const result = validateItem({ type: "create_issue", title: "Report", body }, "create_issue", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.body).toBe(body);
+      expect(result.normalizedItem.data).toBeUndefined();
     });
 
     it("should reject data values that are not objects", async () => {
@@ -484,6 +663,26 @@ describe("safe_output_type_validator", () => {
 
       const valid = validateItem({ type: "add_comment", body: "Review complete.", data: { verdict: "APPROVE", criteria_passed: 5 } }, "add_comment", 1);
       expect(valid.isValid).toBe(true);
+    });
+
+    it("omits blank data only when structured data is enabled", async () => {
+      const { validateItem, resetValidationConfigCache } = await import("./safe_output_type_validator.cjs");
+      const configWithDataSchema = JSON.parse(JSON.stringify(SAMPLE_VALIDATION_CONFIG));
+      configWithDataSchema.add_comment.dataSchema = { type: "object", additionalProperties: false };
+      process.env.GH_AW_VALIDATION_CONFIG = JSON.stringify(configWithDataSchema);
+      resetValidationConfigCache();
+
+      const enabled = validateItem({ type: "add_comment", body: "Review complete.", data: "" }, "add_comment", 1);
+      expect(enabled.isValid).toBe(true);
+      expect(enabled.normalizedItem).not.toHaveProperty("data");
+
+      configWithDataSchema.add_comment.dataEnabled = false;
+      delete configWithDataSchema.add_comment.dataSchema;
+      process.env.GH_AW_VALIDATION_CONFIG = JSON.stringify(configWithDataSchema);
+      resetValidationConfigCache();
+      const disabled = validateItem({ type: "add_comment", body: "Review complete.", data: "" }, "add_comment", 1);
+      expect(disabled.isValid).toBe(false);
+      expect(disabled.error).toContain("'data' is not enabled");
     });
 
     it("should enforce runtime data schema supplied as JSON string", async () => {
@@ -786,6 +985,30 @@ describe("safe_output_type_validator", () => {
     });
   });
 
+  describe("dismiss_pull_request_review review_id", () => {
+    it.each([
+      [{ type: "dismiss_pull_request_review", justification: "This stale review no longer reflects the updated implementation." }, undefined],
+      [{ type: "dismiss_pull_request_review", review_id: "auto", justification: "This stale review no longer reflects the updated implementation." }, "auto"],
+      [{ type: "dismiss_pull_request_review", review_id: "123", justification: "This stale review no longer reflects the updated implementation." }, 123],
+    ])("accepts automatic selection and positive review IDs", async (item, reviewId) => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem(item, "dismiss_pull_request_review", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem?.review_id).toBe(reviewId);
+    });
+
+    it("rejects invalid review IDs", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "dismiss_pull_request_review", review_id: "invalid", justification: "This stale review no longer reflects the updated implementation." }, "dismiss_pull_request_review", 1);
+
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain("must be a valid positive integer");
+    });
+  });
+
   describe("validateIssueOrPRNumber", () => {
     it("should accept undefined", async () => {
       const { validateIssueOrPRNumber } = await import("./safe_output_type_validator.cjs");
@@ -871,6 +1094,14 @@ describe("safe_output_type_validator", () => {
       expect(max).toBe(1);
     });
 
+    it("should allow two noop calls by default", async () => {
+      const { getMaxAllowedForType } = await import("./safe_output_type_validator.cjs");
+
+      const max = getMaxAllowedForType("noop");
+
+      expect(max).toBe(2);
+    });
+
     it("should return overridden max from config", async () => {
       const { getMaxAllowedForType } = await import("./safe_output_type_validator.cjs");
 
@@ -920,6 +1151,17 @@ describe("safe_output_type_validator", () => {
     });
   });
 
+  it("preserves an explicit empty issue_type clear but still requires the field", async () => {
+    const { validateItem } = await import("./safe_output_type_validator.cjs");
+    const cleared = validateItem({ type: "set_issue_type", issue_type: "" }, "set_issue_type", 1);
+    expect(cleared.isValid).toBe(true);
+    expect(cleared.normalizedItem.issue_type).toBe("");
+
+    const missing = validateItem({ type: "set_issue_type" }, "set_issue_type", 1);
+    expect(missing.isValid).toBe(false);
+    expect(missing.error).toContain("'issue_type'");
+  });
+
   describe("custom validation: requiresOneOf", () => {
     it("should pass when at least one field is present", async () => {
       const { validateItem } = await import("./safe_output_type_validator.cjs");
@@ -946,6 +1188,25 @@ describe("safe_output_type_validator", () => {
       expect(result.error).toContain("requires at least one of");
     });
 
+    it.each([null, 1, "1"])("should preserve a milestone clear or assignment: %j", async milestone => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const result = validateItem({ type: "update_issue", issue_number: 42, milestone }, "update_issue", 1);
+      expect(result).toEqual({
+        isValid: true,
+        normalizedItem: { type: "update_issue", issue_number: 42, milestone: milestone === null ? null : 1 },
+      });
+    });
+
+    it.each([
+      ["status", { status: "" }],
+      ["labels", { labels: "" }],
+      ["milestone", { milestone: " \t\n" }],
+    ])("should reject update_issue when only its blank %s field is present", async (_field, update) => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+      const result = validateItem({ type: "update_issue", issue_number: 42, ...update }, "update_issue", 1);
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain("requires at least one of");
+    });
     it("should pass for assign_to_agent with issue_number", async () => {
       const { validateItem } = await import("./safe_output_type_validator.cjs");
 
@@ -1278,6 +1539,36 @@ describe("safe_output_type_validator", () => {
     });
   });
 
+  describe("rejectIfOversized validation", () => {
+    it("should reject an oversized linear_create_issue title instead of truncating it", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const oversizedTitle = "x".repeat(129);
+      const result = validateItem({ type: "linear_create_issue", title: oversizedTitle, body: "A sufficiently detailed body." }, "linear_create_issue", 1);
+
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain("exceeds maximum length");
+    });
+
+    it("should reject an oversized linear_create_issue body instead of truncating it", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const oversizedBody = "x".repeat(65001);
+      const result = validateItem({ type: "linear_create_issue", title: "Valid title", body: oversizedBody }, "linear_create_issue", 1);
+
+      expect(result.isValid).toBe(false);
+      expect(result.error).toContain("exceeds maximum length");
+    });
+
+    it("should accept a linear_create_issue title/body within the configured limits", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "linear_create_issue", title: "Valid title", body: "A sufficiently detailed body." }, "linear_create_issue", 1);
+
+      expect(result.isValid).toBe(true);
+    });
+  });
+
   describe("array validation", () => {
     it("should validate array of strings", async () => {
       const { validateItem } = await import("./safe_output_type_validator.cjs");
@@ -1297,6 +1588,42 @@ describe("safe_output_type_validator", () => {
       expect(result.normalizedItem.labels).toEqual(["reliability", "telemetry"]);
     });
 
+    it("should normalize JSON-array labels string to array", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "create_issue", title: "Test", body: "Detailed issue body text.", labels: '["cookie"]' }, "create_issue", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.labels).toEqual(["cookie"]);
+    });
+
+    it("should normalize multi-label JSON-array string to array", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "create_issue", title: "Test", body: "Detailed issue body text.", labels: '["bug", "enhancement"]' }, "create_issue", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.labels).toEqual(["bug", "enhancement"]);
+    });
+
+    it("should filter non-string entries from JSON-array labels string", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "create_issue", title: "Test", body: "Detailed issue body text.", labels: '["bug", 123, "enhancement"]' }, "create_issue", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.labels).toEqual(["bug", "enhancement"]);
+    });
+
+    it("should fall back to comma-separated parsing for malformed JSON label string", async () => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem({ type: "create_issue", title: "Test", body: "Detailed issue body text.", labels: "[bug, enhancement" }, "create_issue", 1);
+
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem.labels).toEqual(["[bug", "enhancement"]);
+    });
+
     it("should reject array with non-string items", async () => {
       const { validateItem } = await import("./safe_output_type_validator.cjs");
 
@@ -1307,8 +1634,8 @@ describe("safe_output_type_validator", () => {
     });
   });
 
-  describe("undeclared field passthrough", () => {
-    it("should preserve base_commit on normalizedItem", async () => {
+  describe("undeclared fields", () => {
+    it("should preserve the normalized type and declared fields", async () => {
       const { validateItem } = await import("./safe_output_type_validator.cjs");
 
       const item = {
@@ -1316,31 +1643,38 @@ describe("safe_output_type_validator", () => {
         title: "Fix bug",
         body: "Fixes the thing",
         branch: "fix/bug",
-        base_commit: "abc123deadbeef",
       };
 
       const result = validateItem(item, "create_pull_request", 1);
       expect(result.isValid).toBe(true);
-      expect(result.normalizedItem.base_commit).toBe("abc123deadbeef");
+      expect(result.normalizedItem).toEqual(item);
     });
 
-    it("should preserve diff_size on normalizedItem", async () => {
+    it("should preserve declared add_comment.comment_id as a positive integer", async () => {
       const { validateItem } = await import("./safe_output_type_validator.cjs");
 
-      const item = {
-        type: "create_pull_request",
-        title: "Fix bug",
-        body: "Fixes the thing",
-        branch: "fix/bug",
-        diff_size: 1,
-      };
-
-      const result = validateItem(item, "create_pull_request", 1);
+      const result = validateItem({ type: "add_comment", body: "Test comment", comment_id: "123" }, "add_comment", 1);
       expect(result.isValid).toBe(true);
-      expect(result.normalizedItem.diff_size).toBe(1);
+      expect(result.normalizedItem).toEqual({ type: "add_comment", body: "Test comment", comment_id: 123 });
     });
 
-    it("should preserve undeclared fields", async () => {
+    it.each([
+      { itemType: "update_pull_request", item: { type: "update_pull_request", title: "Updated title", base: "release", state: "closed" }, fieldName: "base" },
+      { itemType: "update_pull_request", item: { type: "update_pull_request", title: "Updated title", base: "release", state: "closed" }, fieldName: "state" },
+      { itemType: "upload_asset", item: { type: "upload_asset", path: "image.png", targetFileName: "../../.git/config" }, fieldName: "targetFileName" },
+      { itemType: "create_issue", item: { type: "create_issue", title: "Test", body: "Detailed issue body text.", assignees: ["octocat"] }, fieldName: "assignees" },
+      { itemType: "create_discussion", item: { type: "create_discussion", title: "Test", body: "This discussion body is intentionally long enough for validation.", labels: ["security"] }, fieldName: "labels" },
+      { itemType: "push_to_pull_request_branch", item: { type: "push_to_pull_request_branch", message: "Apply changes", diff_size: 0 }, fieldName: "diff_size" },
+      { itemType: "create_pull_request", item: { type: "create_pull_request", title: "Fix bug", body: "Fixes the thing", branch: "fix/bug", base_commit: "abc123deadbeef" }, fieldName: "base_commit" },
+    ])("should strip undeclared $itemType.$fieldName", async ({ itemType, item, fieldName }) => {
+      const { validateItem } = await import("./safe_output_type_validator.cjs");
+
+      const result = validateItem(item, itemType, 1);
+      expect(result.isValid).toBe(true);
+      expect(result.normalizedItem).not.toHaveProperty(fieldName);
+    });
+
+    it("should preserve enabled structured data", async () => {
       const { validateItem } = await import("./safe_output_type_validator.cjs");
 
       const item = {
@@ -1350,7 +1684,7 @@ describe("safe_output_type_validator", () => {
         data: { project: "test" },
       };
 
-      const result = validateItem(item, "create_issue", 1);
+      const result = validateItem(item, "create_issue", 1, { dataEnabled: true });
       expect(result.isValid).toBe(true);
       expect(result.normalizedItem.data).toEqual({ project: "test" });
     });

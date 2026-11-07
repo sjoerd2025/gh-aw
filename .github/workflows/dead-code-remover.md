@@ -30,14 +30,16 @@ imports:
 network:
   allowed:
     - defaults
+    - github
     - go
+    - node
 tools:
   cli-proxy: true
   bash:
     - "*"
   edit:
   github:
-    mode: gh-proxy
+    mode: local
     github-token: "${{ secrets.GITHUB_TOKEN }}"
     toolsets: [default, pull_requests]
   cache-memory: true
@@ -46,9 +48,6 @@ steps:
   - name: Install deadcode analyzer
     run: go install golang.org/x/tools/cmd/deadcode@latest
 
-sandbox:
-  agent:
-    sudo: false
 ---
 
 # Dead Code Removal Agent
@@ -80,7 +79,7 @@ Inline sub-agent block syntax: `agent` names the sub-agent, `model` selects a sm
 After it runs, parse its stdout JSON and use `skip` / `candidates` as inputs for later phases.
 
 ## agent: discover-candidates
-model: kiwi
+model: gpt-6-luna
 task: |
   Run: deadcode ./cmd/... ./internal/tools/...
   Read: /tmp/gh-aw/cache-memory/dead-code-processed.jsonl (if present)

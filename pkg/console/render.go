@@ -9,13 +9,15 @@ import (
 	"strings"
 	"time"
 
+	lipgloss "charm.land/lipgloss/v2"
+
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 var renderLog = logger.New("console:render")
 
-// RenderStruct renders a Go struct to console output using reflection and struct tags.
+// RenderStruct renders a Go struct for stderr using reflection and struct tags.
 // It supports:
 // - Rendering structs as markdown-style headers with key-value pairs
 // - Rendering slices as tables using the console table renderer
@@ -27,15 +29,36 @@ var renderLog = logger.New("console:render")
 // - `console:"omitempty"` - Skips zero values
 // - `console:"-"` - Skips the field entirely
 func RenderStruct(v any) string {
+	return renderStructWithRenderer(v, RenderTable)
+}
+
+// RenderStructStdout renders reflected data for stdout, including nested tables.
+func RenderStructStdout(v any) string {
+	return renderStructWithRenderer(v, RenderTableStdout)
+}
+
+// RenderStructWithOptions propagates destination and width to nested tables.
+func RenderStructWithOptions(v any, options RenderOptions) string {
+	renderTable := func(config TableConfig) string {
+		config.MaxWidth = options.MaxWidth
+		if options.Stderr {
+			return RenderTableStderr(config)
+		}
+		return RenderTableStdout(config)
+	}
+	return wrapConsoleText(renderStructWithRenderer(v, renderTable), options.MaxWidth)
+}
+
+func renderStructWithRenderer(v any, renderTable func(TableConfig) string) string {
 	renderLog.Printf("Rendering struct: type=%T", v)
 	var output strings.Builder
-	renderValue(reflect.ValueOf(v), "", &output, 0)
+	renderValue(reflect.ValueOf(v), "", &output, 0, renderTable)
 	renderLog.Printf("Struct rendering complete: output_size=%d bytes", output.Len())
 	return output.String()
 }
 
 // renderValue recursively renders a reflect.Value to the output builder
-func renderValue(val reflect.Value, title string, output *strings.Builder, depth int) {
+func renderValue(val reflect.Value, title string, output *strings.Builder, depth int, renderTable func(TableConfig) string) {
 	// Dereference pointers
 	for val.Kind() == reflect.Pointer {
 		if val.IsNil() {
@@ -46,16 +69,16 @@ func renderValue(val reflect.Value, title string, output *strings.Builder, depth
 
 	switch val.Kind() {
 	case reflect.Struct:
-		renderStruct(val, title, output, depth)
+		renderStruct(val, title, output, depth, renderTable)
 	case reflect.Slice, reflect.Array:
-		renderSlice(val, title, output, depth)
+		renderSliceWithRenderer(val, title, output, depth, renderTable)
 	case reflect.Map:
 		renderMap(val, title, output, depth)
 	}
 }
 
 // renderStruct renders a struct as markdown-style headers with key-value pairs
-func renderStruct(val reflect.Value, title string, output *strings.Builder, depth int) {
+func renderStruct(val reflect.Value, title string, output *strings.Builder, depth int, renderTable func(TableConfig) string) {
 	typ := val.Type()
 	renderLog.Printf("Rendering struct: type=%s, title=%s, depth=%d, fields=%d", typ.Name(), title, depth, val.NumField())
 
@@ -69,14 +92,14 @@ func renderStruct(val reflect.Value, title string, output *strings.Builder, dept
 	}
 
 	maxFieldLen := computeMaxFieldLen(val)
-	renderInlineEmbeddedFields(val, maxFieldLen, output, depth)
+	renderInlineEmbeddedFields(val, maxFieldLen, output, depth, renderTable)
 
 	output.WriteString("\n")
 }
 
 // renderInlineEmbeddedFields renders the fields of an anonymous embedded struct
 // directly into the parent struct output, flattening the hierarchy.
-func renderInlineEmbeddedFields(val reflect.Value, maxFieldLen int, output *strings.Builder, depth int) {
+func renderInlineEmbeddedFields(val reflect.Value, maxFieldLen int, output *strings.Builder, depth int, renderTable func(TableConfig) string) {
 	walkInlineFields(val, func(field reflect.Value, fieldType reflect.StructField) {
 		tag := parseConsoleTag(fieldType.Tag.Get("console"))
 		if tag.skip {
@@ -91,7 +114,7 @@ func renderInlineEmbeddedFields(val reflect.Value, maxFieldLen int, output *stri
 			fieldName = tag.header
 		}
 
-		renderStructField(field, fieldName, tag, maxFieldLen, output, depth)
+		renderStructField(field, fieldName, tag, maxFieldLen, output, depth, renderTable)
 	})
 }
 
@@ -111,8 +134,8 @@ func computeMaxFieldLen(val reflect.Value) int {
 			fieldName = tag.header
 		}
 
-		if len(fieldName) > maxFieldLen {
-			maxFieldLen = len(fieldName)
+		if lipgloss.Width(fieldName) > maxFieldLen {
+			maxFieldLen = lipgloss.Width(fieldName)
 		}
 	})
 	return maxFieldLen
@@ -125,6 +148,9 @@ func walkInlineFields(val reflect.Value, visit func(field reflect.Value, fieldTy
 		fieldType := typ.Field(i)
 
 		if fieldType.Anonymous {
+			if parseConsoleTag(fieldType.Tag.Get("console")).skip {
+				continue
+			}
 			if embedded, ok := embeddedStructValue(field); ok {
 				walkInlineFields(embedded, visit)
 				continue
@@ -147,7 +173,7 @@ func embeddedStructValue(field reflect.Value) (reflect.Value, bool) {
 }
 
 // renderStructField renders a single struct field to output, dispatching on its kind.
-func renderStructField(field reflect.Value, fieldName string, tag consoleTag, maxFieldLen int, output *strings.Builder, depth int) {
+func renderStructField(field reflect.Value, fieldName string, tag consoleTag, maxFieldLen int, output *strings.Builder, depth int, renderTable func(TableConfig) string) {
 	// Dereference pointer to check underlying type
 	fieldToCheck := field
 	if field.Kind() == reflect.Pointer && !field.IsNil() {
@@ -162,22 +188,22 @@ func renderStructField(field reflect.Value, fieldName string, tag consoleTag, ma
 	switch {
 	case fieldToCheck.Kind() == reflect.Struct && fieldToCheck.Type().String() != "time.Time":
 		// Nested struct – render recursively
-		renderValue(field, subTitle, output, depth+1)
+		renderValue(field, subTitle, output, depth+1, renderTable)
 	case fieldToCheck.Kind() == reflect.Slice || fieldToCheck.Kind() == reflect.Array:
 		// Slice – render as table
-		renderValue(field, subTitle, output, depth+1)
+		renderValue(field, subTitle, output, depth+1, renderTable)
 	case fieldToCheck.Kind() == reflect.Map:
 		// Map – render as headers
-		renderValue(field, subTitle, output, depth+1)
+		renderValue(field, subTitle, output, depth+1, renderTable)
 	default:
 		// Simple field – render as key-value pair with alignment
-		paddedName := fmt.Sprintf("%-*s", maxFieldLen, fieldName)
+		paddedName := lipgloss.NewStyle().Width(maxFieldLen).Render(fieldName)
 		fmt.Fprintf(output, "  %s: %v\n", paddedName, formatFieldValueWithTag(field, tag))
 	}
 }
 
-// renderSlice renders a slice as a table using the console table renderer
-func renderSlice(val reflect.Value, title string, output *strings.Builder, depth int) {
+// renderSliceWithRenderer renders slices using the selected table destination.
+func renderSliceWithRenderer(val reflect.Value, title string, output *strings.Builder, depth int, renderTable func(TableConfig) string) {
 	if val.Len() == 0 {
 		return
 	}
@@ -202,7 +228,7 @@ func renderSlice(val reflect.Value, title string, output *strings.Builder, depth
 	if elemType.Kind() == reflect.Struct {
 		// Render as table
 		config := buildTableConfig(val, title)
-		output.WriteString(RenderTable(config))
+		output.WriteString(renderTable(config))
 	} else {
 		// Render as list
 		for i := range val.Len() {
@@ -290,6 +316,9 @@ func collectTableFields(t reflect.Type, prefix []int) []tableField {
 		fieldPath[len(prefix)] = i
 
 		if field.Anonymous {
+			if parseConsoleTag(field.Tag.Get("console")).skip {
+				continue
+			}
 			if embeddedType, ok := embeddedStructType(field.Type); ok {
 				fields = append(fields, collectTableFields(embeddedType, fieldPath)...)
 				continue
@@ -584,37 +613,46 @@ func applyTagFormat(val reflect.Value, format, baseValue string) string {
 	return baseValue
 }
 
-// applyNumberFormat formats a value as a human-readable number (e.g., "1k", "1.2M").
-func applyNumberFormat(val reflect.Value, baseValue string) string {
+// applyIntegerFormat formats integer values via a shared dispatcher used by
+// number/filesize tag formatters.
+func applyIntegerFormat(val reflect.Value, baseValue string, format func(int64) string) string {
 	if val.CanInterface() {
 		switch v := val.Interface().(type) {
 		case int:
-			return FormatNumber(v)
+			return format(int64(v))
 		case int64:
-			// #nosec G115 -- Converting int64 to int for display formatting
-			return FormatNumber(int(v))
+			return format(v)
 		case int32:
-			return FormatNumber(int(v))
+			return format(int64(v))
 		case uint:
-			// #nosec G115 -- Converting uint to int for display formatting
-			return FormatNumber(int(v))
+			// #nosec G115 -- Converting uint to int64 for display formatting
+			return format(int64(v))
 		case uint64:
-			// #nosec G115 -- Converting uint64 to int for display formatting
-			return FormatNumber(int(v))
+			// #nosec G115 -- Converting uint64 to int64 for display formatting
+			return format(int64(v))
 		case uint32:
-			return FormatNumber(int(v))
+			return format(int64(v))
 		}
 	}
+
 	// Fallback: use integer kind directly, keeping signed and unsigned separate
 	// to avoid calling Int() on an unsigned kind (which panics).
 	switch {
 	case val.Kind() >= reflect.Int && val.Kind() <= reflect.Int64:
-		return FormatNumber(int(val.Int()))
+		return format(val.Int())
 	case val.Kind() >= reflect.Uint && val.Kind() <= reflect.Uint64:
-		// #nosec G115 -- Converting uint to int for display formatting
-		return FormatNumber(int(val.Uint()))
+		// #nosec G115 -- Converting uint to int64 for display formatting
+		return format(int64(val.Uint()))
 	}
 	return baseValue
+}
+
+// applyNumberFormat formats a value as a human-readable number (e.g., "1k", "1.2M").
+func applyNumberFormat(val reflect.Value, baseValue string) string {
+	return applyIntegerFormat(val, baseValue, func(v int64) string {
+		// #nosec G115 -- Converting int64 to int for display formatting
+		return FormatNumber(int(v))
+	})
 }
 
 // applyCostFormat formats a value as currency with $ prefix.
@@ -641,33 +679,7 @@ func applyCostFormat(val reflect.Value, baseValue string) string {
 
 // applyFilesizeFormat formats a value as a human-readable file size (e.g., "1.2 MB").
 func applyFilesizeFormat(val reflect.Value, baseValue string) string {
-	if val.CanInterface() {
-		switch v := val.Interface().(type) {
-		case int:
-			return FormatFileSize(int64(v))
-		case int64:
-			return FormatFileSize(v)
-		case int32:
-			return FormatFileSize(int64(v))
-		case uint:
-			// #nosec G115 -- Converting uint to int64 for file size display
-			return FormatFileSize(int64(v))
-		case uint64:
-			// #nosec G115 -- Converting uint64 to int64 for file size display
-			return FormatFileSize(int64(v))
-		case uint32:
-			return FormatFileSize(int64(v))
-		}
-	}
-	// Fallback for integer kinds
-	if val.Kind() >= reflect.Int && val.Kind() <= reflect.Int64 {
-		return FormatFileSize(val.Int())
-	}
-	if val.Kind() >= reflect.Uint && val.Kind() <= reflect.Uint64 {
-		// #nosec G115 -- Converting uint to int64 for file size display
-		return FormatFileSize(int64(val.Uint()))
-	}
-	return baseValue
+	return applyIntegerFormat(val, baseValue, FormatFileSize)
 }
 
 // FormatNumber formats large numbers in a human-readable way (e.g., "1k", "1.2k", "1.12M")

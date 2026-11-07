@@ -13,29 +13,295 @@ const {
   AWF_MODELS_URL_MAX_ATTEMPTS,
   AWF_MODELS_URL_RETRY_BASE_MS,
   AWF_MODELS_URL_RETRY_MAX_MS,
+  AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS,
+  AWF_PROVIDER_LISTENER_READY_RETRY_MS,
+  AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS,
+  DEFAULT_API_PROXY_HOST_BRIDGE,
   GEMINI_MODEL_NAME_PREFIX,
+  deriveBaseUrlFromModelsURL,
   enrichReflectModels,
   extractModelIds,
   fetchAWFReflect,
   fetchModelsFromUrl,
+  waitForProviderListenerReady,
   getCatalogModelEntry,
+  hasAzureOIDCProviderEndpoint,
+  hasAPIProxyLocalhostAlias,
   inferProviderTypeForModel,
   inferWireApiForModel,
+  parseReflectTimeoutMs,
+  resolveOpenAICompatibleEndpointFromReflect,
   resolveProviderEndpointFromReflect,
   resolveMultiProviderFromReflect,
+  rewriteAPIProxyURLForHostBridge,
 } = require("./awf_reflect.cjs");
 
 describe("awf_reflect.cjs", () => {
+  describe("hasAzureOIDCProviderEndpoint", () => {
+    it("requires a configured resolved endpoint using Azure OIDC", () => {
+      const endpoint = { provider: "openai", configured: true, auth_type: "github-oidc/azure", port: 10000 };
+      expect(hasAzureOIDCProviderEndpoint({ endpoints: [endpoint] }, "openai")).toBe(true);
+      expect(hasAzureOIDCProviderEndpoint({ endpoints: [{ ...endpoint, auth_type: "static-key" }] }, "openai")).toBe(false);
+      expect(hasAzureOIDCProviderEndpoint({ endpoints: [{ ...endpoint, configured: false }] }, "openai")).toBe(false);
+      expect(hasAzureOIDCProviderEndpoint({ endpoints: [endpoint] }, "anthropic")).toBe(false);
+    });
+  });
+
   describe("constants", () => {
     it("exports expected default values", () => {
       expect(AWF_API_PROXY_REFLECT_URL).toBe("http://api-proxy:10000/reflect");
-      expect(AWF_REFLECT_OUTPUT_PATH).toBe("/tmp/gh-aw/sandbox/firewall/awf-reflect.json");
+      expect(AWF_REFLECT_OUTPUT_PATH).toBe("/tmp/gh-aw/agent/awf-reflect.json");
       expect(AWF_REFLECT_TIMEOUT_MS).toBe(60000);
       expect(AWF_MODELS_URL_TIMEOUT_MS).toBe(3000);
       expect(AWF_MODELS_URL_MAX_ATTEMPTS).toBe(5);
       expect(AWF_MODELS_URL_RETRY_BASE_MS).toBe(250);
       expect(AWF_MODELS_URL_RETRY_MAX_MS).toBe(2000);
+      expect(AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS).toBe(15000);
+      expect(AWF_PROVIDER_LISTENER_READY_RETRY_MS).toBe(250);
+      expect(AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS).toBe(2000);
+      expect(DEFAULT_API_PROXY_HOST_BRIDGE).toBe("host.docker.internal");
       expect(GEMINI_MODEL_NAME_PREFIX).toBe("models/");
+    });
+
+    it("falls back to the default reflect timeout when the environment value is invalid", () => {
+      expect(parseReflectTimeoutMs("")).toBe(60000);
+      expect(parseReflectTimeoutMs("not-a-number")).toBe(60000);
+      expect(parseReflectTimeoutMs("12abc")).toBe(60000);
+      expect(parseReflectTimeoutMs("999999999999999999999999")).toBe(60000);
+      expect(parseReflectTimeoutMs("1234")).toBe(1234);
+    });
+  });
+
+  describe("waitForProviderListenerReady", () => {
+    it("returns ok when listener accepts a connection", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        queueMicrotask(() => listeners.connect && listeners.connect());
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          removeAllListeners() {
+            return this;
+          },
+          end() {},
+          destroy() {},
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "http://api-proxy:10002",
+        timeoutMs: 500,
+        retryDelayMs: 1,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result).toEqual({ ok: true });
+      expect(probingConnect).toHaveBeenCalled();
+    });
+
+    it("returns timeout when listener keeps refusing connections", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        queueMicrotask(() => listeners.error && listeners.error(new Error("connect ECONNREFUSED")));
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          end() {},
+          destroy() {},
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "http://api-proxy:10002",
+        timeoutMs: 20,
+        retryDelayMs: 1,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("timeout");
+      expect(result.error).toContain("ECONNREFUSED");
+    });
+
+    it("returns invalid_base_url for malformed baseUrl", async () => {
+      const result = await waitForProviderListenerReady({
+        baseUrl: "not a url",
+        logger: () => {},
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("invalid_base_url");
+    });
+
+    it("returns timeout when the per-attempt timer fires (hung connect)", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        // Never fire "connect" or "error" — simulates a hung connection attempt.
+        return {
+          once() {
+            return this;
+          },
+          end() {},
+          destroy() {},
+          removeAllListeners() {
+            return this;
+          },
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "http://api-proxy:10002",
+        timeoutMs: 50,
+        retryDelayMs: 1,
+        perAttemptTimeoutMs: 5,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("timeout");
+      expect(result.error).toContain("timed out after");
+    });
+
+    it("uses a TLS secureConnect handshake for https:// baseUrls", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        queueMicrotask(() => listeners.secureConnect && listeners.secureConnect());
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          removeAllListeners() {
+            return this;
+          },
+          end() {},
+          destroy() {},
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "https://api-proxy:10443",
+        timeoutMs: 500,
+        retryDelayMs: 1,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result).toEqual({ ok: true });
+    });
+
+    it("does not report ready on a bare TCP connect for https:// baseUrls", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        // Only fires "connect" (bare TCP), never "secureConnect" (TLS handshake complete).
+        queueMicrotask(() => listeners.connect && listeners.connect());
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          removeAllListeners() {
+            return this;
+          },
+          end() {},
+          destroy() {},
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "https://api-proxy:10443",
+        timeoutMs: 20,
+        retryDelayMs: 1,
+        perAttemptTimeoutMs: 5,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("timeout");
+    });
+
+    it("ignores a late error emitted after a successful connect", async () => {
+      const probingConnect = vi.fn().mockImplementation(() => {
+        const listeners = {};
+        queueMicrotask(() => listeners.connect && listeners.connect());
+        return {
+          once(event, cb) {
+            listeners[event] = cb;
+            return this;
+          },
+          removeAllListeners(event) {
+            delete listeners[event];
+            return this;
+          },
+          end() {},
+          destroy() {
+            // Simulate a trailing error emitted after destroy(). The "error" listener must
+            // still be installed (an EventEmitter without one would throw), and the handler
+            // must ignore it because the probe already settled as ready.
+            if (!listeners.error) throw new Error("error listener was removed before destroy()");
+            listeners.error(new Error("late ECONNRESET"));
+          },
+        };
+      });
+
+      const result = await waitForProviderListenerReady({
+        baseUrl: "http://api-proxy:10002",
+        timeoutMs: 500,
+        retryDelayMs: 1,
+        connectImpl: probingConnect,
+        logger: () => {},
+      });
+      expect(result).toEqual({ ok: true });
+    });
+  });
+
+  describe("rewriteAPIProxyURLForHostBridge", () => {
+    it("does not rewrite api-proxy URLs without a localhost HOSTALIASES mapping", () => {
+      const env = { HOSTALIASES: "/tmp/aliases" };
+      const readFileSync = () => "other-host localhost\n";
+
+      expect(hasAPIProxyLocalhostAlias(env, readFileSync)).toBe(false);
+      expect(rewriteAPIProxyURLForHostBridge("http://api-proxy:10002/models", env, readFileSync)).toBe("http://api-proxy:10002/models");
+    });
+
+    it("rewrites api-proxy URLs when HOSTALIASES maps api-proxy to localhost", () => {
+      const env = { HOSTALIASES: "/tmp/aliases" };
+      const readFileSync = () => "# generated by awf\napi-proxy localhost\n";
+
+      expect(hasAPIProxyLocalhostAlias(env, readFileSync)).toBe(true);
+      expect(rewriteAPIProxyURLForHostBridge("http://api-proxy:10002/models", env, readFileSync)).toBe("http://host.docker.internal:10002/models");
+    });
+
+    it("uses an override bridge host when provided", () => {
+      const env = { HOSTALIASES: "/tmp/aliases", GH_AW_API_PROXY_HOST_BRIDGE: "172.30.0.1" };
+      const readFileSync = () => "api-proxy 127.0.0.1\n";
+
+      expect(rewriteAPIProxyURLForHostBridge("http://api-proxy:10002", env, readFileSync)).toBe("http://172.30.0.1:10002");
+    });
+  });
+
+  describe("deriveBaseUrlFromModelsURL", () => {
+    it("strips a trailing /models segment and leaves non-bridged hosts untouched", () => {
+      const env = {};
+      const readFileSync = () => "";
+
+      expect(deriveBaseUrlFromModelsURL("http://api-proxy:10002/v1/models", env, readFileSync)).toBe("http://api-proxy:10002/v1");
+    });
+
+    it("rewrites the api-proxy host to the HOSTALIASES bridge host, matching resolveProviderEndpointFromReflect", () => {
+      // Regression test: the crush harness previously derived its chat-completions
+      // base URL from models_url without reapplying the api-proxy -> host bridge
+      // rewrite, so it sent requests to the unresolvable "api-proxy" hostname even
+      // though resolveProviderEndpointFromReflect's baseUrl was already rewritten.
+      const env = { HOSTALIASES: "/tmp/aliases" };
+      const readFileSync = () => "api-proxy localhost\n";
+
+      expect(deriveBaseUrlFromModelsURL("http://api-proxy:10002/v1/models", env, readFileSync)).toBe("http://host.docker.internal:10002/v1");
+    });
+
+    it("defaults to process.env and fs.readFileSync when not provided, with no path prefix before /models", () => {
+      expect(deriveBaseUrlFromModelsURL("http://example.test:10002/models")).toBe("http://example.test:10002");
     });
   });
 
@@ -133,6 +399,49 @@ describe("awf_reflect.cjs", () => {
           endpointProvider: "openai",
           port: 10000,
           baseUrl: "http://api-proxy:10000",
+        });
+      });
+    });
+
+    describe("resolveOpenAICompatibleEndpointFromReflect", () => {
+      const reflectData = {
+        endpoints: [
+          { provider: "openai", configured: true, models_url: "http://api-proxy:10000/v1/models" },
+          { provider: "copilot", configured: true, models_url: "http://api-proxy:10002/models" },
+        ],
+      };
+
+      it("derives the versionless Copilot chat endpoint for the github provider", () => {
+        expect(resolveOpenAICompatibleEndpointFromReflect({ provider: "github", reflectData, logger: () => {} })).toEqual({
+          provider: "github",
+          endpointProvider: "copilot",
+          host: "http://api-proxy:10002",
+          basePath: "chat/completions",
+        });
+      });
+
+      it("preserves the OpenAI v1 path", () => {
+        expect(resolveOpenAICompatibleEndpointFromReflect({ provider: "openai", reflectData, logger: () => {} })).toEqual({
+          provider: "openai",
+          endpointProvider: "openai",
+          host: "http://api-proxy:10000",
+          basePath: "v1/chat/completions",
+        });
+      });
+
+      it("does not fall back to a different configured provider", () => {
+        expect(resolveOpenAICompatibleEndpointFromReflect({ provider: "anthropic", reflectData, logger: () => {} })).toBeNull();
+      });
+
+      it("rewrites the host bridge for definition-based engine OpenAI-compatible endpoints", () => {
+        const env = { HOSTALIASES: "/tmp/aliases" };
+        const readFileSync = () => "api-proxy localhost\n";
+
+        expect(resolveOpenAICompatibleEndpointFromReflect({ provider: "github", reflectData, logger: () => {}, env, readFileSync })).toEqual({
+          provider: "github",
+          endpointProvider: "copilot",
+          host: "http://host.docker.internal:10002",
+          basePath: "chat/completions",
         });
       });
     });
@@ -261,6 +570,70 @@ describe("awf_reflect.cjs", () => {
       expect(logs.some(l => l.includes("models fetch returned 503"))).toBe(true);
     });
 
+    it("retries on 429 and eventually succeeds", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn()
+          .mockResolvedValueOnce({ ok: false, status: 429, headers: { get: () => null } })
+          .mockResolvedValueOnce({ ok: false, status: 429, headers: { get: () => null } })
+          .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-4o" }] }) })
+      );
+
+      const logs = [];
+      const result = await fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+      expect(result).toEqual(["gpt-4o"]);
+      expect(logs.filter(l => l.includes("retrying (attempt")).length).toBe(2);
+      expect(logs.some(l => l.includes("models fetch returned 429"))).toBe(true);
+      expect(logs.some(l => l.includes("fetched 1 model(s)"))).toBe(true);
+    });
+
+    it("stops retrying after max attempts on repeated 429 responses", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 429, headers: { get: () => null } }));
+
+      const logs = [];
+      const result = await fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+      expect(result).toBeNull();
+      expect(logs.filter(l => l.includes("retrying (attempt")).length).toBe(AWF_MODELS_URL_MAX_ATTEMPTS - 1);
+      expect(logs.some(l => l.includes("models fetch returned 429"))).toBe(true);
+    });
+
+    it("honors a valid Retry-After header when retrying a 429", async () => {
+      vi.useFakeTimers();
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: false, status: 429, headers: { get: name => (name === "retry-after" ? "3" : null) } })
+        .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-4o" }] }) });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const logs = [];
+      const run = fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+
+      // Let the first attempt settle before advancing timers.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Retry-After: 3 requests a 3000ms wait, but it is capped to AWF_MODELS_URL_RETRY_MAX_MS (2000ms).
+      await vi.advanceTimersByTimeAsync(AWF_MODELS_URL_RETRY_MAX_MS - 1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await run;
+
+      expect(result).toEqual(["gpt-4o"]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([400, 401, 403])("does not retry a permanent %d response", async status => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status }));
+
+      const logs = [];
+      const result = await fetchModelsFromUrl("http://api-proxy:10000/v1/models", 1000, msg => logs.push(msg));
+      expect(result).toBeNull();
+      expect(logs.some(l => l.includes("retrying (attempt"))).toBe(false);
+      expect(logs.some(l => l.includes(`models fetch returned ${status}`))).toBe(true);
+    });
+
     it("delays initial probe for github-oidc auth when probing api-proxy", async () => {
       vi.useFakeTimers();
       process.env.AWF_AUTH_TYPE = "github-oidc";
@@ -286,6 +659,29 @@ describe("awf_reflect.cjs", () => {
   describe("fetchAWFReflect", () => {
     afterEach(() => {
       vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    });
+
+    it("skips network requests when reflection is disabled", async () => {
+      const fetchMock = vi.fn();
+      const logs = [];
+      vi.stubGlobal("fetch", fetchMock);
+      vi.stubEnv("GH_AW_SKIP_REFLECT", "true");
+
+      await expect(
+        fetchAWFReflect({
+          reflectUrl: "http://api-proxy:10000/reflect",
+          outputPath: "/tmp/gh-aw-test-noop.json",
+          logger: msg => logs.push(msg),
+        })
+      ).resolves.toEqual({
+        ok: false,
+        reflectUrl: "http://api-proxy:10000/reflect",
+        outputPath: "/tmp/gh-aw-test-noop.json",
+        reason: "disabled",
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(logs).toContain("awf-reflect: disabled by GH_AW_SKIP_REFLECT");
     });
 
     it("saves enriched reflect data when api-proxy returns null models for configured provider", async () => {
@@ -369,6 +765,30 @@ describe("awf_reflect.cjs", () => {
         status: 503,
       });
       expect(logs.some(l => l.includes("unexpected status 503"))).toBe(true);
+    });
+
+    it("returns reflect data even when persisting awf-reflect output fails", async () => {
+      const reflectPayload = { endpoints: [{ provider: "copilot", configured: true, models: ["copilot/claude-sonnet-4.6"] }] };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => reflectPayload }));
+      const logs = [];
+
+      await expect(
+        fetchAWFReflect({
+          reflectUrl: "http://api-proxy:10000/reflect",
+          outputPath: "/tmp/gh-aw-test-read-only/awf-reflect.json",
+          timeoutMs: 500,
+          logger: msg => logs.push(msg),
+          writeFileSync: () => {
+            throw new Error("EROFS: read-only file system");
+          },
+        })
+      ).resolves.toEqual({
+        ok: true,
+        reflectUrl: "http://api-proxy:10000/reflect",
+        outputPath: "/tmp/gh-aw-test-read-only/awf-reflect.json",
+        reflectData: reflectPayload,
+      });
+      expect(logs.some(l => l.includes("unable to persist reflect payload"))).toBe(true);
     });
 
     it("uses the caller-supplied logger for all messages", async () => {
@@ -471,6 +891,22 @@ describe("awf_reflect.cjs", () => {
       expect(entry).toEqual({ provider_type: "openai", wire_api: "responses", cost: {} });
     });
 
+    it("looks up utility variants through their base model after exact matches", () => {
+      const modelsJson = {
+        providers: {
+          "github-copilot": {
+            models: {
+              "gpt-5.6-luna": { wire_api: "responses" },
+              "gpt-5.6-luna-utility": { wire_api: "completions" },
+            },
+          },
+        },
+      };
+      expect(getCatalogModelEntry(modelsJson, "gpt-5.6-luna-utility?effort=high", "github-copilot")).toEqual({ wire_api: "completions" });
+      delete modelsJson.providers["github-copilot"].models["gpt-5.6-luna-utility"];
+      expect(getCatalogModelEntry(modelsJson, "gpt-5.6-luna-utility", "github-copilot")).toEqual({ wire_api: "responses" });
+    });
+
     it("uses the requested provider when duplicate model names exist", () => {
       const modelsJson = {
         providers: {
@@ -518,13 +954,90 @@ describe("awf_reflect.cjs", () => {
       expect(inferWireApiForModel("anthropic", "claude-opus-5", { wire_api: "responses" })).toBeUndefined();
     });
 
-    it("falls back to completions when the catalog value is invalid or absent", () => {
-      expect(inferWireApiForModel("openai", "gpt-5.5", { wire_api: "grpc" })).toBe("completions");
-      expect(inferWireApiForModel("openai", "gpt-5.5", null)).toBe("completions");
+    it("defaults GPT-5+ models to Responses when the catalog value is invalid or absent", () => {
+      expect(inferWireApiForModel("openai", "gpt-5.5", { wire_api: "grpc" })).toBe("responses");
+      expect(inferWireApiForModel("openai", "gpt-5.5", null)).toBe("responses");
+      expect(inferWireApiForModel("openai", "gpt-7-preview", null)).toBe("responses");
+      expect(inferWireApiForModel("openai", "gpt-4.1", null)).toBe("completions");
+    });
+
+    it.each(["gpt-5-mini", "gpt-6-luna"])("uses the bundled Responses API metadata for %s", model => {
+      const modelsJson = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "models.json"), "utf8"));
+      const catalogEntry = getCatalogModelEntry(modelsJson, model, "openai");
+      expect(catalogEntry.wire_api).toBe("responses");
+      expect(inferWireApiForModel("openai", model, catalogEntry)).toBe("responses");
     });
   });
 
   describe("resolveMultiProviderFromReflect", () => {
+    const splitEndpoint = {
+      provider: "copilot",
+      configured: true,
+      port: 10002,
+      models: ["claude-haiku-4.5", "gpt-5.6-luna", "gpt-5-mini", "gpt-4o", "unsupported"],
+      routing_models: [
+        { model_id: "claude-haiku-4.5", supported_endpoints: ["/chat/completions", "/v1/messages"] },
+        { model_id: "gpt-5.6-luna", supported_endpoints: ["/responses", "ws:/responses"] },
+        { model_id: "gpt-5-mini", supported_endpoints: ["/chat/completions", "/responses", "ws:/responses"] },
+        { model_id: "gpt-4o", supported_endpoints: ["/chat/completions", "/responses"] },
+        { model_id: "unsupported", supported_endpoints: ["/v1/messages"] },
+      ],
+    };
+
+    it("splits Copilot models using HTTP endpoint support and per-model inference", () => {
+      const result = resolveMultiProviderFromReflect({ reflectData: { endpoints: [splitEndpoint] }, model: "gpt-5.6-luna" });
+      expect(result.providers).toEqual([
+        { name: "copilot-responses", type: "openai", baseUrl: "http://api-proxy:10002", wireApi: "responses" },
+        { name: "copilot-completions", type: "openai", baseUrl: "http://api-proxy:10002", wireApi: "completions" },
+      ]);
+      expect(result.models).toEqual([
+        { id: "claude-haiku-4.5", provider: "copilot-completions" },
+        { id: "gpt-5.6-luna", provider: "copilot-responses" },
+        { id: "gpt-5-mini", provider: "copilot-responses" },
+        { id: "gpt-4o", provider: "copilot-completions" },
+      ]);
+      expect(result.model).toBe("copilot-responses/gpt-5.6-luna");
+    });
+
+    it.each(["gpt-5.6-luna", "copilot/gpt-5.6-luna", "copilot-responses/gpt-5.6-luna"])("rejects an unsupported endpoint override for %s", model => {
+      expect(() => resolveMultiProviderFromReflect({ reflectData: { endpoints: [splitEndpoint] }, model, wireApi: "completions" })).toThrow(
+        'Model endpoint mismatch: model "gpt-5.6-luna" with COPILOT_PROVIDER_WIRE_API=completions requires /chat/completions; supported endpoints: /responses, ws:/responses'
+      );
+    });
+
+    it("routes a compatible override only for the selected model, not its siblings", () => {
+      const model = "gpt-5-mini";
+      const result = resolveMultiProviderFromReflect({ reflectData: { endpoints: [splitEndpoint] }, model, wireApi: "completions" });
+      expect(result.model).toBe("copilot-completions/gpt-5-mini");
+      expect(result.models.find(entry => entry.id === "gpt-5.6-luna").provider).toBe("copilot-responses");
+      expect(result.models.find(entry => entry.id === "claude-haiku-4.5").provider).toBe("copilot-completions");
+      expect(result.providers[0].wireApi).toBe("responses");
+    });
+
+    it("uses top-level routing model metadata when an endpoint does not have it", () => {
+      const result = resolveMultiProviderFromReflect({
+        reflectData: {
+          endpoints: [{ provider: "github", configured: true, port: 10002, models: ["gpt-5.6-luna"] }],
+          routing_models: [{ model_id: "gpt-5.6-luna", supported_endpoints: ["/chat/completions"] }],
+        },
+      });
+      expect(result.model).toBe("copilot-completions/gpt-5.6-luna");
+    });
+
+    it("preserves a qualified API preference for a both-supported model instead of selecting the first model", () => {
+      const reflectData = { endpoints: [splitEndpoint] };
+      expect(resolveMultiProviderFromReflect({ reflectData, model: "copilot-responses/gpt-4o" }).model).toBe("copilot-responses/gpt-4o");
+      expect(resolveMultiProviderFromReflect({ reflectData, model: "copilot-completions/gpt-5-mini" }).model).toBe("copilot-completions/gpt-5-mini");
+      expect(resolveMultiProviderFromReflect({ reflectData, model: "copilot-responses/gpt-4o", wireApi: "completions" }).model).toBe("copilot-completions/gpt-4o");
+    });
+
+    it("qualifies a fallback and preserves valid endpoint-qualified selections", () => {
+      const reflectData = { endpoints: [splitEndpoint, { ...splitEndpoint, port: 10003 }] };
+      expect(resolveMultiProviderFromReflect({ reflectData }).model).toBe("copilot-completions/claude-haiku-4.5");
+      expect(resolveMultiProviderFromReflect({ reflectData, model: "unknown" }).model).toBe("");
+      expect(resolveMultiProviderFromReflect({ reflectData, model: "copilot-responses-1/gpt-5-mini" }).model).toBe("copilot-responses-1/gpt-5-mini");
+    });
+
     it("returns null when reflectData is null", () => {
       const logs = [];
       const result = resolveMultiProviderFromReflect({ reflectData: null, logger: msg => logs.push(msg) });
@@ -537,8 +1050,28 @@ describe("awf_reflect.cjs", () => {
         reflectData: { endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-5.4"] }] },
       });
       expect(result).not.toBeNull();
-      expect(result.providers).toHaveLength(1);
-      expect(result.model).toBe("gpt-5.4");
+      expect(result.providers).toHaveLength(2);
+      expect(result.model).toBe("copilot-responses/gpt-5.4");
+    });
+
+    it("rewrites provider baseUrl to the host bridge in sbx HOSTALIASES mode", () => {
+      const originalHostAliases = process.env.HOSTALIASES;
+      const aliasesPath = path.join(os.tmpdir(), `awf-hostaliases-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      fs.writeFileSync(aliasesPath, "api-proxy localhost\n", "utf8");
+      process.env.HOSTALIASES = aliasesPath;
+      try {
+        const result = resolveMultiProviderFromReflect({
+          reflectData: { endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-5.4"] }] },
+        });
+        expect(result.providers[0].baseUrl).toBe("http://host.docker.internal:10002");
+      } finally {
+        if (originalHostAliases === undefined) {
+          delete process.env.HOSTALIASES;
+        } else {
+          process.env.HOSTALIASES = originalHostAliases;
+        }
+        fs.rmSync(aliasesPath, { force: true });
+      }
     });
 
     it("returns null when no configured endpoints exist", () => {
@@ -579,7 +1112,7 @@ describe("awf_reflect.cjs", () => {
         ],
       };
       const result = resolveMultiProviderFromReflect({ reflectData });
-      expect(result.model).toBe("gpt-5.4");
+      expect(result.model).toBe("openai/gpt-5.4");
     });
 
     it("prefers the configured model when it appears in model list", () => {
@@ -590,10 +1123,12 @@ describe("awf_reflect.cjs", () => {
         ],
       };
       const result = resolveMultiProviderFromReflect({ reflectData, model: "claude-sonnet-4.6" });
-      expect(result.model).toBe("claude-sonnet-4.6");
+      expect(result.model).toBe("anthropic/claude-sonnet-4.6");
     });
 
-    it("falls back to first model when configured model is not found in list", () => {
+    // Previously asserted a silent fallback to the first model (gh-aw#70317): a configured
+    // model that is not found must never be replaced by a different model.
+    it("does not fall back to another model when the configured model is not found in list", () => {
       const reflectData = {
         endpoints: [
           { provider: "openai", port: 10001, configured: true, models: ["gpt-5.4"] },
@@ -601,7 +1136,58 @@ describe("awf_reflect.cjs", () => {
         ],
       };
       const result = resolveMultiProviderFromReflect({ reflectData, model: "nonexistent-model" });
-      expect(result.model).toBe("gpt-5.4");
+      expect(result.model).toBe("");
+      expect(result.configuredModelNotFound).toBe(true);
+    });
+
+    describe("recorded /reflect from run 39191157830 (claude-opus-4.8 retired)", () => {
+      // Agent artifact sandbox/firewall/awf-reflect.json of
+      // https://github.com/github/gh-aw/actions/runs/39191157830: models_fetch_complete true,
+      // 40 Copilot models (claude-haiku-4.5 first), no claude-opus-4.8.
+      const recordedReflect = () => JSON.parse(JSON.stringify(require("./fixtures/awf-reflect-sdk-39191157830.json")));
+      const resolve = (model, reflectData = recordedReflect()) => resolveMultiProviderFromReflect({ reflectData, model, logger: () => {} });
+
+      it("case 1: configured claude-opus-4.8 chooses no primary model", () => {
+        const result = resolve("claude-opus-4.8");
+        expect(result.model).toBe("");
+        expect(result.configuredModelNotFound).toBe(true);
+      });
+
+      it("case 2: configured copilot/claude-opus-4.8 chooses no primary model", () => {
+        const result = resolve("copilot/claude-opus-4.8");
+        expect(result.model).toBe("");
+        expect(result.configuredModelNotFound).toBe(true);
+      });
+
+      it("case 3: no configured model chooses the first model", () => {
+        const result = resolve("");
+        expect(result.model).toBe("copilot-completions/claude-haiku-4.5");
+        expect(result.configuredModelNotFound).toBeUndefined();
+      });
+
+      it("case 4: configured live copilot/gpt-5.4 is unchanged", () => {
+        expect(resolve("copilot/gpt-5.4").model).toBe("copilot-responses/gpt-5.4");
+      });
+
+      it("case 5: configured qualified live copilot-completions/gpt-5.4 keeps its wire API", () => {
+        const result = resolve("copilot-completions/gpt-5.4");
+        expect(result.model).toBe("copilot-completions/gpt-5.4");
+        expect(result.models).toContainEqual({ id: "gpt-5.4", provider: "copilot-completions" });
+        expect(result.providers.find(provider => provider.name === "copilot-completions")).toMatchObject({ wireApi: "completions" });
+      });
+
+      // Derived: the recording's unconfigured openai endpoint is configured with a model list
+      // (no recorded run with this shape exists).
+      it("case 8: a model live only on a non-Copilot configured endpoint is unchanged", () => {
+        const reflectData = recordedReflect();
+        Object.assign(
+          reflectData.endpoints.find(endpoint => endpoint.provider === "openai"),
+          { configured: true, models: ["gpt-6.1-pro"] }
+        );
+        const result = resolve("gpt-6.1-pro", reflectData);
+        expect(result.model).toBe("openai/gpt-6.1-pro");
+        expect(result.configuredModelNotFound).toBeUndefined();
+      });
     });
 
     it("derives provider baseUrl from models_url origin when available", () => {
@@ -629,9 +1215,105 @@ describe("awf_reflect.cjs", () => {
         },
       };
       const result = resolveMultiProviderFromReflect({ reflectData, modelsJson });
-      expect(result.providers[0]).toMatchObject({ name: "copilot", type: "openai", wireApi: "responses" });
-      expect(result.providers[1]).toMatchObject({ name: "anthropic", type: "anthropic" });
-      expect(result.providers[1]).not.toHaveProperty("wireApi");
+      expect(result.providers[0]).toMatchObject({ name: "copilot-responses", type: "openai", wireApi: "responses" });
+      expect(result.providers[2]).toMatchObject({ name: "anthropic", type: "anthropic" });
+      expect(result.providers[2]).not.toHaveProperty("wireApi");
+    });
+
+    it("infers wireApi from the base catalog model for a Copilot utility variant", () => {
+      const reflectData = {
+        endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-5.6-luna-utility"] }],
+      };
+      const modelsJson = {
+        providers: {
+          "github-copilot": { models: { "gpt-5.6-luna": { provider_type: "openai", wire_api: "responses", cost: {} } } },
+        },
+      };
+      const result = resolveMultiProviderFromReflect({
+        model: "gpt-5.6-luna-utility",
+        reflectData,
+        modelsJson,
+      });
+      expect(result.providers[0]).toMatchObject({ name: "copilot-responses", type: "openai", wireApi: "responses" });
+    });
+
+    it.each([null, { providers: { "github-copilot": { models: { "gpt-6-luna": { wire_api: "completions" } } } } }])("honors an explicit Responses API for gpt-6-luna with a missing or stale catalog", modelsJson => {
+      const result = resolveMultiProviderFromReflect({
+        model: "gpt-6-luna",
+        wireApi: "responses",
+        reflectData: { endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-6-luna"] }] },
+        modelsJson,
+      });
+      expect(result.model).toBe("copilot-responses/gpt-6-luna");
+      expect(result.providers[0]).toMatchObject({ name: "copilot-responses", type: "openai", wireApi: "responses" });
+    });
+
+    it("applies the wire API override only to the selected provider", () => {
+      const result = resolveMultiProviderFromReflect({
+        model: "gpt-6-luna",
+        wireApi: "responses",
+        reflectData: {
+          endpoints: [
+            { provider: "copilot", port: 10001, configured: true, models: ["gpt-4o"] },
+            { provider: "copilot", port: 10002, configured: true, models: ["gpt-6-luna"] },
+          ],
+        },
+      });
+      expect(result.models[0].provider).toBe("copilot-completions");
+      expect(result.models[1].provider).toBe("copilot-responses-1");
+    });
+
+    it("honors an explicit Completions API over catalog inference", () => {
+      const result = resolveMultiProviderFromReflect({
+        model: "gpt-6-luna",
+        wireApi: "completions",
+        reflectData: { endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-6-luna"] }] },
+        modelsJson: { providers: { "github-copilot": { models: { "gpt-6-luna": { wire_api: "responses" } } } } },
+      });
+      expect(result.model).toBe("copilot-completions/gpt-6-luna");
+    });
+
+    it.each(["Responses", " responses "])("normalizes explicit wire API overrides (%s)", wireApi => {
+      const result = resolveMultiProviderFromReflect({
+        model: "gpt-6-luna",
+        wireApi,
+        reflectData: { endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-6-luna"] }] },
+      });
+      expect(result.providers[0].wireApi).toBe("responses");
+    });
+
+    it("does not apply a wire API override to the fallback primary model or select it for an unmatched model", () => {
+      const reflectData = { endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-4o"] }] };
+      expect(resolveMultiProviderFromReflect({ wireApi: "responses", reflectData }).model).toBe("copilot-completions/gpt-4o");
+      expect(resolveMultiProviderFromReflect({ model: "nonexistent-model", wireApi: "responses", reflectData }).model).toBe("");
+    });
+
+    it("infers the fallback primary model wire API instead of inheriting an automatic GPT default", () => {
+      const result = resolveMultiProviderFromReflect({
+        reflectData: { endpoints: [{ provider: "openai", port: 10002, configured: true, models: ["gpt-4.1"] }] },
+        modelsJson: { providers: { openai: { models: { "gpt-4.1": { wire_api: "completions" } } } } },
+      });
+      expect(result.model).toBe("openai/gpt-4.1");
+      expect(result.providers[0].wireApi).toBe("completions");
+    });
+
+    it("ignores wire API overrides for Anthropic providers", () => {
+      const result = resolveMultiProviderFromReflect({
+        model: "claude-opus-5",
+        wireApi: "responses",
+        reflectData: { endpoints: [{ provider: "anthropic", port: 10002, configured: true, models: ["claude-opus-5"] }] },
+      });
+      expect(result.providers[0]).not.toHaveProperty("wireApi");
+    });
+
+    it.each(["", "grpc", undefined])("keeps catalog inference for an invalid or absent wire API override (%s)", wireApi => {
+      const result = resolveMultiProviderFromReflect({
+        model: "gpt-6-luna",
+        wireApi,
+        reflectData: { endpoints: [{ provider: "copilot", port: 10002, configured: true, models: ["gpt-6-luna"] }] },
+        modelsJson: { providers: { "github-copilot": { models: { "gpt-6-luna": { wire_api: "responses" } } } } },
+      });
+      expect(result.providers[0].wireApi).toBe("responses");
     });
 
     it("handles duplicate provider names by appending a numeric suffix", () => {
@@ -642,10 +1324,9 @@ describe("awf_reflect.cjs", () => {
         ],
       };
       const result = resolveMultiProviderFromReflect({ reflectData });
-      expect(result.providers[0].name).toBe("copilot");
-      expect(result.providers[1].name).toBe("copilot-1");
-      expect(result.models[0]).toEqual({ id: "gpt-5.4", provider: "copilot" });
-      expect(result.models[1]).toEqual({ id: "gpt-5.5", provider: "copilot-1" });
+      expect(result.providers.map(provider => provider.name)).toEqual(["copilot-responses", "copilot-completions", "copilot-responses-1", "copilot-completions-1"]);
+      expect(result.models[0]).toEqual({ id: "gpt-5.4", provider: "copilot-responses" });
+      expect(result.models[1]).toEqual({ id: "gpt-5.5", provider: "copilot-responses-1" });
     });
 
     it("skips endpoints with no resolvable baseUrl", () => {

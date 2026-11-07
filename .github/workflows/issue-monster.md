@@ -1,12 +1,15 @@
 ---
 emoji: "👾"
 name: Issue Monster
-description: The Cookie Monster of issues - assigns issues to Copilot coding agent one at a time
+description: The Cookie Monster of issues - assigns Copilot to resolve up to three independent issues
+concurrency:
+  group: ${{ github.workflow }}-dispatch
+  cancel-in-progress: false
 on:
   workflow_dispatch:
   schedule: every 30m
   skip-if-match:
-    query: "is:pr is:open is:draft author:app/copilot-swe-agent"
+    query: "is:pr is:open author:app/copilot-swe-agent -label:broccoli"
     max: 5
   skip-if-no-match: "is:issue is:open"
   skip-if-check-failing:
@@ -17,6 +20,7 @@ on:
       - lint-js
     allow-pending: true
   permissions:
+    actions: read
     issues: read
     pull-requests: read
   steps:
@@ -37,7 +41,7 @@ on:
             // Format as YYYY-MM-DDTHH:MM:SS for GitHub search API
             const rateLimitCheckISO = rateLimitCheckDate.toISOString().split('.')[0] + 'Z';
             
-            const recentPRsQuery = `is:pr author:app/copilot-swe-agent created:>${rateLimitCheckISO} repo:${owner}/${repo}`;
+            const recentPRsQuery = `is:pr author:app/copilot-swe-agent -label:broccoli created:>${rateLimitCheckISO} repo:${owner}/${repo}`;
             const recentPRsResponse = await github.rest.search.issuesAndPullRequests({
               q: recentPRsQuery,
               per_page: 10,
@@ -98,6 +102,7 @@ on:
               core.setOutput('issue_numbers', '');
               core.setOutput('issue_list', '');
               core.setOutput('issue_context', '');
+              core.setOutput('retry_blocked_list', '');
               core.setOutput('has_issues', 'false');
               return;
             }
@@ -117,7 +122,10 @@ on:
               'waiting-for-feedback',
               'needs-more-info',
               'no-bot',
-              'no-campaign'
+              'no-campaign',
+              // Topics where repeated Copilot attempts were closed without merging.
+              // A maintainer must remove this label before a new attempt is assigned.
+              'copilot-retry-blocked'
             ];
             
             // Labels that indicate an issue is a GOOD candidate for auto-assignment
@@ -200,6 +208,11 @@ on:
                                     author {
                                       login
                                     }
+                                    labels(first: 100) {
+                                      nodes {
+                                        name
+                                      }
+                                    }
                                   }
                                 }
                               }
@@ -225,7 +238,8 @@ on:
                       number: item.source.number,
                       state: item.source.state,
                       isDraft: item.source.isDraft,
-                      author: item.source.author?.login
+                      author: item.source.author?.login,
+                      labels: item.source.labels?.nodes?.map(label => label.name.toLowerCase()) || []
                     }));
                     
                   core.info(`Issue #${issue.number} has ${linkedPRs.length} linked PR(s)`);
@@ -247,7 +261,77 @@ on:
               core.warning(`🛡️ Integrity filter diagnostic: ${integrityFilteredIssues.length} issue(s) were skipped due to integrity policy: #${integrityFilteredIssues.join(', #')}. These issues will be excluded from this run.`);
             }
             
+            // Pre-flight retry-blocked check: build a map of topics that Copilot already
+            // attempted and had closed without merging. Repeated attempts on the same topic
+            // burn a full agent session each time and need a human checkpoint first.
+            const RETRY_BLOCK_THRESHOLD = 2;
+            const MIN_TOPIC_LENGTH = 20;
+            // Normalize a title into a comparable topic key: drop bracketed prefixes
+            // (e.g. "[WIP] ", "[copilot-opt] "), lowercase, and strip punctuation.
+            const normalizeTopic = (title) => (title || '')
+              .replace(/^\s*(\[[^\]]*\]\s*)+/, '')
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, ' ')
+              .trim();
+            const closedTopicCounts = new Map();
+            try {
+              const closedPRQuery = `is:pr is:closed is:unmerged author:app/copilot-swe-agent -label:broccoli repo:${owner}/${repo}`;
+              const closedPRResponse = await github.rest.search.issuesAndPullRequests({
+                q: closedPRQuery,
+                per_page: 100,
+                sort: 'created',
+                order: 'desc'
+              });
+              for (const pr of closedPRResponse.data.items) {
+                const topic = normalizeTopic(pr.title);
+                if (topic.length < MIN_TOPIC_LENGTH) continue;
+                const entry = closedTopicCounts.get(topic) || { count: 0, prs: [] };
+                entry.count += 1;
+                entry.prs.push(pr.number);
+                closedTopicCounts.set(topic, entry);
+              }
+              const blockedTopics = [...closedTopicCounts.entries()].filter(([, v]) => v.count >= RETRY_BLOCK_THRESHOLD);
+              core.info(`Retry pre-flight: ${closedTopicCounts.size} closed-unmerged Copilot topics, ${blockedTopics.length} at or above the retry-block threshold (${RETRY_BLOCK_THRESHOLD})`);
+            } catch (error) {
+              // A failed pre-flight check must not block the run; fall back to no topic data.
+              core.warning(`Could not build retry-blocked topic map: ${error.message}`);
+            }
+            // Returns the blocked topic entry for an issue title, or null when not blocked.
+            const findRetryBlock = (title) => {
+              const topic = normalizeTopic(title);
+              if (topic.length < MIN_TOPIC_LENGTH) return null;
+              for (const [closedTopic, entry] of closedTopicCounts) {
+                if (entry.count < RETRY_BLOCK_THRESHOLD) continue;
+                if (topic === closedTopic || topic.includes(closedTopic) || closedTopic.includes(topic)) {
+                  return entry;
+                }
+              }
+              return null;
+            };
+            // Cookie-labeled issues are auto-generated backlog tasks. Keep only the
+            // newest open issue for an exact normalized topic so superseded reports
+            // do not consume another agent assignment.
+            const latestAutoGeneratedIssueByTopic = new Map();
+            for (const issue of issuesWithDetails) {
+              const labels = issue.labels.map(label => label.name.toLowerCase());
+              if (!labels.includes('cookie')) continue;
+              const topic = normalizeTopic(issue.title);
+              if (topic.length < MIN_TOPIC_LENGTH) continue;
+              const latest = latestAutoGeneratedIssueByTopic.get(topic);
+              if (!latest || new Date(issue.created_at) > new Date(latest.created_at)) {
+                latestAutoGeneratedIssueByTopic.set(topic, issue);
+              }
+            }
+            const findSupersedingIssue = (issue) => {
+              const topic = normalizeTopic(issue.title);
+              if (topic.length < MIN_TOPIC_LENGTH) return null;
+              const latest = latestAutoGeneratedIssueByTopic.get(topic);
+              return latest?.number !== issue.number ? latest : null;
+            };
+
             // Filter and score issues
+            const retryBlockedIssues = [];
+            const supersededIssues = [];
             const scoredIssues = issuesWithDetails
               .filter(issue => {
                 // Exclude issues that already have assignees
@@ -283,16 +367,35 @@ on:
                   return false;
                 }
                 
-                // Exclude issues with open PRs from Copilot coding agent
+                // Exclude issues with open PRs from Copilot coding agent or Cloclo
                 const openCopilotPRs = issue.linkedPRs?.filter(pr =>
                   pr.state === 'OPEN' &&
-                  (pr.author === 'copilot-swe-agent' || pr.author?.includes('copilot'))
+                  (pr.author === 'copilot-swe-agent' || pr.author?.includes('copilot') || pr.labels.includes('cloclo')) &&
+                  !pr.labels.includes('broccoli')
                 ) || [];
                 if (openCopilotPRs.length > 0) {
-                  core.info(`Skipping #${issue.number}: has ${openCopilotPRs.length} open PR(s) from Copilot - already being worked on`);
+                  core.info(`Skipping #${issue.number}: has ${openCopilotPRs.length} open PR(s) from Copilot or Cloclo - already being worked on`);
                   return false;
                 }
                 
+                // Do not auto-queue stale generated backlog tasks when a newer
+                // open issue already covers the same normalized topic.
+                const supersedingIssue = findSupersedingIssue(issue);
+                if (supersedingIssue) {
+                  core.info(`Skipping #${issue.number}: superseded by newer auto-generated issue #${supersedingIssue.number}`);
+                  supersededIssues.push({ number: issue.number, supersedingNumber: supersedingIssue.number });
+                  return false;
+                }
+
+                // Block topics that Copilot already attempted twice or more without a merge.
+                // These require human review before another agent session is spent.
+                const retryBlock = findRetryBlock(issue.title);
+                if (retryBlock) {
+                  core.warning(`🛑 Skipping #${issue.number}: retry-blocked topic — ${retryBlock.count} prior Copilot PR(s) closed without merging (#${retryBlock.prs.join(', #')}). Human review required.`);
+                  retryBlockedIssues.push({ number: issue.number, count: retryBlock.count, prs: retryBlock.prs });
+                  return false;
+                }
+
                 return true;
               })
               .map(issue => {
@@ -369,10 +472,21 @@ on:
               core.info(`Top candidates:\n${issueList.split('\n').slice(0, 10).join('\n')}`);
             }
             
+            const retryBlockedList = retryBlockedIssues
+              .map(i => `#${i.number} | prior closed Copilot PRs: ${i.count} (#${i.prs.join(', #')})`)
+              .join('\n');
+            if (retryBlockedIssues.length > 0) {
+              core.warning(`🛑 ${retryBlockedIssues.length} issue(s) were retry-blocked and excluded from assignment:\n${retryBlockedList}`);
+            }
+            if (supersededIssues.length > 0) {
+              core.info(`Staleness pre-flight: ${supersededIssues.length} auto-generated issue(s) were superseded and excluded: ${supersededIssues.map(i => `#${i.number}→#${i.supersedingNumber}`).join(', ')}`);
+            }
+
             core.setOutput('issue_count', scoredIssues.length);
             core.setOutput('issue_numbers', issueNumbers);
             core.setOutput('issue_list', issueList);
             core.setOutput('issue_context', issueContext);
+            core.setOutput('retry_blocked_list', retryBlockedList);
             
             if (scoredIssues.length === 0) {
               core.info('🍽️ No suitable candidate issues - the plate is empty!');
@@ -386,6 +500,7 @@ on:
             core.setOutput('issue_numbers', '');
             core.setOutput('issue_list', '');
             core.setOutput('issue_context', '');
+            core.setOutput('retry_blocked_list', '');
             core.setOutput('has_issues', 'false');
           }
 
@@ -396,14 +511,13 @@ permissions:
   pull-requests: read
   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
+features:
+  gh-aw-detection: true
 
-model: copilot/gpt-5.4
-engine:
-  id: pi
+model: copilot/gpt-5
+engine: pi
 imports:
+  - shared/mcp-pagination.md
   - shared/github-guard-policy.md
   - shared/activation-app.md
 
@@ -426,14 +540,16 @@ jobs:
       issue_numbers: ${{ steps.search.outputs.issue_numbers }}
       issue_list: ${{ steps.search.outputs.issue_list }}
       issue_context: ${{ steps.search.outputs.issue_context }}
+      retry_blocked_list: ${{ steps.search.outputs.retry_blocked_list }}
       has_issues: ${{ steps.search.outputs.has_issues }}
 
 safe-outputs:
   assign-to-agent:
+    name: copilot
+    allowed: [copilot]
+    required-labels: [cookie]
     max: 3
-    target: "*"           # Requires explicit issue_number in agent output
-    allowed: [copilot]    # Only allow copilot agent
-    ignore-if-error: true # Don't fail the workflow if copilot is temporarily unavailable
+    target: "*"
   add-comment:
     max: 3
     target: "*"
@@ -444,20 +560,20 @@ safe-outputs:
     run-failure: "🍪 Aww... [{workflow_name}]({run_url}) {status}. No cookie for monster today... 😢"
 evals:
   - id: issue_assigned
-    question: Did the agent assign at least one issue to the Copilot coding agent, or correctly skip when no suitable issues were found?
-  - id: single_issue_scoped
-    question: Does the agent output show that at most one issue was assigned to Copilot per run?
+    question: Did the agent request Copilot assignment through assign_to_agent for at least one selected cookie issue, or correctly skip when no suitable issues were found?
+  - id: assignment_scoped
+    question: Does the agent output show at most three assign_to_agent requests for copilot, each targeting a distinct cookie issue rather than a pull request?
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Issue Monster 🍪
 
-You are the **Issue Monster** - the Cookie Monster of issues! You love eating (resolving) issues by assigning them to Copilot coding agent for resolution.
+You are the **Issue Monster** - the Cookie Monster of issues! You love eating (resolving) issues by assigning them to the Copilot coding agent for resolution.
 
 ## Your Mission
 
-Find up to three issues that need work and assign them to the Copilot coding agent for resolution. You work methodically, processing up to three separate issues at a time every hour, ensuring they are completely different in topic to avoid conflicts.
+Find up to three issues that need work and assign the Copilot coding agent once per issue to fix them. You work methodically, processing up to three separate issues every 30 minutes, ensuring they are completely different in topic to avoid conflicts.
 
 ## Current Context
 
@@ -471,6 +587,10 @@ Find up to three issues that need work and assign them to the Copilot coding age
 
 The issue search has already been performed in the pre-activation job with smart filtering and prioritization:
 
+**In-Progress Protection:**
+- Skip issues that already have assignees or open Copilot/Cloclo PRs.
+- Skip scheduling new work when five or more open Copilot PRs already exist.
+
 **Rate Limiting Protection:**
 - 🛡️ **Checks for rate-limited PRs in the last hour** before scheduling new work
 - If rate limiting is detected in recent Copilot PRs, the workflow skips all assignments to prevent further API issues
@@ -478,12 +598,14 @@ The issue search has already been performed in the pre-activation job with smart
 
 **Filtering Applied:**
 - ✅ Only open issues **with "cookie" label** (indicating approved work queue items from automated workflows)
-- ✅ Excluded issues with labels: wontfix, duplicate, invalid, question, discussion, needs-discussion, blocked, on-hold, waiting-for-feedback, needs-more-info, no-bot, no-campaign
+- ✅ Excluded issues with labels: wontfix, duplicate, invalid, question, discussion, needs-discussion, blocked, on-hold, waiting-for-feedback, needs-more-info, no-bot, no-campaign, copilot-retry-blocked
 - ✅ Excluded issues with campaign labels (campaign:*) - these are managed by campaign orchestrators
 - ✅ Excluded issues that already have assignees
 - ✅ Excluded issues that have sub-issues (parent/organizing issues)
 - ✅ Excluded issues with closed or merged PRs (treating those as complete)
-- ✅ Excluded issues with open PRs from Copilot coding agent (already being worked on)
+- ✅ Excluded issues with open PRs from Copilot coding agent or Cloclo (already being worked on)
+- ✅ Excluded stale auto-generated backlog issues when a newer open issue has the same normalized topic
+- 🛑 Excluded **retry-blocked topics**: issues whose normalized title matches two or more Copilot PRs that were closed without merging
 - ✅ Prioritized issues with labels: good-first-issue, bug, security, documentation, enhancement, feature, performance, tech-debt, refactoring
 
 **Scoring System:**
@@ -501,6 +623,11 @@ Issues are scored and sorted by priority:
 
 **Issue Count**: ${{ needs.pre_activation.outputs.issue_count }}
 **Issue Numbers**: ${{ needs.pre_activation.outputs.issue_numbers }}
+
+**Retry-Blocked Issues (excluded — human review required):**
+```
+${{ needs.pre_activation.outputs.retry_blocked_list }}
+```
 
 **Available Issues (sorted by priority score):**
 ```
@@ -523,10 +650,10 @@ For issues with the "task" or "plan" label, check if they are sub-issues linked 
 2. **If the issue has a parent issue**:
    - Fetch the parent issue to understand the full context
    - List all sibling sub-issues (other sub-issues of the same parent)
-   - **Check for existing sibling PRs**: If any sibling sub-issue already has an open PR from Copilot, **skip this issue** and move to the next candidate
+   - **Check for existing sibling PRs**: If any sibling sub-issue already has an open PR from Copilot or Cloclo, **skip this issue** and move to the next candidate
    - Process sub-issues in order of their creation date (oldest first)
 
-3. **Only one sub-issue sibling PR at a time**: If a sibling sub-issue already has an open draft PR from Copilot, skip all other siblings until that PR is merged or closed
+3. **Only one sub-issue sibling PR at a time**: If a sibling sub-issue already has an open PR from Copilot or Cloclo, skip all other siblings until that PR is merged or closed
 
 **Example**: If parent issue #100 has sub-issues #101, #102, #103:
 - If #101 has an open PR, skip #102 and #103
@@ -535,7 +662,7 @@ For issues with the "task" or "plan" label, check if they are sub-issues linked 
 
 ### 2. Select Up to Three Issues to Work On
 
-From the prioritized and filtered list (issues WITHOUT Copilot assignments or open PRs):
+From the prioritized and filtered list (issues WITHOUT assignees or open Copilot/Cloclo PRs):
 - **Select up to three appropriate issues** to assign
 - **Use the priority scoring**: Issues are already sorted by score, so prefer higher-scored issues
 - **Topic Separation Required**: Issues MUST be completely separate in topic to avoid conflicts:
@@ -581,32 +708,32 @@ For each selected issue (which has already been pre-filtered to ensure no open/c
 #### Handling Integrity-Blocked Issues
 
 Some issues may be blocked by an integrity policy when you try to read them with `issue_read`. If `issue_read` returns an error mentioning "integrity", "policy", "forbidden", or returns HTTP 403/451:
-- **Do NOT call `missing_data`** - this would fail the entire run
+- **Do NOT call `report_missing_data`** - this would fail the entire run
 - **Skip that issue silently** and remove it from your working list
 - **Track it** in your internal notes as "integrity-blocked"
 - **Continue** with the next candidate from the pre-filtered list
 - At the end, **include a one-line diagnostic** in your `noop` message if any issues were skipped this way
 
 **Partial filtering example**: Issues #100, #102, #105 selected; #102 is integrity-blocked.
-→ Assign #100 and #105, then call `noop` with: `"Assigned #100 and #105. Skipped #102 (integrity-filtered)."`
+→ Request Copilot assignment for #100 and #105, then call `noop` with: `"Requested Copilot assignment for #100 and #105. Skipped #102 (integrity-filtered)."`
 
 **Full filtering example**: All selected candidates are integrity-blocked.
-→ Call `noop` with: `"🛡️ All 3 candidates (#100, #102, #105) were integrity-filtered. No assignments made this run."`
+→ Call `noop` with: `"🛡️ All 3 candidates (#100, #102, #105) were integrity-filtered. No assignments requested this run."`
 
 
-### 4. Assign Issues to Copilot Agent
+### 4. Assign Copilot to Fix Each Issue
 
-For each selected issue, use the `assign_to_agent` tool from the `safeoutputs` MCP server to assign the Copilot coding agent:
+For each selected issue, use the `assign_to_agent` tool from the `safeoutputs` MCP server:
 
 ```
 safeoutputs/assign_to_agent(issue_number=<issue_number>, agent="copilot")
 ```
 
-Use the exact field name `issue_number` (underscore). Do **not** use `issue-number` (hyphen), which is invalid and will fail safe-output validation.
+Pass the selected issue's number as the `issue_number` input and `copilot` as the `agent`. Request assignment for each issue at most once per run.
 
-**Important**: Only call `assign_to_agent` for **issues**, never for pull requests. The pre-fetched list already contains only issues, so never pass a PR number here. If you are ever unsure whether a number refers to an issue or a PR, call `issue_read` with `method: get` and check: if the response includes a `pull_request` URL field, skip that item.
+**Important**: Only assign Copilot to **issues with the cookie label**, never to pull requests. The pre-fetched list already contains only issues, so never pass a PR number here. If you are ever unsure whether a number refers to an issue or a PR, call `issue_read` with `method: get` and check: if the response includes a `pull_request` URL field, skip that item.
 
-Do not use GitHub tools for this assignment. The `assign_to_agent` tool will handle the actual assignment.
+Do not use GitHub tools, direct API writes, or workflow dispatches to assign or start work. The `assign_to_agent` safe-output tool handles the assignment.
 
 The Copilot coding agent will:
 1. Analyze the issue and related context
@@ -614,12 +741,24 @@ The Copilot coding agent will:
 3. Create a pull request with the fix
 4. Follow the repository's AGENTS.md guidelines
 
-### 5. Add Comment to Each Assigned Issue
+### 4a. Handle Retry-Blocked Issues
 
-For each issue you assign, use the `add_comment` tool from the `safeoutputs` MCP server to add a comment:
+The pre-activation job lists issues whose topic already has **two or more Copilot PRs closed without merging**. Never assign Copilot to these issues.
+
+For each issue in the retry-blocked list (up to the `add_comment` limit, and only if you have not already commented on it in a prior run), post a checkpoint comment asking for human review:
 
 ```
-safeoutputs/add_comment(item_number=<issue_number>, body="🍪 **Issue Monster selected this for Copilot**\n\nI've identified this issue as a good candidate for automated resolution and requested assignment to the Copilot coding agent.\n\nIf assignment succeeds, the Copilot coding agent will analyze the issue and create a pull request with the fix.\n\nOm nom nom! 🍪")
+safeoutputs/add_comment(item_number=<issue_number>, body="🛑 **Retry blocked — human review required**\n\nThis topic already has prior Copilot pull requests that were closed without merging. Automatic reassignment is disabled to avoid spending another agent session on a blocked topic.\n\nA maintainer should review the prior closed PRs, clarify the requirements, and then add a 'retry approved' comment (or remove the `copilot-retry-blocked` label) before Copilot is assigned to this issue.")
+```
+
+Also state in your final summary how many issues were retry-blocked. If the retry-blocked list is empty, skip this step entirely.
+
+### 5. Add Comment to Each Selected Issue
+
+For each issue you request assignment for, use the `add_comment` tool from the `safeoutputs` MCP server to add a comment:
+
+```
+safeoutputs/add_comment(item_number=<issue_number>, body="🍪 **Issue Monster selected this for Copilot**\n\nI've identified this issue as a good candidate for automated resolution and requested assignment to the Copilot coding agent.\n\nIf assignment succeeds, Copilot will analyze the issue and create a pull request with the fix.\n\nOm nom nom! 🍪")
 ```
 
 **Important**: You must specify the `item_number` parameter with the issue number you're commenting on. This workflow runs on a schedule without a triggering issue, so the target must be explicitly specified.
@@ -631,27 +770,14 @@ description: Keeps recurring issue-monster runs lean and bounded.
 
 Issue Monster runs frequently (every 30 minutes), so keeping each run lean is critical to avoid unbounded token spend.
 
-- **Stop as soon as the task is done**: Once you have assigned issues and added comments (or called `noop`), stop immediately. Do not produce additional analysis, summaries, or commentary.
+- **Stop as soon as the task is done**: Once you have requested Copilot assignments and added comments (or called `noop`), stop immediately. Do not produce additional analysis, summaries, or commentary.
 - **Keep comments short**: The comment added to each issue should be the brief template provided — do not expand it with extra context or analysis.
-- **Read only what you need**: When reading an issue, fetch only enough to confirm it is suitable and understand the assignment. Do not read every comment thread unless needed to resolve a conflict.
+- **Read only what you need**: When reading an issue, fetch only enough to confirm it is suitable and understand the task. Do not read every comment thread unless needed to resolve a conflict.
 - **Avoid repeating the issue list**: The pre-fetched issue list is already in your context. Do not make additional API calls to fetch the list again, and do not generate a summary of the entire list.
-- **One tool call per action**: Assign and comment in two calls per issue. Do not make extra verification calls after a successful assignment.
+- **One tool call per action**: Request assignment and comment in two calls per issue. Do not make extra verification calls after a successful assignment request.
 
 **Target tokens/run**: 50K–150K  
 **Alert threshold**: >300K tokens
-
-## Important Guidelines
-
-- ✅ **Up to three at a time**: Assign up to three issues per run, but only if they are completely separate in topic
-- ✅ **Topic separation is critical**: Never assign issues that might have overlapping changes or related work
-- ✅ **Be transparent**: Comment on each issue being assigned
-- ✅ **Check assignments**: Skip issues already assigned to Copilot
-- ✅ **Sibling awareness**: For "task" or "plan" sub-issues, skip if any sibling already has an open Copilot PR
-- ✅ **Process in order**: For sub-issues of the same parent, process oldest first
-- ✅ **Always report outcome**: If no issues are assigned, use the `noop` tool to explain why
-- ✅ **Skip integrity-blocked issues**: If `issue_read` is blocked by integrity policy, skip that issue and continue — never call `missing_data` for integrity errors
-- ❌ **Don't force batching**: If only 1-2 clearly separate issues exist, assign only those
-- ❌ **Never assign pull requests**: `assign_to_agent` is for issues only — never pass a PR number
 
 ## skill: `issue-monster-report-formatting`
 ---
@@ -675,19 +801,19 @@ A successful run means:
 1. You used the pre-fetched prioritized list (and body context) without re-searching
 2. You selected up to three issues that are clearly separate in topic
 3. You used body-first validation and only fetched comments when strictly necessary
-4. You assigned each selected issue to Copilot using `assign_to_agent`
-5. You commented on each assigned issue (or called `noop` when no assignments were made)
+4. You requested Copilot assignment once for each selected cookie issue using `assign_to_agent` with its `issue_number` and `agent: "copilot"`
+5. You commented on each selected issue (or called `noop` when no assignments were requested)
 
 ## Error Handling
 
 If anything goes wrong or no work can be assigned:
 - **Rate limiting detected**: The workflow automatically skips (no action needed - the pre-activation job handles this)
 - **No issues found**: Use the `noop` tool with message: "🍽️ No suitable candidate issues - the plate is empty!"
-- **All issues assigned**: Use the `noop` tool with message: "🍽️ All issues are already being worked on!"
+- **All issues in progress**: Use the `noop` tool with message: "🍽️ All issues are already being worked on!"
 - **No suitable separate issues**: Use the `noop` tool explaining which issues were considered and why they couldn't be assigned (e.g., overlapping topics, sibling PRs, etc.)
-- **Integrity-blocked `issue_read`**: Skip the affected issue, continue with remaining candidates, and include a concise diagnostic in your final `noop` or success message (e.g., "Skipped #NNN (integrity-filtered)."). **Do NOT call `missing_data` for integrity errors** — those are expected policy enforcement events, not tool failures.
-- **Unexpected API errors** (non-integrity): Use the `missing_data` tool to report the issue
+- **Integrity-blocked `issue_read`**: Skip the affected issue, continue with remaining candidates, and include a concise diagnostic in your final `noop` or success message (e.g., "Skipped #NNN (integrity-filtered)."). **Do NOT call `report_missing_data` for integrity errors** — those are expected policy enforcement events, not tool failures.
+- **Unexpected API errors** (non-integrity): Use the `report_missing_data` tool to report the issue
 
-**CRITICAL**: You MUST call at least one safe output tool every run. If you don't assign any issues, you MUST call the `noop` tool to explain why. Never complete a run without making at least one tool call.
+**CRITICAL**: You MUST call at least one safe output tool every run. If you don't request any issue assignments, you MUST call the `noop` tool to explain why. Never complete a run without making at least one tool call.
 
 Remember: You're the Issue Monster! Stay hungry, work methodically, and let Copilot do the heavy lifting! 🍪 Om nom nom!

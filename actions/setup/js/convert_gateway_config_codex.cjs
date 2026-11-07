@@ -23,9 +23,71 @@ require("./shim.cjs");
  */
 
 const path = require("path");
-const { loadGatewayContext, logCLIFilters, filterAndTransformServers, logServerStats, writeSecureOutput } = require("./convert_gateway_config_shared.cjs");
+const fs = require("fs");
+const { runGatewayConversion, writeSecureOutput } = require("./convert_gateway_config_shared.cjs");
+const { buildConfig, serializeConfig, tomlValue, loadCompiledConfig, mergeConfig, expandConfigEnv, isTable, directToolCatalog } = require("./codex_config.cjs");
+const { TMP_GH_AW_PATH } = require("./constants.cjs");
 
-const OUTPUT_PATH = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/config.toml");
+function isWithinRoot(relativePath) {
+  return relativePath !== ".." && !relativePath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePath);
+}
+
+function writeCodexHomeFile(home, filename, content) {
+  if (!home || !path.isAbsolute(home) || path.resolve(home) !== home) {
+    throw new Error("CODEX_HOME must be a canonical absolute path");
+  }
+  if (filename !== "config.toml" && filename !== "models.json") {
+    throw new Error("Unsupported Codex home output file");
+  }
+
+  const managedRoot = path.resolve(TMP_GH_AW_PATH);
+  const relativeHome = path.relative(managedRoot, home);
+  if (!isWithinRoot(relativeHome)) {
+    throw new Error("CODEX_HOME must be within the managed temporary directory");
+  }
+
+  fs.mkdirSync(managedRoot, { recursive: true });
+  const realRoot = fs.realpathSync(managedRoot);
+  const expectedRoot = path.join(fs.realpathSync(path.dirname(managedRoot)), path.basename(managedRoot));
+  if (realRoot !== expectedRoot) {
+    throw new Error("Managed temporary directory resolves outside its canonical parent");
+  }
+  let realHome = realRoot;
+  for (const component of relativeHome.split(path.sep).filter(Boolean)) {
+    const next = path.join(realHome, component);
+    try {
+      const stat = fs.lstatSync(next);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error("CODEX_HOME contains a symlink or non-directory component");
+      }
+    } catch (error) {
+      if (/** @type {NodeJS.ErrnoException} */ error.code !== "ENOENT") throw error;
+      fs.mkdirSync(next);
+    }
+    realHome = fs.realpathSync(next);
+    if (!isWithinRoot(path.relative(realRoot, realHome))) {
+      throw new Error("CODEX_HOME resolves outside the managed temporary directory");
+    }
+  }
+
+  const outputPath = path.join(realHome, filename);
+  try {
+    const stat = fs.lstatSync(outputPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("Codex home output must be a regular, non-symlink file");
+    }
+  } catch (error) {
+    if (/** @type {NodeJS.ErrnoException} */ error.code !== "ENOENT") throw error;
+  }
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+  const fd = fs.openSync(outputPath, flags, 0o600);
+  try {
+    fs.writeFileSync(fd, content);
+    fs.fchmodSync(fd, 0o600);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
 /**
  * @param {string} name
@@ -34,56 +96,72 @@ const OUTPUT_PATH = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-conf
  * @returns {string}
  */
 function toCodexTomlSection(name, value, urlPrefix) {
-  const url = `${urlPrefix}/mcp/${name}`;
+  const url = `${urlPrefix}/mcp/${encodeURIComponent(name)}`;
   const rawHeaders = value.headers;
   /** @type {Record<string, string>} */
   const headers = rawHeaders && typeof rawHeaders === "object" && !Array.isArray(rawHeaders) ? Object.fromEntries(Object.entries(rawHeaders).filter(([, headerValue]) => typeof headerValue === "string")) : {};
   const authKey = headers.Authorization || "";
-  let section = `[mcp_servers.${name}]\n`;
-  section += `url = "${url}"\n`;
-  section += `http_headers = { Authorization = "${authKey}" }\n`;
+  let section = `[mcp_servers.${/^[A-Za-z0-9_-]+$/.test(name) ? name : JSON.stringify(name)}]\n`;
+  section += `url = ${tomlValue(url)}\n`;
+  section += `http_headers = { Authorization = ${tomlValue(authKey)} }\n`;
   section += "\n";
   return section;
 }
 
 function main() {
-  const { gatewayOutput, domain, port, cliServers, servers } = loadGatewayContext();
-
-  core.info("Converting gateway configuration to Codex TOML format...");
-  core.info(`Input: ${gatewayOutput}`);
-  core.info(`Target domain: ${domain}:${port}`);
-
-  // For host.docker.internal, resolve to the gateway IP to avoid DNS resolution
-  // issues in Rust
-  let resolvedDomain = domain;
-  if (domain === "host.docker.internal") {
-    // AWF network gateway IP is always 172.30.0.1
-    resolvedDomain = "172.30.0.1";
-    core.info(`Resolving host.docker.internal to gateway IP: ${resolvedDomain}`);
+  if (process.argv.includes("--direct-tools")) {
+    const home = process.env.CODEX_HOME;
+    if (!home) throw new Error("CODEX_HOME is required to configure Codex direct tools");
+    // Avoid Node's UTF-8 pipe short-read overflow (nodejs/node#66341).
+    const catalog = directToolCatalog(JSON.parse(fs.readFileSync(0).toString("utf8")));
+    const output = JSON.stringify(catalog);
+    writeCodexHomeFile(home, "models.json", output);
+    return output;
   }
-
-  const urlPrefix = `http://${resolvedDomain}:${port}`;
-  logCLIFilters(cliServers);
-  const filteredServers = filterAndTransformServers(servers, cliServers, (_name, entry) => entry);
-
-  // Build the TOML output
-  let toml = '[history]\npersistence = "none"\n\n';
-
-  for (const [name, value] of Object.entries(filteredServers)) {
-    toml += toCodexTomlSection(name, value, urlPrefix);
+  const outputPath = path.join(process.env.RUNNER_TEMP || "/tmp", "gh-aw/mcp-config/config.toml");
+  if (process.argv.includes("--copy-config")) {
+    const home = process.env.CODEX_HOME;
+    if (!home) throw new Error("CODEX_HOME is required to configure Codex");
+    writeCodexHomeFile(home, "config.toml", fs.readFileSync(outputPath));
+    return "";
   }
-
-  logServerStats(servers, Object.keys(filteredServers).length);
-
-  // Write with owner-only permissions (0o600) to protect the gateway bearer token.
-  // An attacker who reads config.toml could issue raw JSON-RPC calls directly
-  // to the gateway.
-  writeSecureOutput(OUTPUT_PATH, toml);
-
-  core.info(`Codex configuration written to ${OUTPUT_PATH}`);
-  core.info("");
-  core.info("Converted configuration:");
-  core.info(toml);
+  if (process.argv.includes("--bootstrap")) {
+    const compiled = loadCompiledConfig();
+    const overrides = expandConfigEnv(compiled.overrides);
+    if (!isTable(overrides)) throw new Error("Invalid Codex configuration overrides");
+    compiled.overrides = overrides;
+    compiled.envExpanded = true;
+    let config = mergeConfig(compiled.defaults, compiled.overrides);
+    if (compiled.disablePlugins) config = mergeConfig(config, { features: { plugins: false } });
+    const output = serializeConfig(config);
+    writeSecureOutput(outputPath, output);
+    writeSecureOutput(path.join(path.dirname(outputPath), "codex-config.json"), JSON.stringify(compiled));
+    return output;
+  }
+  if (process.argv.includes("--config-only")) {
+    const output = serializeConfig(buildConfig({}, ""));
+    writeSecureOutput(outputPath, output);
+    const home = process.env.CODEX_HOME;
+    if (!home) throw new Error("CODEX_HOME is required to configure Codex");
+    writeCodexHomeFile(home, "config.toml", output);
+    return output;
+  }
+  return runGatewayConversion({
+    format: "Codex TOML",
+    engine: "Codex",
+    outputPath,
+    getUrlPrefix: ({ domain, port }) => {
+      if (domain === "host.docker.internal") {
+        core.info("Resolving host.docker.internal to gateway IP: 172.30.0.1");
+        return `http://172.30.0.1:${port}`;
+      }
+      return `http://${domain}:${port}`;
+    },
+    transformServer: (_name, entry) => entry,
+    serialize: (servers, _context, urlPrefix) => {
+      return serializeConfig(buildConfig(servers, urlPrefix));
+    },
+  });
 }
 
 if (require.main === module) {

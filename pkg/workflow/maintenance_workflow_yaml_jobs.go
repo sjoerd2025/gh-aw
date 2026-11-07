@@ -2,8 +2,11 @@ package workflow
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 func writeMaintenanceConditionalActionsCheckoutStep(b *strings.Builder, opts buildMaintenanceWorkflowYAMLOptions) {
@@ -68,10 +71,53 @@ func writeMaintenanceAdminPermissionsStep(b *strings.Builder, opts buildMaintena
 `)
 }
 
+// maintenanceActionPinValidator records invalid pins while jobs are built so that
+// resolver fallback behavior cannot hide validation errors at the YAML boundary.
+type maintenanceActionPinValidator struct {
+	resolver SHAResolver
+	err      error
+}
+
+func (v *maintenanceActionPinValidator) ResolveSHA(ctx context.Context, repo, version string) (string, error) {
+	sha, err := v.resolver.ResolveSHA(ctx, repo, version)
+	if err == nil && v.err == nil {
+		if validationErr := validateYAMLActionPin(sha); validationErr != nil {
+			v.err = fmt.Errorf("maintenance action %s: %w", repo, validationErr)
+		}
+	}
+	return sha, err
+}
+
+func validateYAMLActionPin(actionPin string) error {
+	if strings.IndexFunc(actionPin, func(r rune) bool {
+		return (unicode.IsControl(r) && r != '\t') || r == '\u2028' || r == '\u2029'
+	}) >= 0 {
+		return errors.New("invalid action pin: unsupported control character or line separator")
+	}
+	if strings.Contains(actionPin, "${{") {
+		return errors.New("invalid action pin: GitHub Actions expressions are not allowed")
+	}
+	return nil
+}
+
+func quoteYAMLActionPin(actionPin string) (string, error) {
+	if err := validateYAMLActionPin(actionPin); err != nil {
+		return "", err
+	}
+	actionRef, version, hasVersion := strings.Cut(actionPin, " # ")
+	quotedActionRef := "'" + escapeYAMLSingleQuoted(actionRef) + "'"
+	if hasVersion {
+		return quotedActionRef + " # " + version, nil
+	}
+	return quotedActionRef, nil
+}
+
 func writeMaintenanceCloseExpiredJobYAML(b *strings.Builder, opts buildMaintenanceWorkflowYAMLOptions, setupActionRef, jobName, permissionLine, stepName, scriptName string) {
 	b.WriteString(`  ` + jobName + `:
+    name: ` + stepName + `
     if: ${{ ` + RenderCondition(buildNotForkAndScheduleOnly()) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Closing expired resources requires write access to this resource type only.
     permissions:
       ` + permissionLine + `
     steps:
@@ -100,12 +146,53 @@ func buildMaintenanceCloseExpiredJobs(opts buildMaintenanceWorkflowYAMLOptions, 
 	return b.String()
 }
 
+func buildMaintenanceCleanupStaleSteeringIssuesJob(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("cleanup-stale-steering-issues") {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(`
+  cleanup-stale-steering-issues:
+    name: Cleanup stale steering issues
+    if: ${{ ` + RenderCondition(BuildAnd(
+		buildNotForkCondition(),
+		BuildEventTypeEquals("schedule"),
+	)) + ` }}
+    runs-on: ` + opts.runsOnValue + `
+    # Reading workflow runs and closing issues requires these permissions.
+    permissions:
+      actions: read
+      issues: write
+`)
+	if opts.actionMode == ActionModeDev || opts.actionMode == ActionModeScript {
+		b.WriteString("      contents: read\n")
+	}
+	b.WriteString("    steps:\n")
+	writeMaintenanceConditionalActionsCheckoutStep(&b, opts)
+	writeMaintenanceSetupScriptsStep(&b, setupActionRef)
+	b.WriteString(`      - name: Close stale steering issues
+        uses: ` + getCachedActionPinFromResolver("actions/github-script", opts.resolver) + `
+        with:
+          script: |
+            const { setupGlobals } = require('${{ runner.temp }}/gh-aw/actions/setup_globals.cjs');
+            setupGlobals(core, github, context, exec, io, getOctokit);
+            const { main } = require('${{ runner.temp }}/gh-aw/actions/cleanup_stale_steering_issues.cjs');
+            await main();
+`)
+	return b.String()
+}
+
 func buildMaintenanceCleanupCacheJob(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("cleanup-cache-memory") {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString(`
   cleanup-cache-memory:
+    name: Cleanup cache memory
     if: ${{ ` + RenderCondition(buildNotForkAndScheduleOnlyOrOperation("clean_cache_memories")) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Removing obsolete Actions caches requires actions: write.
     permissions:
       actions: write
     steps:
@@ -125,11 +212,16 @@ func buildMaintenanceCleanupCacheJob(opts buildMaintenanceWorkflowYAMLOptions, s
 }
 
 func buildMaintenanceRunOperationJob(ctx context.Context, opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("run_operation") {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString(`
   run_operation:
-    if: ${{ ` + RenderCondition(buildRunOperationCondition("safe_outputs", "create_labels", "activity_report", "close_agentic_workflows_issues", "clean_cache_memories", "update_pull_request_branches", "validate", "forecast")) + ` }}
+    name: Run maintenance operation
+    if: ${{ ` + RenderCondition(buildRunOperationCondition(maintenanceRunOperationExclusions(opts)...)) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Updates, upgrades, and workflow enable/disable operations need repository write access.
     permissions:
       actions: write
       contents: write
@@ -165,12 +257,26 @@ func buildMaintenanceRunOperationJob(ctx context.Context, opts buildMaintenanceW
 	return b.String()
 }
 
+// maintenanceRunOperationExclusions lists operations handled by dedicated jobs rather than run_operation.
+func maintenanceRunOperationExclusions(opts buildMaintenanceWorkflowYAMLOptions) []string {
+	excluded := []string{"safe_outputs", "create_labels", "activity_report", "close_agentic_workflows_issues", "clean_cache_memories", "update_pull_request_branches", "validate", "forecast"}
+	if len(opts.compactionLedgers) > 0 {
+		excluded = append(excluded, maintenanceCompactLedgerOperation)
+	}
+	return excluded
+}
+
 func buildMaintenanceUpdatePRBranchesJob(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("update_pull_request_branches") {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString(`
   update_pull_request_branches:
+    name: Update pull request branches
     if: ${{ ` + RenderCondition(buildDispatchOperationCondition("update_pull_request_branches")) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Branch updates may write commits and update pull requests.
     permissions:
       contents: write
       pull-requests: write
@@ -201,8 +307,10 @@ func buildMaintenanceApplySafeOutputsJob(opts buildMaintenanceWorkflowYAMLOption
 	var b strings.Builder
 	b.WriteString(`
   apply_safe_outputs:
+    name: Apply safe outputs
     if: ${{ ` + RenderCondition(buildDispatchOperationCondition("safe_outputs")) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Replay can create or update any supported safe-output resource.
     permissions:
       actions: read
       contents: write
@@ -219,6 +327,8 @@ func buildMaintenanceApplySafeOutputsJob(opts buildMaintenanceWorkflowYAMLOption
 	b.WriteString(`      - name: Apply Safe Outputs
         uses: ` + getCachedActionPinFromResolver("actions/github-script", opts.resolver) + `
         env:
+          GH_AW_JOB_CHECK_RUN_ID: ${{ job.check_run_id }}
+          GH_AW_WORKFLOW_ID: "agentics-maintenance"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_AW_RUN_URL: ${{ inputs.run_url }}
         with:
@@ -239,11 +349,16 @@ func buildMaintenanceApplySafeOutputsJob(opts buildMaintenanceWorkflowYAMLOption
 }
 
 func buildMaintenanceCreateLabelsJob(ctx context.Context, opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("create_labels") {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString(`
   create_labels:
+    name: Create labels
     if: ${{ ` + RenderCondition(buildDispatchOperationCondition("create_labels")) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Creating repository labels uses the issues API.
     permissions:
       contents: read
       issues: write
@@ -271,9 +386,11 @@ func buildMaintenanceCreateLabelsJob(ctx context.Context, opts buildMaintenanceW
 func writeMaintenanceIssueReportJobPrefix(b *strings.Builder, opts buildMaintenanceWorkflowYAMLOptions, setupActionRef, jobName, operation string, timeoutMinutes int) {
 	b.WriteString(`
   ` + jobName + `:
+    name: ` + strings.ReplaceAll(jobName, "_", " ") + `
     if: ${{ ` + RenderCondition(buildDispatchOperationCondition(operation)) + ` }}
     runs-on: ` + opts.runsOnValue + `
     timeout-minutes: ` + strconv.Itoa(timeoutMinutes) + `
+    # Read workflow logs and create the resulting report issue.
     permissions:
       actions: read
       contents: read
@@ -286,6 +403,9 @@ func writeMaintenanceIssueReportJobPrefix(b *strings.Builder, opts buildMaintena
 }
 
 func buildMaintenanceActivityReportJob(ctx context.Context, opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("activity_report") {
+		return ""
+	}
 	var b strings.Builder
 	writeMaintenanceIssueReportJobPrefix(&b, opts, setupActionRef, "activity_report", "activity_report", 120)
 	b.WriteString(generateInstallCLISteps(ctx, opts.actionMode, opts.version, opts.actionTag, opts.resolver))
@@ -375,6 +495,9 @@ func buildMaintenanceActivityReportIssueStep(resolver SHAResolver) string {
 }
 
 func buildMaintenanceForecastReportJob(ctx context.Context, opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("forecast_report") {
+		return ""
+	}
 	var b strings.Builder
 	writeMaintenanceIssueReportJobPrefix(&b, opts, setupActionRef, "forecast_report", "forecast", 60)
 	b.WriteString(generateInstallCLISteps(ctx, opts.actionMode, opts.version, opts.actionTag, opts.resolver))
@@ -401,7 +524,6 @@ func buildMaintenanceForecastRunSteps(opts buildMaintenanceWorkflowYAMLOptions) 
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEBUG: "*"
           GH_AW_CMD_PREFIX: ` + getCLICmdPrefix(opts.actionMode) + `
         run: |
           mkdir -p ./.cache/gh-aw/forecast
@@ -459,11 +581,16 @@ func buildMaintenanceForecastIssueStep(resolver SHAResolver) string {
 }
 
 func buildMaintenanceCloseIssuesJob(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("close_agentic_workflows_issues") {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString(`
   close_agentic_workflows_issues:
+    name: Close agentic workflows issues
     if: ${{ ` + RenderCondition(buildDispatchOperationCondition("close_agentic_workflows_issues")) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Closing no-repro issues requires issues: write.
     permissions:
       issues: write
     steps:
@@ -485,11 +612,16 @@ func buildMaintenanceCloseIssuesJob(opts buildMaintenanceWorkflowYAMLOptions, se
 }
 
 func buildMaintenanceValidateWorkflowsJob(ctx context.Context, opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+	if opts.maintenanceConfig.IsJobDisabled("validate_workflows") {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString(`
   validate_workflows:
+    name: Validate workflows
     if: ${{ ` + RenderCondition(buildDispatchOperationCondition("validate")) + ` }}
     runs-on: ` + FormatRunsOn(opts.configuredRunsOn, "ubuntu-latest") + `
+    # Read workflow sources and file issues for validation findings.
     permissions:
       contents: read
       issues: write
@@ -514,12 +646,18 @@ func buildMaintenanceValidateWorkflowsJob(ctx context.Context, opts buildMainten
 	return b.String()
 }
 
-func buildMaintenanceLabelDisableJob(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+func buildMaintenanceLabelDisableJob(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) (string, error) {
+	actionPin, err := quoteYAMLActionPin(getCachedActionPinFromResolver("actions/github-script", opts.resolver))
+	if err != nil {
+		return "", fmt.Errorf("label_disable_agentic_workflow: %w", err)
+	}
 	var b strings.Builder
 	b.WriteString(`
   label_disable_agentic_workflow:
+    name: Disable agentic workflow by label
     if: ${{ ` + RenderCondition(buildLabeledDisableCondition()) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Label requests disable workflow runs and update the requesting issue.
     permissions:
       actions: write
       contents: read
@@ -531,7 +669,7 @@ func buildMaintenanceLabelDisableJob(opts buildMaintenanceWorkflowYAMLOptions, s
 	writeMaintenanceAdminPermissionsStep(&b, opts, "check_permissions")
 	b.WriteString(`      - name: Disable agentic workflow
         if: ${{ steps.check_permissions.outcome == 'success' }}
-        uses: ` + getCachedActionPinFromResolver("actions/github-script", opts.resolver) + `
+        uses: ` + actionPin + `
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -540,15 +678,21 @@ func buildMaintenanceLabelDisableJob(opts buildMaintenanceWorkflowYAMLOptions, s
             const { main } = require('${{ runner.temp }}/gh-aw/actions/disable_agentic_workflow.cjs');
             await main();
 `)
-	return b.String()
+	return b.String(), nil
 }
 
-func buildMaintenanceLabelApplySafeOutputsJob(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+func buildMaintenanceLabelApplySafeOutputsJob(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) (string, error) {
+	actionPin, err := quoteYAMLActionPin(getCachedActionPinFromResolver("actions/github-script", opts.resolver))
+	if err != nil {
+		return "", fmt.Errorf("label_apply_safe_outputs: %w", err)
+	}
 	var b strings.Builder
 	b.WriteString(`
   label_apply_safe_outputs:
+    name: Apply safe outputs by label
     if: ${{ ` + RenderCondition(buildLabeledApplySafeOutputsCondition()) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Applying safe outputs can update each supported repository resource.
     permissions:
       actions: read
       contents: write
@@ -562,8 +706,10 @@ func buildMaintenanceLabelApplySafeOutputsJob(opts buildMaintenanceWorkflowYAMLO
 	writeMaintenanceAdminPermissionsStep(&b, opts, "check_permissions")
 	b.WriteString(`      - name: Apply safe outputs from referenced run
         if: ${{ steps.check_permissions.outcome == 'success' }}
-        uses: ` + getCachedActionPinFromResolver("actions/github-script", opts.resolver) + `
+        uses: ` + actionPin + `
         env:
+          GH_AW_JOB_CHECK_RUN_ID: ${{ job.check_run_id }}
+          GH_AW_WORKFLOW_ID: "agentics-maintenance"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -573,23 +719,31 @@ func buildMaintenanceLabelApplySafeOutputsJob(opts buildMaintenanceWorkflowYAMLO
             const { main } = require('${{ runner.temp }}/gh-aw/actions/label_apply_safe_outputs.cjs');
             await main();
 `)
-	return b.String()
+	return b.String(), nil
 }
 
-func buildMaintenanceLabelTriggeredJobs(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) string {
+func buildMaintenanceLabelTriggeredJobs(opts buildMaintenanceWorkflowYAMLOptions, setupActionRef string) (string, error) {
 	labelDisableJobEnabled := !opts.disableLabelTrigger && !opts.maintenanceConfig.IsJobDisabled("label_disable_agentic_workflow")
 	labelApplySafeOutputsJobEnabled := !opts.disableLabelTrigger && !opts.maintenanceConfig.IsJobDisabled("label_apply_safe_outputs")
 	if !labelDisableJobEnabled && !labelApplySafeOutputsJobEnabled {
-		return ""
+		return "", nil
 	}
 	var b strings.Builder
 	if labelDisableJobEnabled {
-		b.WriteString(buildMaintenanceLabelDisableJob(opts, setupActionRef))
+		job, err := buildMaintenanceLabelDisableJob(opts, setupActionRef)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(job)
 	}
 	if labelApplySafeOutputsJobEnabled {
-		b.WriteString(buildMaintenanceLabelApplySafeOutputsJob(opts, setupActionRef))
+		job, err := buildMaintenanceLabelApplySafeOutputsJob(opts, setupActionRef)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(job)
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 func writeMaintenanceCompileWorkflowsTokenStep(b *strings.Builder, opts buildMaintenanceWorkflowYAMLOptions) {
@@ -597,9 +751,8 @@ func writeMaintenanceCompileWorkflowsTokenStep(b *strings.Builder, opts buildMai
         uses: ` + getCachedActionPinFromResolver("actions/github-script", opts.resolver) + `
 `)
 	if opts.compileGitHubToken != "" {
-		b.WriteString(`        env:
-          GH_AW_MAINTENANCE_GITHUB_TOKEN: ` + opts.compileGitHubToken + `
-`)
+		b.WriteString("        env:\n")
+		writeYAMLEnv(b, "          ", "GH_AW_MAINTENANCE_GITHUB_TOKEN", opts.compileGitHubToken)
 	}
 	b.WriteString(`        with:
 `)
@@ -619,17 +772,19 @@ func buildMaintenanceCompileWorkflowsJob(ctx context.Context, opts buildMaintena
 	var b strings.Builder
 	b.WriteString(`
   compile-workflows:
+    name: Compile workflows
     if: ${{ ` + RenderCondition(buildNotForkAndScheduled()) + ` }}
     runs-on: ` + opts.runsOnValue + `
     concurrency:
       group: ${{ github.workflow }}-compile-workflows-${{ github.repository }}
       cancel-in-progress: true
+    # Detect drift by reading sources and open a tracking issue when necessary.
     permissions:
       contents: read
       issues: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: ` + getActionPin("actions/checkout") + `
         with:
           persist-credentials: false
 
@@ -661,15 +816,17 @@ func buildMaintenanceSecretValidationJob(opts buildMaintenanceWorkflowYAMLOption
 	var b strings.Builder
 	b.WriteString(`
   secret-validation:
+    name: Validate secrets
     if: ${{ ` + RenderCondition(buildNotForkAndScheduleOnly()) + ` }}
     runs-on: ` + opts.runsOnValue + `
+    # Read repository scripts to check configured integration secrets without write access.
     permissions:
       contents: read
     steps:
 `)
 	writeMaintenanceActionsFolderCheckoutStep(&b)
 	b.WriteString(`      - name: Setup Node.js
-        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        uses: ` + getCachedActionPinFromResolver("actions/setup-node", opts.resolver) + `
         with:
           node-version: '22'
 

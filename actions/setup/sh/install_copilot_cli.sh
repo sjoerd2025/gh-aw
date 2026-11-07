@@ -2,21 +2,34 @@
 set +o histexpand
 
 # Install GitHub Copilot CLI with SHA256 checksum verification
-# Usage: install_copilot_cli.sh [VERSION] [--rootless]
+# Usage: install_copilot_cli.sh [VERSION] [--checksums-sha256 DIGEST] [--prefer-toolcache] [--rootless] [--cooldown-days DAYS]
 #
 # This script downloads and installs the GitHub Copilot CLI directly from GitHub
 # releases with SHA256 checksum verification, following the secure pattern from
 # install_awf_binary.sh to avoid executing unverified downloaded scripts.
 #
 # Arguments:
-#   VERSION    - Optional Copilot CLI version to install (default: latest release)
-#   --rootless - Install to ~/.local/bin without sudo; appends that directory to
-#                $GITHUB_PATH so subsequent steps find the binary.  Use this on
-#                ARC/DinD runners that enforce allowPrivilegeEscalation: false.
+#   VERSION    - Optional Copilot CLI version to install. When omitted, the script
+#                resolves the version via compat.json (using GH_AW_COMPILED_VERSION) and
+#                falls back to DEFAULT_COPILOT_VERSION baked into this script.
+#   --rootless - Install to $RUNNER_TEMP/gh-aw/bin without sudo; appends that
+#                directory to $GITHUB_PATH so subsequent steps find the binary.
+#                Selected automatically when neither root nor passwordless sudo is available.
+#   --checksums-sha256 - Independently trusted SHA256SUMS.txt digest for VERSION.
+#                       Requires a literal release version; bypasses toolcache unless
+#                       --prefer-toolcache is also supplied.
+#   --prefer-toolcache - Prefer a trusted cached VERSION even with a manifest pin.
+#                        The pin authenticates downloads, not the cached host binary.
+#   --cooldown-days - Require the GitHub release to be at least DAYS old, including
+#                     toolcache and musl guest installs. Defaults to 0 for standalone
+#                     checksum-only callers; the workflow compiler supplies 3.
+#
+# Environment overrides (testing):
+#   COPILOT_INSTALL_DIR - Override the install directory (default: /usr/local/bin).
 #
 # Security features:
 #   - Downloads binary directly from GitHub releases (no installer script execution)
-#   - Verifies SHA256 checksum against official SHA256SUMS.txt
+#   - Authenticates SHA256SUMS.txt against digests bundled in the trusted action
 #   - Fails fast if checksum verification fails
 
 set -euo pipefail
@@ -24,48 +37,109 @@ set -euo pipefail
 # Configuration
 SECONDS_PER_DAY=86400
 COPILOT_REPO="github/copilot-cli"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${COPILOT_INSTALL_DIR:-/usr/local/bin}"
 COPILOT_DIR="${HOME}/.copilot"
 COPILOT_TOOLCACHE_MAX_DEPTH=4
+# DEFAULT_COPILOT_VERSION is the baked-in fallback used when compat.json is unavailable
+# or selects an unpinned release (only if the default is within the compat window).
+# It is the last resort (priority 3) after engine.version (priority 1) and
+# compat.json toolcache lookup (priority 2).
+DEFAULT_COPILOT_VERSION="1.0.103"
 COMPAT_URL="${COPILOT_COMPAT_URL:-https://raw.githubusercontent.com/github/gh-aw-actions/main/.github/aw/compat.json}"
 COMPILED_GH_AW_VERSION="${GH_AW_COMPILED_VERSION:-}"
+COPILOT_MIN_VERSION_OVERRIDE="${GH_AW_COPILOT_MIN_VERSION:-}"
+COPILOT_GUEST_LIBC="${GH_AW_COPILOT_GUEST_LIBC:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=actions/setup/sh/release_integrity.sh
+source "${SCRIPT_DIR}/release_integrity.sh"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 COMPAT_BUNDLED_PATH="${COPILOT_COMPAT_BUNDLED_PATH:-${REPO_ROOT}/.github/aw/compat.json}"
 COMPAT_MATCHED_MIN_AGENT=""
 COMPAT_MATCHED_MAX_AGENT=""
 COMPAT_CACHE_TTL_DAYS=""
 
-# Parse arguments: treat the first non-flag argument as VERSION, all --<flag> arguments as flags.
 VERSION=""
 ROOTLESS=false
-for arg in "$@"; do
-  case "$arg" in
-    --rootless) ROOTLESS=true ;;
-    --*) echo "WARNING: Unknown flag: $arg" >&2 ;;
+COPILOT_CHECKSUMS_SHA256=""
+SEEN_CHECKSUMS_SHA256=false
+PREFER_TOOLCACHE=false
+COOLDOWN_DAYS=0
+SEEN_COOLDOWN_DAYS=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --rootless) ROOTLESS=true; shift ;;
+    --prefer-toolcache) PREFER_TOOLCACHE=true; shift ;;
+    --cooldown-days)
+      if [ "$SEEN_COOLDOWN_DAYS" = true ] || [ "$#" -lt 2 ] || [[ ! "$2" =~ ^(0|[1-9][0-9]*)$ ]]; then
+        echo "ERROR: --cooldown-days requires exactly one nonnegative integer number of days" >&2
+        exit 1
+      fi
+      COOLDOWN_DAYS="$2"
+      SEEN_COOLDOWN_DAYS=true
+      shift 2
+      ;;
+    --checksums-sha256)
+      if [ "$SEEN_CHECKSUMS_SHA256" = true ] || [ "$#" -lt 2 ]; then
+        echo "ERROR: --checksums-sha256 requires exactly one digest" >&2
+        exit 1
+      fi
+      COPILOT_CHECKSUMS_SHA256="$2"
+      SEEN_CHECKSUMS_SHA256=true
+      shift 2
+      ;;
+    --*) echo "ERROR: Unknown Copilot installer flag: $1" >&2; exit 1 ;;
     *)
       if [ -z "$VERSION" ]; then
-        VERSION="$arg"
+        VERSION="$1"
+      else
+        echo "ERROR: Unexpected Copilot installer argument: $1" >&2
+        exit 1
       fi
+      shift
       ;;
   esac
 done
-
-# In rootless mode, install into the user's home directory instead of /usr/local/bin
-# so that ARC/DinD runners with allowPrivilegeEscalation: false can run without sudo.
-if [ "$ROOTLESS" = "true" ]; then
-  INSTALL_DIR="${HOME}/.local/bin"
+if [ "$SEEN_CHECKSUMS_SHA256" = true ]; then
+  if [[ ! "$COPILOT_CHECKSUMS_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: --checksums-sha256 requires 64 lowercase hexadecimal characters" >&2
+    exit 1
+  fi
+  if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: --checksums-sha256 requires an explicit semantic release version, for example 1.0.98" >&2
+    exit 1
+  fi
 fi
 
-# maybe_sudo runs a command with sudo unless --rootless was specified.
-# In rootless mode, sudo is not available or needed.
-maybe_sudo() {
-  if [ "$ROOTLESS" = "true" ]; then
-    "$@"
+OS="$(uname -s)"
+IS_WINDOWS=false
+case "$OS" in
+  MINGW*|MSYS*|CYGWIN*)
+    IS_WINDOWS=true
+    ROOTLESS=true
+    INSTALL_DIR="${HOME}/.local/bin"
+    ;;
+esac
+
+case "$COPILOT_GUEST_LIBC" in
+  ""|glibc|musl) ;;
+  *)
+    echo "ERROR: Unsupported GH_AW_COPILOT_GUEST_LIBC '${COPILOT_GUEST_LIBC}'; expected glibc or musl." >&2
+    exit 1
+    ;;
+esac
+
+# shellcheck source=actions/setup/sh/install_privileges.sh
+source "${SCRIPT_DIR}/install_privileges.sh"
+configure_install_privileges
+
+# In rootless mode, install under the job-scoped gh-aw tree, which AWF mounts read-only.
+if [ "$ROOTLESS" = "true" ]; then
+  if [ "$IS_WINDOWS" = "true" ]; then
+    INSTALL_DIR="${HOME}/.local/bin"
   else
-    sudo "$@"
+    INSTALL_DIR="$(prepare_rootless_install_dir)"
   fi
-}
+fi
 
 # Rootless mode preflight: create and verify write access to the install directory.
 if [ "$ROOTLESS" = "true" ]; then
@@ -80,9 +154,18 @@ fi
 # `sudo -E awf --enable-chroot ...`, which creates the .copilot directory with
 # root ownership. The Copilot CLI (running as the runner user) then fails when
 # trying to create subdirectories. See: https://github.com/github/gh-aw/issues/12066
-echo "Ensuring correct ownership of $COPILOT_DIR..."
-mkdir -p "$COPILOT_DIR"
-maybe_sudo chown -R "$(id -u):$(id -g)" "$COPILOT_DIR"
+if [ "$ROOTLESS" = "true" ]; then
+  if ! { mkdir -p "$COPILOT_DIR" && [ -w "$COPILOT_DIR" ]; }; then
+    echo "ERROR: Cannot prepare Copilot state at $COPILOT_DIR. Ask a runner administrator to restore ownership of this directory and its contents to $(id -u):$(id -g) and make it writable before retrying. Rootless installation cannot reclaim or re-own state left by a privileged AWF run." >&2
+    exit 1
+  fi
+else
+  echo "Ensuring correct ownership of $COPILOT_DIR..."
+  if ! { mkdir -p "$COPILOT_DIR" && maybe_sudo chown -R "$(id -u):$(id -g)" "$COPILOT_DIR"; }; then
+    echo "ERROR: Cannot prepare Copilot state at $COPILOT_DIR. Ask a runner administrator to restore ownership of this directory and its contents to $(id -u):$(id -g) and make it writable before retrying." >&2
+    exit 1
+  fi
+fi
 
 # Clean up any stale AWF chroot directories left by previous runs.
 # When AWF ran with `sudo -E awf --enable-host-access`, it created
@@ -92,11 +175,14 @@ maybe_sudo chown -R "$(id -u):$(id -g)" "$COPILOT_DIR"
 # reports as "engine terminated unexpectedly" or fatal EACCES errors.
 # Remove them here before the agent starts so the runner is in a clean state.
 echo "Cleaning up stale AWF chroot directories..."
-maybe_sudo find /tmp -maxdepth 1 -name 'awf-*-chroot-home' -type d -exec rm -rf -- {} + 2>/dev/null || true
-maybe_sudo find /tmp -maxdepth 1 -name 'awf-chroot-*' -type d -exec rm -rf -- {} + 2>/dev/null || true
+if ! maybe_sudo find /tmp -maxdepth 1 -name 'awf-*-chroot-home' -type d -exec rm -rf -- {} + 2>/dev/null; then
+  echo "WARNING: Could not remove stale /tmp/awf-*-chroot-home directories. Ask a runner administrator to remove stale directories from previous runs before using this runner; installation will continue." >&2
+fi
+if ! maybe_sudo find /tmp -maxdepth 1 -name 'awf-chroot-*' -type d -exec rm -rf -- {} + 2>/dev/null; then
+  echo "WARNING: Could not remove stale /tmp/awf-chroot-* directories. Ask a runner administrator to remove stale directories from previous runs before using this runner; installation will continue." >&2
+fi
 
-# Detect OS and architecture
-OS="$(uname -s)"
+# Detect architecture
 ARCH="$(uname -m)"
 
 # Map architecture to Copilot CLI naming
@@ -110,10 +196,15 @@ esac
 case "$OS" in
   Linux) PLATFORM="linux" ;;
   Darwin) PLATFORM="darwin" ;;
+  MINGW*|MSYS*|CYGWIN*) PLATFORM="win32" ;;
   *) echo "ERROR: Unsupported operating system: ${OS}"; exit 1 ;;
 esac
 
-TARBALL_NAME="copilot-${PLATFORM}-${ARCH_NAME}.tar.gz"
+if [ "$IS_WINDOWS" = "true" ]; then
+  TARBALL_NAME="copilot-${PLATFORM}-${ARCH_NAME}.zip"
+else
+  TARBALL_NAME="copilot-${PLATFORM}-${ARCH_NAME}.tar.gz"
+fi
 REQUESTED_VERSION="${VERSION:-latest}"
 
 echo "Installing GitHub Copilot CLI${VERSION:+ version $VERSION} (os: ${OS}, arch: ${ARCH})..."
@@ -193,13 +284,74 @@ version_is_greater() {
   return 1
 }
 
+# Return the higher of the compat minimum and a feature-derived minimum version.
+select_effective_min_version() {
+  local compat_min
+  local feature_min
+
+  compat_min="$(normalize_version "${1:-}")"
+  feature_min="$(normalize_version "${2:-}")"
+
+  if [ -z "$feature_min" ]; then
+    printf '%s\n' "$compat_min"
+    return 0
+  fi
+
+  if ! version_is_numeric "$feature_min"; then
+    echo "WARNING: Ignoring invalid GH_AW_COPILOT_MIN_VERSION '${2:-}'" >&2
+    printf '%s\n' "$compat_min"
+    return 0
+  fi
+
+  if [ -z "$compat_min" ] || version_is_greater "$feature_min" "$compat_min"; then
+    if [ -n "$compat_min" ]; then
+      echo "Raising Copilot CLI minimum version from ${compat_min} to ${feature_min} due to GH_AW_COPILOT_MIN_VERSION." >&2
+    else
+      echo "Using Copilot CLI minimum version from GH_AW_COPILOT_MIN_VERSION: ${feature_min}" >&2
+    fi
+    printf '%s\n' "$feature_min"
+    return 0
+  fi
+
+  printf '%s\n' "$compat_min"
+}
+
+validate_explicit_version_minimum() {
+  local requested
+  local feature_min
+
+  requested="$(normalize_version "${1:-}")"
+  feature_min="$(normalize_version "${2:-}")"
+
+  if [ -z "$feature_min" ]; then
+    return 0
+  fi
+
+  if ! version_is_numeric "$feature_min"; then
+    echo "WARNING: Ignoring invalid GH_AW_COPILOT_MIN_VERSION '${2:-}'" >&2
+    return 0
+  fi
+
+  if ! version_is_numeric "$requested"; then
+    echo "WARNING: Could not validate explicit Copilot CLI version '${1:-}' against GH_AW_COPILOT_MIN_VERSION '${2:-}' because it is not numeric." >&2
+    return 0
+  fi
+
+  if version_is_greater "$feature_min" "$requested"; then
+    echo "ERROR: Explicit Copilot CLI version ${1:-} is below required minimum ${2:-} from GH_AW_COPILOT_MIN_VERSION." >&2
+    return 1
+  fi
+
+  return 0
+}
+
 # Download compatibility matrix with bundled fallback.
 download_compat_json() {
   local compat_file="$1"
   local source_file="$2"
 
   echo "Attempting to download compatibility matrix from ${COMPAT_URL}..." >&2
-  if curl -fsSL --retry 3 --retry-delay 5 -o "$compat_file" "$COMPAT_URL"; then
+  if curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o "$compat_file" "$COMPAT_URL"; then
     echo "$COMPAT_URL" > "$source_file"
     echo "Successfully downloaded compatibility matrix from ${COMPAT_URL}" >&2
     return 0
@@ -225,7 +377,7 @@ resolve_compat_with_jq() {
   local compiled_version="$2"
   local compiled_no_v="${compiled_version#v}"
   
-  jq -r --arg compiled "$compiled_no_v" '
+  jq -r --arg compiled "$compiled_no_v" --arg compiled_version "$compiled_version" '
     # Semver comparison: returns -1 if a<b, 0 if equal, 1 if a>b
     def semver_cmp(a; b):
       (a | split(".") | map(tonumber)) as $a_parts |
@@ -251,9 +403,11 @@ resolve_compat_with_jq() {
       $row["min-agent"] as $min_agent |
       $row["max-agent"] as $max_agent |
       
-      # Check if gh-aw version is in range
-      if (semver_cmp($compiled; $min_aw) >= 0) and
-         (($max_aw == "*") or (semver_cmp($compiled; $max_aw) <= 0)) then
+      # Use the open row for development builds, which do not have a semver release tag.
+      if (($compiled_version == "dev") and ($row.open == true)) or
+         (($compiled_version != "dev") and
+          (semver_cmp($compiled; $min_aw) >= 0) and
+          (($max_aw == "*") or (semver_cmp($compiled; $max_aw) <= 0))) then
         "\($max_agent)|\($idx)|\($min_aw)|\($max_aw)|\($min_agent)|\($max_agent)|\($cache_ttl)"
       else empty end
     ) | first // ""
@@ -272,7 +426,7 @@ resolve_version_from_compat() {
     return 1
   fi
 
-  if [[ ! "$compiled_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  if [[ ! "$compiled_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$compiled_version" != "dev" ]]; then
     echo "GH_AW_COMPILED_VERSION '${compiled_version}' is not in vMAJOR.MINOR.PATCH format; skipping compatibility matrix resolution." >&2
     return 1
   fi
@@ -368,6 +522,7 @@ find_cached_copilot_bin() {
   local candidate_version_normalized=""
   local best_candidate=""
   local best_version=""
+  local candidate_manifest_pin=""
 
   echo "Searching toolcache for GitHub Copilot CLI (requested: ${requested_version}, arch: ${ARCH_NAME}, range: ${min_version:-none}..${max_version:-none})..." >&2
   if [ -n "$cache_ttl_days" ]; then
@@ -413,6 +568,17 @@ find_cached_copilot_bin() {
 
       if [ "$candidate_arch" != "$ARCH_NAME" ]; then
         echo "  Skipping candidate (arch mismatch: want ${ARCH_NAME}, got ${candidate_arch})" >&2
+        continue
+      fi
+
+      # A musl guest still needs a verified download even when the host uses cache.
+      candidate_manifest_pin=""
+      if [ "$candidate_version_normalized" = "$(normalize_version "$VERSION")" ]; then
+        candidate_manifest_pin="$COPILOT_CHECKSUMS_SHA256"
+      fi
+      if [ "$COPILOT_GUEST_LIBC" = "musl" ] &&
+        ! release_artifact_sha256 "$COPILOT_REPO" "$candidate_version_normalized" SHA256SUMS.txt "$candidate_manifest_pin" >/dev/null 2>&1; then
+        echo "  Skipping candidate (no reviewed manifest pin for musl guest: ${candidate_version_normalized})" >&2
         continue
       fi
 
@@ -473,23 +639,28 @@ find_cached_copilot_bin() {
 # Make a cached Copilot CLI available both to the current shell and later GitHub Actions steps.
 activate_cached_copilot_bin() {
   local cached_copilot_bin="$1"
-  local cached_copilot_dir=""
   local wrapper_path=""
 
-  cached_copilot_dir="$(dirname "$cached_copilot_bin")"
   echo "Activating cached Copilot CLI from ${cached_copilot_bin}..."
-  export PATH="${cached_copilot_dir}:$PATH"
-  echo "  Prepended ${cached_copilot_dir} to PATH"
+  export PATH="${INSTALL_DIR}:$PATH"
+  echo "  Prepended ${INSTALL_DIR} to PATH"
 
   if [ -n "${GITHUB_PATH:-}" ]; then
-    echo "  Exporting ${cached_copilot_dir} to GITHUB_PATH (${GITHUB_PATH})"
-    echo "$cached_copilot_dir" >> "${GITHUB_PATH}"
+    echo "  Exporting ${INSTALL_DIR} to GITHUB_PATH (${GITHUB_PATH})"
+    echo "$INSTALL_DIR" >> "${GITHUB_PATH}"
+  else
+    echo "  GITHUB_PATH not set — relying on ${INSTALL_DIR}/copilot"
+  fi
+
+  # The agent is launched with the hardcoded absolute path ${INSTALL_DIR}/copilot, which
+  # PATH additions cannot satisfy, so always materialize that path. A small wrapper is used
+  # instead of symlinking or copying the cached script to avoid broken relative paths.
+  if [ "$cached_copilot_bin" = "${INSTALL_DIR}/copilot" ]; then
+    echo "  Cached binary already lives at ${INSTALL_DIR}/copilot — no wrapper needed"
     return 0
   fi
 
-  # Outside GitHub Actions there is no GITHUB_PATH file, so install a small wrapper
-  # instead of symlinking or copying the cached script and risking broken relative paths.
-  echo "  GITHUB_PATH not set — installing wrapper at ${INSTALL_DIR}/copilot"
+  echo "  Installing wrapper at ${INSTALL_DIR}/copilot"
   wrapper_path="${TEMP_DIR}/copilot"
   cat > "$wrapper_path" <<EOF
 #!/usr/bin/env bash
@@ -499,40 +670,178 @@ EOF
   echo "  Wrapper installed at ${INSTALL_DIR}/copilot"
 }
 
-# Create temp directory with cleanup on exit
-TEMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TEMP_DIR"' EXIT
+# Stage a checksum-verified Copilot CLI variant for a musl NVX guest while
+# retaining the host-compatible CLI for setup steps such as plugin installation.
+stage_musl_guest_copilot() {
+  local version="${1:-}"
+  local base_url=""
+  local guest_tarball=""
+  local checksums_file="${TEMP_DIR}/guest-SHA256SUMS.txt"
+  local guest_archive=""
+  local expected_checksum=""
+  local actual_checksum=""
+  local extract_dir="${TEMP_DIR}/guest-copilot"
+  local destination=""
+  local manifest_digest=""
 
-# Resolve a compatible Copilot version from compat matrix unless the caller passed an explicit version.
+  if [ "$COPILOT_GUEST_LIBC" != "musl" ]; then
+    return 0
+  fi
+  if [ "$OS" != "Linux" ]; then
+    echo "ERROR: A musl NVX guest requires a Linux host installation step." >&2
+    return 1
+  fi
+  if [ -z "${RUNNER_TEMP:-}" ]; then
+    echo "ERROR: RUNNER_TEMP is required to stage the musl Copilot CLI for NVX." >&2
+    return 1
+  fi
+
+  if [ -z "$version" ] || [ "$version" = "latest" ]; then
+    base_url="https://github.com/${COPILOT_REPO}/releases/latest/download"
+  else
+    case "$version" in
+      v*) ;;
+      *) version="v$version" ;;
+    esac
+    base_url="https://github.com/${COPILOT_REPO}/releases/download/${version}"
+  fi
+
+  guest_tarball="copilot-linuxmusl-${ARCH_NAME}.tar.gz"
+  guest_archive="${TEMP_DIR}/${guest_tarball}"
+  manifest_digest="$(release_artifact_sha256 "$COPILOT_REPO" "$version" SHA256SUMS.txt "$COPILOT_CHECKSUMS_SHA256")" || return 1
+  echo "Staging checksum-verified ${guest_tarball} for the musl NVX guest..."
+  curl --proto '=https' --proto-redir '=https' -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "$checksums_file" "${base_url}/SHA256SUMS.txt"
+  verify_release_digest "$checksums_file" "$manifest_digest" || return 1
+  curl --proto '=https' --proto-redir '=https' -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "$guest_archive" "${base_url}/${guest_tarball}"
+
+  expected_checksum="$(awk -v fname="$guest_tarball" '$2 == fname {print $1; exit}' "$checksums_file" | tr 'A-F' 'a-f')"
+  if [ -z "$expected_checksum" ]; then
+    echo "ERROR: Could not find checksum for ${guest_tarball} in SHA256SUMS.txt" >&2
+    return 1
+  fi
+  actual_checksum="$(sha256_hash "$guest_archive" | tr 'A-F' 'a-f')"
+  if [ "$expected_checksum" != "$actual_checksum" ]; then
+    echo "ERROR: Checksum verification failed for ${guest_tarball}" >&2
+    return 1
+  fi
+
+  mkdir -p "$extract_dir"
+  tar -xzf "$guest_archive" -C "$extract_dir"
+  if [ ! -f "${extract_dir}/copilot" ] || [ -L "${extract_dir}/copilot" ]; then
+    echo "ERROR: The musl Copilot CLI archive did not contain a regular copilot binary." >&2
+    return 1
+  fi
+  destination="${RUNNER_TEMP}/gh-aw/nvx-engine/copilot"
+  mkdir -p "$(dirname "$destination")"
+  install -m 0755 "${extract_dir}/copilot" "$destination"
+  echo "✓ Staged musl Copilot CLI at ${destination}"
+}
+
+# Keep downloads private and cleanup confined to this invocation's allocation.
+create_release_staging copilot
+
+# Version resolution follows this priority order:
+# Check publication time before activating any cached binary or downloading an
+# archive. Metadata failures are fatal; checksum verification remains independent.
+check_copilot_release_age() {
+  local version="$1"
+  if [ "$COOLDOWN_DAYS" = 0 ]; then
+    printf '%s\n' "$version"
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required for Copilot release-age validation." >&2
+    echo "ERROR: Install jq from https://jqlang.github.io/jq/download/ before installing Copilot CLI." >&2
+    return 1
+  fi
+  if [ -z "${GITHUB_TOKEN:-}" ]; then
+    echo "ERROR: GITHUB_TOKEN is required to authenticate Copilot release-age metadata requests." >&2
+    return 1
+  fi
+  local endpoint metadata resolved authorization_header
+  printf -v authorization_header '%s: %s %s' 'Authorization' 'Bearer' "$GITHUB_TOKEN"
+  metadata="${TEMP_DIR}/release-age.json"
+  if [ -z "$version" ] || [ "$version" = latest ]; then
+    endpoint="https://api.github.com/repos/${COPILOT_REPO}/releases/latest"
+  else
+    if [[ ! "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "ERROR: Cannot verify Copilot release age for invalid version '${version}'" >&2
+      return 1
+    fi
+    endpoint="https://api.github.com/repos/${COPILOT_REPO}/releases/tags/v${version#v}"
+  fi
+  if ! curl --proto '=https' --proto-redir '=https' -H "$authorization_header" \
+    -H "Accept: application/vnd.github+json" -fsSL --connect-timeout 10 --max-time 30 \
+    --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "$metadata" "$endpoint"; then
+    echo "ERROR: Cannot verify Copilot release age: GitHub release metadata is unavailable" >&2
+    return 1
+  fi
+  if ! resolved="$(jq -ser --arg requested "$version" --argjson days "$COOLDOWN_DAYS" '
+    select(length == 1) | .[0]
+    | select(.draft == false)
+    | select(.tag_name | type == "string" and test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+    | select($requested == "" or $requested == "latest" or .tag_name == ("v" + ($requested | ltrimstr("v"))))
+    | select(.published_at | type == "string")
+    | select((now - (.published_at | fromdateiso8601)) >= ($days * 86400))
+    | .tag_name
+  ' "$metadata")"; then
+    echo "ERROR: Copilot release '${version}' must be at least ${COOLDOWN_DAYS} days old; release metadata is invalid or the release is too recent" >&2
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+# 1. Explicit VERSION argument (from engine.version in the workflow)
+# 2. Compat.json toolcache lookup (requires GH_AW_COMPILED_VERSION to select the right window)
+# 3. DEFAULT_COPILOT_VERSION baked into this script
 if [ -z "$VERSION" ]; then
   echo "No explicit Copilot CLI version requested. Attempting compat-driven version resolution..."
   if RESOLVED_COMPAT_INFO="$(resolve_version_from_compat "$COMPILED_GH_AW_VERSION" "${TEMP_DIR}/compat.json")"; then
     IFS='|' read -r RESOLVED_COMPAT_VERSION COMPAT_MATCHED_MIN_AGENT COMPAT_MATCHED_MAX_AGENT COMPAT_CACHE_TTL_DAYS <<< "$RESOLVED_COMPAT_INFO"
     VERSION="$RESOLVED_COMPAT_VERSION"
     REQUESTED_VERSION="latest"
+    COMPAT_MATCHED_MIN_AGENT="$(select_effective_min_version "${COMPAT_MATCHED_MIN_AGENT}" "${COPILOT_MIN_VERSION_OVERRIDE}")"
     echo "Using compat-resolved Copilot CLI window: ${COMPAT_MATCHED_MIN_AGENT}..${COMPAT_MATCHED_MAX_AGENT}"
     echo "Will install compat max-agent ${VERSION} if no cached version satisfies the window."
   else
-    echo "ERROR: Failed to resolve Copilot CLI version from compatibility matrix." >&2
-    echo "ERROR: Cannot install without a compatible version." >&2
-    echo "To fix: Pass an explicit version as an argument (e.g., 'install_copilot_cli.sh 1.0.56')" >&2
-    echo "   or ensure GH_AW_COMPILED_VERSION matches a row in .github/aw/compat.json" >&2
-    exit 1
+    echo "Compat resolution unavailable; falling back to baked-in default version: ${DEFAULT_COPILOT_VERSION}" >&2
+    VERSION="$DEFAULT_COPILOT_VERSION"
+    REQUESTED_VERSION="$DEFAULT_COPILOT_VERSION"
   fi
 else
+  COMPAT_MATCHED_MIN_AGENT="$(select_effective_min_version "${COMPAT_MATCHED_MIN_AGENT}" "${COPILOT_MIN_VERSION_OVERRIDE}")"
+  if ! validate_explicit_version_minimum "$VERSION" "$COPILOT_MIN_VERSION_OVERRIDE"; then
+    exit 1
+  fi
   echo "Explicit Copilot CLI version argument provided (${VERSION}); skipping compat matrix resolution."
 fi
 
-# Prefer the runner toolcache when a compatible Copilot CLI is already available.
-if CACHED_COPILOT_BIN="$(find_cached_copilot_bin "$REQUESTED_VERSION" "${COMPAT_MATCHED_MIN_AGENT}" "${COMPAT_MATCHED_MAX_AGENT}" "${COMPAT_CACHE_TTL_DAYS}")"; then
+# A supplied manifest pin authenticates downloads, not a runner's existing cache.
+if [ -n "$COPILOT_CHECKSUMS_SHA256" ] && [ "$PREFER_TOOLCACHE" = false ]; then
+  echo "Explicit checksum-manifest pin supplied; downloading verified archives instead of using toolcache."
+fi
+if { [ -z "$COPILOT_CHECKSUMS_SHA256" ] || [ "$PREFER_TOOLCACHE" = true ]; } &&
+  CACHED_COPILOT_BIN="$(find_cached_copilot_bin "$REQUESTED_VERSION" "${COMPAT_MATCHED_MIN_AGENT}" "${COMPAT_MATCHED_MAX_AGENT}" "${COMPAT_CACHE_TTL_DAYS}")"; then
+  CACHED_COPILOT_VERSION="$(basename "$(dirname "$(dirname "$(dirname "$CACHED_COPILOT_BIN")")")")"
+  check_copilot_release_age "$CACHED_COPILOT_VERSION" >/dev/null || exit 1
   echo "Using cached GitHub Copilot CLI from ${CACHED_COPILOT_BIN}"
   activate_cached_copilot_bin "$CACHED_COPILOT_BIN"
 
   echo "Verifying cached Copilot CLI installation..."
+  # The agent is spawned with the absolute path ${INSTALL_DIR}/copilot, so that path must
+  # exist even when the CLI itself came from the toolcache.
+  if [ ! -x "${INSTALL_DIR}/copilot" ]; then
+    echo "ERROR: Cached Copilot CLI activation failed - ${INSTALL_DIR}/copilot is missing or not executable"
+    exit 1
+  fi
+
   RESOLVED_COPILOT="$(command -v copilot 2>/dev/null || true)"
   if [ -n "$RESOLVED_COPILOT" ]; then
     echo "  Resolved copilot binary: ${RESOLVED_COPILOT}"
+    echo "  Canonical install path: ${INSTALL_DIR}/copilot"
     "$RESOLVED_COPILOT" --version
+    CACHED_COPILOT_VERSION="$(basename "$(dirname "$(dirname "$(dirname "$CACHED_COPILOT_BIN")")")")"
+    stage_musl_guest_copilot "$CACHED_COPILOT_VERSION"
     echo "✓ Copilot CLI installation complete (cached)"
     exit 0
   fi
@@ -540,6 +849,21 @@ if CACHED_COPILOT_BIN="$(find_cached_copilot_bin "$REQUESTED_VERSION" "${COMPAT_
   echo "ERROR: Cached Copilot CLI activation failed - command not found"
   exit 1
 fi
+
+# A live compatibility matrix can advance beyond the pins bundled in this action.
+# Keep cache selection unchanged, but never download an unreviewed release.
+if [ "$REQUESTED_VERSION" = "latest" ] && [ -n "$COMPAT_MATCHED_MAX_AGENT" ] &&
+  ! release_artifact_sha256 "$COPILOT_REPO" "$VERSION" SHA256SUMS.txt >/dev/null 2>&1; then
+  if version_is_greater "$COMPAT_MATCHED_MIN_AGENT" "$DEFAULT_COPILOT_VERSION" ||
+    version_is_greater "$DEFAULT_COPILOT_VERSION" "$COMPAT_MATCHED_MAX_AGENT"; then
+    echo "ERROR: Compat target ${VERSION} has no reviewed manifest pin and default ${DEFAULT_COPILOT_VERSION} is outside ${COMPAT_MATCHED_MIN_AGENT}..${COMPAT_MATCHED_MAX_AGENT}; update the setup action or supply an explicit version with checksums-sha256." >&2
+    exit 1
+  fi
+  echo "Compat target ${VERSION} has no reviewed manifest pin; falling back to reviewed default ${DEFAULT_COPILOT_VERSION} within ${COMPAT_MATCHED_MIN_AGENT}..${COMPAT_MATCHED_MAX_AGENT}." >&2
+  VERSION="$DEFAULT_COPILOT_VERSION"
+fi
+
+VERSION="$(check_copilot_release_age "$VERSION")" || exit 1
 
 # Build download URLs
 if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
@@ -555,14 +879,16 @@ fi
 
 TARBALL_URL="${BASE_URL}/${TARBALL_NAME}"
 CHECKSUMS_URL="${BASE_URL}/SHA256SUMS.txt"
+CHECKSUMS_SHA256="$(release_artifact_sha256 "$COPILOT_REPO" "$VERSION" SHA256SUMS.txt "$COPILOT_CHECKSUMS_SHA256")"
 
 # Download checksums
 echo "Downloading checksums from ${CHECKSUMS_URL}..."
-curl -fsSL --retry 3 --retry-delay 5 -o "${TEMP_DIR}/SHA256SUMS.txt" "${CHECKSUMS_URL}"
+curl --proto '=https' --proto-redir '=https' -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "${TEMP_DIR}/SHA256SUMS.txt" "${CHECKSUMS_URL}"
+verify_release_digest "${TEMP_DIR}/SHA256SUMS.txt" "$CHECKSUMS_SHA256"
 
 # Download binary tarball
 echo "Downloading binary from ${TARBALL_URL}..."
-curl -fsSL --retry 3 --retry-delay 5 -o "${TEMP_DIR}/${TARBALL_NAME}" "${TARBALL_URL}"
+curl --proto '=https' --proto-redir '=https' -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 --retry-all-errors -o "${TEMP_DIR}/${TARBALL_NAME}" "${TARBALL_URL}"
 
 # Verify checksum
 echo "Verifying SHA256 checksum for ${TARBALL_NAME}..."
@@ -587,8 +913,24 @@ echo "✓ Checksum verification passed for ${TARBALL_NAME}"
 
 # Extract and install binary
 echo "Installing binary to ${INSTALL_DIR}..."
-maybe_sudo tar -xz -C "${INSTALL_DIR}" -f "${TEMP_DIR}/${TARBALL_NAME}"
-maybe_sudo chmod +x "${INSTALL_DIR}/copilot"
+if [ "$IS_WINDOWS" = "true" ]; then
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -qo "${TEMP_DIR}/${TARBALL_NAME}" -d "${INSTALL_DIR}"
+  elif command -v 7z >/dev/null 2>&1; then
+    7z x -y "-o${INSTALL_DIR}" "${TEMP_DIR}/${TARBALL_NAME}" >/dev/null
+  else
+    echo "ERROR: unzip or 7z is required for Windows installation"
+    exit 1
+  fi
+  cat > "${INSTALL_DIR}/copilot" <<EOF
+#!/usr/bin/env bash
+exec "${INSTALL_DIR}/copilot.exe" "\$@"
+EOF
+  chmod +x "${INSTALL_DIR}/copilot"
+else
+  maybe_sudo tar -xz -C "${INSTALL_DIR}" -f "${TEMP_DIR}/${TARBALL_NAME}"
+  maybe_sudo chmod +x "${INSTALL_DIR}/copilot"
+fi
 
 # In rootless mode, add the install dir to PATH for subsequent steps.
 # $GITHUB_PATH is the mechanism for persisting PATH additions across steps in GitHub Actions.
@@ -606,15 +948,17 @@ echo "Verifying Copilot CLI installation..."
 if [ "$ROOTLESS" = "true" ]; then
   if [ -x "${INSTALL_DIR}/copilot" ]; then
     "${INSTALL_DIR}/copilot" --version
+    stage_musl_guest_copilot "$VERSION"
     echo "✓ Copilot CLI installation complete"
   else
     echo "ERROR: Copilot CLI installation failed - binary not found at ${INSTALL_DIR}/copilot"
     exit 1
   fi
-elif command -v copilot >/dev/null 2>&1; then
-  copilot --version
+elif [ -x "${INSTALL_DIR}/copilot" ]; then
+  "${INSTALL_DIR}/copilot" --version
+  stage_musl_guest_copilot "$VERSION"
   echo "✓ Copilot CLI installation complete"
 else
-  echo "ERROR: Copilot CLI installation failed - command not found"
+  echo "ERROR: Copilot CLI installation failed - executable not found at ${INSTALL_DIR}/copilot"
   exit 1
 fi

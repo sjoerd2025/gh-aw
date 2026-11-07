@@ -47,7 +47,7 @@ function initRepo(dir, defaultBranch) {
   git(["commit", "-q", "-m", "seed"], dir);
 }
 
-describe.sequential("apply_samples.cjs", () => {
+describe("apply_samples.cjs", () => {
   let tempDir;
   let configPath;
   let outputsPath;
@@ -156,15 +156,85 @@ describe.sequential("apply_samples.cjs", () => {
     const logText = fs.readFileSync(logPath, "utf8");
     expect(logText).toContain("terminal_reason");
   });
+
+  it("replays dynamic call_workflow samples with workflow_name materialized", () => {
+    const dynamicConfigPath = path.join(tempDir, "call-workflow-config.json");
+    const dynamicToolsPath = path.join(tempDir, "call-workflow-tools.json");
+    const dynamicOutputsPath = path.join(tempDir, "call-workflow-outputs.jsonl");
+    const dynamicLogPath = path.join(tempDir, "call-workflow-agent-stdio.log");
+
+    fs.writeFileSync(
+      dynamicConfigPath,
+      JSON.stringify({
+        "call-workflow": {
+          workflows: ["test-copilot-call-worker"],
+        },
+      })
+    );
+    fs.writeFileSync(
+      dynamicToolsPath,
+      JSON.stringify([
+        {
+          name: "test_copilot_call_worker",
+          _call_workflow_name: "test-copilot-call-worker",
+          description: "Call the test-copilot-call-worker workflow",
+          inputSchema: {
+            type: "object",
+            properties: {
+              sentinel: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      ])
+    );
+
+    const samples = [
+      {
+        tool: "test_copilot_call_worker",
+        arguments: {
+          sentinel: "deterministic-sample",
+        },
+      },
+    ];
+
+    const result = spawnSync(process.execPath, [driverPath], {
+      env: {
+        ...process.env,
+        GH_AW_SAMPLES: JSON.stringify(samples),
+        GH_AW_SAFE_OUTPUTS_CONFIG_PATH: dynamicConfigPath,
+        GH_AW_SAFE_OUTPUTS_TOOLS_PATH: dynamicToolsPath,
+        GH_AW_SAFE_OUTPUTS: dynamicOutputsPath,
+        GH_AW_AGENT_STDIO_LOG: dynamicLogPath,
+      },
+      encoding: "utf8",
+      timeout: 15000,
+    });
+
+    if (result.status !== 0) {
+      throw new Error(`driver exited with status ${result.status}\nstderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+    }
+
+    const outputLines = fs
+      .readFileSync(dynamicOutputsPath, "utf8")
+      .split("\n")
+      .filter(line => line.trim().length > 0);
+    expect(outputLines).toHaveLength(1);
+
+    const firstEntry = JSON.parse(outputLines[0]);
+    expect(firstEntry.type).toBe("call_workflow");
+    expect(firstEntry.workflow_name).toBe("test-copilot-call-worker");
+    expect(firstEntry.inputs).toEqual({
+      sentinel: "deterministic-sample",
+    });
+  });
 });
 
 describe("apply_samples.cjs sendJsonRpc", () => {
   const { sendJsonRpc } = require("./apply_samples.cjs");
 
-  async function* fromLines(lines) {
-    for (const line of lines) {
-      yield line;
-    }
+  function fromLines(lines) {
+    return require("./jsonl_helpers.cjs").streamJsonlEvents(lines.map(line => line + "\n"));
   }
 
   it("skips non-JSON stdout lines until a JSON-RPC response arrives", async () => {

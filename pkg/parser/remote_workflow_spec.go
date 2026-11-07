@@ -12,57 +12,6 @@ import (
 	"github.com/github/gh-aw/pkg/gitutil"
 )
 
-// IsWorkflowSpec checks if a path looks like a workflowspec (owner/repo/path[@ref]).
-func IsWorkflowSpec(path string) bool {
-	// Remove section reference if present
-	cleanPath := path
-	if before, _, ok := strings.Cut(path, "#"); ok {
-		cleanPath = before
-	}
-
-	// Remove ref if present
-	if idx := strings.Index(cleanPath, "@"); idx != -1 {
-		cleanPath = cleanPath[:idx]
-	}
-
-	// Check if it has at least 3 parts (owner/repo/path)
-	parts := strings.Split(cleanPath, "/")
-	if len(parts) < 3 {
-		return false
-	}
-
-	// Preserve legacy behavior expected by parser tests: URL-like paths are
-	// currently treated as workflowspecs because downstream parsing supports
-	// repository/path extraction from slash-delimited remote references.
-	if strings.Contains(cleanPath, "://") {
-		return true
-	}
-
-	// Reject paths that start with "." (local paths like .github/workflows/...)
-	if strings.HasPrefix(cleanPath, ".") {
-		return false
-	}
-
-	// Reject paths that start with "shared/" (local shared files)
-	if strings.HasPrefix(cleanPath, "shared/") {
-		return false
-	}
-
-	// Reject absolute paths
-	if strings.HasPrefix(cleanPath, "/") {
-		return false
-	}
-
-	// Safe indexing: len(parts) >= 3 is guaranteed above.
-	owner := parts[0]
-	repo := parts[1]
-	if owner == "" || repo == "" {
-		return false
-	}
-
-	return true
-}
-
 // downloadIncludeFromWorkflowSpec downloads an include file from GitHub using workflowspec.
 // It first checks the cache, and only downloads if not cached.
 //
@@ -77,6 +26,16 @@ func downloadIncludeFromWorkflowSpec(spec string, cache *ImportCache) (string, e
 	}
 	remoteLog.Printf("Parsed workflowspec: host=%s, owner=%s, repo=%s, file=%s, ref=%s", host, owner, repo, filePath, ref)
 
+	if cache != nil && cache.readOnly {
+		if !gitutil.IsValidFullSHACaseInsensitive(ref) {
+			return "", fmt.Errorf("remote import %s is not pinned to a commit SHA; offline imports require a cached pinned import", spec)
+		}
+		if cachedPath, found := cache.Get(owner, repo, filePath, ref); found {
+			remoteLog.Printf("Using cached import: %s/%s/%s@%s (SHA: %s)", owner, repo, filePath, ref, ref)
+			return cachedPath, nil
+		}
+		return "", fmt.Errorf("remote import %s is not cached; populate the import cache with a trusted compile before using --read-only", spec)
+	}
 	sha := resolveWorkflowSpecSHAForCache(owner, repo, ref, host, cache)
 	if cache != nil && sha != "" {
 		if cachedPath, found := cache.Get(owner, repo, filePath, sha); found {
@@ -114,12 +73,9 @@ func parseWorkflowSpecParts(spec string) (string, string, string, string, string
 	if before, _, ok := strings.Cut(spec, "#"); ok {
 		cleanSpec = before
 	}
-	parts := strings.SplitN(cleanSpec, "@", 2)
-	pathPart := parts[0]
-	ref := "main"
-	if len(parts) == 2 {
-		ref = parts[1]
-	} else {
+	pathPart, ref, hasRef := strings.Cut(cleanSpec, "@")
+	if !hasRef {
+		ref = "main"
 		remoteLog.Print("No ref specified, defaulting to 'main'")
 	}
 
@@ -127,26 +83,47 @@ func parseWorkflowSpecParts(spec string) (string, string, string, string, string
 		return "", "", "", "", "", fmt.Errorf("invalid workflowspec ref: %w", err)
 	}
 
-	slashParts := strings.Split(pathPart, "/")
-	if len(slashParts) < 3 {
+	first, remaining, hasSlash := strings.Cut(pathPart, "/")
+	if !hasSlash {
+		remoteLog.Printf("Invalid workflowspec format: %s", spec)
+		return "", "", "", "", "", errors.New("invalid workflowspec: must be owner/repo/path[@ref]")
+	}
+	second, remaining, hasSlash := strings.Cut(remaining, "/")
+	if !hasSlash {
 		remoteLog.Printf("Invalid workflowspec format: %s", spec)
 		return "", "", "", "", "", errors.New("invalid workflowspec: must be owner/repo/path[@ref]")
 	}
 
 	// Optional host-prefixed format: host/owner/repo/path[@ref]
-	if len(slashParts) >= 4 && strings.Contains(slashParts[0], ".") {
-		filePath := strings.Join(slashParts[3:], "/")
+	third, filePath, hasPath := strings.Cut(remaining, "/")
+	if hasPath && strings.Contains(first, ".") {
+		host := first
+		owner := second
+		repo := third
+		if !IsGitHubHost(host) {
+			return "", "", "", "", "", fmt.Errorf("invalid workflowspec host %q — expected a GitHub host: 'github.com', 'raw.githubusercontent.com', '*.ghe.com' or '*.github.com' (for example: 'github.com/owner/repo/workflows/ci.md@main')", host)
+		}
+		if !IsValidGitHubIdentifier(owner) || !IsValidGitHubRepositoryName(repo) {
+			return "", "", "", "", "", fmt.Errorf("invalid workflowspec repository '%s/%s' — expected 'host/owner/repo/path[@ref]' format (for example: 'github.com/github/gh-aw/workflows/ci.md@main')", owner, repo)
+		}
+		// Raw content is served from raw.githubusercontent.com but the API and
+		// git remotes live on github.com, so normalize it here.
+		if host == "raw.githubusercontent.com" {
+			host = "github.com"
+		}
 		if err := gitutil.ValidateGitPath(filePath); err != nil {
 			return "", "", "", "", "", fmt.Errorf("invalid workflowspec path: %w", err)
 		}
-		return slashParts[0], slashParts[1], slashParts[2], filePath, ref, nil
+		return host, owner, repo, filePath, ref, nil
 	}
 
-	filePath := strings.Join(slashParts[2:], "/")
+	owner := first
+	repo := second
+	filePath = remaining
 	if err := gitutil.ValidateGitPath(filePath); err != nil {
 		return "", "", "", "", "", fmt.Errorf("invalid workflowspec path: %w", err)
 	}
-	return "", slashParts[0], slashParts[1], filePath, ref, nil
+	return "", owner, repo, filePath, ref, nil
 }
 
 func resolveWorkflowSpecSHAForCache(owner, repo, ref, host string, cache *ImportCache) string {

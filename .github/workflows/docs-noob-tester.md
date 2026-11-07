@@ -11,9 +11,6 @@ permissions:
   pull-requests: read
   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 engine:
   id: copilot
@@ -27,7 +24,6 @@ tools:
   cli-proxy: true
   timeout: 120  # Playwright navigation on Astro dev server can take >60s; increase to 120s
   playwright:
-    mode: cli
   edit:
   bash:
     - "*"
@@ -49,19 +45,37 @@ imports:
   - shared/keep-it-short.md
   - shared/otlp.md
 pre-agent-steps:
-  - name: Start docs server
+  - name: Checkout agentics workflows
+    uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    with:
+      repository: githubnext/agentics
+      ref: main
+      path: .agentics
+      persist-credentials: false
+      sparse-checkout: workflows
+  - name: Install docs dependencies
     env:
       EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
     run: |
-      cd "$EXPR_GITHUB_WORKSPACE"
-      nohup make dev-docs > /tmp/gh-aw/agent/preview.log 2>&1 &
+      cd "$EXPR_GITHUB_WORKSPACE/docs" || exit 1
+      npm ci
+  - name: Start docs server
+    env:
+      AGENTICS_WORKFLOWS_DIR: ${{ github.workspace }}/.agentics/workflows
+      EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
+    run: |
+      mkdir -p /tmp/gh-aw/agent
+      cd "$EXPR_GITHUB_WORKSPACE/docs" || exit 1
+      nohup npm run dev -- --host 127.0.0.1 --port 4321 > /tmp/gh-aw/agent/preview.log 2>&1 &
       PID=$!
       echo $PID > /tmp/gh-aw/agent/server.pid
       echo "Server PID: $PID"
   - name: Wait for server readiness
+    # runner-guard:ignore RGS-012 -- loopback-only port/readiness checks for the docs server started above; no external traffic or secrets are sent.
     run: |
       MAX_WAIT=135  # 45 attempts × 3s = 135s max wait
       WAITED=0
+      # runner-guard:ignore RGS-012 -- loopback-only port probe for the docs server started above; no external traffic is sent.
       until (echo > /dev/tcp/127.0.0.1/4321) > /dev/null 2>&1; do
         # Check if the server process has already died
         if [ -f /tmp/gh-aw/agent/server.pid ] && ! kill -0 "$(cat /tmp/gh-aw/agent/server.pid)" 2>/dev/null; then
@@ -79,6 +93,7 @@ pre-agent-steps:
         sleep 3
       done
       WAITED=0
+      # runner-guard:ignore RGS-012 -- loopback-only readiness request to the docs server started above; no secrets are sent.
       until curl -sf http://localhost:4321/gh-aw/ > /dev/null 2>&1; do
         # Check if the server process has already died
         if [ -f /tmp/gh-aw/agent/server.pid ] && ! kill -0 "$(cat /tmp/gh-aw/agent/server.pid)" 2>/dev/null; then

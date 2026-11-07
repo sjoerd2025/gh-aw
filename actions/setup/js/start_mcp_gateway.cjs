@@ -18,7 +18,7 @@ require("./shim.cjs");
  *
  * Required environment variables:
  * - MCP_GATEWAY_DOCKER_COMMAND: Container image to run (required)
- * - MCP_GATEWAY_API_KEY: API key for gateway authentication (required for converter scripts)
+ * - MCP_GATEWAY_AGENT_ID: agent ID for gateway authentication (required for converter scripts)
  * - MCP_GATEWAY_PORT: Port for MCP gateway
  * - MCP_GATEWAY_DOMAIN: Domain for MCP server URLs (e.g., host.docker.internal)
  * - RUNNER_TEMP: GitHub Actions runner temp directory
@@ -27,18 +27,312 @@ require("./shim.cjs");
  * Optional:
  * - GH_AW_ENGINE: Engine type (copilot, codex, claude, gemini)
  * - GH_AW_MCP_CLI_SERVERS: JSON array of server names to exclude from agent config
+ * - GH_AW_MCP_GATEWAY_CUSTOM_ENV_NAMES: JSON array of custom gateway environment variable names
  */
 
-const { spawn, execSync } = require("child_process");
+const { spawn, execFileSync, execSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
+const os = require("os");
 const path = require("path");
-const { withRetry } = require("./error_recovery.cjs");
+const { renderLogToStdout } = require("./render_log_to_stdout.cjs");
 const { lstatGuard } = require("./symlink_guard.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { ERR_SAFE_OUTPUTS_GATEWAY_CONFIG } = require("./error_codes.cjs");
+const { getSetupTimeoutMs } = require("./child_process_timeouts.cjs");
+const { applyGatewayRuntimeTimeouts } = require("./tool_timeouts.cjs");
+const { fetchMCPToolsResult } = require("./mount_mcp_as_cli.cjs");
+const { writeMcpConfiguration } = require("./mcp_configuration.cjs");
+const { PROXY_ENV_NAMES, STEP_NAME_START_MCP_GATEWAY } = require("./constants.cjs");
+const { redactCliProxyDiagnostics } = require("./redact_cli_proxy_diagnostics.cjs");
+const { prepareMCPServerCAs } = require("./mcp_server_ca.cjs");
+const { ERR_CONFIG, ERR_SYSTEM } = require("./error_codes.cjs");
+
+function codedError(message, code = ERR_SYSTEM, options) {
+  return new Error(`${code}: ${message}`, options);
+}
+
+function setFailed(message) {
+  const text = String(message).replace(/^(?:ERROR|FATAL):\s*/, "");
+  core.setFailed(/^ERR_[A-Z]+:/.test(text) ? text : `${ERR_SYSTEM}: ${text}`);
+}
 
 /** @type {number | null} */
 let activeGatewayPid = null;
+const customGatewayEnvMarker = "__GH_AW_MCP_GATEWAY_CUSTOM_ENV__";
+const customGatewayEnvNamePattern = /^[A-Z_][A-Z0-9_]*$/;
+const customGatewayEnvNamesVar = "GH_AW_MCP_GATEWAY_CUSTOM_ENV_NAMES";
+const customGatewayEnvTransportPrefix = "GH_AW_MCP_GATEWAY_ENV_";
+const customGatewayReservedEnvPrefix = "GH_AW_MCP_GATEWAY_";
+const CONTAINER_STATUS_TIMEOUT_MS = getSetupTimeoutMs("mcpContainerStatus");
+const CONFIG_CONVERTER_TIMEOUT_MS = getSetupTimeoutMs("mcpConfigConverter");
+const DOCKER_CLEANUP_TIMEOUT_MS = getSetupTimeoutMs("mcpDockerCleanup");
+const MCP_SERVER_CHECK_TIMEOUT_MS = getSetupTimeoutMs("mcpServerCheck");
+
+/**
+ * Retries startup probes without letting requests or backoff extend the shared
+ * container startup deadline.
+ *
+ * @param {(remainingMs: number) => Promise<void>} probe
+ * @param {ReturnType<typeof resolveGatewayHealthRetryConfig>} retryConfig
+ * @param {number} deadline
+ * @param {string} label
+ * @param {(err: any) => boolean} [shouldRetry]
+ */
+async function retryGatewayStartup(probe, retryConfig, deadline, label, shouldRetry = () => true) {
+  let delayMs = retryConfig.initialDelayMs;
+  for (let attempt = 1; attempt <= retryConfig.maxTotalAttempts; attempt += 1) {
+    const remainingMs = deadline - nowMs();
+    if (remainingMs <= 0) {
+      throw codedError(`${label} startup deadline exceeded`);
+    }
+    try {
+      await probe(remainingMs);
+      if (nowMs() >= deadline) {
+        throw codedError(`${label} startup deadline exceeded`);
+      }
+      return;
+    } catch (err) {
+      if (!shouldRetry(err) || attempt === retryConfig.maxTotalAttempts || nowMs() >= deadline) {
+        throw err;
+      }
+      delayMs = Math.min(delayMs * retryConfig.backoffMultiplier, retryConfig.maxDelayMs);
+      const sleepMs = Math.min(Math.ceil(delayMs), deadline - nowMs());
+      if (attempt === 1 || (attempt & (attempt - 1)) === 0) {
+        core.warning(`${label}: retrying after attempt ${attempt} in ${sleepMs}ms`);
+      }
+      await sleep(sleepMs);
+    }
+  }
+}
+
+/**
+ * Default health-check retry parameters. The defaults give the gateway a retry
+ * budget that outlasts the MCP backend startup timeout, leaving room for backend
+ * cleanup and final server registration before the health check gives up.
+ */
+const MCP_GATEWAY_HEALTH_RETRY_DEFAULTS = Object.freeze({
+  maxTotalAttempts: 150,
+  initialDelayMs: 250,
+  maxDelayMs: 1000,
+  backoffMultiplier: 2,
+});
+
+/** Environment variable overrides for each health-check retry parameter. */
+const MCP_GATEWAY_HEALTH_RETRY_ENV = Object.freeze({
+  maxTotalAttempts: "GH_AW_MCP_GATEWAY_HEALTH_MAX_ATTEMPTS",
+  initialDelayMs: "GH_AW_MCP_GATEWAY_HEALTH_INITIAL_DELAY_MS",
+  maxDelayMs: "GH_AW_MCP_GATEWAY_HEALTH_MAX_DELAY_MS",
+  backoffMultiplier: "GH_AW_MCP_GATEWAY_HEALTH_BACKOFF_MULTIPLIER",
+  backendStartupTimeoutMs: "GH_AW_MCP_GATEWAY_BACKEND_STARTUP_TIMEOUT_MS",
+});
+
+/** Default MCP backend startup timeout the retry budget must outlast. */
+const MCP_GATEWAY_BACKEND_STARTUP_TIMEOUT_DEFAULT_MS = 120_000;
+
+/** Upper bound on explicit and automatically sized health-check attempts. */
+const MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT = 10_000;
+
+/**
+ * Extra time the health check must keep polling after the backend startup
+ * timeout so that backend cleanup and final server registration can complete.
+ */
+const MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS = 25_000;
+
+/**
+ * Reads a positive number from the environment, warning when the variable is
+ * set to a value that cannot be used.
+ *
+ * @param {string} envName
+ * @param {number} defaultValue
+ * @param {NodeJS.ProcessEnv} env
+ * @param {{ integer?: boolean }} [options]
+ * @returns {{ value: number, wasExplicit: boolean }}
+ */
+function readPositiveEnvNumber(envName, defaultValue, env, options = {}) {
+  const raw = env[envName];
+  if (raw === undefined || !raw.trim()) {
+    return { value: defaultValue, wasExplicit: false };
+  }
+  const parsed = Number(raw.trim());
+  const isValid = Number.isFinite(parsed) && parsed > 0 && (!options.integer || Number.isSafeInteger(parsed));
+  if (!isValid) {
+    core.warning(`Ignoring invalid ${envName}='${raw}': expected a positive ${options.integer ? "integer" : "number"}, using ${defaultValue}`);
+    return { value: defaultValue, wasExplicit: false };
+  }
+  return { value: parsed, wasExplicit: true };
+}
+
+/**
+ * Computes a lower bound on the cumulative startup retry delay before exhausting
+ * its attempts. Actual sleeps round up to avoid Node truncating fractional delays.
+ * The retry loop applies the backoff multiplier before its first sleep,
+ * so the first retry waits initialDelayMs * backoffMultiplier.
+ *
+ * @param {{ maxTotalAttempts: number, initialDelayMs: number, maxDelayMs: number, backoffMultiplier: number }} config
+ * @returns {number}
+ */
+function computeHealthRetryBudgetMs(config) {
+  const retries = config.maxTotalAttempts - 1;
+  if (retries <= 0) {
+    return 0;
+  }
+  if (config.backoffMultiplier === 1) {
+    return Math.min(config.initialDelayMs, config.maxDelayMs) * retries;
+  }
+
+  // Sum the exponential ramp and capped tail without iterating over potentially
+  // millions of attempts. expm1 preserves precision for multipliers close to 1.
+  const logMultiplier = Math.log(config.backoffMultiplier);
+  const rampRetries = Math.min(retries, Math.max(0, Math.ceil(Math.log(config.maxDelayMs / config.initialDelayMs) / logMultiplier) - 1));
+  const rampBudgetMs = rampRetries === 0 ? 0 : (config.initialDelayMs * config.backoffMultiplier * Math.expm1(rampRetries * logMultiplier)) / (config.backoffMultiplier - 1);
+  return rampBudgetMs + (retries - rampRetries) * config.maxDelayMs;
+}
+
+/**
+ * Resolves the gateway health-check retry parameters from the environment and
+ * validates that they are mutually consistent.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ maxTotalAttempts: number, initialDelayMs: number, maxDelayMs: number, backoffMultiplier: number, backendStartupTimeoutMs: number, retryBudgetMs: number }}
+ */
+function resolveGatewayHealthRetryConfig(env = process.env) {
+  const maxAttemptsOverride = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.maxTotalAttempts, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.maxTotalAttempts, env, { integer: true });
+  let maxTotalAttempts = maxAttemptsOverride.value;
+  const hasExplicitAttempts = maxAttemptsOverride.wasExplicit;
+  const initialDelayMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.initialDelayMs, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.initialDelayMs, env, { integer: true }).value;
+  let maxDelayMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.maxDelayMs, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.maxDelayMs, env, { integer: true }).value;
+  let backoffMultiplier = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.backoffMultiplier, MCP_GATEWAY_HEALTH_RETRY_DEFAULTS.backoffMultiplier, env).value;
+  const backendStartupTimeoutMs = readPositiveEnvNumber(MCP_GATEWAY_HEALTH_RETRY_ENV.backendStartupTimeoutMs, MCP_GATEWAY_BACKEND_STARTUP_TIMEOUT_DEFAULT_MS, env, { integer: true }).value;
+
+  if (maxTotalAttempts > MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT) {
+    core.warning(`${MCP_GATEWAY_HEALTH_RETRY_ENV.maxTotalAttempts}=${maxTotalAttempts} exceeds the supported maximum, using ${MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT}`);
+    maxTotalAttempts = MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT;
+  }
+
+  // A backoff multiplier below 1 would shrink the delay on every retry, which
+  // contradicts the exponential backoff the retry budget is sized for.
+  if (backoffMultiplier < 1) {
+    core.warning(`${MCP_GATEWAY_HEALTH_RETRY_ENV.backoffMultiplier}=${backoffMultiplier} is below 1, using 1 (constant delay)`);
+    backoffMultiplier = 1;
+  }
+
+  // The retry loop caps every delay at maxDelayMs, so a smaller cap than the initial
+  // delay would silently shorten the first sleep.
+  if (maxDelayMs < initialDelayMs) {
+    core.warning(`${MCP_GATEWAY_HEALTH_RETRY_ENV.maxDelayMs}=${maxDelayMs} is below ${MCP_GATEWAY_HEALTH_RETRY_ENV.initialDelayMs}=${initialDelayMs}, using ${initialDelayMs}`);
+    maxDelayMs = initialDelayMs;
+  }
+
+  const config = { maxTotalAttempts, initialDelayMs, maxDelayMs, backoffMultiplier, backendStartupTimeoutMs };
+  const requiredBudgetMs = backendStartupTimeoutMs + MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS;
+  let retryBudgetMs = computeHealthRetryBudgetMs(config);
+  if (!hasExplicitAttempts && retryBudgetMs < requiredBudgetMs) {
+    const firstDelayMs = Math.min(initialDelayMs * backoffMultiplier, maxDelayMs);
+    let lower = maxTotalAttempts;
+    // Bound automatic sizing to prevent very frequent polling from exploding.
+    let upper = MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT;
+    while (lower < upper) {
+      const middle = lower + Math.floor((upper - lower) / 2);
+      if (computeHealthRetryBudgetMs({ ...config, maxTotalAttempts: middle }) < requiredBudgetMs) {
+        lower = middle + 1;
+      } else {
+        upper = middle;
+      }
+    }
+    config.maxTotalAttempts = lower;
+    retryBudgetMs = computeHealthRetryBudgetMs(config);
+  }
+
+  if (retryBudgetMs < requiredBudgetMs) {
+    core.warning(
+      `MCP gateway health retry budget is ${Math.round(retryBudgetMs / 1000)}s, which is below the ${Math.round(requiredBudgetMs / 1000)}s needed for the ${Math.round(backendStartupTimeoutMs / 1000)}s backend startup timeout plus cleanup and registration; the health check may give up before the gateway is ready`
+    );
+  }
+
+  return Object.freeze({ ...config, retryBudgetMs });
+}
+
+/**
+ * Process health alone does not guarantee that the safe-output backend has
+ * registered its tools. Probe the live backend before permitting agent startup.
+ *
+ * @param {Record<string, unknown>} config
+ * @param {string | undefined} gatewayPort
+ * @param {string | undefined} agentId
+ * @param {ReturnType<typeof resolveGatewayHealthRetryConfig>} retryConfig
+ * @param {number} [startupStartMs]
+ * @returns {Promise<void>}
+ */
+async function waitForSafeOutputsReadiness(config, gatewayPort, agentId, retryConfig, startupStartMs = nowMs()) {
+  const servers = config.mcpServers;
+  const serverName = servers && typeof servers === "object" && ["safeoutputs", "safe-outputs"].find(name => Object.hasOwn(servers, name));
+  if (!serverName) {
+    return;
+  }
+  if (!gatewayPort || !/^\d+$/.test(gatewayPort)) {
+    throw new Error(`${ERR_SAFE_OUTPUTS_GATEWAY_CONFIG}: MCP gateway safeoutputs readiness requires a numeric MCP_GATEWAY_PORT`);
+  }
+  if (!agentId) {
+    throw new Error(`${ERR_SAFE_OUTPUTS_GATEWAY_CONFIG}: MCP gateway safeoutputs readiness requires MCP_GATEWAY_AGENT_ID`);
+  }
+
+  const serverUrl = `http://localhost:${gatewayPort}/mcp/${serverName}`;
+  const deadline = startupStartMs + retryConfig.backendStartupTimeoutMs + MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS;
+  let attempts = 0;
+  let permanentFailure = false;
+  let insufficientBudget = false;
+  let lastProbe = "shared startup deadline exceeded";
+  core.info("Waiting for MCP gateway safeoutputs tool registration...");
+  try {
+    await retryGatewayStartup(
+      async remainingMs => {
+        // Reserve at least 250ms for each of the three handshake requests.
+        if (remainingMs < 750) {
+          insufficientBudget = true;
+          lastProbe = "insufficient startup budget for a readiness probe (requires at least 750ms)";
+          throw codedError(lastProbe);
+        }
+        attempts += 1;
+        // Each probe performs at most three HTTP requests.
+        const result = await fetchMCPToolsResult(serverUrl, agentId, core, Math.min(2000, Math.floor(remainingMs / 3)));
+        lastProbe = result.failure
+          ? `${result.failure.phase} failed (${result.failure.statusCode !== undefined ? `HTTP ${result.failure.statusCode}` : result.failure.code || "transport error"})`
+          : result.tools.length === 0
+            ? "tools/list has no registered tools"
+            : "shared startup deadline exceeded after tools/list";
+        permanentFailure = !result.emptyWasSuccessful && !result.retryable;
+        if (permanentFailure) {
+          throw codedError("safeoutputs authentication or protocol failure");
+        }
+        if (result.tools.length === 0) {
+          throw codedError("safeoutputs tools/list has no registered tools");
+        }
+        if (nowMs() < deadline) {
+          core.info(`MCP gateway safeoutputs is ready with ${result.tools.length} tool(s) after ${attempts} attempt(s)`);
+        }
+      },
+      retryConfig,
+      deadline,
+      "MCP gateway safeoutputs readiness",
+      () => !permanentFailure && !insufficientBudget
+    );
+  } catch (err) {
+    const readinessError = Object.assign(
+      codedError(
+        `MCP gateway safeoutputs readiness failed after ${attempts} attempt(s): ` +
+          (permanentFailure
+            ? "permanent authentication or MCP protocol failure. The agent will not start. Check gateway credentials and MCP backend configuration."
+            : "no tools registered or backend unavailable. The agent will not start. Check MCP gateway startup logs for connection resets (ECONNRESET) or delayed backend registration.") +
+          ` Last probe: ${lastProbe}.`,
+        ERR_SYSTEM,
+        { cause: err }
+      ),
+      { nonRetryable: permanentFailure }
+    );
+    throw readinessError;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Timing helpers
@@ -67,6 +361,178 @@ function printTiming(startMs, label) {
  */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Resolves the marker file that records a successful gateway startup.
+ * print_firewall_logs.sh reads this marker to distinguish "the gateway never
+ * completed startup" from "the gateway started but produced no auditable
+ * egress traffic" when the Squid access log is missing.
+ *
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string}
+ */
+function getGatewayStartupMarkerPath(env = process.env) {
+  return env.MCP_GATEWAY_STARTUP_MARKER || "/tmp/gh-aw/mcp-gateway-started";
+}
+
+/**
+ * Removes any stale startup marker left behind by a previous run.
+ * @param {string} markerPath
+ */
+function clearGatewayStartupMarker(markerPath) {
+  try {
+    fs.rmSync(markerPath, { force: true });
+  } catch (err) {
+    core.warning(`Could not remove stale gateway startup marker ${markerPath}: ${getErrorMessage(err)}`);
+  }
+}
+
+/**
+ * Records that the gateway completed startup. Marker creation is best-effort:
+ * it only affects the wording of a downstream firewall warning.
+ * @param {string} markerPath
+ */
+function writeGatewayStartupMarker(markerPath) {
+  try {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, "", { mode: 0o600 });
+  } catch (err) {
+    core.warning(`Could not write gateway startup marker ${markerPath}: ${getErrorMessage(err)}`);
+  }
+}
+
+/**
+ * Credential shapes that may appear in gateway stderr (bearer headers and
+ * structured `key: value` / `"key": "value"` pairs). They are replaced before
+ * the stderr is written to the workflow log.
+ */
+const gatewayCredentialRedactions = [
+  { pattern: /(Bearer\s+)\S+/gi, replacement: "$1[REDACTED]" },
+  { pattern: /((?:agent[_-]?id|api[_-]?key|token|secret|password|authorization)"?\s*[:=]\s*"?)[^\s,}"]+/gi, replacement: "$1[REDACTED]" },
+];
+const gatewayInternalProxyHosts = ["host.docker.internal", "awf-enclave-mcp"];
+
+/**
+ * Redacts common credential formats from gateway diagnostics output.
+ * @param {string} text
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string}
+ */
+function redactGatewayDiagnostics(text, env = process.env) {
+  return redactCliProxyDiagnostics(text, env, gatewayCredentialRedactions);
+}
+
+/**
+ * Creates the file that captures raw gateway stderr. It lives outside the
+ * artifact directory and is readable only by the current user, because the
+ * unredacted stderr may contain credentials.
+ * @returns {string}
+ */
+function createGatewayStderrPath() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-mcp-gateway-"));
+  fs.chmodSync(dir, 0o700);
+  process.on("exit", () => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup
+    }
+  });
+  return path.join(dir, "stderr.log");
+}
+
+/**
+ * Prints redacted gateway stderr in a collapsed log group. Gateway stdout is
+ * withheld because it carries the gateway configuration, which contains
+ * credentials.
+ * @param {string} stderrPath
+ * @param {string} stdoutPath
+ */
+function printGatewayStartupDiagnostics(stderrPath, stdoutPath) {
+  core.error("Gateway startup diagnostics:");
+  let stderrContent = "";
+  try {
+    stderrContent = fs.readFileSync(stderrPath, "utf8");
+  } catch {
+    stderrContent = "";
+  }
+  if (stderrContent.trim()) {
+    renderLogToStdout("Gateway stderr", redactGatewayDiagnostics(stderrContent));
+  } else {
+    core.error("Gateway stderr: (empty)");
+  }
+  let stdoutSize = 0;
+  try {
+    stdoutSize = fs.statSync(stdoutPath).size;
+  } catch {
+    stdoutSize = 0;
+  }
+  if (stdoutSize > 0) {
+    core.error("Gateway stdout was captured but is not displayed because it may contain credentials.");
+  } else {
+    core.error("Gateway stdout: (empty)");
+  }
+}
+
+/**
+ * Replaces the compiler marker with atomic Docker -e arguments. Runtime values
+ * never enter MCP_GATEWAY_DOCKER_COMMAND, preventing Docker argument injection.
+ *
+ * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string[]}
+ */
+function injectCustomGatewayEnvArgs(args, env = process.env) {
+  const markerIndex = args.indexOf(customGatewayEnvMarker);
+  if (markerIndex === -1) {
+    return args;
+  }
+
+  let names;
+  try {
+    names = JSON.parse(env[customGatewayEnvNamesVar] || "[]");
+  } catch (err) {
+    throw codedError(`${customGatewayEnvNamesVar} must be valid JSON: ${getErrorMessage(err)}`, ERR_CONFIG, { cause: err });
+  }
+  if (!Array.isArray(names) || !names.every(name => typeof name === "string" && customGatewayEnvNamePattern.test(name))) {
+    throw codedError(`${customGatewayEnvNamesVar} must be an array of valid environment variable names`, ERR_CONFIG);
+  }
+  if (names.some(name => name.startsWith(customGatewayReservedEnvPrefix))) {
+    throw codedError(`${customGatewayEnvNamesVar} must not contain names reserved by the ${customGatewayReservedEnvPrefix} namespace`, ERR_CONFIG);
+  }
+  if (new Set(names).size !== names.length) {
+    throw codedError(`${customGatewayEnvNamesVar} must not contain duplicate environment variable names`, ERR_CONFIG);
+  }
+
+  // Missing indexed transport values intentionally become empty container env vars.
+  // This preserves deterministic NAME→slot mapping and keeps Docker argument injection
+  // impossible even if the compiler/runtime metadata ever diverges.
+  const customArgs = names.flatMap((name, index) => ["-e", `${name}=${env[`${customGatewayEnvTransportPrefix}${index}`] || ""}`]);
+  return [...args.slice(0, markerIndex), ...customArgs, ...args.slice(markerIndex + 1)];
+}
+
+/**
+ * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string[]}
+ */
+function injectProxyEnvArgs(args, env = process.env) {
+  const noProxyNames = PROXY_ENV_NAMES.filter(name => name.toLowerCase() === "no_proxy" && env[name] !== undefined);
+  if (PROXY_ENV_NAMES.some(name => name.toLowerCase() !== "no_proxy" && env[name]) && noProxyNames.length === 0) {
+    noProxyNames.push("NO_PROXY");
+  }
+  for (const name of noProxyNames) {
+    const value = env[name] || "";
+    const exclusions = new Set(value.split(",").map(host => host.trim().toLowerCase()));
+    const missingHosts = gatewayInternalProxyHosts.filter(host => !exclusions.has(host));
+    if (missingHosts.length > 0) {
+      env[name] = `${value}${value && !value.endsWith(",") ? "," : ""}${missingHosts.join(",")}`;
+    }
+  }
+  const proxyArgs = PROXY_ENV_NAMES.filter(name => env[name] !== undefined).flatMap(name => ["-e", name]);
+  // Insert after "run" so explicitly configured container settings still win.
+  return [...args.slice(0, 1), ...proxyArgs, ...args.slice(1)];
 }
 
 /**
@@ -99,6 +565,36 @@ function getJSONParseErrorContext(jsonText, parseErrorMessage) {
   const key = keyMatch ? keyMatch[1] : null;
 
   return { line, column, lineText, key };
+}
+
+/**
+ * Resolve compiler-owned expression placeholders only after JSON parsing.
+ * Runtime values are data, never shell source or JSON fragments.
+ * @param {any} value
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {any}
+ */
+function resolveMCPConfigExpressions(value, env = process.env) {
+  if (typeof value === "string") {
+    let transported = false;
+    const resolved = value.replace(/\$\{(GH_AW_MCP_EXPR_[A-F0-9]{64}|GH_AW_MCP_ENV_([A-Za-z_][A-Za-z0-9_]*))\}/g, (_match, name, legacyName) => {
+      transported = true;
+      if (legacyName) return env[legacyName] ?? "";
+      if (env[name] === undefined) throw new Error(`${ERR_CONFIG}: MCP configuration environment variable ${name} is not set`);
+      return env[name];
+    });
+    // The pinned gateway expands placeholders again, including in parsed headers
+    // and env values. It cannot safely accept literal placeholders from data.
+    if (transported && /\$\{[A-Za-z_][A-Za-z0-9_]*\}/.test(resolved)) {
+      throw new Error(`${ERR_CONFIG}: Transported MCP configuration data must not contain gateway environment references`);
+    }
+    return resolved;
+  }
+  if (Array.isArray(value)) return value.map(entry => resolveMCPConfigExpressions(entry, env));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, resolveMCPConfigExpressions(entry, env)]));
+  }
+  return value;
 }
 
 /**
@@ -204,6 +700,38 @@ function applyOTLPIgnoreIfMissing(configObj) {
 }
 
 /**
+ * Collect the names of MCP servers declared as non-critical (`required: false`)
+ * and remove the flag from the configuration handed to the gateway.
+ *
+ * The gateway configuration specification does not define a `required` field,
+ * and the gateway output does not echo it back, so the flag is extracted here
+ * and forwarded to the startup connectivity check instead.
+ *
+ * @param {Record<string, unknown>} configObj
+ * @returns {string[]} names of servers whose startup failure must not abort the workflow
+ */
+function extractOptionalServerNames(configObj) {
+  const servers = configObj && configObj.mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+    return [];
+  }
+  const optional = [];
+  for (const [name, value] of Object.entries(/** @type {Record<string, unknown>} */ servers)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      continue;
+    }
+    const server = /** @type {Record<string, unknown>} */ value;
+    if (server.required === false) {
+      optional.push(name);
+    }
+    // The flag is always removed — including when set to true — because the
+    // gateway configuration specification does not define a `required` field.
+    delete server.required;
+  }
+  return optional;
+}
+
+/**
  * Check whether a process is alive.
  * @param {number} pid
  * @returns {boolean}
@@ -233,24 +761,56 @@ function stopGatewayProcess(pid) {
 }
 
 /**
+ * Retry a failed container startup once, without retrying configuration errors.
+ * @template T
+ * @param {(startupDeadline: number) => Promise<T>} start
+ * @param {number} [startupDeadline]
+ * @returns {Promise<T>}
+ */
+async function startGatewayWithRetry(start, startupDeadline = Infinity) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await start(startupDeadline);
+    } catch (err) {
+      stopGatewayProcess(activeGatewayPid);
+      activeGatewayPid = null;
+      clearGatewayStartupMarker(getGatewayStartupMarkerPath());
+      const message = redactGatewayDiagnostics(getErrorMessage(err));
+      const isNonRetryable = err instanceof Error && "nonRetryable" in err && err.nonRetryable === true;
+      if (message.startsWith(`${ERR_CONFIG}:`) || message.startsWith(`${ERR_SAFE_OUTPUTS_GATEWAY_CONFIG}:`) || isNonRetryable) throw err;
+      if (attempt === 2 || nowMs() >= startupDeadline) {
+        const attemptDescription = attempt === 1 ? "1 startup attempt" : `${attempt} startup attempts`;
+        throw codedError(`Pre-agent failure in step "${STEP_NAME_START_MCP_GATEWAY}" after ${attemptDescription}: ${message}`, ERR_SYSTEM, { cause: err });
+      }
+      core.warning(`${STEP_NAME_START_MCP_GATEWAY}: startup attempt ${attempt} failed; retrying once. ${message}`);
+      await sleep(Math.min(1000, Math.max(0, startupDeadline - nowMs())));
+    }
+  }
+}
+
+/**
  * HTTP GET helper – returns { statusCode, body }.
  * @param {string} url
  * @param {number} timeoutMs
  * @returns {Promise<{ statusCode: number; body: string }>}
  */
 function httpGet(url, timeoutMs) {
+  /** @type {NodeJS.Timeout | undefined} */
+  let timeout;
   return new Promise((resolve, reject) => {
     const req = http.get(url, { timeout: timeoutMs }, res => {
       let data = "";
+      res.on("error", reject);
       res.on("data", chunk => (data += chunk));
       res.on("end", () => resolve({ statusCode: res.statusCode || 0, body: data }));
     });
     req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("timeout"));
+      req.destroy(new Error("timeout"));
     });
     req.on("error", reject);
-  });
+    // Socket inactivity timeouts alone do not bound a slowly streaming body.
+    timeout = setTimeout(() => req.destroy(new Error("timeout")), timeoutMs);
+  }).finally(() => clearTimeout(timeout));
 }
 
 // ---------------------------------------------------------------------------
@@ -265,11 +825,17 @@ function httpGet(url, timeoutMs) {
 function assertNotSymlink(p) {
   try {
     if (lstatGuard(p) === null) {
-      core.setFailed(`ERROR: ${p} is a symlink — possible symlink attack, aborting`);
+      setFailed(`${ERR_CONFIG}: ${p} is a symlink — possible symlink attack, aborting`);
       return false;
     }
-  } catch {
-    // Path does not exist yet – that's fine.
+  } catch (error) {
+    const errorCode = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+    if (errorCode === "ENOENT") {
+      // Path does not exist yet — ignored, that's fine.
+      return true;
+    }
+    setFailed(`${ERR_SYSTEM}: failed to inspect ${p} for symlink safety: ${getErrorMessage(error)}`);
+    return false;
   }
   return true;
 }
@@ -291,7 +857,7 @@ function assertNotSymlink(p) {
 function resolveCopilotConfigPaths() {
   const home = process.env.HOME;
   if (!home) {
-    throw new Error("HOME environment variable is not set; cannot locate Copilot CLI config directory");
+    throw codedError("HOME environment variable is not set; cannot locate Copilot CLI config directory", ERR_CONFIG);
   }
   const dir = path.join(home, ".copilot");
   return { dir, file: path.join(dir, "mcp-config.json") };
@@ -326,6 +892,27 @@ function detectEngineType(configDir, env = process.env, existsSync = fs.existsSy
   return "unknown";
 }
 
+/**
+ * Validates the mutually exclusive gateway agent identifier forms.
+ *
+ * @param {Record<string, unknown>} gateway
+ * @returns {string | null}
+ */
+function validateGatewayAgentIdentifiers(gateway) {
+  const hasAgentId = Object.prototype.hasOwnProperty.call(gateway, "agentId");
+  const hasAgentIds = Object.prototype.hasOwnProperty.call(gateway, "agentIds");
+
+  if (hasAgentId === hasAgentIds) {
+    return "ERROR: Gateway configuration must specify exactly one of 'agentId' or 'agentIds'";
+  }
+  if (hasAgentId) {
+    return typeof gateway.agentId === "string" && gateway.agentId.length > 0 ? null : "ERROR: Gateway 'agentId' must be a non-empty string";
+  }
+  return Array.isArray(gateway.agentIds) && gateway.agentIds.length > 0 && gateway.agentIds.every(agentId => typeof agentId === "string" && agentId.length > 0)
+    ? null
+    : "ERROR: Gateway 'agentIds' must be a non-empty array of non-empty strings";
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -336,7 +923,7 @@ async function main() {
   process.umask(0o077);
 
   const dockerCommand = process.env.MCP_GATEWAY_DOCKER_COMMAND;
-  const apiKey = process.env.MCP_GATEWAY_API_KEY;
+  const agentId = process.env.MCP_GATEWAY_AGENT_ID;
   const gatewayPort = process.env.MCP_GATEWAY_PORT;
   const gatewayDomain = process.env.MCP_GATEWAY_DOMAIN;
   const runnerTemp = process.env.RUNNER_TEMP;
@@ -346,13 +933,13 @@ async function main() {
   // Validate required env vars
   // -----------------------------------------------------------------------
   if (!dockerCommand) {
-    core.setFailed("ERROR: MCP_GATEWAY_DOCKER_COMMAND must be set (command-based execution is not supported per MCP Gateway Specification v1.0.0)");
+    setFailed(`${ERR_CONFIG}: MCP_GATEWAY_DOCKER_COMMAND must be set (command-based execution is not supported per MCP Gateway Specification v1.0.0)`);
     return;
   }
 
   // Validate port is numeric to prevent injection in shell commands and URLs
   if (gatewayPort && !/^\d+$/.test(gatewayPort)) {
-    core.setFailed(`ERROR: MCP_GATEWAY_PORT must be a numeric value, got: '${gatewayPort}'`);
+    setFailed(`${ERR_CONFIG}: MCP_GATEWAY_PORT must be a numeric value, got: '${gatewayPort}'`);
     return;
   }
 
@@ -377,7 +964,7 @@ async function main() {
   try {
     fs.mkdirSync("/tmp/gh-aw/mcp-logs", { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create directory /tmp/gh-aw/mcp-logs: ${String(err)}`, { cause: err });
+    throw codedError(`Failed to create directory /tmp/gh-aw/mcp-logs: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
   }
 
   // Symlink attack prevention on the config directory
@@ -387,7 +974,7 @@ async function main() {
   try {
     fs.mkdirSync(configDir, { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create directory ${configDir}: ${String(err)}`, { cause: err });
+    throw codedError(`Failed to create directory ${configDir}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
   }
   // Post-creation check
   if (!assertNotSymlink(configDir)) {
@@ -396,7 +983,7 @@ async function main() {
   try {
     fs.chmodSync(configDir, 0o700);
   } catch (err) {
-    throw new Error(`Failed to set permissions on ${configDir}: ${String(err)}`, { cause: err });
+    throw codedError(`Failed to set permissions on ${configDir}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
   }
 
   // -----------------------------------------------------------------------
@@ -405,19 +992,19 @@ async function main() {
   if (!/^docker run/.test(dockerCommand)) {
     core.error("ERROR: MCP_GATEWAY_DOCKER_COMMAND has incorrect syntax");
     core.error("Expected: docker run command with image and arguments");
-    core.setFailed(`ERROR: MCP_GATEWAY_DOCKER_COMMAND has incorrect syntax — got: ${dockerCommand}`);
+    setFailed(`${ERR_CONFIG}: MCP_GATEWAY_DOCKER_COMMAND has incorrect syntax; expected docker run command with image and arguments`);
     return;
   }
   if (!/-i/.test(dockerCommand)) {
-    core.setFailed("ERROR: MCP_GATEWAY_DOCKER_COMMAND must include -i flag for interactive mode");
+    setFailed(`${ERR_CONFIG}: MCP_GATEWAY_DOCKER_COMMAND must include -i flag for interactive mode`);
     return;
   }
   if (!/--rm/.test(dockerCommand)) {
-    core.setFailed("ERROR: MCP_GATEWAY_DOCKER_COMMAND must include --rm flag for cleanup");
+    setFailed(`${ERR_CONFIG}: MCP_GATEWAY_DOCKER_COMMAND must include --rm flag for cleanup`);
     return;
   }
   if (!/--network/.test(dockerCommand)) {
-    core.setFailed("ERROR: MCP_GATEWAY_DOCKER_COMMAND must include --network flag for networking");
+    setFailed(`${ERR_CONFIG}: MCP_GATEWAY_DOCKER_COMMAND must include --network flag for networking`);
     return;
   }
 
@@ -430,9 +1017,10 @@ async function main() {
   const configReadStart = nowMs();
   let mcpConfig;
   try {
-    mcpConfig = fs.readFileSync(0, "utf8"); // fd 0 = stdin
+    // Avoid Node's UTF-8 pipe short-read overflow (nodejs/node#66341).
+    mcpConfig = fs.readFileSync(0).toString("utf8");
   } catch (err) {
-    throw new Error(`Failed to read MCP configuration from stdin: ${String(err)}`, { cause: err });
+    throw codedError(`Failed to read MCP configuration from stdin: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
   }
   const normalizedConfig = normalizeSinkVisibilityEncoding(mcpConfig);
   if (normalizedConfig !== mcpConfig) {
@@ -440,12 +1028,6 @@ async function main() {
     mcpConfig = normalizedConfig;
   }
   printTiming(configReadStart, "Configuration read from stdin");
-  core.info("");
-
-  // Log configuration for debugging
-  core.info("-------START MCP CONFIG-----------");
-  core.info(mcpConfig);
-  core.info("-------END MCP CONFIG-----------");
   core.info("");
 
   // -----------------------------------------------------------------------
@@ -461,23 +1043,18 @@ async function main() {
     core.error("");
     core.error("JSON validation error:");
     const parseMessage = getErrorMessage(err);
-    core.error(parseMessage);
     const parseContext = getJSONParseErrorContext(mcpConfig, parseMessage);
     if (parseContext) {
       core.error(`Likely offending location: line ${parseContext.line}, column ${parseContext.column}`);
-      if (parseContext.key) {
-        core.error(`Likely offending key: ${parseContext.key}`);
-      }
-      core.error(`Context line: ${parseContext.lineText}`);
     }
-    core.error("");
-    core.error("Configuration content:");
-    const lines = mcpConfig.split("\n");
-    core.error(lines.slice(0, 50).join("\n"));
-    if (lines.length > 50) {
-      core.error("... (truncated, showing first 50 lines)");
-    }
-    core.setFailed("ERROR: Configuration is not valid JSON");
+    setFailed(`${ERR_CONFIG}: Configuration is not valid JSON`);
+    return;
+  }
+
+  try {
+    configObj.mcpServers = resolveMCPConfigExpressions(configObj.mcpServers);
+  } catch (err) {
+    setFailed(`${ERR_CONFIG}: Failed to resolve MCP configuration expressions: ${getErrorMessage(err)}`);
     return;
   }
 
@@ -486,23 +1063,38 @@ async function main() {
   const gw = configObj.gateway;
   if (!gw || typeof gw !== "object") {
     core.error("Per MCP Gateway Specification v1.0.0 section 4.1.3, the gateway section is required");
-    core.setFailed("ERROR: Configuration is missing required 'gateway' section");
+    setFailed(`${ERR_CONFIG}: Configuration is missing required 'gateway' section`);
     return;
   }
+  applyBuiltinMCPRunnerIdentity(configObj);
+  applyGatewayRuntimeTimeouts(configObj, process.env);
+  const caMountArgs = prepareMCPServerCAs(configObj);
+  mcpConfig = JSON.stringify(configObj);
   if (!("port" in gw) || gw.port == null) {
-    core.setFailed("ERROR: Gateway configuration is missing required 'port' field");
+    setFailed(`${ERR_CONFIG}: Gateway configuration is missing required 'port' field`);
     return;
   }
   if (!("domain" in gw) || gw.domain == null) {
-    core.setFailed("ERROR: Gateway configuration is missing required 'domain' field");
+    setFailed(`${ERR_CONFIG}: Gateway configuration is missing required 'domain' field`);
     return;
   }
-  if (!("apiKey" in gw) || gw.apiKey == null) {
-    core.setFailed("ERROR: Gateway configuration is missing required 'apiKey' field");
+  const agentIdentifierError = validateGatewayAgentIdentifiers(gw);
+  if (agentIdentifierError) {
+    setFailed(`${ERR_CONFIG}: ${agentIdentifierError.replace(/^ERROR:\s*/, "")}`);
     return;
   }
 
   applyOTLPIgnoreIfMissing(configObj);
+
+  const logDir = "/tmp/gh-aw/mcp-logs/";
+  writeMcpConfiguration(logDir, configObj);
+
+  // Servers declared with `required: false` are best-effort: a failed startup
+  // connectivity check for them must not abort the whole gateway.
+  const optionalServerNames = extractOptionalServerNames(configObj);
+  if (optionalServerNames.length > 0) {
+    core.info(`Non-critical MCP server(s) (startup failures tolerated): ${optionalServerNames.join(", ")}`);
+  }
 
   core.info("Configuration validated successfully");
   printTiming(configValidationStart, "Configuration validation");
@@ -511,307 +1103,275 @@ async function main() {
   // -----------------------------------------------------------------------
   // Start gateway container
   // -----------------------------------------------------------------------
-  const logDir = "/tmp/gh-aw/mcp-logs/";
   const outputPath = path.join(configDir, "gateway-output.json");
-  const stderrLogPath = "/tmp/gh-aw/mcp-logs/stderr.log";
+  const gatewayStartupMarker = getGatewayStartupMarkerPath();
+  const healthRetryConfig = resolveGatewayHealthRetryConfig();
+  const gatewayStartupStartedAt = nowMs();
+  const startupDeadline = gatewayStartupStartedAt + healthRetryConfig.backendStartupTimeoutMs + MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS;
+  const { gatewayPid, stderrPath } = await startGatewayWithRetry(async sharedStartupDeadline => {
+    clearGatewayStartupMarker(gatewayStartupMarker);
 
-  // Clean up any stale gateway container from a previous run on this runner.
-  // On persistent self-hosted runners a prior job's gateway container may still
-  // be running and holding the host port, causing "bind: address already in use"
-  // when we try to start the new one.  Force-removing by the well-known container
-  // name is idempotent: docker rm -f exits non-zero when the container doesn't
-  // exist, but the trailing || true (and 2>/dev/null) make the command succeed.
-  core.info("Cleaning up any stale awmg-mcpg container from a previous run...");
-  try {
-    execSync("docker rm -f awmg-mcpg 2>/dev/null && echo 'Removed stale awmg-mcpg container' || true", { stdio: "inherit" });
-  } catch {
-    // Non-fatal: proceed even if the cleanup command itself fails
-    core.info("Could not remove stale awmg-mcpg container (may not exist)");
-  }
-  core.info("");
-
-  core.info(`Starting gateway with container: ${dockerCommand}`);
-  core.info(`Full docker command: ${dockerCommand}`);
-  core.info("");
-
-  const gatewayStartTime = nowMs();
-
-  // Split docker command into args, respecting simple quoting
-  const args = dockerCommand.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
-  const cmd = args.shift();
-  if (!cmd) {
-    core.setFailed("ERROR: MCP_GATEWAY_DOCKER_COMMAND did not contain an executable command");
-    return;
-  }
-
-  const outputFd = fs.openSync(outputPath, "w", 0o600);
-  const stderrFd = fs.openSync(stderrLogPath, "w", 0o600);
-
-  const child = spawn(cmd, args, {
-    stdio: ["pipe", outputFd, stderrFd],
-    env: { ...process.env, MCP_GATEWAY_LOG_DIR: logDir },
-    detached: true,
-  });
-  activeGatewayPid = child.pid || null;
-
-  // Write configuration to stdin then close
-  if (!child.stdin) {
-    stopGatewayProcess(activeGatewayPid);
-    core.setFailed("ERROR: Gateway process stdin is not available");
-    return;
-  }
-  child.stdin.write(JSON.stringify(configObj));
-  child.stdin.end();
-
-  // Allow the child to run independently
-  child.unref();
-
-  const gatewayPid = child.pid;
-  if (!gatewayPid) {
-    core.setFailed("ERROR: Failed to start gateway container");
-    return;
-  }
-
-  core.info(`Gateway started with PID: ${gatewayPid}`);
-  printTiming(gatewayStartTime, "Gateway container launch");
-  core.info("Verifying gateway process is running...");
-
-  if (isProcessAlive(gatewayPid)) {
-    core.info(`Gateway process confirmed running (PID: ${gatewayPid})`);
-  } else {
-    core.error("ERROR: Gateway process exited immediately after start");
-    core.error("");
-    core.error("Gateway stdout output:");
+    // Clean up any stale gateway container from a previous run on this runner.
+    // On persistent self-hosted runners a prior job's gateway container may still
+    // be running and holding the host port, causing "bind: address already in use"
+    // when we try to start the new one.  Force-removing by the well-known container
+    // name is idempotent: docker rm -f exits non-zero when the container doesn't
+    // exist, but the trailing || true (and 2>/dev/null) make the command succeed.
+    core.info("Cleaning up any stale awmg-mcpg container from a previous run...");
     try {
-      core.error(fs.readFileSync(outputPath, "utf8"));
+      execSync("docker rm -f awmg-mcpg 2>/dev/null && echo 'Removed stale awmg-mcpg container' || true", { stdio: "inherit", timeout: DOCKER_CLEANUP_TIMEOUT_MS });
     } catch {
-      core.error("No stdout output available");
+      // Non-fatal: proceed even if the cleanup command itself fails
+      core.info("Could not remove stale awmg-mcpg container (may not exist)");
     }
-    core.error("");
-    core.error("Gateway stderr logs:");
+    core.info("");
+
+    core.info("Starting gateway container...");
+    core.info("");
+
+    const gatewayStartTime = nowMs();
+
+    // Split docker command into args, respecting simple quoting
+    let args = Array.from(dockerCommand.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || []);
+    const cmd = args.shift();
+    if (!cmd) {
+      throw codedError("MCP_GATEWAY_DOCKER_COMMAND did not contain an executable command", ERR_CONFIG);
+    }
+    const gatewayEnv = { ...process.env };
+    // Insert before all existing flags and the image, never into the command string.
+    args.splice(1, 0, ...caMountArgs);
+    args = injectCustomGatewayEnvArgs(args, gatewayEnv);
+    args = injectProxyEnvArgs(args, gatewayEnv);
+
+    const outputFd = fs.openSync(outputPath, "w", 0o600);
+    const stderrPath = createGatewayStderrPath();
+    const stderrFd = fs.openSync(stderrPath, "w", 0o600);
+
+    let child;
     try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
+      child = spawn(cmd, args, {
+        stdio: ["pipe", outputFd, stderrFd],
+        env: { ...gatewayEnv, MCP_GATEWAY_LOG_DIR: logDir },
+        detached: true,
+      });
+    } finally {
+      fs.closeSync(outputFd);
+      fs.closeSync(stderrFd);
     }
-    core.setFailed("ERROR: Gateway process exited immediately after start");
-    return;
-  }
-  core.info("");
+    child.on("error", err => {
+      activeGatewayPid = null;
+      core.error(`ERROR: Failed to launch MCP gateway process: ${getErrorMessage(err)}`);
+    });
+    activeGatewayPid = child.pid || null;
 
-  // -----------------------------------------------------------------------
-  // Wait for gateway to initialise
-  // -----------------------------------------------------------------------
-  core.info("Waiting for gateway to initialize...");
-  await sleep(5000);
-  core.info("Checking if gateway process is still alive after initialization...");
-
-  if (!isProcessAlive(gatewayPid)) {
-    core.error(`ERROR: Gateway process (PID: ${gatewayPid}) exited during initialization`);
-    core.error("");
-    core.error("Gateway stdout (errors are written here per MCP Gateway Specification):");
-    try {
-      core.error(fs.readFileSync(outputPath, "utf8"));
-    } catch {
-      core.error("No stdout output available");
+    // Write configuration to stdin then close
+    if (!child.stdin) {
+      stopGatewayProcess(activeGatewayPid);
+      throw codedError("Gateway process stdin is not available");
     }
-    core.error("");
-    core.error("Gateway stderr logs (debug output):");
-    try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
+    child.stdin.on("error", err => core.warning(`Gateway stdin: ${redactGatewayDiagnostics(getErrorMessage(err))}`));
+    child.stdin.write(JSON.stringify(configObj));
+    child.stdin.end();
+
+    // Allow the child to run independently
+    child.unref();
+
+    const gatewayPid = child.pid;
+    if (!gatewayPid) {
+      throw codedError("Failed to start gateway container");
     }
-    core.setFailed(`ERROR: Gateway process (PID: ${gatewayPid}) exited during initialization`);
-    return;
-  }
-  core.info(`Gateway process is still running (PID: ${gatewayPid})`);
-  core.info("");
 
-  // -----------------------------------------------------------------------
-  // Health check loop
-  // -----------------------------------------------------------------------
-  core.info("Waiting for gateway to be ready...");
-  const healthCheckStart = nowMs();
-  const healthHost = "localhost";
-  const healthUrl = `http://${healthHost}:${gatewayPort}/health`;
+    core.info(`Gateway started with PID: ${gatewayPid}`);
+    printTiming(gatewayStartTime, "Gateway container launch");
+    core.info("Verifying gateway process is running...");
 
-  core.info(`Health endpoint: ${healthUrl}`);
-  core.info(`(Note: MCP_GATEWAY_DOMAIN is '${gatewayDomain}' for container access)`);
-  core.info("Retrying up to 120 times with exponential backoff (250ms to 1s, ~120s total timeout)");
-  core.info("");
-
-  const maxTotalAttempts = 120;
-  // withRetry's maxRetries excludes the initial attempt.
-  const maxRetryCount = maxTotalAttempts - 1;
-  const initialRetryDelayMs = 250;
-  let httpCode = 0;
-  let healthBody = "";
-  let succeeded = false;
-  let attemptsMade = 0;
-
-  core.info("=== Health Check Progress ===");
-  try {
-    await withRetry(
-      async () => {
-        // Counts total health-check attempts, including the final successful attempt.
-        attemptsMade += 1;
-        const elapsedSec = Math.floor((nowMs() - healthCheckStart) / 1000);
-        if (attemptsMade % 10 === 1 || attemptsMade === 1) {
-          core.info(`Attempt ${attemptsMade}/${maxTotalAttempts} (${elapsedSec}s elapsed)...`);
-        }
-
-        const res = await httpGet(healthUrl, 2000);
-        httpCode = res.statusCode;
-        healthBody = res.body;
-        if (httpCode === 200 && healthBody) {
-          core.info(`✓ Health check succeeded on attempt ${attemptsMade} (${elapsedSec}s elapsed)`);
-          succeeded = true;
-          return;
-        }
-        throw new Error(`Health endpoint not ready (HTTP ${httpCode || 0})`);
-      },
-      {
-        maxRetries: maxRetryCount,
-        initialDelayMs: initialRetryDelayMs,
-        maxDelayMs: 1000,
-        backoffMultiplier: 2,
-        jitterMs: 0,
-        // Preserve previous loop behavior: retry any health-check failure until attempts are exhausted.
-        shouldRetry: () => true,
-      },
-      "MCP gateway health check"
-    );
-  } catch {
-    // Retry exhaustion is handled below using existing diagnostics.
-  }
-
-  core.info("=== End Health Check Progress ===");
-  core.info("");
-
-  core.info(`Final HTTP code: ${httpCode}`);
-  core.info(`Total attempts: ${attemptsMade}`);
-  if (healthBody) {
-    core.info(`Health response body: ${healthBody}`);
-  } else {
-    core.info("Health response body: (empty)");
-  }
-
-  if (succeeded) {
-    core.info("Gateway is ready!");
-    printTiming(healthCheckStart, "Health check wait");
-  } else {
-    core.error("");
-    core.error("ERROR: Gateway failed to become ready");
-    core.error(`Last HTTP code: ${httpCode}`);
-    core.error(`Last health response: ${healthBody || "(empty)"}`);
-    core.error("");
-    core.error("Checking if gateway process is still alive...");
     if (isProcessAlive(gatewayPid)) {
-      core.error(`Gateway process (PID: ${gatewayPid}) is still running`);
+      core.info(`Gateway process confirmed running (PID: ${gatewayPid})`);
     } else {
-      core.error(`Gateway process (PID: ${gatewayPid}) has exited`);
+      core.error("ERROR: Gateway process exited immediately after start");
+      core.error("");
+      printGatewayStartupDiagnostics(stderrPath, outputPath);
+      throw codedError("Gateway process exited immediately after start");
     }
-    core.error("");
-    core.error("Docker container status:");
-    try {
-      execSync("docker ps -a 2>/dev/null | head -20", { stdio: "inherit" });
-    } catch {
-      core.error("Could not list docker containers");
-    }
-    core.error("");
-    core.error("Gateway stdout (errors are written here per MCP Gateway Specification):");
-    try {
-      core.error(fs.readFileSync(outputPath, "utf8"));
-    } catch {
-      core.error("No stdout output available");
-    }
-    core.error("");
-    core.error("Gateway stderr logs (debug output):");
-    try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
-    }
-    core.error("");
-    core.error("Checking network connectivity to gateway port...");
-    try {
-      // Validate gatewayPort is numeric to prevent shell injection
-      const safePort = String(gatewayPort).replace(/[^0-9]/g, "");
-      execSync(`netstat -tlnp 2>/dev/null | grep ":${safePort}" || ss -tlnp 2>/dev/null | grep ":${safePort}" || echo "Port ${safePort} does not appear to be listening"`, { stdio: "inherit" });
-    } catch {
-      // ignore
-    }
-    try {
-      process.kill(gatewayPid);
-    } catch {
-      // ignore
-    }
-    core.setFailed("ERROR: Gateway failed to become ready");
-    return;
-  }
-  core.info("");
+    core.info("");
 
-  // -----------------------------------------------------------------------
-  // Wait for gateway output (rewritten configuration)
-  // -----------------------------------------------------------------------
-  core.info("Reading gateway output configuration...");
-  const outputWaitStart = nowMs();
-  const waitAttempts = 10;
-  for (let i = 0; i < waitAttempts; i++) {
+    // -----------------------------------------------------------------------
+    // Wait for gateway to initialise
+    // -----------------------------------------------------------------------
+    core.info("Waiting for gateway to initialize...");
+    await sleep(Math.min(5000, Math.max(0, sharedStartupDeadline - nowMs())));
+    core.info("Checking if gateway process is still alive after initialization...");
+
+    if (!isProcessAlive(gatewayPid)) {
+      core.error(`ERROR: Gateway process (PID: ${gatewayPid}) exited during initialization`);
+      core.error("");
+      printGatewayStartupDiagnostics(stderrPath, outputPath);
+      throw codedError(`Gateway process (PID: ${gatewayPid}) exited during initialization`);
+    }
+    core.info(`Gateway process is still running (PID: ${gatewayPid})`);
+    core.info("");
+
+    // -----------------------------------------------------------------------
+    // Health check loop
+    // -----------------------------------------------------------------------
+    core.info("Waiting for gateway to be ready...");
+    const healthCheckStart = nowMs();
+    const healthHost = "localhost";
+    const healthUrl = `http://${healthHost}:${gatewayPort}/health`;
+
+    const retryBudgetSeconds = Math.round(healthRetryConfig.retryBudgetMs / 1000);
+    core.info(`Health endpoint: ${healthUrl}`);
+    core.info(`(Note: MCP_GATEWAY_DOMAIN is '${gatewayDomain}' for container access)`);
+    core.info(
+      `Retrying up to ${healthRetryConfig.maxTotalAttempts} times with exponential backoff (${healthRetryConfig.initialDelayMs}ms initial delay, capped at ${healthRetryConfig.maxDelayMs}ms, ~${retryBudgetSeconds}s cumulative retry delay excluding request time)`
+    );
+    core.info("");
+
+    const maxTotalAttempts = healthRetryConfig.maxTotalAttempts;
+    let httpCode = 0;
+    let healthBody = "";
+    let succeeded = false;
+    let attemptsMade = 0;
+
+    core.info("=== Health Check Progress ===");
     try {
-      const stat = fs.statSync(outputPath);
-      if (stat.size > 0) {
-        core.info("Gateway output received!");
-        break;
+      await retryGatewayStartup(
+        async remainingMs => {
+          // Counts total health-check attempts, including the final successful attempt.
+          attemptsMade += 1;
+          const elapsedSec = Math.floor((nowMs() - healthCheckStart) / 1000);
+          if (attemptsMade % 10 === 1 || attemptsMade === 1) {
+            core.info(`Attempt ${attemptsMade}/${maxTotalAttempts} (${elapsedSec}s elapsed)...`);
+          }
+
+          const res = await httpGet(healthUrl, Math.min(2000, remainingMs));
+          httpCode = res.statusCode;
+          healthBody = res.body;
+          if (httpCode === 200 && healthBody) {
+            core.info(`✓ Health check succeeded on attempt ${attemptsMade} (${elapsedSec}s elapsed)`);
+            return;
+          }
+          throw codedError(`Health endpoint not ready (HTTP ${httpCode || 0})`);
+        },
+        healthRetryConfig,
+        sharedStartupDeadline,
+        "MCP gateway health check",
+        () => isProcessAlive(gatewayPid)
+      );
+      succeeded = true;
+    } catch {
+      // Retry exhaustion is ignored here; handled below using existing diagnostics.
+    }
+
+    core.info("=== End Health Check Progress ===");
+    core.info("");
+
+    core.info(`Final HTTP code: ${httpCode}`);
+    core.info(`Total attempts: ${attemptsMade}`);
+    if (healthBody) {
+      core.info(`Health response body: ${healthBody}`);
+    } else {
+      core.info("Health response body: (empty)");
+    }
+
+    if (succeeded) {
+      printTiming(healthCheckStart, "Health check wait");
+      const safeOutputsReadinessStart = nowMs();
+      try {
+        await waitForSafeOutputsReadiness(configObj, gatewayPort, agentId, healthRetryConfig, gatewayStartupStartedAt);
+      } finally {
+        printTiming(safeOutputsReadinessStart, "Safe outputs readiness wait");
       }
-    } catch {
-      // not ready yet
+      core.info("Gateway is ready!");
+      writeGatewayStartupMarker(gatewayStartupMarker);
+    } else {
+      core.error("");
+      core.error("ERROR: Gateway failed to become ready");
+      core.error(`Last HTTP code: ${httpCode}`);
+      core.error(`Last health response: ${healthBody || "(empty)"}`);
+      core.error("");
+      core.error("Checking if gateway process is still alive...");
+      if (isProcessAlive(gatewayPid)) {
+        core.error(`Gateway process (PID: ${gatewayPid}) is still running`);
+      } else {
+        core.error(`Gateway process (PID: ${gatewayPid}) has exited`);
+      }
+      core.error("");
+      core.error("Docker container status:");
+      try {
+        execSync("docker ps -a 2>/dev/null | head -20", { stdio: "inherit", timeout: CONTAINER_STATUS_TIMEOUT_MS });
+      } catch {
+        core.error("Could not list docker containers");
+      }
+      core.error("");
+      printGatewayStartupDiagnostics(stderrPath, outputPath);
+      core.error("");
+      core.error("Checking network connectivity to gateway port...");
+      try {
+        // Validate gatewayPort is numeric to prevent shell injection
+        const safePort = String(gatewayPort).replace(/[^0-9]/g, "");
+        execSync(`netstat -tlnp 2>/dev/null | grep ":${safePort}" || ss -tlnp 2>/dev/null | grep ":${safePort}" || echo "Port ${safePort} does not appear to be listening"`, { stdio: "inherit", timeout: CONTAINER_STATUS_TIMEOUT_MS });
+      } catch {
+        // ignore
+      }
+      try {
+        process.kill(gatewayPid);
+      } catch {
+        // ignore
+      }
+      throw codedError("Gateway failed to become ready");
     }
-    if (i < waitAttempts - 1) {
-      await sleep(1000);
-    }
-  }
-  printTiming(outputWaitStart, "Gateway output wait");
-  core.info("");
+    core.info("");
 
-  // Verify output was written
-  let outputSize = 0;
-  try {
-    outputSize = fs.statSync(outputPath).size;
-  } catch {
-    // file doesn't exist
-  }
-  if (outputSize === 0) {
-    core.error("ERROR: Gateway did not write output configuration");
-    core.error("");
-    core.error("Gateway stdout (should contain error or config):");
-    try {
-      core.error(fs.readFileSync(outputPath, "utf8"));
-    } catch {
-      core.error("No stdout output available");
+    // -----------------------------------------------------------------------
+    // Wait for gateway output (rewritten configuration)
+    // -----------------------------------------------------------------------
+    core.info("Reading gateway output configuration...");
+    const outputWaitStart = nowMs();
+    const waitAttempts = 10;
+    for (let i = 0; i < waitAttempts; i++) {
+      try {
+        const stat = fs.statSync(outputPath);
+        if (stat.size > 0) {
+          core.info("Gateway output received!");
+          break;
+        }
+      } catch {
+        // Output file not ready yet — stat failure is ignored.
+      }
+      if (i < waitAttempts - 1) {
+        await sleep(1000);
+      }
     }
-    core.error("");
-    core.error("Gateway stderr logs:");
+    printTiming(outputWaitStart, "Gateway output wait");
+    core.info("");
+
+    // Verify output was written
+    let outputSize = 0;
     try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
+      outputSize = fs.statSync(outputPath).size;
     } catch {
-      core.error("No stderr logs available");
+      // File doesn't exist — ignored, treated as empty output.
     }
-    try {
-      process.kill(gatewayPid);
-    } catch {
-      // ignore
+    if (outputSize === 0) {
+      core.error("ERROR: Gateway did not write output configuration");
+      core.error("");
+      printGatewayStartupDiagnostics(stderrPath, outputPath);
+      try {
+        process.kill(gatewayPid);
+      } catch {
+        // ignore
+      }
+      throw codedError("Gateway did not write output configuration");
     }
-    core.setFailed("ERROR: Gateway did not write output configuration");
-    return;
-  }
+    return { gatewayPid, stderrPath };
+  });
 
   // Restrict permissions
   try {
     fs.chmodSync(outputPath, 0o600);
   } catch (err) {
-    throw new Error(`Failed to set permissions on ${outputPath}: ${String(err)}`, { cause: err });
+    throw codedError(`Failed to set permissions on ${outputPath}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
   }
 
   // Check for error payload
@@ -819,26 +1379,21 @@ async function main() {
   try {
     gatewayOutput = JSON.parse(fs.readFileSync(outputPath, "utf8"));
   } catch (err) {
-    throw new Error("Failed to parse gateway output file " + outputPath + ": " + getErrorMessage(err), { cause: err });
+    throw codedError("Failed to parse gateway output file " + outputPath + ": " + getErrorMessage(err), ERR_SYSTEM, { cause: err });
   }
   if (gatewayOutput.error) {
     core.error("ERROR: Gateway returned an error payload instead of configuration");
     core.error("");
-    core.error("Gateway error details:");
-    core.error(JSON.stringify(gatewayOutput, null, 2));
-    core.error("");
-    core.error("Gateway stderr logs:");
-    try {
-      core.error(fs.readFileSync(stderrLogPath, "utf8"));
-    } catch {
-      core.error("No stderr logs available");
-    }
+    // Only the error field is emitted; the rest of the payload is the gateway
+    // configuration, which contains credentials.
+    core.error(`Gateway error: ${redactGatewayDiagnostics(typeof gatewayOutput.error === "string" ? gatewayOutput.error : JSON.stringify(gatewayOutput.error))}`);
+    printGatewayStartupDiagnostics(stderrPath, outputPath);
     try {
       process.kill(gatewayPid);
     } catch {
       // ignore
     }
-    core.setFailed("ERROR: Gateway returned an error payload instead of configuration");
+    setFailed(`${ERR_CONFIG}: Gateway returned an error payload instead of configuration`);
     return;
   }
 
@@ -849,11 +1404,11 @@ async function main() {
   const configConvertStart = nowMs();
   process.env.MCP_GATEWAY_OUTPUT = outputPath;
 
-  // Validate MCP_GATEWAY_API_KEY
-  if (!apiKey) {
+  // Validate MCP_GATEWAY_AGENT_ID
+  if (!agentId) {
     stopGatewayProcess(gatewayPid);
     core.error("This variable should be set in the workflow before calling start_mcp_gateway.cjs");
-    core.setFailed("ERROR: MCP_GATEWAY_API_KEY environment variable must be set for converter scripts");
+    setFailed(`${ERR_CONFIG}: MCP_GATEWAY_AGENT_ID environment variable must be set for converter scripts`);
     return;
   }
 
@@ -867,20 +1422,31 @@ async function main() {
     codex: "convert_gateway_config_codex.cjs",
     claude: "convert_gateway_config_claude.cjs",
     gemini: "convert_gateway_config_gemini.cjs",
+    pi: "convert_gateway_config_pi.cjs",
   };
 
-  const converterFile = converters[/** @type {keyof typeof converters} */ engineType];
+  // Engines can declare a "mcp.config-adapter" script in their behaviors definition
+  // (e.g. .github/workflows/shared/goose.md) instead of a built-in per-engine converter.
+  // The compiler writes this script to disk and exports its filename via
+  // GH_AW_MCP_CONFIG_ADAPTER before this gateway starts.
+  const converterFile = process.env.GH_AW_MCP_CONFIG_ADAPTER || converters[/** @type {keyof typeof converters} */ engineType];
   if (converterFile) {
     core.info(`Using ${engineType} converter...`);
     const converterPath = path.join(runnerTemp || "", "gh-aw/actions", converterFile);
-    execSync(`node "${converterPath}"`, { stdio: "inherit", env: process.env });
+    try {
+      execFileSync("node", [converterPath], { stdio: "inherit", env: process.env, timeout: CONFIG_CONVERTER_TIMEOUT_MS });
+    } catch (err) {
+      stopGatewayProcess(gatewayPid);
+      setFailed(getErrorMessage(err));
+      return;
+    }
   } else {
     let copilotConfigDir, copilotConfigFile;
     try {
       ({ dir: copilotConfigDir, file: copilotConfigFile } = resolveCopilotConfigPaths());
     } catch (err) {
       stopGatewayProcess(gatewayPid);
-      core.setFailed(`ERROR: ${getErrorMessage(err)}`);
+      setFailed(getErrorMessage(err));
       return;
     }
     core.info(`No agent-specific converter found for engine: ${engineType}`);
@@ -889,7 +1455,7 @@ async function main() {
     try {
       fs.mkdirSync(copilotConfigDir, { recursive: true });
     } catch (err) {
-      throw new Error(`Failed to create directory ${copilotConfigDir}: ${String(err)}`, { cause: err });
+      throw codedError(`Failed to create directory ${copilotConfigDir}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
     }
     const cliServersRaw = process.env.GH_AW_MCP_CLI_SERVERS;
     if (cliServersRaw) {
@@ -911,21 +1477,21 @@ async function main() {
         try {
           fs.copyFileSync(outputPath, copilotConfigFile);
         } catch (err) {
-          throw new Error(`Failed to copy file ${outputPath} to ${copilotConfigFile}: ${String(err)}`, { cause: err });
+          throw codedError(`Failed to copy file ${outputPath} to ${copilotConfigFile}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
         }
       }
     } else {
       try {
         fs.copyFileSync(outputPath, copilotConfigFile);
       } catch (err) {
-        throw new Error(`Failed to copy file ${outputPath} to ${copilotConfigFile}: ${String(err)}`, { cause: err });
+        throw codedError(`Failed to copy file ${outputPath} to ${copilotConfigFile}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
       }
     }
     let copilotConfigContent;
     try {
       copilotConfigContent = fs.readFileSync(copilotConfigFile, "utf8");
     } catch (err) {
-      throw new Error(`Failed to read file ${copilotConfigFile}: ${String(err)}`, { cause: err });
+      throw codedError(`Failed to read file ${copilotConfigFile}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
     }
     core.info(copilotConfigContent);
   }
@@ -941,12 +1507,15 @@ async function main() {
 
   if (fs.existsSync(checkScript)) {
     core.info("Running MCP server checks...");
-    // Store diagnostics in /tmp/gh-aw/mcp-logs/start-gateway.log
-    // Pass apiKey via MCP_GATEWAY_API_KEY env var (already set) rather than
+    // Pass agentId via MCP_GATEWAY_AGENT_ID env var (already set) rather than
     // as a shell argument to avoid shell metacharacter injection risks.
     const safePort = String(gatewayPort).replace(/[^0-9]/g, "");
     try {
-      execSync(`bash "${checkScript}" "${outputPath}" "http://localhost:${safePort}" "$MCP_GATEWAY_API_KEY" 2>&1 | tee /tmp/gh-aw/mcp-logs/start-gateway.log`, { stdio: "inherit", env: process.env });
+      execFileSync("bash", [checkScript, outputPath, `http://localhost:${safePort}`, process.env.MCP_GATEWAY_AGENT_ID || ""], {
+        stdio: "inherit",
+        env: { ...process.env, GH_AW_MCP_OPTIONAL_SERVERS: optionalServerNames.join(",") },
+        timeout: MCP_SERVER_CHECK_TIMEOUT_MS,
+      });
     } catch {
       core.error("ERROR: MCP server checks failed - no servers could be connected");
       core.error("Gateway process will be terminated");
@@ -955,7 +1524,7 @@ async function main() {
       } catch {
         // ignore
       }
-      core.setFailed("ERROR: MCP server checks failed - no servers could be connected");
+      setFailed(`${ERR_SYSTEM}: MCP server checks failed - no servers could be connected`);
       return;
     }
     printTiming(mcpCheckStart, "MCP server connectivity checks");
@@ -972,7 +1541,7 @@ async function main() {
   try {
     fs.mkdirSync(cliDir, { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create directory ${cliDir}: ${String(err)}`, { cause: err });
+    throw codedError(`Failed to create directory ${cliDir}: ${getErrorMessage(err)}`, ERR_SYSTEM, { cause: err });
   }
 
   try {
@@ -1033,7 +1602,9 @@ async function main() {
   // Write GitHub Actions step outputs
   // -----------------------------------------------------------------------
   if (githubOutput) {
-    const outputs = [`gateway-pid=${gatewayPid}`, `gateway-port=${gatewayPort}`, `gateway-api-key=${apiKey}`, `gateway-domain=${gatewayDomain}`].join("\n");
+    // The gateway authenticates with its agent ID; expose the same value under the
+    // API-key output name expected by the AWF host handoff.
+    const outputs = [`gateway-pid=${gatewayPid}`, `gateway-port=${gatewayPort}`, `gateway-agent-id=${agentId}`, `gateway-api-key=${agentId}`, `gateway-domain=${gatewayDomain}`].join("\n");
     try {
       fs.appendFileSync(githubOutput, outputs + "\n");
     } catch {
@@ -1049,17 +1620,76 @@ if (require.main === module) {
     const message = getErrorMessage(err);
     const stack = err instanceof Error ? err.stack : undefined;
     if (stack) core.error(stack);
-    core.setFailed(`FATAL: ${message}`);
+    setFailed(message);
   });
 }
 
+/**
+ * Backend containers do not inherit the gateway container's Docker user.
+ * Keep private logs and staged assets runner-owned for redaction and upload.
+ * @param {Record<string, unknown>} config
+ * @param {number | undefined} [uid]
+ * @param {number | undefined} [gid]
+ */
+function applyBuiltinMCPRunnerIdentity(config, uid = process.geteuid?.(), gid = process.getegid?.()) {
+  const servers = config.mcpServers;
+  if (!servers || typeof servers !== "object") return;
+  for (const [name, server] of Object.entries(servers)) {
+    if (name !== "agenticworkflows" && name !== "safeoutputs") continue;
+    if (!server || typeof server !== "object" || !("container" in server) || typeof server.container !== "string" || !server.container) continue;
+    const args = "args" in server ? server.args : [];
+    if (!Array.isArray(args) || !args.every(arg => typeof arg === "string")) {
+      throw codedError(`Invalid ${name} container arguments`, ERR_CONFIG);
+    }
+    // Docker parses any suffix after -u as a username or UID, including -uroot.
+    if (args.some(arg => arg === "--user" || arg === "-u" || arg.startsWith("--user=") || (arg.startsWith("-u") && !arg.startsWith("--")))) continue;
+    if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid === undefined || gid === undefined || uid < 0 || gid < 0) {
+      throw codedError(`Runner identity is required for the ${name} container`, ERR_CONFIG);
+    }
+    const env = "env" in server ? server.env : {};
+    if (!env || typeof env !== "object" || Array.isArray(env)) {
+      throw codedError(`Invalid ${name} container environment`, ERR_CONFIG);
+    }
+    Object.assign(server, {
+      args: [...args, "--user", `${uid}:${gid}`],
+      // /tmp is private to this backend container; /root is not writable as the runner.
+      env: { HOME: "/tmp", ...env },
+    });
+  }
+}
+
 module.exports = {
+  resolveMCPConfigExpressions,
+  applyBuiltinMCPRunnerIdentity,
   applyOTLPIgnoreIfMissing,
+  clearGatewayStartupMarker,
+  createGatewayStderrPath,
+  customGatewayEnvNamesVar,
+  customGatewayEnvTransportPrefix,
+  customGatewayReservedEnvPrefix,
   detectEngineType,
+  extractOptionalServerNames,
   getOTLPIfMissingMode,
   hasNonEmptyOTLPHeaders,
   isOTLPIfMissingIgnore,
   getJSONParseErrorContext,
+  getGatewayStartupMarkerPath,
+  injectCustomGatewayEnvArgs,
+  injectProxyEnvArgs,
+  computeHealthRetryBudgetMs,
+  MCP_GATEWAY_HEALTH_MAX_ATTEMPTS_LIMIT,
+  MCP_GATEWAY_HEALTH_RETRY_DEFAULTS,
+  MCP_GATEWAY_HEALTH_RETRY_ENV,
+  MCP_GATEWAY_HEALTH_REGISTRATION_MARGIN_MS,
+  MCP_GATEWAY_BACKEND_STARTUP_TIMEOUT_DEFAULT_MS,
+  resolveGatewayHealthRetryConfig,
   normalizeSinkVisibilityEncoding,
+  redactGatewayDiagnostics,
   resolveCopilotConfigPaths,
+  validateGatewayAgentIdentifiers,
+  waitForSafeOutputsReadiness,
+  retryGatewayStartup,
+  startGatewayWithRetry,
+  httpGet,
+  writeGatewayStartupMarker,
 };

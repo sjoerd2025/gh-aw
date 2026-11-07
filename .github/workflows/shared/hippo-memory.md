@@ -31,12 +31,13 @@ mcp-scripts:
         required: true
     run: |
       echo "hippo $INPUT_ARGS"
+      # shellcheck disable=SC2086 # INPUT_ARGS intentionally word-splits into multiple hippo CLI arguments
       hippo $INPUT_ARGS
 
 steps:
   - name: Install hippo-memory
     run: |
-      npm install -g hippo-memory
+      npm install -g hippo-memory@2.0.0
 
   - name: Initialize hippo store
     run: |

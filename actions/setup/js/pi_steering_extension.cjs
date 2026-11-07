@@ -4,8 +4,7 @@
  * Pi Steering Extension for gh-aw
  *
  * Monitors elapsed time and injects steering messages into a Pi agent session
- * when remaining time falls below configured thresholds. Implements the
- * steering extension described in the aw-harness specification §8.3.
+ * when remaining time falls below configured thresholds.
  *
  * This extension is automatically added to every Pi agent invocation by the
  * gh-aw compiler. No workflow frontmatter configuration is required.
@@ -57,12 +56,12 @@ function piSteeringExtension(pi) {
   let criticalInjected = false;
 
   pi.on("agent_start", async () => {
-    startTime = Date.now();
+    startTime ??= Date.now();
     process.stderr.write(`[gh-aw/steering] Session started. timeout=${config.timeoutMinutes}min, warn<${config.timeWarningMinutes}min, critical<${config.timeCriticalMinutes}min\n`);
   });
 
-  pi.on("turn_end", async (/** @type {any} */ _event, /** @type {any} */ ctx) => {
-    if (startTime === undefined) {
+  pi.on("turn_end", async (/** @type {any} */ event, /** @type {any} */ ctx) => {
+    if (startTime === undefined || event.message?.stopReason !== "toolUse") {
       return;
     }
 
@@ -74,19 +73,11 @@ function piSteeringExtension(pi) {
       warningInjected = true;
       criticalInjected = true;
       process.stderr.write(`[gh-aw/steering] CRITICAL: ${remainingMinutes.toFixed(1)}min remaining — injecting critical message\n`);
-      ctx.agent.steer({
-        role: "user",
-        content: `⚠️ CRITICAL: Only ${remainingMinutes.toFixed(0)} minute(s) remaining before the workflow times out. Stop all new research and produce your final output immediately.`,
-        timestamp: Date.now(),
-      });
+      pi.sendUserMessage(`⚠️ CRITICAL: Only ${remainingMinutes.toFixed(0)} minute(s) remaining before the workflow times out. Stop all new research and produce your final output immediately.`, { deliverAs: "steer" });
     } else if (remainingMinutes <= config.timeWarningMinutes && !warningInjected) {
       warningInjected = true;
       process.stderr.write(`[gh-aw/steering] WARNING: ${remainingMinutes.toFixed(1)}min remaining — injecting warning message\n`);
-      ctx.agent.steer({
-        role: "user",
-        content: `⚠️ ${remainingMinutes.toFixed(0)} minute(s) remaining. Please wrap up your current task and start writing your final output.`,
-        timestamp: Date.now(),
-      });
+      pi.sendUserMessage(`⚠️ ${remainingMinutes.toFixed(0)} minute(s) remaining. Please wrap up your current task and start writing your final output.`, { deliverAs: "steer" });
     }
   });
 }

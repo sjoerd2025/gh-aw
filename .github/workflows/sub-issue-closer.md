@@ -7,15 +7,18 @@ on:
   schedule: daily
   workflow_dispatch:
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
-engine: copilot
+engine: pi
+model: copilot/gpt-5
 strict: true
 network:
   allowed:
     - defaults
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:

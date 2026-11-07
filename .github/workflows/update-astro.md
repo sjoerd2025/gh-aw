@@ -11,13 +11,22 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
-
+  copilot-requests: write
 tracker-id: update-astro
-engine: copilot
+engine:
+  id: codex
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 strict: true
 
 timeout-minutes: 45
+runtimes:
+  node:
+    version: "24"
 
 network:
   allowed:
@@ -26,6 +35,7 @@ network:
 
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   bash:
@@ -34,6 +44,7 @@ tools:
   web-fetch:
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 2d
     title-prefix: "[docs] "
@@ -56,7 +67,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Setup Node.js
-        uses: actions/setup-node@v7.0.0
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: "24"
       - name: Check for npm updates in docs
@@ -64,7 +75,7 @@ jobs:
         working-directory: ./docs
         run: |
           ncu_output="$(mktemp)"
-          npx --yes npm-check-updates --jsonUpgraded >"$ncu_output" 2>/dev/null || true
+          npx --yes npm-check-updates --jsonUpgraded --cooldown 3 >"$ncu_output" 2>/dev/null || true
 
           if [ -s "$ncu_output" ] && [ "$(tr -d '[:space:]' <"$ncu_output")" != "{}" ]; then
             echo "has_updates=true" >> "$GITHUB_OUTPUT"
@@ -79,6 +90,16 @@ jobs:
 
           rm -f "$ncu_output"
 
+sandbox:
+  agent:
+    id: awf
+evals:
+  - id: docs-only-updates
+    question: Are proposed dependency changes confined to the docs site rather than root-level or actions packages? Return UNKNOWN when no changes are proposed.
+  - id: build-gated-pr
+    question: When a pull request is requested, does the agent output show a successful docs build with the updated dependencies? Return UNKNOWN when no pull request is requested.
+  - id: failed-build-restraint
+    question: When the docs build remains failing, does the agent refrain from requesting a pull request? Return UNKNOWN when no unresolved build failure is observed.
 ---
 
 # Update Astro
@@ -96,10 +117,10 @@ You are an automated dependency updater for the `docs/` Astro site. Your job is 
 
 ### 1. Update Dependencies
 
-Navigate to the docs folder and run npm-check-updates to update all packages to their latest versions:
+Navigate to the docs folder and run npm-check-updates to update all packages to the latest versions that have been published for at least three days. Apply the cooldown to every dependency update so recently published versions are skipped:
 
 ```bash
-cd docs && npx --yes npm-check-updates --update
+cd docs && npx --yes npm-check-updates --upgrade --cooldown 3
 ```
 
 This updates `package.json` with the latest versions. Then install the updated dependencies:
@@ -176,7 +197,11 @@ Updates npm packages in `docs/` to their latest versions.
 
 ## Important
 
-If no action is needed after completing your work (e.g., build fails and cannot be fixed), you **MUST** call the `noop` safe-output tool with a brief explanation.
+Before finishing, you **MUST** call exactly one terminal safe-output tool:
+
+- `create_pull_request` after updating dependencies and verifying `npm run build` passes.
+- `noop` when no dependency changes are needed after inspection, or when a docs build failure cannot be fixed safely.
+- `report_missing_tool` when infrastructure or tooling prevents meaningful work (for example, unavailable shell commands, missing Node/npm, or inaccessible repository state).
 
 ```json
 {"noop": {"message": "No action needed: [brief explanation]"}}

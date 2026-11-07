@@ -8,10 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/github/gh-aw/pkg/actionpins"
+	"github.com/goccy/go-yaml"
 )
 
 // TestSetupCLIAction tests the setup-cli action's generated install scripts.
 func TestSetupCLIAction(t *testing.T) {
+	t.Parallel()
 	// Get project root
 	wd, err := os.Getwd()
 	if err != nil {
@@ -177,6 +181,7 @@ func TestSetupCLIAction(t *testing.T) {
 
 // TestSetupCLIActionYAML tests the action.yml file structure
 func TestSetupCLIActionYAML(t *testing.T) {
+	t.Parallel()
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Failed to get working directory: %v", err)
@@ -203,7 +208,6 @@ func TestSetupCLIActionYAML(t *testing.T) {
 		"description:",
 		"inputs:",
 		"version:",
-		"required: true",
 		"outputs:",
 		"installed-version:",
 		"runs:",
@@ -217,16 +221,32 @@ func TestSetupCLIActionYAML(t *testing.T) {
 		}
 	}
 
-	// Verify version input is required
-	if !strings.Contains(contentStr, "required: true") {
-		t.Errorf("version input should be required")
+	var action struct {
+		Inputs map[string]actionpins.ActionYAMLInput `yaml:"inputs"`
+	}
+	if err := yaml.Unmarshal(content, &action); err != nil {
+		t.Fatalf("Failed to parse action.yml: %v", err)
 	}
 
-	// Verify github-token has default value
-	if !strings.Contains(contentStr, "github-token:") {
-		t.Errorf("action.yml should define github-token input")
+	version, ok := action.Inputs["version"]
+	if !ok {
+		t.Fatal("action.yml should define version input")
 	}
-	if !strings.Contains(contentStr, "default: ${{ github.token }}") {
+	if version.Required {
+		t.Errorf("version input should be optional")
+	}
+	if version.Default != "latest" {
+		t.Errorf("version input should default to latest, got %q", version.Default)
+	}
+
+	githubToken, ok := action.Inputs["github-token"]
+	if !ok {
+		t.Fatal("action.yml should define github-token input")
+	}
+	if githubToken.Required {
+		t.Errorf("github-token input should be optional")
+	}
+	if githubToken.Default != "${{ github.token }}" {
 		t.Errorf("github-token should have default value of github.token")
 	}
 

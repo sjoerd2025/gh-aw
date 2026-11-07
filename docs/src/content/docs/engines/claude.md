@@ -1,50 +1,52 @@
 ---
-title: Run Claude Code in GitHub Actions with gh-aw
-description: Configure gh-aw to run Claude Code in GitHub Actions with Markdown workflows, safe outputs, and standard GitHub triggers.
+title: Using Claude Code with GitHub Agentic Workflows
+description: Authenticate Claude Code and run your first GitHub Agentic Workflow.
 ---
 
-Claude Code is Anthropic's agentic coding interface for repository analysis and code changes. gh-aw runs Claude Code inside GitHub Actions from a Markdown workflow, adds GitHub event triggers, and routes write operations through validated safe outputs instead of giving the agent direct write access.
+Run Claude Code on GitHub events using an Anthropic API key or GitHub Copilot inference. A Claude subscription OAuth login is not supported.
 
-## Setup
+## Connect your account
 
-Set `engine: claude` in the workflow frontmatter and provide `ANTHROPIC_API_KEY`, or configure keyless authentication with Anthropic Workload Identity Federation. See [Anthropic authentication](/gh-aw/reference/auth/#anthropic_api_key) for the supported options.
+Set `engine: claude` and add an [`ANTHROPIC_API_KEY`](/gh-aw/reference/auth/#anthropic_api_key) repository secret. For keyless authentication, use [Anthropic WIF](/gh-aw/reference/auth/#anthropic-workload-identity-federation-wif).
+
+To bill inference through Copilot instead, add `model: copilot/auto` and `permissions: { copilot-requests: write }`. No Anthropic key is needed.
+
+## Run a daily report
+
+After [setting up gh-aw](/gh-aw/setup/quick-start/), save this workflow:
 
 ```aw wrap title=".github/workflows/daily-status.md"
 ---
 on:
+  workflow_dispatch:
   schedule: daily
-
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
 engine: claude
-
+tools:
+  github:
+    toolsets: [issues, pull_requests]
 safe-outputs:
   create-issue:
     title-prefix: "[status] "
-    labels: [report]
-    close-older-issues: true
 ---
 
-# Daily Repository Status
+# Daily repository status
 
-Analyze the repository and create a concise daily status report covering:
-- Open issues and their priority
-- Recent PR activity
-- Upcoming work items
+Summarize open issues and recent pull request activity in one concise issue.
 ```
 
-## When to choose gh-aw vs. anthropics/claude-code-action
+Compile with `gh aw compile daily-status`, then commit and push both the Markdown and generated lock file. Run it from the repository's Actions tab or wait for its schedule.
 
-Choose gh-aw when the workflow should be defined in Markdown, run behind gh-aw sandboxing, switch engines without rewriting the workflow, or use safe outputs for validated GitHub writes. Choose [`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action) when the main goal is native Claude-driven PR assistance around comment and mention workflows.
+## Capabilities and limitations
 
-## Related pages
+Claude supports native web search and command-level shell restrictions. Dynamic workflows, permission modes, bare mode, and provider-specific configuration are covered in the [Claude reference](/gh-aw/reference/engines/claude/).
 
-- [Quick start](/gh-aw/setup/quick-start/)
-- [Engine reference](/gh-aw/reference/engines/)
-- [AI issue triage](/gh-aw/guides/ai-issue-triage/)
-- [Automated AI pull request review](/gh-aw/guides/automated-pr-review/)
-- [AI-generated release notes and reports](/gh-aw/guides/ai-release-notes/)
-- [Keeping documentation up to date automatically](/gh-aw/guides/docs-automation/)
+## Next steps
+
+- [Claude Code technical reference](/gh-aw/reference/engines/claude/)
+- [Create a workflow](/gh-aw/setup/creating-workflows/)
+- [Workflow examples](/gh-aw/gallery/)
+- [Compare engines](/gh-aw/reference/engines/#engine-feature-comparison)

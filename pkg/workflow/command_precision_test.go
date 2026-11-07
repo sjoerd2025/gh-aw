@@ -42,6 +42,7 @@ tools:
 				"github.event_name == 'issues'",
 				"startsWith(github.event.issue.body, '/test-bot ')",
 				"startsWith(github.event.issue.body, '/test-bot\\n')",
+				"startsWith(github.event.issue.body, '/test-bot\\r')",
 				"github.event.issue.body == '/test-bot'",
 			},
 			shouldNotContain: []string{
@@ -65,6 +66,7 @@ tools:
 				"github.event_name == 'issue_comment'",
 				"startsWith(github.event.comment.body, '/test-bot ')",
 				"startsWith(github.event.comment.body, '/test-bot\\n')",
+				"startsWith(github.event.comment.body, '/test-bot\\r')",
 				"github.event.comment.body == '/test-bot'",
 				"github.event.issue.pull_request == null",
 			},
@@ -222,7 +224,33 @@ tools:
 			},
 		},
 		{
-			name: "slash_command wildcard should use prefix matching",
+			name: "slash_command should not match leading whitespace before command",
+			frontmatter: `---
+on:
+  slash_command:
+    name: test-bot
+    events: [issue_comment]
+tools:
+  github:
+    allowed: [list_issues]
+---`,
+			filename: "command-no-leading-whitespace.md",
+			shouldContain: []string{
+				// Generated conditions must use raw body accessors (no trim), so they match
+				// only when the command appears at position zero. This aligns with the runtime
+				// check_command_position.cjs which also requires the command at position zero.
+				"startsWith(github.event.comment.body, '/test-bot ')",
+				"startsWith(github.event.comment.body, '/test-bot\\n')",
+				"github.event.comment.body == '/test-bot'",
+			},
+			shouldNotContain: []string{
+				// Must not wrap the body in a trim or format call; that would diverge from
+				// the character-zero policy enforced by the runtime helper.
+				"trim(",
+				"format('{0}",
+			},
+		},
+		{
 			frontmatter: `---
 on:
   slash_command:

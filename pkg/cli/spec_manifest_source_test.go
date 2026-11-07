@@ -5,24 +5,55 @@ package cli
 import "testing"
 
 func TestBuildSourceStringWithCommitSHA_ManifestSource(t *testing.T) {
-	workflow := &WorkflowSpec{
-		RepoSpec: RepoSpec{
-			RepoSlug:    "owner/repo",
-			Version:     "v1.2.3",
-			PackagePath: "packages/repo-assist",
-		},
-		WorkflowPath:           "workflows/triage.md",
-		FromRepositoryManifest: true,
+	t.Parallel()
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tests := []struct {
+		name      string
+		version   string
+		commitSHA string
+		wantRef   string
+	}{
+		{name: "release tag", version: "v1.2.0", commitSHA: sha, wantRef: "v1.2.0"},
+		{name: "major ref", version: "v1", commitSHA: sha, wantRef: "v1"},
+		{name: "branch", version: "release/stable", commitSHA: sha, wantRef: "release/stable"},
+		{name: "commit SHA", version: sha, commitSHA: sha, wantRef: sha},
+		{name: "no ref", commitSHA: sha, wantRef: sha},
+		{name: "no commit SHA", version: "v1.2.0", wantRef: "v1.2.0"},
+		{name: "no ref or commit SHA"},
 	}
 
-	got := buildSourceStringWithCommitSHA(workflow, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	want := "owner/repo/packages/repo-assist@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	if got != want {
-		t.Fatalf("expected %q, got %q", want, got)
+	for _, tt := range tests {
+		for _, packagePath := range []string{"", "packages/repo-assist"} {
+			t.Run(tt.name+"/"+packagePath, func(t *testing.T) {
+				t.Parallel()
+				workflow := &WorkflowSpec{
+					RepoSpec: RepoSpec{
+						RepoSlug:    "owner/repo",
+						Version:     tt.version,
+						PackagePath: packagePath,
+					},
+					WorkflowPath:           "workflows/triage.md",
+					FromRepositoryManifest: true,
+				}
+
+				got := buildSourceStringWithCommitSHA(workflow, tt.commitSHA)
+				want := "owner/repo"
+				if packagePath != "" {
+					want += "/" + packagePath
+				}
+				if tt.wantRef != "" {
+					want += "@" + tt.wantRef
+				}
+				if got != want {
+					t.Fatalf("expected %q, got %q", want, got)
+				}
+			})
+		}
 	}
 }
 
 func TestBuildSourceStringWithCommitSHA_ManifestSourceRoot(t *testing.T) {
+	t.Parallel()
 	workflow := &WorkflowSpec{
 		RepoSpec: RepoSpec{
 			RepoSlug: "owner/repo",
@@ -40,6 +71,7 @@ func TestBuildSourceStringWithCommitSHA_ManifestSourceRoot(t *testing.T) {
 }
 
 func TestParseManifestSourceSpec(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		source       string
 		wantManifest bool

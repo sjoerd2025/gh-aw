@@ -9,6 +9,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestLockMetadataDryRunRoundTrip(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(map[bool]string{false: "normal", true: "dry-run"}[dryRun], func(t *testing.T) {
+			expected := &LockMetadata{SchemaVersion: LockSchemaV4, DryRun: dryRun}
+			content, err := expected.ToJSON()
+			require.NoError(t, err)
+			metadata, legacy, err := ExtractMetadataFromLockFile("# gh-aw-metadata: " + content + "\n")
+			require.NoError(t, err)
+			assert.False(t, legacy)
+			assert.Equal(t, expected, metadata)
+			if dryRun {
+				assert.Contains(t, content, `"dry_run":true`)
+			} else {
+				assert.NotContains(t, content, `"dry_run"`)
+			}
+		})
+	}
+	metadata, _, err := ExtractMetadataFromLockFile(`# gh-aw-metadata: {"schema_version":"v4","dry_run":false}`)
+	require.NoError(t, err)
+	assert.False(t, metadata.DryRun)
+	_, _, err = ExtractMetadataFromLockFile(`# gh-aw-metadata: {"schema_version":"v4","dry_run":"true"}`)
+	require.Error(t, err)
+}
+
 func TestExtractMetadataFromLockFile(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -208,7 +232,7 @@ name: test
 `,
 			lockPath:    "malformed.lock.yml",
 			expectError: true,
-			errorText:   "failed to parse lock metadata JSON",
+			errorText:   "lock metadata JSON should be a single valid JSON object",
 		},
 	}
 
@@ -625,10 +649,11 @@ func TestLockMetadataToJSONWithoutStopTime(t *testing.T) {
 func TestGenerateLockMetadataWithAgentInfo(t *testing.T) {
 	hash := "abcd1234"
 	agentInfo := AgentMetadataInfo{
-		AgentID:             "copilot",
-		AgentModel:          "gpt-5",
-		DetectionAgentID:    "copilot",
-		DetectionAgentModel: "gpt-5.1-codex-mini",
+		AgentID:                 "copilot",
+		AgentModel:              "gpt-5",
+		DetectionAgentID:        "copilot",
+		DetectionAgentModel:     "gpt-5.1-codex-mini",
+		EngineBaseURLCustomized: true,
 		EngineVersions: map[string]string{
 			"copilot": "1.0.57",
 			"claude":  "2.1.160",
@@ -643,6 +668,7 @@ func TestGenerateLockMetadataWithAgentInfo(t *testing.T) {
 	assert.Equal(t, "gpt-5", metadata.AgentModel, "Should preserve agent model")
 	assert.Equal(t, "copilot", metadata.DetectionAgentID, "Should preserve detection agent ID")
 	assert.Equal(t, "gpt-5.1-codex-mini", metadata.DetectionAgentModel, "Should preserve detection agent model")
+	assert.True(t, metadata.EngineBaseURLCustomized, "Should preserve Copilot custom base URL signal")
 	assert.Equal(t, "1.0.57", metadata.EngineVersions["copilot"], "Should preserve engine versions")
 	assert.Equal(t, "ubuntu-latest", metadata.AgentImageRunner, "Should preserve agent image runner")
 }
@@ -657,23 +683,27 @@ func TestGenerateLockMetadataAgentFieldsOmittedWhenEmpty(t *testing.T) {
 	assert.NotContains(t, json, `"agent_model"`, "Empty agent_model should be omitted")
 	assert.NotContains(t, json, `"detection_agent_id"`, "Empty detection_agent_id should be omitted")
 	assert.NotContains(t, json, `"detection_agent_model"`, "Empty detection_agent_model should be omitted")
+	assert.NotContains(t, json, `"engine_base_url_customized"`, "Empty engine_base_url_customized should be omitted")
 }
 
 func TestLockMetadataToJSONWithAgentFields(t *testing.T) {
 	metadata := &LockMetadata{
-		SchemaVersion:       LockSchemaV3,
-		FrontmatterHash:     "test123",
-		Strict:              true,
-		AgentID:             "claude",
-		AgentModel:          "claude-sonnet-4.5",
-		DetectionAgentID:    "copilot",
-		DetectionAgentModel: "gpt-5.1-codex-mini",
-		EngineVersions: map[string]string{
-			"claude":      "2.1.160",
-			"copilot":     "1.0.57",
-			"copilot-sdk": "1.0.0",
+		SchemaVersion:   LockSchemaV3,
+		FrontmatterHash: "test123",
+		Strict:          true,
+		AgentMetadataInfo: AgentMetadataInfo{
+			EngineBaseURLCustomized: true,
+			AgentID:                 "claude",
+			AgentModel:              "claude-sonnet-4.5",
+			DetectionAgentID:        "copilot",
+			DetectionAgentModel:     "gpt-5.1-codex-mini",
+			EngineVersions: map[string]string{
+				"claude":      "2.1.160",
+				"copilot":     "1.0.57",
+				"copilot-sdk": "1.0.0",
+			},
+			AgentImageRunner: `["self-hosted","linux"]`,
 		},
-		AgentImageRunner: `["self-hosted","linux"]`,
 	}
 
 	json, err := metadata.ToJSON()
@@ -681,6 +711,7 @@ func TestLockMetadataToJSONWithAgentFields(t *testing.T) {
 	assert.Contains(t, json, `"schema_version":"v3"`)
 	assert.Contains(t, json, `"frontmatter_hash":"test123"`)
 	assert.Contains(t, json, `"strict":true`)
+	assert.Contains(t, json, `"engine_base_url_customized":true`)
 	assert.Contains(t, json, `"agent_id":"claude"`)
 	assert.Contains(t, json, `"agent_model":"claude-sonnet-4.5"`)
 	assert.Contains(t, json, `"detection_agent_id":"copilot"`)

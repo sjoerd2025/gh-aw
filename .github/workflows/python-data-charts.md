@@ -10,9 +10,8 @@ permissions:
   issues: read
   pull-requests: read
 engine:
-  id: copilot
-  copilot-sdk: true
-max-tool-denials: 3
+  id: codex
+model: openai/gpt-5.6-luna
 tools:
   cli-proxy: true
   agentic-workflows:
@@ -20,6 +19,7 @@ tools:
 imports:
   - shared/charts-with-trending.md
   - shared/otlp.md
+  - shared/reporting.md
 safe-outputs:
   upload-artifact:
     max-uploads: 3
@@ -30,11 +30,13 @@ safe-outputs:
     category: "artifacts"
     max: 1
 timeout-minutes: 15
-
-
-sandbox:
-  agent:
-    sudo: false
+evals:
+  - id: chart-images-embedded
+    question: Does the proposed discussion embed the generated chart images using their uploaded asset URLs?
+  - id: data-source-disclosed
+    question: Does the proposed report distinguish generated sample data from collected repository metrics?
+  - id: historical-trends
+    question: When historical data is available, do the charts show progression over that history? Return UNKNOWN when no historical data is available.
 ---
 
 # Python Data Visualization Generator

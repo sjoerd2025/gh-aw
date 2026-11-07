@@ -38,8 +38,10 @@ global.context = mockContext;
 
 // Helper to import the module fresh (bust module cache)
 async function loadModule() {
-  const { main, addCommentWithWorkflowLink, addReaction, addDiscussionReaction, resolveEventEndpoints, VALID_REACTIONS, expectRestEndpoint } = await import("./add_reaction_and_edit_comment.cjs?" + Date.now());
-  return { main, addCommentWithWorkflowLink, addReaction, addDiscussionReaction, resolveEventEndpoints, VALID_REACTIONS, expectRestEndpoint };
+  const { main, addCommentWithWorkflowLink, addReaction, addDiscussionReaction, resolveEventEndpoints, VALID_REACTIONS, expectRestEndpoint, parseDiscussionEndpoint, requireEventField } = await import(
+    "./add_reaction_and_edit_comment.cjs?" + Date.now()
+  );
+  return { main, addCommentWithWorkflowLink, addReaction, addDiscussionReaction, resolveEventEndpoints, VALID_REACTIONS, expectRestEndpoint, parseDiscussionEndpoint, requireEventField };
 }
 
 describe("add_reaction_and_edit_comment.cjs", () => {
@@ -48,6 +50,7 @@ describe("add_reaction_and_edit_comment.cjs", () => {
     delete process.env.GH_AW_REACTION;
     delete process.env.GH_AW_COMMANDS;
     delete process.env.GH_AW_WORKFLOW_NAME;
+    delete process.env.GH_AW_WORKFLOW_EMOJI;
     delete process.env.GH_AW_LOCK_FOR_AGENT;
     delete process.env.GITHUB_WORKFLOW;
     delete process.env.GH_AW_TRACKER_ID;
@@ -68,6 +71,17 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       repository: { discussion: { id: "D_kwDOABcD1M4AaBbC", url: "https://github.com/testowner/testrepo/discussions/10" } },
       addReaction: { reaction: { id: "MDg6UmVhY3Rpb24xMjM0NTY3ODk=", content: "EYES" } },
       addDiscussionComment: { comment: { id: "DC_kwDOABcD1M4AaBbE", url: "https://github.com/testowner/testrepo/discussions/10#discussioncomment-999" } },
+    });
+  });
+
+  describe("discussion endpoint validation", () => {
+    it("rejects malformed and non-positive discussion endpoint numbers", async () => {
+      const { parseDiscussionEndpoint } = await loadModule();
+
+      for (const endpoint of ["discussion:5junk", "discussion:0", "discussion:5:extra"]) {
+        expect(() => parseDiscussionEndpoint(endpoint, "discussion")).toThrow("Invalid discussion endpoint");
+      }
+      expect(() => parseDiscussionEndpoint("discussion_comment:5:2junk", "discussion_comment")).toThrow("Invalid discussion endpoint");
     });
   });
 
@@ -133,6 +147,7 @@ describe("add_reaction_and_edit_comment.cjs", () => {
     it("should add reaction to pull request and create comment", async () => {
       process.env.GH_AW_REACTION = "heart";
       process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
+      process.env.GH_AW_WORKFLOW_EMOJI = "🤖";
       global.context.eventName = "pull_request";
       global.context.payload = {
         pull_request: { number: 456 },
@@ -144,6 +159,7 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       await main();
 
       expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", expect.objectContaining({ content: "heart", owner: "testowner", repo: "testrepo", issue_number: 456 }));
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", expect.objectContaining({ body: expect.stringContaining("🤖 [Test Workflow]") }));
       expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", expect.objectContaining({ body: expect.stringContaining("has started processing this pull request") }));
       expect(mockCore.setOutput).toHaveBeenCalledWith("reaction-id", "789");
       expect(mockCore.setOutput).toHaveBeenCalledWith("comment-id", "999");
@@ -439,7 +455,6 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       const { main } = await loadModule();
       await main();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to process reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to process reaction"));
     });
 
@@ -454,8 +469,22 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       const { main } = await loadModule();
       await main();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to process reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to process reaction"));
+    });
+
+    it("should warn and continue for rate limit 403 errors", async () => {
+      const rateLimitError = new Error("API rate limit exceeded for installation");
+      /** @type {any} */ rateLimitError.status = 403;
+      process.env.GH_AW_REACTION = "eyes";
+      global.context.eventName = "issues";
+      global.context.payload = { issue: { number: 123 }, repository: { html_url: "https://github.com/testowner/testrepo" } };
+      mockGithub.request.mockRejectedValueOnce(rateLimitError);
+
+      const { main } = await loadModule();
+      await main();
+
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("GitHub API rate limiting"));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
 
     it("should fail for other non-403 errors", async () => {
@@ -469,7 +498,6 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       const { main } = await loadModule();
       await main();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to process reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(`${ERR_API}: Failed to process reaction`));
     });
   });
@@ -727,6 +755,36 @@ describe("add_reaction_and_edit_comment.cjs", () => {
       const result = await resolveEventEndpoints("push", "owner", "repo", {});
       expect(result).toBeNull();
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(ERR_VALIDATION));
+    });
+  });
+
+  describe("requireEventField()", () => {
+    it("should return true and not call setFailed for a valid value", async () => {
+      const { requireEventField } = await loadModule();
+      const result = requireEventField(42, "Issue number", ERR_NOT_FOUND);
+      expect(result).toBe(true);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("should return true for the number 0", async () => {
+      const { requireEventField } = await loadModule();
+      const result = requireEventField(0, "Issue number", ERR_NOT_FOUND);
+      expect(result).toBe(true);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("should call setFailed and return false for null", async () => {
+      const { requireEventField } = await loadModule();
+      const result = requireEventField(null, "Issue number", ERR_NOT_FOUND);
+      expect(result).toBe(false);
+      expect(mockCore.setFailed).toHaveBeenCalledWith(`${ERR_NOT_FOUND}: Issue number not found in event payload`);
+    });
+
+    it("should call setFailed and return false for undefined", async () => {
+      const { requireEventField } = await loadModule();
+      const result = requireEventField(undefined, "Comment ID", ERR_VALIDATION);
+      expect(result).toBe(false);
+      expect(mockCore.setFailed).toHaveBeenCalledWith(`${ERR_VALIDATION}: Comment ID not found in event payload`);
     });
   });
 });

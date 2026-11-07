@@ -21,7 +21,7 @@ engine:
 strict: true
 experiments:
   model_size:
-    variants: [claude-sonnet-4.6, claude-haiku-4.5]
+    variants: [claude-sonnet-5, claude-haiku-4.5]
     description: "Tests whether Claude Haiku produces equivalent instruction conciseness improvements at lower token cost versus Claude Sonnet."
     hypothesis: "H0: no change in PR creation rate or run success rate. H1: Claude Haiku reduces AI credit usage >=30% with equivalent run success rate (>=0.90)."
     metric: ai_credits_total
@@ -32,7 +32,9 @@ experiments:
       - name: empty_output_rate
         threshold: "<=0.10"
     min_samples: 20
-    weight: [50, 50]
+    continual:
+      seed: daily-caveman-model-size-v1
+      ramp: [10, 25, 50]
     start_date: "2026-06-04"
 
 network:
@@ -41,6 +43,7 @@ network:
     - github
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 3d
     title-prefix: "[caveman] "
@@ -54,12 +57,44 @@ safe-outputs:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
+    config:
+      filesystem:
+        allow-write:
+          - /tmp/gh-aw/agent
+          - /workspace/.github/aw
+          - /workspace/.github/agents
 tools:
   cli-proxy: true
   cache-memory: true
+  ledger:
+    caveman-run-history:
+      type: table
+      key: run_id
+      schema:
+        type: object
+        required: [record_type, run_id, date, files_processed, files_optimized, planned_outcome]
+        properties:
+          record_type:
+            enum: [caveman_run]
+          run_id:
+            type: string
+          date:
+            type: string
+          files_processed:
+            type: integer
+            minimum: 0
+          files_optimized:
+            type: integer
+            minimum: 0
+          planned_outcome:
+            enum: [pull_request_requested, noop]
+        additionalProperties: false
+      max-record-kb: 4
+      max-patch-kb: 10
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   edit:
   bash:
@@ -69,6 +104,20 @@ timeout-minutes: 30
 
 imports:
   - shared/otlp.md
+mcp-scripts:
+  caveman-run-state:
+    description: "Read the current run's audit record from the read-only caveman ledger."
+    env:
+      CAVEMAN_RUN_ID: ${{ github.run_id }}
+    script: |
+      const { DatabaseSync } = require("node:sqlite");
+      const db = new DatabaseSync("/tmp/gh-aw/ledgers/caveman-run-history/ledger.db", { readOnly: true });
+      try {
+        const row = db.prepare("SELECT value FROM state WHERE key = ? LIMIT 1").get(process.env.CAVEMAN_RUN_ID);
+        return { current_run: row ? JSON.parse(row.value) : null };
+      } finally {
+        db.close();
+      }
 features:
   gh-aw-detection: true
 evals:
@@ -148,9 +197,10 @@ Expected format:
 }
 ```
 
-- If the file does not exist, this is the first run and the cache is intentionally empty. Do **not** call `missing_data` — proceed normally. Count the total number of files in the sorted list (`TOTAL=$(...)`) and pick a **random** starting index with `$(( RANDOM % TOTAL ))`. This avoids always processing the same files first when the cache is cold.
+- If the file does not exist, this is the first run and the cache is intentionally empty. Do **not** call `report_missing_data` — proceed normally. Count the total number of files in the sorted list (`TOTAL=$(...)`) and pick a **random** starting index with `$(( RANDOM % TOTAL ))`. This avoids always processing the same files first when the cache is cold.
 - If the queue in cache differs from the current file list (files added/removed), rebuild the queue from the current sorted list and reset the index to 0.
 - Pick the **next 5 files** starting from `last_processed_index + 1` (wrapping around if needed). This is your **batch** for this run.
+- **Keep cache-memory for the round-robin cursor.** Use the Git-backed ledger only for durable run audit records.
 
 ## Step 3: Analyze and Optimize Each File
 
@@ -206,7 +256,32 @@ Write the updated state to `/tmp/gh-aw/cache-memory/caveman-optimizer/state.json
 
 Use filesystem-safe format `YYYY-MM-DD` for the date (no colons, no T, no Z).
 
-## Step 5: Output
+## Step 5: Record the Run
+
+Before requesting a PR or `noop`, discover and invoke `caveman-run-state` through the `mcpscripts` CLI. It queries the read-only ledger with fixed, parameterized SQL using Node's SQLite API; do not invoke `sqlite3` or install a database client.
+
+If `current_run` is null, invoke `safeoutputs ledger_append '<json>'` exactly once with the following shape, replacing the date, counts, and planned outcome with this run's values. `ledger_append` is available through the `safeoutputs` CLI, not as a standalone shell command or native tool:
+
+```json
+{
+  "ledger": "caveman-run-history",
+  "operation": "upsert",
+  "value": {
+    "record_type": "caveman_run",
+    "run_id": "${{ github.run_id }}",
+    "date": "2026-10-05",
+    "files_processed": 5,
+    "files_optimized": 0,
+    "planned_outcome": "noop"
+  }
+}
+```
+
+Keep `value.run_id` a quoted string; it is the table primary key. Do not add a top-level `key` or fields beyond this schema. Use `pull_request_requested` when requesting a PR, otherwise `noop`. Do not include file contents or raw analysis notes. Do not edit ledger branches directly.
+
+Complete the query and, when needed, the append before Step 6. Queued records are not visible in this run's read-only projection and become durable only after `push_ledger_changes` succeeds. If the query or append fails or is unavailable, call `safeoutputs report_incomplete` with the concrete blocker; do not emit a clean `noop`, request a PR, or claim the audit record was persisted.
+
+## Step 6: Output
 
 **If you made changes to any files**, create a pull request using `create_pull_request`:
 

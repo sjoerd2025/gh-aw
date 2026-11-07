@@ -1,50 +1,55 @@
 ---
-title: Run OpenAI Codex in GitHub Actions with gh-aw
-description: Configure gh-aw to run OpenAI Codex in GitHub Actions with Markdown workflows, GitHub triggers, and safe outputs.
+title: Using OpenAI Codex with GitHub Agentic Workflows
+description: Authenticate OpenAI Codex and run your first GitHub Agentic Workflow.
 ---
 
-OpenAI Codex is OpenAI's coding-focused agent runtime for repository work. gh-aw runs Codex inside GitHub Actions from a Markdown workflow and layers GitHub triggers, sandbox controls, and safe outputs on top so repository automation can stay event-driven and reviewable.
+Run Codex on GitHub events using an OpenAI API key or GitHub Copilot inference. ChatGPT subscription login is not supported.
 
-## Setup
+## Connect your account
 
-Set `engine: codex` and provide `OPENAI_API_KEY`. `CODEX_API_KEY` is also accepted and takes precedence when both are present. See [OpenAI authentication](/gh-aw/reference/auth/#openai_api_key) for the supported configuration.
+Set `engine: codex`, choose an OpenAI model, and add a [`CODEX_API_KEY` or `OPENAI_API_KEY`](/gh-aw/reference/auth/#openai_api_key) repository secret.
+
+To use Copilot inference instead, select a Codex-compatible `copilot/` model and grant [`copilot-requests: write`](/gh-aw/reference/auth/#copilot-requests-write-permission). This requires no OpenAI key. See [provider configuration](/gh-aw/reference/engines/codex/#github-copilot-inference) for details.
+
+## Run a daily report
+
+After [setting up gh-aw](/gh-aw/setup/quick-start/), save this workflow:
 
 ```aw wrap title=".github/workflows/daily-status.md"
 ---
 on:
+  workflow_dispatch:
   schedule: daily
-
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
 engine: codex
-
+model: openai/gpt-6.1-sol
+tools:
+  github:
+    toolsets: [issues, pull_requests]
 safe-outputs:
   create-issue:
     title-prefix: "[status] "
-    labels: [report]
-    close-older-issues: true
 ---
 
-# Daily Repository Status
+# Daily repository status
 
-Analyze the repository and create a concise daily status report covering:
-- Open issues and their priority
-- Recent PR activity
-- Upcoming work items
+Summarize open issues and recent pull request activity in one concise issue.
 ```
 
-## When to choose gh-aw vs. running Codex directly in Actions
+Compile with `gh aw compile daily-status`, then commit and push both the Markdown and generated lock file. Run it from the repository's Actions tab or wait for its schedule.
 
-Choose gh-aw when the workflow should stay in Markdown, reuse the same structure across engines, and enforce GitHub writes through safe outputs. Run Codex directly in Actions when the job needs a custom script layout and manual control over every integration point.
+## Capabilities and limitations
 
-## Related pages
+Codex cannot enforce per-command bash allowlists. Because a sandbox is used, bash restrictions are not normally required. If bash restrictions are required, use `tools.bash: false` to disable shell execution, or choose another engine when command-level restrictions are required.
 
-- [Quick start](/gh-aw/setup/quick-start/)
-- [Engine reference](/gh-aw/reference/engines/)
-- [AI issue triage](/gh-aw/guides/ai-issue-triage/)
-- [Automated AI pull request review](/gh-aw/guides/automated-pr-review/)
-- [AI-generated release notes and reports](/gh-aw/guides/ai-release-notes/)
-- [Keeping documentation up to date automatically](/gh-aw/guides/docs-automation/)
+See the [Codex reference](/gh-aw/reference/engines/codex/) for provider differences, web tools, configuration, and runtime limits.
+
+## Next steps
+
+- [OpenAI Codex technical reference](/gh-aw/reference/engines/codex/)
+- [Create a workflow](/gh-aw/setup/creating-workflows/)
+- [Workflow examples](/gh-aw/gallery/)
+- [Compare engines](/gh-aw/reference/engines/#engine-feature-comparison)

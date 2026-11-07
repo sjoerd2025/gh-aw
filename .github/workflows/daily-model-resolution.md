@@ -16,7 +16,7 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: daily-model-resolution
-model: gpt-5.4-mini
+model: gpt-5
 engine:
   id: copilot
   copilot-sdk: true
@@ -37,11 +37,12 @@ imports:
     with:
       toolsets: [default, actions]
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    id: awf
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -174,11 +175,6 @@ After all `run-analyzer` calls complete, build the report:
 4. **Correct resolutions**: brief confirmation that all other sub-agents used the
    right model size.
 
-### Report Formatting
-
-Use `###` or lower for all headings inside the issue body.
-Wrap verbose tables in `<details><summary>…</summary>` blocks.
-
 ### Report Template
 
 ```markdown
@@ -231,7 +227,7 @@ You **MUST** call one safe-output tool before finishing:
 ## agent: `run-analyzer`
 ---
 description: Parses a single run directory to extract sub-agent dispatch requests and actual models from api-proxy logs, then classifies model size correctness.
-model: gpt-5.4-mini
+model: mini
 ---
 You are a model-resolution analysis sub-agent.
 

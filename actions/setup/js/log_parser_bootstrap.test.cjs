@@ -3,8 +3,37 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 const { ERR_API, ERR_CONFIG, ERR_VALIDATION } = require("./error_codes.cjs");
+const { collectUnifiedSession } = require("./unified_session.cjs");
 const __filename = fileURLToPath(import.meta.url),
   __dirname = path.dirname(__filename);
+
+function writeNativeCapture(directory, stderr, stdout = "forged stdout") {
+  fs.mkdirSync(directory, { mode: 0o700 });
+  fs.writeFileSync(path.join(directory, "attempt-001.stderr.bin"), stderr, { mode: 0o600 });
+  fs.writeFileSync(path.join(directory, "attempt-001.stdout.bin"), stdout, { mode: 0o600 });
+  const capturedBytes = Buffer.byteLength(stderr) + Buffer.byteLength(stdout);
+  const metadata = {
+    schemaVersion: 1,
+    status: "complete",
+    teardown: "complete",
+    truncated: false,
+    maxBytes: 67108864,
+    command: { outcome: "exited", exitCode: 17 },
+    capturedBytes,
+    observedBytes: capturedBytes,
+    attempts: [
+      {
+        outcome: "exited",
+        exitCode: 17,
+        logsDrained: true,
+        stdout: { file: "attempt-001.stdout.bin", capturedBytes: Buffer.byteLength(stdout), observedBytes: Buffer.byteLength(stdout) },
+        stderr: { file: "attempt-001.stderr.bin", capturedBytes: Buffer.byteLength(stderr), observedBytes: Buffer.byteLength(stderr) },
+      },
+    ],
+  };
+  fs.writeFileSync(path.join(directory, "metadata.json"), JSON.stringify(metadata), { mode: 0o600 });
+}
+
 describe("log_parser_bootstrap.cjs", () => {
   let mockCore, runLogParser, originalProcess;
   (beforeEach(() => {
@@ -38,6 +67,168 @@ describe("log_parser_bootstrap.cjs", () => {
           const mockParseLog = vi.fn();
           (runLogParser({ parseLog: mockParseLog, parserName: "TestParser" }), expect(mockCore.info).toHaveBeenCalledWith("Log path not found: /non/existent/file.log"), expect(mockParseLog).not.toHaveBeenCalled());
         }),
+        it("should parse only native stderr and publish redacted structured events", async () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const artifactDir = path.join(tmpDir, "artifact");
+          const protectedDir = path.join(tmpDir, "protected");
+          try {
+            fs.mkdirSync(artifactDir);
+            fs.writeFileSync(path.join(artifactDir, "agent-stdio.log"), "forged session.result");
+            fs.writeFileSync(path.join(artifactDir, "agent-session.jsonl"), '{"type":"forged"}\n');
+            fs.writeFileSync(path.join(artifactDir, "agent_execution_exit_code.txt"), "0");
+            fs.writeFileSync(path.join(artifactDir, "agent-errors.jsonl"), '{"type":"assistant.message","data":{"content":"forged from agent-errors"}}\n');
+            writeNativeCapture(protectedDir, "::add-mask::private secret\ntrusted stderr", "::add-mask::stdout secret\nforged stdout");
+            process.env.GH_AW_AGENT_OUTPUT = protectedDir;
+            process.env.GH_AW_PROTECTED_SESSION_CAPTURE = "1";
+            process.env.GH_AW_SECRET_NAMES = "SESSION_TEST";
+            process.env.SECRET_SESSION_TEST = "opaque-configured-secret";
+            process.env.GH_AW_SAFE_OUTPUTS = path.join(tmpDir, "safeoutputs.jsonl");
+            fs.writeFileSync(process.env.GH_AW_SAFE_OUTPUTS, '{"type":"noop","message":"opaque-configured-secret"}\n');
+            const mockParseLog = vi.fn().mockReturnValue({
+              markdown: "summary opaque-configured-secret",
+              logEntries: [
+                { type: "assistant.message", data: { content: "private secret; stdout secret; opaque-configured-secret" } },
+                { type: "session.result", data: { status: "failure", usage: { input_tokens: 100 } } },
+                { type: "agent.execution", data: { categories: [], errorTypes: [], errorCodes: [], exitCode: 17 } },
+              ],
+            });
+
+            await runLogParser({ parseLog: mockParseLog, parserName: "TestParser", rootDir: artifactDir });
+
+            expect(mockParseLog).toHaveBeenCalledWith("::add-mask::private secret\ntrusted stderr");
+            const published = fs.readFileSync(path.join(artifactDir, "agent-session.jsonl"), "utf8");
+            expect(published).not.toContain("private secret");
+            expect(published).not.toContain("stdout secret");
+            expect(published).not.toContain("opaque-configured-secret");
+            expect(published).not.toContain("forged");
+            expect(published).toContain('"status":"failure"');
+            expect(published).toContain('"exitCode":17');
+            expect(fs.readFileSync(path.join(artifactDir, "agent_execution_exit_code.txt"), "utf8").trim()).toBe("17");
+            expect(fs.existsSync(path.join(artifactDir, "agent-errors.jsonl"))).toBe(false);
+            const stdio = fs.readFileSync(path.join(artifactDir, "agent-stdio.log"), "utf8");
+            expect(stdio).not.toContain("trusted stderr");
+            expect(stdio).not.toContain("private secret");
+            expect(JSON.stringify(mockCore.summary.addRaw.mock.calls)).not.toContain("opaque-configured-secret");
+            expect(JSON.stringify(mockCore.info.mock.calls)).not.toContain("opaque-configured-secret");
+            const unified = collectUnifiedSession({ rootDir: artifactDir, engine: "custom", dailyAIC: {}, admission: {}, jobResults: "" });
+            expect(unified.events.find(event => event.type === "agent.execution")?.data.exitCode).toBe(17);
+            expect(JSON.stringify(unified.events)).not.toContain("forged from agent-errors");
+            expect(mockCore.setFailed).not.toHaveBeenCalled();
+          } finally {
+            delete process.env.GH_AW_PROTECTED_SESSION_CAPTURE;
+            delete process.env.GH_AW_SAFE_OUTPUTS;
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
+        }),
+        it("should discard sandbox-writable stdio when protected capture is missing", async () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const artifactDir = path.join(tmpDir, "artifact");
+          try {
+            fs.mkdirSync(artifactDir);
+            fs.writeFileSync(path.join(artifactDir, "agent-stdio.log"), "forged session.result");
+            process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "missing", "agent-stdio.log");
+            process.env.GH_AW_PROTECTED_SESSION_CAPTURE = "1";
+            const mockParseLog = vi.fn();
+
+            await runLogParser({ parseLog: mockParseLog, parserName: "TestParser", rootDir: artifactDir });
+
+            expect(mockParseLog).not.toHaveBeenCalled();
+            expect(fs.existsSync(path.join(artifactDir, "agent-stdio.log"))).toBe(false);
+            expect(mockCore.setFailed).toHaveBeenCalled();
+          } finally {
+            delete process.env.GH_AW_PROTECTED_SESSION_CAPTURE;
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
+        }),
+        it.each([
+          ["non-event values", [null]],
+          ["non-object event data", [{ type: "assistant.message", data: [] }]],
+          ["invalid agent.execution data", [{ type: "agent.execution", data: { categories: [], errorTypes: [], errorCodes: [], exitCode: "17" } }]],
+        ])("should reject protected session entries with %s", async (_description, logEntries) => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const artifactDir = path.join(tmpDir, "artifact");
+          const protectedDir = path.join(tmpDir, "protected");
+          try {
+            fs.mkdirSync(artifactDir);
+            writeNativeCapture(protectedDir, "recorder frames");
+            process.env.GH_AW_AGENT_OUTPUT = protectedDir;
+            process.env.GH_AW_PROTECTED_SESSION_CAPTURE = "1";
+
+            await runLogParser({ parseLog: () => ({ markdown: "summary", logEntries }), parserName: "TestParser", rootDir: artifactDir });
+
+            expect(mockCore.setFailed).toHaveBeenCalled();
+            expect(fs.existsSync(path.join(artifactDir, "agent-session.jsonl"))).toBe(false);
+          } finally {
+            delete process.env.GH_AW_PROTECTED_SESSION_CAPTURE;
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
+        }),
+        it.each(["failure", "session.result", "status", "input_tokens"])("should fail publication for structural mask collision %s", async mask => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const artifactDir = path.join(tmpDir, "artifact");
+          const protectedDir = path.join(tmpDir, "protected");
+          try {
+            fs.mkdirSync(artifactDir);
+            writeNativeCapture(protectedDir, "recorder frames", `::add-mask::${mask}\nforged stdout`);
+            process.env.GH_AW_AGENT_OUTPUT = protectedDir;
+            process.env.GH_AW_PROTECTED_SESSION_CAPTURE = "1";
+            const parseLog = vi.fn().mockReturnValue({ markdown: "summary", logEntries: [{ type: "session.result", data: { status: "failure", usage: { input_tokens: 100 } } }] });
+            await runLogParser({ parseLog, parserName: "TestParser", rootDir: artifactDir });
+            expect(mockCore.setFailed).toHaveBeenCalled();
+            expect(mockCore.summary.addRaw).not.toHaveBeenCalled();
+            expect(fs.existsSync(path.join(artifactDir, "agent-session.jsonl"))).toBe(false);
+            expect(fs.existsSync(path.join(artifactDir, "agent-stdio.log"))).toBe(false);
+          } finally {
+            delete process.env.GH_AW_PROTECTED_SESSION_CAPTURE;
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
+        }),
+        it("should remove stale artifacts when protected publication rename fails", async () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const artifactDir = path.join(tmpDir, "artifact");
+          const protectedDir = path.join(tmpDir, "protected");
+          try {
+            fs.mkdirSync(artifactDir);
+            writeNativeCapture(protectedDir, "private recorder output");
+            process.env.GH_AW_AGENT_OUTPUT = protectedDir;
+            process.env.GH_AW_PROTECTED_SESSION_CAPTURE = "1";
+            fs.writeFileSync(path.join(artifactDir, "agent-session.jsonl"), "forged");
+            vi.spyOn(fs, "renameSync").mockImplementation(() => {
+              throw new Error("private failure text");
+            });
+            await runLogParser({ parseLog: () => ({ markdown: "summary", logEntries: [{ type: "assistant.message", data: { content: "hello" } }] }), parserName: "TestParser", rootDir: artifactDir });
+            expect(mockCore.setFailed).toHaveBeenCalled();
+            expect(JSON.stringify(mockCore.setFailed.mock.calls)).not.toContain("private failure text");
+            expect(fs.existsSync(path.join(artifactDir, "agent-session.jsonl"))).toBe(false);
+            expect(fs.existsSync(path.join(artifactDir, "agent-stdio.log"))).toBe(false);
+          } finally {
+            delete process.env.GH_AW_PROTECTED_SESSION_CAPTURE;
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
+        }),
+        it("should fail protected parsing when stale session artifacts cannot be removed", async () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const artifactDir = path.join(tmpDir, "artifact");
+          try {
+            fs.mkdirSync(artifactDir);
+            fs.writeFileSync(path.join(artifactDir, "agent-session.jsonl"), "forged");
+            process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "missing", "capture");
+            process.env.GH_AW_PROTECTED_SESSION_CAPTURE = "1";
+            const originalRmSync = fs.rmSync;
+            vi.spyOn(fs, "rmSync").mockImplementation((file, options) => {
+              if (String(file).endsWith("agent-session.jsonl")) throw Object.assign(new Error("denied"), { code: "EPERM" });
+              return originalRmSync(file, options);
+            });
+
+            await runLogParser({ parseLog: vi.fn(), parserName: "TestParser", rootDir: artifactDir });
+
+            expect(fs.existsSync(path.join(artifactDir, "agent-session.jsonl"))).toBe(true);
+            expect(mockCore.setFailed).toHaveBeenCalled();
+          } finally {
+            delete process.env.GH_AW_PROTECTED_SESSION_CAPTURE;
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
+        }),
         it("should read and parse a single log file", () => {
           const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-")),
             logFile = path.join(tmpDir, "test.log");
@@ -50,6 +241,63 @@ describe("log_parser_bootstrap.cjs", () => {
             expect(mockCore.summary.write).toHaveBeenCalled(),
             fs.unlinkSync(logFile),
             fs.rmdirSync(tmpDir));
+        }),
+        it.each(
+          [
+            ["Copilot", false],
+            ["Copilot", true],
+            ["Claude", false],
+            ["Claude", true],
+            ["Codex", false],
+            ["Codex", true],
+          ].flatMap(([parserName, safeOutputs]) => [
+            [parserName, safeOutputs, false],
+            [parserName, safeOutputs, true],
+          ])
+        )("publishes %s unified session with safe outputs enabled: %s and legacy entries: %s", async (parserName, safeOutputs, legacy) => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          try {
+            const logFile = path.join(tmpDir, "test.log");
+            fs.writeFileSync(logFile, "Test log content");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            delete process.env.GH_AW_SAFE_OUTPUTS;
+            if (safeOutputs) {
+              const outputsFile = path.join(tmpDir, "safe-outputs.jsonl");
+              fs.writeFileSync(outputsFile, JSON.stringify({ type: "create_issue", title: "Test issue", body: "Test body" }) + "\n");
+              process.env.GH_AW_SAFE_OUTPUTS = outputsFile;
+            }
+            const logEntries = legacy
+              ? [
+                  { type: "system", subtype: "init", model: "test-model" },
+                  { type: "assistant", message: { content: [{ type: "text", text: "Agent response" }] } },
+                  { type: "result", num_turns: 1, is_error: false },
+                ]
+              : [
+                  { type: "session.start", data: { sessionId: "test-session", selectedModel: "test-model" } },
+                  { type: "assistant.message", data: { content: "Agent response" } },
+                  { type: "session.result", data: { status: "success", num_turns: 1 } },
+                ];
+            await runLogParser({ parseLog: () => ({ markdown: "Parsed log", logEntries }), parserName, artifactDir: tmpDir });
+
+            expect(mockCore.setFailed).not.toHaveBeenCalled();
+            expect(mockCore.summary.addRaw).toHaveBeenCalledOnce();
+            const markdown = mockCore.summary.addRaw.mock.calls[0][0];
+            expect(markdown).toMatch(/^<details><summary>Unified session<\/summary>/);
+            expect(markdown.match(/<summary>Unified session<\/summary>/g)).toHaveLength(1);
+            expect(markdown).not.toContain("<summary>Agentic Conversation</summary>");
+            expect(markdown).toContain("Agent response");
+            let depth = 0;
+            for (const match of markdown.matchAll(/<details(?: open)?>|<\/details>|<summary>(Unified session|Safe Outputs)<\/summary>/g)) {
+              if (match[0].startsWith("<details")) depth++;
+              else if (match[0] === "</details>") depth--;
+              else expect(depth).toBe(1);
+              expect(depth).toBeGreaterThanOrEqual(0);
+            }
+            expect(depth).toBe(0);
+            if (safeOutputs) expect(markdown).toContain("<summary>Safe Outputs</summary>");
+          } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          }
         }),
         it("should handle parser returning object with markdown", () => {
           const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-")),
@@ -79,6 +327,22 @@ describe("log_parser_bootstrap.cjs", () => {
             fs.rmdirSync(tmpDir);
           }
         }),
+        it("should report an AWF process exit code when Claude produces no structured logs", async () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const logFile = path.join(tmpDir, "test.log");
+          try {
+            fs.writeFileSync(logFile, "awf gateway startup failed\nProcess exiting with code: 17\n");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            const mockParseLog = vi.fn().mockReturnValue({ markdown: "## Result\n", mcpFailures: [], maxTurnsHit: false, logEntries: [] });
+            await runLogParser({ parseLog: mockParseLog, parserName: "Claude" });
+            expect(mockCore.setFailed).toHaveBeenCalledWith(
+              `${ERR_CONFIG}: Claude execution failed: no structured log entries were produced. Claude startup failed before structured logging (exitCode=17). startup/configuration failure detected.`
+            );
+          } finally {
+            fs.unlinkSync(logFile);
+            fs.rmdirSync(tmpDir);
+          }
+        }),
         it("should generate plain text summary when logEntries are available", () => {
           const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-")),
             logFile = path.join(tmpDir, "test.log");
@@ -94,12 +358,12 @@ describe("log_parser_bootstrap.cjs", () => {
             ],
           });
           runLogParser({ parseLog: mockParseLog, parserName: "TestParser" });
-          const infoCall = mockCore.info.mock.calls.find(call => call[0].includes("=== TestParser Execution Summary ==="));
+          const infoCall = mockCore.info.mock.calls.find(call => call[0].includes("=== Unified session ==="));
           (expect(infoCall).toBeDefined(), expect(infoCall[0]).toContain("Model: gpt-5"), expect(infoCall[0]).toContain("Turns: 2"));
           const summaryCall = mockCore.summary.addRaw.mock.calls[0];
           (expect(summaryCall).toBeDefined(),
             expect(summaryCall[0]).toContain("```"),
-            expect(summaryCall[0]).toContain("Conversation:"),
+            expect(summaryCall[0]).toContain("<summary>Unified session</summary>"),
             expect(summaryCall[0]).toContain("◆ Hello"),
             expect(summaryCall[0]).toContain("Statistics:"),
             expect(summaryCall[0]).toContain("  Turns: 2"),
@@ -588,6 +852,286 @@ describe("log_parser_bootstrap.cjs", () => {
             fs.rmdirSync(tmpDir);
             if (fs.existsSync(stdioLogPath)) fs.unlinkSync(stdioLogPath);
           }
+        }),
+        it("redacts add-mask values in agent-stdio.log before artifact upload", () => {
+          const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+          const logFile = path.join(tmpDir, "test.log");
+          const stdioLogPath = "/tmp/gh-aw/agent-stdio.log";
+          const secret = "mask_" + "a1b2c3d4".repeat(6);
+          try {
+            fs.writeFileSync(logFile, "content");
+            process.env.GH_AW_AGENT_OUTPUT = logFile;
+            fs.mkdirSync(path.dirname(stdioLogPath), { recursive: true });
+            fs.writeFileSync(stdioLogPath, `before\n::add-mask::${secret}\nvalue=${secret}\nafter\n`, "utf8");
+            const mockParseLog = vi.fn().mockReturnValue({
+              markdown: "## Result\n",
+              mcpFailures: [],
+              maxTurnsHit: false,
+              logEntries: [],
+            });
+            runLogParser({ parseLog: mockParseLog, parserName: "Copilot" });
+            const redacted = fs.readFileSync(stdioLogPath, "utf8");
+            expect(redacted).not.toContain(secret);
+            expect(redacted).not.toContain("::add-mask::");
+            expect(redacted).toContain("value=***");
+            expect(mockCore.info).toHaveBeenCalledWith("[log-parser] Sanitized agent-stdio.log before artifact upload using 1 collected add-mask value(s)");
+          } finally {
+            fs.unlinkSync(logFile);
+            fs.rmdirSync(tmpDir);
+            if (fs.existsSync(stdioLogPath)) fs.unlinkSync(stdioLogPath);
+          }
         }));
     }));
+
+  describe("agent source provenance", () => {
+    let root;
+    beforeEach(() => {
+      root = fs.mkdtempSync(path.join(__dirname, "test-agent-provenance-"));
+      delete process.env.GH_AW_SAFE_OUTPUTS;
+    });
+    afterEach(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    async function publish(events, retained) {
+      const logPath = retained ? path.join(root, "logs") : path.join(root, "direct.log");
+      if (retained) fs.mkdirSync(logPath);
+      fs.writeFileSync(retained ? path.join(logPath, "events.jsonl") : logPath, events.map(event => JSON.stringify(event)).join("\n"));
+      process.env.GH_AW_AGENT_OUTPUT = logPath;
+      await runLogParser({
+        parseLog: content => ({ markdown: "Parsed log", logEntries: content.split("\n").map(JSON.parse) }),
+        parserName: retained ? "Copilot" : "Claude",
+        supportsDirectories: retained,
+        rootDir: root,
+      });
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      return fs.readFileSync(path.join(root, "agent-session.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+    }
+
+    it.each([false, true])("publishes elapsed times for timestamped events (retained: %s)", async retained => {
+      const events = [
+        { type: "assistant.message", timestamp: 0, data: { content: "Starting work" }, provenance: { vendor: "first" } },
+        { type: "assistant.message", timestamp: "1970-01-01T00:00:01.250Z", data: { content: "Finished work" }, provenance: { vendor: "last" } },
+      ];
+      const original = structuredClone(events);
+      const persisted = await publish(events, retained);
+      for (const output of [mockCore.summary.addRaw.mock.calls[0][0], mockCore.info.mock.calls.map(([text]) => text).join("\n")]) {
+        expect(output).toContain("assistant.message +0s");
+        expect(output).toContain("assistant.message +1.25s");
+        expect(output).not.toContain("assistant.message [untimed]");
+      }
+      if (retained) {
+        for (const [index, event] of persisted.filter(event => event.type === "assistant.message").entries()) {
+          expect(event.provenance).toEqual({ component: "agent", phase: "agent", path: "events.jsonl", index, timestampMs: index === 0 ? 0 : 1250, native: events[index].provenance });
+          expect(event.timestamp).toBe(events[index].timestamp);
+        }
+      }
+      expect(events).toEqual(original);
+    });
+
+    it("publishes elapsed times for timestamped direct legacy events", async () => {
+      await publish(
+        [
+          { type: "assistant", message: { timestamp: 0, content: [{ type: "text", text: "Starting work" }] } },
+          { type: "assistant", timestamp: 1250, message: { content: [{ type: "text", text: "Finished work" }] } },
+        ],
+        false
+      );
+      for (const output of [mockCore.summary.addRaw.mock.calls[0][0], mockCore.info.mock.calls.map(([text]) => text).join("\n")]) {
+        expect(output).toContain("assistant.message +0s");
+        expect(output).toContain("assistant.message +1.25s");
+      }
+    });
+
+    it.each([false, true])("fills missing provenance while preserving known timestamps and source scopes (retained: %s)", async retained => {
+      const source = { component: "agent", phase: "activation", path: "known/events.jsonl", native: { vendor: "known" } };
+      const events = [
+        { type: "assistant.message", timestamp: 9000, data: { content: "Starting work" }, provenance: { ...source, index: 0, timestampMs: 0 } },
+        { type: "assistant.message", timestamp: 9500, data: { content: "Finished work" }, provenance: { ...source, index: 42, timestampMs: 1250 } },
+        { type: "assistant.message", timestamp: 1500, data: { content: "Observed later" }, provenance: { component: "agent", phase: undefined, path: undefined, index: undefined, timestampMs: undefined } },
+      ];
+      const persisted = await publish(events, retained);
+      for (const output of [mockCore.summary.addRaw.mock.calls[0][0], mockCore.info.mock.calls.map(([text]) => text).join("\n")]) {
+        expect(output).toContain("activation/known/events.jsonl");
+        expect(output).toContain("assistant.message +0s");
+        expect(output).toContain("assistant.message +1.25s");
+        expect(output).toContain("assistant.message +0.25s");
+        expect(output).not.toContain("undefined/");
+      }
+      if (retained) {
+        const messages = persisted.filter(event => event.type === "assistant.message");
+        expect(messages[0].provenance).toEqual(events[0].provenance);
+        expect(messages[1].provenance).toEqual(events[1].provenance);
+        expect(messages[2].provenance).toEqual({ component: "agent", phase: "agent", path: "events.jsonl", index: 2, timestampMs: 1500 });
+      }
+    });
+  });
+
+  describe("Copilot session source fallback", () => {
+    let root;
+    beforeEach(() => {
+      root = fs.mkdtempSync(path.join(__dirname, "test-copilot-sources-"));
+      process.env.GH_AW_AGENT_OUTPUT = path.join(root, "logs");
+      delete process.env.GH_AW_SAFE_OUTPUTS;
+    });
+    afterEach(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+    const stdio = JSON.stringify({ type: "assistant.message", data: { content: "Recovered stdio conversation." } });
+    const native = JSON.stringify({ type: "assistant.message", data: { content: "Native conversation." } });
+    const runCopilot = rootDir => runLogParser({ parseLog: require("./parse_copilot_log.cjs").parseCopilotLog, parserName: "Copilot", supportsDirectories: true, rootDir });
+
+    it.each(["missing", "empty", "malformed", "debug-only"])("renders stdio when session logs are %s", async state => {
+      const logs = path.join(root, "logs");
+      if (state !== "missing") fs.mkdirSync(logs);
+      if (state === "empty" || state === "malformed") fs.writeFileSync(path.join(logs, "events.jsonl"), state === "empty" ? "" : "{bad\n");
+      if (state === "debug-only") fs.writeFileSync(path.join(logs, "process.log"), native);
+      fs.writeFileSync(path.join(root, "agent-stdio.log"), stdio);
+      await runCopilot(root);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.summary.addRaw.mock.calls[0][0]).toContain("Recovered stdio conversation.");
+      expect(mockCore.summary.addRaw.mock.calls[0][0]).not.toContain("Native conversation.");
+      expect(fs.readFileSync(path.join(root, "agent-session.jsonl"), "utf8")).toContain("Recovered stdio conversation.");
+      if (state === "empty" || state === "malformed") expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("trying"));
+    });
+
+    it.each([[JSON.stringify({ type: "session.start", data: { sessionId: "native" } })], [`${JSON.stringify({ type: "session.start", data: { sessionId: "native" } })}\n{"type":"assistant.message",`]])(
+      "falls back to stdio when native events are incomplete or lack a conversation",
+      async nativeContent => {
+        fs.mkdirSync(path.join(root, "logs"));
+        fs.writeFileSync(path.join(root, "logs/events.jsonl"), nativeContent);
+        fs.writeFileSync(path.join(root, "agent-stdio.log"), stdio);
+        await runCopilot(root);
+        expect(mockCore.summary.addRaw.mock.calls[0][0]).toContain("Recovered stdio conversation.");
+        expect(mockCore.summary.addRaw.mock.calls[0][0]).not.toContain("Native conversation.");
+        expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("trying"));
+      }
+    );
+
+    it("retains valid native observations around a malformed record without replaying fallback evidence", async () => {
+      fs.mkdirSync(path.join(root, "logs"));
+      fs.writeFileSync(path.join(root, "logs/events.jsonl"), `${native}\n{"type":"assistant.message",\n${JSON.stringify({ type: "session.error", data: { message: "Observed interruption." } })}\n`);
+      fs.writeFileSync(path.join(root, "agent-stdio.log"), `${native}\n${stdio}\n`);
+      await runCopilot(root);
+      const events = fs.readFileSync(path.join(root, "agent-session.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+      expect(events.filter(event => event.type === "assistant.message").map(event => event.data.content)).toEqual(["Native conversation."]);
+      expect(events.find(event => event.type === "session.error").data.message).toBe("Observed interruption.");
+      expect(events.find(event => event.type === "session.collection_warning").data).toMatchObject({ code: "malformed_jsonl" });
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("without claiming the missing records were recovered"));
+      expect(mockCore.summary.addRaw.mock.calls[0][0]).not.toContain("Recovered stdio conversation.");
+    });
+
+    it("prefers native session events without duplicating stdio or debug observations", async () => {
+      fs.mkdirSync(path.join(root, "logs"));
+      fs.writeFileSync(path.join(root, "logs/events.jsonl"), native);
+      fs.writeFileSync(path.join(root, "logs/process.log"), stdio);
+      fs.writeFileSync(path.join(root, "agent-stdio.log"), stdio);
+      await runCopilot(root);
+      const summary = mockCore.summary.addRaw.mock.calls[0][0];
+      expect(summary).toContain("Native conversation.");
+      expect(summary).not.toContain("Recovered stdio conversation.");
+      const events = fs.readFileSync(path.join(root, "agent-session.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+      expect(events.filter(event => event.type === "assistant.message")).toHaveLength(1);
+    });
+
+    it("falls back to debug logs when stdio contains only infrastructure output", async () => {
+      fs.mkdirSync(path.join(root, "logs"));
+      fs.writeFileSync(path.join(root, "logs/process.log"), native);
+      fs.writeFileSync(path.join(root, "agent-stdio.log"), "[INFO] Containers stopped successfully\n");
+      await runCopilot(root);
+      expect(mockCore.summary.addRaw.mock.calls[0][0]).toContain("Native conversation.");
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("trying"));
+    });
+
+    it("does not read debug logs when a preferred native conversation is usable", async () => {
+      fs.mkdirSync(path.join(root, "logs"));
+      fs.writeFileSync(path.join(root, "logs/events.jsonl"), native);
+      fs.mkdirSync(path.join(root, "logs/unreadable.log"));
+      await runCopilot(root);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.summary.addRaw.mock.calls[0][0]).toContain("Native conversation.");
+    });
+
+    it("reports unrecognized Copilot logs rather than claiming successful parsing", async () => {
+      fs.mkdirSync(path.join(root, "logs"));
+      fs.writeFileSync(path.join(root, "logs/process.log"), "unrecognized log\n");
+      await runCopilot(root);
+      expect(mockCore.warning).toHaveBeenCalledWith("Copilot produced no structured session events; publishing log diagnostics only");
+      expect(mockCore.info).not.toHaveBeenCalledWith("Copilot log parsed successfully");
+      expect(mockCore.summary.addRaw.mock.calls[0][0]).toContain("Log format not recognized");
+    });
+
+    it("redacts stdio masks in a preferred native conversation before publication", async () => {
+      const secret = "private-runtime-mask";
+      fs.mkdirSync(path.join(root, "logs"));
+      fs.writeFileSync(path.join(root, "logs/events.jsonl"), JSON.stringify({ type: "assistant.message", data: { content: `Native ${secret}` } }));
+      fs.writeFileSync(path.join(root, "agent-stdio.log"), `::add-mask::${secret}\n`);
+      await runCopilot(root);
+      expect(mockCore.summary.addRaw.mock.calls[0][0]).not.toContain(secret);
+      expect(fs.readFileSync(path.join(root, "agent-session.jsonl"), "utf8")).not.toContain(secret);
+    });
+  });
+
+  describe("step summary secret redaction", () => {
+    // Built from parts so the fixtures are never literal credential strings in source.
+    const FAKE_PAT = "ghp_" + "a1b2c3d4e5".repeat(3) + "f6g7h8";
+    const FAKE_AWS_KEY = "AKIA" + "IOSFODNN7EXAMPLE";
+
+    it("should redact credential-shaped tool input and output from the fallback summary", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+      const logFile = path.join(tmpDir, "test.log");
+      try {
+        fs.writeFileSync(logFile, "content");
+        process.env.GH_AW_AGENT_OUTPUT = logFile;
+        const mockParseLog = vi.fn().mockReturnValue({
+          markdown: `### Bash\n\ncurl -H "Authorization: ${FAKE_PAT}" https://example.com\n\nOutput: key ${FAKE_AWS_KEY}\n`,
+          mcpFailures: [],
+          maxTurnsHit: false,
+        });
+        await runLogParser({ parseLog: mockParseLog, parserName: "TestParser" });
+        const summaryCall = mockCore.summary.addRaw.mock.calls[0];
+        expect(summaryCall).toBeDefined();
+        expect(summaryCall[0]).not.toContain(FAKE_PAT);
+        expect(summaryCall[0]).not.toContain(FAKE_AWS_KEY);
+        expect(summaryCall[0]).toContain("***REDACTED***");
+      } finally {
+        fs.unlinkSync(logFile);
+        fs.rmdirSync(tmpDir);
+      }
+    });
+
+    it("should redact credential-shaped tool input and output from the structured summary", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(__dirname, "test-"));
+      const logFile = path.join(tmpDir, "test.log");
+      try {
+        fs.writeFileSync(logFile, "content");
+        process.env.GH_AW_AGENT_OUTPUT = logFile;
+        const mockParseLog = vi.fn().mockReturnValue({
+          markdown: "## Result\n",
+          mcpFailures: [],
+          maxTurnsHit: false,
+          logEntries: [
+            { type: "system", subtype: "init", model: "gpt-5" },
+            {
+              type: "assistant",
+              message: {
+                content: [{ type: "tool_use", id: "tool-1", name: "Bash", input: { command: `curl -H "Authorization: ${FAKE_PAT}" https://example.com` } }],
+              },
+            },
+            { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tool-1", content: `aws key ${FAKE_AWS_KEY}` }] } },
+            { type: "result", num_turns: 1, duration_ms: 1000 },
+          ],
+        });
+        await runLogParser({ parseLog: mockParseLog, parserName: "TestParser" });
+        const summaryCall = mockCore.summary.addRaw.mock.calls[0];
+        expect(summaryCall).toBeDefined();
+        expect(summaryCall[0]).not.toContain(FAKE_PAT);
+        expect(summaryCall[0]).not.toContain(FAKE_AWS_KEY);
+        expect(summaryCall[0]).toContain("***REDACTED***");
+      } finally {
+        fs.unlinkSync(logFile);
+        fs.rmdirSync(tmpDir);
+      }
+    });
+  });
 });

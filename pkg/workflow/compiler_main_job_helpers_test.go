@@ -3,8 +3,12 @@
 package workflow
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -118,6 +122,74 @@ func TestBuildMainJobDependencies(t *testing.T) {
 		assert.NotContains(t, depends, "pre_act_job")
 	})
 
+	t.Run("post-agent jobs are excluded even when referenced", func(t *testing.T) {
+		c := NewCompiler()
+		data := &WorkflowData{
+			Jobs: map[string]any{
+				"prepare": map[string]any{"needs": "activation"},
+				"middle":  map[string]any{"needs": "agent"},
+				"release": map[string]any{"needs": []any{"middle", "prepare"}},
+				"report":  map[string]any{"needs": []string{"release"}},
+			},
+			MarkdownContent: "${{ needs.release.outputs.id }}",
+			CustomSteps:     "run: echo ${{ needs.middle.result }}",
+			EngineConfig: &EngineConfig{
+				Env: map[string]string{"REPORT": "${{ needs.report.result }}"},
+			},
+		}
+		depends, _ := c.buildMainJobDependencies(data, true)
+		assert.Equal(t, []string{"activation", "prepare"}, depends)
+		assert.Equal(t, depends, data.AgentJobNeeds)
+	})
+
+	t.Run("maintenance-dependent jobs are excluded even when referenced", func(t *testing.T) {
+		for job, dependency := range constants.MaintenanceJobDependencies {
+			if dependency != constants.AgentJobName {
+				continue
+			}
+			t.Run(job, func(t *testing.T) {
+				c := NewCompiler()
+				data := &WorkflowData{
+					Jobs: map[string]any{
+						"publish": map[string]any{"needs": []any{job}},
+					},
+					MarkdownContent: "${{ needs.publish.outputs.id }}",
+					CustomSteps:     "run: echo ${{ needs.publish.result }}",
+					EngineConfig: &EngineConfig{
+						Env: map[string]string{"PUBLISH": "${{ needs.publish.result }}"},
+					},
+				}
+				depends, _ := c.buildMainJobDependencies(data, true)
+				assert.Equal(t, []string{"activation"}, depends)
+				assert.Equal(t, depends, data.AgentJobNeeds)
+			})
+		}
+	})
+
+	t.Run("authored maintenance names remain agent prerequisites", func(t *testing.T) {
+		for job := range constants.MaintenanceJobDependencies {
+			t.Run(job, func(t *testing.T) {
+				c := NewCompiler()
+				data := &WorkflowData{Jobs: map[string]any{
+					job:       map[string]any{"runs-on": "ubuntu-latest"},
+					"publish": map[string]any{"needs": []any{job}},
+				}}
+				depends, _ := c.buildMainJobDependencies(data, true)
+				assert.Contains(t, depends, job)
+				assert.Contains(t, depends, "publish")
+			})
+		}
+	})
+
+	t.Run("experiment persistence does not imply an agent dependency", func(t *testing.T) {
+		c := NewCompiler()
+		data := &WorkflowData{Jobs: map[string]any{
+			"publish": map[string]any{"needs": []any{"push_experiments_state"}},
+		}}
+		depends, _ := c.buildMainJobDependencies(data, true)
+		assert.Contains(t, depends, "publish")
+	})
+
 	t.Run("builtin job names are never added to depends", func(t *testing.T) {
 		c := NewCompiler()
 		data := &WorkflowData{
@@ -138,6 +210,15 @@ func TestBuildMainJobDependencies(t *testing.T) {
 		assert.Equal(t, 1, count, "activation should appear exactly once in depends")
 	})
 
+	t.Run("job depending on both activation phases still runs before agent", func(t *testing.T) {
+		c := NewCompiler()
+		data := &WorkflowData{Jobs: map[string]any{
+			"prepare": map[string]any{"needs": []any{"pre_activation", "activation"}},
+		}}
+		depends, _ := c.buildMainJobDependencies(data, true)
+		assert.Contains(t, depends, "prepare")
+	})
+
 	t.Run("engine env content is returned for builtin-reference warning use", func(t *testing.T) {
 		c := NewCompiler()
 		data := &WorkflowData{
@@ -151,18 +232,103 @@ func TestBuildMainJobDependencies(t *testing.T) {
 	})
 }
 
+func TestCompileCustomJobAfterRepoMemory(t *testing.T) {
+	for _, needs := range []string{"push_repo_memory", "agent, push_repo_memory"} {
+		t.Run(needs, func(t *testing.T) {
+			workflow := fmt.Sprintf(`---
+on:
+  workflow_dispatch:
+engine: copilot
+permissions:
+  contents: read
+tools:
+  repo-memory:
+    branch-name: memory/demo
+jobs:
+  publish:
+    needs: [%s]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "publish what the agent saved"
+---
+Write a note to repo memory.
+`, needs)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "demo.md")
+			require.NoError(t, os.WriteFile(path, []byte(workflow), 0644))
+			require.NoError(t, NewCompiler().CompileWorkflow(path))
+
+			content, err := os.ReadFile(filepath.Join(dir, "demo.lock.yml"))
+			require.NoError(t, err)
+			var lock struct {
+				Jobs map[string]struct {
+					Needs any `yaml:"needs"`
+				} `yaml:"jobs"`
+			}
+			require.NoError(t, yaml.Unmarshal(content, &lock))
+			require.Contains(t, lock.Jobs, "agent")
+			require.Contains(t, lock.Jobs, "publish")
+			require.Contains(t, lock.Jobs, "push_repo_memory")
+			assert.NotContains(t, lock.Jobs["agent"].Needs, "publish")
+			assert.Contains(t, lock.Jobs["push_repo_memory"].Needs, "agent")
+			expected := []any{"push_repo_memory"}
+			if needs != "push_repo_memory" {
+				expected = []any{"agent", "push_repo_memory"}
+			}
+			publishNeeds := lock.Jobs["publish"].Needs
+			if single, ok := publishNeeds.(string); ok {
+				publishNeeds = []any{single}
+			}
+			assert.Equal(t, expected, publishNeeds)
+		})
+	}
+}
+
+func TestGetJobsDependingOnAgent(t *testing.T) {
+	jobs := map[string]any{
+		"middle":   map[string]any{"needs": "agent"},
+		"release":  map[string]any{"needs": []any{"middle", "prepare", "report"}},
+		"report":   map[string]any{"needs": []string{"release"}},
+		"prepare":  map[string]any{"needs": "activation"},
+		"cycle_a":  map[string]any{"needs": "cycle_b"},
+		"cycle_b":  map[string]any{"needs": "cycle_a"},
+		"missing":  map[string]any{"needs": "unknown"},
+		"no_needs": map[string]any{},
+		"invalid":  "not a job",
+	}
+	assert.Equal(t, map[string]struct{}{
+		"agent": {}, "middle": {}, "release": {}, "report": {},
+	}, getJobsDependingOnAgent(jobs))
+	assert.Equal(t, map[string]struct{}{"agent": {}}, getJobsDependingOnAgent(nil))
+}
+
 // TestBuildMainJobOutputs tests that the output map contains expected keys under various config.
 func TestBuildMainJobOutputs(t *testing.T) {
+	t.Run("PR checkout invalidation is distinct from ordinary checkout failure", func(t *testing.T) {
+		data := &WorkflowData{AI: "copilot", Permissions: "permissions:\n  contents: read"}
+		outputs := NewCompiler().buildMainJobOutputs(data)
+		assert.Equal(t, "${{ steps.checkout-pr.outputs.checkout_pr_invalidated || 'false' }}", outputs["checkout_pr_invalidated"])
+		data.CheckoutDisabled = true
+		assert.NotContains(t, NewCompiler().buildMainJobOutputs(data), "checkout_pr_invalidated")
+	})
 	t.Run("core outputs are always present", func(t *testing.T) {
 		c := NewCompiler()
 		data := &WorkflowData{AI: "copilot"}
 		outputs := c.buildMainJobOutputs(data)
 		require.NotNil(t, outputs)
 		assert.Contains(t, outputs, "model")
-		assert.Contains(t, outputs, "effective_tokens")
 		assert.Contains(t, outputs, "aic")
+		assert.NotContains(t, outputs, "effective_tokens")
 		assert.Contains(t, outputs, "setup-trace-id")
 		assert.Contains(t, outputs, "invocation_cap_exceeded")
+	})
+
+	t.Run("firewall-disabled non-Copilot workflows use MCP gateway outputs", func(t *testing.T) {
+		c := NewCompiler()
+		data := &WorkflowData{AI: "claude", SandboxConfig: &SandboxConfig{Agent: &AgentSandboxConfig{Disabled: true}}}
+		outputs := c.buildMainJobOutputs(data)
+		assert.Equal(t, "${{ steps.parse-mcp-gateway.outputs.aic }}", outputs["aic"])
+		assert.Equal(t, "${{ steps.parse-mcp-gateway.outputs.ambient_context }}", outputs["ambient_context"])
 	})
 
 	t.Run("safe-outputs fields added when SafeOutputs set", func(t *testing.T) {
@@ -222,6 +388,8 @@ func TestBuildMainJobEnv(t *testing.T) {
 		require.NotNil(t, env)
 		assert.Contains(t, env, "GH_AW_MCP_LOG_DIR")
 		assert.Contains(t, env, "DEFAULT_BRANCH")
+		assert.Equal(t, `""`, env["GH_AW_TARGET_REPO_SLUG"],
+			"the gateway target repository placeholder must resolve outside trial mode")
 	})
 
 	t.Run("upload-assets sets asset env vars", func(t *testing.T) {
@@ -249,6 +417,16 @@ func TestBuildMainJobEnv(t *testing.T) {
 		env := c.buildMainJobEnv(data)
 		require.NotNil(t, env)
 		assert.NotEmpty(t, env["GH_AW_WORKFLOW_ID_SANITIZED"])
+	})
+
+	t.Run("engine version is available to all agent job steps", func(t *testing.T) {
+		c := NewCompiler()
+		data := &WorkflowData{
+			EngineConfig: &EngineConfig{Version: "${{ inputs.engine-version }}"},
+		}
+		env := c.buildMainJobEnv(data)
+		require.NotNil(t, env)
+		assert.Equal(t, `"${{ inputs.engine-version }}"`, env["GH_AW_ENGINE_VERSION"])
 	})
 
 	t.Run("UTC offset from repo config sets GH_AW_PROJECT_UTC", func(t *testing.T) {
@@ -330,6 +508,41 @@ func TestBuildMainJobPermissions(t *testing.T) {
 		}
 		_, err := c.buildMainJobPermissions(data)
 		require.NoError(t, err)
+	})
+
+	t.Run("graders preserve declared permissions", func(t *testing.T) {
+		c := NewCompiler()
+		graders, err := ParseGradersFromFrontmatter(map[string]any{})
+		require.NoError(t, err)
+		data := &WorkflowData{Graders: graders}
+		data.Permissions = "permissions:\n  contents: read"
+		perms, err := c.buildMainJobPermissions(data)
+		require.NoError(t, err)
+		assert.NotContains(t, perms, "actions: read")
+		assert.Contains(t, perms, "contents: read")
+	})
+
+	t.Run("graders allow explicit empty permissions", func(t *testing.T) {
+		c := NewCompiler()
+		graders, err := ParseGradersFromFrontmatter(map[string]any{})
+		require.NoError(t, err)
+		data := &WorkflowData{Graders: graders}
+		data.Permissions = "permissions: {}"
+		_, err = c.buildMainJobPermissions(data)
+		require.NoError(t, err)
+	})
+
+	t.Run("disabled grader does not add actions read", func(t *testing.T) {
+		c := NewCompiler()
+		disabled := false
+		graders, err := ParseGradersFromFrontmatter(map[string]any{})
+		require.NoError(t, err)
+		data := &WorkflowData{Graders: graders}
+		data.Permissions = "permissions:\n  contents: read"
+		data.Graders.Graders["loops"].Enabled = &disabled
+		perms, err := c.buildMainJobPermissions(data)
+		require.NoError(t, err)
+		assert.NotContains(t, perms, "actions: read")
 	})
 }
 

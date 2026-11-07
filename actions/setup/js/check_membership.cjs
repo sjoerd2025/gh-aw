@@ -1,9 +1,19 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { parseRequiredPermissions, parseAllowedBots, checkRepositoryPermission, checkBotStatus, isAllowedBot, isConfusedDeputyAttack } = require("./check_permissions_utils.cjs");
+const { parseRequiredPermissions, parseAllowedBots, canonicalizeBotIdentifier, checkRepositoryPermission, checkBotStatus, isAllowedBot, isConfusedDeputyAttack } = require("./check_permissions_utils.cjs");
 const { writeDenialSummary } = require("./pre_activation_summary.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { withRetry, isTransientError } = require("./error_recovery.cjs");
+
+function isCopilotPullRequestActor(eventName, actor) {
+  if (eventName !== "pull_request" && eventName !== "pull_request_target") {
+    return false;
+  }
+  const canonicalActor = canonicalizeBotIdentifier(actor);
+  const copilotBotNames = process.env.GH_AW_COPILOT_BOT_NAMES?.split(",").filter(Boolean) ?? [];
+  return copilotBotNames.some(name => canonicalizeBotIdentifier(name) === canonicalActor);
+}
 
 /**
  * Attempt to authorize the actor via the bots allowlist.
@@ -18,16 +28,19 @@ const { getErrorMessage } = require("./error_helpers.cjs");
  * @param {string[]} allowedBots
  * @param {string} owner
  * @param {string} repo
+ * @param {{ installationCheckOptional?: boolean }} [options] - When `installationCheckOptional`
+ *   is true, an allowlisted bot is authorized even if the collaborator lookup does not report it
+ *   as installed. This is used for `repository_dispatch`, where GitHub App identities are not
+ *   listed as collaborators but sending the event already requires `contents: write` access.
  * @returns {Promise<{ handled: boolean }>}
  */
-async function checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo) {
+async function checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo, options = {}) {
   if (allowedBots.length === 0 || !isAllowedBot(actorToValidate, allowedBots)) {
     return { handled: false };
   }
 
   core.info(`Actor '${actorToValidate}' matched the allowed bots list: ${allowedBots.join(", ")}`);
 
-  // Verify the bot is active/installed on the repository
   const botStatus = await checkBotStatus(actorToValidate, owner, repo);
 
   if (botStatus.isBot && botStatus.isActive) {
@@ -37,6 +50,15 @@ async function checkBotAllowlistAuthorization(actorToValidate, allowedBots, owne
     core.setOutput("user_permission", "bot");
     return { handled: true };
   } else if (botStatus.isBot && !botStatus.isActive) {
+    // Only bypass when the lookup conclusively reported "not a collaborator" (no error field).
+    // Transient failures (5xx, rate limiting) set `error` and must not grant authorization.
+    if (options.installationCheckOptional && botStatus.error === undefined) {
+      core.info(`✅ Bot '${actorToValidate}' is allowlisted and is not listed as a collaborator; authorizing because this event already requires write access to the repository`);
+      core.setOutput("is_team_member", "true");
+      core.setOutput("result", "authorized_bot");
+      core.setOutput("user_permission", "bot");
+      return { handled: true };
+    }
     const errorMessage = `Access denied: Bot '${actorToValidate}' is not active/installed on this repository`;
     core.warning(`Bot '${actorToValidate}' is in the allowed list but not active/installed on ${owner}/${repo}`);
     core.setOutput("is_team_member", "false");
@@ -121,11 +143,26 @@ async function main() {
         }
 
         try {
-          const response = await github.rest.pulls.get({
-            owner,
-            repo,
-            pull_number: pullNumber,
-          });
+          const response = await withRetry(
+            () =>
+              github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: pullNumber,
+              }),
+            {
+              maxRetries: 3,
+              initialDelayMs: 2500,
+              maxDelayMs: 30000,
+              backoffMultiplier: 2,
+              jitterMs: 0,
+              shouldRetry: error => {
+                const status = error?.response?.status ?? error?.status;
+                return (typeof status === "number" && status >= 500) || isTransientError(error);
+              },
+            },
+            "pull request provenance check"
+          );
           const pullRequest = response?.data;
           const headRepo = pullRequest?.head?.repo?.full_name;
           const baseRepo = pullRequest?.base?.repo?.full_name;
@@ -187,12 +224,45 @@ async function main() {
     return;
   }
 
+  // Allow trusted bots other than Dependabot to synchronize same-repository PRs they
+  // did not open. Cross-repository PRs still require provenance validation because an
+  // attacker may induce an allowlisted bot to update code from their fork.
+  const isPullRequestSynchronization = (eventName === "pull_request" || eventName === "pull_request_target") && context.payload?.action === "synchronize";
+  const pullRequestHeadRepository = context.payload?.pull_request?.head?.repo;
+  const pullRequestBaseRepository = context.payload?.pull_request?.base?.repo;
+  const hasRepositoryIds = Number.isInteger(pullRequestHeadRepository?.id) && Number.isInteger(pullRequestBaseRepository?.id);
+  const isSameRepositoryPullRequest = hasRepositoryIds
+    ? pullRequestHeadRepository.id === pullRequestBaseRepository.id
+    : typeof pullRequestHeadRepository?.full_name === "string" && pullRequestHeadRepository.full_name.toLowerCase() === `${owner}/${repo}`.toLowerCase();
+  const pullRequestAuthor = context.payload?.pull_request?.user?.login;
+  const isAllowlistedBotSynchronizationMismatch = isPullRequestSynchronization && typeof pullRequestAuthor === "string" && pullRequestAuthor !== actorToValidate && isAllowedBot(actorToValidate, allowedBots);
+  const canAuthorizeBotBeforeConfusedDeputyCheck = isAllowlistedBotSynchronizationMismatch && isSameRepositoryPullRequest && actorToValidate !== "dependabot[bot]";
+  if (isAllowlistedBotSynchronizationMismatch) {
+    core.info(
+      `Evaluating allowlisted bot synchronization for actor '${actorToValidate}' on ${eventName}: ` + `PR author '${pullRequestAuthor}', same repository: ${isSameRepositoryPullRequest}, Dependabot: ${actorToValidate === "dependabot[bot]"}`
+    );
+  }
+  if (canAuthorizeBotBeforeConfusedDeputyCheck) {
+    const authorPermission = await checkRepositoryPermission(pullRequestAuthor, owner, repo, requiredPermissions);
+    if (authorPermission.authorized) {
+      core.info(`PR author '${pullRequestAuthor}' is trusted; checking whether bot '${actorToValidate}' is active`);
+      const botResult = await checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo, {
+        installationCheckOptional: isCopilotPullRequestActor(eventName, actorToValidate),
+      });
+      if (botResult.handled) {
+        return;
+      }
+    } else {
+      core.info(`PR author '${pullRequestAuthor}' is not trusted; continuing with confused-deputy validation`);
+    }
+  }
+
   // Guard against Dependabot Confused Deputy attacks.
   // An attacker can trigger @dependabot recreate (for pull_request events) or
   // @dependabot show (for issue_comment events) to make dependabot appear as the
   // actor, bypassing permission checks that rely solely on github.actor.
   // Reference: https://labs.boostsecurity.io/articles/weaponizing-dependabot-pwn-request-at-its-finest/
-  if (isConfusedDeputyAttack(actorToValidate, eventName, context.payload)) {
+  if (isConfusedDeputyAttack(actorToValidate, eventName, context.payload) || isAllowlistedBotSynchronizationMismatch) {
     const errorMessage = `Access denied: Potential confused deputy attack detected. Actor '${actorToValidate}' does not match the event author. The workflow may have been triggered indirectly via a bot command.`;
     core.warning(errorMessage);
     core.setOutput("is_team_member", "false");
@@ -202,12 +272,14 @@ async function main() {
     return;
   }
 
-  // If the actor is in the bots allowlist, skip the roles check entirely and go straight
-  // to bot-status verification. A bot listed in on.bots: is an explicit grant; the roles
-  // mismatch (bots typically have "none" repo permission) is expected and not actionable.
-  // Checking bots first also avoids a spurious "permission does not meet requirements"
-  // warning that would otherwise be emitted by the roles check before authorization succeeds.
-  const botResult = await checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo);
+  // For all other events, preserve confused-deputy validation before bot authorization.
+  // GitHub App identities are not repository collaborators, so the installation lookup used by
+  // checkBotStatus reports them as inactive. On repository_dispatch the sender already needed
+  // `contents: write` on this repository to post the event, so an explicitly allowlisted App is
+  // authorized even when that lookup finds nothing.
+  const botResult = await checkBotAllowlistAuthorization(actorToValidate, allowedBots, owner, repo, {
+    installationCheckOptional: eventName === "repository_dispatch" || isCopilotPullRequestActor(eventName, actorToValidate),
+  });
   if (botResult.handled) {
     return;
   }

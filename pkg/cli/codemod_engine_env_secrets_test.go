@@ -5,14 +5,54 @@ package cli
 import (
 	"testing"
 
+	"github.com/github/gh-aw/pkg/workflow/aw"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func TestEngineEnvSecretsCodemod_PreservesUnrelatedEnv(t *testing.T) {
+	t.Parallel()
+	content := `---
+engine:
+  id: codex
+  env:
+    UNSAFE: |
+      ${{ secrets.UNSAFE }}
+      continuation
+    ALSO_UNSAFE: ${{ secrets.ALSO_UNSAFE }}
+    SAFE: value # retain safe comment
+env:
+  UNSAFE: unrelated-top-level
+---
+
+# Prompt
+`
+	document, err := aw.Parse(content)
+	require.NoError(t, err)
+	mod := getEngineEnvSecretsCodemod()
+	result, applied, err := mod.Apply(content, document.Frontmatter)
+	require.NoError(t, err)
+	require.True(t, applied)
+	assert.NotContains(t, result, "secrets.UNSAFE")
+	assert.NotContains(t, result, "secrets.ALSO_UNSAFE")
+	assert.NotContains(t, result, "continuation")
+	assert.Contains(t, result, "SAFE: value # retain safe comment")
+	assert.Contains(t, result, "env:\n  UNSAFE: unrelated-top-level\n---\n\n# Prompt\n")
+
+	document, err = aw.Parse(result)
+	require.NoError(t, err)
+	second, applied, err := mod.Apply(result, document.Frontmatter)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Equal(t, result, second)
+}
+
 func TestEngineEnvSecretsCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getEngineEnvSecretsCodemod()
 
 	t.Run("removes unsafe secret-bearing engine env keys and keeps allowed override", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 engine:
@@ -41,6 +81,7 @@ engine:
 	})
 
 	t.Run("removes empty env block after deleting unsafe entries", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 engine:
@@ -67,6 +108,7 @@ engine:
 	})
 
 	t.Run("no-op when only allowed engine secret override is used", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 engine:
@@ -92,6 +134,7 @@ engine:
 	})
 
 	t.Run("no-op when COPILOT_PROVIDER_API_KEY is used (BYOK)", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 engine:
@@ -121,6 +164,7 @@ engine:
 	})
 
 	t.Run("no-op when COPILOT_PROVIDER_BEARER_TOKEN is used (BYOK)", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 engine:
@@ -148,6 +192,7 @@ engine:
 	})
 
 	t.Run("supports inline engine runtime.id for allowlist", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 engine:

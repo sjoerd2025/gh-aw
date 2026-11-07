@@ -52,6 +52,19 @@ type replaceLabelFixtureFile struct {
 	Scenarios []replaceLabelFixtureScenario `yaml:"scenarios"`
 }
 
+type replaceLabelErrorFixtureFile struct {
+	FixtureID string                             `yaml:"fixture_id"`
+	Scenarios []replaceLabelErrorFixtureScenario `yaml:"scenarios"`
+}
+
+type replaceLabelErrorFixtureScenario struct {
+	ScenarioID string   `yaml:"scenario_id"`
+	Category   string   `yaml:"category"`
+	Codes      []string `yaml:"codes"`
+	Stage      string   `yaml:"owning_stage"`
+	Result     string   `yaml:"result"`
+}
+
 type replaceLabelFixtureScenario struct {
 	ScenarioID string                   `yaml:"scenario_id"`
 	Input      replaceLabelFixtureInput `yaml:"input"`
@@ -478,13 +491,27 @@ func TestFormalReplaceLabelP14_CrossRepoRestriction(t *testing.T) {
 }
 
 func TestFormalReplaceLabelP15_TargetModeEnforcement(t *testing.T) {
-	n, ok := formalResolveTargetNumber("triggering", 42, 99)
-	require.True(t, ok)
-	assert.Equal(t, 42, n)
+	tests := []struct {
+		name      string
+		target    string
+		trigger   int
+		requested int
+		expected  int
+	}{
+		{name: "T-RL-014 omitted target uses triggering item", trigger: 42, requested: 99, expected: 42},
+		{name: "T-RL-015 triggering target ignores requested item", target: "triggering", trigger: 42, requested: 99, expected: 42},
+		{name: "T-RL-016 fixed target ignores requested item", target: "123", trigger: 42, requested: 99, expected: 123},
+		{name: "T-RL-017 fixed target works without requested item", target: "123", trigger: 42, expected: 123},
+		{name: "T-RL-018 wildcard target uses requested item", target: "*", trigger: 42, requested: 99, expected: 99},
+	}
 
-	n, ok = formalResolveTargetNumber("*", 42, 99)
-	require.True(t, ok)
-	assert.Equal(t, 99, n)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n, ok := formalResolveTargetNumber(tt.target, tt.trigger, tt.requested)
+			require.True(t, ok)
+			assert.Equal(t, tt.expected, n)
+		})
+	}
 }
 
 func TestFormalReplaceLabelEdge_BothLabelsIdentical(t *testing.T) {
@@ -570,21 +597,37 @@ func TestFormalStagedMode(t *testing.T) {
 	assert.Equal(t, "true", string(*cfg.Staged))
 }
 
+type formalRunReplaceLabelOpts struct {
+	Staged      bool
+	LabelToAdd  string
+	AllowedAdd  []string
+	Blocked     []string
+	BeforeWrite func() []string
+	OnWrite     func()
+}
+
 // formalRunReplaceLabel models the core execute path of the replace_label handler.
-// onWrite is invoked exactly once when the handler would call the write API
+// OnWrite is invoked exactly once when the handler would call the write API
 // (issues.setLabels). In staged mode the handler must return before reaching
-// onWrite; this is the invariant asserted by TestFormalStagedMode_NoWriteAPI.
-func formalRunReplaceLabel(staged bool, onWrite func()) formalReplaceLabelOutcome {
-	if staged {
+// OnWrite; this is the invariant asserted by TestFormalStagedMode_NoWriteAPI.
+func formalRunReplaceLabel(opts formalRunReplaceLabelOpts) formalReplaceLabelOutcome {
+	if opts.Staged {
 		return formalReplaceLabelOutcome{Success: true, Staged: true}
 	}
-	onWrite()
+	blocked := opts.Blocked
+	if opts.BeforeWrite != nil {
+		blocked = opts.BeforeWrite()
+	}
+	if err := formalValidateSingleLabel(opts.LabelToAdd, opts.AllowedAdd, blocked, "label_to_add"); err != nil {
+		return formalReplaceLabelOutcome{Success: false}
+	}
+	opts.OnWrite()
 	return formalReplaceLabelOutcome{Success: true}
 }
 
 func TestFormalStagedMode_NoWriteAPI(t *testing.T) {
 	writeCalls := 0
-	outcome := formalRunReplaceLabel(true, func() { writeCalls++ })
+	outcome := formalRunReplaceLabel(formalRunReplaceLabelOpts{Staged: true, LabelToAdd: "done", OnWrite: func() { writeCalls++ }})
 	assert.True(t, outcome.Success)
 	assert.True(t, outcome.Staged)
 	assert.Zero(t, writeCalls, "staged mode must not call the write API (setLabels)")
@@ -592,10 +635,26 @@ func TestFormalStagedMode_NoWriteAPI(t *testing.T) {
 
 func TestFormalNonStagedMode_InvokesWriteAPI(t *testing.T) {
 	writeCalls := 0
-	outcome := formalRunReplaceLabel(false, func() { writeCalls++ })
+	outcome := formalRunReplaceLabel(formalRunReplaceLabelOpts{LabelToAdd: "done", OnWrite: func() { writeCalls++ }})
 	assert.True(t, outcome.Success)
 	assert.False(t, outcome.Staged)
 	assert.Equal(t, 1, writeCalls, "non-staged mode must invoke the write API exactly once")
+}
+
+func TestFormalBlockedLabelAddedViaReplaceLabelMidBlocklistChange_NoWriteAPI(t *testing.T) {
+	writeCalls := 0
+	outcome := formalRunReplaceLabel(formalRunReplaceLabelOpts{
+		LabelToAdd: "done",
+		AllowedAdd: []string{"done"},
+		Blocked:    []string{},
+		BeforeWrite: func() []string {
+			return []string{"done"}
+		},
+		OnWrite: func() { writeCalls++ },
+	})
+
+	assert.False(t, outcome.Success)
+	assert.Zero(t, writeCalls, "label_to_add blocked before setLabels must be rejected without calling the write API")
 }
 
 func TestFormalSingleRESTCall(t *testing.T) {
@@ -671,4 +730,39 @@ func TestFormalFixtureLoaderRejectsEmptyScenarios(t *testing.T) {
 	_, err := parseReplaceLabelFixture([]byte("fixture_id: test\nscenarios: []\n"))
 	require.Error(t, err)
 	require.ErrorContains(t, err, "no scenarios")
+}
+
+func TestFormalReplaceLabelErrorCategoryFixture(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(formalRepoRoot(t), "specs", "replace-label-compliance", "rl-004-error-categories.yaml"))
+	require.NoError(t, err)
+
+	var fixture replaceLabelErrorFixtureFile
+	require.NoError(t, yamlv3.Unmarshal(data, &fixture))
+	require.Equal(t, "RL-ERR-004", fixture.FixtureID)
+
+	expected := map[string]replaceLabelErrorFixtureScenario{
+		"Schema validation failure":          {Codes: []string{"SCHEMA_INVALID"}, Stage: "5.1", Result: "soft-skip-warning"},
+		"Count gate exceeded":                {Codes: []string{"MAX_EXCEEDED"}, Stage: "5.2", Result: "soft-skip-warning"},
+		"Target resolution failure":          {Codes: []string{"TARGET_UNRESOLVABLE"}, Stage: "5.3", Result: "soft-skip-warning"},
+		"Repository not in allowlist":        {Codes: []string{"REPO_NOT_ALLOWED"}, Stage: "5.3", Result: "soft-skip-warning"},
+		"Label validation failure":           {Codes: []string{"LABEL_BLOCKED", "LABEL_NOT_ALLOWED"}, Stage: "5.4", Result: "soft-skip-warning"},
+		"Gate check (required-labels)":       {Codes: []string{"GATE_REQUIRED_LABELS"}, Stage: "5.5", Result: "skipped-without-run-failure"},
+		"Gate check (title prefix)":          {Codes: []string{"GATE_TITLE_PREFIX"}, Stage: "5.5", Result: "skipped-without-run-failure"},
+		"REST setLabels failure":             {Codes: []string{"SETLABELS_FAILED"}, Stage: "5.8", Result: "hard-error"},
+		"Rate-limit exhausted after retries": {Codes: []string{"RATE_LIMIT_EXHAUSTED"}, Stage: "5.8", Result: "hard-error"},
+	}
+	require.Len(t, fixture.Scenarios, len(expected))
+	seenCodes := make(map[string]bool)
+	for _, scenario := range fixture.Scenarios {
+		want, ok := expected[scenario.Category]
+		require.True(t, ok, "unexpected error category %q", scenario.Category)
+		require.Equal(t, want.Codes, scenario.Codes, scenario.Category)
+		require.Equal(t, want.Stage, scenario.Stage, scenario.Category)
+		require.Equal(t, want.Result, scenario.Result, scenario.Category)
+		require.NotEmpty(t, scenario.ScenarioID)
+		for _, code := range scenario.Codes {
+			require.False(t, seenCodes[code], "duplicate error code %q", code)
+			seenCodes[code] = true
+		}
+	}
 }

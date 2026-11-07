@@ -10,6 +10,7 @@ import (
 )
 
 func TestGetScheduleAtToAroundCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	assert.Equal(t, "schedule-at-to-around-migration", codemod.ID)
@@ -20,6 +21,7 @@ func TestGetScheduleAtToAroundCodemod(t *testing.T) {
 }
 
 func TestScheduleCodemod_DailyAt(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
@@ -47,6 +49,7 @@ on:
 }
 
 func TestScheduleCodemod_WeeklyOnAt(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
@@ -74,12 +77,13 @@ on:
 }
 
 func TestScheduleCodemod_MonthlyOn(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
 on:
   schedule:
-    - cron: monthly on 1
+    - cron: monthly on 1 # first day of the month
 ---
 
 # Test`
@@ -96,17 +100,18 @@ on:
 
 	require.NoError(t, err)
 	assert.True(t, applied)
-	assert.Contains(t, result, "0 0 1 * *")
-	assert.Contains(t, result, "# Converted from 'monthly on 1'")
+	assertPolicyCodemodValue(t, result, []any{map[string]any{"cron": "0 0 1 * *"}}, "on", "schedule")
+	assert.Contains(t, result, "# first day of the month")
 }
 
 func TestScheduleCodemod_MonthlyOnAt(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
 on:
   schedule:
-    - cron: monthly on 15 at 14:00
+    - cron: "monthly on 15 at 14:00" # middle of the month
 ---
 
 # Test`
@@ -123,11 +128,12 @@ on:
 
 	require.NoError(t, err)
 	assert.True(t, applied)
-	assert.Contains(t, result, "0 9 15 * *")
-	assert.Contains(t, result, "# Converted from 'monthly on 15 at 14:00'")
+	assertPolicyCodemodValue(t, result, []any{map[string]any{"cron": "0 9 15 * *"}}, "on", "schedule")
+	assert.Contains(t, result, "# middle of the month")
 }
 
 func TestScheduleCodemod_DailyAround_NoChange(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
@@ -154,6 +160,7 @@ on:
 }
 
 func TestScheduleCodemod_StandardCron_NoChange(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
@@ -180,6 +187,7 @@ on:
 }
 
 func TestScheduleCodemod_PreservesIndentation(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
@@ -202,10 +210,12 @@ on:
 
 	require.NoError(t, err)
 	assert.True(t, applied)
-	assert.Contains(t, result, "    - cron: daily around 09:00")
+	assert.Contains(t, result, "    - cron:")
+	assertPolicyCodemodValue(t, result, []any{map[string]any{"cron": "daily around 09:00"}}, "on", "schedule")
 }
 
 func TestScheduleCodemod_MultipleSchedules(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
@@ -235,6 +245,7 @@ on:
 }
 
 func TestScheduleCodemod_ScheduleField(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---
@@ -257,10 +268,11 @@ on:
 
 	require.NoError(t, err)
 	assert.True(t, applied)
-	assert.Contains(t, result, "schedule: daily around 09:00")
+	assertPolicyCodemodValue(t, result, []any{map[string]any{"schedule": "daily around 09:00"}}, "on", "schedule")
 }
 
 func TestScheduleCodemod_PreservesMarkdown(t *testing.T) {
+	t.Parallel()
 	codemod := getScheduleAtToAroundCodemod()
 
 	content := `---

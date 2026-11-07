@@ -4,9 +4,19 @@ import path from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let exports;
+let scanCacheDirectory;
+const runMain = () => exports.main({ cachePath: path.join(scanCacheDirectory, "scan.jsonl") });
+
+function httpError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  error.response = { status };
+  return error;
+}
 
 describe("check_daily_aic_workflow_guardrail", () => {
   beforeEach(async () => {
+    scanCacheDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "aic-main-test-"));
     vi.resetModules();
     process.env.GITHUB_EVENT_NAME = "";
     process.env.GH_AW_WORKFLOW_DISPATCH_AW_CONTEXT = "";
@@ -16,7 +26,113 @@ describe("check_daily_aic_workflow_guardrail", () => {
     exports = mod.default || mod;
   });
 
+  it("fails closed for the repo-memory backend unless explicitly enabled", async () => {
+    const outputs = {};
+    const setFailed = vi.fn();
+    global.core = {
+      setOutput: (key, value) => {
+        outputs[key] = value;
+      },
+      setFailed,
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: { addDetails: vi.fn(), write: vi.fn() },
+    };
+    global.github = {};
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" } };
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "100";
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS_BACKEND = "repo-memory";
+    process.env.GITHUB_EVENT_NAME = "schedule";
+    delete process.env.GH_AW_ALLOW_INSECURE_REPO_MEMORY_AIC;
+    delete process.env.GH_AW_DAILY_AIC_REPO_MEMORY_TRUSTED;
+    delete process.env.GH_AW_DAILY_AIC_REPO_MEMORY_BRANCH_MISSING;
+    vi.resetModules();
+    const mod = await import("./check_daily_aic_workflow_guardrail.cjs");
+    exports = mod.default || mod;
+
+    try {
+      await exports.main({ repoMemoryDir: scanCacheDirectory });
+      expect(outputs.daily_ai_credits_guardrail_status).toBe("structural_error");
+      expect(outputs.daily_ai_credits_guardrail_error).toContain("untrusted");
+      expect(setFailed).toHaveBeenCalledOnce();
+
+      process.env.GH_AW_ALLOW_INSECURE_REPO_MEMORY_AIC = "true";
+      await exports.main({ repoMemoryDir: scanCacheDirectory });
+      expect(outputs.daily_ai_credits_guardrail_status).toBe("under_budget");
+      expect(setFailed).toHaveBeenCalledOnce();
+    } finally {
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS_BACKEND;
+      delete process.env.GH_AW_ALLOW_INSECURE_REPO_MEMORY_AIC;
+      delete process.env.GITHUB_EVENT_NAME;
+    }
+  });
+
+  it("accepts a prior-run ledger when provenance is trusted and coverage has matured", async () => {
+    const outputs = {};
+    const setFailed = vi.fn();
+    global.core = {
+      setOutput: (key, value) => {
+        outputs[key] = value;
+      },
+      setFailed,
+      info: vi.fn(),
+      warning: vi.fn(),
+      summary: { addDetails: vi.fn(), write: vi.fn() },
+    };
+    global.github = {};
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" } };
+    const repoMemoryDir = path.join(scanCacheDirectory, "memory");
+    const usageRoot = path.join(scanCacheDirectory, "usage");
+    fs.mkdirSync(usageRoot, { recursive: true });
+    fs.writeFileSync(path.join(usageRoot, "agent_usage.jsonl"), `${JSON.stringify({ aic: 4 })}\n`, "utf8");
+    const now = Date.now();
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "100";
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS_BACKEND = "repo-memory";
+    process.env.GH_AW_DAILY_AIC_REPO_MEMORY_TRUSTED = "true";
+    process.env.GH_AW_DAILY_AIC_REPO_MEMORY_DIR = repoMemoryDir;
+    process.env.GH_AW_WORKFLOW_ID = "daily-code-metrics";
+    process.env.GITHUB_EVENT_NAME = "schedule";
+    process.env.GITHUB_RUN_ID = "41";
+    process.env.GITHUB_REPOSITORY = "test-owner/test-repo";
+    try {
+      const ledgerModule = await import("./daily_aic_repo_memory_ledger.cjs");
+      const ledger = ledgerModule.default || ledgerModule;
+      ledger.appendCurrentRunLedgerEntry({
+        repoMemoryDir,
+        usageRoot,
+        now: now - 60_000,
+      });
+      fs.writeFileSync(
+        ledger.ledgerCoveragePath(repoMemoryDir, "test-owner/test-repo", "daily-code-metrics"),
+        JSON.stringify({ version: 1, repository: "test-owner/test-repo", workflow_id: "daily-code-metrics", initialized_at: new Date(now - ledger.WINDOW_MS).toISOString() })
+      );
+
+      await exports.main({ repoMemoryDir });
+
+      expect(outputs.daily_ai_credits_guardrail_status).toBe("under_budget");
+      expect(outputs.daily_ai_credits_total).toBe("4");
+      expect(setFailed).not.toHaveBeenCalled();
+    } finally {
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS_BACKEND;
+      delete process.env.GH_AW_DAILY_AIC_REPO_MEMORY_TRUSTED;
+      delete process.env.GH_AW_DAILY_AIC_REPO_MEMORY_DIR;
+      delete process.env.GH_AW_WORKFLOW_ID;
+      delete process.env.GITHUB_EVENT_NAME;
+      delete process.env.GITHUB_RUN_ID;
+      delete process.env.GITHUB_REPOSITORY;
+    }
+  });
+
   afterEach(() => {
+    fs.rmSync(scanCacheDirectory, { recursive: true, force: true });
     delete process.env.GITHUB_EVENT_NAME;
     delete process.env.GH_AW_WORKFLOW_DISPATCH_AW_CONTEXT;
     delete process.env.GH_AW_HAS_SLASH_COMMAND;
@@ -186,6 +302,29 @@ describe("check_daily_aic_workflow_guardrail", () => {
     expect(markdown).not.toContain("| Min / Max AIC |  /  |");
   });
 
+  it("separates recorded consumption from unresolved estimates in the activation summary", () => {
+    const markdown = exports.renderDailyAICSummary(
+      "PR labeling",
+      "author",
+      5000,
+      [
+        { id: 1, html_url: "https://example.test/1", created_at: "2026-05-31T10:00:00Z", conclusion: "success", aic: 809.28, source: "recorded" },
+        { id: 2, html_url: "https://example.test/2", created_at: "2026-05-31T11:00:00Z", conclusion: "cancelled", aic: 5000, source: "estimated" },
+        { id: 3, html_url: "https://example.test/3", created_at: "2026-05-31T12:00:00Z", conclusion: "cancelled", aic: 0, source: "recorded", accountingReason: "confirmed_zero" },
+      ],
+      null,
+      { candidateRunsCount: 3, inspectedRunsCount: 3, truncatedByRateLimit: false }
+    );
+    expect(markdown).toContain("| Recorded AIC | 810 |");
+    expect(markdown).toContain("| Estimated AIC (unresolved accounting) | 5K |");
+    expect(markdown).toContain("| [#2](https://example.test/2) | 2026-05-31T11:00:00Z | cancelled | 5K | Estimated |");
+    expect(markdown).toContain("Subsequent scans retry unresolved accounting");
+    expect(markdown).toContain("| Confirmed-zero runs (no AI jobs ran) | 1 |");
+    expect(markdown).toContain("Confirmed zero (no AI jobs ran)");
+    expect(markdown).toContain("| cancelled | 0 | Confirmed zero (no AI jobs ran) |");
+    expect(markdown).toContain("not provider billing");
+  });
+
   it("renders a daily AI Credits details summary with stats and prior runs", () => {
     const markdown = exports.renderDailyAICSummary(
       "Nightly triage",
@@ -229,9 +368,9 @@ describe("check_daily_aic_workflow_guardrail", () => {
     expect(markdown).not.toContain("Guardrail issue:");
   });
 
-  it("main() does not fail the step when GitHub API calls throw", async () => {
+  it("main() fails the step when GitHub API calls leave accounting unknown", async () => {
     // Simulate a scenario where the GitHub API throws during workflow run lookup.
-    // The step should catch the error and NOT rethrow it, keeping daily_ai_credits_exceeded at "false".
+    // core.setFailed blocks activation without misreporting a budget exceedance.
     const coreOutputs = {};
     const coreWarnings = [];
     const mockCore = {
@@ -240,6 +379,7 @@ describe("check_daily_aic_workflow_guardrail", () => {
       },
       info: () => {},
       warning: msg => coreWarnings.push(msg),
+      setFailed: msg => coreWarnings.push(msg),
     };
 
     const mockGithub = {
@@ -274,12 +414,15 @@ describe("check_daily_aic_workflow_guardrail", () => {
     process.env.GH_AW_GITHUB_TOKEN = "fake-token";
 
     try {
-      // Should resolve without throwing even though the API calls throw
-      await expect(exports.main()).resolves.toBeUndefined();
+      await expect(runMain()).resolves.toBeUndefined();
       // The default "false" output must be set
       expect(coreOutputs["daily_ai_credits_exceeded"]).toBe("false");
-      // A warning must be emitted describing the error
-      expect(coreWarnings.some(w => /unexpected error.*skipped/i.test(w))).toBe(true);
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("transient_error");
+      expect(coreOutputs["daily_ai_credits_guardrail_error"]).toBe(
+        "Daily workflow AI Credits are unknown: current_run read stopped (transport or read error; attempts: 1; reason: non_transient). Accounting remains unverified; agent startup is blocked."
+      );
+      // Unknown accounting is an activation failure, not a successful skip.
+      expect(coreWarnings.some(w => /AI Credits are unknown/i.test(w))).toBe(true);
     } finally {
       delete global.core;
       delete global.github;
@@ -289,9 +432,177 @@ describe("check_daily_aic_workflow_guardrail", () => {
     }
   });
 
-  it("main() logs rate limit consumption delta when guardrail runs without candidate runs", async () => {
-    // Verify that fetchAndLogRateLimit is called at the start and end of the guardrail
-    // and that a consumption-delta diagnostic log is emitted.
+  it.each([false, true])("main() reports exhausted historical 502 estimates with exceeded=%s", async exceeded => {
+    vi.useFakeTimers();
+    const outputs = {};
+    const setFailed = vi.fn();
+    global.core = {
+      setOutput: (key, value) => {
+        outputs[key] = value;
+      },
+      info: vi.fn(),
+      warning: vi.fn(),
+      setFailed,
+      summary: { addDetails: vi.fn(), write: vi.fn() },
+    };
+    const time = new Date(Date.now() - 60000).toISOString();
+    const jobs = vi.fn().mockRejectedValue(httpError(502, "Server Error"));
+    global.github = {
+      rest: {
+        actions: {
+          getWorkflowRun: vi.fn(async () => ({ status: 200, data: { workflow_id: 7 } })),
+          listWorkflowRuns: vi.fn(async () => ({ status: 200, data: { workflow_runs: [{ id: 1, run_attempt: 1, status: "completed", conclusion: "success", created_at: time, updated_at: time }] } })),
+          listJobsForWorkflowRun: jobs,
+        },
+      },
+    };
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = exceeded ? "1000" : "2000";
+    process.env.GH_AW_MAX_AI_CREDITS = "1000";
+    process.env.GH_AW_GITHUB_TOKEN = "synthetic";
+    try {
+      const pending = runMain();
+      await vi.runAllTimersAsync();
+      await pending;
+      expect(outputs.daily_ai_credits_guardrail_status).toBe(exceeded ? "exceeded" : "under_budget");
+      expect(outputs.daily_ai_credits_exceeded).toBe(String(exceeded));
+      expect(outputs.daily_ai_credits_total).toBe("1000");
+      expect(outputs.daily_ai_credits_estimated).toBe("1000");
+      expect(setFailed).not.toHaveBeenCalled();
+      expect(jobs).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_MAX_AI_CREDITS;
+      delete process.env.GH_AW_GITHUB_TOKEN;
+    }
+  });
+
+  it("main() does not report a quota-reset retry deadline for an ordinary 502", async () => {
+    vi.useFakeTimers();
+    const info = vi.fn();
+    const error = httpError(502, "Server Error");
+    error.response.headers = { "x-ratelimit-remaining": "4000", "x-ratelimit-reset": String(Date.now() / 1000 + 3600) };
+    global.core = { setOutput: vi.fn(), setFailed: vi.fn(), info, warning: vi.fn() };
+    global.github = { rest: { actions: { getWorkflowRun: vi.fn().mockRejectedValue(error) } } };
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "1000";
+    process.env.GH_AW_GITHUB_TOKEN = "synthetic";
+    try {
+      const pending = runMain();
+      await vi.runAllTimersAsync();
+      await pending;
+      expect(global.core.setFailed).toHaveBeenCalledWith("Daily workflow AI Credits are unknown: current_run read stopped (HTTP 502; attempts: 3; reason: retry_exhausted). Accounting remains unverified; agent startup is blocked.");
+      expect(info.mock.calls.some(([message]) => message.includes("must not retry before"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_GITHUB_TOKEN;
+    }
+  });
+
+  it.each([
+    ["workflow_history", 502, {}, 3, "retry_exhausted", "transient_error"],
+    ["repository_history", 502, {}, 3, "retry_exhausted", "transient_error"],
+    ["workflow_history", 503, { "retry-after": "120" }, 1, "retry_restricted", "transient_error"],
+    ["workflow_history", 502, { "x-ratelimit-remaining": "100" }, 1, "quota_stop", "transient_error"],
+    ["workflow_history", 403, { "x-ratelimit-remaining": "0" }, 1, "quota_stop", "transient_error"],
+    ["workflow_history", 403, {}, 1, "non_transient", "structural_error"],
+  ])("main() safely attributes %s HTTP %i while keeping unknown history blocked", async (operation, httpStatus, headers, attempts, reason, guardrailStatus) => {
+    vi.useFakeTimers();
+    const outputs = {};
+    const sensitive = "private-payload https://example.invalid/blob?token=private";
+    const error = httpError(httpStatus, sensitive);
+    error.response.headers = headers;
+    const failedRead = vi.fn().mockRejectedValue(error);
+    const workflowHistory = operation === "workflow_history" ? failedRead : vi.fn().mockRejectedValue(httpError(404, "not found"));
+    const getCurrent = vi.fn().mockResolvedValue({ status: 200, data: { workflow_id: 7 } });
+    global.core = {
+      setOutput: (key, value) => {
+        outputs[key] = value;
+      },
+      setFailed: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+    };
+    global.github = { rest: { actions: { getWorkflowRun: getCurrent, listWorkflowRuns: workflowHistory, listWorkflowRunsForRepo: failedRead } } };
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "1000";
+    process.env.GH_AW_MAX_AI_CREDITS = "100";
+    process.env.GH_AW_GITHUB_TOKEN = "synthetic";
+    try {
+      const pending = runMain();
+      await vi.runAllTimersAsync();
+      await pending;
+      const diagnostic =
+        reason === "quota_stop"
+          ? ` GitHub API ${headers["x-ratelimit-remaining"] === "0" ? "quota_exhausted" : "quota_reserve"} (HTTP ${httpStatus}; resource=unknown; remaining=${headers["x-ratelimit-remaining"]}; limit=unknown; used=unknown; reset=unknown; retry_not_before=unknown)`
+          : httpStatus === 403
+            ? " GitHub API permission_denied (HTTP 403; Check the credential's access to this operation; quota exhaustion was not established.)"
+            : "";
+      const message = `Daily workflow AI Credits are unknown: ${operation} read stopped (HTTP ${httpStatus}; attempts: ${attempts}; reason: ${reason}). Accounting remains unverified; agent startup is blocked.${diagnostic}`;
+      expect(outputs).toMatchObject({ daily_ai_credits_guardrail_status: guardrailStatus, daily_ai_credits_guardrail_error: message, daily_ai_credits_total: "", daily_ai_credits_estimated: "", daily_ai_credits_exceeded: "false" });
+      expect(global.core.setFailed).toHaveBeenCalledWith(message);
+      expect(failedRead).toHaveBeenCalledTimes(attempts);
+      expect(getCurrent).toHaveBeenCalledOnce();
+      if (operation === "repository_history") expect(workflowHistory).toHaveBeenCalledOnce();
+      expect(JSON.stringify([outputs, global.core.info.mock.calls, global.core.setFailed.mock.calls])).not.toContain(sensitive);
+    } finally {
+      vi.useRealTimers();
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_MAX_AI_CREDITS;
+      delete process.env.GH_AW_GITHUB_TOKEN;
+    }
+  });
+
+  it("main() keeps wrapped quota failures classified and blocks unknown accounting", async () => {
+    const outputs = {};
+    const quotaError = httpError(403, "API rate limit exceeded for installation; private-payload");
+    quotaError.response.headers = { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1791972360" };
+    const wrapped = new Error("unable to download artifact: private-payload", { cause: quotaError });
+    const getCurrent = vi.fn().mockRejectedValue(wrapped);
+    global.core = {
+      setOutput: (key, value) => {
+        outputs[key] = value;
+      },
+      setFailed: vi.fn(),
+      info: vi.fn(),
+      warning: vi.fn(),
+    };
+    global.github = { rest: { actions: { getWorkflowRun: getCurrent } } };
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "1000";
+    process.env.GH_AW_GITHUB_TOKEN = "synthetic";
+    try {
+      await runMain();
+      expect(outputs.daily_ai_credits_guardrail_status).toBe("transient_error");
+      expect(outputs.daily_ai_credits_total).toBe("");
+      expect(outputs.daily_ai_credits_guardrail_error).toContain("current_run read stopped");
+      expect(outputs.daily_ai_credits_guardrail_error).toContain("quota_exhausted");
+      expect(outputs.daily_ai_credits_guardrail_error).toContain("reset=2026-10-14T10:06:00.000Z");
+      expect(global.core.setFailed).toHaveBeenCalledWith(outputs.daily_ai_credits_guardrail_error);
+      expect(getCurrent).toHaveBeenCalledOnce();
+      expect(JSON.stringify([outputs, global.core.info.mock.calls, global.core.setFailed.mock.calls])).not.toContain("private-payload");
+    } finally {
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_GITHUB_TOKEN;
+    }
+  });
+
+  it("main() counts business requests instead of unrelated rate-limit snapshots", async () => {
+    // The unrelated quota endpoint must not supply the business-request budget.
     const coreInfos = [];
     const coreOutputs = {};
     const mockCore = {
@@ -355,24 +666,20 @@ describe("check_daily_aic_workflow_guardrail", () => {
     process.env.GH_AW_GITHUB_TOKEN = "fake-token";
 
     try {
-      await expect(exports.main()).resolves.toBeUndefined();
+      await expect(runMain()).resolves.toBeUndefined();
 
-      // A consumption-delta log must have been emitted.
-      const consumptionLog = coreInfos.find(msg => msg.includes("rate limit consumed by daily AIC guardrail"));
+      const consumptionLog = coreInfos.find(msg => msg.includes("Daily AIC business API requests"));
       expect(consumptionLog).toBeDefined();
-      expect(consumptionLog).toContain("rateLimitBeforeInspection");
-      expect(consumptionLog).toContain("rateLimitAfterInspection");
-      expect(consumptionLog).toContain("consumed");
-      const detailsPrefix = "[daily-workflow-aic] GitHub API rate limit consumed by daily AIC guardrail: ";
+      const detailsPrefix = "[daily-workflow-aic] Daily AIC business API requests: ";
       const details = JSON.parse(consumptionLog.slice(detailsPrefix.length));
       expect(details).toMatchObject({
-        rateLimitBeforeInspection: 4995,
-        rateLimitAfterInspection: 5000,
-        consumed: 0,
+        requests: 2,
+        cacheHits: 0,
       });
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("under_budget");
 
-      // fetchAndLogRateLimit must have been called at least twice (start + end).
-      expect(rateLimitCallCount).toBe(2);
+      // Only the authoritative run and history requests are needed.
+      expect(rateLimitCallCount).toBe(0);
     } finally {
       delete global.core;
       delete global.github;
@@ -412,7 +719,7 @@ describe("check_daily_aic_workflow_guardrail", () => {
               return {
                 data: {
                   workflow_runs: [
-                    { id: 10, html_url: "https://example.test/runs/10", created_at: nowIso, conclusion: "success" },
+                    { id: 10, html_url: "https://example.test/runs/10", created_at: nowIso, updated_at: nowIso, run_attempt: 1, status: "completed", conclusion: "success" },
                     // A stale run: encountering this should immediately stop pagination.
                     { id: 9, html_url: "https://example.test/runs/9", created_at: staleIso, conclusion: "success" },
                   ],
@@ -455,7 +762,7 @@ describe("check_daily_aic_workflow_guardrail", () => {
     process.env.GITHUB_EVENT_NAME = "pull_request";
 
     try {
-      await expect(exports.main()).resolves.toBeUndefined();
+      await expect(runMain()).resolves.toBeUndefined();
 
       // Only page 1 should have been fetched; the stale run should have
       // terminated pagination before page 2 was requested.
@@ -467,6 +774,7 @@ describe("check_daily_aic_workflow_guardrail", () => {
 
       // Guardrail not exceeded (50 < 1000).
       expect(coreOutputs["daily_ai_credits_exceeded"]).toBe("false");
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("under_budget");
     } finally {
       delete global.core;
       delete global.github;
@@ -478,8 +786,8 @@ describe("check_daily_aic_workflow_guardrail", () => {
     }
   });
 
-  it("main() marks the step failed when the daily AI Credits guardrail is exceeded", async () => {
-    const getRunAICSpy = vi.spyOn(exports, "getRunAIC").mockResolvedValue(200);
+  it("main() marks the guardrail exceeded when daily AI Credits equal the threshold", async () => {
+    const getRunAICSpy = vi.spyOn(exports, "getRunAIC").mockResolvedValue(100);
 
     const coreOutputs = {};
     const setFailed = vi.fn();
@@ -525,6 +833,9 @@ describe("check_daily_aic_workflow_guardrail", () => {
               workflow_runs: [
                 {
                   id: 41,
+                  run_attempt: 1,
+                  updated_at: nowIso,
+                  status: "completed",
                   html_url: "https://example.test/runs/41",
                   created_at: nowIso,
                   conclusion: "success",
@@ -554,12 +865,12 @@ describe("check_daily_aic_workflow_guardrail", () => {
     process.env.GITHUB_EVENT_NAME = "pull_request";
 
     try {
-      await expect(exports.main()).resolves.toBeUndefined();
+      await expect(runMain()).resolves.toBeUndefined();
       expect(coreOutputs["daily_ai_credits_exceeded"]).toBe("true");
-      expect(coreOutputs["daily_ai_credits_total_effective_tokens"]).toBe("200");
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("exceeded");
+      expect(coreOutputs["daily_ai_credits_total"]).toBe("100");
       expect(coreOutputs["daily_ai_credits_threshold"]).toBe("100");
-      expect(setFailed).toHaveBeenCalledTimes(1);
-      expect(setFailed.mock.calls[0][0]).toMatch(/guardrail exceeded/i);
+      expect(setFailed).not.toHaveBeenCalled();
     } finally {
       delete global.core;
       delete global.github;
@@ -574,14 +885,11 @@ describe("check_daily_aic_workflow_guardrail", () => {
     }
   });
 
-  it("main() stops the inspection loop early when in-loop rate-limit re-check finds headroom exhausted", async () => {
-    // Set up 15 candidate runs (all within 24 h), no cache entries, and a rate-limit mock that
-    // returns plenty of budget on the first call (start snapshot) but drops below the reserve
-    // (RATE_LIMIT_RESERVE = 100) on the second call, which is the in-loop re-check triggered
-    // after RATE_LIMIT_RECHECK_INTERVAL = 10 consumed API operations.
-    // With ESTIMATED_API_OPERATIONS_PER_RUN = 2, 10 ops = 5 cache-miss runs processed before
-    // the 6th iteration triggers the re-check and breaks out of the loop.
-    const getRunAICSpy = vi.spyOn(exports, "getRunAIC").mockResolvedValue(10);
+  it("main() stops on business-response quota exhaustion without trusting rate_limit", async () => {
+    // A business-request rejection must stop before inspecting the second run.
+    const quotaError = httpError(403, "API quota exhausted");
+    quotaError.response.headers = { "x-ratelimit-remaining": "0" };
+    const getRunAICSpy = vi.spyOn(exports, "getRunAIC").mockRejectedValue(quotaError);
 
     let rateLimitGetCallCount = 0;
     const nowIso = new Date().toISOString();
@@ -591,8 +899,7 @@ describe("check_daily_aic_workflow_guardrail", () => {
         rateLimit: {
           get: async () => {
             rateLimitGetCallCount++;
-            // First call (start snapshot): plenty of budget.
-            // Subsequent calls (in-loop re-check, end snapshot): below reserve.
+            // This endpoint must never be consulted by the scan.
             const remaining = rateLimitGetCallCount === 1 ? 5000 : 50;
             return {
               data: {
@@ -613,6 +920,9 @@ describe("check_daily_aic_workflow_guardrail", () => {
             data: {
               workflow_runs: Array.from({ length: 15 }, (_, i) => ({
                 id: i + 100,
+                run_attempt: 1,
+                updated_at: nowIso,
+                status: "completed",
                 html_url: `https://example.test/runs/${i + 100}`,
                 created_at: nowIso,
                 conclusion: "success",
@@ -620,6 +930,135 @@ describe("check_daily_aic_workflow_guardrail", () => {
             },
             headers: {},
           }),
+        },
+      },
+    };
+
+    const coreInfos = [];
+    const coreOutputs = {};
+    const mockCore = {
+      setOutput: (key, value) => {
+        coreOutputs[key] = value;
+      },
+      info: msg => coreInfos.push(msg),
+      warning: () => {},
+      setFailed: msg => coreInfos.push(msg),
+      summary: {
+        addDetails: function () {
+          return this;
+        },
+        write: async () => {},
+      },
+    };
+
+    const mockContext = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
+
+    global.core = mockCore;
+    global.github = mockGithub;
+    global.context = mockContext;
+
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "1000000";
+    process.env.GH_AW_GITHUB_TOKEN = "fake-token";
+    process.env.GITHUB_EVENT_NAME = "pull_request";
+
+    try {
+      await expect(runMain()).resolves.toBeUndefined();
+
+      expect(getRunAICSpy).toHaveBeenCalledTimes(1);
+
+      // The incomplete window is reported as a failure.
+      const stopLog = coreInfos.find(msg => msg.includes("AI Credits are unknown"));
+      expect(stopLog).toBeDefined();
+
+      // Unknown is neither an exceedance nor a verified under-budget result.
+      expect(coreOutputs["daily_ai_credits_exceeded"]).toBe("false");
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("transient_error");
+      expect(rateLimitGetCallCount).toBe(0);
+    } finally {
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_GITHUB_TOKEN;
+      delete process.env.GITHUB_EVENT_NAME;
+      getRunAICSpy.mockRestore();
+    }
+  });
+
+  it("falls back to repository run history when workflow-specific run lookup 404s under required workflows", async () => {
+    const getRunAICSpy = vi.spyOn(exports, "getRunAIC").mockResolvedValue(25);
+    const workflowName = "Reusable PR Review";
+    const callerWorkflowName = "PR Review";
+    const workflowId = 324645976;
+    const now = Date.parse("2026-09-22T03:21:08Z");
+    const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const nowIso = new Date(now).toISOString();
+    let listWorkflowRunsCalls = 0;
+    let listWorkflowRunsForRepoCalls = 0;
+    const repoCreatedFilters = [];
+
+    const mockGithub = {
+      rest: {
+        rateLimit: {
+          get: async () => ({
+            data: {
+              resources: {
+                core: { limit: 5000, remaining: 4990, used: 10, reset: Math.floor(Date.now() / 1000) + 3600 },
+              },
+            },
+            headers: {},
+          }),
+        },
+        actions: {
+          getWorkflowRun: async () => ({
+            data: {
+              workflow_id: workflowId,
+              actor: { login: "octocat" },
+              triggering_actor: { login: "octocat" },
+            },
+            headers: {},
+          }),
+          listWorkflowRuns: async () => {
+            listWorkflowRunsCalls += 1;
+            throw httpError(404, "Not Found");
+          },
+          listWorkflowRunsForRepo: async ({ created, page }) => {
+            listWorkflowRunsForRepoCalls += 1;
+            repoCreatedFilters.push(created);
+            if (page === 1) {
+              return {
+                data: {
+                  workflow_runs: Array.from({ length: 100 }, (_, index) => ({
+                    id: 1000 + index,
+                    workflow_id: 999,
+                    name: workflowName,
+                    html_url: `https://example.test/runs/${1000 + index}`,
+                    created_at: nowIso,
+                    conclusion: "success",
+                  })),
+                },
+                headers: {},
+              };
+            }
+            return {
+              data: {
+                workflow_runs: [
+                  {
+                    id: 41,
+                    workflow_id: workflowId,
+                    run_attempt: 1,
+                    updated_at: nowIso,
+                    status: "completed",
+                    name: callerWorkflowName,
+                    html_url: "https://example.test/runs/41",
+                    created_at: nowIso,
+                    conclusion: "success",
+                  },
+                ],
+              },
+              headers: {},
+            };
+          },
         },
       },
     };
@@ -640,28 +1079,191 @@ describe("check_daily_aic_workflow_guardrail", () => {
       },
     };
 
-    const mockContext = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
-
     global.core = mockCore;
     global.github = mockGithub;
-    global.context = mockContext;
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
 
-    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "1000000";
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "100";
     process.env.GH_AW_GITHUB_TOKEN = "fake-token";
+    process.env.GH_AW_WORKFLOW_NAME = workflowName;
     process.env.GITHUB_EVENT_NAME = "pull_request";
 
     try {
-      await expect(exports.main()).resolves.toBeUndefined();
+      await expect(runMain()).resolves.toBeUndefined();
 
-      // 5 cache-miss runs are processed (10 consumed API ops) before iteration 6 triggers the
-      // in-loop re-check, finds remaining=50 <= RATE_LIMIT_RESERVE=100, and breaks the loop.
-      expect(getRunAICSpy).toHaveBeenCalledTimes(5);
+      expect(listWorkflowRunsCalls).toBe(1);
+      expect(listWorkflowRunsForRepoCalls).toBe(2);
+      expect(repoCreatedFilters).toEqual([">=2026-09-21T03:21:08.000Z", ">=2026-09-21T03:21:08.000Z"]);
+      expect(getRunAICSpy).toHaveBeenCalledTimes(1);
+      expect(getRunAICSpy.mock.calls[0][1]).toBe(41);
+      expect(coreOutputs["daily_ai_credits_exceeded"]).toBe("false");
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("under_budget");
+      expect(coreInfos.some(msg => msg.includes("falling back to repository run listing by workflow ID"))).toBe(true);
+    } finally {
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_GITHUB_TOKEN;
+      delete process.env.GH_AW_WORKFLOW_NAME;
+      delete process.env.GITHUB_EVENT_NAME;
+      dateNowSpy.mockRestore();
+      getRunAICSpy.mockRestore();
+    }
+  });
 
-      // The in-loop stop log must have been emitted.
-      const stopLog = coreInfos.find(msg => msg.includes("Stopping inspection: rate limit headroom exhausted during inspection loop"));
-      expect(stopLog).toBeDefined();
+  it("marks permanent 404 guardrail failures as structural errors distinct from transient failures", async () => {
+    const coreOutputs = {};
+    const coreWarnings = [];
+    const mockCore = {
+      setOutput: (key, value) => {
+        coreOutputs[key] = value;
+      },
+      info: () => {},
+      warning: msg => coreWarnings.push(msg),
+      setFailed: msg => coreWarnings.push(msg),
+    };
 
-      // Guardrail not exceeded (5 × 10 = 50 < 1000000).
+    const mockGithub = {
+      rest: {
+        rateLimit: {
+          get: async () => ({
+            data: {
+              resources: {
+                core: { limit: 5000, remaining: 4990, used: 10, reset: Math.floor(Date.now() / 1000) + 3600 },
+              },
+            },
+            headers: {},
+          }),
+        },
+        actions: {
+          getWorkflowRun: async () => ({
+            data: {
+              workflow_id: 324645976,
+              actor: { login: "octocat" },
+              triggering_actor: { login: "octocat" },
+            },
+            headers: {},
+          }),
+          listWorkflowRuns: async () => {
+            throw httpError(404, "Not Found");
+          },
+          listWorkflowRunsForRepo: async () => {
+            throw httpError(404, "Not Found");
+          },
+        },
+      },
+    };
+
+    global.core = mockCore;
+    global.github = mockGithub;
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
+
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "10";
+    process.env.GH_AW_GITHUB_TOKEN = "fake-token";
+    process.env.GH_AW_WORKFLOW_NAME = "PR Quality Review";
+    process.env.GITHUB_EVENT_NAME = "pull_request";
+
+    try {
+      await expect(runMain()).resolves.toBeUndefined();
+      expect(coreOutputs["daily_ai_credits_exceeded"]).toBe("false");
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("structural_error");
+      expect(coreWarnings.some(w => /AI Credits are unknown/i.test(w))).toBe(true);
+    } finally {
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_GITHUB_TOKEN;
+      delete process.env.GH_AW_WORKFLOW_NAME;
+      delete process.env.GITHUB_EVENT_NAME;
+    }
+  });
+
+  it("fallback stops immediately when a page returns zero unfiltered repository runs (sourceRunCount === 0 fast-exit)", async () => {
+    const workflowName = "My Workflow";
+    let listWorkflowRunsForRepoCalls = 0;
+    const nowIso = new Date().toISOString();
+
+    const mockGithub = {
+      rest: {
+        rateLimit: {
+          get: async () => ({
+            data: {
+              resources: {
+                core: { limit: 5000, remaining: 4990, used: 10, reset: Math.floor(Date.now() / 1000) + 3600 },
+              },
+            },
+            headers: {},
+          }),
+        },
+        actions: {
+          getWorkflowRun: async () => ({
+            data: {
+              workflow_id: 324645976,
+              actor: { login: "octocat" },
+              triggering_actor: { login: "octocat" },
+            },
+            headers: {},
+          }),
+          listWorkflowRuns: async () => {
+            throw httpError(404, "Not Found");
+          },
+          listWorkflowRunsForRepo: async ({ page }) => {
+            listWorkflowRunsForRepoCalls += 1;
+            if (page === 1) {
+              // 100 unrelated runs — causes the loop to continue to page 2
+              return {
+                data: {
+                  workflow_runs: Array.from({ length: 100 }, (_, i) => ({
+                    id: 100 + i,
+                    workflow_id: 999,
+                    name: "Other Workflow",
+                    html_url: `https://example.test/runs/${100 + i}`,
+                    created_at: nowIso,
+                    conclusion: "success",
+                  })),
+                },
+                headers: {},
+              };
+            }
+            // page 2: empty — signals exhaustion of repository run history
+            return { data: { workflow_runs: [] }, headers: {} };
+          },
+        },
+      },
+    };
+
+    const coreOutputs = {};
+    const mockCore = {
+      setOutput: (key, value) => {
+        coreOutputs[key] = value;
+      },
+      info: () => {},
+      warning: () => {},
+      summary: {
+        addDetails: function () {
+          return this;
+        },
+        write: async () => {},
+      },
+    };
+
+    global.core = mockCore;
+    global.github = mockGithub;
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
+
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "100";
+    process.env.GH_AW_GITHUB_TOKEN = "fake-token";
+    process.env.GH_AW_WORKFLOW_NAME = workflowName;
+    process.env.GITHUB_EVENT_NAME = "pull_request";
+
+    try {
+      await expect(runMain()).resolves.toBeUndefined();
+      // page 1 has 100 unrelated runs → loop must continue; page 2 is empty →
+      // sourceRunCount === 0 fast-exit fires, page 3 must never be queried.
+      expect(listWorkflowRunsForRepoCalls).toBe(2);
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("under_budget");
       expect(coreOutputs["daily_ai_credits_exceeded"]).toBe("false");
     } finally {
       delete global.core;
@@ -669,8 +1271,85 @@ describe("check_daily_aic_workflow_guardrail", () => {
       delete global.context;
       delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
       delete process.env.GH_AW_GITHUB_TOKEN;
+      delete process.env.GH_AW_WORKFLOW_NAME;
       delete process.env.GITHUB_EVENT_NAME;
-      getRunAICSpy.mockRestore();
+    }
+  });
+
+  it("falls back by workflow ID when GH_AW_WORKFLOW_NAME is absent", async () => {
+    let listWorkflowRunsForRepoCalls = 0;
+
+    const mockGithub = {
+      rest: {
+        rateLimit: {
+          get: async () => ({
+            data: {
+              resources: {
+                core: { limit: 5000, remaining: 4990, used: 10, reset: Math.floor(Date.now() / 1000) + 3600 },
+              },
+            },
+            headers: {},
+          }),
+        },
+        actions: {
+          getWorkflowRun: async () => ({
+            data: {
+              workflow_id: 324645976,
+              actor: { login: "octocat" },
+              triggering_actor: { login: "octocat" },
+            },
+            headers: {},
+          }),
+          listWorkflowRuns: async () => {
+            throw httpError(404, "Not Found");
+          },
+          listWorkflowRunsForRepo: async () => {
+            listWorkflowRunsForRepoCalls += 1;
+            return { data: { workflow_runs: [] }, headers: {} };
+          },
+        },
+      },
+    };
+
+    const coreOutputs = {};
+    const coreWarnings = [];
+    const mockCore = {
+      setOutput: (key, value) => {
+        coreOutputs[key] = value;
+      },
+      info: () => {},
+      warning: msg => coreWarnings.push(msg),
+      setFailed: msg => coreWarnings.push(msg),
+      summary: {
+        addDetails: function () {
+          return this;
+        },
+        write: async () => {},
+      },
+    };
+
+    global.core = mockCore;
+    global.github = mockGithub;
+    global.context = { repo: { owner: "test-owner", repo: "test-repo" }, runId: 42 };
+
+    process.env.GH_AW_MAX_DAILY_AI_CREDITS = "10";
+    process.env.GH_AW_GITHUB_TOKEN = "fake-token";
+    // GH_AW_WORKFLOW_NAME is intentionally absent because the fallback does not
+    // depend on the reusable workflow's display name.
+    process.env.GITHUB_EVENT_NAME = "pull_request";
+
+    try {
+      await expect(runMain()).resolves.toBeUndefined();
+      expect(coreOutputs["daily_ai_credits_exceeded"]).toBe("false");
+      expect(coreOutputs["daily_ai_credits_guardrail_status"]).toBe("under_budget");
+      expect(listWorkflowRunsForRepoCalls).toBe(1);
+    } finally {
+      delete global.core;
+      delete global.github;
+      delete global.context;
+      delete process.env.GH_AW_MAX_DAILY_AI_CREDITS;
+      delete process.env.GH_AW_GITHUB_TOKEN;
+      delete process.env.GITHUB_EVENT_NAME;
     }
   });
 

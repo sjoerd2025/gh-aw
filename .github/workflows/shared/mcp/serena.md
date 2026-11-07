@@ -16,6 +16,12 @@
 # The 'languages' input configures the Serena MCP server language list.
 
 import-schema:
+  path:
+    type: string
+    default: '\${PATH}'
+    description: >
+      PATH inside the Serena container. Runtime paths must be covered by its
+      declared mounts; the default is the MCP gateway PATH, not the runner PATH.
   languages:
     type: array
     items:
@@ -28,19 +34,22 @@ import-schema:
 
 mcp-servers:
   serena:
-    container: "ghcr.io/github/serena-mcp-server:latest"
+    container: "ghcr.io/oraios/serena:1.7.0"
     args:
       - "--network"
       - "host"
-    entrypoint: "serena"
+    entrypoint: "/workspaces/serena/.venv/bin/serena"
     entrypointArgs:
       - "start-mcp-server"
       - "--context"
       - "codex"
       - "--project"
       - \${GITHUB_WORKSPACE}
+    env:
+      PATH: ${{ github.aw.import-inputs.path }}
     mounts:
       - \${GITHUB_WORKSPACE}:\${GITHUB_WORKSPACE}:rw
+      - \${RUNNER_TOOL_CACHE}:\${RUNNER_TOOL_CACHE}:ro
 ---
 
 ## Serena Code Analysis

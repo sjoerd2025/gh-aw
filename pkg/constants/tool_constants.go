@@ -1,5 +1,15 @@
 package constants
 
+const (
+	LinearMCPReadOnlyURL      = "https://mcp.linear.app/mcp/readonly"
+	LinearMCPDefaultTokenExpr = "${{ secrets.LINEAR_API_KEY }}"
+	LinearTeamIDExpr          = "${{ secrets.LINEAR_TEAM_ID }}"
+	LinearProjectIDExpr       = "${{ vars.LINEAR_PROJECT_ID }}"
+	JiraBaseURLExpr           = "https://pelidehalleux.atlassian.net"
+	JiraUserEmailExpr         = "${{ secrets.JIRA_USER_EMAIL }}"
+	JiraAPITokenExpr          = "${{ secrets.JIRA_API_TOKEN }}"
+)
+
 // AllowedExpressions contains the GitHub Actions expressions that can be used in workflow markdown content
 // see https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#github-context
 var AllowedExpressions = []string{
@@ -55,6 +65,11 @@ var AllowedExpressions = []string{
 	"github.event.pull_request.head.sha",
 	"github.event.pull_request.base.sha",
 	"github.actor",
+	"github.aw.context.items",
+	"github.aw.context.webhook.event",
+	"gateway.events",
+	"toJSON(gateway.events)",
+	"toJSON(github.aw.context.items)",
 	"github.event_name",
 	"github.job",
 	"github.owner",

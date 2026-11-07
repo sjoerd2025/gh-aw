@@ -7,9 +7,45 @@ sidebar:
 
 Integrity filtering (`tools.github.min-integrity`) controls which GitHub content an agent can access during a workflow run. Rather than filtering by permissions, it filters by **trust**: the author association of an issue, pull request, or comment, and whether that content has been merged into the main branch.
 
+## Migrate from lockdown mode
+
+GitHub lockdown mode has been superseded by integrity filtering. Replace `lockdown: true` with `min-integrity: approved`:
+
+```yaml wrap
+# Before (deprecated)
+tools:
+  github:
+    lockdown: true
+
+# After
+tools:
+  github:
+    min-integrity: approved
+```
+
+Replace `lockdown: false` with `min-integrity: none`:
+
+```yaml wrap
+# Before (deprecated)
+tools:
+  github:
+    lockdown: false
+
+# After
+tools:
+  github:
+    min-integrity: none
+```
+
 ## How It Works
 
 The MCP gateway intercepts tool calls to GitHub and applies integrity checks to each piece of content returned. If an item's integrity level is below the configured minimum, the gateway removes it before the AI engine sees it. This happens transparently — the agent receives a reduced result set, and filtered items are logged as `DIFC_FILTERED` events for later inspection.
+
+Starting with [MCP gateway v0.5.0](https://github.com/github/gh-aw-mcpg/releases/tag/v0.5.0), proxy responses that cannot be filtered item by item, such as artifact downloads, raw content, and redirects, require resource-level authorization even in filter mode. These requests can be denied when the configured allow-only policy does not authorize the resource.
+
+Starting with [MCP gateway v0.5.1](https://github.com/github/gh-aw-mcpg/releases/tag/v0.5.1), Actions job logs, security advisory contents, and file contents fetched at explicit SHAs or non-default refs have baseline `none` integrity. Repository visibility and trusted PR authors do not promote these payloads to `approved`; requests can therefore be denied by `min-integrity: approved`.
+
+[MCP gateway v0.5.2](https://github.com/github/gh-aw-mcpg/releases/tag/v0.5.2) filters nested review-thread comments individually in filter mode, preserving thread and pagination metadata. In strict mode, any denied comment rejects the entire response.
 
 ## Configuration
 
@@ -116,6 +152,11 @@ Use this to suppress content from known-bad accounts — automated bots, comprom
 
 `trusted-users` elevates content from listed GitHub usernames to `approved` integrity, regardless of their author association. This is useful for contractors, partner developers, or external contributors who should be treated as trusted even though GitHub classifies them as `CONTRIBUTOR` or `FIRST_TIME_CONTRIBUTOR`.
 
+Bot logins such as `github-actions[bot]` are also valid. Use the full login, including the `[bot]` suffix. Trust is configured per author and does not extend to other authors' comments on a trusted bot's issue or pull request. Listing a bot does not require lowering `min-integrity` to `none`.
+
+> [!NOTE]
+> MCP gateway v0.4.37 fixes author-trust handling for wrapped `issue_read` responses. Earlier versions could filter trusted authors' issue bodies as `DIFC_FILTERED` at `min-integrity: approved`. Workflows compiled with an earlier gateway version must be recompiled with an updated CLI to use the fix; see the [runtime fix and regression coverage](https://github.com/github/gh-aw-mcpg/pull/15292).
+
 ```aw wrap
 tools:
   github:
@@ -123,6 +164,7 @@ tools:
     trusted-users:
       - "contractor-1"
       - "partner-dev"
+      - "github-actions[bot]"
 ```
 
 Trust elevation only raises integrity — it never lowers it. A user already at `merged` stays at `merged`. `blocked-users` always takes precedence: if a user appears in both `blocked-users` and `trusted-users`, they are blocked.
@@ -354,7 +396,7 @@ gh aw logs --filtered-integrity
 
 This is useful when investigating whether your `min-integrity` configuration is filtering expected content or when tuning the level after observing real traffic patterns.
 
-## Related Documentation
+## Learn More
 
 - [GitHub Tools Reference](/gh-aw/reference/github-tools/) — Full `tools.github` configuration
 - [MCP Gateway](/gh-aw/reference/mcp-gateway/) — Gateway architecture and log format

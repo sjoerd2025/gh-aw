@@ -3,8 +3,11 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,6 +34,30 @@ func TestValidateOnNeedsTargets(t *testing.T) {
 		err := validateOnNeedsTargets(data)
 		require.Error(t, err, "expected on.needs validation error")
 		require.ErrorContains(t, err, `built-in job "activation"`, "error should explain invalid built-in target")
+	})
+
+	t.Run("post-agent maintenance targets rejected", func(t *testing.T) {
+		for job := range constants.MaintenanceJobDependencies {
+			t.Run(job, func(t *testing.T) {
+				data := &WorkflowData{OnNeeds: []string{job}}
+				err := validateOnNeedsTargets(data)
+				require.ErrorContains(t, err, `built-in job "`+job+`"`)
+				require.True(t, constants.IsCompilerOwnedJobName(job))
+				require.NotContains(t, constants.KnownBuiltInJobNames, job)
+			})
+		}
+	})
+
+	t.Run("authored job with maintenance name accepted", func(t *testing.T) {
+		for job := range constants.MaintenanceJobDependencies {
+			t.Run(job, func(t *testing.T) {
+				data := &WorkflowData{
+					Jobs:    map[string]any{job: map[string]any{}},
+					OnNeeds: []string{job},
+				}
+				require.NoError(t, validateOnNeedsTargets(data), "authored job should not be treated as generated")
+			})
+		}
 	})
 
 	t.Run("target depending on activation rejected", func(t *testing.T) {
@@ -142,5 +169,133 @@ func TestValidateOnGitHubAppNeedsExpressions(t *testing.T) {
 		err := c.validateOnNeeds(data)
 		require.Error(t, err, "expected on.github-app validation error")
 		require.ErrorContains(t, err, "on.github-app.client-id", "error field should use yaml key client-id")
+	})
+}
+
+func TestValidatePromptNeedsAvailableBeforeActivation(t *testing.T) {
+	t.Run("shares deferred expression eligibility", func(t *testing.T) {
+		for _, tt := range []struct {
+			name   string
+			prompt string
+			needs  string
+			valid  bool
+		}{
+			{"direct output", "${{ needs.release.outputs.id }}", "activation", true},
+			{"direct result", "${{ needs.release.result }}", "activation", true},
+			{"undeclared output", "${{ needs.release.outputs.unknown }}", "activation", false},
+			{"compound", "${{ needs.release.outputs.id || 'none' }}", "activation", false},
+			{"raw condition", "{{#if needs.release.outputs.id}}yes{{/if}}", "activation", false},
+			{"expression condition", "{{#if ${{ needs.release.outputs.id }} }}yes{{/if}}", "activation", false},
+			{"direct and compound", "${{ needs.release.outputs.id }} ${{ needs.release.outputs.id || 'none' }}", "activation", false},
+			{"after agent", "${{ needs.release.outputs.id }}", "agent", false},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), ".github", "workflows")
+				require.NoError(t, os.MkdirAll(dir, 0o700))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "prompt.md"), []byte(tt.prompt), 0o600))
+				c := NewCompiler()
+				c.markdownPath = filepath.Join(dir, "workflow.md")
+				data := &WorkflowData{
+					MarkdownContent: "{{#runtime-import prompt.md}}",
+					Jobs: map[string]any{
+						"release": map[string]any{"needs": tt.needs, "outputs": map[string]any{"id": "value"}},
+					},
+				}
+				err := c.validateOnNeeds(data)
+				if tt.valid {
+					require.NoError(t, err)
+				} else {
+					require.ErrorContains(t, err, "not available before activation")
+				}
+			})
+		}
+	})
+
+	t.Run("rejects runtime-import reference to explicit-needs job not in activation needs", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+		promptsDir := filepath.Join(tmpDir, ".github", "prompts")
+		require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+		require.NoError(t, os.MkdirAll(promptsDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(promptsDir, "runtime.md"), []byte("Value: ${{ needs.select.outputs.value }}"), 0600))
+
+		c := NewCompiler()
+		c.markdownPath = filepath.Join(workflowsDir, "workflow.md")
+		data := &WorkflowData{
+			MarkdownContent: "{{#runtime-import .github/prompts/runtime.md}}",
+			Jobs: map[string]any{
+				"select": map[string]any{
+					"needs": "other",
+				},
+			},
+		}
+
+		err := c.validateOnNeeds(data)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "prompt references needs.select.*")
+		require.ErrorContains(t, err, "not available before activation")
+	})
+
+	t.Run("allows runtime-import reference to explicit-needs job in on.needs", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+		promptsDir := filepath.Join(tmpDir, ".github", "prompts")
+		require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+		require.NoError(t, os.MkdirAll(promptsDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(promptsDir, "runtime.md"), []byte("Value: ${{ needs.select.outputs.value }}"), 0600))
+
+		c := NewCompiler()
+		c.markdownPath = filepath.Join(workflowsDir, "workflow.md")
+		data := &WorkflowData{
+			MarkdownContent: "{{#runtime-import .github/prompts/runtime.md}}",
+			OnNeeds:         []string{"select", "other"},
+			Jobs: map[string]any{
+				"select": map[string]any{
+					"needs": "other",
+				},
+				"other": map[string]any{},
+			},
+		}
+
+		require.NoError(t, c.validateOnNeeds(data))
+	})
+
+	t.Run("allows no-explicit-needs runtime-import reference because activation auto-adds it", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+		promptsDir := filepath.Join(tmpDir, ".github", "prompts")
+		require.NoError(t, os.MkdirAll(workflowsDir, 0755))
+		require.NoError(t, os.MkdirAll(promptsDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(promptsDir, "runtime.md"), []byte("Value: ${{ needs.select.outputs.value }}"), 0600))
+
+		c := NewCompiler()
+		c.markdownPath = filepath.Join(workflowsDir, "workflow.md")
+		data := &WorkflowData{
+			MarkdownContent: "{{#runtime-import .github/prompts/runtime.md}}",
+			Jobs: map[string]any{
+				"select": map[string]any{},
+			},
+		}
+
+		require.NoError(t, c.validateOnNeeds(data))
+	})
+
+	t.Run("allows no-explicit-needs reference from frontmatter import only", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+		sharedDir := filepath.Join(workflowsDir, "shared")
+		require.NoError(t, os.MkdirAll(sharedDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "runtime.md"), []byte("Value: ${{ needs.select.outputs.value }}"), 0600))
+
+		c := NewCompiler()
+		c.markdownPath = filepath.Join(workflowsDir, "workflow.md")
+		data := &WorkflowData{
+			ImportPaths: []string{".github/workflows/shared/runtime.md"},
+			Jobs: map[string]any{
+				"select": map[string]any{},
+			},
+		}
+
+		require.NoError(t, c.validateOnNeeds(data))
 	})
 }

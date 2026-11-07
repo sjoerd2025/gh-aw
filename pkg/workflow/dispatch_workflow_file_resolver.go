@@ -9,6 +9,7 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/goccy/go-yaml"
 )
 
 // getCurrentWorkflowName extracts the workflow name from the file path
@@ -74,9 +75,11 @@ func findWorkflowFile(workflowName string, currentWorkflowPath string) (*findWor
 	mdPath := filepath.Clean(filepath.Join(searchDir, workflowName+".md"))
 	lockPath := filepath.Clean(filepath.Join(searchDir, workflowName+".lock.yml"))
 	ymlPath := filepath.Clean(filepath.Join(searchDir, workflowName+".yml"))
+	yamlPath := filepath.Clean(filepath.Join(searchDir, workflowName+".yaml"))
 
 	// Validate paths are within the search directory (prevent path traversal)
-	if !isPathWithinDir(mdPath, searchDir) || !isPathWithinDir(lockPath, searchDir) || !isPathWithinDir(ymlPath, searchDir) {
+	if !isPathWithinDir(mdPath, searchDir) || !isPathWithinDir(lockPath, searchDir) ||
+		!isPathWithinDir(ymlPath, searchDir) || !isPathWithinDir(yamlPath, searchDir) {
 		dispatchWorkflowValidationLog.Printf("Rejecting workflow name '%s': resolved paths escape search dir %s", workflowName, searchDir)
 		return result, fmt.Errorf("invalid workflow name '%s' (path traversal not allowed)", workflowName)
 	}
@@ -84,12 +87,23 @@ func findWorkflowFile(workflowName string, currentWorkflowPath string) (*findWor
 	// Check which files exist
 	result.mdPath = mdPath
 	result.lockPath = lockPath
-	result.ymlPath = ymlPath
 	result.mdExists = fileutil.FileExists(mdPath)
 	result.lockExists = fileutil.FileExists(lockPath)
-	result.ymlExists = fileutil.FileExists(ymlPath)
 
-	dispatchWorkflowValidationLog.Printf("Workflow file search results: md_exists=%v, lock_exists=%v, yml_exists=%v", result.mdExists, result.lockExists, result.ymlExists)
+	// Prefer .yml over .yaml; fall back to .yaml when only that exists.
+	// Both extensions are valid GitHub Actions workflow file extensions.
+	if fileutil.FileExists(ymlPath) {
+		result.ymlPath = ymlPath
+		result.ymlExists = true
+	} else if fileutil.FileExists(yamlPath) {
+		result.ymlPath = yamlPath
+		result.ymlExists = true
+	} else {
+		result.ymlPath = ymlPath // default to .yml path when neither exists
+		result.ymlExists = false
+	}
+
+	dispatchWorkflowValidationLog.Printf("Workflow file search results: md_exists=%v, lock_exists=%v, yml_exists=%v (path=%s)", result.mdExists, result.lockExists, result.ymlExists, result.ymlPath)
 	return result, nil
 }
 
@@ -113,6 +127,79 @@ func mdHasWorkflowDispatch(mdPath string) (bool, error) {
 		return false, nil
 	}
 	return containsWorkflowDispatch(onSection), nil
+}
+
+// mdHasWorkQueueTools reports whether a workflow source enables the work-queue tool.
+func mdHasWorkQueueTools(mdPath string) (bool, error) {
+	content, err := os.ReadFile(mdPath) // #nosec G304 -- mdPath is validated via isPathWithinDir in findWorkflowFile
+	if err != nil {
+		return false, err
+	}
+	result, err := parser.ExtractFrontmatterFromContent(string(content))
+	if err != nil || result == nil {
+		return false, err
+	}
+	tools, ok := result.Frontmatter["tools"].(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	value, configured := tools["work-queue"]
+	return configured && value != false, nil
+}
+
+// mdHasWorkQueueWorker reports whether a workflow source declares itself as a queue worker.
+func mdHasWorkQueueWorker(mdPath string) (bool, error) {
+	content, err := os.ReadFile(mdPath) // #nosec G304 -- mdPath is validated via isPathWithinDir in findWorkflowFile
+	if err != nil {
+		return false, err
+	}
+	result, err := parser.ExtractFrontmatterFromContent(string(content))
+	if err != nil || result == nil {
+		return false, err
+	}
+	tools, ok := result.Frontmatter["tools"].(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	workQueue, ok := tools["work-queue"].(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	worker, ok := workQueue["worker"].(bool)
+	return ok && worker, nil
+}
+
+// lockHasWorkQueueProtocol reports whether a compiled workflow includes both queue admission and reconciliation.
+func lockHasWorkQueueProtocol(lockPath string) (bool, error) {
+	content, err := os.ReadFile(lockPath) // #nosec G304 -- lockPath is validated via isPathWithinDir in findWorkflowFile
+	if err != nil {
+		return false, err
+	}
+	var compiled struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string `yaml:"name"`
+				ID   string `yaml:"id"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(content, &compiled); err != nil {
+		return false, err
+	}
+	hasStep := func(jobName, stepName, stepID string) bool {
+		job, ok := compiled.Jobs[jobName]
+		if !ok {
+			return false
+		}
+		for _, step := range job.Steps {
+			if step.Name == stepName && (stepID == "" || step.ID == stepID) {
+				return true
+			}
+		}
+		return false
+	}
+	return hasStep(string(constants.ActivationJobName), "Snapshot work queue state", "") &&
+		hasStep(string(constants.SafeOutputsJobName), "Reconcile work queue claim", "work_queue_claim_reconciliation"), nil
 }
 
 // extractMDWorkflowDispatchInputs reads a .md workflow file's frontmatter and extracts

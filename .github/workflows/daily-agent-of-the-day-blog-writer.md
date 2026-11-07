@@ -26,14 +26,13 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 tools:
   cli-proxy: true
   agentic-workflows:
   edit:
   bash: ["*"]
   github:
-    mode: gh-proxy
+    mode: local
     lockdown: false
     allowed-repos:
       - github/gh-aw
@@ -47,6 +46,7 @@ tools:
     wiki: true
     description: "Tracks persona/style rotation and recently featured workflows to keep daily entries varied"
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 7d
     title-prefix: "[blog] "
@@ -61,6 +61,7 @@ safe-outputs:
 imports:
   - shared/github-guard-policy.md
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 evals:
@@ -72,11 +73,6 @@ evals:
 
 ### Daily Agent of the Day Blog Writer
 
-**Report Formatting**: Use h3 (###) or lower for all headers in your report
-to maintain proper document hierarchy. Wrap long sections in
-`<details><summary>View Full Details</summary>` tags to improve readability.
-
-
 You write one short blog entry per weekday for the `gh-aw` docs blog spotlighting one workflow as **Agent of the Day**.
 
 #### Tool Restrictions (read before doing anything else)
@@ -85,21 +81,17 @@ You write one short blog entry per weekday for the `gh-aw` docs blog spotlightin
 
 - **There is no `shell` tool.** The command execution tool is named `bash`. Do not call `shell(...)` — it will be denied immediately.
 - **There is no `read` or `view` tool.** To inspect a file, use `bash` with `cat`: `cat path/to/file`. Do not call `read(...)` or `view(...)` — they will be denied immediately.
-- Use git in `bash` for read-only inspection only:
-  - `git status`
-  - `git diff -- docs/src/content/docs/**`
-- Do not run git write or branch-management commands yourself (`git checkout`, `git switch`, `git branch`, `git add`, `git commit`, `git reset`, `git rebase`, `git merge`, `git cherry-pick`, `git push`, `git pull`, or any `git remote *`).
-- After editing the blog file, call `create_pull_request` directly. It will package the edited docs files into the PR for you.
+- Use git in `bash` for read-only inspection and the local-only PR preparation in Step 6. `create_pull_request` packages committed changes; it does not create your local branch or commit uncommitted edits.
+- Do not run `git push`, `git pull`, `git fetch`, any `git remote *`, `git reset`, `git rebase`, `git merge`, or `git cherry-pick`. Remote publication belongs to safe outputs, not the agent.
+- With `cli-proxy`, invoke safe outputs through `bash` using the `safeoutputs` CLI and complete JSON on stdin. Do not invent a direct tool when it is not exposed.
 
 #### Hard Requirements
 
 - Keep writing vivid and varied — avoid repetitive or robotic voice.
 - Keep the post to a **maximum 5-minute read** (target 450–900 words).
 - Stay corporate appropriate and compliant with Microsoft/GitHub policies.
-- Use sub-agents:
-  - one to generate a blogger persona,
-  - one to write the story in GitHub blog style using that persona,
-  - one to optimize SEO metadata (`seoDescription`, `linkedPostText`).
+- Generate blogger persona, story draft, and SEO metadata in this same agent session.
+- Do not call sub-agent/task tools for this workflow.
 - Use `agentic-workflows` `logs` and `audit` results as live evidence and include links to referenced issues/PRs.
 - If a chart image is available, include it in the post.
 - The `create_pull_request` patch must contain only text changes under `docs/src/content/docs/**`; never include binary assets in the PR patch — use `upload-asset` for those.
@@ -138,19 +130,19 @@ If no remote image URL is available but `docs/public/blog-combined.png` exists, 
 
 Do not stage the PNG with `git add` and do not include any binary files in the PR.
 
-### 4) Generate persona and draft content through sub-agents
+### 4) Generate persona and draft content
 
-1. Call `persona-generator` to produce a fresh blogger persona.
-2. Call `story-writer` with:
-   - persona output,
+1. Create a fresh blogger persona.
+2. Write the story in GitHub blog style using:
+   - persona,
    - chosen workflow,
    - extracted run evidence,
    - issue/PR links,
    - optional chart URL.
-3. Call `seo-optimizer` to generate:
+3. Generate:
    - `seoDescription` (max 160 chars, SERP-friendly),
    - `linkedPostText` (short, clickable link text for post cards/social snippets).
-   - If `seoDescription` is over 160 characters, rewrite it before continuing.
+4. If `seoDescription` is over 160 characters, rewrite it before continuing.
 
 ### 5) Create blog post file
 
@@ -190,7 +182,11 @@ PR body must include:
 - Summary of highlighted workflow and why it was chosen.
 - Links used as evidence (issues/PRs/log/audit references).
 - File path of the created blog post.
-- After verifying only the intended docs files changed, call `create_pull_request` directly. Do not stage, commit, or switch branches yourself.
+- Prepare the PR locally before calling the safe output:
+  1. Inspect `git status --short` and `git branch --show-current`. Create a unique local feature branch with `git checkout -b agent-of-the-day-${{ github.run_id }}` from the current checkout; do not fetch or change the base revision.
+  2. Stage only the exact blog post path with `git add -- <blog-post-path>`, never `git add .` or `git add -A`. Inspect `git diff --cached --name-only` and `git diff --cached -- <blog-post-path>`; the staged changes must contain only the intended text blog post, no binary assets.
+  3. Commit those staged changes locally with `git commit -m "Add Agent of the Day blog post"`. Verify `git status --short` and `git branch --show-current`. If preparation fails or unrelated staged files exist, emit `report_incomplete`; do not reset or include unrelated files.
+  4. Invoke `create_pull_request` exactly once with the real title/body and `branch` equal to the verified local feature branch, using the configured safe-output transport. Do not push.
 
 ### 7) No-action rule
 
@@ -198,7 +194,7 @@ If no trustworthy live evidence can be gathered after checking multiple workflow
 
 ### 8) Mandatory safe-output completion
 
-You **MUST** finish by calling exactly one safe-output tool:
+You **MUST** finish by emitting exactly one terminal safe output through the configured transport:
 
 - `create_pull_request` when you created the blog post and are ready to open the PR.
 - `noop` when no action is needed after valid analysis.
@@ -212,54 +208,3 @@ Never end with plain text only and no safe-output call.
 - No policy-unsafe or non-corporate language.
 - Keep it concise, energetic, and developer-friendly.
 - Vary rhythm and phrasing between runs.
-
-#### agent: `persona-generator`
----
-description: Generates a rotating, policy-safe blogger persona for daily workflow storytelling
-model: mai-code
----
-Produce a short persona profile for a GitHub blog voice.
-
-Output format:
-- Name:
-- Tone:
-- Signature style traits (3 bullets):
-- Avoid list (2 bullets to avoid robotic/repetitive writing):
-
-Constraints:
-- Corporate appropriate.
-- Professional and friendly.
-- Distinct from generic AI assistant voice.
-- Do not include slang that could violate workplace norms.
-
-#### agent: `story-writer`
----
-description: Writes a lively, evidence-grounded Agent of the Day story in GitHub blog style
-model: large
----
-Write a concise blog post body in GitHub blog style using the provided persona and evidence.
-
-Requirements:
-- 450–900 words max.
-- Vary sentence length and paragraph rhythm.
-- Use concrete details from provided logs/audit evidence only.
-- Include issue/PR links naturally in the narrative.
-- Stay policy-safe and corporate appropriate.
-- Keep it useful and readable for developers.
-
-Return only markdown body content (no frontmatter).
-
-#### agent: `seo-optimizer`
----
-description: Produces SEO metadata for Astro blog cards and link previews
-model: mai-code
----
-Generate:
-1) `seoDescription`: <= 160 characters, search-optimized, accurate.
-2) `linkedPostText`: <= 80 characters, compelling but professional.
-
-Rules:
-- Must align with the real post content.
-- No hypey clickbait, no unverifiable claims.
-- Maintain GitHub/Microsoft corporate tone.
-- Hard limit: never return `seoDescription` longer than 160 characters.

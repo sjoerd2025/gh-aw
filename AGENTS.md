@@ -21,15 +21,18 @@ Everything else should be loaded **lazily** through skills only when needed.
 
 ## Critical Rules (Always Applicable)
 
-1. If you changed files, use `report_progress` to commit and push.
+1. If you changed files, use `report_progress` to commit and push if available; otherwise, use Git directly after the same validation gates.
 2. Before **intermediate** `report_progress` calls, run `make agent-report-progress-no-test` (fast, no tests). Before the **final** `report_progress`, run `make agent-report-progress` (includes `test-unit`).
    - `test-unit` is impacted-first by default (~30s target). Use `TEST_UNIT_RUN_FULL=1 make test-unit` or `make test-unit-all` when full-suite coverage is required.
    - Run `test-unit` only once per PR — at the final push, not on every intermediate save.
 3. After Go changes, run `make fmt`.
 4. After workflow markdown changes (`.md` under `.github/workflows/`), run `make recompile`.
 5. Do not add `.lock.yml` files to `.gitignore`.
-6. Never attempt to trigger a workflow run (e.g., `gh run`, `gh aw run`) as part of a Copilot cloud agent run. The token does not have the required access. Always fail with an error — do not task the user or ask them to run it manually.
+6. Copilot cloud agents may dispatch a workflow only when the user explicitly requests a dry-run test and the exact published source and lock revision has passed the review, compilation, and live-execution gates in `.github/aw/debug-agentic-workflow.md`. Compile with `--dry-run` and dispatch that reviewed revision; compilation alone does not start a run, and dispatch alone does not enable dry-run protections. Dry-run suppresses compiler-managed mutations, not arbitrary script effects. Non-dry-run dispatch remains prohibited. On an authorization error, stop and report it; never retry with different credentials, bypass protections, or ask the user to run it manually.
 7. **Large-file guard**: before reading any file with `github-mcp-server-get_file_contents`, check its size. Files larger than 20 KB must be read with targeted tools (`grep`, `glob`, `bash`, or `view` with `view_range`) instead of full-file reads. See [token-optimization.md](.github/aw/token-optimization.md) for the full technique.
+8. Never ask the user to confirm the plan. Always execute the plan.
+9. **Autopilot mode**: Never ask for confirmation before taking action. Never prompt the user with "Should I proceed?", "Do you want me to…?", or any equivalent. Always act immediately and autonomously.
+10. **Grading contract**: Follow `.github/skills/operational-value-designer/SKILL.md`. Built-ins compute over the in-memory unified session in conclusion; custom `graders.<distinct-id>.script` JavaScript and repository-owned `graders.operational-value.run` Bash run only in the separate graders job. Bash reads session JSONL from `$1` / `GH_AW_SESSION_FILE`, config JSON from `GH_AW_GRADER_CONFIG`, and returns legacy metric arrays; detected file writes are rejected. Shell is trusted code, not yet microVM-isolated. Never add user code or steps to conclusion. Adopt workflow semantics and grader acceptance rules together at the same workflow path and commit; corrections are prospective and prior results are never rewritten.
 
 ## Upstream-managed workflow sources (read-only in this repo)
 
@@ -46,20 +49,29 @@ Workflows that declare a `source:` frontmatter entry (for example `source: githu
 
 Use skills only when the task requires specialized guidance. Do not pre-load every skill.
 
-When the relevant skill is not obvious, first discover candidates and then load only the minimal guidance needed:
+All skills are local to this repository under `.github/skills/`. **NEVER** use GitHub Agent Finder (`agentfinder.github.com`) or any other remote skill discovery service to look for skills.
 
-- Query GitHub Agent Finder directly with the built-in REST API at `https://agentfinder.github.com/api/v1/search`.
-- Send an ARD search request with the user's task in `query.text`; do not ask the user for the endpoint.
+When the relevant skill is not obvious, first discover candidates locally and then load only the minimal guidance needed:
+
+- Discover skills by listing or searching `.github/skills/*/SKILL.md` in this repository.
 - Use **skill fusion** after discovery: read only the specific skill sections or fragments needed instead of loading full skills broadly.
 
 ### Use these skills by intent
 
 - Workflow create/update/debug/upgrade tasks → `.github/skills/agentic-workflows/SKILL.md`
 - Core engineering conventions, validation flow, and command playbooks → `.github/skills/developer/SKILL.md`
+- Code organization, file structure, WASM stubs, string patterns → `.github/skills/developer-code-organization/SKILL.md`
+- Security best practices, template injection, shell script safety, supply chain → `.github/skills/developer-security/SKILL.md`
+- Compiler internals, validation architecture, safe outputs, schema, MCP logs → `.github/skills/developer-internals/SKILL.md`
+- Adding or extending declarative agentic engines → `.github/skills/custom-engine-implementation/SKILL.md`
+- Release management, breaking CLI change rules, firewall log parsing → `.github/skills/developer-release/SKILL.md`
 - Error handling design/patterns → `.github/skills/error-recovery-patterns/SKILL.md`
 - GitHub MCP usage patterns → `.github/skills/github-mcp-server/SKILL.md`
 - Query helpers for issues/PRs/workflows/discussions/labels → matching `.github/skills/github-*-query/SKILL.md`
+- Security-focused reviews of agentic workflow changes (compile/scans/audit/optimization) → `.github/skills/review-agentic-workflows/SKILL.md`
 - Doc-writing conventions → `.github/skills/documentation/SKILL.md`
+- Issue/comment Markdown construction and refactoring → `.github/skills/issue-markdown/SKILL.md`
+- Visual changes to the docs site or landing page (layout, widths, spacing, colour, header nav) → `.github/skills/docs-design/SKILL.md`
 - Reviewing or writing `git`/`gh`/remote operations against checkouts (per-checkout credentials, sparse/shallow monorepos, safe-outputs MCP runs without credentials) → `.github/skills/checkout-credential-review/SKILL.md`
 - Authoring, validating, or debugging canvas extensions (loopback servers, actions, iframe rendering, state model, theme tokens) → `.github/skills/create-canvas/SKILL.md`
 
@@ -99,6 +111,26 @@ DEBUG_COLORS=0 DEBUG=* gh aw compile workflow.md 2>debug.log
 | `*` | Everything |
 
 To discover the exact namespace for a package, look for `logger.New(...)` at the top of the relevant `.go` file (e.g. `var log = logger.New("cli:run_workflow_execution")`).
+
+### Adding debug logs
+
+When adding new debug instrumentation to Go code, use `pkg/logger` — **never** `fmt.Println`, `log.Printf`, or other ad-hoc output:
+
+```go
+import "github.com/github/gh-aw/pkg/logger"
+
+var log = logger.New("cli:my_package") // one per file/package, at package scope
+
+func doSomething() {
+    log.Debug("starting operation", "key", value)
+    // ...
+    log.Debug("operation complete", "result", result)
+}
+```
+
+- Pick a namespace that matches the existing hierarchy (e.g. `cli:`, `workflow:`, `mcp:`).
+- Pass structured key/value pairs after the message for queryable context.
+- All output is gated by `DEBUG` at runtime — no user-visible noise in normal operation.
 
 ### GitHub Actions debug runs
 

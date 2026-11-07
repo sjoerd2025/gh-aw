@@ -3,15 +3,26 @@ package workflow
 import (
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var mcpCLIMountLog = logger.New("workflow:mcp_cli_mount")
+
+var promptRepoIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+
+const (
+	// Keep these aligned with gh-aw-firewall's finite disclosure charge constants.
+	enclaveResultStatusBitCost = 1
+	enclaveTimingBucketBits    = 4
+	enclaveConfidentialRunBits = 8
+)
 
 // mcp_cli_mount.go generates a workflow step that mounts MCP servers as local CLI tools
 // and produces the prompt section that informs the agent about these tools.
@@ -64,7 +75,7 @@ func appendCustomMCPServerIfEligible(servers []string, toolName string, toolValu
 //
 // Returns nil when no servers are eligible for mounting.
 // The GitHub MCP server is excluded (handled differently).
-func getMCPCLIServerNames(data *WorkflowData) []string {
+func getMCPCLIServerNames(data *WorkflowData) []string { //nolint:largefunc // Existing CLI proxy selection handles all supported tool sources.
 	if data == nil {
 		return nil
 	}
@@ -89,7 +100,7 @@ func getMCPCLIServerNames(data *WorkflowData) []string {
 				if !isPlaywrightCLIMode(data.Tools) {
 					servers = append(servers, toolName)
 				}
-			case "qmd":
+			case "qmd", "work-queue":
 				servers = append(servers, toolName)
 			case "agentic-workflows":
 				// The gateway and manifest use "agenticworkflows" (no hyphen) as the server ID.
@@ -120,13 +131,17 @@ func getMCPCLIServerNames(data *WorkflowData) []string {
 	if IsMCPScriptsEnabled(data.MCPScripts) && !slices.Contains(servers, constants.MCPScriptsMCPServerID.String()) {
 		servers = append(servers, constants.MCPScriptsMCPServerID.String())
 	}
+	if enclavesEnabled(data) && !slices.Contains(servers, enclaveMCPServerName) {
+		servers = append(servers, enclaveMCPServerName)
+	}
 
-	// Copilot always runs with --disable-builtin-mcps. When at least one CLI mount
-	// trigger is active (safeoutputs/mcpscripts or cli-proxy), the mount script
-	// discovers all MCP servers from the gateway manifest (including GitHub and
-	// custom servers such as azure-devops) and exposes wrappers on PATH. Reflect
-	// that runtime reality in the generated CLI server list so agents can call
-	// these wrappers deterministically instead of guessing command names.
+	// Copilot normally runs with --disable-builtin-mcps. When at least one CLI
+	// mount trigger is active (safeoutputs/mcpscripts or cli-proxy), the mount
+	// script discovers all MCP servers from the gateway manifest (including
+	// GitHub and custom servers such as azure-devops) and exposes wrappers on
+	// PATH. Reflect that runtime reality in the generated CLI server list so
+	// agents can call these wrappers deterministically instead of guessing
+	// command names.
 	//
 	// Use cli-proxy as part of the activation condition because the initial
 	// collection deliberately excludes GitHub: a workflow with cli-proxy: true
@@ -136,6 +151,9 @@ func getMCPCLIServerNames(data *WorkflowData) []string {
 	if isCLIMountActive && data.EngineConfig != nil && data.EngineConfig.ID == string(constants.CopilotEngine) {
 		if hasGitHubTool(data.ParsedTools) && !isGitHubCLIModeEnabled(data) && !slices.Contains(servers, constants.GitHubMCPServerID.String()) {
 			servers = append(servers, constants.GitHubMCPServerID.String())
+		}
+		if isWorkQueueEnabled(data) && !slices.Contains(servers, "work-queue") {
+			servers = append(servers, "work-queue")
 		}
 
 		for toolName, toolValue := range data.Tools {
@@ -205,7 +223,7 @@ func getMountedCLIServerNamesIfBashRestricted(workflowData *WorkflowData, tools 
 	return getMCPCLIServerNames(buildCLIWorkflowDataForMounts(workflowData, tools, safeOutputs, mcpScripts))
 }
 
-func withMountedCLIShellCommandsInRestrictedBash(workflowData *WorkflowData) map[string]any {
+func withMountedCLIShellCommandsInRestrictedBash(workflowData *WorkflowData) map[string]any { //nolint:largefunc // Existing shell wrapper logic preserves command rewriting order.
 	if workflowData == nil {
 		return nil
 	}
@@ -282,11 +300,8 @@ func withMountedCLIShellCommandsInRestrictedBash(workflowData *WorkflowData) map
 // getMCPCLIExcludeFromAgentConfig returns the sorted list of MCP server names that
 // should be excluded from the agent's MCP config (because they are CLI-only).
 //
-// Only excludes servers when tools.cli-proxy is explicitly enabled. Infrastructure
-// servers (safeoutputs, mcpscripts) are CLI-mounted even without cli-proxy (so the
-// agent can call them as shell commands), but they remain in the agent's MCP config
-// unless cli-proxy is explicitly enabled. This preserves existing agent behaviour
-// for workflows that use safeoutputs via MCP rather than via the CLI wrapper.
+// Only explicit tools.cli-proxy excludes CLI-mounted servers. Infrastructure
+// wrappers do not otherwise prevent native MCP access.
 func getMCPCLIExcludeFromAgentConfig(data *WorkflowData) []string {
 	if data == nil || data.ParsedTools == nil || !data.ParsedTools.CLIProxy {
 		return nil
@@ -308,10 +323,12 @@ func (c *Compiler) generateMCPCLIMountStep(yaml *strings.Builder, data *Workflow
 	yaml.WriteString("        id: mount-mcp-clis\n")
 	yaml.WriteString("        continue-on-error: true\n")
 	yaml.WriteString("        env:\n")
-	yaml.WriteString("          MCP_GATEWAY_API_KEY: ${{ steps.start-mcp-gateway.outputs.gateway-api-key }}\n")
+	if !enclavesEnabled(data) {
+		yaml.WriteString("          MCP_GATEWAY_AGENT_ID: ${{ steps.start-mcp-gateway.outputs.gateway-agent-id }}\n")
+	}
 	yaml.WriteString("          MCP_GATEWAY_DOMAIN: ${{ steps.start-mcp-gateway.outputs.gateway-domain }}\n")
 	yaml.WriteString("          MCP_GATEWAY_PORT: ${{ steps.start-mcp-gateway.outputs.gateway-port }}\n")
-	fmt.Fprintf(yaml, "        uses: %s\n", getActionPin("actions/github-script"))
+	yaml.WriteString("        uses: " + getActionPin("actions/github-script") + "\n")
 	yaml.WriteString("        with:\n")
 	yaml.WriteString("          script: |\n")
 	yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
@@ -341,7 +358,17 @@ func GetMCPCLIPathSetup(data *WorkflowData) string {
 //
 // The server list is computed at compile time from the workflow configuration.
 // Each entry uses the `--help` convention so agents can discover tool signatures at runtime.
+//
+// The section is omitted when shell execution is fully disabled (tools.bash: false or
+// tools.bash: []): the agent has no way to invoke the CLI wrappers, so advertising them
+// would steer the model towards an unusable tool path (for example telling it to call the
+// safeoutputs CLI from bash when only the safeoutputs MCP tools are reachable).
 func buildMCPCLIPromptSection(data *WorkflowData) *PromptSection {
+	if data != nil && data.BashDisabled {
+		mcpCLIMountLog.Print("Skipping MCP CLI tools prompt section: bash is fully disabled")
+		return nil
+	}
+
 	servers := getMCPCLIServerNames(data)
 	if len(servers) == 0 {
 		return nil
@@ -351,16 +378,87 @@ func buildMCPCLIPromptSection(data *WorkflowData) *PromptSection {
 	// Using step outputs (e.g. steps.mount-mcp-clis.outputs.mcp-cli-servers-list) here
 	// would reference a step from the agent job in the activation job's env block, which
 	// is out of scope and triggers actionlint errors.
-	lines := make([]string, len(servers))
-	for i, server := range servers {
-		lines[i] = fmt.Sprintf("- `%s` — run `%s --help` to see available tools", server, server)
+	budgetLines := staticEnclaveInformationBudgetPromptLines(data)
+	lines := make([]string, 0, typeutil.SafeAllocationCapacity(len(servers), len(budgetLines)))
+	for _, server := range servers {
+		lines = append(lines, fmt.Sprintf("- `%s` — run `%s --help` to see available tools", server, server))
+	}
+	if len(budgetLines) > 0 {
+		lines = append(lines, budgetLines...)
+	}
+
+	promptFile := mcpCLIToolsPromptFile
+	envVars := map[string]string{
+		"GH_AW_MCP_CLI_SERVERS_LIST": strings.Join(lines, "\n"),
+	}
+	if slices.Contains(servers, constants.SafeOutputsMCPServerID.String()) {
+		promptFile = mcpCLIToolsWithSafeOutputsPromptFile
 	}
 
 	return &PromptSection{
-		Content: mcpCLIToolsPromptFile,
+		Content: promptFile,
 		IsFile:  true,
-		EnvVars: map[string]string{
-			"GH_AW_MCP_CLI_SERVERS_LIST": strings.Join(lines, "\n"),
-		},
+		EnvVars: envVars,
 	}
+}
+
+func sanitizePromptRepoIdentifier(repo string) string {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return "[invalid-repo]"
+	}
+	if !promptRepoIdentifierPattern.MatchString(repo) {
+		return "[invalid-repo]"
+	}
+	return repo
+}
+
+func staticEnclaveInformationBudgetPromptLines(data *WorkflowData) []string {
+	if !enclavesEnabled(data) {
+		return nil
+	}
+	var repoLines []string
+	for _, enclave := range data.Enclaves {
+		if enclave == nil || enclave.Agent == nil {
+			continue
+		}
+		for _, repo := range enclave.Repos {
+			if repo == nil {
+				continue
+			}
+			switch repo.Sensitivity {
+			case "public":
+				safeRepo := sanitizePromptRepoIdentifier(repo.Repo)
+				repoLines = append(repoLines, fmt.Sprintf("- `%s` (`public`) still requires a finite response schema; do not apply the confidential repository's 8-bit budget to this scope.", safeRepo))
+			case "trusted":
+				repoLines = append(repoLines, "- A trusted repository is unmetered and permits free-form strings inside a strict structured schema. Use only for content approved for unrestricted disclosure; never change sensitivity to bypass a confidential budget.")
+			case "confidential":
+				payloadBits := enclaveConfidentialRunBits - enclaveResultStatusBitCost - enclaveTimingBucketBits
+				maxCardinality := 1 << payloadBits
+				repoLines = append(repoLines, fmt.Sprintf("- A confidential repository has an %d-bit per-run budget, so response schema cardinality must be at most %d.", enclaveConfidentialRunBits, maxCardinality))
+			case "internal":
+				repoLines = append(repoLines, "- An internal repository has a finite per-run budget; keep response schema cardinality within the budget reported by `awf-enclave --help`.")
+			case "sealed":
+				repoLines = append(repoLines, "- A sealed repository has a 0-bit per-run budget and never launches an enclave; do not invoke `awf-enclave enclave_run_agent` for it.")
+			}
+		}
+	}
+	if len(repoLines) == 0 {
+		return nil
+	}
+	lines := []string{
+		"",
+		"For `awf-enclave enclave_run_agent`, non-trusted response schemas are constrained by finite-disclosure information budgets, not just `max-output-bytes`.",
+		// Keep these constants aligned with gh-aw-firewall's finite disclosure charge:
+		// RESULT_STATUS_BIT_COST=1, TIMING_BUCKET_BITS=4, and
+		// ENCLAVE_SENSITIVITY_RUN_BITS.confidential=8.
+		"The finite-disclosure charge is 1 status bit + ceil(log2(response schema cardinality)) + 4 timing bits.",
+	}
+	lines = append(lines, repoLines...)
+	lines = append(lines,
+		"Use small enums and booleans for finite schemas; bound integers with `minimum`/`maximum`, strings with finite `enum` values, and arrays with `maxItems` and finite item schemas. For objects, use `additionalProperties: false`; the combined field cardinalities must fit the budget.",
+		"For non-trusted scopes, do not return repository text through unrestricted strings or retry with a wider schema after `bit-budget-exhausted`. A response can be under `max-output-bytes` and still exceed its information budget.",
+		"Respect the configured enclave timeout, task-byte limit, model request/token limits, invocation limit, and output-byte limit; the schema budget is an additional bound, not a replacement.",
+	)
+	return lines
 }

@@ -18,6 +18,7 @@
  */
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const fs = require("fs");
 // SEC-004: No sanitize needed - body fields are read-only (temp ID extraction)
 // Actual sanitize happens in create_issue/add_comment handlers that write content
 
@@ -230,6 +231,7 @@ function loadTemporaryIdMap() {
   if (!mapJson || mapJson === "{}") {
     return new Map();
   }
+
   try {
     const mapObject = JSON.parse(mapJson);
     /** @type {Map<string, RepoIssuePair>} */
@@ -250,6 +252,26 @@ function loadTemporaryIdMap() {
   } catch (error) {
     if (typeof core !== "undefined") {
       core.warning(`Failed to parse temporary ID map: ${getErrorMessage(error)}`);
+    }
+    return new Map();
+  }
+}
+
+/**
+ * Load the temporary ID map from an artifact file.
+ * @param {string} filePath - Path to the JSON map file
+ * @returns {Map<string, RepoIssuePair>} Map of temporary ID to repository and issue number
+ */
+function loadTemporaryIdMapFromFile(filePath) {
+  if (!filePath) {
+    return new Map();
+  }
+  try {
+    return loadTemporaryIdMapFromResolved(JSON.parse(fs.readFileSync(filePath, "utf8")));
+  } catch (error) {
+    const isMissingFile = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+    if (!isMissingFile && typeof core !== "undefined") {
+      core.warning(`Failed to parse temporary ID map artifact: ${getErrorMessage(error)}`);
     }
     return new Map();
   }
@@ -628,6 +650,7 @@ function replaceTemporaryProjectReferences(text, tempProjectMap) {
  * Checks fields that commonly contain temporary IDs:
  * - body (for create_issue, create_discussion, add_comment)
  * - parent_issue_number, sub_issue_number (for link_sub_issue)
+ * - blocked_by (for create_issue dependencies)
  * - issue_number (for add_comment, update_issue, etc.)
  * - discussion_number (for create_discussion, update_discussion)
  *
@@ -653,7 +676,7 @@ function extractTemporaryIdReferences(message) {
   }
 
   // Check direct ID reference fields
-  const idFields = ["parent_issue_number", "sub_issue_number", "issue_number", "item_number", "discussion_number", "pull_request_number", "content_number"];
+  const idFields = ["parent_issue_number", "sub_issue_number", "issue_number", "item_number", "discussion_number", "pull_request_number", "content_number", "id", "work_item_id", "source_id", "target_id"];
 
   for (const field of idFields) {
     const value = message[field];
@@ -662,6 +685,13 @@ function extractTemporaryIdReferences(message) {
       if (isTemporaryId(valueStr)) {
         tempIds.add(normalizeTemporaryId(valueStr));
       }
+    }
+  }
+
+  const blockedBy = message.blocked_by;
+  for (const value of Array.isArray(blockedBy) ? blockedBy : [blockedBy]) {
+    if (value !== undefined && value !== null && isTemporaryId(String(value).trim())) {
+      tempIds.add(normalizeTemporaryId(String(value).trim()));
     }
   }
 
@@ -788,6 +818,7 @@ module.exports = {
   replaceTemporaryIdReferencesLegacy,
   replaceArtifactUrlReferences,
   loadTemporaryIdMap,
+  loadTemporaryIdMapFromFile,
   loadTemporaryIdMapFromResolved,
   resolveIssueNumber,
   resolveRepoIssueTarget,

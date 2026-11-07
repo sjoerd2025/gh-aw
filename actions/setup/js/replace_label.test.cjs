@@ -53,6 +53,7 @@ describe("replace_label", () => {
     };
 
     mockContext = {
+      eventName: "issues",
       repo: {
         owner: "test-owner",
         repo: "test-repo",
@@ -67,6 +68,118 @@ describe("replace_label", () => {
     global.core = mockCore;
     global.github = mockGithub;
     global.context = mockContext;
+  });
+
+  describe("runtime target authorization", () => {
+    const message = { label_to_remove: "in-progress", label_to_add: "done", item_number: 99 };
+
+    it("T-RL-015 ignores a conflicting item_number when target is triggering", async () => {
+      const setLabelsCalls = [];
+      mockGithub.rest.issues.setLabels = async params => {
+        setLabelsCalls.push(params);
+        return { data: params.labels.map(name => ({ name })) };
+      };
+      const handler = await main({ target: "triggering" });
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(42);
+      expect(setLabelsCalls[0].issue_number).toBe(42);
+    });
+
+    it("T-RL-014 defaults to the triggering item when target is omitted", async () => {
+      const setLabelsCalls = [];
+      mockGithub.rest.issues.setLabels = async params => {
+        setLabelsCalls.push(params);
+        return { data: params.labels.map(name => ({ name })) };
+      };
+      const handler = await main({});
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(42);
+      expect(setLabelsCalls[0].issue_number).toBe(42);
+    });
+
+    it("T-RL-016 ignores a conflicting item_number when target is a fixed number", async () => {
+      const setLabelsCalls = [];
+      mockGithub.rest.issues.setLabels = async params => {
+        setLabelsCalls.push(params);
+        return { data: params.labels.map(name => ({ name })) };
+      };
+      const handler = await main({ target: "123" });
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(123);
+      expect(setLabelsCalls[0].issue_number).toBe(123);
+    });
+
+    it("T-RL-017 uses a fixed numeric target without an item_number", async () => {
+      const setLabelsCalls = [];
+      mockGithub.rest.issues.setLabels = async params => {
+        setLabelsCalls.push(params);
+        return { data: params.labels.map(name => ({ name })) };
+      };
+      const handler = await main({ target: "123" });
+
+      const result = await handler({ label_to_remove: "in-progress", label_to_add: "done" }, {});
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(123);
+      expect(setLabelsCalls[0].issue_number).toBe(123);
+    });
+
+    it.each([-1, 1.5, Infinity])("rejects invalid fixed target %s", async target => {
+      const handler = await main({ target });
+      const setLabelsCalls = [];
+      mockGithub.rest.issues.setLabels = async params => {
+        setLabelsCalls.push(params);
+        return { data: [] };
+      };
+
+      const result = await handler({ label_to_remove: "in-progress", label_to_add: "done" }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe("Invalid issue/PR number");
+      expect(setLabelsCalls).toHaveLength(0);
+    });
+
+    it("T-RL-018 accepts item_number when target is wildcard", async () => {
+      const setLabelsCalls = [];
+      mockGithub.rest.issues.setLabels = async params => {
+        setLabelsCalls.push(params);
+        return { data: params.labels.map(name => ({ name })) };
+      };
+      const handler = await main({ target: "*" });
+
+      const result = await handler(message, {});
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(99);
+      expect(setLabelsCalls[0].issue_number).toBe(99);
+    });
+
+    it("skips when the triggering context has no issue or pull request", async () => {
+      mockContext.eventName = "workflow_dispatch";
+      mockContext.payload = {};
+      const setLabelsCalls = [];
+      mockGithub.rest.issues.setLabels = async params => {
+        setLabelsCalls.push(params);
+        return { data: [] };
+      };
+      const handler = await main({});
+
+      const result = await handler({ label_to_remove: "in-progress", label_to_add: "done" }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.skipped).toBe(true);
+      expect(result.error).toContain('Target is "triggering" but not running in issue or pull request context');
+      expect(setLabelsCalls).toHaveLength(0);
+    });
   });
 
   it("should replace label when both labels are valid", async () => {
@@ -147,6 +260,41 @@ describe("replace_label", () => {
     expect(result.success).toBe(false);
   });
 
+  it("should reject label_to_add before setLabels when blocklist changes mid-flight", async () => {
+    let setLabelsCalls = 0;
+    let getCalls = 0;
+    const config = { allowed_add: ["done"], blocked: [] };
+    mockGithub.rest.issues.get = async () => {
+      getCalls++;
+      if (getCalls === 2) {
+        config.blocked = ["done"];
+      }
+      return {
+        data: {
+          title: "Test issue title",
+          labels: [
+            { name: "in-progress", node_id: "LA_in_progress_123" },
+            { name: "bug", node_id: "LA_bug_456" },
+          ],
+          node_id: "I_issue_789",
+        },
+      };
+    };
+    mockGithub.rest.issues.setLabels = async () => {
+      setLabelsCalls++;
+      return { data: [] };
+    };
+
+    const handler = await main(config);
+    const result = await handler({ label_to_remove: "in-progress", label_to_add: "done" }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("blocked pattern");
+    expect(getCalls).toBe(2);
+    expect(config.blocked).toEqual(["done"]);
+    expect(setLabelsCalls).toBe(0);
+  });
+
   it("should skip when required-labels filter does not match", async () => {
     const handler = await main({ required_labels: ["approved"] });
     // Issue has "in-progress" and "bug" but not "approved"
@@ -196,6 +344,36 @@ describe("replace_label", () => {
     const result = await handler({ label_to_remove: "in-progress", label_to_add: "done" }, {});
 
     expect(result.success).toBe(false);
+  });
+
+  it("should reject a successful setLabels response that omits label_to_add", async () => {
+    mockGithub.rest.issues.setLabels = async () => ({
+      data: [{ name: "bug" }],
+    });
+
+    const handler = await main({});
+    const result = await handler({ label_to_remove: "in-progress", label_to_add: "done" }, {});
+
+    expect(result).toEqual({
+      success: false,
+      error: 'replace_label: label_to_add "done" not found in POST-setLabels response',
+    });
+    expect(mockCore.errors).toContain(result.error);
+  });
+
+  it("should reject a successful setLabels response that retains label_to_remove", async () => {
+    mockGithub.rest.issues.setLabels = async () => ({
+      data: [{ name: "in-progress" }, { name: "bug" }, { name: "done" }],
+    });
+
+    const handler = await main({});
+    const result = await handler({ label_to_remove: "in-progress", label_to_add: "done" }, {});
+
+    expect(result).toEqual({
+      success: false,
+      error: 'replace_label: label_to_remove "in-progress" still present after setLabels call',
+    });
+    expect(mockCore.errors).toContain(result.error);
   });
 
   describe("allowed-transitions", () => {

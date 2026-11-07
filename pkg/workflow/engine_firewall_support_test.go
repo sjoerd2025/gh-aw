@@ -3,10 +3,13 @@
 package workflow
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestHasNetworkRestrictions(t *testing.T) {
@@ -22,6 +25,16 @@ func TestHasNetworkRestrictions(t *testing.T) {
 		}
 		if hasNetworkRestrictions(perms) {
 			t.Error("defaults mode should not have restrictions")
+		}
+	})
+
+	t.Run("blocked domains restrict defaults mode", func(t *testing.T) {
+		perms := &NetworkPermissions{
+			Allowed: []string{"defaults"},
+			Blocked: []string{"tracker.example.com"},
+		}
+		if !hasNetworkRestrictions(perms) {
+			t.Error("blocked domains should restrict defaults mode")
 		}
 	})
 
@@ -76,7 +89,7 @@ func TestCheckNetworkSupport_NoRestrictions(t *testing.T) {
 }
 
 func TestCheckNetworkSupport_WithRestrictions(t *testing.T) {
-	t.Run("copilot engine with restrictions - no warning", func(t *testing.T) {
+	t.Run("copilot engine with restrictions - no warning without web tools", func(t *testing.T) {
 		compiler := NewCompiler()
 		engine := NewCopilotEngine()
 		perms := &NetworkPermissions{
@@ -89,7 +102,7 @@ func TestCheckNetworkSupport_WithRestrictions(t *testing.T) {
 			t.Errorf("Expected no error, got: %v", err)
 		}
 		if compiler.warningCount != initialWarnings {
-			t.Error("Should not emit warning for copilot engine with network restrictions")
+			t.Error("Should not emit warning for copilot engine without enabled web tools")
 		}
 	})
 
@@ -130,7 +143,7 @@ func TestCheckNetworkSupport_WithRestrictions(t *testing.T) {
 }
 
 func TestCheckNetworkSupport_StrictMode(t *testing.T) {
-	t.Run("strict mode: copilot engine with restrictions - no error", func(t *testing.T) {
+	t.Run("strict mode: copilot engine with restrictions - no error without web tools", func(t *testing.T) {
 		compiler := NewCompiler()
 		compiler.strictMode = true
 		engine := NewCopilotEngine()
@@ -139,9 +152,7 @@ func TestCheckNetworkSupport_StrictMode(t *testing.T) {
 		}
 
 		err := compiler.checkNetworkSupport(engine, perms)
-		if err != nil {
-			t.Errorf("Expected no error for copilot in strict mode, got: %v", err)
-		}
+		require.NoError(t, err)
 	})
 
 	t.Run("strict mode: claude engine with restrictions - no error (claude supports firewall)", func(t *testing.T) {
@@ -182,6 +193,227 @@ func TestCheckNetworkSupport_StrictMode(t *testing.T) {
 		if err != nil {
 			t.Errorf("Expected no error when no restrictions in strict mode, got: %v", err)
 		}
+	})
+}
+
+func TestValidateCopilotWebToolsSupport(t *testing.T) {
+	type testCase struct {
+		name         string
+		engine       CodingAgentEngine
+		engineConfig *EngineConfig
+		tools        map[string]any
+		strictMode   bool
+		wantErr      bool
+		wantWarnings int
+		errContains  []string
+	}
+	tests := []testCase{
+		{
+			name:        "non-strict web-fetch is rejected",
+			engine:      NewCopilotEngine(),
+			tools:       map[string]any{"web-fetch": nil},
+			wantErr:     true,
+			errContains: []string{"tools.web-fetch", "offline BYOK mode", "copilot-sdk: true"},
+		},
+		{
+			name:        "non-strict web-search is rejected",
+			engine:      NewCopilotEngine(),
+			tools:       map[string]any{"web-search": map[string]any{}},
+			wantErr:     true,
+			errContains: []string{"tools.web-search", "offline BYOK mode", "MCP server"},
+		},
+		{
+			name:        "non-strict enabled tools produce errors",
+			engine:      NewCopilotEngine(),
+			tools:       map[string]any{"web-fetch": true, "web-search": true},
+			wantErr:     true,
+			errContains: []string{"tools.web-fetch", "tools.web-search"},
+		},
+		{
+			name:        "strict enabled fetch produces error",
+			engine:      NewCopilotEngine(),
+			tools:       map[string]any{"web-fetch": true},
+			strictMode:  true,
+			wantErr:     true,
+			errContains: []string{"tools.web-fetch", "offline BYOK mode"},
+		},
+		{
+			name:       "strict enabled tools produce errors",
+			engine:     NewCopilotEngine(),
+			tools:      map[string]any{"web-fetch": nil, "web-search": true},
+			strictMode: true,
+			wantErr:    true,
+			errContains: []string{
+				"tools.web-fetch",
+				"tools.web-search",
+				"offline BYOK mode",
+				"COPILOT_OFFLINE=true",
+				"use a supported engine",
+				"engine: codex",
+			},
+		},
+		{
+			name:         "old pinned version does not bypass rejection",
+			engine:       NewCopilotEngine(),
+			engineConfig: &EngineConfig{Version: "1.0.86"},
+			tools:        map[string]any{"web-search": true},
+			strictMode:   true,
+			wantErr:      true,
+			errContains:  []string{"tools.web-search", "offline BYOK mode"},
+		},
+		{
+			name:       "disabled tools are allowed",
+			engine:     NewCopilotEngine(),
+			tools:      map[string]any{"web-fetch": false, "web-search": false},
+			strictMode: true,
+		},
+		{
+			name:       "unrelated tools are allowed",
+			engine:     NewCopilotEngine(),
+			tools:      map[string]any{"github": nil, "bash": []any{"git"}},
+			strictMode: true,
+		},
+		{
+			name:        "tools are rejected without network restrictions",
+			engine:      NewCopilotEngine(),
+			tools:       map[string]any{"web-fetch": nil, "web-search": nil},
+			strictMode:  true,
+			wantErr:     true,
+			errContains: []string{"tools.web-fetch", "tools.web-search"},
+		},
+		{
+			name:         "SDK custom fetch is allowed",
+			engine:       NewCopilotEngine(),
+			engineConfig: &EngineConfig{CopilotSDK: true},
+			tools:        map[string]any{"web-fetch": nil},
+			strictMode:   true,
+		},
+		{
+			name:         "SDK native search remains unavailable",
+			engine:       NewCopilotEngine(),
+			engineConfig: &EngineConfig{CopilotSDK: true},
+			tools:        map[string]any{"web-fetch": nil, "web-search": nil},
+			wantErr:      true,
+			errContains:  []string{"tools.web-search", "offline BYOK mode"},
+		},
+	}
+
+	for _, engine := range []CodingAgentEngine{NewCodexEngine(), NewPiEngine(), NewClaudeEngine()} {
+		tests = append(tests, testCase{
+			name:       "web tools with " + engine.GetID() + " are allowed",
+			engine:     engine,
+			tools:      map[string]any{"web-fetch": nil, "web-search": nil},
+			strictMode: true,
+		})
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler(WithFailFast(false))
+			compiler.strictMode = tt.strictMode
+
+			err := compiler.validateCopilotWebToolsSupport(tt.engine, tt.engineConfig, tt.tools)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				for _, expected := range tt.errContains {
+					require.ErrorContains(t, err, expected)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantWarnings, compiler.GetWarningCount())
+		})
+	}
+}
+
+func TestToolsNetworkSupportCompilation(t *testing.T) {
+	workflow := func(engine string, strict bool) string {
+		return fmt.Sprintf(`---
+on: workflow_dispatch
+engine: %s
+strict: %t
+network:
+  allowed:
+    - example.com
+tools:
+  web-fetch:
+  web-search:
+---
+Test firewall-bound tool validation.
+`, engine, strict)
+	}
+
+	t.Run("non-strict mode rejects unavailable tools", func(t *testing.T) {
+		compiler := NewCompiler(WithFailFast(false))
+		_, err := compiler.ParseWorkflowString(workflow("copilot", false), "non-strict-tools.md")
+		require.ErrorContains(t, err, "tools.web-fetch")
+		require.ErrorContains(t, err, "tools.web-search")
+		assert.Equal(t, 0, compiler.GetWarningCount())
+	})
+
+	t.Run("strict mode rejects Copilot web tools", func(t *testing.T) {
+		compiler := NewCompiler(WithFailFast(false))
+		_, err := compiler.ParseWorkflowString(workflow("copilot", true), "strict-copilot-tools.md")
+		require.Error(t, err)
+		require.ErrorContains(t, err, "tools.web-fetch")
+		require.ErrorContains(t, err, "tools.web-search")
+		require.ErrorContains(t, err, "offline BYOK mode")
+		require.NotContains(t, err.Error(), "engine: claude")
+	})
+
+	t.Run("strict mode rejects unavailable Copilot web-search for old versions", func(t *testing.T) {
+		compiler := NewCompiler()
+		_, err := compiler.ParseWorkflowString(`---
+on: workflow_dispatch
+engine:
+  id: copilot
+  version: "1.0.86"
+strict: true
+network:
+  allowed:
+    - example.com
+tools:
+  web-search:
+---
+Test unavailable web-search firewall validation.
+`, "strict-copilot-old-web-search.md")
+		require.ErrorContains(t, err, "tools.web-search")
+		require.ErrorContains(t, err, "offline BYOK mode")
+	})
+
+	t.Run("strict mode allows web tools for Claude", func(t *testing.T) {
+		compiler := NewCompiler(WithFailFast(false))
+		_, err := compiler.ParseWorkflowString(workflow("claude", true), "strict-claude-tools.md")
+		require.NoError(t, err)
+	})
+}
+
+func TestCopilotNetworkSupportCompilation(t *testing.T) {
+	workflow := func(strict bool) string {
+		return fmt.Sprintf(`---
+on: workflow_dispatch
+engine: copilot
+strict: %t
+network:
+  allowed:
+    - example.com
+---
+Test Copilot firewall-bound engine validation.
+`, strict)
+	}
+
+	t.Run("non-strict mode compiles without warning when web tools are disabled", func(t *testing.T) {
+		compiler := NewCompiler()
+		_, err := compiler.ParseWorkflowString(workflow(false), "non-strict-copilot.md")
+		require.NoError(t, err)
+		assert.Equal(t, 0, compiler.GetWarningCount())
+	})
+
+	t.Run("strict mode accepts Copilot when web tools are disabled", func(t *testing.T) {
+		compiler := NewCompiler()
+		_, err := compiler.ParseWorkflowString(workflow(true), "strict-copilot.md")
+		require.NoError(t, err)
 	})
 }
 
@@ -273,7 +505,7 @@ func TestCheckFirewallDisable(t *testing.T) {
 func TestGenerateFirewallLogParsingStepFixesFirewallPermissions(t *testing.T) {
 	step := generateFirewallLogParsingStep("test-workflow", nil)
 	stepContent := strings.Join(step, "\n")
-	expectedLogsDir := constants.AWFProxyLogsDir
+	expectedLogsDir := constants.AWFProxyLogsDir.String()
 
 	if !strings.Contains(stepContent, "AWF_LOGS_DIR: "+expectedLogsDir) {
 		t.Error("Expected firewall log parsing step to keep AWF_LOGS_DIR set to logs directory")
@@ -295,8 +527,7 @@ func TestGenerateFirewallLogParsingStepNetworkIsolationOmitsSudo(t *testing.T) {
 		Name: "test-workflow",
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:               "awf",
-				NetworkIsolation: true,
+				ID: "awf",
 			},
 		},
 	}
@@ -309,25 +540,25 @@ func TestGenerateFirewallLogParsingStepNetworkIsolationOmitsSudo(t *testing.T) {
 	}
 }
 
-func TestGenerateFirewallLogParsingStepWithNetworkIsolationFalse(t *testing.T) {
+func TestGenerateFirewallLogParsingStepWithPrivilegedRuntime(t *testing.T) {
 	workflowData := &WorkflowData{
 		Name: "test-workflow",
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:               "awf",
-				NetworkIsolation: false,
+				ID:      "awf",
+				Runtime: AgentRuntimeCloudHypervisor,
 			},
 		},
 	}
 	step := generateFirewallLogParsingStep("test-workflow", workflowData)
 	stepContent := strings.Join(step, "\n")
 
-	// With NetworkIsolation explicitly false, should invoke script without --rootless
+	// Runtime profiles that run AWF with sudo must invoke the script without --rootless
 	if !strings.Contains(stepContent, `bash "${RUNNER_TEMP}/gh-aw/actions/print_firewall_logs.sh"`) {
-		t.Error("Expected firewall log parsing step to invoke print_firewall_logs.sh when NetworkIsolation is explicitly false")
+		t.Error("Expected firewall log parsing step to invoke print_firewall_logs.sh for a privileged runtime")
 	}
 	if strings.Contains(stepContent, "--rootless") {
-		t.Error("Expected no --rootless flag when NetworkIsolation is explicitly false")
+		t.Error("Expected no --rootless flag for a privileged runtime profile")
 	}
 }
 
@@ -339,9 +570,8 @@ func TestGenerateFirewallLogParsingStepLegacySecurityOmitsRootless(t *testing.T)
 		Name: "test-workflow",
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{
-				ID:               "awf",
-				NetworkIsolation: true,
-				LegacySecurity:   true,
+				ID:      "awf",
+				Runtime: AgentRuntimeDockerSudoIptables,
 			},
 		},
 	}

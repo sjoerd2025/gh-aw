@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -22,10 +23,15 @@ func hasNetworkRestrictions(networkPermissions *NetworkPermissions) bool {
 		return false
 	}
 
+	// Blocked domains always restrict access, including when allowed is defaults.
+	if len(networkPermissions.Blocked) > 0 {
+		return true
+	}
+
 	// If allowed domains are specified and it's not just the defaults ecosystem, we have restrictions
 	if len(networkPermissions.Allowed) > 0 {
 		// Check if it's ONLY "defaults" (which means use default ecosystem, not a restriction)
-		if len(networkPermissions.Allowed) == 1 && networkPermissions.Allowed[0] == "defaults" {
+		if len(networkPermissions.Allowed) == 1 && slices.Contains(networkPermissions.Allowed, "defaults") {
 			return false
 		}
 		return true
@@ -33,11 +39,6 @@ func hasNetworkRestrictions(networkPermissions *NetworkPermissions) bool {
 
 	// Empty allowed list [] means deny-all, which is a restriction
 	if networkPermissions.ExplicitlyDefined && len(networkPermissions.Allowed) == 0 {
-		return true
-	}
-
-	// If blocked domains are specified, we have restrictions
-	if len(networkPermissions.Blocked) > 0 {
 		return true
 	}
 
@@ -101,7 +102,7 @@ func generateSquidLogsUploadStep(workflowName string, workflowData *WorkflowData
 	artifactName := "firewall-logs-" + sanitizedName
 	// Firewall logs location: /tmp/gh-aw on standard runners, ${{ runner.temp }}/gh-aw on ARC/DinD.
 	// Use ${{ runner.temp }} (Actions expression) because `with:` blocks don't expand shell vars.
-	firewallLogsDir := constants.AWFProxyLogsDir + "/"
+	firewallLogsDir := constants.AWFProxyLogsDir.String() + "/"
 	if isArcDindTopology(workflowData) {
 		firewallLogsDir = constants.AWFProxyLogsDirExpr + "/"
 	}
@@ -110,7 +111,7 @@ func generateSquidLogsUploadStep(workflowName string, workflowData *WorkflowData
 		"      - name: Upload Firewall Logs",
 		"        if: always()",
 		"        continue-on-error: true",
-		"        uses: " + getActionPin("actions/upload-artifact"),
+		"        uses: " + getActionPinForData("actions/upload-artifact", workflowData),
 		"        with:",
 		"          name: " + artifactName,
 		"          path: " + firewallLogsDir,
@@ -125,18 +126,16 @@ func generateFirewallLogParsingStep(workflowName string, workflowData *WorkflowD
 	// Firewall logs are at a known location in the sandbox folder structure.
 	// On ARC/DinD, /tmp/gh-aw is not daemon-visible so logs land under runner.temp/gh-aw.
 	// For env: blocks, use ${{ runner.temp }} (Actions expression) since shell vars aren't expanded there.
-	firewallLogsDirEnv := constants.AWFProxyLogsDir
+	firewallLogsDirEnv := constants.AWFProxyLogsDir.String()
 	if isArcDindTopology(workflowData) {
 		firewallLogsDirEnv = constants.AWFProxyLogsDirExpr
 	}
 
-	// In network-isolation (rootless) mode, pass --rootless so the script uses
-	// non-interactive sudo (sudo -n) with a non-sudo chmod fallback. In non-network-isolation
-	// mode, and in legacy-security mode (where AWF ran with full sudo access), the script
-	// uses plain sudo.
+	// When the runtime profile runs AWF rootless, pass --rootless so the script uses
+	// non-interactive sudo (sudo -n) with a non-sudo chmod fallback. Profiles where AWF
+	// ran with host privileges (docker-sudo-iptables, cloud-hypervisor) use plain sudo.
 	scriptArg := ""
-	agentCfg := getAgentConfig(workflowData)
-	if isAWFNetworkIsolationEnabled(workflowData) && !agentCfg.LegacySecurity {
+	if isAWFNetworkIsolationEnabled(workflowData) && getSandboxRuntimeProfile(workflowData).Rootless && !hasCloudHypervisorEnclaves(workflowData) {
 		scriptArg = " --rootless"
 	}
 

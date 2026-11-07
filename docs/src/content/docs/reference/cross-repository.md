@@ -21,6 +21,8 @@ The `checkout:` frontmatter field controls how `actions/checkout` is invoked in 
 
 For multi-repository workflows, list multiple entries to clone several repos into the workspace. Mark the agent's primary target with `current: true` when working from a central repository that targets a different repo.
 
+For sidecar workflows that only need to check out a target repository and not their own, set `permissions.contents: none` to skip the automatic workflow-repository checkout while keeping other configured `checkout:` entries intact — see [Target-Only Checkout](/gh-aw/reference/checkout/#target-only-checkout-permissionscontents-none).
+
 When `current: true` points to a checkout in a subdirectory, pull-request patch generation for `create-pull-request` and `push-to-pull-request-branch` runs from that checkout path (when targeting that repository). This ensures PR patches include the real file changes instead of workspace-root gitlinks/subproject entries.
 
 ```yaml wrap
@@ -154,11 +156,15 @@ When `allowed-repos` is specified:
 - Target repository (from `target-repo` or current repo) is always implicitly allowed
 - Creates a union of allowed destinations
 
-### Checkout Requirement for `push-to-pull-request-branch`
+### Checkout Requirement for Pull Request Outputs
 
-Unlike other safe output types, `push-to-pull-request-branch` with `target-repo` requires the target repository to be **checked out into the workflow workspace** using the `checkout:` frontmatter field with a `path:` specified. Without a checkout, the agent has no local git history to create and push a patch from.
+Unlike other safe output types, `create-pull-request` and `push-to-pull-request-branch` with a cross-repository target require the target repository to be **checked out into the workflow workspace**. This also applies when the target is resolved from `GH_AW_TARGET_REPO_SLUG`. You can use either a `checkout:` frontmatter entry with a `path:` specified or a custom `steps:` entry that clones the repository under `$GITHUB_WORKSPACE`. Without a target checkout, these handlers return an error instead of generating a patch from the workflow repository.
 
-See the [Scheduled Push to Pull-Request Branch](#example-scheduled-push-to-pull-request-branch) example and the [Push to PR Branch cross-repo usage](/gh-aw/reference/safe-outputs-pull-requests/#cross-repo-usage) documentation for a complete setup.
+Safe outputs first consult the checkout manifest produced by `checkout:` entries, then fall back to scanning `$GITHUB_WORKSPACE` for git repositories and matching them by `remote.origin.url`.
+
+Commit changes in the target checkout against the intended target base branch. Reading a target file through GitHub tools and copying it into the workflow repository does not establish that base: Git treats the copy as a new file even if it already exists in the target repository. `git am --3way` cannot turn that new-file patch into a modification without an original target blob.
+
+See the [Scheduled Push to Pull Request Branch](#example-scheduled-push-to-pull-request-branch) example and the [Push to PR Branch cross-repo usage](/gh-aw/reference/safe-outputs-pull-requests/#cross-repo-usage) documentation for a complete setup.
 
 ## Examples
 
@@ -215,12 +221,12 @@ engine:
 
 steps:
   - name: Checkout main repo
-    uses: actions/checkout@v6
+    uses: actions/checkout@v7
     with:
       path: main-repo
 
   - name: Checkout secondary repo
-    uses: actions/checkout@v6
+    uses: actions/checkout@v7
     with:
       repository: org/secondary-repo
       token: ${{ secrets.CROSS_REPO_PAT }}
@@ -237,7 +243,7 @@ Compare code structure between main-repo and secondary-repo.
 
 This approach provides full control over checkout timing and configuration.
 
-### Example: Scheduled Push to Pull-Request Branch
+### Example: Scheduled Push to Pull Request Branch
 
 A scheduled workflow that automatically pushes changes to open pull-request branches in another repository needs to fetch those branches after checkout. Without `fetch:`, only the default branch (usually `main`) is available.
 
@@ -269,13 +275,11 @@ updates to each PR branch.
 
 `fetch: ["refs/pulls/open/*"]` causes a `git fetch` step to run after `actions/checkout`, downloading all open PR head refs into the workspace. The agent can then inspect and modify those branches directly.
 
-## Related Documentation
+## Learn More
 
 - [GitHub Repository Checkout](/gh-aw/reference/checkout/) - Full checkout configuration reference
 - [MultiRepoOps Pattern](/gh-aw/patterns/multi-repo-ops/) - Cross-repository workflow pattern
-- [MultiRepoOps — Central Control Plane](/gh-aw/patterns/central-repo-ops/#using-a-central-control-repository) — Central control plane pattern
 - [GitHub Tools Reference](/gh-aw/reference/github-tools/) - Complete GitHub Tools configuration
-- [Safe Outputs Reference](/gh-aw/reference/safe-outputs/) - Complete safe output configuration
 - [Safe Outputs (Pull Requests)](/gh-aw/reference/safe-outputs-pull-requests/) - `target-repo`, `head-repo`, and fork-branch PR flows
 - [Authentication Reference](/gh-aw/reference/auth/) - PAT and GitHub App setup
-- [Multi-Repository Examples](/gh-aw/examples/multi-repo/) - Complete working examples
+- [Multi-Repository Examples](/gh-aw/gallery/multi-repo/) - Complete working examples

@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"maps"
 	"strconv"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -19,6 +20,7 @@ type IssueReportingConfig struct {
 	ReportAsFailure      *string  `yaml:"report-as-failure,omitempty"` // Whether to surface these signals as agent failures (default: true). Set to false to revert to old behavior. Supports literal bool or GitHub Actions expression.
 	TitlePrefix          string   `yaml:"title-prefix,omitempty"`      // Prefix for issue titles
 	Labels               []string `yaml:"labels,omitempty"`            // Labels to add to created issues
+	Implicit             bool     `yaml:"-"`                           // True when this config was auto-defaulted rather than authored by the user; recomputed after import merges (e.g. for report-incomplete's create-issue default)
 }
 
 // Type aliases so existing code (compiler_types.go, tests, etc.) continues to compile unchanged.
@@ -42,11 +44,28 @@ type MissingToolConfig = IssueReportingConfig
 type ReportIncompleteConfig = IssueReportingConfig
 
 func (c *Compiler) parseMissingDataConfig(outputMap map[string]any) *MissingDataConfig {
-	return c.parseIssueReportingConfig(outputMap, "missing-data", "[missing data]", false, true, missingDataLog)
+	return c.parseIssueReportingConfig(normalizeMissingReportKeys(outputMap), "report-missing-data", "[missing data]", false, true, missingDataLog)
 }
 
 func (c *Compiler) parseMissingToolConfig(outputMap map[string]any) *MissingToolConfig {
-	return c.parseIssueReportingConfig(outputMap, "missing-tool", "[missing tool]", false, true, missingToolLog)
+	return c.parseIssueReportingConfig(normalizeMissingReportKeys(outputMap), "report-missing-tool", "[missing tool]", false, true, missingToolLog)
+}
+
+func normalizeMissingReportKeys(outputMap map[string]any) map[string]any {
+	if outputMap == nil {
+		return nil
+	}
+	normalized := maps.Clone(outputMap)
+	for _, kind := range []string{"tool", "data"} {
+		legacy, canonical := "missing-"+kind, "report-missing-"+kind
+		if value, exists := normalized[legacy]; exists {
+			if _, canonicalExists := normalized[canonical]; !canonicalExists {
+				normalized[canonical] = value
+			}
+			delete(normalized, legacy)
+		}
+	}
+	return normalized
 }
 
 // parseReportIncompleteConfig handles report_incomplete configuration.

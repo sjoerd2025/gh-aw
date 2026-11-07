@@ -1,4 +1,5 @@
 import { AST_NODE_TYPES, ESLintUtils, TSESTree } from "@typescript-eslint/utils";
+import { resolveWriteOnceInitializerChain } from "./command-initializer-utils";
 
 const createRule = ESLintUtils.RuleCreator(name => `https://github.com/github/gh-aw/tree/main/eslint-factory#${name}`);
 
@@ -104,9 +105,12 @@ function isContextGithubExpression(node: TSESTree.Node): boolean {
  * - `getOctokit(...)` call results (bare or via known module objects, e.g.
  *   `github.getOctokit(...)` or `actions.getOctokit(...)`)
  * - `context.github` member expression
+ * - Fallback (`||` / `??`) and ternary expressions with a known source branch
  */
 function isOctokitSourceExpression(node: TSESTree.Node): boolean {
   if (node.type === AST_NODE_TYPES.Identifier && OCTOKIT_CLIENT_NAMES.has(node.name)) return true;
+  if (node.type === AST_NODE_TYPES.LogicalExpression && (node.operator === "||" || node.operator === "??")) return isOctokitSourceExpression(node.left) || isOctokitSourceExpression(node.right);
+  if (node.type === AST_NODE_TYPES.ConditionalExpression) return isOctokitSourceExpression(node.consequent) || isOctokitSourceExpression(node.alternate);
 
   if (node.type === AST_NODE_TYPES.CallExpression) {
     const callee = node.callee;
@@ -136,7 +140,7 @@ export const noGithubRequestInterpolatedRouteRule = createRule({
       description:
         "Disallow template literals with interpolations or string concatenation as the route argument of Octokit.request() calls. " +
         "Octokit clients are detected by well-known names (github, octokit, githubClient, octokitClient), " +
-        "identifiers initialized from getOctokit(...) call results, context.github, and simple const aliases of any of these. " +
+        "identifiers initialized from getOctokit(...) call results, context.github, and const aliases or fallback expressions containing any of these. " +
         "Use the typed placeholder form for value interpolation, or thread a typed route string from the caller when the entire route is dynamic.",
     },
     schema: [],
@@ -219,12 +223,14 @@ export const noGithubRequestInterpolatedRouteRule = createRule({
         if (!clientName) return;
 
         const firstArg = node.arguments[0];
-        if (!firstArg) return;
+        if (!firstArg || firstArg.type === AST_NODE_TYPES.SpreadElement) return;
 
-        const routeKind = getInterpolatedRouteKind(firstArg);
+        const routeExpr = resolveWriteOnceInitializerChain(firstArg as TSESTree.Expression, context.sourceCode);
+
+        const routeKind = getInterpolatedRouteKind(routeExpr);
         if (!routeKind) return;
 
-        if (isOpaqueWholeRouteInterpolation(firstArg)) {
+        if (isOpaqueWholeRouteInterpolation(routeExpr)) {
           context.report({
             node: firstArg,
             messageId: "opaqueWholeRoute",

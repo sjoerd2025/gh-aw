@@ -12,15 +12,16 @@ var runtimeDefLog = logger.New("workflow:runtime_definitions")
 
 // Runtime represents configuration for a runtime environment
 type Runtime struct {
-	ID              string            // Unique identifier (e.g., "node", "python")
-	Name            string            // Display name (e.g., "Node.js", "Python")
-	ActionRepo      string            // GitHub Actions repository (e.g., "actions/setup-node")
-	ActionVersion   string            // Action version (e.g., "v4", without @ prefix)
-	VersionField    string            // Field name for version in action (e.g., "node-version")
-	DefaultVersion  string            // Default version to use
-	Commands        []string          // Commands that indicate this runtime is needed
-	ExtraWithFields map[string]string // Additional 'with' fields for the action
-	ManifestFiles   []string          // Package manifest file names for this runtime (matched by filename, no path)
+	ID                string            // Unique identifier (e.g., "node", "python")
+	Name              string            // Display name (e.g., "Node.js", "Python")
+	ActionRepo        string            // GitHub Actions repository (e.g., "actions/setup-node")
+	ActionVersion     string            // Action version (e.g., "v4", without @ prefix)
+	VersionField      string            // Field name for version in action (e.g., "node-version")
+	DefaultVersion    string            // Default version to use
+	Commands          []string          // Commands that indicate this runtime is needed
+	ExtraWithFields   map[string]string // Additional 'with' fields for the action
+	ManifestFiles     []string          // Package manifest file names for this runtime (matched by filename, no path)
+	UnverifiedCreator bool              // True if the action creator is not GitHub-verified; triggers zizmor suppression
 }
 
 // RuntimeRequirement represents a detected runtime requirement
@@ -76,7 +77,8 @@ var knownRuntimes = []*Runtime{
 		ExtraWithFields: map[string]string{
 			"otp-version": "27",
 		},
-		ManifestFiles: []string{"mix.exs", "mix.lock"},
+		ManifestFiles:     []string{"mix.exs", "mix.lock"},
+		UnverifiedCreator: true, // erlef org is not GitHub-verified on the Marketplace
 	},
 	{
 		ID:             "go",
@@ -166,7 +168,11 @@ var knownRuntimes = []*Runtime{
 		VersionField:   "version",
 		DefaultVersion: "", // Uses latest
 		Commands:       []string{"uv", "uvx"},
-		ManifestFiles:  []string{"pyproject.toml", "uv.lock"},
+		ExtraWithFields: map[string]string{
+			"enable-cache": "false",
+		},
+		ManifestFiles:     []string{"pyproject.toml", "uv.lock"},
+		UnverifiedCreator: true, // astral-sh org is not GitHub-verified on the Marketplace
 	},
 }
 
@@ -205,9 +211,9 @@ var securityConfigFiles = []string{
 	"DESIGN.md",          // Captures design-system source of truth consumed by coding agents
 	"README.md",          // Primary documentation file often imported by agents as context
 	"CONTRIBUTING.md",    // Contribution guidelines; modifying could mislead contributors or agents
-	"CHANGELOG.md",       // Release history; modification could misrepresent project state
 	"SECURITY.md",        // Security policy; tampering could suppress vulnerability disclosure
 	"CODE_OF_CONDUCT.md", // Community conduct policy
+	"CHANGELOG.md",       // Release history; changes should receive human scrutiny
 }
 
 // allManifestFilesBaseCache caches the base (no-extra) result of getAllManifestFiles.

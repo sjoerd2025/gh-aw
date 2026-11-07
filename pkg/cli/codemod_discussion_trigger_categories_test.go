@@ -3,13 +3,16 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/workflow/aw"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestGetDiscussionTriggerCategoriesLowercaseCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getDiscussionTriggerCategoriesLowercaseCodemod()
 
 	assert.Equal(t, "discussion-trigger-categories-lowercase", codemod.ID)
@@ -20,6 +23,7 @@ func TestGetDiscussionTriggerCategoriesLowercaseCodemod(t *testing.T) {
 }
 
 func TestDiscussionTriggerCategoriesCodemod_LowercasesMixedCaseValues(t *testing.T) {
+	t.Parallel()
 	codemod := getDiscussionTriggerCategoriesLowercaseCodemod()
 
 	content := `---
@@ -48,13 +52,14 @@ on:
 
 	require.NoError(t, err)
 	assert.True(t, applied)
-	assert.Contains(t, result, "- agentic workflows")
-	assert.Contains(t, result, "types: [general]")
+	assertPolicyCodemodValue(t, result, []any{"agentic workflows"}, "on", "discussion", "types")
+	assertPolicyCodemodValue(t, result, []any{"general"}, "on", "discussion_comment", "types")
 	assert.NotContains(t, result, "- Agentic Workflows")
 	assert.NotContains(t, result, "types: [General]")
 }
 
 func TestDiscussionTriggerCategoriesCodemod_NoOpWhenAlreadyLowercase(t *testing.T) {
+	t.Parallel()
 	codemod := getDiscussionTriggerCategoriesLowercaseCodemod()
 
 	content := `---
@@ -87,6 +92,7 @@ on:
 }
 
 func TestDiscussionTriggerCategoriesCodemod_LowercasesQuotedOnAndTriggerKeys(t *testing.T) {
+	t.Parallel()
 	codemod := getDiscussionTriggerCategoriesLowercaseCodemod()
 
 	content := `---
@@ -115,31 +121,236 @@ func TestDiscussionTriggerCategoriesCodemod_LowercasesQuotedOnAndTriggerKeys(t *
 
 	require.NoError(t, err)
 	assert.True(t, applied)
-	assert.Contains(t, result, "- agentic workflows")
-	assert.Contains(t, result, "types: [general]")
+	assertPolicyCodemodValue(t, result, []any{"agentic workflows"}, "on", "discussion", "types")
+	assertPolicyCodemodValue(t, result, []any{"general"}, "on", "discussion_comment", "types")
 	assert.NotContains(t, result, "- Agentic Workflows")
 	assert.NotContains(t, result, "types: [General]")
 }
 
-func TestGetBlockMappingKey(t *testing.T) {
+func TestDiscussionTriggerCategoriesCodemod_FrontmatterCases(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
-		name    string
-		line    string
-		wantKey string
-		wantOK  bool
+		name         string
+		lines        []string
+		wantModified bool
+		wantLines    []string
 	}{
-		{name: "plain key", line: "on:", wantKey: "on", wantOK: true},
-		{name: "quoted key", line: `"on":`, wantKey: "on", wantOK: true},
-		{name: "inline comment with extra spaces", line: `"discussion":    # category`, wantKey: "discussion", wantOK: true},
-		{name: "inline value", line: "on: push", wantKey: "", wantOK: false},
-		{name: "list item", line: "- on:", wantKey: "", wantOK: false},
+		{
+			name:         "empty input is not modified",
+			lines:        []string{},
+			wantModified: false,
+			wantLines:    []string{},
+		},
+		{
+			name: "no on block leaves lines untouched",
+			lines: []string{
+				"name: test",
+				"jobs:",
+				"  build:",
+			},
+			wantModified: false,
+			wantLines: []string{
+				"name: test",
+				"jobs:",
+				"  build:",
+			},
+		},
+		{
+			name: "on block without discussion trigger is untouched",
+			lines: []string{
+				"on:",
+				"  push:",
+				"    branches: [main]",
+			},
+			wantModified: false,
+			wantLines: []string{
+				"on:",
+				"  push:",
+				"    branches: [main]",
+			},
+		},
+		{
+			name: "discussion block-list types are lowercased",
+			lines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - Created",
+				"      - Answered",
+			},
+			wantModified: true,
+			wantLines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - created",
+				"      - answered",
+			},
+		},
+		{
+			name: "discussion inline array types are lowercased",
+			lines: []string{
+				"on:",
+				"  discussion:",
+				"    types: [Created, Answered]",
+			},
+			wantModified: true,
+			wantLines: []string{
+				"on:",
+				"  discussion:",
+				"    types: [created, answered]",
+			},
+		},
+		{
+			name: "discussion_comment trigger is also handled",
+			lines: []string{
+				"on:",
+				"  discussion_comment:",
+				"    types:",
+				"      - Created",
+			},
+			wantModified: true,
+			wantLines: []string{
+				"on:",
+				"  discussion_comment:",
+				"    types:",
+				"      - created",
+			},
+		},
+		{
+			name: "already lowercase types are not modified",
+			lines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - created",
+			},
+			wantModified: false,
+			wantLines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - created",
+			},
+		},
+		{
+			name: "comment and blank lines inside on block are ignored",
+			lines: []string{
+				"on:",
+				"  # a comment",
+				"",
+				"  discussion:",
+				"    types:",
+				"      - Created",
+			},
+			wantModified: true,
+			wantLines: []string{
+				"on:",
+				"  # a comment",
+				"",
+				"  discussion:",
+				"    types:",
+				"      - created",
+			},
+		},
+		{
+			name: "trigger block ends when a sibling key is reached",
+			lines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - Created",
+				"  push:",
+				"    branches: [main]",
+			},
+			wantModified: true,
+			wantLines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - created",
+				"  push:",
+				"    branches: [main]",
+			},
+		},
+		{
+			name: "on block ends when a top level key is reached",
+			lines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - Created",
+				"jobs:",
+				"  build:",
+			},
+			wantModified: true,
+			wantLines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - created",
+				"jobs:",
+				"  build:",
+			},
+		},
+		{
+			name: "empty types key switches into list-item mode",
+			lines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - Answered",
+				"      - Created",
+			},
+			wantModified: true,
+			wantLines: []string{
+				"on:",
+				"  discussion:",
+				"    types:",
+				"      - answered",
+				"      - created",
+			},
+		},
+		{
+			name: "quoted trigger keys are recognized",
+			lines: []string{
+				"on:",
+				`  "discussion":`,
+				"    types:",
+				"      - Created",
+			},
+			wantModified: true,
+			wantLines: []string{
+				"on:",
+				`  "discussion":`,
+				"    types:",
+				"      - created",
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotKey, gotOK := getBlockMappingKey(tt.line)
-			assert.Equal(t, tt.wantKey, gotKey)
-			assert.Equal(t, tt.wantOK, gotOK)
+			t.Parallel()
+			content := "---\n" + strings.Join(tt.lines, "\n") + "\n---\n\n# Prompt\n"
+			gotContent, gotModified, err := getDiscussionTriggerCategoriesLowercaseCodemod().Apply(content, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantModified, gotModified)
+			if gotModified {
+				want, err := aw.Parse("---\n" + strings.Join(tt.wantLines, "\n") + "\n---\n")
+				require.NoError(t, err)
+				got, err := aw.Parse(gotContent)
+				require.NoError(t, err)
+				assert.Equal(t, want.Frontmatter, got.Frontmatter)
+			} else {
+				assert.Equal(t, content, gotContent)
+			}
+			assert.True(t, strings.HasSuffix(gotContent, "\n---\n\n# Prompt\n"))
+			second, applied, err := getDiscussionTriggerCategoriesLowercaseCodemod().Apply(gotContent, nil)
+			require.NoError(t, err)
+			assert.False(t, applied)
+			assert.Equal(t, gotContent, second)
 		})
 	}
 }

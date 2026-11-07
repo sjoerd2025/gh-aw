@@ -92,6 +92,9 @@ func TestGenerateMCPScriptsMCPServerScript(t *testing.T) {
 	if !strings.Contains(script, "GH_AW_MCP_SCRIPTS_API_KEY") {
 		t.Error("Script should reference GH_AW_MCP_SCRIPTS_API_KEY environment variable")
 	}
+	if !strings.Contains(script, "apiKey: apiKey,") {
+		t.Error("Script should pass the API key to the HTTP MCP server")
+	}
 
 	// Test the tools configuration JSON
 	toolsJSON := GenerateMCPScriptsToolsConfig(config)
@@ -184,13 +187,12 @@ func TestGenerateMCPScriptsToolsConfigWithEnv(t *testing.T) {
 		t.Error("Tools config should contain env field")
 	}
 
-	// Verify that env contains environment variable names (not secrets or $ prefixes)
-	// The values should be just the variable names like "GH_TOKEN": "GH_TOKEN"
-	if !strings.Contains(toolsJSON, `"GH_TOKEN": "GH_TOKEN"`) {
+	// The manifest refers to tool-specific transport names, never secret values.
+	if !strings.Contains(toolsJSON, `"GH_TOKEN": "`+mcpScriptEnvBindingName("github-query", "GH_TOKEN")+`"`) {
 		t.Error("Tools config should contain GH_TOKEN env variable name")
 	}
 
-	if !strings.Contains(toolsJSON, `"API_KEY": "API_KEY"`) {
+	if !strings.Contains(toolsJSON, `"API_KEY": "`+mcpScriptEnvBindingName("github-query", "API_KEY")+`"`) {
 		t.Error("Tools config should contain API_KEY env variable name")
 	}
 

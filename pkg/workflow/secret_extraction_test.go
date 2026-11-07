@@ -82,6 +82,41 @@ func TestSharedExtractSecretsFromValue(t *testing.T) {
 			},
 		},
 		{
+			name:  "compact secret expression",
+			value: "${{secrets.TOKEN}}",
+			expected: map[string]string{
+				"TOKEN": "${{secrets.TOKEN}}",
+			},
+		},
+		{
+			name:  "mixed-case context and secret name",
+			value: "${{ Secrets.Token }}",
+			expected: map[string]string{
+				"Token": "${{ Secrets.Token }}",
+			},
+		},
+		{
+			name:  "lowercase secret name",
+			value: "${{ secrets.lowercase_token }}",
+			expected: map[string]string{
+				"lowercase_token": "${{ secrets.lowercase_token }}",
+			},
+		},
+		{
+			name:  "secret after variable fallback",
+			value: "${{ vars.A || secrets.B }}",
+			expected: map[string]string{
+				"B": "${{ vars.A || secrets.B }}",
+			},
+		},
+		{
+			name:  "secret after github token fallback",
+			value: "${{ github.token || secrets.X }}",
+			expected: map[string]string{
+				"X": "${{ github.token || secrets.X }}",
+			},
+		},
+		{
 			name:  "secret with default value",
 			value: "${{ secrets.DD_SITE || 'datadoghq.com' }}",
 			expected: map[string]string{
@@ -266,80 +301,32 @@ func TestSharedExtractSecretsFromMap(t *testing.T) {
 	}
 }
 
-// TestSharedReplaceSecretsWithEnvVars tests the shared ReplaceSecretsWithEnvVars utility function
-func TestSharedReplaceSecretsWithEnvVars(t *testing.T) {
-	tests := []struct {
-		name     string
-		value    string
-		secrets  map[string]string
-		expected string
-	}{
-		{
-			name:  "simple replacement",
-			value: "${{ secrets.DD_API_KEY }}",
-			secrets: map[string]string{
-				"DD_API_KEY": "${{ secrets.DD_API_KEY }}",
-			},
-			expected: "\\${DD_API_KEY}",
-		},
-		{
-			name:  "replacement with default value",
-			value: "${{ secrets.DD_SITE || 'datadoghq.com' }}",
-			secrets: map[string]string{
-				"DD_SITE": "${{ secrets.DD_SITE || 'datadoghq.com' }}",
-			},
-			expected: "\\${DD_SITE}",
-		},
-		{
-			name:  "bearer token replacement",
-			value: "Bearer ${{ secrets.TAVILY_API_KEY }}",
-			secrets: map[string]string{
-				"TAVILY_API_KEY": "${{ secrets.TAVILY_API_KEY }}",
-			},
-			expected: "Bearer \\${TAVILY_API_KEY}",
-		},
-		{
-			name:  "multiple replacements",
-			value: "${{ secrets.KEY1 }} and ${{ secrets.KEY2 }}",
-			secrets: map[string]string{
-				"KEY1": "${{ secrets.KEY1 }}",
-				"KEY2": "${{ secrets.KEY2 }}",
-			},
-			expected: "\\${KEY1} and \\${KEY2}",
-		},
-		{
-			name:     "no replacements",
-			value:    "plain value",
-			secrets:  map[string]string{},
-			expected: "plain value",
-		},
-		{
-			name:  "partial replacement",
-			value: "${{ secrets.API_KEY }} and plain text",
-			secrets: map[string]string{
-				"API_KEY": "${{ secrets.API_KEY }}",
-			},
-			expected: "\\${API_KEY} and plain text",
-		},
-	}
+func TestExtractEnvExpressionsFromValuePrefersFallbackForDuplicateVariable(t *testing.T) {
+	result := ExtractEnvExpressionsFromValue("${{ env.HOST || 'localhost' }}/${{ env.HOST }}")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ReplaceSecretsWithEnvVars(tt.value, tt.secrets)
-			if result != tt.expected {
-				t.Errorf("Expected %q, got %q", tt.expected, result)
-			}
-		})
-	}
+	assert.Equal(t, map[string]string{
+		"HOST": "${{ env.HOST || 'localhost' }}",
+	}, result)
 }
 
-// TestReplaceSecretsWithEnvVars_FallbackExpressionDeterminism verifies that when a single
+func TestExtractEnvExpressionsFromMapPrefersFallbackForDuplicateVariable(t *testing.T) {
+	result := ExtractEnvExpressionsFromMap(map[string]string{
+		"HOST_WITH_FALLBACK": "${{ env.HOST || 'localhost' }}",
+		"HOST":               "${{ env.HOST }}",
+	})
+
+	assert.Equal(t, map[string]string{
+		"HOST": "${{ env.HOST || 'localhost' }}",
+	}, result)
+}
+
+// TestReplaceSecretsWithShellEnvVars_FallbackExpressionDeterminism verifies that when a single
 // GitHub Actions expression references two secrets (e.g. a fallback pattern like
 // "${{ secrets.DD_APPLICATION_KEY || secrets.DD_APP_KEY }}"), the replacement is
 // deterministic across repeated calls. Previously, Go map iteration produced either
-// "\${DD_APP_KEY}" or "\${DD_APPLICATION_KEY}" non-deterministically, causing
+// "${DD_APP_KEY}" or "${DD_APPLICATION_KEY}" non-deterministically, causing
 // smoke-otel-backends.lock.yml to differ between compiler runs.
-func TestReplaceSecretsWithEnvVars_FallbackExpressionDeterminism(t *testing.T) {
+func TestReplaceSecretsWithShellEnvVars_FallbackExpressionDeterminism(t *testing.T) {
 	// Both secrets map to the same expression — this is what ExtractSecretsFromMap
 	// produces for "${{ secrets.DD_APPLICATION_KEY || secrets.DD_APP_KEY }}".
 	sharedExpr := "${{ secrets.DD_APPLICATION_KEY || secrets.DD_APP_KEY }}"
@@ -352,7 +339,7 @@ func TestReplaceSecretsWithEnvVars_FallbackExpressionDeterminism(t *testing.T) {
 	const runs = 50
 	var first string
 	for i := range runs {
-		got := ReplaceSecretsWithEnvVars(sharedExpr, secrets)
+		got := ReplaceSecretsWithShellEnvVars(sharedExpr, secrets)
 		if i == 0 {
 			first = got
 			continue
@@ -366,39 +353,12 @@ func TestReplaceSecretsWithEnvVars_FallbackExpressionDeterminism(t *testing.T) {
 	// first in sorted order and performs the replacement; the second key finds nothing
 	// to replace. Note: '_' (ASCII 95) > 'L' (ASCII 76), so "DD_APPLICATION_KEY" sorts
 	// before "DD_APP_KEY" (comparison diverges at position 6: 'L' < '_').
-	want := "\\${DD_APPLICATION_KEY}"
-	if first != want {
-		t.Errorf("ReplaceSecretsWithEnvVars(%q, secrets) = %q, want %q", sharedExpr, first, want)
-	}
-}
-
-// TestReplaceSecretsWithBashVars_FallbackExpressionDeterminism verifies that
-// ReplaceSecretsWithBashVars produces deterministic output for fallback expressions
-// with two secret references. Mirrors TestReplaceSecretsWithEnvVars_FallbackExpressionDeterminism.
-func TestReplaceSecretsWithBashVars_FallbackExpressionDeterminism(t *testing.T) {
-	value := "${{ secrets.DD_APPLICATION_KEY || secrets.DD_APP_KEY }}"
-
-	const runs = 50
-	var first string
-	for i := range runs {
-		got := ReplaceSecretsWithBashVars(value)
-		if i == 0 {
-			first = got
-			continue
-		}
-		if got != first {
-			t.Errorf("non-deterministic output: run 0 produced %q, run %d produced %q", first, i, got)
-		}
-	}
-
-	// "DD_APPLICATION_KEY" sorts before "DD_APP_KEY" ('L' < '_'), so it wins.
 	want := "${DD_APPLICATION_KEY}"
 	if first != want {
-		t.Errorf("ReplaceSecretsWithBashVars(%q) = %q, want %q", value, first, want)
+		t.Errorf("ReplaceSecretsWithShellEnvVars(%q, secrets) = %q, want %q", sharedExpr, first, want)
 	}
 }
 
-// TestSharedExtractSecretsFromValueEdgeCases tests edge cases for the shared ExtractSecretsFromValue utility function
 func TestSharedExtractSecretsFromValueEdgeCases(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -546,11 +506,9 @@ func TestExtractWorkflowInputExpressionsFromValue(t *testing.T) {
 			},
 		},
 		{
-			name:  "double-quote bracket notation",
-			value: `"base":"${{ inputs["base-branch"] }}"`,
-			expected: map[string]string{
-				"GH_AW_INPUT_BASE_BRANCH": `${{ inputs["base-branch"] }}`,
-			},
+			name:     "invalid double-quote bracket notation",
+			value:    `"base":"${{ inputs["base-branch"] }}"`,
+			expected: map[string]string{},
 		},
 		{
 			name:     "no input expressions",
@@ -649,9 +607,9 @@ func TestContainsJobOutputExpr(t *testing.T) {
 			want:  true,
 		},
 		{
-			name:  "bracket notation with double quotes",
+			name:  "invalid bracket notation with double quotes",
 			value: `${{ needs["auth"].outputs["token"] }}`,
-			want:  true,
+			want:  false,
 		},
 		{
 			name:  "full bracket notation (job and outputs key both in brackets)",

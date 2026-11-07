@@ -9,10 +9,176 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func extractWorkflowStepByName(t *testing.T, workflowYAML, stepName string) string {
+	t.Helper()
+
+	marker := "- name: " + stepName
+	nameIdx := strings.Index(workflowYAML, marker)
+	if nameIdx == -1 {
+		t.Fatalf("Expected %q step in generated workflow", stepName)
+	}
+
+	lineStart := nameIdx
+	for lineStart > 0 && workflowYAML[lineStart-1] != '\n' {
+		lineStart--
+	}
+	indent := workflowYAML[lineStart:nameIdx]
+	stepSection := workflowYAML[lineStart:]
+	nextStepMarker := "\n" + indent + "- name:"
+	if next := strings.Index(stepSection[1:], nextStepMarker); next != -1 {
+		stepSection = stepSection[:next+1]
+	}
+	return stepSection
+}
+
+func TestUnifiedArtifactUploadRequiresProtectedParserSuccess(t *testing.T) {
+	compiler := NewCompiler()
+	var protected strings.Builder
+	compiler.generateUnifiedArtifactUpload(&protected, []string{"/tmp/gh-aw/agent-session.jsonl"}, "", &WorkflowData{}, true)
+	assert.Contains(t, protected.String(), "steps.parse_agent_logs.outcome == 'success'")
+
+	var unprotected strings.Builder
+	compiler.generateUnifiedArtifactUpload(&unprotected, []string{"/tmp/gh-aw/agent-session.jsonl"}, "", &WorkflowData{}, false)
+	assert.NotContains(t, unprotected.String(), "parse_agent_logs")
+}
+
+func TestProtectedSessionCapturePublicationPipeline(t *testing.T) {
+	for _, protected := range []bool{false, true} {
+		t.Run(map[bool]string{false: "shared", true: "protected"}[protected], func(t *testing.T) {
+			dir := testutil.TempDir(t, "protected-publication")
+			capture := "false"
+			if protected {
+				capture = "true"
+			}
+			definition := `---
+engine:
+  id: protected-test
+  display-name: Protected Test
+  auth:
+    - role: api-key
+      secret: CAPTURE_TEST_SECRET
+  behaviors:
+    execution:
+      command-name: protected-test
+      protected-session-capture: ` + capture + `
+    log-parser: |
+      function parseLog() { return { markdown: "verified", logEntries: [{ type: "assistant.message", data: { content: "verified" } }] }; }
+---
+`
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "engine.md"), []byte(definition), 0o600))
+			content := `---
+on: workflow_dispatch
+strict: false
+permissions:
+  contents: read
+engine:
+  id: protected-test
+env:
+  GLOBAL_SECRET: ${{ secrets.CAPTURE_GLOBAL_SECRET }}
+imports: [engine.md]
+safe-outputs:
+  create-issue:
+    max: 1
+---
+Test protected publication.
+`
+			source := filepath.Join(dir, "capture.md")
+			require.NoError(t, os.WriteFile(source, []byte(content), 0o600))
+			require.NoError(t, NewCompiler().CompileWorkflow(source))
+			lock, err := os.ReadFile(filepath.Join(dir, "capture.lock.yml"))
+			require.NoError(t, err)
+			workflow := string(lock)
+			require.Equal(t, 1, strings.Count(workflow, "      - name: Parse agent logs for step summary\n"))
+			parserStep := extractWorkflowStepByName(t, workflow, "Parse agent logs for step summary")
+			ingestStep := extractWorkflowStepByName(t, workflow, "Ingest agent output")
+			fallbackStep := extractWorkflowStepByName(t, workflow, "Upload agent output fallback artifact")
+			uploadStep := extractWorkflowStepByName(t, workflow, "Upload agent artifacts")
+			parserPosition := strings.Index(workflow, "      - name: Parse agent logs for step summary\n")
+			redactionPosition := strings.Index(workflow, "      - name: Redact secrets in logs\n")
+			ingestPosition := strings.Index(workflow, "      - name: Ingest agent output\n")
+			if protected {
+				assert.Less(t, parserPosition, redactionPosition)
+				assert.Less(t, parserPosition, ingestPosition)
+				assert.Contains(t, parserStep, "GH_AW_SECRET_NAMES: 'CAPTURE_GLOBAL_SECRET,CAPTURE_TEST_SECRET,")
+				assert.Contains(t, parserStep, "SECRET_CAPTURE_TEST_SECRET: ${{ secrets.CAPTURE_TEST_SECRET }}")
+				assert.Contains(t, parserStep, "SECRET_CAPTURE_GLOBAL_SECRET: ${{ secrets.CAPTURE_GLOBAL_SECRET }}")
+				assert.Contains(t, ingestStep, "GH_AW_PROTECTED_SESSION_CAPTURE: 1")
+				for _, step := range []string{ingestStep, fallbackStep, uploadStep} {
+					assert.Contains(t, step, "steps.parse_agent_logs.outcome == 'success'")
+				}
+			} else {
+				assert.Less(t, redactionPosition, ingestPosition)
+				assert.Less(t, ingestPosition, parserPosition)
+				assert.NotContains(t, parserStep, "SECRET_CAPTURE_TEST_SECRET:")
+				for _, step := range []string{ingestStep, fallbackStep, uploadStep} {
+					assert.NotContains(t, step, "parse_agent_logs")
+					assert.NotContains(t, step, "GH_AW_PROTECTED_SESSION_CAPTURE")
+				}
+			}
+		})
+	}
+}
+
+func TestArtifactDownloadSingleArtifactUsesExactName(t *testing.T) {
+	steps := strings.Join(buildArtifactDownloadSteps(ArtifactDownloadConfig{
+		ArtifactName: "detection",
+		DownloadPath: "/tmp/gh-aw/threat-detection/",
+		StepName:     "Download detection artifact",
+		StepID:       "download-detection-artifact",
+	}, getActionPin), "")
+
+	assert.Contains(t, steps, "name: detection", "single-artifact downloads should use exact names to avoid ambiguous multi-match merges")
+	assert.NotContains(t, steps, "pattern: detection", "single-artifact downloads should not use pattern matching")
+	assert.NotContains(t, steps, "merge-multiple: true", "single-artifact downloads should not merge multiple matches")
+}
+
+func TestArtifactDownloadFallbackUsesPatternWhenSupported(t *testing.T) {
+	steps := strings.Join(buildArtifactDownloadSteps(ArtifactDownloadConfig{
+		ArtifactName:     "agent",
+		FallbackArtifact: "agent-output-fallback",
+		DownloadPath:     "/tmp/gh-aw/",
+		StepName:         "Download agent output artifact",
+	}, getActionPin), "")
+
+	assert.Contains(t, steps, `pattern: "{agent,agent-output-fallback}"`, "fallback downloads should intentionally match both candidate artifact names")
+	assert.Contains(t, steps, "merge-multiple: true", "fallback downloads should merge both candidate artifact contents")
+	assert.NotContains(t, steps, "name: agent\n", "fallback downloads should not use exact-name downloads when pattern matching is supported")
+}
+
+func TestArtifactDownloadFallbackUsesNameWithDownloadArtifactV3(t *testing.T) {
+	steps := strings.Join(buildArtifactDownloadSteps(ArtifactDownloadConfig{
+		ArtifactName:     "agent",
+		FallbackArtifact: "agent-output-fallback",
+		DownloadPath:     "/tmp/gh-aw/",
+		StepName:         "Download agent output artifact",
+	}, func(string) string {
+		return "actions/download-artifact@a9bc5e6ef2cb54c177f32aa5726adaa15e7e2d59 # v3.1.0"
+	}), "")
+
+	assert.Contains(t, steps, "name: agent\n", "download-artifact v3 only supports exact name downloads")
+	assert.NotContains(t, steps, "pattern:", "download-artifact v3 should not receive unsupported pattern input")
+	assert.NotContains(t, steps, "merge-multiple:", "download-artifact v3 should not receive unsupported merge-multiple input")
+}
+
+func TestDownloadArtifactInputLinesUsePatternOnlyWhenSupported(t *testing.T) {
+	v4Lines := strings.Join(downloadArtifactInputLines("evals", "actions/download-artifact@abc123 # v4.3.0"), "")
+	assert.Contains(t, v4Lines, "pattern: evals")
+	assert.Contains(t, v4Lines, "merge-multiple: true")
+	assert.NotContains(t, v4Lines, "name: evals")
+
+	v3Lines := strings.Join(downloadArtifactInputLines("evals", "actions/download-artifact@abc123 # v3.1.0"), "")
+	assert.Contains(t, v3Lines, "name: evals")
+	assert.NotContains(t, v3Lines, "pattern: evals")
+	assert.NotContains(t, v3Lines, "merge-multiple: true")
+}
 
 func TestAccessLogUploadConditional(t *testing.T) {
 	compiler := NewCompiler()
@@ -317,6 +483,138 @@ This workflow should generate a unified artifact upload step that includes the p
 	t.Log("Unified artifact upload step verified successfully (includes prompt)")
 }
 
+func TestAmbientFoldersIncludedInActivationArtifact(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "ambient-folders-artifact-test")
+	sharedDir := filepath.Join(tmpDir, "shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sharedContent := `---
+ambient-folders:
+  - .squad
+jobs:
+  activation:
+    pre-steps:
+      - name: Create ambient folder
+        run: |
+          mkdir -p .squad
+          echo team > .squad/team.md
+---
+
+# Shared ambient folder setup
+`
+	if err := os.WriteFile(filepath.Join(sharedDir, "ambient.md"), []byte(sharedContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	testContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+imports:
+  - shared/ambient.md
+---
+
+# Test Ambient Folders
+`
+	testFile := filepath.Join(tmpDir, "test-workflow.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockYAML := string(lockContent)
+
+	for _, want := range []string{
+		"Stage ambient folders for activation artifact",
+		"GH_AW_AMBIENT_FOLDERS: \".squad\"",
+		"/tmp/gh-aw/ambient-folders",
+		"Restore ambient folders from activation artifact",
+		".squad",
+	} {
+		if !strings.Contains(lockYAML, want) {
+			t.Fatalf("Expected compiled workflow to contain %q, got:\n%s", want, lockYAML)
+		}
+	}
+}
+
+func TestAmbientFoldersRestoredAfterCustomCheckout(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "ambient-folders-custom-checkout-test")
+	sharedDir := filepath.Join(tmpDir, "shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sharedContent := `---
+ambient-folders:
+  - .squad
+jobs:
+  activation:
+    pre-steps:
+      - name: Create ambient folder
+        run: |
+          mkdir -p .squad
+          echo team > .squad/team.md
+---
+
+# Shared ambient folder setup
+`
+	if err := os.WriteFile(filepath.Join(sharedDir, "ambient.md"), []byte(sharedContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	testContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+imports:
+  - shared/ambient.md
+steps:
+  - name: Custom checkout
+    uses: actions/checkout@v4
+---
+
+# Test Ambient Folders With Custom Checkout
+`
+	testFile := filepath.Join(tmpDir, "test-workflow.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockYAML := string(lockContent)
+	checkoutIndex := strings.Index(lockYAML, "name: Custom checkout")
+	if checkoutIndex == -1 {
+		t.Fatalf("Expected custom checkout step in compiled workflow, got:\n%s", lockYAML)
+	}
+	restoreIndex := strings.LastIndex(lockYAML, "Restore ambient folders from activation artifact")
+	if restoreIndex == -1 {
+		t.Fatalf("Expected ambient restore step in compiled workflow, got:\n%s", lockYAML)
+	}
+	if restoreIndex < checkoutIndex {
+		t.Fatalf("Expected final ambient restore after custom checkout; checkout index %d, restore index %d", checkoutIndex, restoreIndex)
+	}
+}
+
 func TestPatchIncludedInArtifactWhenThreatDetectionEnabled(t *testing.T) {
 	// When push-to-pull-request-branch is staged, usesPatchesAndCheckouts() returns false.
 	// But if threat detection is enabled, the detection job needs patches for security
@@ -378,5 +676,281 @@ Push some changes.
 	}
 	if !strings.Contains(uploadSection, "/tmp/gh-aw/aw-*.bundle") {
 		t.Error("Expected '/tmp/gh-aw/aw-*.bundle' in unified artifact upload when threat detection is enabled with staged push-to-pull-request-branch")
+	}
+}
+
+// TestAgentOutputFallbackArtifact verifies that safe-output processing does not depend on the
+// large "agent" artifact upload succeeding: a small dedicated artifact carries the agent output
+// and accounting evidence, and downstream jobs match both artifacts when downloading. See
+// gh-aw#53099, where a timed-out upload of the agent artifact silently dropped every safe output.
+func TestAgentOutputFallbackArtifact(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "agent-output-fallback-test")
+
+	testContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+graders: {}
+safe-outputs:
+  create-issue:
+---
+
+# Test Agent Output Fallback
+
+Body.
+`
+
+	testFile := filepath.Join(tmpDir, "test-workflow.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockYAML := string(lockContent)
+
+	agentJob := extractJobSection(lockYAML, string(constants.AgentJobName))
+	assert.Equal(t, 1, strings.Count(agentJob, "id: redact_secrets\n"))
+	redactionSection := extractWorkflowStepByName(t, lockYAML, "Redact secrets in logs")
+	assert.Contains(t, redactionSection, "id: redact_secrets")
+	assert.Equal(t, 1, strings.Count(redactionSection, "id: redact_secrets"))
+	assert.Less(t, strings.Index(lockYAML, "id: redact_secrets"), strings.Index(lockYAML, "- name: Upload agent output fallback artifact"))
+
+	uploadSection := extractWorkflowStepByName(t, lockYAML, "Upload agent output fallback artifact")
+	assert.Contains(t, uploadSection, "if: always() && steps.redact_secrets.outcome == 'success'")
+	for _, expected := range []string{
+		"name: agent-output-fallback\n",
+		"/tmp/gh-aw/agent_output.json",
+		"/tmp/gh-aw/safeoutputs.jsonl",
+		"/tmp/gh-aw/agent_execution.json",
+		"/tmp/gh-aw/agent_usage.jsonl",
+		"/tmp/gh-aw/agent_usage.json",
+		"/tmp/gh-aw/agent/harness_retry.json",
+		"/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl",
+		"/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/model-routing.jsonl",
+		"/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl",
+		"/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl",
+		"/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl",
+		"/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/model-routing.jsonl",
+		constants.AWFResolvedConfigFilePath.String(),
+		"if-no-files-found: ignore",
+		"continue-on-error: true",
+	} {
+		if !strings.Contains(uploadSection, expected) {
+			t.Errorf("Expected %q in fallback upload step, got:\n%s", expected, uploadSection)
+		}
+	}
+	assert.NotContains(t, uploadSection, "/graders/")
+	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Upload agent artifacts"), "/tmp/gh-aw/agent/harness_retry.json")
+
+	// The fallback artifact must be uploaded before the (large, failure-prone) agent artifact.
+	uploadIdx := strings.Index(lockYAML, "- name: Upload agent output fallback artifact")
+	agentUploadIdx := strings.Index(lockYAML, "- name: Upload agent artifacts")
+	if agentUploadIdx == -1 {
+		t.Fatal("Upload agent artifacts step not found")
+	}
+	if uploadIdx > agentUploadIdx {
+		t.Error("Expected the agent output fallback upload to come before the unified agent artifact upload")
+	}
+
+	// Downstream jobs must match both artifacts so the agent output is still found when the
+	// unified agent artifact upload failed.
+	if !strings.Contains(lockYAML, `pattern: "{agent,agent-output-fallback}"`) {
+		t.Error("Expected agent output download to match both the agent and fallback artifacts")
+	}
+	if !strings.Contains(lockYAML, "merge-multiple: true") {
+		t.Error("Expected 'merge-multiple: true' so both artifacts extract into the same directory")
+	}
+}
+
+func TestAgentOutputFallbackArtifactArcDind(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "agent-output-fallback-arc-dind-test")
+	testFile := filepath.Join(tmpDir, "test-workflow.md")
+	testContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+runner:
+  topology: arc-dind
+graders: {}
+safe-outputs:
+  create-issue:
+---
+
+# Test ARC/DinD Agent Output Fallback
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	uploadSection := extractWorkflowStepByName(t, string(lockContent), "Upload agent output fallback artifact")
+
+	for _, expected := range []string{
+		"${{ runner.temp }}/gh-aw/agent_output.json",
+		"${{ runner.temp }}/gh-aw/agent_usage.jsonl",
+		"${{ runner.temp }}/gh-aw/agent/harness_retry.json",
+		"${{ runner.temp }}/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl",
+		"${{ runner.temp }}/gh-aw/sandbox/firewall/logs/api-proxy-logs/model-routing.jsonl",
+		"${{ runner.temp }}/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl",
+		"${{ runner.temp }}/gh-aw/sandbox/firewall/audit/api-proxy-logs/model-routing.jsonl",
+		"${{ runner.temp }}/gh-aw/awf-resolved-config.json",
+	} {
+		assert.Contains(t, uploadSection, expected)
+	}
+	assert.NotContains(t, uploadSection, "/tmp/gh-aw/")
+	consolidation := extractWorkflowStepByName(t, string(lockContent), "Consolidate artifacts for ARC/DinD")
+	assert.Less(t, strings.Index(string(lockContent), "Consolidate artifacts for ARC/DinD"), strings.Index(string(lockContent), "id: validate_final_recovery_envelopes"))
+	assert.Less(t, strings.Index(string(lockContent), "id: validate_final_recovery_envelopes"), strings.Index(string(lockContent), "Upload agent output fallback artifact"))
+	assert.Contains(t, uploadSection, "steps.validate_final_recovery_envelopes.outcome == 'success'")
+	assert.Contains(t, consolidation, `cp "${RUNNER_TEMP}/gh-aw/sandbox/agent/harness_retry.json" "${RUNNER_TEMP}/gh-aw/agent/harness_retry.json" || true`)
+	assert.Contains(t, consolidation, `cp "${RUNNER_TEMP}/gh-aw/sandbox/agent/harness_retry.json" "/tmp/gh-aw/agent/harness_retry.json" || true`)
+}
+
+func TestSampledAgentExecutionEvidenceReachesUsageArtifact(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "sampled-agent-accounting-test")
+	testFile := filepath.Join(tmpDir, "test-workflow.md")
+	testContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+safe-outputs:
+  create-issue:
+    samples:
+      - title: Sampled issue
+        body: Deterministic sample
+---
+
+# Sampled Agent Accounting
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	compiler.SetUseSamples(true)
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockYAML := string(lockContent)
+
+	assert.Contains(t, lockYAML, "Replay safe-outputs samples (deterministic)")
+	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Initialize agent execution evidence"), `"state":"not_started"`)
+	assert.NotContains(t, lockYAML, "Mark agent execution started")
+	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Upload agent output fallback artifact"), agentExecutionEvidencePath)
+	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Upload agent output fallback artifact"), agentExecutionExitCodePath)
+	assert.Contains(t, lockYAML, `pattern: "{agent,agent-output-fallback}"`)
+	assert.Contains(t, extractWorkflowStepByName(t, lockYAML, "Upload usage artifact"), "/tmp/gh-aw/usage/agent/execution.json")
+}
+
+func TestAgentArtifactExcludesUserGeneratedDirectory(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "agent-artifact-paths-test")
+	testFile := filepath.Join(tmpDir, "test-workflow.md")
+	testContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+---
+
+# Test Agent Artifact Paths
+
+Body.
+`
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockYAML := string(lockContent)
+	agentJob := extractJobSection(lockYAML, string(constants.AgentJobName))
+	assert.Equal(t, 1, strings.Count(agentJob, "id: redact_secrets\n"))
+	redactionSection := extractWorkflowStepByName(t, lockYAML, "Redact secrets in logs")
+	assert.Contains(t, redactionSection, "id: redact_secrets")
+	assert.Less(t, strings.Index(lockYAML, "id: redact_secrets"), strings.Index(lockYAML, "- name: Upload agent artifacts"))
+	uploadSection := extractWorkflowStepByName(t, agentJob, "Upload agent artifacts")
+	assert.Contains(t, uploadSection, "if: always() && steps.redact_secrets.outcome == 'success'")
+
+	for _, expected := range []string{
+		constants.TmpMcpLogsDir,
+		constants.TmpSandboxAgentLogsDir,
+		constants.AgentStdioLogPath,
+		constants.AWFProxyLogsDir.String() + "/",
+		constants.AWFAuditDir.String() + "/",
+		constants.AWFResolvedConfigFilePath.String(),
+	} {
+		assert.Contains(t, uploadSection, expected)
+	}
+	assert.NotContains(t, uploadSection, "\n            "+constants.TmpGhAwAgentDir+"\n")
+}
+
+func TestAgentOutputFallbackArtifact_NoSafeOutputs(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "agent-output-fallback-no-safe-outputs-test")
+
+	testContent := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+---
+
+# Test No Agent Output Fallback
+
+Body.
+`
+
+	testFile := filepath.Join(tmpDir, "test-workflow.md")
+	if err := os.WriteFile(testFile, []byte(testContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(testFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockYAML := string(lockContent)
+
+	if strings.Contains(lockYAML, "Upload agent output fallback artifact") {
+		t.Error("Expected no fallback artifact upload when safe-outputs is not declared")
 	}
 }

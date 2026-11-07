@@ -25,6 +25,30 @@ func badErrorf(err error) error {
 	return fmt.Errorf("wrapped: %s", err.Error()) // want `redundant \.Error\(\) call: pass the error value directly with %s`
 }
 
+func badParenthesizedErrorf(err error) error {
+	return fmt.Errorf("wrapped: %s", (err.Error())) // want `redundant \.Error\(\) call: pass the error value directly with %s`
+}
+
+func badNestedParenthesizedSprintf(err error) string {
+	return (fmt.Sprintf)(("failed: %v"), ((err.Error)())) // want `redundant \.Error\(\) call: pass the error value directly with %v`
+}
+
+func badParenthesizedFprintf(w io.Writer, err error) {
+	fmt.Fprintf(w, ("error: %s\n"), (err.Error())) // want `redundant \.Error\(\) call: pass the error value directly with %s`
+}
+
+func goodParenthesizedError(err error) string {
+	return fmt.Sprintf(("failed: %s"), (err))
+}
+
+func goodParenthesizedOtherVerb(err error) string {
+	return fmt.Sprintf("type: %T", (err.Error()))
+}
+
+func suppressedParenthesizedError(err error) string {
+	return fmt.Sprintf("failed: %s", (err.Error())) //nolint:sprintferrdot
+}
+
 // badFprintf calls fmt.Fprintf with err.Error() and a %s verb — should be flagged.
 func badFprintf(w io.Writer, err error) {
 	fmt.Fprintf(w, "error: %s\n", err.Error()) // want `redundant \.Error\(\) call: pass the error value directly with %s`
@@ -59,6 +83,11 @@ func goodNonErrorDot(f *os.File) string {
 // goodNilErr explicitly avoids the pattern.
 func goodNilErr() string {
 	return fmt.Sprintf("sentinel: %s", sentinel)
+}
+
+// goodFscanf consumes input rather than formatting output — no diagnostic expected.
+func goodFscanf(r io.Reader, err error) {
+	fmt.Fscanf(r, "%s", err.Error())
 }
 
 // suppressedSprintfS intentionally keeps err.Error() with suppression.

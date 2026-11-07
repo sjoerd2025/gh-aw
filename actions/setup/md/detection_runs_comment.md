@@ -1,5 +1,18 @@
 ### {workflow_name}
 
-**Conclusion:** {conclusion} | **Reason:** {reason}
+**Outcome:** `{category}`
 
-> Generated from [{workflow_name}]({run_url})
+{description}
+
+<details>
+<summary>Run details</summary>
+
+| Field | Value |
+|---|---|
+| Conclusion | `{conclusion}` |
+| Reason | `{reason}` |
+| Run | [View run]({run_url}) |
+
+</details>
+
+The conclusion reflects the configured detection policy; it does not change the outcome category. Agent text and detection payloads are omitted.

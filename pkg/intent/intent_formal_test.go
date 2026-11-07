@@ -27,6 +27,7 @@ func matchingResolver() intent.Resolver {
 // TestFormal_ExplicitIntentWins (P1 — ExplicitIntentWins)
 // Invariant: ExplicitIntent wins over any other source (closing issues, labels).
 func TestFormal_ExplicitIntentWins(t *testing.T) {
+	t.Parallel()
 	r := matchingResolver()
 	explicit := &intent.IntentRecord{
 		Status: intent.AttributionMapped,
@@ -50,6 +51,7 @@ func TestFormal_ExplicitIntentWins(t *testing.T) {
 // TestFormal_SingleClosingIssue (P2 — SingleClosingIssueAttributed)
 // Invariant: One closing issue produces source = closing_issue.
 func TestFormal_SingleClosingIssue(t *testing.T) {
+	t.Parallel()
 	r := matchingResolver()
 	rec := r.ResolvePullRequest(intent.PullRequestData{
 		NodeID: "PR_single",
@@ -65,6 +67,7 @@ func TestFormal_SingleClosingIssue(t *testing.T) {
 // TestFormal_MultipleClosingIssuesAmbiguous (P3 — AmbiguousOnMultipleRoots)
 // Invariant: Two or more closing issues produce status = ambiguous.
 func TestFormal_MultipleClosingIssuesAmbiguous(t *testing.T) {
+	t.Parallel()
 	r := matchingResolver()
 	rec := r.ResolvePullRequest(intent.PullRequestData{
 		NodeID: "PR_ambiguous",
@@ -81,6 +84,7 @@ func TestFormal_MultipleClosingIssuesAmbiguous(t *testing.T) {
 // TestFormal_AmbiguousNeverMapped (P4 — NoArbitraryAmbiguityResolution)
 // Invariant: An ambiguous record is never reported as mapped.
 func TestFormal_AmbiguousNeverMapped(t *testing.T) {
+	t.Parallel()
 	r := matchingResolver()
 	rec := r.ResolvePullRequest(intent.PullRequestData{
 		NodeID: "PR_ambig2",
@@ -97,6 +101,7 @@ func TestFormal_AmbiguousNeverMapped(t *testing.T) {
 // TestFormal_LabelFallback (P5 — LabelFallbackWhenNoClosingIssue)
 // Invariant: When there are no closing issues, PR labels are used as fallback.
 func TestFormal_LabelFallback(t *testing.T) {
+	t.Parallel()
 	r := matchingResolver()
 	rec := r.ResolvePullRequest(intent.PullRequestData{
 		NodeID: "PR_label",
@@ -111,6 +116,7 @@ func TestFormal_LabelFallback(t *testing.T) {
 // TestFormal_UnlinkedWhenNoSource (P6 — UnlinkedWhenNoSource)
 // Invariant: With no closing issues, no labels, and no explicit intent, status is unlinked.
 func TestFormal_UnlinkedWhenNoSource(t *testing.T) {
+	t.Parallel()
 	r := matchingResolver()
 	rec := r.ResolvePullRequest(intent.PullRequestData{NodeID: "PR_empty"})
 
@@ -121,6 +127,7 @@ func TestFormal_UnlinkedWhenNoSource(t *testing.T) {
 // TestFormal_SafestPolicyFields (P7 — FailClosedForUnlinked)
 // Invariant: A PolicyCompiler with no rules produces the safest execution policy.
 func TestFormal_SafestPolicyFields(t *testing.T) {
+	t.Parallel()
 	compiler := intent.PolicyCompiler{}
 	resolver := matchingResolver()
 
@@ -141,6 +148,7 @@ func TestFormal_SafestPolicyFields(t *testing.T) {
 // Invariant: Unlinked and ambiguous records always receive the safest execution
 // policy even when a permissive wildcard rule (empty conditions) is present.
 func TestFormal_FailClosedForIndeterminate(t *testing.T) {
+	t.Parallel()
 	autoMerge := true
 	permissiveRule := intent.PolicyRule{
 		ID: "wildcard-permissive",
@@ -194,6 +202,7 @@ func TestFormal_FailClosedForIndeterminate(t *testing.T) {
 // TestFormal_PolicyDeterminism (P8 — PolicyDeterminism)
 // Invariant: Compiling the same intent record twice yields identical policies.
 func TestFormal_PolicyDeterminism(t *testing.T) {
+	t.Parallel()
 	compiler := intent.PolicyCompiler{}
 	resolver := matchingResolver()
 
@@ -213,6 +222,7 @@ func TestFormal_PolicyDeterminism(t *testing.T) {
 // TestFormal_ExplicitOverridesSuggested (P9 — SuggestedNotOfficial)
 // Invariant: Explicit metadata never returns a suggested status.
 func TestFormal_ExplicitOverridesSuggested(t *testing.T) {
+	t.Parallel()
 	r := matchingResolver()
 	explicit := &intent.IntentRecord{
 		Status: intent.AttributionMapped,
@@ -229,6 +239,7 @@ func TestFormal_ExplicitOverridesSuggested(t *testing.T) {
 // TestFormal_SingleSourcePerRecord (P10 — MixingSourcesForbidden)
 // Invariant: Every resolved record carries exactly one attribution source.
 func TestFormal_SingleSourcePerRecord(t *testing.T) {
+	t.Parallel()
 	r := matchingResolver()
 
 	cases := []struct {
@@ -282,6 +293,7 @@ func TestFormal_SingleSourcePerRecord(t *testing.T) {
 // Invariant: mergePolicy never lets a lower-precedence rule relax Autonomy or WriteScope;
 // the more-restrictive value must always survive.
 func TestFormal_StricterWinsForAutonomyAndWriteScope(t *testing.T) {
+	t.Parallel()
 	// Two rules: the first grants broad access; the second is more restrictive.
 	// Stricter-wins means the second (more restrictive) values must be retained.
 	broadRule := intent.PolicyRule{
@@ -334,6 +346,7 @@ func TestFormal_StricterWinsForAutonomyAndWriteScope(t *testing.T) {
 // Invariant: mergePolicy intersects AllowedTools so that only tools permitted by
 // all matching rules remain; nil (unrestricted) defers to the non-nil side.
 func TestFormal_AllowedToolsIntersection(t *testing.T) {
+	t.Parallel()
 	repo := intent.RepositoryContext{Owner: "owner", Name: "repo"}
 	// Use a mapped record (labels required for non-unlinked status).
 	rec := matchingResolver().ResolvePullRequest(intent.PullRequestData{
@@ -390,5 +403,79 @@ func TestFormal_AllowedToolsIntersection(t *testing.T) {
 			"P12: deny-all empty slice must not be collapsed to unrestricted nil")
 		assert.Empty(t, policy.AllowedTools,
 			"P12: intersection with deny-all must yield deny-all")
+	})
+}
+
+// TestFormal_SeedRuleEnumValidation (P13 — SeedEnumsValidated)
+// Invariant: an unrecognized Autonomy or WriteScope on the rule that seeds the
+// accumulator must not be carried into the compiled policy; it falls back to the
+// safest default for that field (fail-closed).
+func TestFormal_SeedRuleEnumValidation(t *testing.T) {
+	t.Parallel()
+	repo := intent.RepositoryContext{Owner: "owner", Name: "repo"}
+	// Use a mapped record (labels required for non-unlinked status).
+	rec := matchingResolver().ResolvePullRequest(intent.PullRequestData{
+		ClosingIssues: []intent.RootReference{
+			{NodeID: "I_1", Labels: []string{"security"}},
+		},
+	})
+
+	t.Run("typo_in_seed_rule_falls_back_to_safest", func(t *testing.T) {
+		rule := intent.PolicyRule{
+			ID: "typo",
+			Set: intent.ExecutionPolicy{
+				Autonomy:   "boundeed",    // typo for "bounded"
+				WriteScope: "any_branchh", // typo for "any_branch"
+			},
+		}
+		compiler := intent.PolicyCompiler{Rules: []intent.PolicyRule{rule}}
+		policy := compiler.Compile(rec, repo)
+
+		assert.Equal(t, "propose_only", policy.Autonomy,
+			"P13: unrecognized autonomy must fall back to the safest default")
+		assert.Equal(t, "none", policy.WriteScope,
+			"P13: unrecognized write scope must fall back to the safest default")
+	})
+
+	t.Run("valid_seed_values_preserved", func(t *testing.T) {
+		rule := intent.PolicyRule{
+			ID:  "valid",
+			Set: intent.ExecutionPolicy{Autonomy: "bounded", WriteScope: "any_branch"},
+		}
+		compiler := intent.PolicyCompiler{Rules: []intent.PolicyRule{rule}}
+		policy := compiler.Compile(rec, repo)
+
+		assert.Equal(t, "bounded", policy.Autonomy, "P13: recognized autonomy must be preserved")
+		assert.Equal(t, "any_branch", policy.WriteScope, "P13: recognized write scope must be preserved")
+	})
+
+	t.Run("unset_seed_values_remain_unspecified", func(t *testing.T) {
+		rule := intent.PolicyRule{
+			ID:  "unset",
+			Set: intent.ExecutionPolicy{MaxAttempts: 3},
+		}
+		compiler := intent.PolicyCompiler{Rules: []intent.PolicyRule{rule}}
+		policy := compiler.Compile(rec, repo)
+
+		assert.Empty(t, policy.Autonomy, "P13: unset autonomy must stay unspecified for later merges")
+		assert.Empty(t, policy.WriteScope, "P13: unset write scope must stay unspecified for later merges")
+	})
+
+	t.Run("invalid_seed_cannot_be_relaxed_by_later_rule", func(t *testing.T) {
+		seed := intent.PolicyRule{
+			ID:  "typo-seed",
+			Set: intent.ExecutionPolicy{Autonomy: "boundeed", WriteScope: "any_branchh"},
+		}
+		later := intent.PolicyRule{
+			ID:  "permissive",
+			Set: intent.ExecutionPolicy{Autonomy: "bounded", WriteScope: "any_branch"},
+		}
+		compiler := intent.PolicyCompiler{Rules: []intent.PolicyRule{seed, later}}
+		policy := compiler.Compile(rec, repo)
+
+		assert.Equal(t, "propose_only", policy.Autonomy,
+			"P13: sanitized seed must not be relaxed by a later permissive rule")
+		assert.Equal(t, "none", policy.WriteScope,
+			"P13: sanitized seed must not be relaxed by a later permissive rule")
 	})
 }

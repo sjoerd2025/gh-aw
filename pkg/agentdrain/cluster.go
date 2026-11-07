@@ -39,6 +39,9 @@ func (s *clusterStore) add(template []string, stage string) *Cluster {
 // get retrieves a cluster by ID.
 func (s *clusterStore) get(id int) (*Cluster, bool) {
 	c, ok := s.clusters[id]
+	if !ok {
+		clusterLog.Printf("Cluster lookup miss: id=%d", id)
+	}
 	return c, ok
 }
 
@@ -48,53 +51,6 @@ func (s *clusterStore) all() []Cluster {
 	for _, c := range s.clusters {
 		out = append(out, *c)
 	}
+	clusterLog.Printf("Returning snapshot of %d clusters", len(out))
 	return out
-}
-
-// computeSimilarity returns the fraction of positions where tokens a and b
-// match exactly, considering only positions that are not paramToken in a.
-// Returns 0 when the slices have different lengths.
-func computeSimilarity(a, b []string, paramToken string) float64 {
-	if len(a) != len(b) {
-		clusterLog.Printf("Similarity: length mismatch (%d vs %d), returning 0", len(a), len(b))
-		return 0
-	}
-	nonParam := 0
-	matches := 0
-	for i, tok := range a {
-		if tok == paramToken {
-			continue
-		}
-		nonParam++
-		if tok == b[i] {
-			matches++
-		}
-	}
-	if nonParam == 0 {
-		// All positions are wildcards – treat as a perfect structural match.
-		return 1.0
-	}
-	sim := float64(matches) / float64(nonParam)
-	if clusterLog.Enabled() {
-		clusterLog.Printf("Similarity: matches=%d/%d non-param positions, score=%.3f", matches, nonParam, sim)
-	}
-	return sim
-}
-
-// mergeTemplate produces a new template by replacing positions where the two
-// token slices differ with paramToken. Positions where either token already is
-// paramToken also become paramToken.
-func mergeTemplate(existing, incoming []string, paramToken string) []string {
-	if len(existing) != len(incoming) {
-		return existing
-	}
-	merged := make([]string, len(existing))
-	for i, tok := range existing {
-		if tok == paramToken || incoming[i] == paramToken || tok != incoming[i] {
-			merged[i] = paramToken
-		} else {
-			merged[i] = tok
-		}
-	}
-	return merged
 }

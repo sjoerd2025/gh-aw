@@ -2,7 +2,7 @@
 private: true
 emoji: "📦"
 name: Daily Model Inventory Checker
-description: Queries model lists from OpenAI, Anthropic, and Google APIs daily, uses AWF /reflect for Copilot models, then analyzes the combined inventory to propose updates to the builtin model alias mapping
+description: Queries model lists from OpenAI, Anthropic, and Google APIs daily, uses AWF /reflect for Copilot models, checks every workflow model pin against the live Copilot catalogue, then analyzes the combined inventory to propose updates to the builtin model alias mapping
 on:
   schedule:
     - cron: daily
@@ -64,6 +64,7 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the OpenAI API key is sent only to the official OpenAI models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             https://api.openai.com/v1/models) || true
@@ -91,7 +92,7 @@ jobs:
 
       - name: Upload OpenAI artifacts
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: openai-models
           path: |
@@ -121,6 +122,7 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the Anthropic API key is sent only to the official Anthropic models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
@@ -150,7 +152,7 @@ jobs:
 
       - name: Upload Anthropic artifacts
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: anthropic-models
           path: |
@@ -180,8 +182,10 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the Gemini API key is sent only to the official Google models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
-            "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}") || true
+            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            "https://generativelanguage.googleapis.com/v1beta/models") || true
           if [ "${HTTP_STATUS:-0}" = "200" ]; then
             jq '{
               provider: "gemini",
@@ -210,7 +214,7 @@ jobs:
 
       - name: Upload Gemini artifacts
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: gemini-models
           path: |
@@ -225,7 +229,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Create placeholder for Copilot billing models
+      - name: Create placeholder for GitHub Copilot billing models
         id: fetch
         shell: bash
         run: |
@@ -247,9 +251,9 @@ jobs:
         shell: bash
         run: cat /tmp/gh-aw/agent/model-inventory/copilot-billing/models.json 2>/dev/null || echo "(no models.json)"
 
-      - name: Upload Copilot billing models artifact
+      - name: Upload GitHub Copilot billing models artifact
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: copilot-billing-models
           path: /tmp/gh-aw/agent/model-inventory/copilot-billing/models.json
@@ -262,15 +266,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Install Copilot SDK with bundled Copilot CLI
+      - name: Install GitHub Copilot SDK with bundled GitHub Copilot CLI
         shell: bash
         run: |
           set -euo pipefail
           SDK_DIR="$RUNNER_TEMP/copilot-sdk"
           mkdir -p "$SDK_DIR"
-          npm install --prefix "$SDK_DIR" --no-save @github/copilot-sdk@1.0.8
+          npm install --prefix "$SDK_DIR" --no-save @github/copilot-sdk@1.0.13
 
-      - name: Fetch Copilot SDK model billing information
+      - name: Fetch GitHub Copilot SDK model billing information
         shell: bash
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
@@ -301,9 +305,9 @@ jobs:
         shell: bash
         run: cat /tmp/gh-aw/agent/model-inventory/copilot-sdk/models.json 2>/dev/null || echo "(no models.json)"
 
-      - name: Upload Copilot SDK models artifact
+      - name: Upload GitHub Copilot SDK models artifact
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: copilot-sdk-models
           path: /tmp/gh-aw/agent/model-inventory/copilot-sdk/models.json
@@ -312,16 +316,18 @@ jobs:
 
 steps:
   - name: Download all model artifacts
-    uses: actions/download-artifact@v8.0.1
+    uses: actions/download-artifact@v8.0.2
     with:
       path: /tmp/gh-aw/agent/model-inventory/artifacts
 
   - name: Predownload models.dev API index
     shell: bash
+    # runner-guard:ignore RGS-012 -- unauthenticated GET from a public read-only model index; no secrets are sent.
     run: |
       set -euo pipefail
       OUT="/tmp/gh-aw/agent/model-inventory/models-dev"
       mkdir -p "$OUT"
+      # runner-guard:ignore RGS-012 -- unauthenticated GET from a public read-only model index; no secrets are sent.
       curl -fsS https://models.dev/api.json -o "$OUT/api.json"
       echo "Downloaded models.dev API index to $OUT/api.json"
 
@@ -333,27 +339,55 @@ steps:
       echo "Combined inventory written to $INVENTORY"
       cat "$INVENTORY"
 
+# The pin check runs again after the agent, preferring the harness's own /reflect capture,
+# so the report artifact and step summary do not depend on the agent.
+post-steps:
+  - name: Check workflow model pins
+    if: always()
+    continue-on-error: true
+    shell: bash
+    run: |
+      set -euo pipefail
+      OUT="/tmp/gh-aw/agent/model-inventory/model-pins"
+      REFLECT=/dev/null
+      for candidate in /tmp/gh-aw/agent/awf-reflect.json /tmp/gh-aw/sandbox/firewall/awf-reflect.json /tmp/gh-aw/agent/model-inventory/reflect.json; do
+        if [ -s "$candidate" ]; then REFLECT="$candidate"; break; fi
+      done
+      echo "Checking workflow model pins against $REFLECT"
+      node "${RUNNER_TEMP}/gh-aw/actions/model_pin_check.cjs" --reflect "$REFLECT" --out-dir "$OUT" --repo "$GITHUB_WORKSPACE" > /dev/null
+      cat "$OUT/model-pins.md" >> "$GITHUB_STEP_SUMMARY"
+
+  - name: Upload workflow model pin report
+    if: always()
+    uses: actions/upload-artifact@v7.0.2
+    with:
+      name: model-pins
+      path: /tmp/gh-aw/agent/model-inventory/model-pins/
+      if-no-files-found: warn
+      retention-days: 30
+
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   playwright:
-    mode: cli
   bash:
     - "*"
   github:
     toolsets: [default]
 
 safe-outputs:
-  create-issue:
+  create-pull-request:
+    exclude-lock-yml: true
     expires: 7d
     title-prefix: "[model-inventory] "
     labels: [automation, models]
     max: 1
-    close-older-issues: true
+    close-older-pull-requests: true
 
 imports:
+  - shared/lock-safe-pull-request.md
   - shared/otlp.md
 features:
   gh-aw-detection: true
@@ -478,6 +512,26 @@ while IFS= read -r entry; do
 done < <(jq -c '.endpoints[]? | select(.configured == true and .models == null and .models_url != null)' "$OUT" 2>/dev/null || true)
 echo "Copilot reflect metadata written to $OUT"
 ```
+
+### Step 0.5: Check Workflow Model Pins
+
+Run the deterministic pin checker right after Step 0. It classifies every model pin configured
+by `.github/workflows/*.md` (and their imports) against the Copilot catalogue in the reflect
+file, using the same resolver as the engine harnesses. Do not classify pins yourself.
+
+```bash
+set -euo pipefail
+REPO="${GITHUB_WORKSPACE:-$PWD}"
+node "$REPO/actions/setup/js/model_pin_check.cjs" \
+  --reflect /tmp/gh-aw/agent/model-inventory/reflect.json \
+  --out-dir /tmp/gh-aw/agent/model-inventory/model-pins \
+  --repo "$REPO"
+```
+
+It writes `model-pins-summary.md` (the issue section), `model-pins.md` (every pin with its
+classification) and `model-pins.json` to `/tmp/gh-aw/agent/model-inventory/model-pins/`. The
+run uploads that directory as the `model-pins` artifact. Read `counts.unresolvable` from
+`model-pins.json` for Step 6.
 
 ### Step 1: Load and Validate the Inventory
 
@@ -682,13 +736,19 @@ Focus on aliases that provide genuine value to workflow authors. Prioritize:
 - Adding new semantic task-oriented aliases
 - Updating patterns that are stale
 
-### Step 6: Create Issue
+### Step 6: Implement Updates and Create a Pull Request
 
-If you found any meaningful updates to propose, create a GitHub issue using `create_issue`.
+Implement evidence-backed alias, pricing, or unresolvable model-pin corrections. Preserve historical model entries and do not guess replacement pins. Validate the changed mappings and compile any changed workflow Markdown, commit locally, then call `create_pull_request`. Report unresolved inventory or validation blockers with `report_incomplete`.
 
-**Issue title format**: `Model alias inventory update - YYYY-MM-DD`
+**Pull request title format**: `Model alias inventory update - YYYY-MM-DD`
 
-**Issue body structure** (use h3 `###` or lower — never h1/h2):
+**Workflow model pins**: start the pull request body with the contents of
+`/tmp/gh-aw/agent/model-inventory/model-pins/model-pins-summary.md` from Step 0.5, copied
+verbatim (it begins with `### Action required` when any pin is unresolvable). Do not edit,
+reorder or summarize it. If `counts.unresolvable` in `model-pins.json` is greater than 0,
+the title must be `Model alias inventory - action required - YYYY-MM-DD`. Implement only replacements supported by live evidence; if none can be validated, report the blocker rather than creating an empty pull request.
+
+**Pull request body structure** (use h3 `###` or lower — never h1/h2):
 
 ```markdown
 ### Summary
@@ -755,9 +815,8 @@ Any caveats, historical entries retained, or aliases that are already well-cover
 ```
 
 If no updates are needed (all live models are already covered by existing aliases, all
-`models.json` pricing entries are up to date, and no new task-oriented aliases are warranted), create an issue with
-title `Model alias inventory - no changes needed - YYYY-MM-DD` and a brief summary confirming
-coverage is up to date.
+`models.json` pricing entries are up to date, no new task-oriented aliases are warranted, and
+`counts.unresolvable` in `model-pins.json` is 0), call `noop` with a brief summary confirming coverage is up to date. Do not create a report-only pull request. Never report no changes needed when any workflow model pin is unresolvable.
 
 
 ### Output Format

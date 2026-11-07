@@ -230,15 +230,16 @@ When implementing or updating daily report workflows:
 
 ### merged_prs
 
-**Definition**: Count of pull requests that have been merged
+**Definition**: Count of pull requests whose `mergedAt` timestamp falls within the report window
 
-**Scope**: PRs where `merged = true`
+**Scope**: PRs where `window_start <= mergedAt < window_end`. Daily cross-report comparisons use the previous complete UTC calendar day (`YYYY-MM-DDT00:00:00Z` to `YYYY-MM-(DD+1)T00:00:00Z`).
 
 **Used By**:
 - Copilot Agent Analysis
-- Daily Performance Summary
 
 **Python Variable**: `merged_prs`
+
+**Notes**: Reports using a different window must use a scope-specific metric name (for example, `merged_prs_90d`) and must not compare it directly to this daily event metric.
 
 ---
 
@@ -261,14 +262,14 @@ When implementing or updating daily report workflows:
 
 **Definition**: Total count of agentic workflow source files in `.github/workflows/`
 
-**Scope**: All `.md` workflow source files (agentic workflows, not standard GitHub Actions YAML)
+**Scope**: Direct files matching `.github/workflows/*.md` only. Exclude nested shared components, skills, and other non-workflow Markdown files.
 
 **Used By**:
 - Daily Code Metrics Report
 
 **Python Variable**: `total_workflows`
 
-**Notes**: This counts `.md` files which are agentic workflow sources that compile to `.lock.yml` files. Standard GitHub Actions workflows (`.yml`) are not included in this count.
+**Notes**: This counts one source for each compiled workflow. The direct `.github/workflows/*.lock.yml` basename set must match the source basename set; standard GitHub Actions workflows and nested Markdown files are not included.
 
 ---
 
@@ -279,7 +280,7 @@ When implementing or updating daily report workflows:
 **Scope**: Varies by report - document specific time range
 
 **Used By**:
-- Daily Firewall Report (last 7 days)
+- Daily Firewall Report (last 24 hours)
 - Daily Observability Report (last 7 days)
 
 **Python Variable**: `workflow_runs_analyzed`
@@ -389,7 +390,7 @@ When implementing or updating daily report workflows:
 
 **Definition**: Total lines of code in the repository across all languages
 
-**Scope**: All source files, calculated using cloc or similar tool
+**Scope**: Git-tracked files only, calculated with the pinned command `cloc --vcs=git --json --quiet .`. The `--vcs=git` flag makes cloc enumerate files via `git ls-files` rather than walking the working tree, so untracked/build artifacts (`node_modules/`, `dist/`, `build/`, etc.) are excluded regardless of what happens to exist in the working tree that run. Always use this exact command — a plain `cloc .` is not reproducible run-to-run and has caused implausible day-over-day LOC swings (see github/gh-aw#55519).
 
 **Used By**:
 - Daily Code Metrics Report
@@ -398,13 +399,15 @@ When implementing or updating daily report workflows:
 
 **Standardized Name**: Use `lines_of_code_total` for clarity
 
+**Notes**: Report `cloc_command` and `cloc_file_count` (from `.SUM.nFiles` in the cloc JSON output) alongside this metric so day-over-day scope drift can be detected automatically.
+
 ---
 
 ### test_loc / test_lines_of_code
 
 **Definition**: Total lines of code in test files
 
-**Scope**: Files matching test patterns (*_test.go, *.test.js, test_*.py, etc.)
+**Scope**: Git-tracked files (via `git ls-files`) matching test patterns (*_test.go, *.test.js, test_*.py, etc.)
 
 **Used By**:
 - Daily Code Metrics Report
@@ -426,7 +429,7 @@ When implementing or updating daily report workflows:
 
 **Python Variable**: `test_to_source_ratio`
 
-**Notes**: Values between 0.5-1.0 are considered healthy
+**Notes**: Values between 0.5-1.0 are typical
 
 ---
 
@@ -479,9 +482,9 @@ When implementing or updating daily report workflows:
 
 ### agent_prs_total
 
-**Definition**: Total count of pull requests created by Copilot coding agent
+**Definition**: Count of pull requests created by Copilot coding agent during the report window
 
-**Scope**: PRs created by copilot-swe-agent (user.login == "copilot" or branch starts with "copilot/")
+**Scope**: Copilot PRs where `window_start <= createdAt < window_end`
 
 **Used By**:
 - Copilot Agent Analysis
@@ -494,9 +497,9 @@ When implementing or updating daily report workflows:
 
 ### agent_prs_merged
 
-**Definition**: Count of Copilot coding agent PRs that were successfully merged
+**Definition**: Count of Copilot coding agent PRs merged during the report window
 
-**Scope**: Agent PRs where `merged = true`
+**Scope**: Copilot PRs where `window_start <= mergedAt < window_end`. Retrieve this independently of the created-in-window cohort so it is directly comparable to `merged_prs`.
 
 **Used By**:
 - Copilot Agent Analysis
@@ -507,11 +510,24 @@ When implementing or updating daily report workflows:
 
 ---
 
+### agent_prs_merged_from_created
+
+**Definition**: Count of Copilot coding agent PRs created during the report window that have merged
+
+**Scope**: Subset of `agent_prs_total` where `mergedAt` is non-null. This creation-cohort metric is only the numerator for `agent_success_rate`; it is not comparable to event-scoped `merged_prs`.
+
+**Used By**:
+- Copilot Agent Analysis
+
+**Python Variable**: `agent_prs_merged_from_created`
+
+---
+
 ### agent_success_rate
 
-**Definition**: Percentage of Copilot coding agent PRs that were merged
+**Definition**: Percentage of the Copilot PRs created during the report window that have merged
 
-**Scope**: (agent_prs_merged / agent_prs_total) * 100
+**Scope**: `(agent_prs_merged_from_created / agent_prs_total) * 100`, where `agent_prs_merged_from_created` is the subset of the `agent_prs_total` creation cohort that has merged. Do not use the event-scoped `agent_prs_merged` as this denominator's numerator.
 
 **Used By**:
 - Copilot Agent Analysis

@@ -11,10 +11,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func assertSerenaImportLanguages(t *testing.T, content string, expected []any) {
+	t.Helper()
+	parsed, err := parser.ExtractFrontmatterFromContent(content)
+	require.NoError(t, err)
+	imports, ok := parsed.Frontmatter["imports"].([]any)
+	require.True(t, ok)
+	for _, entry := range imports {
+		mapping, ok := entry.(map[string]any)
+		if !ok || mapping["uses"] != "shared/mcp/serena.md" {
+			continue
+		}
+		inputs, ok := mapping["with"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, expected, inputs["languages"])
+		return
+	}
+	t.Fatal("Serena shared import is missing")
+}
+
 func TestSerenaToSharedImportCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getSerenaToSharedImportCodemod()
 
 	t.Run("migrates tools.serena short syntax to imports", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 tools:
@@ -38,7 +59,7 @@ strict: false
 		assert.NotContains(t, result, "serena:", "Codemod should remove tools.serena configuration")
 		assert.Contains(t, result, "imports:", "Codemod should add imports block")
 		assert.Contains(t, result, "- uses: shared/mcp/serena.md", "Codemod should add Serena shared import")
-		assert.Contains(t, result, "languages: [\"go\", \"typescript\"]", "Codemod should preserve short syntax languages")
+		assertSerenaImportLanguages(t, result, []any{"go", "typescript"})
 
 		parsed, parseErr := parser.ExtractFrontmatterFromContent(result)
 		require.NoError(t, parseErr, "Result should contain valid frontmatter")
@@ -47,6 +68,7 @@ strict: false
 	})
 
 	t.Run("migrates tools.serena long syntax languages object to imports", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 tools:
@@ -80,10 +102,11 @@ strict: false
 		assert.True(t, applied, "Codemod should be applied for long syntax tools.serena")
 		assert.NotContains(t, result, "serena:", "Codemod should remove tools.serena block")
 		assert.Contains(t, result, "- uses: shared/mcp/serena.md", "Codemod should add Serena shared import")
-		assert.Contains(t, result, "languages: [\"go\", \"typescript\"]", "Codemod should convert language object keys to array")
+		assertSerenaImportLanguages(t, result, []any{"go", "typescript"})
 	})
 
 	t.Run("removes tools.serena when shared import already exists without adding duplicate", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 imports:
@@ -125,6 +148,7 @@ tools:
 	})
 
 	t.Run("does not modify workflows without tools.serena", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 imports:
@@ -154,6 +178,7 @@ imports:
 	})
 
 	t.Run("migrates engine.tools.serena and preserves engine sibling fields", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine:
   tools:
@@ -181,7 +206,7 @@ engine:
 		require.NoError(t, err, "Codemod should not return an error")
 		assert.True(t, applied, "Codemod should be applied when engine.tools.serena is present")
 		assert.Contains(t, result, "imports:", "Codemod should add imports block")
-		assert.Contains(t, result, "languages: [\"typescript\"]", "Codemod should preserve engine.tools.serena languages")
+		assertSerenaImportLanguages(t, result, []any{"typescript"})
 		assert.NotContains(t, result, "\n  tools:", "Codemod should remove now-empty engine.tools block")
 
 		parsed, parseErr := parser.ExtractFrontmatterFromContent(result)
@@ -197,6 +222,7 @@ engine:
 	})
 
 	t.Run("preserves github/gh-aw source pin when migrating serena (does not rewrite to @main)", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 source: github/gh-aw/.github/workflows/duplicate-code-detector.md@852cb06ad52958b402ed982b69957ffc57ca0619
 engine: copilot
@@ -223,6 +249,7 @@ tools:
 	})
 
 	t.Run("storybookjs and FluidFramework: preserves pinned source and migrates tools.serena to imports", func(t *testing.T) {
+		t.Parallel()
 		// Simulates the duplicate-code-detector.md workflow used by storybookjs/storybook and
 		// microsoft/FluidFramework, both sourced from gh-aw at the same pinned commit.
 		// The codemod must migrate tools.serena without touching the source pin.
@@ -265,19 +292,21 @@ strict: true
 
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
 				result, applied, err := codemod.Apply(content, frontmatter)
 				require.NoError(t, err, "Codemod should not return an error")
 				assert.True(t, applied, "Codemod should be applied when tools.serena is present")
 				assert.Contains(t, result, "source: github/gh-aw/.github/workflows/duplicate-code-detector.md@852cb06ad52958b402ed982b69957ffc57ca0619", "Source pin must be preserved unchanged")
 				assert.NotContains(t, result, "@main", "Source pin must not be rewritten to @main")
 				assert.Contains(t, result, "- uses: shared/mcp/serena.md", "Serena import must be added")
-				assert.Contains(t, result, `languages: ["typescript"]`, "Serena import must include languages")
+				assertSerenaImportLanguages(t, result, []any{"typescript"})
 				assert.NotContains(t, result, "  serena:", "tools.serena must be removed")
 			})
 		}
 	})
 
 	t.Run("falls back to engine.tools.serena when top-level tools.serena is invalid", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine:
   tools:
@@ -308,10 +337,11 @@ tools:
 		require.NoError(t, err, "Codemod should not return an error")
 		assert.True(t, applied, "Codemod should fall back to engine.tools.serena when top-level tools.serena is invalid")
 		assert.Contains(t, result, "- uses: shared/mcp/serena.md", "Codemod should add shared Serena import")
-		assert.Contains(t, result, "languages: [\"typescript\"]", "Codemod should use languages from engine.tools.serena")
+		assertSerenaImportLanguages(t, result, []any{"typescript"})
 	})
 
 	t.Run("migrates tools list form (tools: [serena]) with empty languages placeholder", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 tools:
@@ -343,6 +373,7 @@ strict: false
 	})
 
 	t.Run("migrates tools inline list form (tools: [serena]) with empty languages placeholder", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 tools: [serena]
@@ -367,6 +398,7 @@ strict: false
 	})
 
 	t.Run("migrates tools list form with other tools preserved", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 tools:
@@ -394,6 +426,7 @@ strict: false
 	})
 
 	t.Run("does not modify workflows with tools list that does not contain serena", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 tools:

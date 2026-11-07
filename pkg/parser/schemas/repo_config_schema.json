@@ -6,7 +6,96 @@
   "version": "1.0.0",
   "type": "object",
   "additionalProperties": false,
+  "definitions": {
+    "workQueueRetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "backoff_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
+      }
+    }
+  },
   "properties": {
+    "protected_files": {
+      "description": "Repository-wide exceptions to safe-output protected-file checks. Does not bypass allowed-files restrictions or change the protected-files policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "exclude": {
+          "description": "Repository-root path globs exempt from protected-file checks, combined with per-workflow exclusions. Supports * (not /) and ** (including /). Each pattern must contain a letter, digit, underscore, or hyphen, with no leading / or whitespace; catch-all patterns are not allowed.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "allOf": [{ "pattern": "^[^/\\s][^\\s]*$" }, { "pattern": "[A-Za-z0-9_-]" }]
+          },
+          "examples": [[".changeset/*.md"]]
+        }
+      }
+    },
+    "admission": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable admission and conclusion_admission jobs for all workflows. Admission is also enabled by on.admission: true in an individual workflow."
+    },
+    "gateway-dispatch": {
+      "type": "boolean",
+      "default": false,
+      "description": "Experimental. Enable nested on.gateway-dispatch triggers delivered through repository_dispatch by an approved gateway server. Disabled unless explicitly true. This setting does not deploy a server or grant dispatch authority."
+    },
+    "work_queue": {
+      "description": "Global scheduling and backing Issue/label overrides. AW supplies authorization and approved worker routes. Missing settings use one pool, concurrency 16, pending limit 4096 and three attempts with 30-second backoff.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "pending_limit": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "retry": { "$ref": "#/definitions/workQueueRetry" },
+        "issues": {
+          "description": "Global backing Issue projection and label prefix for work-queue participants. Omitted or false disables projection; true uses work and work:<status> labels.",
+          "oneOf": [
+            { "type": "boolean" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 33, "pattern": "^[^\\x00-\\x1f\\x7f]+$" }, "title_prefix": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[^\\x00-\\x1f\\x7f]+$" } }
+            }
+          ]
+        },
+        "mode": { "type": "string", "enum": ["weighted-priority", "strict-priority"] },
+        "class_weights": { "type": "array", "minItems": 5, "maxItems": 5, "items": { "type": "integer", "minimum": 1, "maximum": 1000 } },
+        "accounting_weights": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 1000 } },
+        "pools": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "concurrency": { "type": "integer", "minimum": 1, "maximum": 4096 },
+              "per_account_limit": { "type": "integer", "minimum": 1, "maximum": 4096 },
+              "retry": { "$ref": "#/definitions/workQueueRetry" }
+            }
+          }
+        }
+      }
+    },
+    "artifact_retention_days": {
+      "description": "Retention in days for all gh-aw workflow artifacts, overriding per-artifact settings. Accepts an integer from 1 to 400 or a GitHub Actions expression resolving to that range. When omitted, uses vars.GH_AW_DEFAULT_ARTIFACT_RETENTION_DAYS, then the existing per-artifact retention. GitHub repository, organization, and enterprise retention limits still apply.",
+      "oneOf": [
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 400
+        },
+        {
+          "type": "string",
+          "pattern": "^\\$\\{\\{[^{}\\r\\n]*[^\\s{}][^{}\\r\\n]*\\}\\}$"
+        }
+      ],
+      "examples": [7, 30, "${{ vars.ARTIFACT_RETENTION_DAYS || '7' }}"]
+    },
     "action_pins": {
       "description": "Mapping of action repository@version references to replacement repository@version references. Enables enterprises running in a private cloud to redirect actions to internal mirrors. Keys and values must use the format 'owner/repo@ref'.",
       "type": "object",
@@ -17,6 +106,17 @@
       },
       "propertyNames": {
         "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+@[A-Za-z0-9._/+:-]+$"
+      }
+    },
+    "action_pin_prefixes": {
+      "description": "Replace a matching action repository prefix after resolving its SHA. The longest prefix wins; exact action_pins entries take precedence.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._/-]*$"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._/-]*$"
       }
     },
     "container_pins": {
@@ -45,12 +145,25 @@
       }
     },
     "ghes": {
-      "description": "Enable GitHub Enterprise Server (GHES) compatibility mode. Artifact actions continue to use latest non-v3 pins because upload-artifact/download-artifact v3 are deprecated.",
+      "description": "Enable GitHub Enterprise Server (GHES) compatibility mode. Artifact actions use upload-artifact@v3.2.2 and download-artifact@v3.1.0.",
+      "type": "boolean"
+    },
+    "require_self_hosted_runners": {
+      "description": "Require every generated workflow job to select a self-hosted runner. Jobs must use the self-hosted label or a runner group.",
+      "type": "boolean"
+    },
+    "lock_file_logo": {
+      "description": "Include the ASCII logo in generated workflow headers. Defaults to true when omitted. Set to false to omit the logo.",
       "type": "boolean"
     },
     "help_command": {
       "description": "Enable or disable the builtin centralized /help slash command handler. Defaults to true when omitted. Set to false to disable.",
       "type": "boolean"
+    },
+    "strict": {
+      "description": "Enforce strict mode for every workflow compiled in this repository. Only true is accepted so workflows cannot opt out with frontmatter.",
+      "type": "boolean",
+      "const": true
     },
     "utc": {
       "description": "Project home UTC offset used when rendering local times in CLI output. Must be a numeric UTC offset such as +00:00 or -08:00.",
@@ -68,7 +181,7 @@
         },
         {
           "type": "object",
-          "description": "Enable auto-upgrade with a custom schedule. Providing an object implies enabled.",
+          "description": "Enable auto-upgrade with a custom schedule or upgrade options. Providing an object implies enabled.",
           "additionalProperties": false,
           "properties": {
             "cron": {
@@ -77,6 +190,16 @@
               "minLength": 9,
               "pattern": "^[0-9*/,\\-]+ [0-9*/,\\-]+ [0-9*/,\\-]+ [0-9*/,\\-]+ [0-9*/,\\-]+$",
               "examples": ["0 9 * * 1", "30 5 * * 1-5", "0 0 * * 0"]
+            },
+            "options": {
+              "description": "Supported command-line options passed to gh aw upgrade.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["--pre-releases"]
+              },
+              "uniqueItems": true,
+              "examples": [["--pre-releases"]]
             }
           }
         }
@@ -132,12 +255,12 @@
               "type": "boolean"
             },
             "disabled_jobs": {
-              "description": "Maintenance workflow job IDs to skip when generating agentics-maintenance.yml. Supported IDs are close-expired-entities, apply_safe_outputs, label_disable_agentic_workflow, and label_apply_safe_outputs. Values are case-insensitive; underscores and hyphens are treated equivalently.",
+              "description": "Maintenance workflow job IDs to skip when generating agentics-maintenance.yml. Supported IDs are close-expired-entities, apply_safe_outputs, label_disable_agentic_workflow, label_apply_safe_outputs, run_operation, update_pull_request_branches, validate_workflows, activity_report, forecast_report, close_agentic_workflows_issues, create_labels, cleanup-cache-memory, and cleanup-stale-steering-issues. Values are case-insensitive; underscores and hyphens are treated equivalently.",
               "type": "array",
               "items": {
                 "type": "string",
                 "minLength": 1,
-                "examples": ["close-expired-entities", "apply_safe_outputs", "label_disable_agentic_workflow", "label_apply_safe_outputs"]
+                "examples": ["close-expired-entities", "apply_safe_outputs", "run_operation", "validate_workflows", "cleanup-cache-memory", "cleanup-stale-steering-issues"]
               },
               "uniqueItems": true
             },

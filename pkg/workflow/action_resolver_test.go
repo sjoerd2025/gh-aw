@@ -205,6 +205,12 @@ func TestParseTagRefTSV(t *testing.T) {
 			wantType: "commit",
 		},
 		{
+			name:     "uppercase SHA is accepted",
+			input:    "EA222E359276C0702A5F5203547FF9D88D0DDD76\tcommit",
+			wantSHA:  "EA222E359276C0702A5F5203547FF9D88D0DDD76",
+			wantType: "commit",
+		},
+		{
 			name:        "empty input is rejected",
 			input:       "",
 			wantErr:     true,
@@ -308,6 +314,27 @@ func TestActionResolverGetUsedCacheKeysReturnsCopy(t *testing.T) {
 
 	if _, ok := resolver.GetUsedCacheKeys()["owner/action-a@v1"]; !ok {
 		t.Error("Expected resolver used cache keys to be immutable via returned map")
+	}
+}
+
+func TestActionResolverMarksCompilerGeneratedDockerActionsAsUsed(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+	cache := NewActionCache(tmpDir)
+	resolver := NewActionResolver(cache)
+
+	cache.Set("docker/build-push-action", "v7.4.0", "build_push_sha")
+	cache.Set("docker/setup-buildx-action", "v4.4.0", "setup_buildx_sha")
+
+	resolver.MarkCompilerGeneratedActionsAsUsed()
+
+	usedKeys := resolver.GetUsedCacheKeys()
+	for _, key := range []string{
+		"docker/build-push-action@v7.4.0",
+		"docker/setup-buildx-action@v4.4.0",
+	} {
+		if _, ok := usedKeys[key]; !ok {
+			t.Errorf("Expected compiler-generated Docker action %s to be marked used", key)
+		}
 	}
 }
 

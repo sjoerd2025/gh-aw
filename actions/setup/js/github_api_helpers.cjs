@@ -55,8 +55,8 @@ function logGraphQLError(error, operation, hints = {}) {
   }
 
   if (error.status) core.info(`HTTP status: ${error.status}`);
-  if (error.request) core.info(`Request: ${JSON.stringify(error.request, null, 2)}`);
-  if (error.data) core.info(`Response data: ${JSON.stringify(error.data, null, 2)}`);
+  if (error.request) core.info("Request details omitted");
+  if (error.data) core.info("Response data omitted");
 }
 
 /**
@@ -178,6 +178,16 @@ async function resolveTopLevelDiscussionCommentId(github, commentNodeId) {
 }
 
 /**
+ * Type guard for a resolved REST endpoint descriptor, shared by handlers that
+ * choose between a REST call ({route, params}) and a GraphQL/discussion path.
+ * @param {unknown} endpoint
+ * @returns {endpoint is { route: string, params: Record<string, unknown> }}
+ */
+function isRestEndpoint(endpoint) {
+  return typeof endpoint === "object" && endpoint !== null && "route" in endpoint && "params" in endpoint;
+}
+
+/**
  * Create a discussion comment with optional threaded reply target.
  * @param {Object} github - GitHub API client (must support graphql)
  * @param {string} discussionId - Discussion GraphQL node ID
@@ -217,6 +227,7 @@ module.exports = {
   createDiscussionComment,
   fetchAllRepoLabels,
   getFileContent,
+  isRestEndpoint,
   logGraphQLError,
   resolveTopLevelDiscussionCommentId,
 };

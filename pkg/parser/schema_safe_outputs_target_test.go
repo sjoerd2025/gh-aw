@@ -6,6 +6,215 @@ import (
 	"testing"
 )
 
+func TestMainWorkflowSchema_CreateIssueOptOut(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		value any
+		valid bool
+	}{
+		{"disabled", false, true},
+		{"null", nil, true},
+		{"empty", map[string]any{}, true},
+		{"configured", map[string]any{"max": 1}, true},
+		{"true", true, false},
+		{"string", "false", false},
+		{"zero-max", map[string]any{"max": 0}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			frontmatter := map[string]any{
+				"on": "push",
+				"safe-outputs": map[string]any{
+					"create-issue": tc.value,
+				},
+			}
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/create-issue-opt-out.md")
+			if (err == nil) != tc.valid {
+				t.Fatalf("schema validity = %v, want %v: %v", err == nil, tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestMainWorkflowSchema_AllowFullHistoryFetch(t *testing.T) {
+	t.Parallel()
+	for _, handler := range []string{"create-pull-request", "push-to-pull-request-branch"} {
+		for _, tc := range []struct {
+			name  string
+			value any
+			valid bool
+		}{
+			{"enabled", true, true},
+			{"disabled", false, true},
+			{"string", "true", false},
+			{"expression", "${{ inputs.allow-history }}", false},
+		} {
+			t.Run(handler+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				frontmatter := map[string]any{
+					"on":     "push",
+					"engine": "copilot",
+					"safe-outputs": map[string]any{
+						handler: map[string]any{"allow-full-history-fetch": tc.value},
+					},
+				}
+				err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/history-fetch-test.md")
+				if (err == nil) != tc.valid {
+					t.Fatalf("schema validity = %v, want %v: %v", err == nil, tc.valid, err)
+				}
+			})
+		}
+	}
+	t.Run("reject-global-option", func(t *testing.T) {
+		t.Parallel()
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "copilot",
+			"safe-outputs": map[string]any{
+				"create-pull-request":      map[string]any{},
+				"allow-full-history-fetch": true,
+			},
+		}
+		if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/history-fetch-test.md"); err == nil {
+			t.Fatal("expected global history-fetch option to fail schema validation")
+		}
+	})
+}
+
+func TestMainWorkflowSchema_AllowMergedBaseBaseline(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		value any
+		valid bool
+	}{
+		{"enabled", true, true},
+		{"disabled", false, true},
+		{"string", "true", false},
+		{"expression", "${{ inputs.allow-merged-base-baseline }}", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			frontmatter := map[string]any{
+				"on":     "push",
+				"engine": "copilot",
+				"safe-outputs": map[string]any{
+					"push-to-pull-request-branch": map[string]any{"allow-merged-base-baseline": tc.value},
+				},
+			}
+			err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/merged-base-baseline-test.md")
+			if (err == nil) != tc.valid {
+				t.Fatalf("schema validity = %v, want %v: %v", err == nil, tc.valid, err)
+			}
+		})
+	}
+	t.Run("handler-scoped", func(t *testing.T) {
+		t.Parallel()
+		frontmatter := map[string]any{
+			"on":     "push",
+			"engine": "copilot",
+			"safe-outputs": map[string]any{
+				"create-pull-request": map[string]any{"allow-merged-base-baseline": true},
+			},
+		}
+		if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/merged-base-baseline-test.md"); err == nil {
+			t.Fatal("expected merged-base baseline option on create-pull-request to fail schema validation")
+		}
+	})
+}
+
+func TestMainWorkflowSchema_SafeOutputConfigCoverage(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on":     "push",
+		"engine": "copilot",
+		"safe-outputs": map[string]any{
+			"add-comment": map[string]any{
+				"allows-comment-ids":        []any{"IC_kwDOABCD123456"},
+				"hide-older-comments-match": []any{"workflow-id"},
+			},
+			"assign-milestone": map[string]any{
+				"auto_create": true,
+			},
+			"create-issue": map[string]any{
+				"require-temporary-id": true,
+			},
+			"create-pull-request": map[string]any{
+				"require-temporary-id": true,
+			},
+			"push-to-pull-request-branch": map[string]any{
+				"base-branch": "main",
+			},
+			"threat-detection": map[string]any{
+				"engine-config": "copilot",
+				"environment":   "production",
+				"model":         "gpt-5",
+			},
+		},
+	}
+
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/safe-output-config-coverage-test.md"); err != nil {
+		t.Fatalf("expected safe-output configuration fields to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchema_UpdatePullRequestSupportsReplaceIsland(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on":     "push",
+		"engine": "copilot",
+		"safe-outputs": map[string]any{
+			"update-pull-request": map[string]any{
+				"operation": "replace-island",
+			},
+		},
+	}
+
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/update-pull-request-replace-island-test.md"); err != nil {
+		t.Fatalf("expected update-pull-request replace-island operation to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchema_AzureDevOpsUpdateWorkItemSupportsStatus(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on":     "push",
+		"engine": "copilot",
+		"safe-outputs": map[string]any{
+			"ado-update-work-item": map[string]any{
+				"target": 42,
+				"status": true,
+			},
+		},
+	}
+
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/ado-update-work-item-status-test.md"); err != nil {
+		t.Fatalf("expected ado-update-work-item status to pass schema validation, got: %v", err)
+	}
+}
+
+func TestMainWorkflowSchema_SafeOutputsRejectsCommentMemory(t *testing.T) {
+	t.Parallel()
+
+	frontmatter := map[string]any{
+		"on":     "push",
+		"engine": "copilot",
+		"safe-outputs": map[string]any{
+			"comment-memory": map[string]any{
+				"footer": true,
+			},
+		},
+	}
+
+	if err := ValidateMainWorkflowFrontmatterWithSchemaAndLocation(frontmatter, "/tmp/gh-aw/safe-output-comment-memory-test.md"); err == nil {
+		t.Fatal("expected safe-outputs.comment-memory to fail schema validation")
+	}
+}
+
 // TestMainWorkflowSchema_SafeOutputsTargetProperties validates that safe output
 // types which support target/target-repo/allowed-repos in the Go code also accept
 // those properties in the JSON schema. This is a regression test for cases where
@@ -138,6 +347,8 @@ func TestMainWorkflowSchema_SafeOutputsTargetProperties(t *testing.T) {
 			safeOutputs: map[string]any{
 				"remove-labels": map[string]any{
 					"allowed":       []any{"bug", "feature"},
+					"issues":        true,
+					"pull-requests": false,
 					"target":        "*",
 					"target-repo":   "github/github",
 					"allowed-repos": []any{"github/docs"},
@@ -285,12 +496,13 @@ func TestMainWorkflowSchema_SafeOutputsTargetProperties(t *testing.T) {
 			},
 		},
 		{
-			name: "dispatch-workflow with target-repo and allowed-repos",
+			name: "dispatch-workflow with target-repo, allowed-repos, and allowed-refs",
 			safeOutputs: map[string]any{
 				"dispatch-workflow": map[string]any{
 					"workflows":     []any{"worker"},
 					"target-repo":   "github/github",
 					"allowed-repos": []any{"github/docs"},
+					"allowed-refs":  []any{"refs/heads/release/*"},
 				},
 			},
 		},
@@ -301,6 +513,15 @@ func TestMainWorkflowSchema_SafeOutputsTargetProperties(t *testing.T) {
 					"target":        "*",
 					"target-repo":   "github/github",
 					"allowed-repos": []any{"github/docs"},
+				},
+			},
+		},
+		{
+			name: "create-check-run with target",
+			safeOutputs: map[string]any{
+				"create-check-run": map[string]any{
+					"name":   "Test Check",
+					"target": "*",
 				},
 			},
 		},

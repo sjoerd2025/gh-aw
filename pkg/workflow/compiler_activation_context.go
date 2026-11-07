@@ -38,9 +38,8 @@ type activationJobBuildContext struct {
 	activationNeeds            []string
 	activationCondition        string
 
-	// activationAllScripts holds the `run` scripts extracted from jobs.activation.pre-steps,
-	// cached to avoid repeated extraction. Only pre-steps are honored for built-in jobs;
-	// jobs.activation.steps and jobs.activation.post-steps are not injected by the compiler.
+	// activationAllScripts holds the `run` scripts extracted from jobs.activation setup,
+	// pre, and activation steps, cached to avoid repeated extraction.
 	activationAllScripts []string
 	// activationInferredPerms holds the permissions inferred from activationAllScripts,
 	// cached here to avoid repeated inference.
@@ -77,12 +76,21 @@ func (c *Compiler) newActivationJobBuildContext(
 		return nil, err
 	}
 	c.addActivationSetupAndWorkflowCallSteps(ctx, setupActionRef)
+	webhookSteps, err := buildWebhookValidationStep(data)
+	if err != nil {
+		return nil, err
+	}
+	ctx.steps = append(ctx.steps, webhookSteps...)
+	// Experiment variants must be selected before the aw_info step, which reads
+	// steps.pick-experiment.outputs.<name> when engine.model references an experiment.
+	c.addActivationExperimentSteps(ctx)
 
 	engine, err := c.getAgenticEngine(data.AI)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get agentic engine: %w", err)
 	}
 	c.addActivationEngineOutputs(ctx, engine)
+	addActivationExperimentOutputs(ctx)
 
 	return ctx, nil
 }
@@ -114,13 +122,12 @@ func cacheActivationPreStepPermissions(ctx *activationJobBuildContext) error {
 	// Cache scripts from setup/pre-steps and inferred permissions once to avoid redundant
 	// extraction and inference calls in buildActivationPermissions and
 	// addActivationFeedbackAndValidationSteps.
-	// Only setup/pre-steps are honored for built-in jobs: applyBuiltinJobPreSteps (compiler_jobs.go)
-	// inserts only jobs.<name>.setup-steps / jobs.<name>.pre-steps; jobs.<name>.steps and jobs.<name>.post-steps are
-	// ignored for built-in jobs, so scanning them would cause false-positive errors or
-	// unneeded permission grants.
+	// Activation setup/pre/regular steps are injected into the built-in activation job;
+	// scan their scripts so permission inference stays aligned with emitted steps.
 	activationJobName := string(constants.ActivationJobName)
 	ctx.activationAllScripts = extractRunScriptsFromJobSection(ctx.data.Jobs, activationJobName, "setup-steps")
 	ctx.activationAllScripts = append(ctx.activationAllScripts, extractRunScriptsFromJobSection(ctx.data.Jobs, activationJobName, "pre-steps")...)
+	ctx.activationAllScripts = append(ctx.activationAllScripts, extractRunScriptsFromJobSection(ctx.data.Jobs, activationJobName, "steps")...)
 	if len(ctx.activationAllScripts) > 0 {
 		inferredPerms, err := inferPermissionsFromShellScripts(ctx.activationAllScripts)
 		if err != nil {
@@ -134,12 +141,20 @@ func cacheActivationPreStepPermissions(ctx *activationJobBuildContext) error {
 func (c *Compiler) addActivationSetupAndWorkflowCallSteps(ctx *activationJobBuildContext, setupActionRef string) {
 	ctx.steps = append(ctx.steps, c.generateCheckoutActionsFolder(ctx.data)...)
 	activationSetupTraceID, activationSetupParentSpanID := buildActivationSetupParentSpans(ctx.preActivationJob)
+	if ctx.data.AdmissionEnabled {
+		if activationSetupTraceID == "" {
+			activationSetupTraceID = "${{ needs.admission.outputs.trace-id }}"
+		} else {
+			activationSetupTraceID = "${{ needs.admission.outputs.trace-id || " + stripExpressionWrapper(activationSetupTraceID) + " }}"
+		}
+	}
 	enableArtifactClient := hasMaxDailyAICGuardrail(ctx.data)
 	artifactClientCondition := ""
 	if enableArtifactClient {
 		artifactClientCondition = maxDailyAICreditsConfiguredIfExpr
 	}
-	ctx.steps = append(ctx.steps, c.generateSetupStepWithArtifactClientCondition(
+	ctx.steps = append(ctx.steps, c.generateSetupStepForJob(
+		"activation",
 		ctx.data,
 		setupActionRef,
 		SetupActionDestination,
@@ -180,6 +195,36 @@ func (c *Compiler) addActivationWorkflowCallResolutionSteps(ctx *activationJobBu
 	}
 }
 
+// addActivationExperimentSteps appends the experiment selection steps when experiments are
+// declared in the frontmatter. These steps run early in the activation job so that the selected
+// variants are available both to the aw_info step (which resolves an engine.model that
+// references an experiment) and to the prompt substitute_placeholders step later in the job.
+func (c *Compiler) addActivationExperimentSteps(ctx *activationJobBuildContext) {
+	experimentSteps := c.generateExperimentSteps(ctx.data)
+	if len(experimentSteps) == 0 {
+		return
+	}
+	compilerActivationJobLog.Printf("Adding %d experiment step(s) for %d experiment(s)", len(experimentSteps), len(ctx.data.Experiments))
+	ctx.steps = append(ctx.steps, experimentSteps...)
+}
+
+// addActivationExperimentOutputs exposes the selected experiment variants as activation job
+// outputs. It is called after addActivationEngineOutputs so that a declared experiment name
+// keeps precedence over a same-named built-in output.
+func addActivationExperimentOutputs(ctx *activationJobBuildContext) {
+	if len(ctx.data.Experiments) == 0 {
+		return
+	}
+	// Expose the combined experiment JSON as a job output so downstream jobs can access
+	// the variant assignments via needs.activation.outputs.experiments.
+	ctx.outputs["experiments"] = "${{ steps.pick-experiment.outputs.experiments }}"
+	// Also expose each experiment variant individually so downstream jobs can reference
+	// needs.activation.outputs.<name> in timeout-minutes or other expressions.
+	for _, name := range sortedExperimentNames(ctx.data.Experiments) {
+		ctx.outputs[name] = "${{ steps.pick-experiment.outputs." + name + " }}"
+	}
+}
+
 func (c *Compiler) addActivationEngineOutputs(ctx *activationJobBuildContext, engine CodingAgentEngine) {
 	ctx.engine = engine
 	compilerActivationJobLog.Print("Generating aw_info step in activation job")
@@ -188,6 +233,7 @@ func (c *Compiler) addActivationEngineOutputs(ctx *activationJobBuildContext, en
 	ctx.steps = append(ctx.steps, awInfoYAML.String())
 	ctx.outputs["engine_id"] = "${{ steps.generate_aw_info.outputs.engine_id }}"
 	ctx.outputs["model"] = "${{ steps.generate_aw_info.outputs.model }}"
+	ctx.outputs["aw_context"] = "${{ steps.generate_aw_info.outputs.aw_context }}"
 	ctx.outputs["lockdown_check_failed"] = "${{ steps.generate_aw_info.outputs.lockdown_check_failed == 'true' }}"
 	ctx.outputs["oauth_token_check_failed"] = "${{ steps.check-oauth-tokens.outputs.oauth_token_check_failed == 'true' }}"
 	if !ctx.data.StaleCheckDisabled {

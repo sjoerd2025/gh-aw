@@ -9,59 +9,30 @@ package sprintferrdot
 import (
 	"go/ast"
 	"go/types"
-	"strconv"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
-var errorIface = universeErrorInterface()
-
-// universeErrorInterface returns the built-in error interface type, or nil.
-func universeErrorInterface() *types.Interface {
-	errorObj := types.Universe.Lookup("error")
-	if errorObj == nil {
-		return nil
-	}
-	iface, ok := errorObj.Type().Underlying().(*types.Interface)
-	if !ok {
-		return nil
-	}
-	return iface
-}
+var errorIface = astutil.UniverseErrorInterface()
 
 // Analyzer is the sprintf-err-dot analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "sprintferrdot",
-	Doc:      "reports redundant .Error() calls on error arguments passed to fmt format functions",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/sprintferrdot",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("sprintferrdot", "reports redundant .Error() calls on error arguments passed to fmt format functions", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeErrDotCall(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeErrDotCall checks whether a call expression is a fmt format function
@@ -85,7 +56,7 @@ func analyzeErrDotCall(pass *analysis.Pass, n ast.Node, generatedFiles filecheck
 		return
 	}
 
-	formatStr, ok := extractStringLit(call.Args[formatArgIdx])
+	formatStr, ok := astutil.StringLitValue(call.Args[formatArgIdx])
 	if !ok {
 		return
 	}
@@ -116,7 +87,7 @@ func analyzeErrDotCall(pass *analysis.Pass, n ast.Node, generatedFiles filecheck
 // fmtFormatCallInfo returns the format-string argument index and the
 // variadic-args start index for recognised fmt format functions.
 func fmtFormatCallInfo(pass *analysis.Pass, call *ast.CallExpr) (formatArgIdx, variadicStart int, ok bool) {
-	sel, isSel := call.Fun.(*ast.SelectorExpr)
+	sel, isSel := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !isSel {
 		return 0, 0, false
 	}
@@ -126,24 +97,11 @@ func fmtFormatCallInfo(pass *analysis.Pass, call *ast.CallExpr) (formatArgIdx, v
 	switch sel.Sel.Name {
 	case "Sprintf", "Errorf", "Printf":
 		return 0, 1, true
-	case "Fprintf", "Fscanf":
+	case "Fprintf":
 		return 1, 2, true
 	default:
 		return 0, 0, false
 	}
-}
-
-// extractStringLit returns the unquoted value of a string literal expression.
-func extractStringLit(expr ast.Expr) (string, bool) {
-	lit, ok := expr.(*ast.BasicLit)
-	if !ok {
-		return "", false
-	}
-	s, err := strconv.Unquote(lit.Value)
-	if err != nil {
-		return "", false
-	}
-	return s, true
 }
 
 // parseSimpleFormatVerbs returns the list of format verbs in sequential order.
@@ -203,11 +161,11 @@ func parseSimpleFormatVerbs(format string) []rune {
 // isErrorDotCall reports whether expr is a zero-argument .Error() call on a
 // value that implements the error interface.
 func isErrorDotCall(pass *analysis.Pass, expr ast.Expr) bool {
-	call, ok := expr.(*ast.CallExpr)
+	call, ok := astutil.UnwrapParenExpr(expr).(*ast.CallExpr)
 	if !ok || len(call.Args) != 0 {
 		return false
 	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Error" {
 		return false
 	}

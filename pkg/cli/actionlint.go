@@ -16,11 +16,12 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/scanfindings"
 )
 
 var actionlintLog = logger.New("cli:actionlint")
 
-// actionlintVersion caches the actionlint version to avoid repeated Docker calls
+// actionlintVersion caches the actionlint version to avoid repeated subprocess calls.
 var actionlintVersion string
 
 const actionlintShellMetacharacters = " \t\n'\"`$&;|*?[](){}<>!#"
@@ -171,7 +172,7 @@ func displayActionlintSummary() {
 	fmt.Fprintf(os.Stderr, "\n%s\n", separator)
 }
 
-// getActionlintVersion fetches and caches the actionlint version from Docker.
+// getActionlintVersion fetches and caches the local or Docker actionlint version.
 // The provided context allows caller-driven cancellation.
 func getActionlintVersion(ctx context.Context) (string, error) {
 	// Return cached version if already fetched
@@ -179,20 +180,18 @@ func getActionlintVersion(ctx context.Context) (string, error) {
 		return actionlintVersion, nil
 	}
 
-	actionlintLog.Print("Fetching actionlint version from Docker")
+	actionlintLog.Print("Fetching actionlint version")
 
-	// Run docker command to get version with a 30 second timeout
+	// Fetch the version with a 30 second timeout.
 	versionCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(
-		versionCtx,
-		"docker",
-		"run",
-		"--rm",
-		ActionlintImage,
-		"--version",
-	)
+	var cmd *exec.Cmd
+	if localPath := localScannerPath(versionCtx, "actionlint"); localPath != "" {
+		cmd = exec.CommandContext(versionCtx, localPath, "--version")
+	} else {
+		cmd = exec.CommandContext(versionCtx, "docker", "run", "--rm", ActionlintImage, "--version")
+	}
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -213,7 +212,7 @@ func getActionlintVersion(ctx context.Context) (string, error) {
 	return version, nil
 }
 
-// runActionlintOnFiles runs the actionlint linter on one or more .lock.yml files using Docker.
+// runActionlintOnFiles runs actionlint locally when compatible, otherwise using Docker.
 // The provided context allows caller-driven cancellation.
 func runActionlintOnFiles(ctx context.Context, lockFiles []string, verbose bool, strict bool) error {
 	return runActionlintOnFilesWithOptions(ctx, lockFiles, verbose, strict, actionlintRunOptions{
@@ -236,6 +235,7 @@ func runActionlintOnFilesWithOptions(ctx context.Context, lockFiles []string, ve
 		return nil
 	}
 	actionlintLog.Printf("Running actionlint on %d file(s): %v (verbose=%t, strict=%t)", len(lockFiles), lockFiles, verbose, strict)
+	fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage(fmt.Sprintf("Running actionlint on %d file(s)", len(lockFiles))))
 	maybePrintActionlintVersion(ctx)
 
 	gitRoot, relPaths, err := resolveActionlintPaths(lockFiles)
@@ -283,7 +283,62 @@ func runActionlintOnFilesWithOptions(ctx context.Context, lockFiles []string, ve
 	if shouldParseOutput && actionlintStats != nil {
 		actionlintStats.TotalWorkflows += len(lockFiles)
 	}
-	return handleActionlintExecutionError(runResult.err, strict, lockFiles, totalErrors, parseErr)
+	err = handleActionlintExecutionError(runResult.err, strict, lockFiles, totalErrors, parseErr, runResult.stdout)
+	if strict && err == nil && parseErr != nil {
+		err = fmt.Errorf("strict mode: actionlint output could not be parsed: %w", parseErr)
+	}
+	return reportActionlintResult(ctx, err, runResult.stdout, parseErr, shouldParseOutput && totalErrors > 0)
+}
+
+func reportActionlintResult(ctx context.Context, err error, output string, parseErr error, hasFindings bool) error {
+	actionlintLog.Printf("Reporting actionlint result: hasFindings=%t, err=%v, parseErr=%v", hasFindings, err, parseErr)
+	if hasFindings && parseErr == nil {
+		findingsErr := withActionlintFindings(err, output)
+		reportCompileScannerResult(ctx, "actionlint", findingsErr)
+		if err != nil {
+			return findingsErr
+		}
+		return nil
+	}
+	reportErr := err
+	if reportErr == nil {
+		reportErr = parseErr
+	}
+	reportCompileScannerResult(ctx, "actionlint", reportErr)
+	return err
+}
+
+func withActionlintFindings(err error, output string) error {
+	var native []actionlintError
+	if decodeErr := json.Unmarshal([]byte(output), &native); decodeErr != nil {
+		return fmt.Errorf("actionlint output could not be parsed: %w", decodeErr)
+	}
+	diagnostics := make([]scannerDiagnostic, 0, len(native))
+	sources := make(scannerSources)
+	for _, issue := range native {
+		severity := scanfindings.SeverityHigh
+		if !isHighSeverityActionlintError(issue) {
+			severity = scanfindings.SeverityLow
+		}
+		finding := scanfindings.Finding{
+			RuleID: issue.Kind, Severity: severity, Message: issue.Message,
+			File: issue.Filepath, Line: issue.Line, Column: issue.Column,
+		}
+		identity := sources.findingIdentity(finding)
+		if issue.Kind == "shellcheck" {
+			if stableIdentity, ok := sources.shellcheckIdentity(issue); ok {
+				identity = stableIdentity
+			}
+		}
+		diagnostics = append(diagnostics, scannerDiagnostic{Finding: finding, Identity: identity})
+	}
+	if len(diagnostics) == 0 {
+		return err
+	}
+	if err == nil {
+		err = fmt.Errorf("actionlint found %d issue(s)", len(diagnostics))
+	}
+	return &scannerFindingsError{err: err, diagnostics: diagnostics}
 }
 
 func maybePrintActionlintVersion(ctx context.Context) {
@@ -302,7 +357,7 @@ func maybePrintActionlintVersion(ctx context.Context) {
 func resolveActionlintPaths(lockFiles []string) (string, []string, error) {
 	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to find git root: %w", err)
+		return "", nil, err
 	}
 	relPaths := make([]string, 0, len(lockFiles))
 	for _, lockFile := range lockFiles {
@@ -320,17 +375,18 @@ func runActionlintCommand(ctx context.Context, gitRoot string, lockFiles, relPat
 	runCtx, cancel := context.WithTimeout(ctx, timeoutDuration)
 	defer cancel()
 
+	cmd := buildActionlintCommand(runCtx, gitRoot, relPaths, options)
 	verboseHint := ""
 	if verbose {
-		verboseHint = buildActionlintDockerCommand(gitRoot, relPaths, options)
+		verboseHint = formatActionlintCommand(cmd.Args)
 	}
 	printActionlintRunMessage(lockFiles, relPaths, verboseHint, options)
 
-	cmd := exec.CommandContext(runCtx, "docker", buildActionlintDockerArgs(gitRoot, relPaths, options)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	actionlintLog.Printf("actionlint command finished: err=%v, ctxErr=%v", err, runCtx.Err())
 
 	return actionlintCommandResult{
 		stdout:          stdout.String(),
@@ -341,6 +397,15 @@ func runActionlintCommand(ctx context.Context, gitRoot string, lockFiles, relPat
 	}
 }
 
+func buildActionlintCommand(ctx context.Context, gitRoot string, relPaths []string, options actionlintRunOptions) *exec.Cmd {
+	if localPath := localScannerPath(ctx, "actionlint"); localPath != "" {
+		cmd := exec.CommandContext(ctx, localPath, buildActionlintArgs(relPaths, options)...)
+		cmd.Dir = gitRoot
+		return cmd
+	}
+	return exec.CommandContext(ctx, "docker", buildActionlintDockerArgs(gitRoot, relPaths, options)...)
+}
+
 func buildActionlintDockerArgs(gitRoot string, relPaths []string, options actionlintRunOptions) []string {
 	dockerArgs := []string{
 		"run",
@@ -348,27 +413,30 @@ func buildActionlintDockerArgs(gitRoot string, relPaths []string, options action
 		"-v", gitRoot + ":/workdir",
 		"-w", "/workdir",
 		ActionlintImage,
-		"-format", "{{json .}}",
 	}
-	if !options.IncludeShellcheck {
-		dockerArgs = append(dockerArgs, "-shellcheck=")
-	}
-	if !options.IncludePyflakes {
-		dockerArgs = append(dockerArgs, "-pyflakes=")
-	}
-	for _, ignorePattern := range options.IgnorePatterns {
-		dockerArgs = append(dockerArgs, "-ignore", ignorePattern)
-	}
-	return append(dockerArgs, relPaths...)
+	return append(dockerArgs, buildActionlintArgs(relPaths, options)...)
 }
 
-func buildActionlintDockerCommand(gitRoot string, relPaths []string, options actionlintRunOptions) string {
-	args := buildActionlintDockerArgs(gitRoot, relPaths, options)
+func buildActionlintArgs(relPaths []string, options actionlintRunOptions) []string {
+	args := []string{"-format", "{{json .}}"}
+	if !options.IncludeShellcheck {
+		args = append(args, "-shellcheck=")
+	}
+	if !options.IncludePyflakes {
+		args = append(args, "-pyflakes=")
+	}
+	for _, ignorePattern := range options.IgnorePatterns {
+		args = append(args, "-ignore", ignorePattern)
+	}
+	return append(args, relPaths...)
+}
+
+func formatActionlintCommand(args []string) string {
 	formattedArgs := append([]string(nil), args...)
 	for i, arg := range formattedArgs {
 		formattedArgs[i] = actionlintShellQuoteArg(arg)
 	}
-	return "docker " + strings.Join(formattedArgs, " ")
+	return strings.Join(formattedArgs, " ")
 }
 
 func actionlintShellQuoteArg(arg string) string {
@@ -404,16 +472,21 @@ func actionlintContextError(result actionlintCommandResult, lockFiles []string) 
 		if actionlintStats != nil {
 			actionlintStats.IntegrationErrors++
 		}
-		return fmt.Errorf("actionlint timed out after %d minutes on %s - this may indicate a Docker or network issue",
+		actionlintLog.Printf("actionlint timed out after %s on %d file(s)", result.timeoutDuration, len(lockFiles))
+		return fmt.Errorf("actionlint timed out after %d minutes on %s - this may indicate a tooling or subprocess issue",
 			int(result.timeoutDuration.Minutes()), actionlintFileDescription(lockFiles))
 	}
 	if errors.Is(result.ctxErr, context.Canceled) {
+		actionlintLog.Print("actionlint was canceled before completion")
 		return errors.New("actionlint was canceled before completion (for example by Ctrl+C or caller cancellation)")
 	}
 	return nil
 }
 
-func handleActionlintExecutionError(err error, strict bool, lockFiles []string, totalErrors int, parseErr error) error {
+func handleActionlintExecutionError(err error, strict bool, lockFiles []string, totalErrors int, parseErr error, stdout string) error {
+	if strict && parseErr != nil {
+		return fmt.Errorf("strict mode: actionlint output could not be parsed: %w", parseErr)
+	}
 	if err == nil {
 		return nil
 	}
@@ -430,7 +503,7 @@ func handleActionlintExecutionError(err error, strict bool, lockFiles []string, 
 	exitCode := exitErr.ExitCode()
 	actionlintLog.Printf("Actionlint exited with code %d, found %d errors", exitCode, totalErrors)
 	if exitCode == 1 {
-		return handleActionlintFindings(strict, lockFiles, totalErrors, parseErr)
+		return handleActionlintFindings(strict, lockFiles, totalErrors, parseErr, stdout)
 	}
 
 	fileDescription := actionlintFileDescription(lockFiles)
@@ -442,18 +515,26 @@ func handleActionlintExecutionError(err error, strict bool, lockFiles []string, 
 	return fmt.Errorf("actionlint failed with exit code %d on %s", exitCode, fileDescription)
 }
 
-func handleActionlintFindings(strict bool, lockFiles []string, totalErrors int, parseErr error) error {
-	if !strict {
+func handleActionlintFindings(strict bool, lockFiles []string, totalErrors int, parseErr error, stdout string) error {
+	if strict {
+		fileDescription := actionlintFileDescription(lockFiles)
 		if parseErr != nil {
-			actionlintLog.Printf("actionlint findings could not be parsed in non-strict mode: %v", parseErr)
+			return fmt.Errorf("strict mode: actionlint exited with errors on %s but output could not be parsed — this is likely a tooling or integration error", fileDescription)
 		}
-		return nil
+		return fmt.Errorf("strict mode: actionlint found %d errors in %s - workflows must have no actionlint errors in strict mode", totalErrors, fileDescription)
 	}
-	fileDescription := actionlintFileDescription(lockFiles)
+
+	// In non-strict mode, fail only on high-severity errors.
+	highSeverityCount := countHighSeverityErrors(stdout)
+	if highSeverityCount > 0 {
+		fileDescription := actionlintFileDescription(lockFiles)
+		return fmt.Errorf("actionlint found %d high severity error(s) in %s", highSeverityCount, fileDescription)
+	}
+
 	if parseErr != nil {
-		return fmt.Errorf("strict mode: actionlint exited with errors on %s but output could not be parsed — this is likely a tooling or integration error", fileDescription)
+		actionlintLog.Printf("actionlint findings could not be parsed in non-strict mode: %v", parseErr)
 	}
-	return fmt.Errorf("strict mode: actionlint found %d errors in %s - workflows must have no actionlint errors in strict mode", totalErrors, fileDescription)
+	return nil
 }
 
 func actionlintFileDescription(lockFiles []string) string {
@@ -491,6 +572,62 @@ func parseAndDisplayActionlintOutput(stdout string, verbose bool) (int, map[stri
 	}
 
 	return totalErrors, errorsByKind, nil
+}
+
+// countHighSeverityErrors counts actionlint errors that are high severity.
+// Non-shellcheck errors are always considered high severity.
+// Shellcheck errors are high severity only if their severity level is "error" or "warning".
+// Shellcheck "info" and "style" level findings are considered low severity.
+func countHighSeverityErrors(stdout string) int {
+	if stdout == "" || strings.TrimSpace(stdout) == "" {
+		return 0
+	}
+	var errors []actionlintError
+	if err := json.Unmarshal([]byte(stdout), &errors); err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range errors {
+		if isHighSeverityActionlintError(e) {
+			count++
+		}
+	}
+	return count
+}
+
+// isHighSeverityActionlintError determines whether an actionlint error is high severity.
+// Shellcheck findings with "info" or "style" severity are low severity.
+// All other errors (including non-shellcheck errors) are high severity.
+func isHighSeverityActionlintError(e actionlintError) bool {
+	if e.Kind != "shellcheck" {
+		return true
+	}
+	// Shellcheck messages from actionlint have the format:
+	// "shellcheck reported issue in this script: SC<code>:<severity>:<line>:<col>: <message>"
+	severity := extractShellcheckSeverity(e.Message)
+	switch severity {
+	case "info", "style":
+		return false
+	default:
+		return true
+	}
+}
+
+// extractShellcheckSeverity extracts the severity from a shellcheck actionlint message.
+// Expected format: "shellcheck reported issue in this script: SC<code>:<severity>:<line>:<col>: <message>"
+func extractShellcheckSeverity(message string) string {
+	// Find the "SC" code prefix
+	scIdx := strings.Index(message, "SC")
+	if scIdx < 0 {
+		return ""
+	}
+	// After "SC<digits>:" we expect the severity
+	rest := message[scIdx:]
+	parts := strings.SplitN(rest, ":", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[1]
 }
 
 func buildActionlintCompilerError(err actionlintError) console.CompilerError {

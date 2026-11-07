@@ -6,6 +6,8 @@ import (
 	"maps"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestApplyDefaultGitCommandsForSafeOutputs(t *testing.T) {
@@ -91,7 +93,7 @@ func TestApplyDefaultGitCommandsForSafeOutputs(t *testing.T) {
 
 			// Extract cache-memory config
 			cacheMemoryConfig, _ := compiler.extractCacheMemoryConfigFromMap(tools)
-			result := engine.computeAllowedClaudeToolsString(tools, tt.safeOutputs, cacheMemoryConfig, nil, nil)
+			result := engine.computeAllowedClaudeToolsString(tools, tt.safeOutputs, cacheMemoryConfig, nil, nil, nil)
 
 			// Parse the result string into individual tools
 			resultTools := []string{}
@@ -197,7 +199,7 @@ func TestAdditionalClaudeToolsForSafeOutputs(t *testing.T) {
 
 			// Extract cache-memory config
 			cacheMemoryConfig, _ := compiler.extractCacheMemoryConfigFromMap(tools)
-			result := engine.computeAllowedClaudeToolsString(tools, tt.safeOutputs, cacheMemoryConfig, nil, nil)
+			result := engine.computeAllowedClaudeToolsString(tools, tt.safeOutputs, cacheMemoryConfig, nil, nil, nil)
 
 			// Parse the result string into individual tools
 			resultTools := []string{}
@@ -221,10 +223,7 @@ func TestAdditionalClaudeToolsForSafeOutputs(t *testing.T) {
 				}
 			}
 
-			// Write tool should be present for any SafeOutputs configuration
-			if tt.safeOutputs != nil && !hasWriteTool {
-				t.Error("Expected Write tool to be present when SafeOutputs is configured")
-			}
+			assert.Equal(t, tt.expectEditingTools, hasWriteTool, "Safe outputs must not independently grant repository writes")
 
 			// If we don't expect editing tools, verify they aren't there due to this feature
 			if !tt.expectEditingTools {

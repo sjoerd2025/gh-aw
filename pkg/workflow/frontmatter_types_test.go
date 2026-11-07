@@ -3,12 +3,189 @@
 package workflow
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestFrontmatterConfigGitHubAppJSON(t *testing.T) {
+	var config FrontmatterConfig
+	err := json.Unmarshal([]byte(`{"github-app":{"client-id":"client","private-key":"key","ignore-if-missing":true}}`), &config)
+	require.NoError(t, err)
+	require.NotNil(t, config.GitHubApp)
+	assert.Equal(t, "client", config.GitHubApp.AppID)
+	assert.Equal(t, "key", config.GitHubApp.PrivateKey)
+	assert.True(t, config.GitHubApp.IgnoreIfMissing)
+
+	data, err := json.Marshal(config)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"github-app":{"client-id":"client","private-key":"key","ignore-if-missing":true}}`, string(data))
+}
+
+func TestParseFrontmatterConfigMaxTurnsAndMaxRuns(t *testing.T) {
+	config, err := ParseFrontmatterConfig(map[string]any{
+		"name":      "test-workflow",
+		"max-turns": 15,
+		"max-runs":  "${{ inputs.max-runs }}",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, config.MaxTurns)
+	assert.Equal(t, 15, config.MaxTurns.IntValue())
+	require.NotNil(t, config.MaxRuns)
+	assert.True(t, config.MaxRuns.IsExpression())
+	assert.Equal(t, "${{ inputs.max-runs }}", config.MaxRuns.String())
+}
+
+func TestParseFrontmatterConfigShorthands(t *testing.T) {
+	for _, trigger := range []any{"workflow_dispatch", map[string]any{"workflow_dispatch": nil}} {
+		for _, max := range []any{0, 1, int64(2), uint64(3), float64(4), "${{ inputs.max }}"} {
+			frontmatter := map[string]any{
+				"on":           trigger,
+				"excluded-env": []any{"OTEL_EXPORTER_OTLP_HEADERS"},
+				"tools":        map[string]any{"github": false},
+				"sandbox":      map[string]any{"agent": false},
+				"safe-outputs": map[string]any{
+					"noop": map[string]any{"max": max},
+					"data": map[string]any{"max": 1},
+				},
+			}
+			original, err := json.Marshal(frontmatter)
+			require.NoError(t, err)
+
+			config, err := ParseFrontmatterConfig(frontmatter)
+			require.NoError(t, err)
+			assert.Equal(t, map[string]any{"workflow_dispatch": nil}, config.On)
+			assert.Equal(t, []string{"OTEL_EXPORTER_OTLP_HEADERS"}, config.ExcludedEnv)
+			require.NotNil(t, config.Tools)
+			assert.Nil(t, config.Tools.GitHub)
+			require.NotNil(t, config.Sandbox)
+			require.NotNil(t, config.Sandbox.Agent)
+			assert.True(t, config.Sandbox.Agent.Disabled)
+			require.NotNil(t, config.SafeOutputs)
+			require.NotNil(t, config.SafeOutputs.NoOp)
+			require.NotNil(t, config.SafeOutputs.NoOp.Max)
+			assert.Equal(t, fmt.Sprint(max), *config.SafeOutputs.NoOp.Max)
+			assert.Equal(t, map[string]any{"max": float64(1)}, config.SafeOutputs.Data)
+
+			after, err := json.Marshal(frontmatter)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(original), string(after), "parsing must not mutate frontmatter")
+		}
+	}
+}
+
+func TestParseFrontmatterConfigSchemaShorthands(t *testing.T) {
+	tests := []struct {
+		name        string
+		frontmatter map[string]any
+	}{
+		{
+			name: "restricted bash allow-list",
+			frontmatter: map[string]any{
+				"tools": map[string]any{"bash": []any{"echo"}},
+			},
+		},
+		{
+			name: "tool booleans and github string",
+			frontmatter: map[string]any{
+				"tools": map[string]any{"github": "remote", "bash": false, "edit": true, "grep": false},
+			},
+		},
+		{
+			name: "enabled github tool",
+			frontmatter: map[string]any{
+				"tools": map[string]any{"github": true},
+			},
+		},
+		{
+			name: "string configuration sections",
+			frontmatter: map[string]any{
+				"permissions": "read-all",
+				"network":     "defaults",
+				"environment": "production",
+				"concurrency": "one-at-a-time",
+				"container":   "ubuntu:latest",
+				"sandbox":     "awf",
+			},
+		},
+		{
+			name: "safe output booleans and sandbox agent",
+			frontmatter: map[string]any{
+				"sandbox":      map[string]any{"agent": "awf"},
+				"safe-outputs": map[string]any{"noop": false, "mentions": true},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original, err := json.Marshal(tt.frontmatter)
+			require.NoError(t, err)
+			config, err := ParseFrontmatterConfig(tt.frontmatter)
+			require.NoError(t, err)
+			require.NotNil(t, config)
+			if tools, ok := tt.frontmatter["tools"].(map[string]any); ok {
+				if commands, ok := tools["bash"].([]any); ok {
+					require.NotNil(t, config.Tools)
+					require.NotNil(t, config.Tools.Bash)
+					assert.Equal(t, []string{"echo"}, config.Tools.Bash.AllowedCommands)
+					assert.Equal(t, []any{"echo"}, commands, "parsing must not mutate frontmatter")
+				}
+				if github, ok := tools["github"].(string); ok {
+					require.NotNil(t, config.Tools)
+					require.NotNil(t, config.Tools.GitHub)
+					assert.Equal(t, GitHubMCPMode(github), config.Tools.GitHub.Mode)
+				}
+				if github, ok := tools["github"].(bool); ok && github {
+					require.NotNil(t, config.Tools)
+					require.NotNil(t, config.Tools.GitHub)
+				}
+			}
+			if sandbox, ok := tt.frontmatter["sandbox"].(string); ok {
+				assert.Equal(t, SandboxType(sandbox), config.Sandbox.Type)
+			}
+			if sandbox, ok := tt.frontmatter["sandbox"].(map[string]any); ok {
+				if agent, ok := sandbox["agent"].(string); ok {
+					require.NotNil(t, config.Sandbox)
+					require.NotNil(t, config.Sandbox.Agent)
+					assert.Equal(t, agent, config.Sandbox.Agent.ID)
+				}
+			}
+			if safeOutputs, ok := tt.frontmatter["safe-outputs"].(map[string]any); ok {
+				require.NotNil(t, config.SafeOutputs)
+				assert.Nil(t, config.SafeOutputs.NoOp)
+				require.NotNil(t, config.SafeOutputs.Mentions)
+				require.NotNil(t, config.SafeOutputs.Mentions.Enabled)
+				assert.True(t, *config.SafeOutputs.Mentions.Enabled)
+				assert.Equal(t, false, safeOutputs["noop"])
+			}
+			if _, ok := tt.frontmatter["permissions"]; ok {
+				require.NotNil(t, config.PermissionsTyped)
+				assert.Equal(t, "read-all", config.PermissionsTyped.Shorthand)
+			}
+			if _, ok := tt.frontmatter["network"]; ok {
+				require.NotNil(t, config.Network)
+				assert.Equal(t, []string{"defaults"}, config.Network.Allowed)
+			}
+			if _, ok := tt.frontmatter["environment"]; ok {
+				assert.Equal(t, "production", config.Environment["name"])
+			}
+			if _, ok := tt.frontmatter["concurrency"]; ok {
+				assert.Equal(t, "one-at-a-time", config.Concurrency["group"])
+			}
+			if _, ok := tt.frontmatter["container"]; ok {
+				assert.Equal(t, "ubuntu:latest", config.Container["image"])
+			}
+			after, err := json.Marshal(tt.frontmatter)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(original), string(after), "normalization must not mutate frontmatter")
+		})
+	}
+}
 
 func TestParseFrontmatterConfig(t *testing.T) {
 	t.Run("parses minimal workflow config", func(t *testing.T) {
@@ -97,14 +274,140 @@ func TestParseFrontmatterConfig(t *testing.T) {
 		require.Equal(t, "${{ secrets.SOME_TOKEN }}", config.SkillReferences[0].GitHubToken)
 	})
 
+	t.Run("parses top-level ambient-folders", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"ambient-folders": []any{" docs ", "src\\lib", "docs"},
+		}
+
+		config, err := ParseFrontmatterConfig(frontmatter)
+		require.NoError(t, err)
+
+		require.Equal(t, []string{"docs", "src/lib"}, config.AmbientFolders)
+		require.Equal(t, []string{"docs", "src/lib"}, config.ToMap()["ambient-folders"])
+
+		roundTripped, err := ParseFrontmatterConfig(config.ToMap())
+		require.NoError(t, err)
+		require.Equal(t, config.AmbientFolders, roundTripped.AmbientFolders)
+	})
+
+	t.Run("rejects invalid top-level ambient-folders", func(t *testing.T) {
+		config, err := ParseFrontmatterConfig(map[string]any{
+			"ambient-folders": []any{"../docs"},
+		})
+
+		require.ErrorContains(t, err, "is not a relative path within the repository")
+		assert.Nil(t, config)
+	})
+
+	t.Run("parses top-level github-app", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"github-app": map[string]any{
+				"client-id":         "${{ vars.APP_ID }}",
+				"private-key":       "${{ secrets.APP_PRIVATE_KEY }}",
+				"ignore-if-missing": true,
+				"owner":             "github",
+				"repositories":      []any{"gh-aw"},
+				"permissions": map[string]any{
+					"members": "read",
+				},
+			},
+		}
+
+		config, err := ParseFrontmatterConfig(frontmatter)
+		require.NoError(t, err)
+		require.NotNil(t, config.GitHubApp)
+
+		assert.Equal(t, "${{ vars.APP_ID }}", config.GitHubApp.AppID)
+		assert.Equal(t, "${{ secrets.APP_PRIVATE_KEY }}", config.GitHubApp.PrivateKey)
+		assert.True(t, config.GitHubApp.IgnoreIfMissing)
+		assert.Equal(t, "github", config.GitHubApp.Owner)
+		assert.Equal(t, []string{"gh-aw"}, config.GitHubApp.Repositories)
+		assert.Equal(t, map[string]string{"members": "read"}, config.GitHubApp.Permissions)
+
+		reconstructedApp, ok := config.ToMap()["github-app"].(map[string]any)
+		require.True(t, ok, "github-app should round-trip as a map")
+		assert.Equal(t, "${{ vars.APP_ID }}", reconstructedApp["client-id"])
+		assert.Equal(t, "${{ secrets.APP_PRIVATE_KEY }}", reconstructedApp["private-key"])
+		assert.Equal(t, true, reconstructedApp["ignore-if-missing"])
+		assert.Equal(t, "github", reconstructedApp["owner"])
+		assert.Equal(t, []any{"gh-aw"}, reconstructedApp["repositories"])
+		assert.Equal(t, map[string]any{"members": "read"}, reconstructedApp["permissions"])
+
+		roundTripped, err := ParseFrontmatterConfig(config.ToMap())
+		require.NoError(t, err)
+		require.NotNil(t, roundTripped.GitHubApp)
+		assert.Equal(t, config.GitHubApp, roundTripped.GitHubApp)
+
+		roundTripped.GitHubApp.Repositories[0] = "other"
+		roundTripped.GitHubApp.Permissions["members"] = "write"
+		assert.Equal(t, []string{"gh-aw"}, config.GitHubApp.Repositories)
+		assert.Equal(t, map[string]string{"members": "read"}, config.GitHubApp.Permissions)
+	})
+
+	t.Run("drops incomplete top-level github-app like compiler fallback", func(t *testing.T) {
+		config, err := ParseFrontmatterConfig(map[string]any{
+			"github-app": map[string]any{
+				"client-id":         "${{ vars.APP_ID }}",
+				"ignore-if-missing": true,
+			},
+		})
+
+		require.NoError(t, err)
+		assert.Nil(t, config.GitHubApp)
+		assert.NotContains(t, config.ToMap(), "github-app")
+	})
+
+	t.Run("parses string map top-level github-app", func(t *testing.T) {
+		config, err := ParseFrontmatterConfig(map[string]any{
+			"github-app": map[string]string{
+				"client-id":   "client-id",
+				"private-key": "private-key",
+			},
+		})
+
+		require.NoError(t, err)
+		require.NotNil(t, config.GitHubApp)
+		assert.Equal(t, "client-id", config.GitHubApp.AppID)
+		assert.Equal(t, "private-key", config.GitHubApp.PrivateKey)
+	})
+
+	t.Run("rejects unsupported top-level github-app type", func(t *testing.T) {
+		config, err := ParseFrontmatterConfig(map[string]any{"github-app": "invalid"})
+
+		require.ErrorContains(t, err, "github-app has an unsupported type")
+		assert.Nil(t, config)
+	})
+
+	t.Run("parses top-level github-app app-id alias", func(t *testing.T) {
+		frontmatter := map[string]any{
+			"github-app": map[string]any{
+				"app-id":      "${{ vars.APP_ID }}",
+				"private-key": "${{ secrets.APP_PRIVATE_KEY }}",
+			},
+		}
+
+		config, err := ParseFrontmatterConfig(frontmatter)
+		require.NoError(t, err)
+		require.NotNil(t, config.GitHubApp)
+		assert.Equal(t, "${{ vars.APP_ID }}", config.GitHubApp.AppID)
+
+		reconstructedApp, ok := config.ToMap()["github-app"].(map[string]any)
+		require.True(t, ok, "github-app should round-trip as a map")
+		assert.Equal(t, "${{ vars.APP_ID }}", reconstructedApp["client-id"])
+		assert.NotContains(t, reconstructedApp, "app-id")
+	})
+
 	t.Run("parses complete workflow config", func(t *testing.T) {
 		frontmatter := map[string]any{
 			"name":        "full-workflow",
 			"description": "A complete workflow",
-			"engine":      "copilot",
-			"source":      "owner/repo/path@main",
-			"redirect":    "owner/repo/new-path@main",
-			"tracker-id":  "test-tracker-123",
+			"metadata": map[string]any{
+				"docs": "https://docs.example.com/full-workflow",
+			},
+			"engine":     "copilot",
+			"source":     "owner/repo/path@main",
+			"redirect":   "owner/repo/new-path@main",
+			"tracker-id": "test-tracker-123",
 			"tools": map[string]any{
 				"bash": map[string]any{
 					"enabled": true,
@@ -134,6 +437,9 @@ func TestParseFrontmatterConfig(t *testing.T) {
 
 		if config.Description != "A complete workflow" {
 			t.Errorf("Description = %q, want %q", config.Description, "A complete workflow")
+		}
+		if config.Metadata["docs"] != "https://docs.example.com/full-workflow" {
+			t.Errorf("Metadata docs = %q, want documentation URL", config.Metadata["docs"])
 		}
 
 		if config.Engine != "copilot" {
@@ -249,8 +555,8 @@ func TestParseFrontmatterConfig(t *testing.T) {
 			t.Error("expected error for non-expression string timeout-minutes, got nil")
 			return
 		}
-		if !strings.Contains(err.Error(), "timeout-minutes") {
-			t.Errorf("error message should mention 'timeout-minutes', got: %v", err)
+		if !strings.Contains(err.Error(), "must be an integer or a GitHub Actions expression") {
+			t.Errorf("error message should describe the integer/expression requirement, got: %v", err)
 		}
 	})
 
@@ -492,17 +798,17 @@ func TestParseFrontmatterConfig(t *testing.T) {
 			{
 				name:        "number form",
 				runsOn:      42,
-				errContains: "invalid runs-on type",
+				errContains: "expected a string, array of strings, or object",
 			},
 			{
 				name:        "array contains non-string",
 				runsOn:      []any{"self-hosted", 42},
-				errContains: "invalid runs-on array entry type",
+				errContains: "expected a string label",
 			},
 			{
 				name:        "object contains unknown key",
 				runsOn:      map[string]any{"unknown": "value"},
-				errContains: "invalid runs-on object key",
+				errContains: "is not supported, expected 'group' or 'labels'",
 			},
 		}
 
@@ -633,7 +939,7 @@ func TestFrontmatterConfigFieldExtraction(t *testing.T) {
 		frontmatter := map[string]any{
 			"runtimes": map[string]any{
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 				},
 			},
 		}
@@ -1091,7 +1397,7 @@ func TestFrontmatterConfigIntegration(t *testing.T) {
 			},
 			"runtimes": map[string]any{
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 				},
 			},
 		}
@@ -1176,7 +1482,7 @@ func TestRuntimesConfigTyping(t *testing.T) {
 		frontmatter := map[string]any{
 			"runtimes": map[string]any{
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 				},
 			},
 		}
@@ -1195,8 +1501,8 @@ func TestRuntimesConfigTyping(t *testing.T) {
 			t.Fatal("RuntimesTyped.Node should not be nil")
 		}
 
-		if config.RuntimesTyped.Node.Version != "20" {
-			t.Errorf("Node version = %s, want 20", config.RuntimesTyped.Node.Version)
+		if config.RuntimesTyped.Node.Version != "24" {
+			t.Errorf("Node version = %s, want 24", config.RuntimesTyped.Node.Version)
 		}
 
 		// Legacy field should still be populated
@@ -1236,7 +1542,7 @@ func TestRuntimesConfigTyping(t *testing.T) {
 		frontmatter := map[string]any{
 			"runtimes": map[string]any{
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 				},
 				"python": map[string]any{
 					"version": "3.11",
@@ -1272,7 +1578,7 @@ func TestRuntimesConfigTyping(t *testing.T) {
 			"name": "test-workflow",
 			"runtimes": map[string]any{
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 				},
 			},
 		}
@@ -1296,15 +1602,15 @@ func TestRuntimesConfigTyping(t *testing.T) {
 			t.Fatal("node runtime should be in runtimes map")
 		}
 
-		if node["version"] != "20" {
-			t.Errorf("node version = %v, want 20", node["version"])
+		if node["version"] != "24" {
+			t.Errorf("node version = %v, want 24", node["version"])
 		}
 	})
 
 	t.Run("handles all runtime types", func(t *testing.T) {
 		frontmatter := map[string]any{
 			"runtimes": map[string]any{
-				"node":   map[string]any{"version": "20"},
+				"node":   map[string]any{"version": "24"},
 				"python": map[string]any{"version": "3.11"},
 				"go":     map[string]any{"version": "1.21"},
 				"uv":     map[string]any{"version": "0.1.0"},
@@ -1514,7 +1820,7 @@ func TestTypedConfigsBackwardCompatibility(t *testing.T) {
 		frontmatter := map[string]any{
 			"runtimes": map[string]any{
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 				},
 			},
 		}
@@ -1534,8 +1840,8 @@ func TestTypedConfigsBackwardCompatibility(t *testing.T) {
 
 		// Legacy field should have the same data
 		if node, ok := config.Runtimes["node"].(map[string]any); ok {
-			if node["version"] != "20" {
-				t.Error("Legacy Runtimes field should have version 20")
+			if node["version"] != "24" {
+				t.Error("Legacy Runtimes field should have version 24")
 			}
 		} else {
 			t.Error("Legacy Runtimes should have node entry")
@@ -1577,7 +1883,7 @@ func TestTypedConfigsBackwardCompatibility(t *testing.T) {
 		frontmatter := map[string]any{
 			"runtimes": map[string]any{
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 				},
 			},
 			"permissions": map[string]any{
@@ -1650,7 +1956,7 @@ func TestParseRuntimesConfigWithIfCondition(t *testing.T) {
 					"if":      "hashFiles('requirements.txt') != ''",
 				},
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 					"if":      "hashFiles('package.json') != ''",
 				},
 			},
@@ -1664,7 +1970,7 @@ func TestParseRuntimesConfigWithIfCondition(t *testing.T) {
 					If:      "hashFiles('requirements.txt') != ''",
 				},
 				"node": {
-					Version: "20",
+					Version: "24",
 					If:      "hashFiles('package.json') != ''",
 				},
 			},
@@ -1673,12 +1979,12 @@ func TestParseRuntimesConfigWithIfCondition(t *testing.T) {
 			name: "runtime without if condition",
 			runtimes: map[string]any{
 				"node": map[string]any{
-					"version": "20",
+					"version": "24",
 				},
 			},
 			expected: map[string]RuntimeConfig{
 				"node": {
-					Version: "20",
+					Version: "24",
 					If:      "",
 				},
 			},
@@ -1737,7 +2043,7 @@ func TestRuntimesConfigToMapWithIfCondition(t *testing.T) {
 			If:      "hashFiles('requirements.txt') != ''",
 		},
 		Node: &RuntimeConfig{
-			Version: "20",
+			Version: "24",
 		},
 	}
 
@@ -1772,8 +2078,8 @@ func TestRuntimesConfigToMapWithIfCondition(t *testing.T) {
 	if !ok {
 		t.Fatal("node runtime not found in result")
 	}
-	if nodeMap["version"] != "20" {
-		t.Errorf("node version: got %v, want 20", nodeMap["version"])
+	if nodeMap["version"] != "24" {
+		t.Errorf("node version: got %v, want 24", nodeMap["version"])
 	}
 	if _, hasIf := nodeMap["if"]; hasIf {
 		t.Error("node should not have if condition in map")
@@ -1783,7 +2089,7 @@ func TestRuntimesConfigToMapWithIfCondition(t *testing.T) {
 func TestParseRuntimesConfig_Cooldown(t *testing.T) {
 	runtimes := map[string]any{
 		"node": map[string]any{
-			"version":  "20",
+			"version":  "24",
 			"cooldown": false,
 		},
 	}
@@ -1807,7 +2113,7 @@ func TestRuntimesConfigToMap_Cooldown(t *testing.T) {
 	disabled := false
 	result := runtimesConfigToMap(&RuntimesConfig{
 		Node: &RuntimeConfig{
-			Version:  "20",
+			Version:  "24",
 			Cooldown: &disabled,
 		},
 	})
@@ -1841,7 +2147,7 @@ func TestParseFrontmatterConfigCheckoutDisabled(t *testing.T) {
 		}
 	})
 
-	t.Run("checkout: true is not a valid value (treated as object)", func(t *testing.T) {
+	t.Run("checkout: true is rejected", func(t *testing.T) {
 		frontmatter := map[string]any{
 			"name":     "test-workflow",
 			"engine":   "claude",
@@ -1849,13 +2155,8 @@ func TestParseFrontmatterConfigCheckoutDisabled(t *testing.T) {
 		}
 
 		config, err := ParseFrontmatterConfig(frontmatter)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		// checkout: true is not recognized as a disable flag; CheckoutDisabled stays false
-		if config.CheckoutDisabled {
-			t.Error("CheckoutDisabled should be false when checkout: true is set")
-		}
+		require.ErrorContains(t, err, "checkout must be an object or an array of objects")
+		assert.Nil(t, config)
 	})
 
 	t.Run("checkout object leaves CheckoutDisabled false", func(t *testing.T) {

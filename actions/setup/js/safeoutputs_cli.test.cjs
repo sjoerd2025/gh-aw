@@ -3,28 +3,36 @@ import { createRequire } from "module";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { compileFunction } from "node:vm";
 
 const require = createRequire(import.meta.url);
-const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
+const { runSafeOutputsCLI, buildMissingToolAlternatives, emitMissingToolPermissionIssue, emitInfrastructureIncomplete, hasExpectedSafeOutputs, hasTerminalSafeOutput, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
 
 describe("safeoutputs_cli.cjs", () => {
+  it("executes the CommonJS module in strict mode", () => {
+    const source = fs.readFileSync(require.resolve("./safeoutputs_cli.cjs"), "utf8");
+    const execute = compileFunction(`${source}\nreturn (function () { return this; })();`, ["require", "module", "exports"]);
+    const module = { exports: {} };
+    expect(execute(require, module, module.exports)).toBeUndefined();
+  });
+
   describe("runSafeOutputsCLI", () => {
     it("throws when an argument key contains invalid characters", () => {
       process.env.GH_AW_SAFEOUTPUTS_CLI = "true"; // 'true' exits 0, accepts any args
-      expect(() => runSafeOutputsCLI("missing_tool", { "bad key!": "value" })).toThrow("invalid safeoutputs argument key");
+      expect(() => runSafeOutputsCLI("report_missing_tool", { "bad key!": "value" })).toThrow("invalid safeoutputs argument key");
       delete process.env.GH_AW_SAFEOUTPUTS_CLI;
     });
 
     it("skips empty string values", () => {
       // 'true' succeeds without checking args, so empty-value keys must be skipped silently
       process.env.GH_AW_SAFEOUTPUTS_CLI = "true";
-      expect(() => runSafeOutputsCLI("missing_tool", { tool: "", reason: "test" })).not.toThrow();
+      expect(() => runSafeOutputsCLI("report_missing_tool", { tool: "", reason: "test" })).not.toThrow();
       delete process.env.GH_AW_SAFEOUTPUTS_CLI;
     });
 
     it("wraps CLI errors with tool name and key summary", () => {
       process.env.GH_AW_SAFEOUTPUTS_CLI = "false"; // 'false' exits 1
-      expect(() => runSafeOutputsCLI("missing_tool", { tool: "tool/permission", reason: "test" })).toThrow("safeoutputs missing_tool(tool, reason) failed");
+      expect(() => runSafeOutputsCLI("report_missing_tool", { tool: "tool/permission", reason: "test" })).toThrow("safeoutputs report_missing_tool(tool, reason) failed");
       delete process.env.GH_AW_SAFEOUTPUTS_CLI;
     });
   });
@@ -78,11 +86,11 @@ describe("safeoutputs_cli.cjs", () => {
         logger: message => logs.push(message),
       });
       expect(calls).toHaveLength(1);
-      expect(calls[0].toolName).toBe("missing_tool");
+      expect(calls[0].toolName).toBe("report_missing_tool");
       expect(calls[0].args.tool).toBe("tool/permission");
       expect(calls[0].args.reason).toContain("missing tool/permission issue");
       expect(calls[0].args.alternatives).toContain("Denied commands: go version");
-      expect(logs.some(m => m.includes("missing_tool emitted"))).toBe(true);
+      expect(logs.some(m => m.includes("report_missing_tool emitted"))).toBe(true);
     });
 
     it("skips emission when safeOutputsPath is empty", () => {
@@ -97,6 +105,22 @@ describe("safeoutputs_cli.cjs", () => {
       expect(logs.some(m => m.includes("skipped"))).toBe(true);
     });
 
+    it("preserves workflow allowlist guidance through the actual CLI emission path", () => {
+      const calls = [];
+      emitMissingToolPermissionIssue({
+        safeOutputsPath: "/tmp/safeoutputs.jsonl",
+        deniedCommands: ["shell(node --test scripts/pr-sous-chef.test.mjs)"],
+        permissionOutput: "[sdk-driver] permission denied by workflow tool permissions: shell(node --test scripts/pr-sous-chef.test.mjs)",
+        runSafeOutputsCLI: (toolName, args) => calls.push({ toolName, args }),
+        logger: () => {},
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args.alternatives).toContain("workflow tools configuration");
+      expect(calls[0].args.alternatives).toContain("Denied commands: shell(node --test scripts/pr-sous-chef.test.mjs)");
+      expect(calls[0].args.alternatives).not.toContain("Verify token scopes");
+      expect(calls[0].args.alternatives.length).toBeLessThanOrEqual(512);
+    });
+
     it("logs error when CLI invocation fails", () => {
       const logs = [];
       emitMissingToolPermissionIssue({
@@ -106,7 +130,7 @@ describe("safeoutputs_cli.cjs", () => {
         },
         logger: message => logs.push(message),
       });
-      expect(logs.some(m => m.includes("missing_tool emission failed"))).toBe(true);
+      expect(logs.some(m => m.includes("report_missing_tool emission failed"))).toBe(true);
       expect(logs.some(m => m.includes("EROFS"))).toBe(true);
     });
   });
@@ -181,7 +205,7 @@ describe("safeoutputs_cli.cjs", () => {
     });
 
     it("returns false when all entries are diagnostic types", () => {
-      const filePath = makeTempFile('{"type":"noop","message":"nothing to do"}\n{"type":"missing_tool","tool":"x"}\n{"type":"report_incomplete","reason":"infra"}\n');
+      const filePath = makeTempFile('{"type":"noop","message":"nothing to do"}\n{"type":"report_missing_tool","tool":"x"}\n{"type":"report_incomplete","reason":"infra"}\n');
       try {
         expect(hasExpectedSafeOutputs(filePath)).toBe(false);
       } finally {
@@ -198,8 +222,8 @@ describe("safeoutputs_cli.cjs", () => {
       }
     });
 
-    it("returns false when the file contains only a missing_tool entry", () => {
-      const filePath = makeTempFile('{"type":"missing_tool","tool":"tool/permission"}\n');
+    it("returns false when the file contains only a report_missing_tool entry", () => {
+      const filePath = makeTempFile('{"type":"report_missing_tool","tool":"tool/permission"}\n');
       try {
         expect(hasExpectedSafeOutputs(filePath)).toBe(false);
       } finally {
@@ -217,7 +241,7 @@ describe("safeoutputs_cli.cjs", () => {
     });
 
     it("returns true when an expected entry is mixed with diagnostic entries", () => {
-      const filePath = makeTempFile('{"type":"missing_tool","tool":"x"}\n{"type":"add_comment","body":"done"}\n');
+      const filePath = makeTempFile('{"type":"report_missing_tool","tool":"x"}\n{"type":"add_comment","body":"done"}\n');
       try {
         expect(hasExpectedSafeOutputs(filePath)).toBe(true);
       } finally {
@@ -284,6 +308,66 @@ describe("safeoutputs_cli.cjs", () => {
         },
       });
       expect(result).toBe(false);
+    });
+  });
+
+  describe("hasTerminalSafeOutput", () => {
+    function makeTempFile(content) {
+      const p = path.join(os.tmpdir(), `safeoutputs-terminal-test-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+      fs.writeFileSync(p, content, "utf8");
+      return p;
+    }
+
+    it("returns true for noop and non-diagnostic entries", () => {
+      const filePath = makeTempFile('{"type":"report_missing_tool","tool":"x"}\n{"type":"noop","message":"done"}\n');
+      try {
+        expect(hasTerminalSafeOutput(filePath)).toBe(true);
+      } finally {
+        fs.rmSync(filePath);
+      }
+    });
+
+    it("returns false for report_incomplete unless explicitly included", () => {
+      const filePath = makeTempFile('{"type":"report_incomplete","reason":"blocked"}\n');
+      try {
+        expect(hasTerminalSafeOutput(filePath)).toBe(false);
+        expect(hasTerminalSafeOutput(filePath, { includeReportIncomplete: true })).toBe(true);
+      } finally {
+        fs.rmSync(filePath);
+      }
+    });
+
+    it("returns false for report_missing_data unless explicitly included", () => {
+      const filePath = makeTempFile('{"type":"report_missing_data","reason":"metadata unavailable"}\n');
+      try {
+        expect(hasTerminalSafeOutput(filePath)).toBe(false);
+        expect(hasTerminalSafeOutput(filePath, { includeMissingData: true })).toBe(true);
+      } finally {
+        fs.rmSync(filePath);
+      }
+    });
+
+    it("scopes detection to content after byteOffset", () => {
+      const firstLine = '{"type":"noop","message":"old"}\n';
+      const filePath = makeTempFile(`${firstLine}{"type":"report_missing_tool","tool":"x"}\n`);
+      try {
+        expect(hasTerminalSafeOutput(filePath, { byteOffset: 0 })).toBe(true);
+        expect(hasTerminalSafeOutput(filePath, { byteOffset: Buffer.byteLength(firstLine) })).toBe(false);
+      } finally {
+        fs.rmSync(filePath);
+      }
+    });
+
+    it("returns false when byteOffset is used with an injected string reader", () => {
+      const logs = [];
+      expect(
+        hasTerminalSafeOutput("/fake/path.jsonl", {
+          byteOffset: 1,
+          logger: message => logs.push(message),
+          readFileSync: () => '{"type":"noop","message":"old"}\n',
+        })
+      ).toBe(false);
+      expect(logs.some(message => message.includes("byteOffset is unsupported"))).toBe(true);
     });
   });
 

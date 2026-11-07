@@ -33,6 +33,7 @@ func TestCommandGroupAssignments(t *testing.T) {
 		{name: "validate command in development group", commandName: "validate", expectedGroup: "development", shouldHaveGroup: true},
 		{name: "mcp command in development group", commandName: "mcp", expectedGroup: "development", shouldHaveGroup: true},
 		{name: "fix command in development group", commandName: "fix", expectedGroup: "development", shouldHaveGroup: true},
+		{name: "format command in development group", commandName: "format", expectedGroup: "development", shouldHaveGroup: true},
 		{name: "domains command in development group", commandName: "domains", expectedGroup: "development", shouldHaveGroup: true},
 
 		// Execution Commands
@@ -47,7 +48,6 @@ func TestCommandGroupAssignments(t *testing.T) {
 		{name: "status command in analysis group", commandName: "status", expectedGroup: "analysis", shouldHaveGroup: true},
 		{name: "list command in analysis group", commandName: "list", expectedGroup: "analysis", shouldHaveGroup: true},
 		{name: "health command in analysis group", commandName: "health", expectedGroup: "analysis", shouldHaveGroup: true},
-		{name: "outcomes command in analysis group", commandName: "outcomes", expectedGroup: "analysis", shouldHaveGroup: true},
 		{name: "checks command in analysis group", commandName: "checks", expectedGroup: "analysis", shouldHaveGroup: true},
 		// Hidden commands should still be grouped so they appear in the correct
 		// section when explicitly shown (for example in full help/test contexts).
@@ -60,22 +60,29 @@ func TestCommandGroupAssignments(t *testing.T) {
 		{name: "completion command in utilities group", commandName: "completion", expectedGroup: "utilities", shouldHaveGroup: true},
 		{name: "hash-frontmatter command in utilities group", commandName: "hash-frontmatter", expectedGroup: "utilities", shouldHaveGroup: true},
 		{name: "project command in utilities group", commandName: "project", expectedGroup: "utilities", shouldHaveGroup: true},
+		{name: "json-schema command in utilities group", commandName: "json-schema", expectedGroup: "utilities", shouldHaveGroup: true},
+		{name: "skill command in utilities group", commandName: "skill", expectedGroup: "utilities", shouldHaveGroup: true},
 
 		// Commands without groups (intentionally)
 		{name: "version command without group", commandName: "version", expectedGroup: "", shouldHaveGroup: false},
 		// Note: help command is special in Cobra and managed separately, so we don't test it here
 	}
 
+	// Keep the parent test serial: Cobra's Commands() lazily sorts shared state,
+	// so even map construction must not overlap other top-level tests.
+	// Subtests can read the completed map in parallel.
+	commandMap := make(map[string]*cobra.Command, len(rootCmd.Commands()))
+	for _, cmd := range rootCmd.Commands() {
+		commandMap[cmd.Name()] = cmd
+	}
+	if commandMap["outcomes"] != nil {
+		t.Fatal("outcomes must be exposed through logs, not as a standalone command")
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Find the command
-			var foundCmd *cobra.Command
-			for _, cmd := range rootCmd.Commands() {
-				if cmd.Name() == tt.commandName {
-					foundCmd = cmd
-					break
-				}
-			}
+			t.Parallel()
+			foundCmd := commandMap[tt.commandName]
 
 			if foundCmd == nil {
 				t.Fatalf("Command %q not found", tt.commandName)
@@ -99,6 +106,7 @@ func TestCommandGroupAssignments(t *testing.T) {
 
 // TestCommandGroupsExist verifies that all expected command groups exist
 func TestCommandGroupsExist(t *testing.T) {
+	t.Parallel()
 	expectedGroups := map[string]string{
 		"setup":       "Setup Commands:",
 		"development": "Development Commands:",
@@ -135,15 +143,17 @@ func TestNoCommandsInAdditionalCommandsWithGroups(t *testing.T) {
 	// Commands that should NOT be in Additional Commands (should have groups)
 	commandsShouldHaveGroups := []string{"remove", "update", "deploy", "trial", "mcp-server", "pr"}
 
+	// Keep map construction in the serial parent test, before parallel subtests.
+	// See TestCommandGroupAssignments for the rationale.
+	commandMap := make(map[string]*cobra.Command, len(rootCmd.Commands()))
+	for _, cmd := range rootCmd.Commands() {
+		commandMap[cmd.Name()] = cmd
+	}
+
 	for _, cmdName := range commandsShouldHaveGroups {
 		t.Run("command "+cmdName+" has group", func(t *testing.T) {
-			var foundCmd *cobra.Command
-			for _, cmd := range rootCmd.Commands() {
-				if cmd.Name() == cmdName {
-					foundCmd = cmd
-					break
-				}
-			}
+			t.Parallel()
+			foundCmd := commandMap[cmdName]
 
 			if foundCmd == nil {
 				t.Fatalf("Command %q not found", cmdName)

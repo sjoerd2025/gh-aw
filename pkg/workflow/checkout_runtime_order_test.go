@@ -11,6 +11,29 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 )
 
+// compilerInjectedStepNames are not part of the checkout ordering contract exercised
+// by these tests. OTLP steps are emitted for every workflow because the endpoint
+// defaults to the enterprise GH_AW_DEFAULT_OTLP_ENDPOINT secret or variable /
+// GH_AW_DEFAULT_OTLP_HEADERS secret pair.
+var compilerInjectedStepNames = map[string]bool{
+	"Mask OTLP telemetry headers":         true,
+	"Mask OTLP custom attribute values":   true,
+	"Check OTLP telemetry configuration":  true,
+	"Initialize agent execution evidence": true,
+}
+
+// filterCompilerInjectedSteps removes unrelated compiler-injected steps from a step name list.
+func filterCompilerInjectedSteps(names []string) []string {
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if compilerInjectedStepNames[name] {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered
+}
+
 // TestCheckoutRuntimeOrderInCustomSteps verifies that when custom steps contain
 // a checkout step, the temp directory is created first, then the checkout step
 // runs, and runtime setup steps are inserted AFTER the checkout step. This ensures
@@ -118,6 +141,8 @@ steps:
 			}
 		}
 	}
+
+	stepNames = filterCompilerInjectedSteps(stepNames)
 
 	t.Logf("Found %d steps: %v", len(stepNames), stepNames)
 
@@ -436,6 +461,8 @@ Run node --version to check the Node.js version.
 		}
 	}
 
+	stepNames = filterCompilerInjectedSteps(stepNames)
+
 	if len(stepNames) < 4 {
 		t.Fatalf("Expected at least 4 steps, got %d: %v", len(stepNames), stepNames)
 	}
@@ -444,7 +471,7 @@ Run node --version to check the Node.js version.
 	// 1. First step should be "Checkout actions folder" (checkout local actions)
 	// 2. Second step should be "Setup Scripts" (use the checked out action)
 	// 3. Third step should be "Set runtime paths" (safe-outputs port, always injected)
-	// 4. Fourth step should be "Checkout repository" (automatic full checkout - no separate .github checkout needed)
+	// 4. Fourth step should be the generated default repository checkout (no separate .github checkout needed)
 	// NOTE: The .github sparse checkout is skipped when full repository checkout is performed
 
 	if stepNames[0] != "Checkout actions folder" {
@@ -459,8 +486,8 @@ Run node --version to check the Node.js version.
 		t.Errorf("Third step should be 'Set runtime paths', got '%s'", stepNames[2])
 	}
 
-	if stepNames[3] != "Checkout repository" {
-		t.Errorf("Fourth step should be 'Checkout repository', got '%s'", stepNames[3])
+	if stepNames[3] != "Checkout repository (gh-aw default)" {
+		t.Errorf("Fourth step should be the generated default repository checkout, got '%s'", stepNames[3])
 	}
 
 	// Verify that .github checkout is NOT present (redundant with full checkout)

@@ -18,7 +18,7 @@ func NewInitCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Initialize the repository for agentic workflows",
-		Long: `Initialize the repository for agentic workflows by configuring .gitattributes and creating the dispatcher skill file.
+		Long: `Initialize the repository for agentic workflows by configuring repository settings.
 
 This command performs non-interactive repository setup and does not prompt for
 engine selection or secret configuration.
@@ -26,12 +26,14 @@ engine selection or secret configuration.
 This command:
 - Configures .gitattributes to mark .lock.yml files as generated
 - Creates the dispatcher skill at .github/skills/agentic-workflows/SKILL.md
-- Creates the custom agent at .github/agents/agentic-workflows.md
 - Removes old prompt files from .github/prompts/ if they exist
 - Configures VSCode settings (.vscode/settings.json)
 - Generates/updates .github/workflows/agentics-maintenance.yml if any workflows use the expires field for discussions or issues
 
-By default (without --no-mcp):
+With --engine copilot:
+- Creates the custom agent at .github/agents/agentic-workflows.md
+
+With --engine copilot (without --no-mcp):
 - Creates .github/workflows/copilot-setup-steps.yml with gh-aw installation steps
 - Creates .github/mcp.json with gh-aw MCP server configuration
 
@@ -57,20 +59,20 @@ With --completions flag:
 - Provides instructions for enabling completions in your shell
 
 After running this command, you can:
-- Use GitHub Copilot Chat or coding agent tools with the agentic-workflows skill to get started with workflow tasks
-- The dispatcher skill will route your request to the appropriate specialized prompt
 - Add workflows from the catalog with: ` + string(constants.CLIExtensionPrefix) + ` add <workflow-name>
 - Create new workflows from scratch with: ` + string(constants.CLIExtensionPrefix) + ` new <workflow-name>`,
 		Example: `  ` + string(constants.CLIExtensionPrefix) + ` init                                # Initialize repository with defaults
   ` + string(constants.CLIExtensionPrefix) + ` init -v                             # Initialize with verbose output
-  ` + string(constants.CLIExtensionPrefix) + ` init --engine claude                # Use Claude engine — skips Copilot MCP/skill files
+  ` + string(constants.CLIExtensionPrefix) + ` init --engine copilot               # Add Copilot MCP and agent files
+  ` + string(constants.CLIExtensionPrefix) + ` init --engine claude                # Initialize for the Claude engine
   ` + string(constants.CLIExtensionPrefix) + ` init --no-mcp                       # Skip MCP configuration
   ` + string(constants.CLIExtensionPrefix) + ` init --no-skill                     # Skip dispatcher skill creation
   ` + string(constants.CLIExtensionPrefix) + ` init --no-agent                     # Skip custom agent creation
   ` + string(constants.CLIExtensionPrefix) + ` init --codespaces                   # Configure Codespaces for current repo only
   ` + string(constants.CLIExtensionPrefix) + ` init --codespaces=repo1,repo2       # Codespaces with additional repos
   ` + string(constants.CLIExtensionPrefix) + ` init --completions                  # Install shell completions
-  ` + string(constants.CLIExtensionPrefix) + ` init --create-pull-request          # Initialize and create a pull request`,
+  ` + string(constants.CLIExtensionPrefix) + ` init --create-pull-request          # Initialize and create a pull request
+  ` + string(constants.CLIExtensionPrefix) + ` init --pr --auto-merge              # Initialize and enable pull request auto-merge`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			verbose, _ := cmd.Flags().GetBool("verbose")
 			mcpFlag, _ := cmd.Flags().GetBool("mcp")
@@ -84,6 +86,10 @@ After running this command, you can:
 			createPRFlag, _ := cmd.Flags().GetBool("create-pull-request")
 			prFlagAlias, _ := cmd.Flags().GetBool("pr")
 			createPR := createPRFlag || prFlagAlias // Support both --create-pull-request and --pr
+			autoMerge, _ := cmd.Flags().GetBool("auto-merge")
+			if err := requireAutoMergePR(autoMerge, createPR); err != nil {
+				return err
+			}
 
 			if engineOverride != "" {
 				registry := workflow.GetGlobalEngineRegistry()
@@ -129,6 +135,8 @@ After running this command, you can:
 				CodespaceEnabled: codespaceEnabled,
 				Completions:      completions,
 				CreatePR:         createPR,
+				AutoMerge:        autoMerge,
+				PRMessage:        cmd.Flag("pr-message").Value.String(),
 				RootCmd:          cmd.Root(),
 			}
 			if err := InitRepository(opts); err != nil {
@@ -152,9 +160,11 @@ After running this command, you can:
 	cmd.Flags().Lookup("codespaces").NoOptDefVal = " "
 	cmd.Flags().Bool("completions", false, "Install shell completion for the detected shell (bash, zsh, fish, or PowerShell)")
 	cmd.Flags().Bool("create-pull-request", false, "Create a pull request with the initialization changes")
+	addPRMessageFlag(cmd)
 	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")
+	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --pr or --create-pull-request)")
 	_ = cmd.Flags().MarkHidden("pr") // Hide the short alias from help output
-	cmd.Flags().Bool("mcp", false, "Configure GitHub Copilot Agent MCP server integration (deprecated, MCP is enabled by default)")
+	cmd.Flags().Bool("mcp", false, "Configure GitHub Copilot Agent MCP server integration (deprecated; use --engine copilot)")
 	// Hide the deprecated --mcp flag from help (kept for backward compatibility)
 	_ = cmd.Flags().MarkHidden("mcp")
 

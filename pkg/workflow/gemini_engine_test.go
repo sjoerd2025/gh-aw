@@ -50,7 +50,7 @@ func TestGeminiEngine(t *testing.T) {
 		}
 		secrets := engine.GetRequiredSecretNames(workflowData)
 		assert.Contains(t, secrets, "GEMINI_API_KEY", "Should require GEMINI_API_KEY")
-		assert.Contains(t, secrets, "MCP_GATEWAY_API_KEY", "Should require MCP_GATEWAY_API_KEY when MCP servers present")
+		assert.Contains(t, secrets, "MCP_GATEWAY_AGENT_ID", "Should require MCP_GATEWAY_AGENT_ID when MCP servers present")
 		assert.Contains(t, secrets, "GITHUB_MCP_SERVER_TOKEN", "Should require GITHUB_MCP_SERVER_TOKEN for GitHub tool")
 	})
 
@@ -98,7 +98,7 @@ func TestGeminiEngineInstallation(t *testing.T) {
 			stepContent := strings.Join(steps[1], "\n")
 			assert.Contains(t, stepContent, "Install Gemini CLI", "Second step should install Gemini CLI")
 			assert.Contains(t, stepContent, "@google/gemini-cli", "Should install @google/gemini-cli package")
-			assert.NotContains(t, stepContent, "NPM_CONFIG_MIN_RELEASE_AGE", "Gemini installation should not set npm release-age cooldown")
+			assert.Contains(t, stepContent, "NPM_CONFIG_MIN_RELEASE_AGE: '3'", "Gemini installation should set the default release-age cooldown")
 		}
 	})
 
@@ -112,6 +112,31 @@ func TestGeminiEngineInstallation(t *testing.T) {
 
 		steps := engine.GetInstallationSteps(workflowData)
 		assert.Empty(t, steps, "Should skip installation when custom command is specified")
+	})
+
+	t.Run("default version is installed and recorded", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:         "test-workflow",
+			EngineConfig: &EngineConfig{},
+		}
+
+		steps := engine.GetInstallationSteps(workflowData)
+		assert.Equal(t, string(constants.DefaultGeminiVersion), workflowData.EngineConfig.Version)
+		assert.Contains(t, stepsToString(steps), "npm install --ignore-scripts -g @google/gemini-cli@"+string(constants.DefaultGeminiVersion))
+	})
+
+	t.Run("explicit version overrides the default", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+			EngineConfig: &EngineConfig{
+				Version: "0.62.0",
+			},
+		}
+
+		steps := engine.GetInstallationSteps(workflowData)
+		assert.Equal(t, "0.62.0", workflowData.EngineConfig.Version)
+		assert.Contains(t, stepsToString(steps), "npm install --ignore-scripts -g @google/gemini-cli@0.62.0")
+		assert.NotContains(t, stepsToString(steps), "@google/gemini-cli@"+string(constants.DefaultGeminiVersion))
 	})
 
 	t.Run("with firewall", func(t *testing.T) {
@@ -162,8 +187,10 @@ func TestGeminiEngineExecution(t *testing.T) {
 		assert.Contains(t, stepContent, "--skip-trust", "Should include --skip-trust flag to prevent workspace trust check from overriding --yolo")
 		assert.Contains(t, stepContent, "--output-format stream-json", "Should use streaming JSON output format")
 		assert.Contains(t, stepContent, `--prompt "$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`, "Should include prompt argument with correct shell quoting")
+		assert.Contains(t, stepContent, "shell_harness.cjs", "Should run the CLI through the shared shell harness")
 		assert.Contains(t, stepContent, "/tmp/test.log", "Should include log file")
 		assert.Contains(t, stepContent, "GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}", "Should set GEMINI_API_KEY env var")
+		assert.Contains(t, stepContent, "GH_AW_TIMEOUT_MINUTES: 20", "Should expose the step timeout to the shared harness")
 	})
 
 	t.Run("with model", func(t *testing.T) {
@@ -332,6 +359,9 @@ func TestGeminiEngineFirewallIntegration(t *testing.T) {
 					Enabled: true,
 				},
 			},
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{ID: "awf"},
+			},
 		}
 
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
@@ -341,10 +371,11 @@ func TestGeminiEngineFirewallIntegration(t *testing.T) {
 
 		// Should use AWF command
 		assert.Contains(t, stepContent, "awf", "Should use AWF when firewall is enabled")
+		assert.Contains(t, stepContent, "shell_harness.cjs", "Should run the sandboxed CLI through the shared shell harness")
 		// With config file support, domains and apiProxy are in the JSON config
 		assert.Contains(t, stepContent, "allowDomains", "Should include allowDomains in config JSON")
 		assert.Contains(t, stepContent, `\"enabled\":true`, "Should include apiProxy enabled in config JSON")
-		assert.Contains(t, stepContent, "GEMINI_API_BASE_URL: http://host.docker.internal:10003", "Should set GEMINI_API_BASE_URL to LLM gateway URL")
+		assert.Contains(t, stepContent, "GEMINI_API_BASE_URL: http://api-proxy:10003", "Should use the isolated AWF API proxy hostname")
 	})
 
 	t.Run("firewall disabled", func(t *testing.T) {
@@ -595,7 +626,7 @@ func TestGenerateGeminiSettingsStep(t *testing.T) {
 
 		assert.Contains(t, content, "run_shell_command(echo)", "Should include original restricted bash command")
 		assert.Contains(t, content, "run_shell_command(mymcp:*)", "Should include mounted custom MCP CLI command")
-		assert.Contains(t, content, "run_shell_command(playwright:*)", "Should include mounted playwright CLI command")
+		assert.Contains(t, content, "run_shell_command(playwright-cli:*)", "Should include Playwright CLI command")
 		assert.Contains(t, content, "run_shell_command(safeoutputs:*)", "Should include mounted safeoutputs CLI command")
 	})
 }

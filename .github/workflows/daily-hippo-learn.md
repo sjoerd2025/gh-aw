@@ -17,10 +17,10 @@ permissions:
 
   copilot-requests: write
 tracker-id: daily-hippo-learn
-model: copilot/gpt-5.4
+model: copilot/gpt-5
 engine:
   id: pi
-  bare: true
+  model-provider: github
 
 timeout-minutes: 30
 
@@ -36,8 +36,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
-
 tools:
   cli-proxy: true
   bash:

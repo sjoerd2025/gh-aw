@@ -10,6 +10,7 @@ import (
 )
 
 func TestEngineMaxRunsToTopLevelCodemod_Metadata(t *testing.T) {
+	t.Parallel()
 	codemod := getEngineMaxRunsToTopLevelCodemod()
 
 	assert.Equal(t, "engine-max-runs-to-top-level", codemod.ID)
@@ -20,6 +21,7 @@ func TestEngineMaxRunsToTopLevelCodemod_Metadata(t *testing.T) {
 }
 
 func TestEngineMaxRunsToTopLevelCodemod_NoOp(t *testing.T) {
+	t.Parallel()
 	codemod := getEngineMaxRunsToTopLevelCodemod()
 
 	content := `---
@@ -42,6 +44,7 @@ engine:
 }
 
 func TestEngineMaxRunsToTopLevelCodemod_MigratesField(t *testing.T) {
+	t.Parallel()
 	codemod := getEngineMaxRunsToTopLevelCodemod()
 
 	content := `---
@@ -68,6 +71,7 @@ engine:
 }
 
 func TestEngineMaxRunsToTopLevelCodemod_RespectsExistingTopLevel(t *testing.T) {
+	t.Parallel()
 	codemod := getEngineMaxRunsToTopLevelCodemod()
 
 	content := `---
@@ -93,7 +97,8 @@ engine:
 	assert.NotContains(t, result, "\n  max-runs:")
 }
 
-func TestEngineMaxRunsToTopLevelCodemod_InlineEngineMapNoOp(t *testing.T) {
+func TestEngineMaxRunsToTopLevelCodemod_InlineEngineMap(t *testing.T) {
+	t.Parallel()
 	codemod := getEngineMaxRunsToTopLevelCodemod()
 
 	content := `---
@@ -111,6 +116,8 @@ engine: { id: copilot, max-runs: 42 }
 
 	result, applied, err := codemod.Apply(content, frontmatter)
 	require.NoError(t, err)
-	assert.False(t, applied)
-	assert.Equal(t, content, result)
+	assert.True(t, applied)
+	assert.Contains(t, result, "max-turns: 42")
+	assert.NotContains(t, result, "max-runs:")
+	assert.Contains(t, result, "engine: { id: copilot }")
 }

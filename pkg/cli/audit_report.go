@@ -2,71 +2,95 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
-	"github.com/github/gh-aw/pkg/github"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/scanfindings"
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/timeutil"
 )
 
 var auditReportLog = logger.New("cli:audit_report")
+var ghaLogTimestampPrefixPattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T`)
 
 // AuditData represents the complete structured audit data for a workflow run
 type AuditData struct {
-	Overview                OverviewData             `json:"overview"`
-	Comparison              *AuditComparisonData     `json:"comparison,omitempty"`
-	TaskDomain              *TaskDomainInfo          `json:"task_domain,omitempty"`
-	BehaviorFingerprint     *BehaviorFingerprint     `json:"behavior_fingerprint,omitempty"`
-	AgenticAssessments      []AgenticAssessment      `json:"agentic_assessments,omitempty"`
-	Metrics                 MetricsData              `json:"metrics"`
-	KeyFindings             []Finding                `json:"key_findings,omitempty"`
-	Recommendations         []Recommendation         `json:"recommendations,omitempty"`
-	ObservabilityInsights   []ObservabilityInsight   `json:"observability_insights,omitempty"`
-	PerformanceMetrics      *PerformanceMetrics      `json:"performance_metrics,omitempty"`
-	EngineConfig            *AuditEngineConfig       `json:"engine_config,omitempty"`
-	PromptAnalysis          *PromptAnalysis          `json:"prompt_analysis,omitempty"`
-	SessionAnalysis         *SessionAnalysis         `json:"session_analysis,omitempty"`
-	SafeOutputSummary       *SafeOutputSummary       `json:"safe_output_summary,omitempty"`
-	MCPServerHealth         *MCPServerHealth         `json:"mcp_server_health,omitempty"`
-	Jobs                    []JobData                `json:"jobs,omitempty"`
-	DownloadedFiles         []FileInfo               `json:"downloaded_files"`
-	MissingTools            []MissingToolReport      `json:"missing_tools,omitempty"`
-	MissingData             []MissingDataReport      `json:"missing_data,omitempty"`
-	Noops                   []NoopReport             `json:"noops,omitempty"`
-	MCPFailures             []MCPFailureReport       `json:"mcp_failures,omitempty"`
-	FirewallTokenUsage      *TokenUsageSummary       `json:"firewall_token_usage,omitempty"`
-	GitHubRateLimitUsage    *GitHubRateLimitUsage    `json:"github_rate_limit_usage,omitempty"`
-	FirewallAnalysis        *FirewallAnalysis        `json:"firewall_analysis,omitempty"`
-	PolicyAnalysis          *PolicyAnalysis          `json:"policy_analysis,omitempty"`
-	RedactedDomainsAnalysis *RedactedDomainsAnalysis `json:"redacted_domains_analysis,omitempty"`
-	Errors                  []ErrorInfo              `json:"errors,omitempty"`
-	Warnings                []ErrorInfo              `json:"warnings,omitempty"`
-	ToolUsage               []ToolUsageInfo          `json:"tool_usage,omitempty"`
-	MCPToolUsage            *MCPToolUsageData        `json:"mcp_tool_usage,omitempty"`
-	CreatedItems            []CreatedItemReport      `json:"created_items,omitempty"`
-	Outcomes                []OutcomeReport          `json:"outcomes,omitempty"`
-	OutcomeSummary          *OutcomeSummary          `json:"outcome_summary,omitempty"`
-	Experiments             *ExperimentData          `json:"experiments,omitempty"`
+	SchemaVersion              int                      `json:"schema_version"`
+	CacheSource                auditCacheSource         `json:"cache_source,omitempty"`
+	Overview                   OverviewData             `json:"overview"`
+	Comparison                 *AuditComparisonData     `json:"comparison,omitempty"`
+	TaskDomain                 *TaskDomainInfo          `json:"task_domain,omitempty"`
+	BehaviorFingerprint        *BehaviorFingerprint     `json:"behavior_fingerprint,omitempty"`
+	AgenticAssessments         []AgenticAssessment      `json:"agentic_assessments,omitempty"`
+	Metrics                    MetricsData              `json:"metrics"`
+	KeyFindings                []AuditFinding           `json:"key_findings,omitempty"`
+	Recommendations            []Recommendation         `json:"recommendations,omitempty"`
+	ObservabilityInsights      []ObservabilityInsight   `json:"observability_insights,omitempty"`
+	PerformanceMetrics         *PerformanceMetrics      `json:"performance_metrics,omitempty"`
+	EngineConfig               *AuditEngineConfig       `json:"engine_config,omitempty"`
+	PromptAnalysis             *PromptAnalysis          `json:"prompt_analysis,omitempty"`
+	SessionAnalysis            *SessionAnalysis         `json:"session_analysis,omitempty"`
+	SafeOutputSummary          *SafeOutputSummary       `json:"safe_output_summary,omitempty"`
+	MCPServerHealth            *MCPServerHealth         `json:"mcp_server_health,omitempty"`
+	Jobs                       []JobData                `json:"jobs,omitempty"`
+	DownloadedFiles            []FileInfo               `json:"downloaded_files"`
+	MissingTools               []MissingToolReport      `json:"missing_tools,omitempty"`
+	MissingData                []MissingDataReport      `json:"missing_data,omitempty"`
+	Noops                      []NoopReport             `json:"noops,omitempty"`
+	MCPFailures                []MCPFailureReport       `json:"mcp_failures,omitempty"`
+	SkillActivations           []SkillActivation        `json:"skill_activations,omitempty"`
+	GatewaySteeringEvents      []GatewaySteeringEvent   `json:"gateway_steering_events,omitempty"`
+	SteeringNotices            []SteeringNotice         `json:"steering_notices,omitempty"`
+	SteeringNoticesUnavailable bool                     `json:"steering_notices_unavailable,omitempty"`
+	FirewallTokenUsage         *TokenUsageSummary       `json:"firewall_token_usage,omitempty"`
+	DetectionModelUsage        []DetectionModelUsage    `json:"detection_model_usage,omitempty"`
+	ModelRouting               *ModelRoutingSummary     `json:"model_routing,omitempty"`
+	ModelEndpointMismatches    []ModelEndpointMismatch  `json:"model_endpoint_mismatches,omitempty"`
+	GitHubRateLimitUsage       *GitHubRateLimitUsage    `json:"github_rate_limit_usage,omitempty"`
+	FirewallAnalysis           *FirewallAnalysis        `json:"firewall_analysis,omitempty"`
+	PolicyAnalysis             *PolicyAnalysis          `json:"policy_analysis,omitempty"`
+	RedactedDomainsAnalysis    *RedactedDomainsAnalysis `json:"redacted_domains_analysis,omitempty"`
+	Errors                     []ValidationIssue        `json:"errors,omitempty"`
+	Warnings                   []ValidationIssue        `json:"warnings,omitempty"`
+	ToolUsage                  []ToolUsageInfo          `json:"tool_usage,omitempty"`
+	MCPToolUsage               *MCPToolUsageData        `json:"mcp_tool_usage,omitempty"`
+	CreatedItems               []CreatedItemReport      `json:"created_items,omitempty"`
+	Outcomes                   []OutcomeReport          `json:"outcomes,omitempty"`
+	OutcomeSummary             *OutcomeSummary          `json:"outcome_summary,omitempty"`
+	Experiments                *ExperimentData          `json:"experiments,omitempty"`
+	Graders                    *GradersData             `json:"graders,omitempty"`
+	Evals                      *EvalsSummary            `json:"evals,omitempty"`
+	Ledger                     *LedgerActivity          `json:"ledger,omitempty"`
+	WorkQueue                  *WorkQueueReport         `json:"work_queue,omitempty"`
+	Friction                   *FrictionCostSummary     `json:"friction,omitempty"`
+	EvidenceSearch             *AuditEvidenceSearch     `json:"evidence_search,omitempty"`
+	ModelCatalog               *AuditModelCatalog       `json:"model_catalog,omitempty"`
+	Retries                    *AuditRetrySummary       `json:"retries,omitempty"`
 }
 
-// Finding represents a key insight discovered during audit
-type Finding struct {
-	Category    string `json:"category"`         // e.g., "error", "performance", "cost", "tooling"
-	Severity    string `json:"severity"`         // "critical", "high", "medium", "low", "info"
-	Title       string `json:"title"`            // Brief title
-	Description string `json:"description"`      // Detailed description
-	Impact      string `json:"impact,omitempty"` // What impact this has
+// AuditFinding represents a key insight discovered during audit
+type AuditFinding struct {
+	Code        AuditFindingCode           `json:"code"`             // Stable machine-readable identifier
+	Category    string                     `json:"category"`         // e.g., "error", "performance", "cost", "tooling"
+	Severity    scanfindings.SeverityLevel `json:"severity"`         // shared severity vocabulary
+	Title       string                     `json:"title"`            // Brief title
+	Description string                     `json:"description"`      // Detailed description
+	Impact      string                     `json:"impact,omitempty"` // What impact this has
+	PlaybookURL string                     `json:"playbook_url,omitempty"`
 }
 
 // Recommendation represents an actionable suggestion
@@ -105,16 +129,20 @@ type OverviewData struct {
 
 // MetricsData contains execution metrics
 type MetricsData struct {
-	TokenUsage     int                    `json:"token_usage,omitempty" console:"header:Token Usage,format:number,omitempty"`
-	AIC            float64                `json:"aic,omitempty"`
-	AmbientContext *AmbientContextMetrics `json:"ambient_context,omitempty" console:"title:Ambient Context,omitempty"`
-	ActionMinutes  float64                `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
-	Turns          int                    `json:"turns,omitempty" console:"header:Turns,omitempty"`
-	ErrorCount     int                    `json:"error_count" console:"header:Errors"`
-	WarningCount   int                    `json:"warning_count" console:"header:Warnings"`
+	TokenUsage           int                    `json:"token_usage,omitempty" console:"header:Token Usage,format:number,omitempty"`
+	AIC                  float64                `json:"aic,omitempty"`
+	AmbientContext       *AmbientContextMetrics `json:"ambient_context,omitempty" console:"title:Ambient Context,omitempty"`
+	WorkingSet           *WorkingSetMetrics     `json:"working_set,omitempty" console:"-"`
+	Friction             *FrictionCostSummary   `json:"-" console:"-"`
+	ActionMinutes        float64                `json:"action_minutes,omitempty" console:"header:Action Minutes,omitempty"`
+	Turns                int                    `json:"turns,omitempty" console:"header:Turns,omitempty"`
+	ErrorCount           int                    `json:"error_count" console:"header:Errors"`
+	SubagentFailureCount int                    `json:"subagent_failure_count,omitempty" console:"header:Sub-agent Failures,omitempty"`
+	WarningCount         int                    `json:"warning_count" console:"header:Warnings"`
 }
 
-// JobData contains information about individual jobs
+// JobData is the audit report rendering of a job.
+// It is derived from, and intentionally much smaller than, the raw API mirror JobInfo.
 type JobData struct {
 	Name       string        `json:"name" console:"header:Name"`
 	Status     string        `json:"status" console:"header:Status"`
@@ -123,12 +151,9 @@ type JobData struct {
 	Steps      []JobStepData `json:"steps,omitempty"`
 }
 
-// JobStepData contains information about an individual workflow job step.
-type JobStepData struct {
-	Name       string `json:"name"`
-	Status     string `json:"status,omitempty"`
-	Conclusion string `json:"conclusion,omitempty"`
-}
+// JobStepData is an alias for JobStep, kept to avoid renaming the existing
+// "Data" suffixed usages of this type within this package.
+type JobStepData = JobStep
 
 // FileInfo contains information about downloaded artifact files
 type FileInfo struct {
@@ -141,23 +166,29 @@ type FileInfo struct {
 // URL is present for creation types (e.g. create_issue, add_comment) but may be empty
 // for modification types (e.g. add_labels, close_issue) that do not return a URL.
 type CreatedItemReport struct {
-	Type        string         `json:"type" console:"header:Type"`
-	URL         string         `json:"url,omitempty" console:"header:URL,omitempty"`
-	Number      int            `json:"number,omitempty" console:"header:Number,omitempty"`
-	Repo        string         `json:"repo,omitempty" console:"header:Repo,omitempty"`
-	TemporaryID string         `json:"temporaryId,omitempty" console:"header:Temp ID,omitempty"`
-	Metadata    map[string]any `json:"metadata,omitempty" console:"-"`
-	BeforeState map[string]any `json:"before_state,omitempty" console:"-"`
-	AfterState  map[string]any `json:"after_state,omitempty" console:"-"`
-	Timestamp   string         `json:"timestamp" console:"header:Timestamp"`
+	Type            string         `json:"type" console:"header:Type"`
+	URL             string         `json:"url,omitempty" console:"header:URL,omitempty"`
+	Number          int            `json:"number,omitempty" console:"header:Number,omitempty"`
+	Repo            string         `json:"repo,omitempty" console:"header:Repo,omitempty"`
+	Provider        string         `json:"provider,omitempty" console:"-"`
+	ID              any            `json:"id,omitempty" console:"-"`
+	Identifier      string         `json:"identifier,omitempty" console:"-"`
+	Target          map[string]any `json:"target,omitempty" console:"-"`
+	Labels          []LabelReport  `json:"labels,omitempty" console:"-"`
+	LabelsAdded     []string       `json:"labelsAdded,omitempty" console:"-"`
+	LabelsSuggested []string       `json:"labelsSuggested,omitempty" console:"-"`
+	LabelsBefore    []string       `json:"labelsBefore,omitempty" console:"-"`
+	TemporaryID     string         `json:"temporaryId,omitempty" console:"header:Temp ID,omitempty"`
+	Metadata        map[string]any `json:"metadata,omitempty" console:"-"`
+	BeforeState     map[string]any `json:"before_state,omitempty" console:"-"`
+	AfterState      map[string]any `json:"after_state,omitempty" console:"-"`
+	Timestamp       string         `json:"timestamp" console:"header:Timestamp"`
 }
 
-// ErrorInfo contains detailed error information
-type ErrorInfo struct {
-	File    string `json:"file,omitempty"`
-	Line    int    `json:"line,omitempty"`
-	Type    string `json:"type"`
-	Message string `json:"message"`
+type LabelReport struct {
+	Name       string `json:"name"`
+	DatabaseID int64  `json:"database_id,omitempty"`
+	NodeID     string `json:"node_id,omitempty"`
 }
 
 // ToolUsageInfo contains aggregated tool usage statistics
@@ -170,54 +201,77 @@ type ToolUsageInfo struct {
 	OutputSample  string `json:"output_sample,omitempty" console:"header:Response Preview,omitempty"`
 }
 
+// IntegrityFilterSummary contains aggregate DIFC integrity-filter activity.
+type IntegrityFilterSummary struct {
+	TotalFiltered          int            `json:"total_filtered"`
+	RunsWithFilteredEvents int            `json:"runs_with_filtered_events,omitempty"`
+	FilteredServerCounts   map[string]int `json:"filtered_server_counts,omitempty"`
+	FilteredToolCounts     map[string]int `json:"filtered_tool_counts,omitempty"`
+	FilteredReasonCounts   map[string]int `json:"filtered_reason_counts,omitempty"`
+}
+
 // MCPToolUsageData contains detailed MCP tool usage statistics and individual call records
 type MCPToolUsageData struct {
-	Summary            []MCPToolSummary    `json:"summary"`                        // Aggregated statistics per tool
-	ToolCalls          []MCPToolCall       `json:"tool_calls"`                     // Individual tool call records
-	Servers            []MCPServerStats    `json:"servers,omitempty"`              // Server-level statistics
-	FilteredEvents     []DifcFilteredEvent `json:"filtered_events,omitempty"`      // DIFC filtered events
-	GuardPolicySummary *GuardPolicySummary `json:"guard_policy_summary,omitempty"` // Guard policy enforcement summary
+	Summary            []MCPToolSummary        `json:"summary"`                        // Aggregated statistics per tool
+	ToolCalls          []MCPToolCall           `json:"tool_calls"`                     // Individual tool call records
+	Servers            []MCPServerStats        `json:"servers,omitempty"`              // Server-level statistics
+	FilteredEvents     []DifcFilteredEvent     `json:"filtered_events,omitempty"`      // DIFC filtered events
+	Integrity          *IntegrityFilterSummary `json:"integrity,omitempty"`            // Aggregate DIFC integrity-filter activity
+	GuardPolicySummary *GuardPolicySummary     `json:"guard_policy_summary,omitempty"` // Guard policy enforcement summary
 }
 
 // MCPToolSummary contains aggregated statistics for a single MCP tool
 type MCPToolSummary struct {
-	ServerName      string `json:"server_name" console:"header:Server"`
-	ToolName        string `json:"tool_name" console:"header:Tool"`
-	CallCount       int    `json:"call_count" console:"header:Calls"`
-	TotalInputSize  int    `json:"total_input_size" console:"header:Total Input,format:number"`
-	TotalOutputSize int    `json:"total_output_size" console:"header:Total Output,format:number"`
-	MaxInputSize    int    `json:"max_input_size" console:"header:Max Input,format:number"`
-	MaxOutputSize   int    `json:"max_output_size" console:"header:Max Output,format:number"`
-	AvgDuration     string `json:"avg_duration,omitempty" console:"header:Avg Duration,omitempty"`
-	MaxDuration     string `json:"max_duration,omitempty" console:"header:Max Duration,omitempty"`
-	ErrorCount      int    `json:"error_count,omitempty" console:"header:Errors,omitempty"`
+	ServerName         string `json:"server_name" console:"header:Server"`
+	ToolUsageStatsBase `json:"-" console:"-"`
+	ToolName           string `json:"tool_name" console:"header:Tool"`
+	CallCount          int    `json:"call_count" console:"header:Calls"`
+	TotalInputSize     int    `json:"total_input_size" console:"header:Total Input,format:number"`
+	TotalOutputSize    int    `json:"total_output_size" console:"header:Total Output,format:number"`
+	AvgInputSize       int    `json:"avg_input_size,omitempty" console:"header:Avg Input,format:number"`
+	AvgOutputSize      int    `json:"avg_output_size,omitempty" console:"header:Avg Output,format:number"`
+	MaxInputSize       int    `json:"max_input_size" console:"header:Max Input,format:number"`
+	MaxOutputSize      int    `json:"max_output_size" console:"header:Max Output,format:number"`
+	AvgDuration        string `json:"avg_duration,omitempty" console:"header:Avg Duration,omitempty"`
+	MaxDuration        string `json:"max_duration,omitempty" console:"header:Max Duration,omitempty"`
+	ErrorCount         int    `json:"error_count,omitempty" console:"header:Errors,omitempty"`
+}
+
+func (s *MCPToolSummary) syncFieldsFromBase() {
+	s.syncFields(&s.ToolName, &s.CallCount, &s.MaxOutputSize, &s.MaxDuration)
+}
+
+func (s *MCPToolSummary) syncBaseFromFields() {
+	s.syncFromFields(s.ToolName, s.CallCount, s.MaxOutputSize, s.MaxDuration)
 }
 
 // MCPToolCall represents a single MCP tool call with full details
 type MCPToolCall struct {
-	Timestamp           string `json:"timestamp"`
-	ServerName          string `json:"server_name"`
-	ToolName            string `json:"tool_name"`
-	Method              string `json:"method,omitempty"`
-	InputSize           int    `json:"input_size"`
-	OutputSize          int    `json:"output_size"`
-	Duration            string `json:"duration,omitempty"`
-	Status              string `json:"status"`
-	Error               string `json:"error,omitempty"`
-	EffectiveTokenDelta int    `json:"effective_token_delta,omitempty"` // Change in effective tokens caused by this tool call result
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	Timestamp  string `json:"timestamp"`
+	ServerName string `json:"server_name"`
+	ToolName   string `json:"tool_name"`
+	Method     string `json:"method,omitempty"`
+	InputSize  int    `json:"input_size"`
+	OutputSize int    `json:"output_size"`
+	Duration   string `json:"duration,omitempty"`
+	Status     string `json:"status"`
+	Error      string `json:"error,omitempty"`
 }
 
 // MCPServerStats contains server-level statistics
 type MCPServerStats struct {
-	ServerName string `json:"server_name" console:"header:Server"`
+	MCPServerStatsBase
 	// RequestCount is kept for backward-compatible report schemas that label per-server
 	// request volume; in MCP usage summaries this currently mirrors ToolCallCount.
 	RequestCount    int    `json:"request_count" console:"header:Requests"`
-	ToolCallCount   int    `json:"tool_call_count" console:"header:Tool Calls"`
 	TotalInputSize  int    `json:"total_input_size" console:"header:Total Input,format:number"`
 	TotalOutputSize int    `json:"total_output_size" console:"header:Total Output,format:number"`
+	AvgInputSize    int    `json:"avg_input_size,omitempty" console:"header:Avg Input,format:number"`
+	AvgOutputSize   int    `json:"avg_output_size,omitempty" console:"header:Avg Output,format:number"`
+	MaxInputSize    int    `json:"max_input_size,omitempty" console:"header:Max Input,format:number"`
+	MaxOutputSize   int    `json:"max_output_size,omitempty" console:"header:Max Output,format:number"`
 	AvgDuration     string `json:"avg_duration,omitempty" console:"header:Avg Duration,omitempty"`
-	ErrorCount      int    `json:"error_count,omitempty" console:"header:Errors,omitempty"`
 }
 
 // GuardPolicySummary contains summary statistics for guard policy enforcement.
@@ -259,17 +313,25 @@ type OverviewDisplay struct {
 }
 
 // buildAuditData creates structured audit data from workflow run information
-func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage *MCPToolUsageData) AuditData {
+func buildAuditData(_ context.Context, processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage *MCPToolUsageData) AuditData {
+	auditData, _ := buildLocalAuditData(processedRun, metrics, mcpToolUsage)
+	return auditData
+}
+
+// buildLocalAuditData creates an audit exclusively from downloaded run data.
+// Callers such as logs --audit use this path to avoid additional GitHub API calls.
+func buildLocalAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage *MCPToolUsageData) (AuditData, []CreatedItemReport) {
 	run := processedRun.Run
 	auditReportLog.Printf("Building audit data for run ID %d", run.DatabaseID)
+	mcpToolUsage = normalizeMCPPayloadStats(mcpToolUsage)
 	expData := extractExperimentData(run.LogsPath)
 	overview := buildAuditOverview(run, expData)
 	metricsData, inferredEngineID := buildAuditMetrics(processedRun, metrics)
 	jobs := buildAuditJobs(processedRun.JobDetails)
 	errors := extractAuditErrors(run)
 	downloadedFiles := extractDownloadedFiles(run.LogsPath)
-	toolUsage := buildAuditToolUsage(metrics, mcpToolUsage)
-	createdItems := extractCreatedItemsFromManifest(run.LogsPath)
+	toolUsage := buildAuditToolUsage(metrics, mcpToolUsage, processedRun.SkillActivations)
+	createdItems := resolveCreatedItems(run.LogsPath, processedRun.SafeOutputs)
 	taskDomain, behaviorFingerprint, agenticAssessments := buildAuditAssessments(processedRun, metricsData, toolUsage, createdItems, overview.AwContext)
 	findings, recommendations, observabilityInsights := buildAuditNarrative(processedRun, metricsData, errors, toolUsage, createdItems, agenticAssessments)
 	auditData := assembleAuditData(auditDataInputs{
@@ -292,8 +354,12 @@ func buildAuditData(processedRun ProcessedRun, metrics LogMetrics, mcpToolUsage 
 		recommendations:       recommendations,
 		observabilityInsights: observabilityInsights,
 	})
-	addAuditOutcomeSummary(&auditData, createdItems)
-	return auditData
+	auditData.ModelRouting = applyAwInfoModelRouting(processedRun.ModelRouting, processedRun.Run.LogsPath)
+	auditData.SteeringNotices = tokenUsageSteeringNotices(processedRun.TokenUsage)
+	auditData.SteeringNoticesUnavailable = tokenUsageSteeringNoticesUnavailable(processedRun.TokenUsage)
+	auditData.ModelEndpointMismatches = readSessionModelEndpointMismatches(processedRun.Run.LogsPath)
+	auditData.DetectionModelUsage = readDetectionModelUsage(processedRun.Run.LogsPath)
+	return auditData, createdItems
 }
 
 func buildAuditOverview(run WorkflowRun, expData *ExperimentData) OverviewData {
@@ -337,10 +403,18 @@ func buildAuditMetrics(processedRun ProcessedRun, metrics LogMetrics) (MetricsDa
 	if run.Conclusion == "failure" && metricsData.ErrorCount == 0 {
 		metricsData.ErrorCount = 1
 	}
+	if processedRun.TokenUsage != nil {
+		// DeclaredSubagentModels mirrors requests and must not be counted again.
+		for _, request := range processedRun.TokenUsage.SubagentModelRequests {
+			metricsData.SubagentFailureCount += request.FailedCount
+		}
+	}
 
 	fallbackMetrics, inferredEngineID := lookupFallbackMetrics(run.LogsPath, metricsData)
 	applyFallbackMetrics(&metricsData, processedRun, metrics, fallbackMetrics)
 	populateAuditMetricContext(&metricsData, processedRun.TokenUsage)
+	metricsData.WorkingSet = processedRun.WorkingSet
+	metricsData.Friction = processedRun.Friction
 	return metricsData, inferredEngineID
 }
 
@@ -389,9 +463,7 @@ func buildAuditJobs(jobDetails []JobInfoWithDuration) []JobData {
 			Name:       jobDetail.Name,
 			Status:     jobDetail.Status,
 			Conclusion: jobDetail.Conclusion,
-			Steps: sliceutil.Map(jobDetail.Steps, func(step JobStep) JobStepData {
-				return JobStepData(step)
-			}),
+			Steps:      jobDetail.Steps,
 		}
 		if jobDetail.Duration > 0 {
 			job.Duration = timeutil.FormatDuration(jobDetail.Duration)
@@ -400,7 +472,7 @@ func buildAuditJobs(jobDetails []JobInfoWithDuration) []JobData {
 	})
 }
 
-func extractAuditErrors(run WorkflowRun) []ErrorInfo {
+func extractAuditErrors(run WorkflowRun) []ValidationIssue {
 	if run.Conclusion != "failure" || run.LogsPath == "" {
 		return nil
 	}
@@ -410,8 +482,33 @@ func extractAuditErrors(run WorkflowRun) []ErrorInfo {
 	return nil
 }
 
-func buildAuditToolUsage(metrics LogMetrics, mcpToolUsage *MCPToolUsageData) []ToolUsageInfo {
-	return mergeMCPToolUsageInfo(buildToolUsageInfo(metrics), mcpToolUsage)
+func buildAuditToolUsage(metrics LogMetrics, mcpToolUsage *MCPToolUsageData, skillActivations []SkillActivation) []ToolUsageInfo {
+	usage := mergeMCPToolUsageInfo(buildToolUsageInfo(metrics), mcpToolUsage)
+	skillCounts := make(map[string]int, len(skillActivations))
+	for _, activation := range skillActivations {
+		name := "skill:" + activation.Name
+		count := activation.InvocationCount
+		if count <= 0 {
+			count = 1
+		}
+		skillCounts[name] += count
+	}
+	merged := make([]ToolUsageInfo, 0, len(usage)+len(skillCounts))
+	for _, tool := range usage {
+		if count, ok := skillCounts[tool.Name]; ok {
+			tool.CallCount += count
+			delete(skillCounts, tool.Name)
+		}
+		merged = append(merged, tool)
+	}
+	for _, activation := range skillActivations {
+		name := "skill:" + activation.Name
+		if count, ok := skillCounts[name]; ok {
+			merged = append(merged, ToolUsageInfo{Name: name, CallCount: count})
+			delete(skillCounts, name)
+		}
+	}
+	return merged
 }
 
 func buildAuditAssessments(processedRun ProcessedRun, metricsData MetricsData, toolUsage []ToolUsageInfo, createdItems []CreatedItemReport, awContext *AwContext) (*TaskDomainInfo, *BehaviorFingerprint, []AgenticAssessment) {
@@ -421,7 +518,7 @@ func buildAuditAssessments(processedRun ProcessedRun, metricsData MetricsData, t
 	return taskDomain, behaviorFingerprint, agenticAssessments
 }
 
-func buildAuditNarrative(processedRun ProcessedRun, metricsData MetricsData, errors []ErrorInfo, toolUsage []ToolUsageInfo, createdItems []CreatedItemReport, agenticAssessments []AgenticAssessment) ([]Finding, []Recommendation, []ObservabilityInsight) {
+func buildAuditNarrative(processedRun ProcessedRun, metricsData MetricsData, errors []ValidationIssue, toolUsage []ToolUsageInfo, createdItems []CreatedItemReport, agenticAssessments []AgenticAssessment) ([]AuditFinding, []Recommendation, []ObservabilityInsight) {
 	findings := generateFindings(processedRun, metricsData, errors)
 	findings = append(findings, generateAgenticAssessmentFindings(agenticAssessments)...)
 
@@ -443,13 +540,13 @@ type auditDataInputs struct {
 	metricsData           MetricsData
 	jobs                  []JobData
 	downloadedFiles       []FileInfo
-	errors                []ErrorInfo
+	errors                []ValidationIssue
 	toolUsage             []ToolUsageInfo
 	createdItems          []CreatedItemReport
 	taskDomain            *TaskDomainInfo
 	behaviorFingerprint   *BehaviorFingerprint
 	agenticAssessments    []AgenticAssessment
-	findings              []Finding
+	findings              []AuditFinding
 	recommendations       []Recommendation
 	observabilityInsights []ObservabilityInsight
 }
@@ -466,28 +563,29 @@ func assembleAuditData(inputs auditDataInputs) AuditData {
 	performanceMetrics := generatePerformanceMetrics(inputs.processedRun, metricsData, inputs.toolUsage)
 	chainMetrics := buildSafeOutputChainMetrics(run.LogsPath)
 	engineConfig := extractEngineConfigWithInferredEngine(run.LogsPath, inputs.inferredEngineID)
-	promptAnalysis := extractPromptAnalysis(run.LogsPath)
 	sessionAnalysis := buildSessionAnalysis(inputs.processedRun, inputs.metrics)
 	safeOutputSummary := buildSafeOutputSummary(inputs.createdItems, chainMetrics)
 	mcpServerHealth := buildMCPServerHealth(inputs.mcpToolUsage, inputs.processedRun.MCPFailures)
 
-	if auditReportLog.Enabled() {
-		auditReportLog.Printf("Built audit data: %d jobs, %d errors, %d tool types, %d findings, %d recommendations",
-			len(inputs.jobs), len(inputs.errors), len(inputs.toolUsage), len(inputs.findings), len(inputs.recommendations))
-	}
+	logAssembledAuditData(inputs)
 
 	return AuditData{
+		SchemaVersion:           auditSchemaVersion,
+		Retries:                 readAuditRetrySummary(run.LogsPath),
 		Overview:                inputs.overview,
 		TaskDomain:              inputs.taskDomain,
 		BehaviorFingerprint:     inputs.behaviorFingerprint,
 		AgenticAssessments:      inputs.agenticAssessments,
 		Metrics:                 metricsData,
+		Friction:                inputs.processedRun.Friction,
+		Ledger:                  inputs.processedRun.Ledger,
+		WorkQueue:               inputs.processedRun.WorkQueue,
 		KeyFindings:             inputs.findings,
 		Recommendations:         inputs.recommendations,
 		ObservabilityInsights:   inputs.observabilityInsights,
 		PerformanceMetrics:      performanceMetrics,
 		EngineConfig:            engineConfig,
-		PromptAnalysis:          promptAnalysis,
+		PromptAnalysis:          extractPromptAnalysis(run.LogsPath),
 		SessionAnalysis:         sessionAnalysis,
 		SafeOutputSummary:       safeOutputSummary,
 		MCPServerHealth:         mcpServerHealth,
@@ -497,28 +595,35 @@ func assembleAuditData(inputs auditDataInputs) AuditData {
 		MissingData:             inputs.processedRun.MissingData,
 		Noops:                   inputs.processedRun.Noops,
 		MCPFailures:             inputs.processedRun.MCPFailures,
+		SkillActivations:        inputs.processedRun.SkillActivations,
+		GatewaySteeringEvents:   inputs.processedRun.GatewaySteeringEvents,
 		FirewallTokenUsage:      inputs.processedRun.TokenUsage,
 		GitHubRateLimitUsage:    inputs.processedRun.GitHubRateLimitUsage,
 		FirewallAnalysis:        inputs.processedRun.FirewallAnalysis,
 		PolicyAnalysis:          inputs.processedRun.PolicyAnalysis,
 		RedactedDomainsAnalysis: inputs.processedRun.RedactedDomainsAnalysis,
 		Errors:                  inputs.errors,
+		Warnings:                auditEngineConfigWarnings(engineConfig),
 		ToolUsage:               inputs.toolUsage,
 		MCPToolUsage:            inputs.mcpToolUsage,
 		CreatedItems:            inputs.createdItems,
 		Experiments:             inputs.expData,
+		Graders:                 extractGradersData(run.LogsPath),
+		Evals:                   buildEvalsSummary(run),
 	}
 }
 
-func addAuditOutcomeSummary(auditData *AuditData, createdItems []CreatedItemReport) {
-	if len(createdItems) == 0 {
-		return
+func logAssembledAuditData(inputs auditDataInputs) {
+	if auditReportLog.Enabled() {
+		auditReportLog.Printf("Built audit data: %d jobs, %d errors, %d tool types, %d findings, %d recommendations", len(inputs.jobs), len(inputs.errors), len(inputs.toolUsage), len(inputs.findings), len(inputs.recommendations))
 	}
-	mapping := github.LoadObjectiveMappingFromConfig()
-	outcomeReports := EvaluateOutcomes(createdItems, "", mapping)
-	auditData.Outcomes = outcomeReports
-	outcomeSummary := ComputeOutcomeSummary(outcomeReports, mapping)
-	auditData.OutcomeSummary = &outcomeSummary
+}
+
+func auditEngineConfigWarnings(config *AuditEngineConfig) []ValidationIssue {
+	if config == nil || config.RoutingWarning == "" {
+		return nil
+	}
+	return []ValidationIssue{{Type: "model_routing_outcome_disagreement", Message: config.RoutingWarning}}
 }
 
 // extractDownloadedFiles scans the logs directory recursively and returns file information.
@@ -592,7 +697,11 @@ func extractCreatedItemsFromManifest(logsPath string) []CreatedItemReport {
 		// File not present is expected for runs without safe outputs
 		return nil
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			auditReportLog.Printf("Failed to close safe-output manifest: %v", err)
+		}
+	}()
 
 	var items []CreatedItemReport
 	scanner := bufio.NewScanner(f)
@@ -620,20 +729,45 @@ func extractCreatedItemsFromManifest(logsPath string) []CreatedItemReport {
 	return items
 }
 
+// resolveCreatedItems returns created items read from the on-disk safe-output manifest
+// at logsPath, falling back to entities already carried in-memory (e.g. from a cached
+// usage/activity summary) only when the manifest file itself is absent — such as when an
+// `--artifacts usage`-only cache is reused and the manifest was never downloaded. A manifest
+// file that exists but legitimately contains no created items is not treated as missing, so
+// runs with no safe outputs are reported as empty rather than falling back to stale cached data.
+func resolveCreatedItems(logsPath string, cachedSafeOutputs []CreatedItemReport) []CreatedItemReport {
+	if logsPath != "" {
+		manifestPath := filepath.Join(logsPath, safeOutputItemsManifestFilename)
+		_, err := os.Stat(manifestPath)
+		switch {
+		case err == nil:
+			return extractCreatedItemsFromManifest(logsPath)
+		case errors.Is(err, os.ErrNotExist):
+			// Manifest genuinely absent (e.g. usage-only cache reuse); fall back below.
+		default:
+			auditReportLog.Printf("Error checking safe-output manifest %s: %v", manifestPath, err)
+		}
+	}
+	return cachedSafeOutputs
+}
+
 // describeFile provides a short description for known artifact files
 func describeFile(filename string) string {
 	descriptions := map[string]string{
-		"aw_info.json":                  "Engine configuration and workflow metadata",
-		"safe_output.jsonl":             "Safe outputs from workflow execution",
-		safeOutputItemsManifestFilename: "Created items manifest (audit trail)",
-		constants.AgentOutputFilename:   "Validated safe outputs",
-		"aw.patch":                      "Git patch of changes made during execution",
-		"agent-stdio.log":               "Agent standard output/error logs",
-		"log.md":                        "Human-readable agent session summary",
-		"firewall.md":                   "Firewall log analysis report",
-		"run_summary.json":              "Cached summary of workflow run analysis",
-		forecastAICCacheFileName:        "Cached AI Credits (AIC) value for forecasting",
-		"prompt.txt":                    "Input prompt for AI agent",
+		"aw_info.json":                            "Engine configuration and workflow metadata",
+		"safe_output.jsonl":                       "Safe outputs from workflow execution",
+		safeOutputItemsManifestFilename:           "Created items manifest (audit trail)",
+		constants.SafeOutputErrorsFilename:        "Safe outputs failure diagnostics (error code, message, failing types)",
+		constants.AgentOutputFilename.String():    "Validated safe outputs",
+		"aw.patch":                                "Git patch of changes made during execution",
+		"agent-stdio.log":                         "Agent standard output/error logs",
+		"log.md":                                  "Human-readable agent session summary",
+		"firewall.md":                             "Firewall log analysis report",
+		"run_summary.json":                        "Cached summary of workflow run analysis",
+		forecastAICCacheFileName:                  "Cached AI Credits (AIC) value for forecasting",
+		"prompt.txt":                              "Input prompt for AI agent",
+		constants.GraderResultsFilename.String():  "Deterministic grader results for the run",
+		constants.GraderManifestFilename.String(): "Grader manifest (configured graders and thresholds)",
 	}
 
 	if desc, ok := descriptions[filename]; ok {
@@ -693,7 +827,7 @@ func parseDurationString(s string) time.Duration {
 // ##[error] annotations (GitHub Actions error annotations), which are the most precise
 // failure indicators. If none are found, it falls back to the content of the last step
 // (highest step number) as a general failure indicator.
-func extractPreAgentStepErrors(logsPath string) []ErrorInfo {
+func extractPreAgentStepErrors(logsPath string) []ValidationIssue {
 	agentStdioPath := filepath.Join(logsPath, "agent-stdio.log")
 	agentRan := fileutil.FileExists(agentStdioPath)
 
@@ -729,14 +863,14 @@ type stepLog struct {
 	stepKey string
 }
 
-func scanWorkflowStepLogs(workflowLogsDir string, maxMessageLen int) ([]ErrorInfo, *stepLog, error) {
+func scanWorkflowStepLogs(workflowLogsDir string, maxMessageLen int) ([]ValidationIssue, *stepLog, error) {
 	jobDirs, err := os.ReadDir(workflowLogsDir)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var lastStep *stepLog
-	var errorAnnotations []ErrorInfo
+	var errorAnnotations []ValidationIssue
 
 	for _, jobEntry := range jobDirs {
 		if !jobEntry.IsDir() {
@@ -764,9 +898,9 @@ func scanWorkflowStepLogs(workflowLogsDir string, maxMessageLen int) ([]ErrorInf
 func scanFlatStepLog(
 	workflowLogsDir, filename string,
 	lastStep *stepLog,
-	errorAnnotations []ErrorInfo,
+	errorAnnotations []ValidationIssue,
 	maxMessageLen int,
-) (*stepLog, []ErrorInfo) {
+) (*stepLog, []ValidationIssue) {
 	if !strings.HasSuffix(filename, ".txt") {
 		return lastStep, errorAnnotations
 	}
@@ -784,9 +918,9 @@ func scanFlatStepLog(
 func scanNestedStepLogs(
 	workflowLogsDir, jobName string,
 	lastStep *stepLog,
-	errorAnnotations []ErrorInfo,
+	errorAnnotations []ValidationIssue,
 	maxMessageLen int,
-) (*stepLog, []ErrorInfo) {
+) (*stepLog, []ValidationIssue) {
 	jobDir := filepath.Join(workflowLogsDir, jobName)
 	stepFiles, err := os.ReadDir(jobDir)
 	if err != nil {
@@ -803,7 +937,7 @@ func scanNestedStepLogs(
 		}
 
 		stepFilePath := filepath.Join(jobDir, stepFile.Name())
-		stepKey := jobName + "/" + stepName
+		stepKey := path.Join(jobName, stepName)
 		lastStep = updateLastStep(lastStep, stepFilePath, num, stepKey)
 		errorAnnotations = appendErrorAnnotation(errorAnnotations, stepFilePath, stepKey, num, maxMessageLen, "step")
 	}
@@ -823,12 +957,12 @@ func updateLastStep(lastStep *stepLog, path string, num int, stepKey string) *st
 }
 
 func appendErrorAnnotation(
-	errorAnnotations []ErrorInfo,
+	errorAnnotations []ValidationIssue,
 	filePath, stepKey string,
 	num int,
 	maxMessageLen int,
 	logLabel string,
-) []ErrorInfo {
+) []ValidationIssue {
 	errorLines := extractGHErrorLines(filePath)
 	if len(errorLines) == 0 {
 		return errorAnnotations
@@ -837,7 +971,7 @@ func appendErrorAnnotation(
 	message := stringutil.Truncate(strings.Join(errorLines, "\n"), maxMessageLen)
 	auditReportLog.Printf("Extracted ##[error] annotations from %s %s (%d)", logLabel, stepKey, num)
 
-	return append(errorAnnotations, ErrorInfo{
+	return append(errorAnnotations, ValidationIssue{
 		Type:    "step_failure",
 		File:    stepKey,
 		Message: message,
@@ -855,7 +989,7 @@ func extractGHErrorLines(filePath string) []string {
 	for line := range strings.SplitSeq(string(content), "\n") {
 		if strings.Contains(line, "##[error]") {
 			stripped := stripGHALogTimestamps(line)
-			if stripped != "" {
+			if stripped != "" && !isAgentToolResultAnnotation(stripped) {
 				errorLines = append(errorLines, stripped)
 			}
 		}
@@ -864,12 +998,39 @@ func extractGHErrorLines(filePath string) []string {
 	return errorLines
 }
 
-func extractAgentFailureError(agentRan bool, agentStdioPath string, maxMessageLen int) []ErrorInfo {
+func isAgentToolResultAnnotation(line string) bool {
+	_, payload, found := strings.Cut(line, "##[error]")
+	if !found {
+		return false
+	}
+
+	var event struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(payload)), &event); err != nil || event.Type != "user" {
+		return false
+	}
+	hasToolResult := false
+	for _, content := range event.Message.Content {
+		if content.Type != "tool_result" {
+			return false
+		}
+		hasToolResult = true
+	}
+	return hasToolResult
+}
+
+func extractAgentFailureError(agentRan bool, agentStdioPath string, maxMessageLen int) []ValidationIssue {
 	if !agentRan {
 		return nil
 	}
 	if agentExcerpt := extractAgentStdioFailureExcerpt(agentStdioPath, maxMessageLen); agentExcerpt != "" {
-		return []ErrorInfo{{
+		return []ValidationIssue{{
 			Type:    "agent_failure",
 			File:    "agent-stdio.log",
 			Message: agentExcerpt,
@@ -878,7 +1039,7 @@ func extractAgentFailureError(agentRan bool, agentStdioPath string, maxMessageLe
 	return nil
 }
 
-func extractLastStepFallbackError(lastStep *stepLog, workflowLogsDir string, maxMessageLen int) []ErrorInfo {
+func extractLastStepFallbackError(lastStep *stepLog, workflowLogsDir string, maxMessageLen int) []ValidationIssue {
 	if lastStep == nil {
 		auditReportLog.Printf("No step log files found in %s", workflowLogsDir)
 		return nil
@@ -898,7 +1059,7 @@ func extractLastStepFallbackError(lastStep *stepLog, workflowLogsDir string, max
 	message = stringutil.Truncate(message, maxMessageLen)
 
 	auditReportLog.Printf("Extracted pre-agent step error from %s (step %d) as fallback", lastStep.stepKey, lastStep.num)
-	return []ErrorInfo{{
+	return []ValidationIssue{{
 		Type:    "step_failure",
 		File:    lastStep.stepKey,
 		Message: message,
@@ -911,7 +1072,11 @@ func extractAgentStdioFailureExcerpt(agentStdioPath string, maxMessageLen int) s
 		auditReportLog.Printf("Failed to read %s: %v", agentStdioPath, err)
 		return ""
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			auditReportLog.Printf("Failed to close agent startup log: %v", err)
+		}
+	}()
 
 	// Read only the tail of the file to bound memory use for large logs.
 	const maxReadBytes int64 = 64 * 1024 // 64 KB tail window
@@ -1002,7 +1167,7 @@ func stripGHALogTimestamps(content string) string {
 		// GHA timestamp format: YYYY-MM-DDTHH:MM:SS[.sss...]Z<space>
 		// The 'T' separator is always at position 10. Search for the terminating 'Z' after 'T'
 		// in a generous window (positions 11-35) to handle any fractional seconds length.
-		if len(line) > 19 && line[4] == '-' && line[7] == '-' && line[10] == 'T' {
+		if len(line) > 19 && ghaLogTimestampPrefixPattern.MatchString(line) {
 			// Find the Z that ends the timestamp within a reasonable range
 			searchBound := min(35, len(line))
 			if zIdx := strings.IndexByte(line[11:searchBound], 'Z'); zIdx >= 0 {
@@ -1010,9 +1175,7 @@ func stripGHALogTimestamps(content string) string {
 				if zPos+1 <= len(line) {
 					line = line[zPos+1:]
 					// Skip leading space after the timestamp
-					if line != "" && line[0] == ' ' {
-						line = line[1:]
-					}
+					line = strings.TrimPrefix(line, " ")
 				}
 			}
 		}

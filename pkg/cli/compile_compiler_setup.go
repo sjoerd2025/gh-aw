@@ -28,6 +28,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -98,7 +99,16 @@ func createAndConfigureCompiler(config CompileConfig) *workflow.Compiler {
 		workflow.WithVerbose(config.Verbose),
 		workflow.WithEngineOverride(config.EngineOverride),
 		workflow.WithFailFast(config.FailFast),
+		workflow.WithLint(!config.SkipLint),
 	)
+	compiler.SetModelPricingResolver(func(_ context.Context, provider, model string) (map[string]float64, bool) {
+		return findExactModelPricing(provider, model)
+	})
+	if config.activeModels != nil || config.DryRun {
+		compiler.SetConfiguredModelValidator(func(data *workflow.WorkflowData) []string {
+			return configuredModelValidationMessages(data, config.activeModels, config.DryRun)
+		})
+	}
 	compileCompilerSetupLog.Print("Created compiler instance")
 
 	// Configure compiler flags
@@ -128,7 +138,8 @@ func configureCompilerFlags(compiler *workflow.Compiler, config CompileConfig) {
 	compileCompilerSetupLog.Printf("Validation enabled: %v", config.Validate)
 
 	// Set noEmit flag to validate without generating lock files
-	compiler.SetNoEmit(config.NoEmit)
+	compiler.SetNoEmit(config.NoEmit || config.ReadOnly)
+	compiler.SetReadOnly(config.ReadOnly)
 	if config.NoEmit {
 		compileCompilerSetupLog.Print("No-emit mode enabled: validating without generating lock files")
 	}
@@ -137,6 +148,10 @@ func configureCompilerFlags(compiler *workflow.Compiler, config CompileConfig) {
 	compiler.SetStrictMode(config.Strict)
 	compiler.SetAllowActionRefs(config.AllowActionRefs)
 	compiler.SetForceStaged(config.Staged)
+	compiler.SetDryRun(config.DryRun)
+	compiler.SetEnvironmentOverride(config.EnvironmentOverride)
+	compiler.SetRequireSelfHostedRunners(config.RequireSelfHostedRunners)
+	compiler.SetLockFileLogo(!config.NoLogo)
 
 	// Set trial mode if specified
 	if config.TrialMode {
@@ -153,6 +168,10 @@ func configureCompilerFlags(compiler *workflow.Compiler, config CompileConfig) {
 		compiler.SetUseSamples(true)
 	}
 
+	configureCompilerMaintenanceFlags(compiler, config)
+}
+
+func configureCompilerMaintenanceFlags(compiler *workflow.Compiler, config CompileConfig) {
 	// Set refresh stop time flag
 	compiler.SetRefreshStopTime(config.RefreshStopTime)
 	if config.RefreshStopTime {
@@ -180,10 +199,10 @@ func configureCompilerFlags(compiler *workflow.Compiler, config CompileConfig) {
 	}
 
 	// Set GHES compatibility mode when the --ghes flag is passed.
-	// v3 artifact pins are deprecated, so artifact actions continue to use latest pins.
+	// When enabled, artifact actions use versions supported by GHES.
 	compiler.SetGHESCompat(config.GHESCompat)
 	if config.GHESCompat {
-		compileCompilerSetupLog.Print("GHES compatibility mode enabled via --ghes flag: artifact actions will use latest non-v3 pins")
+		compileCompilerSetupLog.Print("GHES compatibility mode enabled via --ghes flag: artifact actions will use v3-compatible pins")
 	}
 
 	// Load pre-cached manifests from file (written by MCP server at startup).
@@ -250,7 +269,7 @@ func setupRepositoryContext(compiler *workflow.Compiler, config CompileConfig) {
 		parts := strings.SplitN(config.ScheduleSeed, "/", 2)
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 			compileCompilerSetupLog.Printf("Invalid --schedule-seed value %q: expected 'owner/repo' format", config.ScheduleSeed)
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(
 				fmt.Sprintf("--schedule-seed %q is not in 'owner/repo' format; ignoring and falling back to git remote detection", config.ScheduleSeed),
 			))
 		} else {

@@ -11,7 +11,7 @@ import (
 	"github.com/github/gh-aw/pkg/testutil"
 )
 
-func TestMCPLogsUpload(t *testing.T) {
+func TestPlaywrightCLIArtifactsUpload(t *testing.T) {
 	// Create a temporary directory for the test
 	tmpDir := testutil.TempDir(t, "test-*")
 
@@ -55,18 +55,12 @@ Please navigate to example.com and take a screenshot.
 
 	lockContentStr := string(lockContent)
 
-	// Verify Playwright MCP configuration uses official Docker image
-	if !strings.Contains(lockContentStr, "mcr.microsoft.com/playwright/mcp") {
-		t.Error("Expected Playwright MCP configuration to include official Docker image 'mcr.microsoft.com/playwright/mcp'")
+	if strings.Contains(lockContentStr, "mcr.microsoft.com/playwright/mcp") {
+		t.Error("Expected compiled workflow not to contain the removed Playwright MCP image")
 	}
 
-	// Verify the playwright output directory is pre-created and made writable so the Docker container
-	// (which runs as a non-root user) can write screenshots to the mounted volume path
-	if !strings.Contains(lockContentStr, "mkdir -p /tmp/gh-aw/mcp-logs/playwright") {
-		t.Error("Expected 'mkdir -p /tmp/gh-aw/mcp-logs/playwright' in Start MCP Gateway step to pre-create screenshot directory")
-	}
-	if !strings.Contains(lockContentStr, "chmod 777 /tmp/gh-aw/mcp-logs/playwright") {
-		t.Error("Expected 'chmod 777 /tmp/gh-aw/mcp-logs/playwright' in Start MCP Gateway step so non-root Docker user can write screenshots")
+	if !strings.Contains(lockContentStr, "npm install -g @playwright/cli@") {
+		t.Error("Expected compiled workflow to install Playwright CLI")
 	}
 
 	// Verify MCP logs are uploaded via the unified artifact upload
@@ -74,8 +68,8 @@ Please navigate to example.com and take a screenshot.
 		t.Error("Expected 'Upload agent artifacts' step to be in generated workflow")
 	}
 
-	// Verify the upload step uses actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-	if !strings.Contains(lockContentStr, "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a") {
+	// Verify the upload step uses actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+	if !strings.Contains(lockContentStr, "uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9") {
 		t.Error("Expected upload-artifact action to be used for artifact upload step")
 	}
 
@@ -179,8 +173,8 @@ This workflow does not use Playwright but should still have MCP logs upload.
 		t.Error("Expected MCP logs path in unified artifact upload even when Playwright is not used")
 	}
 
-	// Verify the upload step uses actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-	if !strings.Contains(lockContentStr, "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a") {
+	// Verify the upload step uses actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+	if !strings.Contains(lockContentStr, "uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9") {
 		t.Error("Expected upload-artifact action to be used for artifact upload step")
 	}
 

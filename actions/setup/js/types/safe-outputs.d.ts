@@ -23,6 +23,32 @@ interface BaseSafeOutputItem {
   integrity?: string;
 }
 
+type IssueArtifactType = "generic" | "link" | "plan" | "embedded_html";
+
+interface IssueArtifactMetadata {
+  /** Artifact format; defaults to "generic" when omitted. */
+  type?: IssueArtifactType;
+  name: string;
+}
+
+type IssueArtifactBodyInput = IssueArtifactMetadata & { body: string; path?: never };
+
+/** MCP paths are absolute workspace or /tmp/gh-aw/agent files; sensitive publication sources are denied. */
+type IssueArtifactInput = IssueArtifactBodyInput | (IssueArtifactMetadata & { path: string; body?: never });
+
+interface IssueArtifact extends IssueArtifactMetadata {
+  /** Validated artifact format with the default applied. */
+  type: IssueArtifactType;
+  body: string;
+}
+
+interface CreatedIssueArtifact {
+  /** Per-issue artifact number returned by GitHub. */
+  number: number;
+  /** Artifact page URL, when returned by GitHub. */
+  url: string | undefined;
+}
+
 /**
  * JSONL item for creating a GitHub issue
  */
@@ -32,6 +58,8 @@ interface CreateIssueItem extends BaseSafeOutputItem {
   title: string;
   /** Issue body content */
   body: string;
+  /** Optional artifacts to attach after creating the issue. */
+  artifacts?: IssueArtifactBodyInput[];
   /** Optional labels to add to the issue */
   labels?: string[];
   /** Optional issue fields to set after creating the issue */
@@ -130,6 +158,15 @@ interface MarkPullRequestAsReadyForReviewItem extends BaseSafeOutputItem {
 }
 
 /**
+ * JSONL item for approving a pending workflow run from a fork pull request
+ */
+interface ApproveWorkflowRunItem extends BaseSafeOutputItem {
+  type: "approve_workflow_run";
+  /** Positive integer workflow run ID */
+  run_id: number | string;
+}
+
+/**
  * JSONL item for adding a comment to an issue or PR
  */
 interface AddCommentItem extends BaseSafeOutputItem {
@@ -209,6 +246,19 @@ interface CreateCodeScanningAlertItem extends BaseSafeOutputItem {
 }
 
 /**
+ * JSONL item for uploading a code coverage report via actions/upload-code-coverage
+ */
+interface UploadCodeCoverageItem extends BaseSafeOutputItem {
+  type: "upload_code_coverage";
+  /** Path to the coverage report file (staging-relative, absolute, or workspace-relative) */
+  file: string;
+  /** Linguist language name for the coverage report (e.g. "Go", "TypeScript") */
+  language: string;
+  /** Label identifying this coverage report (e.g. "code-coverage/unit-tests") */
+  label: string;
+}
+
+/**
  * JSONL item for adding labels to an issue or PR
  */
 interface AddLabelsItem extends BaseSafeOutputItem {
@@ -283,8 +333,8 @@ interface UpdatePullRequestItem extends BaseSafeOutputItem {
   title?: string;
   /** Optional new pull request body (behavior depends on operation) */
   body?: string;
-  /** Update operation for body: 'replace' (default), 'append', or 'prepend' */
-  operation?: "replace" | "append" | "prepend";
+  /** Update operation for body: 'replace' (default), 'append', 'prepend', or 'replace-island' */
+  operation?: "replace" | "append" | "prepend" | "replace-island";
   /** When true, updates the pull request branch with the latest base branch changes before other updates */
   update_branch?: boolean;
   /** Optional pull request number for target "*" */
@@ -308,12 +358,20 @@ interface PushToPrBranchItem extends BaseSafeOutputItem {
  * JSONL item for reporting missing tools
  */
 interface MissingToolItem extends BaseSafeOutputItem {
-  type: "missing_tool";
+  type: "report_missing_tool" | "missing_tool";
   /** Optional: Name of the missing tool */
   tool?: string;
   /** Reason why the tool is needed or information about the limitation */
   reason: string;
   /** Optional alternatives or workarounds */
+  alternatives?: string;
+}
+
+interface MissingDataItem extends BaseSafeOutputItem {
+  type: "report_missing_data" | "missing_data";
+  data_type?: string;
+  reason?: string;
+  context?: string;
   alternatives?: string;
 }
 
@@ -496,11 +554,13 @@ type SafeOutputItem =
   | CloseIssueItem
   | ClosePullRequestItem
   | MarkPullRequestAsReadyForReviewItem
+  | ApproveWorkflowRunItem
   | AddCommentItem
   | CommentMemoryItem
   | CreatePullRequestItem
   | CreatePullRequestReviewCommentItem
   | CreateCodeScanningAlertItem
+  | UploadCodeCoverageItem
   | AddLabelsItem
   | RemoveLabelsItem
   | AddReviewerItem
@@ -508,6 +568,7 @@ type SafeOutputItem =
   | UpdatePullRequestItem
   | PushToPrBranchItem
   | MissingToolItem
+  | MissingDataItem
   | UploadAssetItem
   | AssignMilestoneItem
   | SetIssueTypeItem
@@ -534,6 +595,11 @@ interface SafeOutputItems {
 export {
   // JSONL item types
   BaseSafeOutputItem,
+  IssueArtifactType,
+  IssueArtifactInput,
+  IssueArtifactBodyInput,
+  IssueArtifact,
+  CreatedIssueArtifact,
   CreateIssueItem,
   CreateDiscussionItem,
   UpdateDiscussionItem,
@@ -541,11 +607,13 @@ export {
   CloseIssueItem,
   ClosePullRequestItem,
   MarkPullRequestAsReadyForReviewItem,
+  ApproveWorkflowRunItem,
   AddCommentItem,
   CommentMemoryItem,
   CreatePullRequestItem,
   CreatePullRequestReviewCommentItem,
   CreateCodeScanningAlertItem,
+  UploadCodeCoverageItem,
   AddLabelsItem,
   RemoveLabelsItem,
   AddReviewerItem,
@@ -553,6 +621,7 @@ export {
   UpdatePullRequestItem,
   PushToPrBranchItem,
   MissingToolItem,
+  MissingDataItem,
   UploadAssetItem,
   AssignMilestoneItem,
   SetIssueTypeItem,

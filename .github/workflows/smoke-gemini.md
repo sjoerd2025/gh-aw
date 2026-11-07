@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test workflow that validates Gemini engine functionality twice daily
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-gemini
     strategy: centralized
@@ -22,8 +23,8 @@ experiments:
   sub_agent_strategy:
     variants: [single_agent, sub_agents]
     description: "Test whether decomposing smoke test tasks to sub-agents reduces cost without losing reliability"
-    hypothesis: "H0: no change in effective_tokens. H1: sub_agents reduces tokens by >=20%"
-    metric: effective_tokens
+    hypothesis: "H0: no change in aic. H1: sub_agents reduces tokens by >=20%"
+    metric: aic
     secondary_metrics: [run_duration_seconds, success_rate]
     guardrail_metrics:
       - name: success_rate
@@ -35,12 +36,19 @@ experiments:
     tags: [cost_optimization, smoke_tests]
 engine:
   id: gemini
+  fallback-models:
+    - gemini/gemini-3.8-flash
+    - gemini/gemini-2.5-pro
 strict: true
 imports:
-  - shared/gh.md
   - shared/reporting-otlp.md
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/smoke-test-brevity.md
+  - shared/playwright-title-test.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: agent-stdio
 network:
   allowed:
     - defaults
@@ -75,14 +83,12 @@ evals:
   - id: sub_agent_strategy_goal_met
     question: Does the agent output show that the objective for experiment sub_agent_strategy was successfully completed?
 
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Gemini Engine Validation
-
-**CRITICAL EFFICIENCY REQUIREMENTS:**
-- Keep ALL outputs extremely short and concise. Use single-line responses.
-- NO verbose explanations or unnecessary context.
-- Minimize file reading - only read what is absolutely necessary for the task.
 
 {{#if experiments.sub_agent_strategy == 'single_agent'}}
 ## Test Requirements (Single Agent — Baseline)

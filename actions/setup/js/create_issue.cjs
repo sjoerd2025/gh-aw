@@ -1,26 +1,28 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { createReportIssue, renderIssueParameters } = require("./issue_report.cjs");
+const { normalizeReportText, normalizeReportTitle } = require("./report_ast.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
+
 const { sanitizeLabelContent } = require("./sanitize_label_content.cjs");
 const { sanitizeTitle, applyTitlePrefix } = require("./sanitize_title.cjs");
-const { sanitizeContent } = require("./sanitize_content.cjs");
-const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
-const { getBodyHeader, getDisclosureHeader } = require("./messages_header.cjs");
-const { generateWorkflowIdMarker, generateWorkflowCallIdMarker, generateCloseKeyMarker, normalizeCloseOlderKey } = require("./generate_footer.cjs");
-const { generateHistoryUrl } = require("./generate_history_link.cjs");
-const { getTrackerID } = require("./get_tracker_id.cjs");
+const { sanitizeContent, expandAllowedAliases } = require("./sanitize_content.cjs");
+const { normalizeCloseOlderKey } = require("./generate_footer.cjs");
+const { appendExecutionProvenance, stripExecutionProvenance } = require("./execution_provenance.cjs");
+const { buildIssueBodyReport, ISSUE_BODY_SUFFIX } = require("./issue_body.cjs");
 const { generateTemporaryId, isTemporaryId, normalizeTemporaryId, getOrGenerateTemporaryId, replaceTemporaryIdReferences } = require("./temporary_id.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { removeDuplicateTitleFromDescription } = require("./remove_duplicate_title.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { ERR_VALIDATION } = require("./error_codes.cjs");
+const { ERR_API, ERR_VALIDATION } = require("./error_codes.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { renderTemplateFromFile } = require("./messages_core.cjs");
-const { createExpirationLine, addExpirationToFooter } = require("./ephemerals.cjs");
 const { MAX_SUB_ISSUES, getSubIssueCount, linkSubIssue } = require("./sub_issue_helpers.cjs");
-const { closeOlderIssues, searchOlderIssues, addIssueComment } = require("./close_older_issues.cjs");
-const { parseBoolTemplatable } = require("./templatable.cjs");
+const { closeOlderIssues, searchOlderIssues } = require("./close_older_issues.cjs");
+const { parseBoolTemplatable, parseIntTemplatable } = require("./templatable.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
@@ -28,8 +30,10 @@ const { parseAllowedIssueFields, validateAllowedIssueFields } = require("./allow
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { MAX_LABELS, MAX_ASSIGNEES } = require("./constants.cjs");
 const { findAgent, getIssueDetails, assignAgentToIssue } = require("./assign_agent_helpers.cjs");
-const { parseDeduplicateByTitle, normalizeTitleForDedup, findDuplicateByTitle } = require("./issue_title_dedup.cjs");
-const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { createTokenBrokerGitHubClient, isTokenBrokerEnabled } = require("./token_broker_github.cjs");
+const { parseDeduplicateByTitle, normalizeTitleForDedup, normalizeDeduplicationLabels, hasDeduplicationLabels, findDuplicateIssue } = require("./issue_title_dedup.cjs");
+const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
+const { normalizeIssueArtifacts, sanitizeIssueArtifacts, createIssueArtifacts } = require("./issue_artifacts.cjs");
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const ISSUE_FIELD_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const RECENTLY_CLOSED_DEDUP_DAYS = 30;
@@ -38,9 +42,102 @@ const TITLE_DEDUP_MAX_SEARCH_PAGES = 2;
 const TITLE_DEDUP_MIN_SEARCH_RATE_LIMIT_FRACTION = 0.2;
 
 /**
+ * @typedef {NonNullable<Parameters<typeof github.rest.issues.create>[0]>} IssueParameters
+ * @typedef {Awaited<ReturnType<typeof github.rest.issues.create>>["data"]} Issue
+ * @typedef {import("./types/safe-outputs").IssueArtifactBodyInput} IssueArtifactBodyInput
+ * @typedef {import("./types/safe-outputs").IssueArtifact} IssueArtifact
+ * @typedef {import("./types/safe-outputs").CreatedIssueArtifact} CreatedIssueArtifact
+ * @typedef {Omit<IssueParameters, "owner" | "repo" | "title" | "body"> & {owner?: string, repo?: string, title: string, body: string, artifacts?: IssueArtifactBodyInput[]}} CreateIssueParameters
+ * @typedef {{staged: false, issue: Issue, artifacts?: CreatedIssueArtifact[]} | {staged: true, preview: IssueParameters & {artifacts?: IssueArtifact[]}}} CreateIssueResult
+ */
+
+/**
+ * Create an attributed issue from a custom safe-output job.
+ * Call setupGlobals before using this API. Title and body must be trusted or
+ * sanitized by the custom job; this helper does not enforce agent tool policies.
+ * @param {CreateIssueParameters} parameters
+ * @returns {Promise<CreateIssueResult>}
+ */
+async function createIssue(parameters) {
+  if (typeof github === "undefined" || typeof context === "undefined" || typeof core === "undefined") {
+    throw new Error(`${ERR_VALIDATION}: Call setupGlobals(core, github, context, exec, io, getOctokit) from index.cjs before creating an issue`);
+  }
+  if (!process.env.GH_AW_WORKFLOW_ID || !process.env.GH_AW_WORKFLOW_NAME) {
+    throw new Error(`${ERR_VALIDATION}: GH_AW_WORKFLOW_ID and GH_AW_WORKFLOW_NAME are required for custom issue attribution; recompile the workflow`);
+  }
+  if (!parameters || typeof parameters.title !== "string" || !parameters.title.trim() || typeof parameters.body !== "string") {
+    throw new Error(`${ERR_VALIDATION}: createIssue requires a non-empty title and a string body`);
+  }
+  const owner = parameters.owner ?? context.repo.owner;
+  const repo = parameters.repo ?? context.repo.repo;
+  if (typeof owner !== "string" || !owner.trim() || typeof repo !== "string" || !repo.trim()) {
+    throw new Error(`${ERR_VALIDATION}: createIssue requires a repository owner and name`);
+  }
+  if ((parameters.labels !== undefined && !Array.isArray(parameters.labels)) || (parameters.assignees !== undefined && !Array.isArray(parameters.assignees))) {
+    throw new Error(`${ERR_VALIDATION}: createIssue labels and assignees must be arrays`);
+  }
+  const labels = Array.isArray(parameters.labels)
+    ? parameters.labels
+        .filter(Boolean)
+        .map(label => String(label).trim())
+        .filter(Boolean)
+        .map(sanitizeLabelContent)
+        .filter(Boolean)
+        .map(label => (label.length > 64 ? label.substring(0, 64) : label))
+        .filter((label, index, array) => array.indexOf(label) === index)
+    : undefined;
+  const assignees = Array.isArray(parameters.assignees)
+    ? parameters.assignees
+        .filter(Boolean)
+        .map(assignee => String(assignee).trim())
+        .filter(Boolean)
+        .filter((assignee, index, array) => array.indexOf(assignee) === index)
+    : undefined;
+  const issueArrayLimitError = getIssueArrayLimitError(labels, assignees);
+  if (issueArrayLimitError) {
+    throw new Error(`${ERR_VALIDATION}: ${issueArrayLimitError}`);
+  }
+  const { artifacts: artifactInput, ...issueParameters } = parameters;
+  const artifacts = normalizeIssueArtifacts(artifactInput);
+  const report = buildIssueBodyReport(parameters.title, parameters.body, { repo: { owner, repo } });
+  /** @type {IssueParameters & {title: string, body: string}} */
+  const request = renderIssueParameters({ ...issueParameters, owner, repo }, report);
+  if (labels) request.labels = labels;
+  if (assignees) request.assignees = assignees;
+  if (isStagedMode()) {
+    core.info(`Staged: would create issue in ${owner}/${repo} with title: ${request.title}`);
+    return { staged: true, preview: { ...request, ...(artifacts.length > 0 ? { artifacts } : {}) } };
+  }
+  const { data: issue } = await withRetry(() => createReportIssue(github, request), RATE_LIMIT_RETRY_CONFIG, `create_issue in ${owner}/${repo}`);
+  core.info(`Created issue ${owner}/${repo}#${issue.number}: ${issue.html_url}`);
+  const createdArtifacts = await createIssueArtifacts(github, owner, repo, issue.number, artifacts);
+  return { staged: false, issue, ...(createdArtifacts.length > 0 ? { artifacts: createdArtifacts } : {}) };
+}
+
+/**
+ * @param {string[]|undefined} labels
+ * @param {string[]|undefined} assignees
+ * @returns {string|undefined}
+ */
+function getIssueArrayLimitError(labels, assignees) {
+  const labelsLimitResult = tryEnforceArrayLimit(labels, MAX_LABELS, "labels");
+  if (!labelsLimitResult.success) {
+    return labelsLimitResult.error;
+  }
+
+  const assigneesLimitResult = tryEnforceArrayLimit(assignees, MAX_ASSIGNEES, "assignees");
+  if (!assigneesLimitResult.success) {
+    return assigneesLimitResult.error;
+  }
+
+  return undefined;
+}
+
+/**
  * Create a dedicated GitHub client for copilot assignment operations.
  *
  * Token precedence:
+ *   0. Token broker copilot-task capability, when opted in (never falls back)
  *   1. config["github-token"] — per-handler PAT configured in the workflow frontmatter
  *   2. GH_AW_ASSIGN_TO_AGENT_TOKEN — agent token injected by the compiler as a step env var
  *   3. global github — step-level token (fallback when no agent token is available)
@@ -49,6 +146,7 @@ const TITLE_DEDUP_MIN_SEARCH_RATE_LIMIT_FRACTION = 0.2;
  * @returns {Promise<Object>} Authenticated GitHub client
  */
 async function createCopilotAssignmentClient(config) {
+  if (isTokenBrokerEnabled()) return createTokenBrokerGitHubClient();
   const token = config["github-token"] || process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN;
   if (!token) {
     core.debug("No dedicated agent token configured — using step-level github client for copilot assignment");
@@ -149,15 +247,19 @@ async function findOrCreateParentIssue({ githubClient, groupId, owner, repo, tit
   core.info(`Creating new parent issue for group: ${groupId}`);
   try {
     const template = createParentIssueTemplate(groupId, titlePrefix, workflowName, workflowSourceURL, expiresHours);
+    template.children.push(...parseReportMarkdown(appendExecutionProvenance("", workflowName, ""), { allowMetadata: true, agentTainted: false }));
     const { data: parentIssue } = await withRetry(
       () =>
-        githubClient.rest.issues.create({
-          owner,
-          repo,
-          title: template.title,
-          body: template.body,
-          labels: labels,
-        }),
+        createReportIssue(
+          githubClient,
+          {
+            owner,
+            repo,
+            title: template.title,
+            labels: labels,
+          },
+          template
+        ),
       { initialDelayMs: 15000, maxDelayMs: 45000, jitterMs: 10000 },
       `create_parent_issue for group ${groupId}`
     );
@@ -177,7 +279,7 @@ async function findOrCreateParentIssue({ githubClient, groupId, owner, repo, tit
  * @param {string} workflowName - Name of the workflow
  * @param {string} workflowSourceURL - URL to the workflow source
  * @param {number} [expiresHours=0] - Hours until expiration (0 means no expiration)
- * @returns {any} - Template with title and body
+ * @returns {import("./report_ast.cjs").Report}
  */
 function createParentIssueTemplate(groupId, titlePrefix, workflowName, workflowSourceURL, expiresHours = 0) {
   // Use applyTitlePrefix to ensure proper spacing after prefix
@@ -192,17 +294,24 @@ function createParentIssueTemplate(groupId, titlePrefix, workflowName, workflowS
 
   // Load and render the issue template
   const issueTemplatePath = `${process.env.RUNNER_TEMP}/gh-aw/prompts/issue_group_parent.md`;
-  let body = renderTemplateFromFile(issueTemplatePath, templateContext);
-
-  // Add footer with workflow information
-  const footer = `\n\n> Workflow: [${workflowName}](${workflowSourceURL})`;
-
-  // Add expiration to footer if configured using ephemerals helper
-  const footerWithExpiration = addExpirationToFooter(footer, expiresHours, "Parent Issue");
-
-  body = `${body}${footerWithExpiration}`;
-
-  return { title, body };
+  const children = parseReportMarkdown(renderTemplateFromFile(issueTemplatePath, {}), { context: templateContext, minimumHeadingLevel: 2, allowMetadata: true, agentTainted: false });
+  /** @type {import("./report_ast.cjs").ReportInline[]} */
+  const workflowLabel = [{ type: "text", value: workflowName, agentTainted: false }];
+  /** @type {import("./report_ast.cjs").ReportInline[]} */
+  const workflowReference = workflowSourceURL ? [{ type: "link", url: workflowSourceURL, children: workflowLabel, agentTainted: false }] : workflowLabel;
+  children.push({
+    type: "quote",
+    agentTainted: false,
+    children: [
+      {
+        type: "paragraph",
+        agentTainted: false,
+        children: [{ type: "text", value: "Workflow: ", agentTainted: false }, ...workflowReference],
+      },
+    ],
+  });
+  if (expiresHours > 0) children.push({ type: "quote", agentTainted: false, children: [{ type: "expiration", expiresAt: new Date(Date.now() + expiresHours * 60 * 60 * 1000).toISOString(), agentTainted: false }] });
+  return { type: "report", title, children };
 }
 
 /**
@@ -271,51 +380,63 @@ async function resolveIssueNodeId(githubClient, owner, repo, issueNumber) {
 }
 
 /**
+ * GraphQL query used to discover issue field definitions for a repository.
+ * Exported so integration tests can validate the exact query sent in production
+ * against the live schema, instead of maintaining a separate copy that could drift.
+ */
+const ISSUE_FIELDS_QUERY = `query($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    issueFields(first: 100) {
+      nodes {
+        __typename
+        ... on IssueFieldText {
+          id
+          name
+          dataType
+        }
+        ... on IssueFieldNumber {
+          id
+          name
+          dataType
+        }
+        ... on IssueFieldDate {
+          id
+          name
+          dataType
+        }
+        ... on IssueFieldSingleSelect {
+          id
+          name
+          dataType
+          options {
+            id
+            name
+          }
+        }
+        ... on IssueFieldMultiSelect {
+          id
+          name
+          dataType
+          options {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/**
  * Fetch issue field metadata from repository.
- * Returns configured field definitions including types, options, and iterations.
+ * Returns configured field definitions including types and options.
  * @param {Object} githubClient
  * @param {string} owner
  * @param {string} repo
  * @returns {Promise<Array<any>>}
  */
 async function fetchIssueFields(githubClient, owner, repo) {
-  const result = await githubClient.graphql(
-    `query($owner: String!, $repo: String!) {
-      repository(owner: $owner, name: $repo) {
-        issueFields(first: 100) {
-          nodes {
-            __typename
-            ... on IssueField {
-              id
-              name
-              dataType
-            }
-            ... on IssueFieldSingleSelect {
-              id
-              name
-              dataType
-              options {
-                id
-                name
-              }
-            }
-            ... on IssueFieldIteration {
-              id
-              name
-              dataType
-              configuration {
-                iterations {
-                  id
-                  title
-                }
-              }
-            }
-          }
-        }
-      }
-    }`,
-    { owner, repo }
-  );
+  const result = await githubClient.graphql(ISSUE_FIELDS_QUERY, { owner, repo });
 
   return Array.isArray(result?.repository?.issueFields?.nodes) ? result.repository.issueFields.nodes.filter(Boolean) : [];
 }
@@ -362,14 +483,23 @@ function buildIssueFieldMutationInput(requestedFields, availableFields) {
       return { fieldId: matchedField.id, singleSelectOptionId: selectedOption.id };
     }
 
-    if (dataType === "ITERATION") {
-      const iterations = matchedField?.configuration?.iterations;
-      const availableIterations = Array.isArray(iterations) ? iterations : [];
-      const selectedIteration = availableIterations.find(iteration => typeof iteration?.title === "string" && iteration.title.toLowerCase() === String(field.value).toLowerCase());
-      if (!selectedIteration) {
-        throw new Error(`${ERR_VALIDATION}: invalid iteration "${field.value}" for issue field "${field.name}". Available iterations: ${availableIterations.map(iteration => iteration.title).join(", ") || "(none)"}`);
+    if (dataType === "MULTI_SELECT") {
+      const options = Array.isArray(matchedField.options) ? matchedField.options : [];
+      const requestedValues = String(field.value)
+        .split(",")
+        .map(value => value.trim())
+        .filter(Boolean);
+      if (requestedValues.length === 0) {
+        throw new Error(`${ERR_VALIDATION}: issue field "${field.name}" requires at least one selected option`);
       }
-      return { fieldId: matchedField.id, singleSelectOptionId: selectedIteration.id };
+      const multiSelectOptionIds = requestedValues.map(value => {
+        const selectedOption = options.find(option => typeof option?.name === "string" && option.name.toLowerCase() === value.toLowerCase());
+        if (!selectedOption) {
+          throw new Error(`${ERR_VALIDATION}: invalid option "${value}" for issue field "${field.name}". Available options: ${options.map(option => option.name).join(", ") || "(none)"}`);
+        }
+        return selectedOption.id;
+      });
+      return { fieldId: matchedField.id, multiSelectOptionIds };
     }
 
     return { fieldId: matchedField.id, textValue: String(field.value) };
@@ -377,19 +507,121 @@ function buildIssueFieldMutationInput(requestedFields, availableFields) {
 }
 
 /**
- * Apply issue field values to a newly-created issue.
- * Resolves metadata and sends the setIssueFieldValue GraphQL mutation.
- * @param {{githubClient: Object, owner: string, repo: string, issueNumber: number, fields: Array<{name: string, value: string|number}>}} params
+ * Parse and resolve an issue reference used by create_issue.blocked_by.
+ * Supports issue numbers, cross-repository references, URLs, and temporary IDs.
+ *
+ * @param {string|number} value
+ * @param {Map<string, {repo: string, number: number}>} temporaryIdMap
+ * @param {string} defaultRepo
+ * @param {boolean} [allowUnresolvedTemporaryIds] - When true (staged mode), unresolved temporary IDs are reported instead of deferring
+ * @returns {{target: {repo: string, number: number}|null, deferred?: boolean, unresolvedTemporaryId?: string, error?: string}}
+ */
+function resolveBlockedByReference(value, temporaryIdMap, defaultRepo, allowUnresolvedTemporaryIds = false) {
+  const raw = String(value).trim();
+  if (isTemporaryId(raw)) {
+    const resolved = temporaryIdMap.get(normalizeTemporaryId(raw));
+    if (!resolved) {
+      if (allowUnresolvedTemporaryIds) {
+        return { target: null, unresolvedTemporaryId: raw };
+      }
+      return { target: null, deferred: true, error: `Unresolved temporary ID: ${raw}` };
+    }
+    return { target: { repo: resolved.repo, number: resolved.number } };
+  }
+
+  const numericMatch = raw.match(/^#?([1-9]\d*)$/);
+  const crossRepoMatch = raw.match(/^([\w.-]+\/[\w.-]+)#([1-9]\d*)$/);
+  const urlMatch = raw.match(/^https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/issues\/([1-9]\d*)(?:[?#/].*)?$/);
+  const match = crossRepoMatch || urlMatch;
+  const repo = match ? match[1] : defaultRepo;
+  const numberString = match ? match[2] : numericMatch?.[1];
+  const number = Number(numberString);
+
+  if (!repo || !Number.isSafeInteger(number) || number < 1) {
+    return {
+      target: null,
+      error: `Invalid blocked_by reference '${raw}'. Expected an issue number, owner/repo#number, GitHub issue URL, or temporary ID.`,
+    };
+  }
+  return { target: { repo, number } };
+}
+
+/**
+ * Normalize blocked_by to a list of resolved issue references.
+ *
+ * @param {unknown} blockedBy
+ * @param {Map<string, {repo: string, number: number}>} temporaryIdMap
+ * @param {string} defaultRepo
+ * @param {boolean} [allowUnresolvedTemporaryIds] - When true (staged mode), unresolved temporary IDs are kept as display-only references instead of deferring
+ * @returns {{targets: Array<{repo: string, number: number}>, references: Array<string>, deferred?: boolean, error?: string}}
+ */
+function resolveBlockedByReferences(blockedBy, temporaryIdMap, defaultRepo, allowUnresolvedTemporaryIds = false) {
+  if (blockedBy === undefined || blockedBy === null) {
+    return { targets: [], references: [] };
+  }
+  const values = Array.isArray(blockedBy) ? blockedBy : [blockedBy];
+  const targets = [];
+  // Display references in declared order, including temporary IDs left unresolved in staged mode
+  const references = [];
+  const seen = new Set();
+
+  for (const value of values) {
+    if (typeof value !== "string" && typeof value !== "number") {
+      return { targets: [], references: [], error: "create_issue 'blocked_by' must be an issue reference or an array of issue references" };
+    }
+    const resolved = resolveBlockedByReference(value, temporaryIdMap, defaultRepo, allowUnresolvedTemporaryIds);
+    if (resolved.deferred) {
+      return { targets: [], references: [], deferred: true, error: resolved.error };
+    }
+    if (resolved.unresolvedTemporaryId) {
+      if (!seen.has(resolved.unresolvedTemporaryId)) {
+        seen.add(resolved.unresolvedTemporaryId);
+        references.push(resolved.unresolvedTemporaryId);
+      }
+      continue;
+    }
+    if (!resolved.target) {
+      return { targets: [], references: [], error: resolved.error };
+    }
+    const key = `${resolved.target.repo.toLowerCase()}#${resolved.target.number}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      targets.push(resolved.target);
+      references.push(`${resolved.target.repo}#${resolved.target.number}`);
+    }
+  }
+  return { targets, references };
+}
+
+/**
+ * Discover and validate issue field mutation inputs against the repository's configured
+ * fields (schema, unknown-field, and invalid-option checks). Performed before issue
+ * creation so invalid `fields` payloads fail fast without leaving an orphaned issue.
+ * @param {Object} githubClient
+ * @param {string} owner
+ * @param {string} repo
+ * @param {Array<{name: string, value: string|number}>} fields
+ * @returns {Promise<Array<any>>}
+ */
+async function resolveIssueFieldMutationInput(githubClient, owner, repo, fields) {
+  if (!Array.isArray(fields) || fields.length === 0) {
+    return [];
+  }
+  const availableFields = await fetchIssueFields(githubClient, owner, repo);
+  return buildIssueFieldMutationInput(fields, availableFields);
+}
+
+/**
+ * Apply pre-validated issue field mutation inputs to a newly-created issue.
+ * @param {{githubClient: Object, owner: string, repo: string, issueNumber: number, issueFieldsInput: Array<any>}} params
  * @returns {Promise<void>}
  */
-async function applyIssueFields({ githubClient, owner, repo, issueNumber, fields }) {
-  if (!Array.isArray(fields) || fields.length === 0) {
+async function submitIssueFieldMutation({ githubClient, owner, repo, issueNumber, issueFieldsInput }) {
+  if (!Array.isArray(issueFieldsInput) || issueFieldsInput.length === 0) {
     return;
   }
 
   const issueId = await resolveIssueNodeId(githubClient, owner, repo, issueNumber);
-  const availableFields = await fetchIssueFields(githubClient, owner, repo);
-  const issueFields = buildIssueFieldMutationInput(fields, availableFields);
 
   await githubClient.graphql(
     `mutation($input: SetIssueFieldValueInput!) {
@@ -402,7 +634,7 @@ async function applyIssueFields({ githubClient, owner, repo, issueNumber, fields
     {
       input: {
         issueId,
-        issueFields,
+        issueFields: issueFieldsInput,
       },
     }
   );
@@ -466,13 +698,23 @@ async function searchTitleDedupIssues(githubClient, query) {
  * @param {Object} githubClient
  * @param {string} owner
  * @param {string} repo
+ * @param {string[]} labels
  * @returns {Promise<Array<{title: string}>>}
  */
-async function getRepoTitleDedupCandidates(githubClient, owner, repo) {
+async function getRepoTitleDedupCandidates(githubClient, owner, repo, labels) {
   const sinceDate = new Date(Date.now() - RECENTLY_CLOSED_DEDUP_DAYS * MS_PER_DAY).toISOString().slice(0, 10);
+  const labelQualifiers = labels
+    .map(
+      label =>
+        ` label:"${label
+          .replace(/\\/g, "\\\\")
+          .replace(/"/g, '\\"')
+          .replace(/\r?\n|\r/g, " ")}"`
+    )
+    .join("");
   const [openIssues, recentlyClosedIssues] = await Promise.all([
-    searchTitleDedupIssues(githubClient, `repo:${owner}/${repo} is:issue is:open`),
-    searchTitleDedupIssues(githubClient, `repo:${owner}/${repo} is:issue is:closed closed:>=${sinceDate}`),
+    searchTitleDedupIssues(githubClient, `repo:${owner}/${repo} is:issue is:open${labelQualifiers}`),
+    searchTitleDedupIssues(githubClient, `repo:${owner}/${repo} is:issue is:closed closed:>=${sinceDate}${labelQualifiers}`),
   ]);
 
   if (openIssues.truncated) {
@@ -530,12 +772,14 @@ async function main(config = {}) {
   const groupEnabled = parseBoolTemplatable(config.group, false);
   const closeOlderIssuesEnabled = parseBoolTemplatable(config.close_older_issues, false);
   const groupByDayEnabled = parseBoolTemplatable(config.group_by_day, false);
+  const deduplicateByLabels = normalizeDeduplicationLabels(config.deduplicate_by_labels);
   let deduplicateByTitle;
   try {
     deduplicateByTitle = parseDeduplicateByTitle(config.deduplicate_by_title);
   } catch (error) {
     throw new Error(`${ERR_VALIDATION}: ${getErrorMessage(error)}`, { cause: error });
   }
+  const deduplicationEnabled = deduplicateByTitle.enabled || deduplicateByLabels.length > 0;
   const rawCloseOlderKey = config.close_older_key ? String(config.close_older_key) : "";
   const closeOlderKey = rawCloseOlderKey ? normalizeCloseOlderKey(rawCloseOlderKey) : "";
   if (rawCloseOlderKey && !closeOlderKey) {
@@ -546,11 +790,12 @@ async function main(config = {}) {
   // Create an authenticated GitHub client. Uses config["github-token"] when set
   // (for cross-repository operations), otherwise falls back to the step-level github.
   const githubClient = await createAuthenticatedGitHubClient(config);
-  let allowedMentionAliases = [];
+  const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
+  let defaultMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
-    allowedMentionAliases = config.allowedMentionAliases;
+    defaultMentionAliases = config.allowedMentionAliases;
   } else if (config.mentions != null) {
-    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+    defaultMentionAliases = await resolveDefaultMentions(context, githubClient, core, config.mentions, defaultTargetRepo);
   }
 
   // Check if copilot assignment is enabled
@@ -637,9 +882,6 @@ async function main(config = {}) {
   const parentIssueCache = new Map();
 
   // Extract triggering context for footer generation
-  const triggeringIssueNumber = context.payload?.issue?.number && !context.payload?.issue?.pull_request ? context.payload.issue.number : undefined;
-  const triggeringPRNumber = context.payload?.pull_request?.number || (context.payload?.issue?.pull_request ? context.payload.issue.number : undefined);
-  const triggeringDiscussionNumber = context.payload?.discussion?.number;
   const parentIssueNumber = context.payload?.issue?.number;
 
   /**
@@ -668,6 +910,26 @@ async function main(config = {}) {
       };
     }
     const { repo: qualifiedItemRepo, repoParts } = repoResult;
+
+    // In staged mode no issues are created, so temporary IDs never resolve; validate the
+    // references without deferring so dependent issues still get a staged preview.
+    const blockedBy = resolveBlockedByReferences(message.blocked_by, temporaryIdMap, qualifiedItemRepo, isStaged);
+    if (blockedBy.deferred) {
+      core.info(`Deferring create_issue: ${blockedBy.error}`);
+      return { success: false, deferred: true, error: blockedBy.error };
+    }
+    if (blockedBy.error) {
+      return { success: false, error: blockedBy.error };
+    }
+    for (const blockedIssue of blockedBy.targets) {
+      const blockedRepoResult = resolveAndValidateRepo(blockedIssue, defaultTargetRepo, allowedRepos, "blocked-by dependency");
+      if (!blockedRepoResult.success) {
+        core.warning(`Skipping issue: ${blockedRepoResult.error}`);
+        return { success: false, error: blockedRepoResult.error };
+      }
+      blockedIssue.repo = blockedRepoResult.repo;
+    }
+    const allowedMentionAliases = await resolveMentionsForItem(context, githubClient, core, config.mentions, defaultMentionAliases, defaultTargetRepo, repoResult);
 
     // Get or generate the temporary ID for this issue
     const tempIdResult = getOrGenerateTemporaryId(message, "issue");
@@ -739,9 +1001,20 @@ async function main(config = {}) {
       .filter((assignee, index, arr) => arr.indexOf(assignee) === index);
 
     let issueFields;
+    /** @type {IssueArtifact[]} */
+    let artifacts;
+    let preparedIssueFieldsInput = [];
     try {
+      artifacts = sanitizeIssueArtifacts(normalizeIssueArtifacts(message.artifacts, config.max_issue_artifacts, config.max_issue_artifact_size), { allowedAliases: allowedMentionAliases, maxMentions });
+      artifacts = artifacts.map(artifact => ({ ...artifact, body: replaceTemporaryIdReferences(artifact.body, temporaryIdMap, qualifiedItemRepo) }));
+      artifacts = normalizeIssueArtifacts(artifacts, config.max_issue_artifacts, config.max_issue_artifact_size);
       issueFields = normalizeIssueFields(message.fields);
       validateAllowedIssueFields(issueFields, allowedIssueFields);
+      if (issueFields.length > 0) {
+        // Discover and validate field schema/options before creating the issue so
+        // invalid `fields` payloads fail fast without leaving an orphaned issue.
+        preparedIssueFieldsInput = await resolveIssueFieldMutationInput(githubClient, repoParts.owner, repoParts.repo, issueFields);
+      }
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };
     }
@@ -754,16 +1027,10 @@ async function main(config = {}) {
     assignees = assignees.filter(assignee => assignee !== "copilot");
 
     // Enforce max limits on labels and assignees before API calls
-    const labelsLimitResult = tryEnforceArrayLimit(labels, MAX_LABELS, "labels");
-    if (!labelsLimitResult.success) {
-      core.warning(`Issue limit exceeded: ${labelsLimitResult.error}`);
-      return { success: false, error: labelsLimitResult.error };
-    }
-
-    const assigneesLimitResult = tryEnforceArrayLimit(assignees, MAX_ASSIGNEES, "assignees");
-    if (!assigneesLimitResult.success) {
-      core.warning(`Issue limit exceeded: ${assigneesLimitResult.error}`);
-      return { success: false, error: assigneesLimitResult.error };
+    const issueArrayLimitError = getIssueArrayLimitError(labels, assignees);
+    if (issueArrayLimitError) {
+      core.warning(`Issue limit exceeded: ${issueArrayLimitError}`);
+      return { success: false, error: issueArrayLimitError };
     }
 
     let title = message.title?.trim() ?? "";
@@ -775,9 +1042,10 @@ async function main(config = {}) {
     processedBody = removeDuplicateTitleFromDescription(title, processedBody);
 
     // Sanitize body content to neutralize @mentions, URLs, and other security risks
-    processedBody = sanitizeContent(processedBody, { allowedAliases: allowedMentionAliases });
+    processedBody = sanitizeContent(normalizeReportText(processedBody, { preserveImageAttributes: true }), { allowedAliases: allowedMentionAliases, maxMentions });
 
-    const bodyLines = processedBody.split("\n");
+    const bodyNodes = parseReportMarkdown(stripExecutionProvenance(processedBody), { minimumHeadingLevel: 2, allowMetadata: true, agentTainted: true, allowedMentions: expandAllowedAliases(allowedMentionAliases) });
+    bodyNodes.push(...(message[ISSUE_BODY_SUFFIX] || []));
 
     if (!title) {
       // Use the first non-empty line of the body as the title fallback rather than
@@ -792,8 +1060,17 @@ async function main(config = {}) {
     // Sanitize title for Unicode security and remove any duplicate prefixes
     title = sanitizeTitle(title, titlePrefix);
 
+    // Sanitization can empty the title (e.g. the agent supplied only the title
+    // prefix, or every character was stripped). GitHub rejects a blank title with
+    // "title can't be blank", which fails the whole safe_outputs job, so fall back
+    // to a generic title instead.
+    if (!title.trim()) {
+      core.warning(`create_issue title became empty after sanitization — falling back to "Agent Output"`);
+      title = "Agent Output";
+    }
+
     // Apply title prefix (only if it doesn't already exist)
-    title = applyTitlePrefix(title, titlePrefix);
+    title = normalizeReportTitle(applyTitlePrefix(title, titlePrefix));
 
     const normalizedTitle = normalizeTitleForDedup(title);
 
@@ -811,9 +1088,9 @@ async function main(config = {}) {
       };
     }
 
-    if (deduplicateByTitle.enabled) {
+    if (deduplicationEnabled) {
       const withinRunCandidates = createdTitlesByRepo.get(qualifiedItemRepo) || [];
-      const withinRunDuplicate = findDuplicateByTitle(normalizedTitle, withinRunCandidates, deduplicateByTitle.maxDistance);
+      const withinRunDuplicate = findDuplicateIssue(normalizedTitle, withinRunCandidates, deduplicateByTitle);
       if (withinRunDuplicate) {
         core.warning(`Dropping duplicate create_issue (within-run) in ${qualifiedItemRepo}: "${title}" (matched "${withinRunDuplicate.title}", distance=${withinRunDuplicate.distance})`);
         return {
@@ -831,7 +1108,7 @@ async function main(config = {}) {
         if (!repoTitleDedupCandidatesCache.has(repoCacheKey) && !skipRepoLevelSearch) {
           skipRepoLevelSearch = await shouldSkipRepoTitleDedupSearch(githubClient, repoParts.owner, repoParts.repo);
           if (!skipRepoLevelSearch) {
-            const dedupCandidatesPromise = getRepoTitleDedupCandidates(githubClient, repoParts.owner, repoParts.repo);
+            const dedupCandidatesPromise = getRepoTitleDedupCandidates(githubClient, repoParts.owner, repoParts.repo, deduplicateByLabels);
             dedupCandidatesPromise.catch(() => {
               if (repoTitleDedupCandidatesCache.get(repoCacheKey) === dedupCandidatesPromise) {
                 repoTitleDedupCandidatesCache.delete(repoCacheKey);
@@ -844,9 +1121,11 @@ async function main(config = {}) {
         const repoCandidatesPromise = repoTitleDedupCandidatesCache.get(repoCacheKey);
         if (repoCandidatesPromise) {
           const repoCandidates = await repoCandidatesPromise;
-          const repoDuplicate = findDuplicateByTitle(normalizedTitle, repoCandidates, deduplicateByTitle.maxDistance);
+          const repoDuplicate = findDuplicateIssue(normalizedTitle, repoCandidates, deduplicateByTitle);
           if (repoDuplicate) {
-            recordSeenTitle(qualifiedItemRepo, title, normalizedTitle);
+            if (hasDeduplicationLabels(labels, deduplicateByLabels)) {
+              recordSeenTitle(qualifiedItemRepo, title, normalizedTitle);
+            }
             core.warning(`Dropping duplicate create_issue (repo-level) in ${qualifiedItemRepo}: "${title}" (matched "${repoDuplicate.title}", distance=${repoDuplicate.distance})`);
             return {
               success: true,
@@ -867,85 +1146,38 @@ async function main(config = {}) {
     if (effectiveParentIssueNumber) {
       core.info("Detected issue context, parent issue " + effectiveParentRepo + "#" + effectiveParentIssueNumber);
       // Use full repo reference if cross-repo, short reference if same repo
-      if (effectiveParentRepo === qualifiedItemRepo) {
-        bodyLines.push(`Related to #${effectiveParentIssueNumber}`);
-      } else {
-        bodyLines.push(`Related to ${effectiveParentRepo}#${effectiveParentIssueNumber}`);
-      }
+      bodyNodes.push({
+        type: "paragraph",
+        agentTainted: false,
+        children: [
+          { type: "text", value: "Related to ", agentTainted: false },
+          effectiveParentRepo === qualifiedItemRepo
+            ? { type: "issue_reference", number: String(effectiveParentIssueNumber), agentTainted: false }
+            : {
+                type: "link",
+                url: `${context.serverUrl || "https://github.com"}/${effectiveParentRepo}/issues/${effectiveParentIssueNumber}`,
+                children: [{ type: "text", value: `${effectiveParentRepo}#${effectiveParentIssueNumber}`, agentTainted: false }],
+                agentTainted: false,
+              },
+        ],
+      });
     }
 
     const workflowName = process.env.GH_AW_WORKFLOW_NAME ?? "Workflow";
-    const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE ?? "";
     const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "";
     const workflowId = process.env.GH_AW_WORKFLOW_ID ?? "";
-    // GH_AW_CALLER_WORKFLOW_ID is set at compile time to `github.repository/<workflow-id>`.
-    // When multiple workflows call the same reusable workflow via workflow_call they all
-    // share the same GH_AW_WORKFLOW_ID. We embed a separate gh-aw-workflow-call-id marker
-    // with the caller's identity so close-older-issues can distinguish callers precisely.
     const callerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID ?? "";
     const runUrl = buildWorkflowRunUrl(context, context.repo);
-
-    // Inject body header before user content (unshifted first, so caution will appear before it)
-    const bodyHeader = getBodyHeader({ workflowName, runUrl });
-    if (bodyHeader) {
-      bodyLines.unshift(...bodyHeader.split("\n"), "");
-    }
-
-    // Inject disclosure header (this runs after body-header, but appears before it because unshift prepends)
-    const disclosureHeader = getDisclosureHeader({ workflowName, runUrl });
-    if (disclosureHeader) {
-      bodyLines.unshift(...disclosureHeader.split("\n"), "");
-    }
-
-    // Inject CAUTION at top of body if threat detection warning was raised
-    // (unshifted after header so it appears first in the final output)
-    const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
-    if (detectionCaution) {
-      bodyLines.unshift(...detectionCaution.split("\n"), "");
-    }
-
-    // Add tracker-id comment if present
-    const trackerIDComment = getTrackerID("markdown");
-    if (trackerIDComment) {
-      bodyLines.push(trackerIDComment);
-    }
-
-    // Generate footer and add expiration using helper
-    // When footer is disabled, only add XML markers (no visible footer content)
-    if (includeFooter) {
-      const historyUrl = generateHistoryUrl({
-        owner: repoParts.owner,
-        repo: repoParts.repo,
-        itemType: "issue",
-        workflowCallId: callerWorkflowId,
-        workflowId,
-        serverUrl: context.serverUrl,
-      });
-      const footer = addExpirationToFooter(
-        generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, historyUrl, { skipDetectionCaution: true }).trimEnd(),
-        expiresHours,
-        "Issue"
-      );
-      bodyLines.push(``, ``, footer);
-    }
-
-    // Add standalone workflow-id marker for searchability (consistent with comments)
-    // Always add XML markers even when footer is disabled
-    if (workflowId) {
-      bodyLines.push(``, generateWorkflowIdMarker(workflowId));
-    }
-    // Add workflow-call-id marker when available to allow close-older-issues to
-    // distinguish callers that share the same reusable workflow (and GH_AW_WORKFLOW_ID)
-    if (callerWorkflowId) {
-      bodyLines.push(generateWorkflowCallIdMarker(callerWorkflowId));
-    }
-    // Add explicit close-key marker when a custom deduplication key is provided
-    if (closeOlderKey) {
-      bodyLines.push(generateCloseKeyMarker(closeOlderKey));
-    }
-
-    bodyLines.push("");
-    const body = bodyLines.join("\n").trim();
+    const report = buildIssueBodyReport(title, bodyNodes, {
+      repo: repoParts,
+      footer: includeFooter,
+      bodyFooter: config.body_footer,
+      expiresHours,
+      closeOlderKey,
+      allowedMentions: expandAllowedAliases(allowedMentionAliases),
+    });
+    const request = renderIssueParameters({ owner: repoParts.owner, repo: repoParts.repo, title, labels, assignees }, report);
+    const { body } = request;
 
     // Reserve a max-count slot synchronously before any async pre-creation work.
     // There is no await between check and increment, so concurrent invocations
@@ -963,7 +1195,7 @@ async function main(config = {}) {
     // When found, post the new content as a comment on the existing issue instead of
     // creating a duplicate. This groups multiple same-day runs into a single issue.
     // The reserved max-count slot is released when posting as a comment.
-    if (groupByDayEnabled && (closeOlderKey || workflowId)) {
+    if (!isStaged && artifacts.length === 0 && groupByDayEnabled && (closeOlderKey || workflowId)) {
       const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD (UTC)
       try {
         const existingIssues = await searchOlderIssues(
@@ -981,7 +1213,12 @@ async function main(config = {}) {
         });
         if (todayIssue) {
           core.info(`Group-by-day: found open issue #${todayIssue.number} created today (${today}) — posting new content as a comment`);
-          const comment = await addIssueComment(githubClient, repoParts.owner, repoParts.repo, todayIssue.number, body);
+          const { data: comment } = await githubClient.rest.issues.createComment({
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            issue_number: todayIssue.number,
+            body,
+          });
           core.info(`Posted content as comment ${comment.html_url} on issue #${todayIssue.number}`);
           // No issue was created (content was grouped into a comment), so free
           // the reserved slot for subsequent create_issue calls.
@@ -1013,7 +1250,11 @@ async function main(config = {}) {
     // If in staged mode, preview the issue without creating it
     if (isStaged) {
       logStagedPreviewInfo(`Would create issue in ${qualifiedItemRepo} with title: ${title}`);
-      if (deduplicateByTitle.enabled) {
+      const stagedBlockedBy = blockedBy.references;
+      if (stagedBlockedBy.length > 0) {
+        logStagedPreviewInfo(`Would mark issue as blocked by: ${stagedBlockedBy.join(", ")}`);
+      }
+      if (deduplicationEnabled && hasDeduplicationLabels(labels, deduplicateByLabels)) {
         recordSeenTitle(qualifiedItemRepo, title, normalizedTitle);
       }
       // Return success with staged flag and preview info
@@ -1026,41 +1267,32 @@ async function main(config = {}) {
           labels,
           assignees,
           fields: issueFields,
+          ...(artifacts.length > 0 ? { artifacts } : {}),
           bodyLength: body.length,
           temporaryId,
+          ...(stagedBlockedBy.length > 0 ? { blockedBy: stagedBlockedBy } : {}),
         },
       };
     }
 
+    let artifactFailure;
     try {
-      const { data: issue } = await withRetry(
-        () =>
-          githubClient.rest.issues.create({
-            owner: repoParts.owner,
-            repo: repoParts.repo,
-            title,
-            body,
-            labels,
-            assignees,
-          }),
-        RATE_LIMIT_RETRY_CONFIG,
-        `create_issue in ${qualifiedItemRepo}`
-      );
+      const { data: issue } = await withRetry(() => createReportIssue(githubClient, request), RATE_LIMIT_RETRY_CONFIG, `create_issue in ${qualifiedItemRepo}`);
 
       core.info(`Created issue ${qualifiedItemRepo}#${issue.number}: ${issue.html_url}`);
       createdIssues.push({ ...issue, _repo: qualifiedItemRepo });
-      if (deduplicateByTitle.enabled) {
+      if (deduplicationEnabled && hasDeduplicationLabels(labels, deduplicateByLabels)) {
         recordSeenTitle(qualifiedItemRepo, title, normalizedTitle);
       }
 
       if (issueFields.length > 0) {
         try {
-          await applyIssueFields({
+          await submitIssueFieldMutation({
             githubClient,
             owner: repoParts.owner,
             repo: repoParts.repo,
             issueNumber: issue.number,
-            fields: issueFields,
+            issueFieldsInput: preparedIssueFieldsInput,
           });
           core.info(`Applied ${issueFields.length} issue field(s) to ${qualifiedItemRepo}#${issue.number}`);
         } catch (error) {
@@ -1073,11 +1305,51 @@ async function main(config = {}) {
         }
       }
 
+      // Dependency attachment is best-effort: the issue already exists at this point,
+      // so a dependency API failure must not report the whole create_issue as failed.
+      /** @type {Array<string>} */
+      const blockedByFailures = [];
+      for (const blockedIssue of blockedBy.targets) {
+        const [blockedOwner, blockedRepo] = blockedIssue.repo.split("/");
+        try {
+          const { data: blocker } = await githubClient.rest.issues.get({
+            owner: blockedOwner,
+            repo: blockedRepo,
+            issue_number: blockedIssue.number,
+          });
+          if (!Number.isSafeInteger(blocker?.id) || blocker.id < 1) {
+            throw new Error(`${ERR_VALIDATION}: Issue ${blockedIssue.repo}#${blockedIssue.number} did not return a valid issue ID`);
+          }
+          await githubClient.request("POST /repos/{owner}/{repo}/issues/{issue_number}/dependencies/blocked_by", {
+            owner: repoParts.owner,
+            repo: repoParts.repo,
+            issue_number: issue.number,
+            issue_id: blocker.id,
+          });
+          core.info(`Added blocked-by dependency: ${qualifiedItemRepo}#${issue.number} <- ${blockedIssue.repo}#${blockedIssue.number}`);
+        } catch (error) {
+          const dependencyError = getErrorMessage(error);
+          blockedByFailures.push(`${blockedIssue.repo}#${blockedIssue.number}: ${dependencyError}`);
+          core.warning(`Issue ${qualifiedItemRepo}#${issue.number} was created, but blocked-by dependency ${blockedIssue.repo}#${blockedIssue.number} could not be added: ${dependencyError}`);
+        }
+      }
+
       // Store the mapping of temporary_id -> {repo, number}
       // temporaryId is guaranteed to be non-null because we checked tempIdResult.error above
       const normalizedTempId = normalizeTemporaryId(String(temporaryId));
       temporaryIdMap.set(normalizedTempId, { repo: qualifiedItemRepo, number: issue.number });
       core.info(`Stored temporary ID mapping: ${temporaryId} -> ${qualifiedItemRepo}#${issue.number}`);
+
+      /** @type {CreatedIssueArtifact[]} */
+      let createdArtifacts = [];
+      try {
+        const resolvedArtifacts = artifacts.map(artifact => ({ ...artifact, body: replaceTemporaryIdReferences(artifact.body, temporaryIdMap, qualifiedItemRepo) }));
+        createdArtifacts = await createIssueArtifacts(githubClient, repoParts.owner, repoParts.repo, issue.number, resolvedArtifacts, config.max_issue_artifact_size);
+      } catch (error) {
+        const artifactError = getErrorMessage(error);
+        core.error(artifactError);
+        artifactFailure = { success: false, repo: qualifiedItemRepo, number: issue.number, url: issue.html_url, temporaryId, error: artifactError };
+      }
 
       // Assign copilot directly using agent helpers when enabled (similar to assign_to_agent.cjs pattern)
       if (hasCopilot && assignCopilot) {
@@ -1089,10 +1361,12 @@ async function main(config = {}) {
         try {
           const agentId = await findAgent(repoParts.owner, repoParts.repo, "copilot", issue.number, copilotClient);
           if (!agentId) {
+            if (isTokenBrokerEnabled()) throw new Error(`${ERR_API}: Broker-authenticated copilot assignment failed for issue #${issue.number}: agent unavailable`);
             core.warning(`copilot coding agent is not available for ${qualifiedItemRepo}`);
           } else {
             const issueDetails = await getIssueDetails(repoParts.owner, repoParts.repo, issue.number, copilotClient);
             if (!issueDetails) {
+              if (isTokenBrokerEnabled()) throw new Error(`${ERR_API}: Broker-authenticated copilot assignment failed for issue #${issue.number}: issue details unavailable`);
               core.warning(`Failed to get issue details for copilot assignment of issue #${issue.number}`);
             } else if (issueDetails.currentAssignees.some(a => a.id === agentId)) {
               core.info(`copilot is already assigned to issue #${issue.number}`);
@@ -1101,12 +1375,14 @@ async function main(config = {}) {
               if (assigned) {
                 core.info(`Successfully assigned copilot coding agent to issue #${issue.number}`);
               } else {
+                if (isTokenBrokerEnabled()) throw new Error(`${ERR_API}: Broker-authenticated copilot assignment failed for issue #${issue.number}`);
                 core.warning(`Failed to assign copilot to issue #${issue.number}`);
               }
             }
           }
         } catch (error) {
           core.warning(`Failed to assign copilot to issue #${issue.number}: ${getErrorMessage(error)}`);
+          if (isTokenBrokerEnabled()) throw error;
         }
       }
 
@@ -1189,7 +1465,7 @@ async function main(config = {}) {
           core.info("✓ Successfully linked issue #" + issue.number + " as sub-issue of #" + effectiveParentIssueNumber);
         } catch (error) {
           core.info(`Warning: Could not link sub-issue to parent: ${getErrorMessage(error)}`);
-          core.info(`Error details: ${error instanceof Error ? error.stack : String(error)}`);
+          core.info(`Error details: ${error instanceof Error && error.stack ? error.stack : getErrorMessage(error)}`);
           // Fallback: add a comment if sub-issue linking fails
           try {
             core.info(`Attempting fallback: adding comment to parent issue #${effectiveParentIssueNumber}...`);
@@ -1197,7 +1473,21 @@ async function main(config = {}) {
               owner: repoParts.owner,
               repo: repoParts.repo,
               issue_number: effectiveParentIssueNumber,
-              body: `Created related issue: #${issue.number}`,
+              body: renderSizedReport({
+                type: "report",
+                title: "Related issue",
+                children: [
+                  {
+                    type: "paragraph",
+                    agentTainted: false,
+                    children: [
+                      { type: "text", value: "Created related issue: ", agentTainted: false },
+                      { type: "issue_reference", number: String(issue.number), agentTainted: false },
+                    ],
+                  },
+                  ...parseReportMarkdown(appendExecutionProvenance("", workflowName, runUrl), { allowMetadata: true, agentTainted: false }),
+                ],
+              }).body,
             });
             core.info("✓ Added comment to parent issue #" + effectiveParentIssueNumber + " (sub-issue linking not available)");
           } catch (commentError) {
@@ -1208,17 +1498,30 @@ async function main(config = {}) {
         core.info(`Skipping sub-issue linking: parent is in different repository (${effectiveParentRepo})`);
       }
 
+      if (artifactFailure) {
+        return artifactFailure;
+      }
+
       // Return result with temporary ID mapping info
       return {
         success: true,
         repo: qualifiedItemRepo,
         number: issue.number,
         url: issue.html_url,
+        body,
+        id: issue.id,
+        metadata: { node_id: issue.node_id },
         temporaryId: temporaryId,
+        ...(createdArtifacts.length > 0 ? { artifacts: createdArtifacts } : {}),
+        ...(blockedByFailures.length > 0 ? { blocked_by_errors: blockedByFailures } : {}),
         _repo: qualifiedItemRepo, // For tracking in the closure
       };
     } catch (error) {
       const errorMessage = getErrorMessage(error);
+      if (artifactFailure) {
+        core.error(`✗ Failed to complete post-create steps for "${title}" in ${qualifiedItemRepo}: ${errorMessage}`);
+        return artifactFailure;
+      }
       if (errorMessage.includes("Issues has been disabled in this repository")) {
         core.info(`⚠ Cannot create issue "${title}" in ${qualifiedItemRepo}: Issues are disabled for this repository`);
         core.info("Consider enabling issues in repository settings if you want to create issues automatically");
@@ -1236,4 +1539,4 @@ async function main(config = {}) {
   };
 }
 
-module.exports = { main, createParentIssueTemplate, searchForExistingParent, getSubIssueCount };
+module.exports = { main, createIssue, createParentIssueTemplate, searchForExistingParent, getSubIssueCount, ISSUE_FIELDS_QUERY };

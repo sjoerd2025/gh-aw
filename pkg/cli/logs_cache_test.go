@@ -25,9 +25,11 @@ func makeRunDir(t *testing.T, parent string, id int64, createdAt time.Time, writ
 			CLIVersion:  "test",
 			RunID:       id,
 			ProcessedAt: time.Now(),
-			Run: WorkflowRun{
-				DatabaseID: id,
-				CreatedAt:  createdAt,
+			RunAnalysis: RunAnalysis{
+				Run: WorkflowRun{
+					DatabaseID: id,
+					CreatedAt:  createdAt,
+				},
 			},
 		}
 		data, err := json.Marshal(summary)
@@ -39,6 +41,7 @@ func makeRunDir(t *testing.T, parent string, id int64, createdAt time.Time, writ
 }
 
 func TestCleanupOldRunFolders(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	cutoff := now.Add(-7 * 24 * time.Hour) // 1 week ago
 
@@ -133,6 +136,7 @@ func TestCleanupOldRunFolders(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmpDir := t.TempDir()
 			tt.setup(t, tmpDir)
 
@@ -152,6 +156,7 @@ func TestCleanupOldRunFolders(t *testing.T) {
 }
 
 func TestCleanupOldRunFoldersVerbose(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	cutoff := now.Add(-7 * 24 * time.Hour)
 	tmpDir := t.TempDir()

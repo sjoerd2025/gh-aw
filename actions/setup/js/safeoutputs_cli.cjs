@@ -1,20 +1,26 @@
 // @ts-check
+"use strict";
+
+const { normalizeSafeOutputName } = require("./safe_output_names.cjs");
 
 /**
  * Shared safeoutputs CLI helpers for all agentic harnesses.
  *
  * Provides the low-level CLI invocation helper and the higher-level emit
- * functions so that missing_tool / report_incomplete diagnostics are emitted
+ * functions so that report_missing_tool / report_incomplete diagnostics are emitted
  * through the supported safeoutputs CLI channel rather than via direct file
  * appends.  This survives read-only teardown states (EROFS) where direct
  * appends would silently drop structured failure signals.
  */
 
-"use strict";
-
 const childProcess = require("child_process");
 const fs = require("fs");
 const { ERR_VALIDATION, ERR_SYSTEM } = require("./error_codes.cjs");
+const { getSetupTimeoutMs } = require("./child_process_timeouts.cjs");
+const { iterateJsonl } = require("./jsonl_helpers.cjs");
+const { buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
+
+const SAFEOUTPUTS_CLI_TIMEOUT_MS = getSetupTimeoutMs("safeoutputsCli");
 
 /**
  * @typedef {(toolName: string, args: Record<string, string>) => void} RunSafeOutputsCLILike
@@ -38,7 +44,7 @@ function runSafeOutputsCLI(toolName, args) {
     commandArgs.push(value);
   }
   try {
-    childProcess.execFileSync(command, commandArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    childProcess.execFileSync(command, commandArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: SAFEOUTPUTS_CLI_TIMEOUT_MS });
   } catch (error) {
     const err = /** @type {{message?: string, stderr?: string | Buffer}} */ error ?? {};
     const stderr = typeof err.stderr === "string" ? err.stderr.trim() : Buffer.isBuffer(err.stderr) ? err.stderr.toString("utf8").trim() : "";
@@ -49,7 +55,7 @@ function runSafeOutputsCLI(toolName, args) {
 }
 
 /**
- * Build missing_tool alternatives text with optional denied-command diagnostics.
+ * Build report_missing_tool alternatives text with optional denied-command diagnostics.
  * @param {string} baseAlternatives
  * @param {string[]} deniedCommands
  * @returns {string}
@@ -90,12 +96,13 @@ function buildMissingToolAlternatives(baseAlternatives, deniedCommands) {
 }
 
 /**
- * Emit a structured missing_tool signal for repeated permission-denied failures.
+ * Emit a structured report_missing_tool signal for repeated permission-denied failures.
  * @param {{
  *   safeOutputsPath?: string,
  *   runSafeOutputsCLI?: RunSafeOutputsCLILike,
  *   logger?: (message: string) => void,
- *   deniedCommands?: string[]
+ *   deniedCommands?: string[],
+ *   permissionOutput?: string
  * }=} options
  */
 function emitMissingToolPermissionIssue(options) {
@@ -103,21 +110,23 @@ function emitMissingToolPermissionIssue(options) {
   const runSafeOutputs = options && options.runSafeOutputsCLI ? options.runSafeOutputsCLI : runSafeOutputsCLI;
   const logger = options && options.logger ? options.logger : defaultLog;
   const deniedCommands = options && options.deniedCommands ? options.deniedCommands : [];
+  const permissionOutput = options && typeof options.permissionOutput === "string" ? options.permissionOutput : "";
 
   if (!safeOutputsPath) {
-    logger("missing_tool skipped: GH_AW_SAFE_OUTPUTS is not set");
+    logger("report_missing_tool skipped: GH_AW_SAFE_OUTPUTS is not set");
     return;
   }
   try {
-    runSafeOutputs("missing_tool", {
-      tool: "tool/permission",
-      reason: "missing tool/permission issue: numerous permission denied errors detected",
-      alternatives: buildMissingToolAlternatives("Verify token scopes, repository permissions, and MCP/tool access configuration.", deniedCommands),
+    const payload = JSON.parse(buildMissingToolPermissionIssuePayload(deniedCommands, permissionOutput));
+    runSafeOutputs("report_missing_tool", {
+      tool: payload.tool,
+      reason: payload.reason,
+      alternatives: buildMissingToolAlternatives(payload.alternatives, deniedCommands),
     });
-    logger(`missing_tool emitted via safeoutputs CLI: ${safeOutputsPath}`);
+    logger(`report_missing_tool emitted via safeoutputs CLI: ${safeOutputsPath}`);
   } catch (error) {
     const err = /** @type {Error} */ /** @type {unknown} */ error;
-    logger(`missing_tool emission failed: ${err.message}`);
+    logger(`report_missing_tool emission failed: ${err.message}`);
   }
 }
 
@@ -156,7 +165,16 @@ function emitInfrastructureIncomplete(details, options) {
  * Diagnostic safe-output types that represent infrastructure signals, not task-level work.
  * Entries with these types are excluded when checking whether expected outputs were produced.
  */
-const DIAGNOSTIC_SAFE_OUTPUT_TYPES = new Set(["noop", "missing_tool", "report_incomplete"]);
+// Expected-output checks look for task-level outputs only, so noop is diagnostic
+// there even though terminal-output checks treat noop as a completed result.
+// report_missing_data is not an infrastructure diagnostic for expected-output checks,
+// but it is non-terminal for shared harness checks by default. Engines with
+// legacy terminal semantics opt report_missing_data/report_incomplete in via flags.
+const TERMINAL_SAFE_OUTPUT_TYPES = new Set(["noop"]);
+const DIAGNOSTIC_SAFE_OUTPUT_TYPES = new Set(["noop", "report_missing_tool", "report_incomplete"]);
+// Types in this set are excluded by the catch-all fallthrough; opt-in checks for
+// report_missing_data/report_incomplete must run before that fallthrough.
+const NON_TERMINAL_SAFE_OUTPUT_TYPES = new Set(["report_missing_tool", "report_missing_data", "report_incomplete"]);
 
 /**
  * Read the safe-outputs JSONL file and check whether it contains at least one
@@ -187,18 +205,82 @@ function hasExpectedSafeOutputs(safeOutputsPath, options) {
     return false;
   }
 
-  const lines = content.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && parsed.type && !DIAGNOSTIC_SAFE_OUTPUT_TYPES.has(parsed.type)) {
-        logger(`hasExpectedSafeOutputs: non-diagnostic entry found in ${safeOutputsPath}: type=${parsed.type}`);
-        return true;
+  for (const parsed of iterateJsonl(content)) {
+    if (parsed && parsed.type && !DIAGNOSTIC_SAFE_OUTPUT_TYPES.has(normalizeSafeOutputName(parsed.type))) {
+      logger(`hasExpectedSafeOutputs: non-diagnostic entry found in ${safeOutputsPath}: type=${parsed.type}`);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Read a safe-outputs JSONL file and check whether it contains a terminal agent
+ * result. Terminal outputs include noop and any non-diagnostic task output types.
+ * `byteOffset` scopes the check to output appended by the current attempt.
+ * @param {string} safeOutputsPath - Path to the safe-outputs JSONL file
+ * @param {{
+ *   byteOffset?: number,
+ *   includeMissingData?: boolean,
+ *   includeReportIncomplete?: boolean,
+ *   logger?: (msg: string) => void,
+ *   readFileSync?: (path: string, encoding: BufferEncoding) => string
+ * }=} options
+ * @returns {boolean}
+ */
+function hasTerminalSafeOutput(safeOutputsPath, options) {
+  const logger = options && options.logger ? options.logger : defaultLog;
+  const byteOffset = options && Number.isFinite(options.byteOffset) ? Number(options.byteOffset) : 0;
+
+  if (!safeOutputsPath) {
+    return false;
+  }
+  if (byteOffset > 0 && options?.readFileSync) {
+    logger("hasTerminalSafeOutput: byteOffset is unsupported with injected readFileSync; returning false");
+    return false;
+  }
+
+  let content;
+  try {
+    if (byteOffset > 0) {
+      const fd = fs.openSync(safeOutputsPath, "r");
+      try {
+        const stats = fs.fstatSync(fd);
+        const fileSize = stats.size;
+        if (fileSize <= byteOffset) return false;
+        const length = fileSize - byteOffset;
+        const buf = Buffer.allocUnsafe(length);
+        fs.readSync(fd, buf, 0, length, byteOffset);
+        content = buf.toString("utf8");
+      } finally {
+        fs.closeSync(fd);
       }
-    } catch {
-      // Skip malformed lines — they do not represent valid entries
+    } else {
+      const readFile = options && options.readFileSync ? options.readFileSync : fs.readFileSync;
+      content = readFile(safeOutputsPath, "utf8");
+    }
+  } catch {
+    return false;
+  }
+
+  for (const parsed of iterateJsonl(content)) {
+    const type = parsed && typeof parsed.type === "string" ? normalizeSafeOutputName(parsed.type) : "";
+    if (!type) continue;
+    if (TERMINAL_SAFE_OUTPUT_TYPES.has(type)) {
+      logger(`hasTerminalSafeOutput: terminal entry found in ${safeOutputsPath}: type=${type}`);
+      return true;
+    }
+    if (type === "report_missing_data" && options?.includeMissingData) {
+      logger(`hasTerminalSafeOutput: terminal entry found in ${safeOutputsPath}: type=${type}`);
+      return true;
+    }
+    if (type === "report_incomplete" && options?.includeReportIncomplete) {
+      logger(`hasTerminalSafeOutput: terminal entry found in ${safeOutputsPath}: type=${type}`);
+      return true;
+    }
+    if (!NON_TERMINAL_SAFE_OUTPUT_TYPES.has(type)) {
+      logger(`hasTerminalSafeOutput: terminal entry found in ${safeOutputsPath}: type=${type}`);
+      return true;
     }
   }
   return false;
@@ -232,18 +314,10 @@ function hasNoopInSafeOutputs(safeOutputsPath, options) {
     return false;
   }
 
-  const lines = content.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && parsed.type === "noop") {
-        logger(`hasNoopInSafeOutputs: noop entry found in ${safeOutputsPath}`);
-        return true;
-      }
-    } catch {
-      // Skip malformed lines — they do not represent valid noop entries
+  for (const parsed of iterateJsonl(content)) {
+    if (parsed && parsed.type === "noop") {
+      logger(`hasNoopInSafeOutputs: noop entry found in ${safeOutputsPath}`);
+      return true;
     }
   }
   return false;
@@ -264,6 +338,7 @@ if (typeof module !== "undefined" && module.exports) {
     emitMissingToolPermissionIssue,
     emitInfrastructureIncomplete,
     hasExpectedSafeOutputs,
+    hasTerminalSafeOutput,
     hasNoopInSafeOutputs,
   };
 }

@@ -214,7 +214,7 @@ func rpcEntryToTimelineEvent(entry RPCMessageEntry) (UnifiedTimelineEvent, bool)
 		ServerName: entry.ServerID,
 	}
 
-	switch entry.Type {
+	switch entry.EffectiveType() {
 	case "DIFC_FILTERED":
 		evt.Kind = TimelineKindDIFCFiltered
 		evt.ToolName = entry.ToolName
@@ -291,12 +291,15 @@ func auditEntryToTimelineEvent(entry AuditLogEntry) (UnifiedTimelineEvent, bool)
 func findGatewayJSONLPath(logDir string) string {
 	// Root-level gateway.jsonl (pre-mcp-logs-subdirectory artifact layout)
 	if p := filepath.Join(logDir, "gateway.jsonl"); fileutil.FileExists(p) {
+		gatewayLogsLog.Printf("Using root-level gateway.jsonl: %s", p)
 		return p
 	}
 	// mcp-logs/ subdirectory (standard layout after artifact download)
 	if p := filepath.Join(logDir, "mcp-logs", "gateway.jsonl"); fileutil.FileExists(p) {
+		gatewayLogsLog.Printf("Using mcp-logs gateway.jsonl: %s", p)
 		return p
 	}
+	gatewayLogsLog.Printf("No gateway.jsonl in %s, falling back to rpc-messages.jsonl", logDir)
 	// Fallback: rpc-messages.jsonl
 	return findRPCMessagesPath(logDir)
 }
@@ -527,8 +530,9 @@ func collectAgentTimelineEvents(logDir string, verbose bool) ([]UnifiedTimelineE
 // UnifiedTimelineEvent with Kind == TimelineKindSteering.
 // Returns (zero, false) when the entry is not a recognised steering event.
 //
-// The Status field is set to "token" for token_steering events and "time" for
-// timeout_steering events so that the renderer can apply appropriate icons.
+// The Status field is set to "token" for token_steering events, "time" for
+// timeout_steering events and "credit" for ai_credit_steering events, followed
+// by the budget threshold (for example "credit 90%") when AWF recorded one.
 // The Reason field carries the full message text.
 // The Time field is set from the Timestamp field when present; zero otherwise.
 func steeringEntryToTimelineEvent(entry proxyEventsEntry) (UnifiedTimelineEvent, bool) {
@@ -544,6 +548,11 @@ func steeringEntryToTimelineEvent(entry proxyEventsEntry) (UnifiedTimelineEvent,
 		status = "token"
 	case timeoutSteeringEventName:
 		status = "time"
+	case aiCreditSteeringEventName:
+		status = "credit"
+	}
+	if entry.Threshold > 0 {
+		status = fmt.Sprintf("%s %d%%", status, entry.Threshold)
 	}
 
 	var t time.Time
@@ -566,33 +575,25 @@ func steeringEntryToTimelineEvent(entry proxyEventsEntry) (UnifiedTimelineEvent,
 // returns a slice of TimelineKindSteering timeline events, one per recognised steering
 // record.  Returns nil (not an error) when no proxy events file is found.
 func collectSteeringTimelineEvents(logDir string, verbose bool) ([]UnifiedTimelineEvent, error) {
-	eventsPath := findAPIProxyEventsFile(logDir)
-	if eventsPath == "" {
+	log, err := findAPIProxyEventsLog(logDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse proxy events in %s: %w", logDir, err)
+	}
+	if log == nil {
 		gatewayLogsLog.Printf("No api-proxy events.jsonl found in %s; skipping steering timeline collection", logDir)
 		return nil, nil
 	}
 
-	gatewayLogsLog.Printf("Collecting steering timeline events from: %s", eventsPath)
+	gatewayLogsLog.Printf("Collecting steering timeline events from: %s", log.path)
 
-	f, err := os.Open(filepath.Clean(eventsPath))
-	if err != nil {
-		return nil, fmt.Errorf("failed to open proxy events file: %w", err)
-	}
-	defer f.Close()
-
-	entries, err := scanSteeringEntries(f)
-	if err != nil {
-		return nil, fmt.Errorf("scanner error reading proxy events: %w", err)
-	}
-
-	events := make([]UnifiedTimelineEvent, 0, len(entries))
-	for _, entry := range entries {
+	events := make([]UnifiedTimelineEvent, 0, len(log.entries))
+	for _, entry := range log.entries {
 		if evt, ok := steeringEntryToTimelineEvent(entry); ok {
 			events = append(events, evt)
 		}
 	}
 
-	gatewayLogsLog.Printf("Collected %d steering timeline events from %s", len(events), filepath.Base(eventsPath))
+	gatewayLogsLog.Printf("Collected %d steering timeline events from %s", len(events), filepath.Base(log.path))
 	return events, nil
 }
 

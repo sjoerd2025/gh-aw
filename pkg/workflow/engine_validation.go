@@ -56,6 +56,9 @@ var engineValidationLog = logger.New("workflow:engine_validation")
 // to "latest". Unpinned "latest" versions change unpredictably and undermine
 // supply chain security guarantees.
 func (c *Compiler) validateEngineVersion(workflowData *WorkflowData) error {
+	if err := c.validatePiEngineConfig(workflowData); err != nil {
+		return err
+	}
 	if workflowData.EngineConfig == nil || workflowData.EngineConfig.Version == "" {
 		// No explicit version set; the compiler uses its own pinned default.
 		return nil
@@ -72,7 +75,7 @@ func (c *Compiler) validateEngineVersion(workflowData *WorkflowData) error {
 		"and may introduce vulnerabilities or breaking changes. " +
 		"Pin the engine version to a specific version for reproducibility and security."
 
-	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
+	fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(warningMsg))
 	c.IncrementWarningCount()
 	return nil
 }
@@ -155,8 +158,20 @@ func isModelOnlyEngineJSON(engineJSON string) bool {
 	return hasPreference
 }
 
+// isEngineDefinitionJSON reports whether engineJSON declares a shared engine definition
+// (an engine object carrying a 'behaviors' block). Such entries define an engine's
+// installation and execution rather than selecting the workflow's engine.
+func isEngineDefinitionJSON(engineJSON string) bool {
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(engineJSON), &obj); err != nil {
+		return false
+	}
+	_, hasBehaviors := obj["behaviors"]
+	return hasBehaviors
+}
+
 // validateSingleEngineSpecification validates that only one engine field exists across all files
-func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, includedEnginesJSON []string) (string, error) {
+func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, includedEnginesJSON []string) (string, error) { //nolint:largefunc // Preserve existing engine-import validation and error precedence.
 	var allEngines []string
 	// firstIncludedRealEngine holds the raw JSON of the first non-model-only engine spec
 	// from included files. It is used below to extract the engine ID when the single
@@ -174,6 +189,10 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 	// "multiple engine fields" errors when a shared workflow only declares engine.model
 	// without engine.id). Objects with unknown keys or empty objects are not skipped
 	// and will continue through normal validation.
+	// Engine *definition* files (declaring behaviors) describe how to run an engine
+	// rather than selecting one, so they only act as a selection when nothing else
+	// specifies an engine.
+	var firstIncludedDefinition string
 	for _, engineJSON := range includedEnginesJSON {
 		if engineJSON == "" {
 			continue
@@ -181,10 +200,20 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 		if isModelOnlyEngineJSON(engineJSON) {
 			continue
 		}
+		if isEngineDefinitionJSON(engineJSON) {
+			if firstIncludedDefinition == "" {
+				firstIncludedDefinition = engineJSON
+			}
+			continue
+		}
 		allEngines = append(allEngines, engineJSON)
 		if firstIncludedRealEngine == "" {
 			firstIncludedRealEngine = engineJSON
 		}
+	}
+	if len(allEngines) == 0 && firstIncludedDefinition != "" {
+		allEngines = append(allEngines, firstIncludedDefinition)
+		firstIncludedRealEngine = firstIncludedDefinition
 	}
 
 	// Check count (only counting real engine specifications)
@@ -192,7 +221,7 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 		return "", nil // No engine specification found anywhere; will use default
 	}
 
-	if len(allEngines) > 1 {
+	if len(allEngines) > 1 && !canMergeModelRoutingEngineSpecifications(mainEngineSetting, allEngines) {
 		return "", fmt.Errorf("multiple engine fields found (%d engine specifications detected). Only one engine field is allowed across the main workflow and all included files. Remove duplicate engine specifications to keep only one.\n\nExample:\nengine: copilot\n\nSee: %s", len(allEngines), constants.DocsEnginesURL)
 	}
 
@@ -232,6 +261,34 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 	return "", fmt.Errorf("invalid engine configuration in included file, missing or invalid 'id' field. Expected string, object with 'id' field, or inline definition with 'runtime.id'.\n\nExample (string):\nengine: copilot\n\nExample (object with id):\nengine:\n  id: copilot\n  model: gpt-4\n\nExample (inline runtime definition):\nengine:\n  runtime:\n    id: codex\n\nSee: %s", constants.DocsEnginesURL)
 }
 
+func canMergeModelRoutingEngineSpecifications(mainEngineSetting string, engineSpecs []string) bool {
+	engineID := mainEngineSetting
+	mainEngineSeen := false
+	for _, engineJSON := range engineSpecs {
+		if mainEngineSetting != "" && engineJSON == mainEngineSetting && !mainEngineSeen {
+			mainEngineSeen = true
+			continue
+		}
+		var engine map[string]any
+		if err := json.Unmarshal([]byte(engineJSON), &engine); err != nil {
+			return false
+		}
+		if _, ok := engine["model-routing"].(map[string]any); !ok {
+			return false
+		}
+		id, ok := engine["id"].(string)
+		if !ok || id == "" {
+			return false
+		}
+		if engineID == "" {
+			engineID = id
+		} else if !strings.EqualFold(engineID, id) {
+			return false
+		}
+	}
+	return engineID != ""
+}
+
 // EngineHasValidateSecretStep checks if the engine provides a validate-secret step.
 // This is used to determine whether the secret_verification_result job output should be added.
 //
@@ -239,7 +296,6 @@ func (c *Compiler) validateSingleEngineSpecification(mainEngineSetting string, i
 //   - Copilot engine: Adds step unless permissions.copilot-requests is write or custom command is set
 //   - Claude engine: Adds step unless custom command is set
 //   - Codex engine: Adds step unless custom command is set
-//   - Antigravity engine: Adds step unless custom command is set
 //   - Gemini engine: Adds step unless custom command is set
 //   - Custom engine: Never adds this step (uses BaseEngine default which returns empty)
 //

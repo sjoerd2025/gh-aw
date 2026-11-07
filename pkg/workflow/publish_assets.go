@@ -3,20 +3,19 @@ package workflow
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/typeutil"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 )
 
 var publishAssetsLog = logger.New("workflow:publish_assets")
-var githubExpressionPattern = regexp.MustCompile(`(?s)^\$\{\{.*\}\}$`)
 
 func isGitHubExpression(value string) bool {
-	trimmed := strings.TrimSpace(value)
-	return githubExpressionPattern.MatchString(trimmed)
+	_, ok := actionslanguageservice.WrappedExpression(value)
+	return ok
 }
 
 func normalizeAllowedExtension(extension string) string {
@@ -139,7 +138,7 @@ func (c *Compiler) buildUploadAssetsJob(data *WorkflowData, mainJobName string, 
 		// Publish assets job depends on the agent job; reuse its trace ID so all jobs share one OTLP trace
 		publishTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
 		publishParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		preSteps = append(preSteps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, publishTraceID, publishParentSpanID)...)
+		preSteps = append(preSteps, c.generateSetupStepForJob("upload_assets", data, setupActionRef, SetupActionDestination, false, publishTraceID, publishParentSpanID, "")...)
 	}
 
 	// Step 1: Checkout repository
@@ -246,7 +245,7 @@ func generateSafeOutputsAssetsArtifactUpload(builder *strings.Builder, data *Wor
 
 	builder.WriteString("      # Upload safe-outputs assets for upload_assets job\n")
 	builder.WriteString("      - name: Upload Safe Outputs Assets\n")
-	builder.WriteString("        if: always()\n")
+	builder.WriteString("        if: always() && " + secretRedactionSuccessCondition(data) + "\n")
 	fmt.Fprintf(builder, "        uses: %s\n", pinAction("actions/upload-artifact"))
 	builder.WriteString("        with:\n")
 	fmt.Fprintf(builder, "          name: %ssafe-outputs-assets\n", prefix)

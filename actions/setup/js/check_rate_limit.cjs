@@ -9,7 +9,8 @@ const { fetchAndLogRateLimit } = require("./github_rate_limit_logger.cjs");
  * Prevents users from triggering workflows too frequently
  */
 
-const PROGRAMMATIC_EVENTS = ["workflow_dispatch", "repository_dispatch", "issue_comment", "pull_request_review", "pull_request_review_comment", "discussion_comment"];
+// Keep in sync with pkg/workflow/role_checks.go and the user-rate-limit.events schema enum.
+const PROGRAMMATIC_EVENTS = ["discussion", "discussion_comment", "issue_comment", "issues", "pull_request", "pull_request_review", "pull_request_review_comment", "repository_dispatch", "workflow_dispatch"];
 
 async function main() {
   const {
@@ -43,8 +44,11 @@ async function main() {
 
   // Get configuration from environment variables
   // Use .trim() + || so that empty/whitespace-only values also fall back to defaults
-  const maxRuns = parseInt(process.env.GH_AW_RATE_LIMIT_MAX?.trim() || "5", 10);
-  const windowMinutes = parseInt(process.env.GH_AW_RATE_LIMIT_WINDOW?.trim() || "60", 10);
+  const maxRuns = Number(process.env.GH_AW_RATE_LIMIT_MAX?.trim() || "5");
+  const windowMinutes = Number(process.env.GH_AW_RATE_LIMIT_WINDOW?.trim() || "60");
+  if (!Number.isFinite(maxRuns) || !Number.isSafeInteger(maxRuns) || maxRuns <= 0 || !Number.isFinite(windowMinutes) || !Number.isSafeInteger(windowMinutes) || windowMinutes <= 0) {
+    throw new Error("Rate limit maximum and window must be positive integers");
+  }
   const eventsList = process.env.GH_AW_RATE_LIMIT_EVENTS?.trim() || "";
   // Default: admin, maintain, and write roles are exempt from rate limiting
   const ignoredRolesList = process.env.GH_AW_RATE_LIMIT_IGNORED_ROLES?.trim() || "admin,maintain,write";
@@ -109,8 +113,8 @@ async function main() {
 
   // Calculate time threshold
   const windowMs = windowMinutes * 60 * 1000;
-  const thresholdTime = new Date(Date.now() - windowMs);
-  const thresholdISO = thresholdTime.toISOString();
+  const thresholdTimestamp = Date.now() - windowMs;
+  const thresholdISO = new Date(thresholdTimestamp).toISOString();
 
   core.info(`   Time window: runs created after ${thresholdISO}`);
 
@@ -156,11 +160,16 @@ async function main() {
           break;
         }
 
-        // Skip if run is older than the time window
+        // Stop if run is older than the time window (runs are newest-first)
         const runCreatedAt = new Date(run.created_at);
-        if (runCreatedAt < thresholdTime) {
-          core.info(`   Skipping run ${run.id} - created before threshold (${run.created_at})`);
+        if (Number.isNaN(runCreatedAt.getTime())) {
+          core.warning(`Skipping run ${run.id} with invalid creation date`);
           continue;
+        }
+        if (runCreatedAt.getTime() < thresholdTimestamp) {
+          core.info(`   Stopping pagination - run ${run.id} created before threshold (${run.created_at})`);
+          hasMore = false;
+          break;
         }
 
         // Check if run is by the same actor

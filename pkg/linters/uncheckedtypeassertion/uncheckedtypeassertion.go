@@ -7,32 +7,22 @@ import (
 	"go/ast"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:uncheckedtypeassertion")
+
 // Analyzer is the unchecked-type-assertion analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "uncheckedtypeassertion",
-	Doc:      "reports single-value type assertions that may panic if the dynamic type does not match",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/uncheckedtypeassertion",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("uncheckedtypeassertion", "reports single-value type assertions that may panic if the dynamic type does not match", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -40,18 +30,16 @@ func run(pass *analysis.Pass) (any, error) {
 	// Build a parent map for each file so we can detect the two-value form.
 	fileParents := make(map[*ast.File]map[ast.Node]ast.Node)
 	for _, f := range pass.Files {
-		fileParents[f] = buildParentMap(f)
+		fileParents[f] = astutil.BuildParentMap(f)
 	}
 
 	nodeFilter := []ast.Node{
 		(*ast.TypeAssertExpr)(nil),
 	}
 
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		inspectTypeAssertExpr(pass, noLintIndex, generatedFiles, fileParents, n)
 	})
-
-	return nil, nil
 }
 
 func inspectTypeAssertExpr(pass *analysis.Pass, noLintIndex nolint.DirectiveIndex, generatedFiles filecheck.GeneratedIndex, fileParents map[*ast.File]map[ast.Node]ast.Node, n ast.Node) {
@@ -92,6 +80,7 @@ func inspectTypeAssertExpr(pass *analysis.Pass, noLintIndex nolint.DirectiveInde
 		return
 	}
 
+	pkgLog.Printf("flagging unchecked type assertion to %s at %s", t, pos)
 	pass.ReportRangef(
 		typeAssert,
 		"type assertion x.(%s) is unchecked and may panic; use the two-value form v, ok := x.(%s) instead",
@@ -100,43 +89,6 @@ func inspectTypeAssertExpr(pass *analysis.Pass, noLintIndex nolint.DirectiveInde
 }
 
 func isSafeTwoValueAssertion(typeAssert *ast.TypeAssertExpr, parents map[ast.Node]ast.Node) bool {
-	parent := parents[typeAssert]
-	for parent != nil {
-		paren, ok := parent.(*ast.ParenExpr)
-		if !ok {
-			break
-		}
-		parent = parents[paren]
-	}
-
-	switch p := parent.(type) {
-	case *ast.AssignStmt:
-		return len(p.Lhs) == 2 && len(p.Rhs) == 1
-	case *ast.ValueSpec:
-		return len(p.Names) == 2 && len(p.Values) == 1
-	default:
-		return false
-	}
-}
-
-// buildParentMap constructs a map from each AST node to its direct parent node.
-func buildParentMap(root ast.Node) map[ast.Node]ast.Node {
-	parents := make(map[ast.Node]ast.Node)
-	var stack []ast.Node
-
-	ast.Inspect(root, func(n ast.Node) bool {
-		if n == nil {
-			if len(stack) > 0 {
-				stack = stack[:len(stack)-1]
-			}
-			return false
-		}
-		if len(stack) > 0 {
-			parents[n] = stack[len(stack)-1]
-		}
-		stack = append(stack, n)
-		return true
-	})
-
-	return parents
+	_, isTwoValue := astutil.TwoValueTypeAssertionOKIdent(typeAssert, parents)
+	return isTwoValue
 }

@@ -196,8 +196,10 @@ func createMCPToolConfig(server *MCPRegistryServerForProcessing, preferredTransp
 					mcpSection["container"] = containerStr
 
 					// Add environment variables for Docker container
-					if env, hasEnv := server.Config["env"]; hasEnv {
-						mcpSection["env"] = convertToGitHubActionsEnv(env, server.EnvironmentVariables)
+					if envRaw, hasEnv := server.Config["env"]; hasEnv {
+						if envMap, ok := envRaw.(map[string]any); ok {
+							mcpSection["env"] = convertToGitHubActionsEnv(envMap, server.EnvironmentVariables)
+						}
 					}
 				}
 			} else {
@@ -218,8 +220,10 @@ func createMCPToolConfig(server *MCPRegistryServerForProcessing, preferredTransp
 				}
 
 				// Add environment variables if present
-				if env, hasEnv := server.Config["env"]; hasEnv {
-					mcpSection["env"] = convertToGitHubActionsEnv(env, server.EnvironmentVariables)
+				if envRaw, hasEnv := server.Config["env"]; hasEnv {
+					if envMap, ok := envRaw.(map[string]any); ok {
+						mcpSection["env"] = convertToGitHubActionsEnv(envMap, server.EnvironmentVariables)
+					}
 				}
 			}
 		} else {
@@ -267,8 +271,10 @@ func createMCPToolConfig(server *MCPRegistryServerForProcessing, preferredTransp
 			}
 
 			// Add environment variables if present
-			if env, hasEnv := server.Config["env"]; hasEnv {
-				mcpSection["env"] = convertToGitHubActionsEnv(env, server.EnvironmentVariables)
+			if envRaw, hasEnv := server.Config["env"]; hasEnv {
+				if envMap, ok := envRaw.(map[string]any); ok {
+					mcpSection["env"] = convertToGitHubActionsEnv(envMap, server.EnvironmentVariables)
+				}
 			}
 		} else {
 			return nil, errors.New("docker transport requires configuration")
@@ -330,8 +336,7 @@ The command will:
   gh aw mcp add weekly-research makenotion/notion-mcp-server  # Add Notion MCP server to weekly-research.md
   gh aw mcp add weekly-research makenotion/notion-mcp-server --transport stdio  # Prefer stdio transport
   gh aw mcp add weekly-research makenotion/notion-mcp-server --registry https://custom.registry.com/v1  # Use custom registry
-  gh aw mcp add weekly-research makenotion/notion-mcp-server --tool-id my-notion  # Use custom tool ID
-`,
+  gh aw mcp add weekly-research makenotion/notion-mcp-server --tool-id my-notion  # Use custom tool ID`,
 		Args: cobra.RangeArgs(0, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			verbose, _ := cmd.Flags().GetBool("verbose")

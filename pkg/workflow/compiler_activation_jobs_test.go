@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -119,7 +120,7 @@ func TestBuildPreActivationJob_WithReaction(t *testing.T) {
 			workflowData := &WorkflowData{
 				Name:       "Test Workflow",
 				Command:    []string{"test"},
-				AIReaction: tt.reaction,
+				AIReaction: ReactionType(tt.reaction),
 			}
 
 			// Pre-activation job should NOT contain the reaction step any more
@@ -299,6 +300,66 @@ func TestBuildActivationJob_SkipsSecretValidationWithEnvironment(t *testing.T) {
 	stepsStr := strings.Join(job.Steps, "")
 	assert.NotContains(t, stepsStr, "id: validate-secret", "Activation job should skip validate-secret when top-level environment is configured")
 	assert.NotContains(t, job.Outputs, "secret_verification_result", "Activation job should not expose secret_verification_result output when validate-secret is skipped")
+}
+
+// TestBuildActivationJob_Environment verifies that manual-approval takes precedence over the workflow environment.
+func TestBuildActivationJob_Environment(t *testing.T) {
+	tests := []struct {
+		name        string
+		environment string
+		approval    string
+		want        string
+	}{
+		{
+			name: "no environment",
+		},
+		{
+			name:        "inherits workflow environment",
+			environment: "environment: production",
+			want:        "environment: production",
+		},
+		{
+			name:        "indents workflow environment object",
+			environment: "environment:\n  name: production\n  url: https://example.com",
+			want:        "environment:\n      name: production\n      url: https://example.com",
+		},
+		{
+			name:        "manual approval environment takes precedence",
+			environment: "environment: production",
+			approval:    "approval",
+			want:        "environment: approval",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &WorkflowData{
+				Environment:    tt.environment,
+				ManualApproval: tt.approval,
+			}
+			job, err := NewCompiler().buildActivationJob(data, false, "", "test.lock.yml")
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, job.Environment)
+		})
+	}
+}
+
+func TestBuildActivationJob_ManualApprovalPreservesEnvironmentDeployment(t *testing.T) {
+	data := &WorkflowData{
+		Environment:    "environment:\n  name: production\n  url: https://example.com\n  deployment: false",
+		ManualApproval: "approval",
+	}
+
+	job, err := NewCompiler().buildActivationJob(data, false, "", "test.lock.yml")
+	require.NoError(t, err)
+
+	var compiled map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(job.Environment), &compiled))
+	assert.Equal(t, map[string]any{
+		"name":       "approval",
+		"url":        "https://example.com",
+		"deployment": false,
+	}, compiled["environment"])
 }
 
 // TestBuildActivationJob_OAuthTokenCheckStep verifies that the activation job

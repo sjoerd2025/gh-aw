@@ -5,7 +5,10 @@ sidebar:
   order: 5
 ---
 
-Custom safe outputs extend built-in GitHub operations to integrate with third-party services — Slack, Discord, Notion, Jira, databases, or any external API requiring authentication. Use them for any write operation that built-in safe outputs don't cover.
+Custom safe outputs extend built-in GitHub operations to integrate with third-party services — Slack, Discord, Notion, databases, or any external API requiring authentication. Use them for write operations that built-in safe outputs do not already cover.
+
+> [!NOTE]
+> Jira Cloud now has built-in safe outputs for issue creation, issue updates, comments, and label additions. Use the built-in Jira handlers when those operations are sufficient, and reach for custom safe outputs only when you need unsupported Jira mutations or another external system.
 
 ## Quick Start
 
@@ -84,6 +87,39 @@ Custom safe outputs separate read and write operations: agents use read-only Mod
 ```
 
 ## Creating a Custom Safe Output
+
+### Recording execution outcomes
+
+Custom jobs can expose execution status and the canonical resource URI through
+two optional job output mappings:
+
+```yaml
+outputs:
+  status: ${{ steps.publish.outputs.status }}
+  url: ${{ steps.publish.outputs.url }}
+```
+
+The step with `id: publish` sets these outputs using `$GITHUB_OUTPUT` or
+`core.setOutput`. Set `status` to `success`, `failure`, `cancelled`, or `skipped`.
+Use `skipped` for staged previews and intentional no-ops. Set `url` only to the
+absolute URI returned by the service for the generated resource, never a URI
+suggested by the agent. These outputs describe one job-level outcome; a job
+processing multiple items must choose the resource it reports.
+
+Conclusion records a `safe_output.result` event in `usage/aw_session.jsonl` with
+`data.type` set to the normalized job name, `data.status`, and optional `data.url`.
+Without an explicit status, the Actions job result is used. Failed, cancelled,
+and skipped jobs cannot report successful resource creation, and their resource
+URLs are omitted. A successful job without a URL proves execution, not creation
+of an identifiable resource. Invalid status or URI values produce collection
+warnings without publishing their contents. Prepared work-queue adapters retain
+their separate effect-verification contract.
+
+Custom safe scripts use the handler return value instead of job outputs:
+return `{ success: true, url: canonicalResourceUri }` after the service confirms
+the operation. The manifest transports this status and URI to conclusion.
+Staged previews and deferred operations do not become successful resource events;
+script failures remain available as `safe_output.error` evidence.
 
 ### Step 1: Define the Shared Configuration
 
@@ -218,6 +254,96 @@ The agent uses read-only tools to query, then calls the safe-job which executes 
 
 ## Safe Job Reference
 
+### Attribution and Tracking
+
+Custom jobs should add a generated-by footer linking to the workflow run and preserve workflow provenance annotations on published issues, discussions, and comments. Direct API calls bypass the built-in handlers: without attribution, provenance searches, audits, and workflow-output tracking cannot identify those items as workflow-generated. Preserve the footer and annotations when updating existing content.
+
+Custom jobs receive the same `GH_AW_WORKFLOW_*`, engine, tracker, message, and detection metadata as built-in safe-output jobs. For GitHub issues, use the stable API below rather than maintaining footer templates or metadata comments manually. For other destinations, include equivalent attribution and a workflow-run link in the custom implementation.
+
+### Issue Creation API
+
+`actions/setup/js/index.cjs` re-exports the supported `setupGlobals`, `createIssue`, and `logSpan` API for custom jobs. Issue creation is implemented in the existing `create_issue.cjs` handler module; telemetry comes from `otlp.cjs`. Run the setup action to install the runtime helpers and prompt templates, then load `${RUNNER_TEMP}/gh-aw/actions/index.cjs` from `actions/github-script`.
+
+```aw wrap
+safe-outputs:
+  jobs:
+    publish-finding:
+      description: "Publish one validated finding"
+      runs-on: ubuntu-latest
+      permissions:
+        issues: write
+      inputs:
+        body:
+          description: "Finding details"
+          required: true
+          type: string
+      steps:
+        - uses: github/gh-aw/actions/setup@main
+        - uses: actions/github-script@v9.0.0
+          with:
+            script: |
+              const fs = require("node:fs");
+              const actionsDir = `${process.env.RUNNER_TEMP}/gh-aw/actions`;
+              const { setupGlobals, createIssue } = require(`${actionsDir}/index.cjs`);
+              setupGlobals(core, github, context, exec, io, getOctokit);
+              const { sanitizeContent } = require(`${actionsDir}/sanitize_content.cjs`);
+              const output = JSON.parse(fs.readFileSync(process.env.GH_AW_AGENT_OUTPUT, "utf8"));
+              const items = output.items.filter(item => item.type === "publish_finding");
+              if (items.length !== 1 || typeof items[0].body !== "string") {
+                throw new Error("Exactly one finding with a string body is required");
+              }
+              const result = await createIssue({
+                title: "Validated workflow finding",
+                body: sanitizeContent(items[0].body),
+              });
+              if (!result.staged) core.info(result.issue.html_url);
+```
+
+Use a release containing this API, and pin the setup action to a trusted commit in production.
+
+| API | Contract |
+|-----|----------|
+| `setupGlobals(core, github, context, exec, io, getOctokit)` | Initializes the GitHub Actions runtime once before calling `createIssue`. |
+| `createIssue(parameters)` | Accepts Octokit issue-creation parameters, with a required string `body`; `owner` and `repo` default to the workflow repository. Labels are sanitized and deduplicated; labels and assignees use the built-in handler's limits. Returns `{ staged: false, issue }` with the created Octokit issue, or `{ staged: true, preview }` with the fully decorated request when `GH_AW_SAFE_OUTPUTS_STAGED` is `"true"`. Throws on invalid input or API failure. |
+| `logSpan(toolName, attributes?, options?)` | Re-exports the [OpenTelemetry span helper](/gh-aw/reference/open-telemetry/#custom-spans-from-shared-imports). Returns `Promise<void>`, uses the configured trace context, and preserves its non-fatal export behavior. |
+
+The helper adds the standard generated-by footer, workflow-run and history links, configured headers and disclosure, detection warnings, and workflow, caller, engine, and tracker annotations. Cross-repository issues still link to the original workflow run. Missing attribution metadata or a body exceeding GitHub's 65,536-character limit **including attribution** fails before creation; content is not silently truncated.
+
+`parameters.artifacts` accepts [issue artifacts](/gh-aw/reference/safe-outputs/#issue-artifacts) with inline `body` content, with a maximum of 10 artifacts per issue and 1048576 UTF-8 bytes (1 MB) per artifact body. Unlike the built-in MCP tool, this privileged helper does not accept `path`. Artifacts are validated before issue creation and attached afterward using the same client and repository. The custom job must sanitize their names and content. Live results include `artifacts: [{ number, url }]` when attachments were created; staged previews include the artifact requests without writing them. An attachment failure throws an error identifying the already-created issue and how many artifacts were attached. The built-in `create-issue` frontmatter limit does not configure custom jobs.
+
+The helper's JSDoc types are `CreateIssueParameters` and `CreateIssueResult`. Shared artifact types distinguish `IssueArtifactInput` (MCP input with exactly one of `body` or `path`), `IssueArtifactBodyInput` (body-only input for this helper and recorded requests), normalized `IssueArtifact` (required format), and `CreatedIssueArtifact` (numeric `number` and a `url` that may be undefined). Narrow results on `staged` to access either normalized preview artifacts or created artifact metadata.
+
+This is a posting helper, not the built-in `create-issue` policy handler. The custom job remains responsible for validating and sanitizing agent-controlled content, enforcing job-level output counts and allowed repositories, and supplying a token with appropriate permissions. Trusted custom metadata comments are preserved. The helper does not perform grouping, deduplication, expiration, assignment to agents, or manifest artifact upload.
+
+#### Attaching a Text File as an Issue Artifact
+
+For the built-in `create_issue` MCP tool, pass [`artifacts[].path`](/gh-aw/reference/safe-outputs/#attaching-files-by-path); the backend reads the file before recording its content, so no separate file transport is needed. The following alternative applies only to a trusted custom job using `createIssue`, which accepts `body`, not `path`. When the agent writes `/tmp/gh-aw/agent/issue-plan.md`, declare that file in the custom job so it survives the runner boundary:
+
+```yaml
+artifacts:
+  - /tmp/gh-aw/agent/issue-plan.md
+```
+
+The compiler downloads declared files beside the agent output, preserving their path relative to `/tmp/gh-aw/`. After the setup action and `setupGlobals` call from the example above, read the downloaded file using the installed guarded-file helper and pass its sanitized text as `body`:
+
+```javascript
+const path = require("node:path");
+const { readGuardedFile } = require(`${actionsDir}/symlink_guard.cjs`);
+const source = path.join(path.dirname(process.env.GH_AW_AGENT_OUTPUT), "agent", "issue-plan.md");
+const body = sanitizeContent(readGuardedFile(source, 1048576).toString("utf8"), {
+  maxLength: Number.MAX_SAFE_INTEGER,
+  maxLines: Number.MAX_SAFE_INTEGER,
+});
+const result = await createIssue({
+  title: "Implement parser caching",
+  body: "The implementation plan is attached.",
+  artifacts: [{ type: "plan", name: "Implementation plan", body }],
+});
+if (!result.staged) core.info(result.issue.html_url);
+```
+
+The file read rejects oversized or unsafe sources before issue creation. Artifact validation still checks the sanitized UTF-8 body against the helper's 1 MB default. Use a fixed declared path, not an unchecked agent-supplied path. See [depending on agent-job files](#depending-on-agent-job-files) for supported extensions, redaction, and path restrictions. Binary files and downloadable originals use [path-based file uploads](/gh-aw/reference/safe-outputs/#attaching-files-by-path), not issue artifact bodies.
+
 ### Job Properties
 
 | Property | Type | Required | Description |
@@ -232,6 +358,7 @@ The agent uses read-only tools to query, then calls the safe-job which executes 
 | `env` | object | No | Environment variables for all steps |
 | `if` | string | No | Conditional execution expression |
 | `timeout-minutes` | number | No | Maximum job duration (GitHub Actions default: 360) |
+| `artifacts` | array of strings | No | Agent-job filesystem paths this job depends on (see [Depending on Agent-Job Files](#depending-on-agent-job-files)) |
 
 ### Job Ordering (`needs:`)
 
@@ -272,12 +399,27 @@ All jobs must define `inputs`:
 | `boolean` | True/false (as strings: `"true"` or `"false"`) |
 | `choice` | Selection from predefined options |
 
+Input definitions also support `description`, `required`, and `default`. String
+inputs (including inputs with an omitted `type`) in jobs and scripts may set
+`max-length` to override
+the default 10,240-byte input limit:
+
+| Property | Type | Applies to | Description |
+|----------|------|------------|-------------|
+| `max-length` | integer | `string` inputs | Maximum allowed length in characters; 1–1,000,000. Replaces the default 10,240-byte limit for this input. |
+
+This is useful for large structured values that must remain in the safe-output
+item, such as data inspected by threat detection or post-processing steps. Use
+`artifacts:` instead when the payload is a file or directory; artifact files are
+available to the custom job but are not part of the safe-output item.
+
 ```yaml wrap
 inputs:
   message:
     description: "Message content"
     required: true
     type: string
+    max-length: 40000
   notify:
     description: "Send notification"
     required: false
@@ -334,16 +476,52 @@ steps:
 
 The `inputs:` schema serves as both the MCP tool definition visible to the agent and validation for the output fields written to `GH_AW_AGENT_OUTPUT`.
 
+> [!IMPORTANT]
+> A custom job runs **once per workflow run**, not once per tool call. If the agent calls the tool multiple times, every call is collected into the `.items[]` array of the single `GH_AW_AGENT_OUTPUT` file. Your job must iterate over `.items[]` (for example with `jq -c '.items[] | select(.type == "my_job")'`) to process all calls. Reading only `.items[0]` silently drops every call after the first — the run still succeeds, so the data loss is easy to miss.
+>
+> Because inline [scripts](#inline-script-handlers-safe-outputsscripts) cannot access repository secrets, any per-item handler that needs a secret (for example to call an external API with a token) must be a job — and therefore must loop over `.items[]` itself.
+
+### Depending on Agent-Job Files
+
+The agent job only uploads a fixed set of paths as its artifact (logs, patches, `agent_output.json`, and a few other compiler-managed files). If your job's `inputs` reference a filesystem path the agent wrote during the run (for example a directory the prompt instructed the agent to populate under `/tmp/gh-aw/agent/`), that path is **not** included by default and is silently dropped — the custom job will fail trying to read a file that was never uploaded.
+
+Declare any such paths with `artifacts:` so the compiler persists them in the unified agent artifact upload:
+
+```yaml wrap
+safe-outputs:
+  jobs:
+    publish-review-bundle:
+      description: "Publish a prepared directory as a workflow artifact"
+      runs-on: ubuntu-latest
+      artifacts:
+        - /tmp/gh-aw/agent/review-bundles/
+      inputs:
+        source_dir:
+          description: "Directory under /tmp/gh-aw/agent/ containing prepared files"
+          required: true
+          type: string
+      steps:
+        - run: |
+            # $GH_AW_AGENT_OUTPUT's directory contains the downloaded agent artifact,
+            # so the declared path above is available under that same root here.
+            echo "processing bundle"
+```
+
+Each entry must be a literal path or glob rooted under `/tmp/gh-aw/` (the same tree the compiler already scans for secrets before upload); GitHub Actions expressions and control characters are rejected. Directory paths must end with `/`; the compiler expands them to recursive globs so only files with extensions covered by secret redaction (`.txt`, `.json`, `.log`, `.md`, `.mdx`, `.yml`, `.jsonl`, or `.patch`) are persisted. File paths or globs must use one of those extensions. Paths outside that root, entries containing `..` path traversal segments, and entries referencing hidden files or directories (any path segment starting with `.`, since the unified artifact upload does not include hidden files) are all rejected at compile time. The redaction pass also removes symbolic links before upload so they cannot resolve outside the scanned tree. Prefer embedding values directly in the safe-output item when later stages must inspect them; use `max-length` for larger strings. Reach for `artifacts:` when the payload is a directory or multiple files that do not need to be part of the safe-output item.
+
+If artifact secret redaction fails, the source is removed and the step fails. Diagnostics include a fixed operation stage (`read`, `redact`, `write`, `replace`, or `unlink`) and an allowlisted filesystem error code, such as `EACCES`, `EPERM`, or `ENOSPC`; unrecognized errors use `unknown`. Exception messages, file paths, secret values, and runtime masks are excluded from these failure diagnostics. A failed removal remains a fatal error, not permission to upload the unsanitized source.
+
 ## Inline Script Handlers (`safe-outputs.scripts`)
 
-Use `safe-outputs.scripts` to define lightweight inline JavaScript handlers that execute inside the consolidated safe-outputs job handler loop. Unlike `jobs` (which create a separate GitHub Actions job for each tool call), scripts run in-process alongside the built-in safe-output handlers — there is no extra job allocation or startup overhead.
+Use `safe-outputs.scripts` to define lightweight inline JavaScript handlers that execute inside the consolidated safe-outputs job handler loop. Unlike `jobs` (which run as a single separate GitHub Actions job per workflow run, processing all of that tool's calls together), scripts run in-process alongside the built-in safe-output handlers — once per tool call, with no extra job allocation or startup overhead.
 
 **When to use scripts vs jobs:**
 
 | | Scripts | Jobs |
 |---|---|---|
 | Execution | In-process, in the consolidated safe-outputs job | Separate GitHub Actions job |
-| Startup | Fast (no job scheduling) | Slower (new job per call) |
+| Invocation | Once per tool call (each call gets its own `item`) | Once per workflow run (job must loop over `.items[]`) |
+| Startup | Fast (no job scheduling) | Slower (one job per run) |
 | Secrets | Not directly available — use for lightweight logic | Full access to repository secrets |
 | Use case | Lightweight processing, logging, notifications without secrets | External API calls requiring secrets |
 
@@ -516,7 +694,7 @@ When `GH_AW_SAFE_OUTPUTS_STAGED === 'true'`, skip the real operation and display
 | Job fails silently | Add `core.info()` logging and ensure `core.setFailed()` is called on errors |
 | Agent calls wrong tool | Make `description` specific and unique; explicitly mention job name in prompt |
 
-## Related Documentation
+## Learn More
 
 - [DeterministicOps](/gh-aw/patterns/deterministic-ops/) - Mixing computation and AI reasoning
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Built-in safe output types

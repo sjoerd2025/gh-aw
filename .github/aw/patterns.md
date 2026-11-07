@@ -19,6 +19,10 @@ Use this router when a user asks for a workflow architecture, strategy, operatin
 
 Pattern docs base path: `https://github.com/github/gh-aw/blob/main/docs/src/content/docs/patterns/`
 
+### Documentation Workflows
+- **Load when:** The user needs documentation agents, required docs checks, or post-merge page/index upkeep.
+- **Instructions:** [documentation-workflows.md](documentation-workflows.md)
+
 ### MonitorOps
 - **Load when:** The user needs repository-wide workflow observability, trend reporting, and escalation for recurring failures or token waste.
 - **Pattern doc:** https://github.com/github/gh-aw/blob/main/docs/src/content/docs/patterns/monitor-ops.md
@@ -51,6 +55,10 @@ Pattern docs base path: `https://github.com/github/gh-aw/blob/main/docs/src/cont
 - **Load when:** The user needs manual trigger flows (`workflow_dispatch`) with custom inputs for testing or controlled runs.
 - **Pattern doc:** https://github.com/github/gh-aw/blob/main/docs/src/content/docs/patterns/dispatch-ops.md
 
+### Feature Grower
+- **Load when:** The user wants a scheduled agent to advance long-lived features one implementation-ready sub-issue at a time.
+- **Pattern doc:** https://github.com/github/gh-aw/blob/main/docs/src/content/docs/patterns/feature-grower.md
+
 ### IssueOps
 - **Load when:** The user needs fully automated issue triage, categorization, and responses on issue events.
 - **Pattern doc:** https://github.com/github/gh-aw/blob/main/docs/src/content/docs/patterns/issue-ops.md
@@ -70,6 +78,7 @@ Pattern docs base path: `https://github.com/github/gh-aw/blob/main/docs/src/cont
 ### Orchestration
 - **Load when:** The user needs orchestrator/worker architecture using reusable workflows or workflow dispatch.
 - **Pattern doc:** https://github.com/github/gh-aw/blob/main/docs/src/content/docs/patterns/orchestration.md
+- **Also load:** [work-queue.md](work-queue.md) when orchestration requires durable Work and Claims shared by dispatchers and workers.
 
 ### ProjectOps
 - **Load when:** The user needs intelligent routing and controlled field updates in GitHub Projects.
@@ -92,8 +101,12 @@ Pattern docs base path: `https://github.com/github/gh-aw/blob/main/docs/src/cont
 - **Pattern doc:** https://github.com/github/gh-aw/blob/main/docs/src/content/docs/experimental/trial-ops.md
 
 ### WorkQueueOps
-- **Load when:** The user needs durable queue processing for many items via issues, sub-issues, discussions, or cache-memory.
+- **Load when:** The user needs lightweight backlog processing via issue checklists, sub-issues, discussions, or cache-memory, without native Claim authority or scheduling guarantees.
 - **Pattern doc:** https://github.com/github/gh-aw/blob/main/docs/src/content/docs/patterns/workqueue-ops.md
+
+### Git-backed Work Queue
+- **Load when:** The user needs native fair scheduling, Work DAGs, Claim-scoped effects, or queue deployment/inspection/recovery.
+- **Instructions:** [work-queue.md](work-queue.md)
 
 ## Notes
 

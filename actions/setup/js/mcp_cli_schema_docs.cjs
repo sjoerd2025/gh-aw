@@ -247,7 +247,7 @@ function renderToolSignature(serverName, tool, options = {}) {
     return `${serverName} ${tool.name}`;
   }
   if (shouldUseJsonMode(schema)) {
-    return `printf '%s' '<json object>' | ${serverName} ${tool.name} .`;
+    return `${serverName} ${tool.name} '<json object>'`;
   }
   const tokens = [];
   for (const entry of optionEntries) {
@@ -284,12 +284,13 @@ function renderToolRecommendedExample(serverName, tool, options = {}) {
     return a.localeCompare(b);
   });
 
-  if (shouldUseJsonMode(schema)) {
+  if (serverName === "safeoutputs" || shouldUseJsonMode(schema)) {
     const payload = {};
     for (const key of orderedKeys) {
       payload[key] = exampleValueForKey(key, properties[key]);
     }
-    return `printf '%s' '${JSON.stringify(payload, null, 2)}' | ${serverName} ${tool.name} .`;
+    const json = JSON.stringify(payload, null, serverName === "safeoutputs" ? undefined : 2).replaceAll("'", "\\u0027");
+    return `${serverName} ${tool.name} '${json}'`;
   }
 
   const segments = [];

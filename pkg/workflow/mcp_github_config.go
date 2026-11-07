@@ -63,6 +63,8 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -73,6 +75,154 @@ import (
 )
 
 var githubConfigLog = logger.New("workflow:mcp_github_config")
+
+func dynamicEnclaveGitHubGuardRepos(workflowData *WorkflowData) []string {
+	enclave := enclaveDynamicRepositoryPolicyConfig(workflowData)
+	if enclave == nil || enclave.Dynamic == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	repos := make([]string, 0, typeutil.SafeAllocationCapacity(len(enclave.Dynamic.AllowedRepositories), len(enclave.Dynamic.AllowedOwners)))
+	add := func(repo string) {
+		repo = strings.TrimSpace(repo)
+		if repo == "" {
+			return
+		}
+		if _, ok := seen[repo]; ok {
+			return
+		}
+		seen[repo] = struct{}{}
+		repos = append(repos, repo)
+	}
+	for _, repo := range enclave.Dynamic.AllowedRepositories {
+		add(repo)
+	}
+	for _, owner := range enclave.Dynamic.AllowedOwners {
+		add(owner + "/*") //nolint:manualpathconcat // GitHub owner/repo guard patterns are not filesystem paths.
+	}
+	sort.Strings(repos)
+	return repos
+}
+
+func dynamicEnclaveGitHubGuardPolicies(workflowData *WorkflowData) map[string]any {
+	repos := dynamicEnclaveGitHubGuardRepos(workflowData)
+	if len(repos) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"allow-only": map[string]any{
+			"min-integrity": GitHubIntegrityApproved,
+			"repos":         repos,
+		},
+	}
+}
+
+// staticEnclaveGitHubGuardPolicies builds a server-level guard policy for a GitHub MCP server
+// that exists only to serve a static enclave agent identity. It mirrors the enclave identity
+// policy exactly, so the server-level guard never broadens access beyond the identity policy
+// already enforced by the gateway.
+func staticEnclaveGitHubGuardPolicies(workflowData *WorkflowData) map[string]any {
+	if enclaveStaticGitHubAgentConfig(workflowData) == nil {
+		return nil
+	}
+	allowOnly := enclaveGitHubMCPAgentPolicy(workflowData).AllowOnly
+	repos, _ := allowOnly["repos"].([]string) //nolint:typeassertionokdiscarded // A missing repos list is handled below.
+	if len(repos) == 0 {
+		return nil
+	}
+	policy := make(map[string]any, len(allowOnly))
+	maps.Copy(policy, allowOnly)
+	return map[string]any{"allow-only": policy}
+}
+
+// githubBackendIsStaticEnclaveDelegationOnly reports whether the GitHub MCP server is rendered
+// solely to serve a static enclave agent identity (primary-agent GitHub access disabled).
+func githubBackendIsStaticEnclaveDelegationOnly(workflowData *WorkflowData) bool {
+	return enclaveGitHubIssuesEnabled(workflowData) && !primaryGitHubMCPEnabled(workflowData)
+}
+
+// githubBackendIsEnclaveOnly reports whether the GitHub MCP server is rendered solely to
+// serve an enclave agent identity (static or dynamic), with no primary-agent GitHub access.
+// Backends in this state always derive their guard/write-sink policies statically from the
+// enclave declaration, never from the determine-automatic-lockdown step outputs, even though
+// that step may still be generated for them solely to supply GH_AW_SINK_VISIBILITY.
+func githubBackendIsEnclaveOnly(workflowData *WorkflowData) bool {
+	return githubBackendIsStaticEnclaveDelegationOnly(workflowData) || githubBackendIsDynamicDelegationOnly(workflowData)
+}
+
+func githubGuardPoliciesFromStep(workflowData *WorkflowData, explicitGuardPolicies map[string]any) bool {
+	if len(explicitGuardPolicies) > 0 {
+		return false
+	}
+	if workflowData == nil {
+		return true
+	}
+	if githubBackendIsEnclaveOnly(workflowData) {
+		return false
+	}
+	githubTool, hasGitHub := workflowData.Tools["github"]
+	if !hasGitHub {
+		// Default-tool resolution removes the "github" key when tools.github is false. The
+		// static/dynamic enclave-only backends that could otherwise cause
+		// githubLockdownDetectionStepEnabled to return true here (via its own enclave checks)
+		// were already excluded above, so deferring to it below only covers the remaining
+		// case: a plain (non-enclave) GitHub MCP server whose "github" key was removed by
+		// default-tool resolution. This keeps the result in lockstep with whether the
+		// determine-automatic-lockdown step is actually generated.
+		return githubLockdownDetectionStepEnabled(workflowData)
+	}
+	return githubTool != false
+}
+
+// dynamicEnclaveWriteSinkGuardPolicy builds a write-sink guard policy for data returned
+// by a dynamic enclave. The destination visibility is resolved at runtime from the
+// workflow repository; the dynamic sensitivity limits the accepted source secrecy labels.
+func dynamicEnclaveWriteSinkGuardPolicy(workflowData *WorkflowData) map[string]any {
+	enclave := enclaveDynamicRepositoryPolicyConfig(workflowData)
+	if enclave == nil || enclave.Dynamic == nil {
+		return nil
+	}
+	accept := []string{"*"}
+	if enclave.Dynamic.Sensitivity != "public" {
+		repos := dynamicEnclaveGitHubGuardRepos(workflowData)
+		accept = writeSinkAcceptLabelsForRepos(repos)
+	}
+	return writeSinkGuardPolicy(accept)
+}
+
+// staticEnclaveWriteSinkGuardPolicy builds the write-sink policy required by
+// safeoutputs when the only guarded GitHub source is a static enclave agent.
+func staticEnclaveWriteSinkGuardPolicy(workflowData *WorkflowData) map[string]any {
+	if !githubBackendIsStaticEnclaveDelegationOnly(workflowData) {
+		return nil
+	}
+	enclave := enclaveStaticGitHubAgentConfig(workflowData)
+	if enclave == nil {
+		return nil
+	}
+	repos := enclaveGitHubAllowedRepos(enclave)
+	if len(repos) == 0 {
+		return nil
+	}
+	return writeSinkGuardPolicy(writeSinkAcceptLabelsForRepos(repos))
+}
+
+func writeSinkAcceptLabelsForRepos(repos []string) []string {
+	accept := make([]string, 0, typeutil.SafeAllocationCapacity(len(repos)))
+	for _, repo := range repos {
+		accept = append(accept, transformRepoPattern(repo))
+	}
+	return accept
+}
+
+func writeSinkGuardPolicy(accept []string) map[string]any {
+	return map[string]any{
+		"write-sink": map[string]any{
+			"accept":          accept,
+			"sink-visibility": sinkVisibilityRuntimeExpr,
+		},
+	}
+}
 
 // hasGitHubTool checks if the GitHub tool is configured (using ParsedTools)
 func hasGitHubTool(parsedTools *Tools) bool {
@@ -89,10 +239,7 @@ func hasGitHubApp(githubTool map[string]any) bool {
 }
 
 // isGitHubCLIModeEnabled returns true when GitHub prompt/runtime mode is explicitly set
-// to `tools.github.mode: gh-proxy`. If mode is explicitly set to `local` or `remote`, it
-// takes precedence over the legacy features.cli-proxy flag (treated as MCP mode).
-// When mode is not explicitly set, this returns the legacy `features.cli-proxy` flag
-// value for backward compatibility.
+// to `tools.github.mode: gh-proxy`.
 func isGitHubCLIModeEnabled(data *WorkflowData) bool {
 	if data == nil {
 		return false
@@ -111,13 +258,20 @@ func isGitHubCLIModeEnabled(data *WorkflowData) bool {
 					case GitHubMCPModeLocal, GitHubMCPModeRemote:
 						return false
 					default:
-						githubConfigLog.Printf("Unrecognized tools.github.mode value: %s, falling back to legacy behavior", stringValue)
+						githubConfigLog.Printf("Unrecognized tools.github.mode value: %s, treating as MCP mode", stringValue)
 					}
 				}
 			}
 		}
 	}
-	return isFeatureEnabled(constants.CliProxyFeatureFlag, data)
+	return false
+}
+
+func isGitHubAppTokenForCLIProxy(data *WorkflowData) bool {
+	if data == nil || data.ParsedTools == nil || data.ParsedTools.GitHub == nil || data.ParsedTools.GitHub.GitHubApp == nil {
+		return false
+	}
+	return isGitHubCLIModeEnabled(data)
 }
 
 // normalizeGitHubType normalizes and validates GitHub MCP transport values.
@@ -269,7 +423,7 @@ func parseGitHubAllowedToolsAndLimits(allowedSetting any) ([]string, map[string]
 		return parseStringSliceAny(allowedSetting, nil), nil
 	}
 
-	allowedTools := make([]string, 0, len(allowedItems))
+	allowedTools := make([]string, 0)
 	toolCallLimits := make(map[string]int)
 
 	for _, item := range allowedItems {
@@ -344,9 +498,9 @@ func getGitHubGuardPolicies(githubTool map[string]any) map[string]any {
 		// parse-guard-vars step. The step outputs proper JSON arrays (split on comma/newline,
 		// validated, jq-encoded) from both the compile-time static values and the
 		// GH_AW_GITHUB_* org/repo variables.
-		policy["blocked-users"] = guardExprSentinel + "${{ steps.parse-guard-vars.outputs.blocked_users }}"
-		policy["trusted-users"] = guardExprSentinel + "${{ steps.parse-guard-vars.outputs.trusted_users }}"
-		policy["approval-labels"] = guardExprSentinel + "${{ steps.parse-guard-vars.outputs.approval_labels }}"
+		policy["blocked-users"] = guardExprSentinel + "${GH_AW_GUARD_BLOCKED_USERS}"
+		policy["trusted-users"] = guardExprSentinel + "${GH_AW_GUARD_TRUSTED_USERS}"
+		policy["approval-labels"] = guardExprSentinel + "${GH_AW_GUARD_APPROVAL_LABELS}"
 		return map[string]any{
 			"allow-only": policy,
 		}
@@ -485,7 +639,7 @@ func deriveSafeOutputsGuardPolicyFromGitHub(githubTool map[string]any) map[strin
 		}
 	case []any:
 		// Array of patterns
-		acceptList = make([]string, 0, len(r))
+		acceptList = make([]string, 0)
 		for _, item := range r {
 			if pattern, ok := item.(string); ok {
 				acceptList = append(acceptList, transformRepoPattern(pattern))
@@ -493,7 +647,7 @@ func deriveSafeOutputsGuardPolicyFromGitHub(githubTool map[string]any) map[strin
 		}
 	case []string:
 		// Array of patterns (already strings)
-		acceptList = make([]string, 0, len(r))
+		acceptList = make([]string, 0)
 		for _, pattern := range r {
 			acceptList = append(acceptList, transformRepoPattern(pattern))
 		}
@@ -537,26 +691,28 @@ func transformRepoPattern(pattern string) string {
 // Two cases produce a non-nil policy:
 //  1. Explicit guard policy — when repos/min-integrity are set on the GitHub tool, a write-sink
 //     policy is derived from those settings (e.g. "private:myorg/myrepo").
-//  2. Auto-lockdown — when the GitHub tool is present without explicit guard policies and without
-//     a GitHub App configured, auto-lockdown detection will set repos=all at runtime, so a
+//  2. Auto-lockdown — when the GitHub tool is present without explicit guard policies,
+//     auto-lockdown detection will set repos=all at runtime, so a
 //     write-sink policy with accept=["*"] is returned to match that runtime behaviour.
 //
 // When private-to-public-flows: allow is declared, sink-visibility is omitted from the returned
 // policy per MCP Gateway Specification Section 10.9.3: the blanket allow disables both
 // forcePublicRepos and sink-visibility enforcement.
 //
-// Returns nil when workflowData is nil, when no GitHub tool is present, or when a GitHub App is
-// configured (auto-lockdown is skipped for GitHub App tokens, which are already repo-scoped).
+// Returns nil when workflowData is nil, or when neither the GitHub tool nor a dynamic repository enclave is present.
 func deriveWriteSinkGuardPolicyFromWorkflow(workflowData *WorkflowData) map[string]any {
 	if workflowData == nil || workflowData.Tools == nil {
-		return nil
+		return dynamicEnclaveWriteSinkGuardPolicy(workflowData)
 	}
 	rawGithubTool, hasGitHub := workflowData.Tools["github"]
 	if !hasGitHub {
-		return nil
+		if policy := staticEnclaveWriteSinkGuardPolicy(workflowData); policy != nil {
+			return policy
+		}
+		return dynamicEnclaveWriteSinkGuardPolicy(workflowData)
 	}
 
-	toolConfig, _ := rawGithubTool.(map[string]any)
+	toolConfig, _ := rawGithubTool.(map[string]any) //nolint:typeassertionokdiscarded // A non-map tool has no explicit guard policy.
 
 	// Detect blanket opt-out: private-to-public-flows: allow.
 	// Per Section 10.9.3, allow disables sink-visibility enforcement in addition to forcePublicRepos.
@@ -577,11 +733,12 @@ func deriveWriteSinkGuardPolicyFromWorkflow(workflowData *WorkflowData) map[stri
 	}
 
 	// When no explicit guard policy is configured but automatic lockdown detection would run
-	// (GitHub tool present and not disabled, no GitHub App configured), return accept=["*"]
-	// because automatic lockdown always sets repos=all at runtime.
+	// (GitHub tool present and not disabled), return accept=["*"] because automatic lockdown
+	// always sets repos=all at runtime. GitHub App token scope is authentication, not a
+	// substitute for the DIFC sink labels enforced by the MCP gateway.
 	// sink-visibility is set as a runtime expression so that the write-sink guard can enforce
 	// public/private/internal semantics based on the actual repository visibility at workflow execution time.
-	if rawGithubTool != false && len(getGitHubGuardPolicies(toolConfig)) == 0 && !hasGitHubApp(toolConfig) {
+	if rawGithubTool != false && len(getGitHubGuardPolicies(toolConfig)) == 0 {
 		writeSink := map[string]any{
 			"accept": []string{"*"},
 		}
@@ -591,6 +748,13 @@ func deriveWriteSinkGuardPolicyFromWorkflow(workflowData *WorkflowData) map[stri
 		return map[string]any{
 			"write-sink": writeSink,
 		}
+	}
+
+	if rawGithubTool == false {
+		if policy := staticEnclaveWriteSinkGuardPolicy(workflowData); policy != nil {
+			return policy
+		}
+		return dynamicEnclaveWriteSinkGuardPolicy(workflowData)
 	}
 
 	return nil
@@ -624,6 +788,8 @@ func getGitHubDockerImageVersion(githubTool map[string]any) string {
 // Otherwise, "fields_param" is enabled by default when the effective server version is v1.6.0
 // or later, because that version introduced the optional fields-filtering parameter for
 // list/search tools (search_code, list_pull_requests, search_issues, etc.).
+// As of v1.8.0, the fields parameter is available by default without the feature flag;
+// the flag is still emitted for v1.6.0–v1.7.x compatibility and is a no-op on v1.8.0+.
 // Enabling fields_param reduces token usage by letting agents request only the fields they need.
 func getGitHubFeatures(githubTool map[string]any) string {
 	// Respect an explicit user-supplied features override.
@@ -635,7 +801,8 @@ func getGitHubFeatures(githubTool map[string]any) string {
 		}
 	}
 
-	// Default: enable fields_param when the server version supports it (v1.6.0+)
+	// Default: enable fields_param when the server version supports it (v1.6.0+).
+	// On v1.8.0+ the fields parameter is available by default, so the flag is a no-op.
 	version := getGitHubDockerImageVersion(githubTool)
 	if versionAtLeast(version, string(constants.DefaultGitHubMCPServerVersion), "v1.6.0") {
 		githubConfigLog.Printf("GitHub MCP features (default v1.6.0+): fields_param")

@@ -15,9 +15,14 @@
 //   ## skill: `name`       Opens a skill block.  name must start with a
 //                          lowercase letter and contain only lowercase letters,
 //                          digits, hyphens, or underscores (safe for filenames).
+//   ## end skill: `name`   Optional. Explicitly closes the block opened by the
+//                          matching "## skill: `name`" marker.
 //
-// A skill block ends at the next level-2 Markdown heading (## ...) or EOF.
-// There is no explicit end marker — any H2 heading closes the skill block.
+// A skill block ends at a matching "## end skill: `name`" marker if one is
+// present, or otherwise at the next level-2 Markdown heading (## ...) or EOF.
+// The explicit end marker lets a skill block be embedded in the middle of a
+// document (for example via an import) without swallowing unrelated content
+// that follows it, and lets the block itself contain nested "##" headings.
 //
 // Supported frontmatter fields (all others are stripped with a warning)
 // ─────────────────────────────────────────────────────────────────────
@@ -28,6 +33,9 @@
 
 const fs = require("fs");
 const path = require("path");
+const { collectInlineEndMarkers, unknownInlineEndMarkerError } = require("./inline_marker_helpers.cjs");
+const { inlineArtifactTarget } = require("./inline_artifact_target.cjs");
+const { INLINE_SKILL_MANIFEST } = require("./pi_workflow_skills.cjs");
 
 // Supported frontmatter fields for inline skills.
 // Any other field is stripped with a warning.
@@ -36,8 +44,15 @@ const SUPPORTED_FRONTMATTER_FIELDS = ["description"];
 // Regex for the start marker: ## skill: `name` (lowercase identifier)
 const START_MARKER_RE = /^##[ \t]+skill:[ \t]+`([a-z][a-z0-9_-]*)`[ \t]*$/gm;
 
+// Regex for the optional explicit end marker: ## end skill: `name`
+const END_MARKER_RE = /^##[ \t]+end[ \t]+skill:[ \t]+`([a-z][a-z0-9_-]*)`[ \t]*$/gm;
+
+// Regex for an inline sub-agent marker exactly at an implicit H2 boundary.
+const AGENT_START_BOUNDARY_RE = /^##[ \t]+agent:[ \t]+`(?:[a-z][a-z0-9_-]*)`[ \t]*(?:\n|$)/;
+
 // Regex that matches the start of any level-2 Markdown heading (## ).
-// Used to find the boundary where each skill block ends.
+// Used to find the boundary where each skill block ends when no explicit end
+// marker is present.
 const H2_HEADING_RE = /^##[ \t]/gm;
 
 /**
@@ -111,36 +126,53 @@ function filterInlineSkillFrontmatter(content, skillName) {
 /**
  * Extracts inline skills from markdown content.
  *
- * Returns the main content (everything before the first ## skill: marker, with
- * trailing newlines stripped) and an array of extracted skills.
+ * Returns the reassembled main content (with skill blocks removed) and an
+ * array of extracted skills.
  *
- * A skill block extends from its start marker to the next H2 heading or EOF.
+ * A skill block extends from its start marker to a matching "## end skill:
+ * `name`" marker if present, or otherwise to the next H2 heading or EOF. When
+ * a skill is closed by an explicit end marker, any text following it (up to
+ * the next start marker or EOF) is preserved in the main content rather than
+ * discarded.
+ *
+ * Throws if an end marker's name does not correspond to any start marker of
+ * the same name found within its search window (an "orphan" end marker),
+ * which is almost always an authoring mistake such as a typo.
  *
  * @param {string} content - Markdown with potential inline skill blocks.
  * @returns {{ mainContent: string, skills: Array<{name: string, content: string}> }}
  */
 function extractInlineSkills(content) {
   const startMatches = [...content.matchAll(START_MARKER_RE)];
+  const endMarkers = collectInlineEndMarkers(content, END_MARKER_RE);
 
   if (startMatches.length === 0) {
+    if (endMarkers.length > 0) {
+      throw unknownInlineEndMarkerError(content, endMarkers[0], "skill");
+    }
     return { mainContent: content, skills: [] };
   }
 
-  // Main content is everything before the first start marker (trailing newlines stripped).
-  const firstMatch = startMatches[0];
-  if (firstMatch.index === undefined) {
-    return { mainContent: content, skills: [] };
-  }
-  const mainContent = content.slice(0, firstMatch.index).replace(/\n+$/, "");
-
-  // Collect all H2 heading positions for block boundary detection.
+  // Collect all H2 heading positions for the implicit block boundary fallback.
   const h2Positions = [...content.matchAll(H2_HEADING_RE)].map(m => m.index).filter(i => i !== undefined);
+
+  // Track explicit end markers so unused markers can be reported as orphans.
+  const usedEnd = new Array(endMarkers.length).fill(false);
 
   /** @type {Array<{name: string, content: string}>} */
   const skills = [];
+  /** @type {string[]} */
+  const mainParts = [];
+  let cursor = 0;
+  let prevExplicit = true; // text before the first marker is always kept
 
-  for (const m of startMatches) {
+  for (let i = 0; i < startMatches.length; i++) {
+    const m = startMatches[i];
     if (m.index === undefined) continue;
+
+    if (prevExplicit) {
+      mainParts.push(content.slice(cursor, m.index));
+    }
 
     const name = m[1];
 
@@ -148,14 +180,123 @@ function extractInlineSkills(content) {
     let lineEnd = m.index + m[0].length;
     if (lineEnd < content.length && content[lineEnd] === "\n") lineEnd++;
 
-    // Content ends at the next H2 heading after the start marker line, or EOF.
-    const contentEnd = h2Positions.find(pos => pos >= lineEnd) ?? content.length;
+    const windowEnd = i + 1 < startMatches.length ? /** @type {number} */ startMatches[i + 1].index : content.length;
 
-    const skillContent = content.slice(lineEnd, contentEnd).trim();
+    let matchedEnd;
+    for (let ei = 0; ei < endMarkers.length; ei++) {
+      const e = endMarkers[ei];
+      if (usedEnd[ei] || e.name !== name || e.start < lineEnd || e.start >= windowEnd) continue;
+      matchedEnd = e;
+      usedEnd[ei] = true;
+      break;
+    }
+
+    let skillContent;
+    let newCursor;
+    const explicit = matchedEnd !== undefined;
+    let preserveAfterImplicitBoundary = false;
+    if (explicit) {
+      skillContent = content.slice(lineEnd, matchedEnd.start).trim();
+      newCursor = matchedEnd.end;
+    } else {
+      const contentEnd = h2Positions.find(pos => pos >= lineEnd) ?? content.length;
+      skillContent = content.slice(lineEnd, contentEnd).trim();
+      newCursor = contentEnd;
+      if (AGENT_START_BOUNDARY_RE.test(content.slice(contentEnd))) {
+        preserveAfterImplicitBoundary = true;
+      }
+    }
+
     skills.push({ name, content: skillContent });
+    cursor = newCursor;
+    prevExplicit = explicit || preserveAfterImplicitBoundary;
   }
 
+  if (prevExplicit) {
+    mainParts.push(content.slice(cursor));
+  }
+
+  const orphan = endMarkers.find((_, ei) => !usedEnd[ei]);
+  if (orphan) {
+    throw unknownInlineEndMarkerError(content, orphan, "skill");
+  }
+
+  const mainContent = mainParts
+    .join("")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/\n+$/, "");
+
   return { mainContent, skills };
+}
+
+/**
+ * Ensures every "## skill: `name`" start marker in content has a matching
+ * explicit "## end skill: `name`" marker, inserting one at the block's
+ * implicit boundary (next H2 heading or EOF) for any start marker that
+ * doesn't already have one.
+ *
+ * This is intended for content that is about to be spliced into a larger
+ * document (for example a runtime-imported file). Without it, a skill block
+ * that relies on implicit closing would expand to swallow whatever content
+ * follows it once spliced in — including unrelated content from subsequent
+ * imports or the main workflow body — instead of stopping where it would
+ * have stopped when the file was considered on its own.
+ *
+ * Blocks that already have an explicit end marker are left untouched. The
+ * boundary computed here matches exactly what {@link extractInlineSkills}
+ * would already infer for implicit blocks, so this is a no-op with respect to
+ * extraction results when the content is not spliced elsewhere.
+ *
+ * @param {string} content - Markdown that may contain "## skill:" blocks.
+ * @returns {string} Content with implicit end markers made explicit.
+ */
+function closeUnterminatedSkillMarkers(content) {
+  const startMatches = [...content.matchAll(START_MARKER_RE)];
+  if (startMatches.length === 0) return content;
+
+  const h2Positions = [...content.matchAll(H2_HEADING_RE)].map(m => m.index).filter(i => i !== undefined);
+  const endMarkers = collectInlineEndMarkers(content, END_MARKER_RE);
+  const usedEnd = new Array(endMarkers.length).fill(false);
+
+  /** @type {Array<{pos: number, name: string}>} */
+  const insertions = [];
+
+  for (let i = 0; i < startMatches.length; i++) {
+    const m = startMatches[i];
+    if (m.index === undefined) continue;
+
+    const name = m[1];
+    let lineEnd = m.index + m[0].length;
+    if (lineEnd < content.length && content[lineEnd] === "\n") lineEnd++;
+
+    const windowEnd = i + 1 < startMatches.length ? /** @type {number} */ startMatches[i + 1].index : content.length;
+
+    let matchedEnd;
+    for (let ei = 0; ei < endMarkers.length; ei++) {
+      const e = endMarkers[ei];
+      if (usedEnd[ei] || e.name !== name || e.start < lineEnd || e.start >= windowEnd) continue;
+      matchedEnd = e;
+      usedEnd[ei] = true;
+      break;
+    }
+
+    if (matchedEnd === undefined) {
+      const contentEnd = h2Positions.find(pos => pos >= lineEnd) ?? content.length;
+      insertions.push({ pos: contentEnd, name });
+    }
+  }
+
+  if (insertions.length === 0) return content;
+
+  // Insert from the end of the string backwards so earlier offsets stay valid.
+  insertions.sort((a, b) => b.pos - a.pos);
+  let result = content;
+  for (const { pos, name } of insertions) {
+    const needsLeadingNewline = pos > 0 && result[pos - 1] !== "\n";
+    const marker = `${needsLeadingNewline ? "\n" : ""}\n## end skill: \`${name}\`\n`;
+    result = result.slice(0, pos) + marker + result.slice(pos);
+  }
+  return result;
 }
 
 /**
@@ -164,7 +305,7 @@ function extractInlineSkills(content) {
  *
  * Each AI engine stores its skill definitions in a different location:
  *   claude   → .claude/skills/<name>.md
- *   codex    → .codex/skills/<name>.md
+ *   codex    → .codex/skills/<name>/SKILL.md
  *   gemini   → .gemini/skills/<name>.md
  *   copilot  → .github/skills/<name>/SKILL.md  (default)
  *   others   → .github/skills/<name>/SKILL.md  (fallback)
@@ -177,9 +318,11 @@ function getEngineSkillTarget(engineId) {
     case "claude":
       return { dir: ".claude/skills", ext: ".md" };
     case "codex":
-      return { dir: ".codex/skills", ext: ".md" };
+      return { dir: ".codex/skills", ext: "/SKILL.md" };
     case "gemini":
       return { dir: ".gemini/skills", ext: ".md" };
+    case "pi":
+      return { dir: ".pi/skills", ext: "/SKILL.md" };
     default:
       return { dir: ".github/skills", ext: "/SKILL.md" };
   }
@@ -191,7 +334,7 @@ function getEngineSkillTarget(engineId) {
  *
  * The target directory and filename extension are determined by engineId:
  *   - claude  → <base>/.claude/skills/<name>.md
- *   - codex   → <base>/.codex/skills/<name>.md
+ *   - codex   → <base>/.codex/skills/<name>/SKILL.md
  *   - gemini  → <base>/.gemini/skills/<name>.md
  *   - default → <base>/.github/skills/<name>/SKILL.md
  *
@@ -210,9 +353,10 @@ function getEngineSkillTarget(engineId) {
  *   Defaults to `workspaceDir` when omitted (for tests and legacy callers).
  * @param {string} [engineId] - The engine ID (e.g. "claude", "copilot").
  *   Defaults to "copilot" behavior when omitted.
+ * @param {(content: string, target?: string) => string} [restoreValues] - Restore literal context after parsing author-owned metadata
  * @returns {string} Main content with skill sections removed.
  */
-function writeInlineSkills(content, workspaceDir, skillsBaseDir, engineId) {
+function writeInlineSkills(content, workspaceDir, skillsBaseDir, engineId, restoreValues = content => content) {
   const { mainContent, skills } = extractInlineSkills(content);
 
   if (skills.length === 0) {
@@ -220,7 +364,7 @@ function writeInlineSkills(content, workspaceDir, skillsBaseDir, engineId) {
   }
 
   const baseDir = skillsBaseDir || workspaceDir;
-  const { dir, ext } = getEngineSkillTarget(engineId);
+  const { dir, ext } = inlineArtifactTarget("SKILL", getEngineSkillTarget(engineId));
   const skillsDir = path.join(baseDir, dir);
   core.info(`[extractInlineSkills] Engine: "${engineId || "(default)"}" → dir="${dir}" ext="${ext}"`);
   core.info(`[extractInlineSkills] Writing ${skills.length} skill(s) to: ${skillsDir}`);
@@ -238,7 +382,7 @@ function writeInlineSkills(content, workspaceDir, skillsBaseDir, engineId) {
       throw new Error(`Failed to create directory ${path.dirname(skillPath)}: ${String(err)}`, { cause: err });
     }
     const filteredContent = filterInlineSkillFrontmatter(skill.content, skill.name);
-    const skillContent = filteredContent.endsWith("\n") ? filteredContent : filteredContent + "\n";
+    const skillContent = restoreValues(filteredContent.endsWith("\n") ? filteredContent : filteredContent + "\n", skillPath);
     try {
       fs.writeFileSync(skillPath, skillContent, "utf8");
     } catch (err) {
@@ -247,8 +391,20 @@ function writeInlineSkills(content, workspaceDir, skillsBaseDir, engineId) {
     core.info(`[extractInlineSkills] Written skill: ${skillPath} (${skillContent.length} bytes)`);
   }
 
+  if ((engineId || "").toLowerCase() === "pi") {
+    // Bare Pi runs load exactly these extracted skills (pi_workflow_skills.cjs), so record them
+    // in the activation artifact rather than trusting whatever else the skills directory holds.
+    const manifestPath = path.join(skillsDir, INLINE_SKILL_MANIFEST);
+    try {
+      fs.writeFileSync(manifestPath, JSON.stringify([...new Set(skills.map(skill => skill.name))]) + "\n", "utf8");
+    } catch (err) {
+      throw new Error(`Failed to write file ${manifestPath}: ${String(err)}`, { cause: err });
+    }
+    core.info(`[extractInlineSkills] Written inline skill manifest: ${manifestPath}`);
+  }
+
   core.info(`[extractInlineSkills] Done — ${skills.length} file(s) written to ${skillsDir}`);
   return mainContent;
 }
 
-module.exports = { extractInlineSkills, writeInlineSkills, getEngineSkillTarget, filterInlineSkillFrontmatter };
+module.exports = { extractInlineSkills, writeInlineSkills, getEngineSkillTarget, filterInlineSkillFrontmatter, closeUnterminatedSkillMarkers };

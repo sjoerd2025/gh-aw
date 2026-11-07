@@ -22,19 +22,26 @@ network:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
       - default
 
+evals:
+  - id: weekday_environment
+    question: Does the test_environment request select staging on Monday, Wednesday, or Friday and production on Tuesday or Thursday? Return UNKNOWN when the run day is unavailable or is a weekend.
+  - id: weekday_test_type
+    question: Does the test_environment request select smoke on Monday, Wednesday, or Friday and integration on Tuesday or Thursday? Return UNKNOWN when the run day is unavailable or is a weekend.
+  - id: selection_rationale
+    question: Does the agent explain the selected configuration using the run's day of the week rather than claiming a staged deployment actually executed?
 safe-outputs:
   staged: true
   jobs:
     test_environment:
-      name: "Test Environment Deployment"
+      name: test_environment
       description: "A test job with choice input"
       runs-on: ubuntu-latest
       inputs:

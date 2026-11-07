@@ -16,6 +16,7 @@ describe("firewall_blocked_domains.cjs", () => {
   let extractAndSanitizeDomain;
   let getBlockedDomains;
   let generateBlockedDomainsSection;
+  let generateBlockedDomainsReportSection;
   let testDir;
 
   beforeEach(async () => {
@@ -30,6 +31,7 @@ describe("firewall_blocked_domains.cjs", () => {
     extractAndSanitizeDomain = module.extractAndSanitizeDomain;
     getBlockedDomains = module.getBlockedDomains;
     generateBlockedDomainsSection = module.generateBlockedDomainsSection;
+    generateBlockedDomainsReportSection = module.generateBlockedDomainsReportSection;
   });
 
   afterEach(() => {
@@ -100,6 +102,12 @@ describe("firewall_blocked_domains.cjs", () => {
 
     it("should identify allowed request with 200 status", () => {
       expect(isRequestBlocked("TCP_TUNNEL:HIER_DIRECT", "200")).toBe(false);
+    });
+
+    it("should identify successful NONE_NONE requests as allowed", () => {
+      expect(isRequestBlocked("NONE_NONE:HIER_NONE", "200")).toBe(false);
+      expect(isRequestBlocked("NONE_NONE:HIER_NONE", "206")).toBe(false);
+      expect(isRequestBlocked("NONE_NONE:HIER_NONE", "304")).toBe(false);
     });
 
     it("should identify allowed request with TCP_TUNNEL decision", () => {
@@ -291,6 +299,20 @@ describe("firewall_blocked_domains.cjs", () => {
       expect(result).not.toContain("api.anthropic.com");
     });
 
+    it("should not report successful SNI guard records as blocked", () => {
+      const logsDir = path.join(testDir, "logs-sni-guard");
+      fs.mkdirSync(logsDir, { recursive: true });
+
+      const logContent = [
+        '1773003475.166 172.30.0.30:50232 api.anthropic.com:443 18.64.224.91:443 1.1 CONNECT 200 NONE_NONE:HIER_NONE api.anthropic.com:443 "-"',
+        '1773003475.167 172.30.0.30:50232 api.anthropic.com:443 18.64.224.91:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.anthropic.com:443 "-"',
+      ].join("\n");
+
+      fs.writeFileSync(path.join(logsDir, "access.log"), logContent);
+
+      expect(getBlockedDomains(logsDir)).toEqual([]);
+    });
+
     it("should handle invalid log lines gracefully", () => {
       const logsDir = path.join(testDir, "logs6");
       fs.mkdirSync(logsDir, { recursive: true });
@@ -431,6 +453,12 @@ describe("firewall_blocked_domains.cjs", () => {
       expect(result).toContain("> <details>");
       expect(result).toContain("> <summary>Firewall blocked 1 domain</summary>");
       expect(result).toContain("> - `api.github.com`");
+      expect(result).toContain("> </details>\n\n> [!TIP]");
+      expect(result).not.toContain("\\[\\!TIP\\]");
+      expect(generateBlockedDomainsReportSection(["api.github.com"], TEMPLATE_PATH)).toMatchObject([
+        { type: "alert", kind: "WARNING", children: [{ type: "details" }] },
+        { type: "alert", kind: "TIP" },
+      ]);
       expect(result).toContain("`tools.github.mode: gh-proxy`");
       expect(result).toContain("> ```yaml\n> tools:\n>   github:\n>     mode: gh-proxy\n> ```");
       expect(result).toContain("> See [GitHub Tools](https://github.github.com/gh-aw/reference/github-tools/) for more information on `gh-proxy` mode.");
@@ -454,6 +482,8 @@ describe("firewall_blocked_domains.cjs", () => {
       const result = generateBlockedDomainsSection(["other.example.com"], TEMPLATE_PATH);
 
       expect(result).not.toContain("gh-proxy");
+      expect(result).not.toContain("[!TIP]");
+      expect(generateBlockedDomainsReportSection(["other.example.com"], TEMPLATE_PATH)).toMatchObject([{ type: "alert", kind: "WARNING" }]);
       expect(result).not.toContain("GitHub Tools");
       expect(result).toContain("> See [Network Configuration](https://github.github.com/gh-aw/reference/network/) for more information.");
     });

@@ -19,9 +19,9 @@ func NewAddWizardCommand(validateEngine func(string) error) *cobra.Command {
 		Long: `Interactively add one or more agentic workflows with guided setup.
 
 This command walks you through:
-  - Selecting an AI engine (Copilot, Claude, Codex, Gemini, Antigravity, OpenCode, or Pi)
+  - Selecting an AI engine (Copilot, Claude, Codex, Gemini, or Pi)
   - Configuring API keys and secrets
-  - Creating a pull request with the workflow
+  - Writing the workflow locally or creating a pull request with it
   - Optionally running the workflow immediately
 
 Use 'add' for non-interactive workflow addition.
@@ -52,9 +52,10 @@ Note: To create a new workflow from scratch, use the 'new' command instead.`,
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard https://example.com/workflow.json        # Import JSON workflow definition with guided setup
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --engine copilot   # Pre-select engine
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --no-secret        # Skip secret prompt
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --pr --auto-merge  # Use pull request delivery with auto-merge
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --append "custom footer"            # Append custom content
   ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --no-security-scanner             # Skip security scan
-`,
+  ` + string(constants.CLIExtensionPrefix) + ` add-wizard githubnext/agentics/ci-doctor --no-config # Skip GitHub App permission/event inference from package workflows`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
 				return errors.New("missing workflow specification\n\nRun 'gh aw add-wizard --help' for usage information")
@@ -74,6 +75,19 @@ Note: To create a new workflow from scratch, use the 'new' command instead.`,
 			skipSecret := noSecret || skipSecretLegacy
 			appendText, _ := cmd.Flags().GetString("append")
 			disableSecurityScanner := resolveDeprecatedBoolFlag(cmd, "no-security-scanner", "disable-security-scanner")
+			noGitHubAppInference, _ := cmd.Flags().GetBool("no-config")
+			autoMerge, _ := cmd.Flags().GetBool("auto-merge")
+			createPRFlag, _ := cmd.Flags().GetBool("create-pull-request")
+			prFlagAlias, _ := cmd.Flags().GetBool("pr")
+			createPR := createPRFlag || prFlagAlias
+			if err := requireAutoMergePR(autoMerge, createPR); err != nil {
+				return err
+			}
+			ghAwRef, _ := cmd.Flags().GetString("gh-aw-ref")
+			resolvedGhAwRef, err := resolveAddGhAwRef(cmd.Context(), ghAwRef)
+			if err != nil {
+				return err
+			}
 
 			addWizardLog.Printf("Starting add-wizard: workflows=%v, engine=%s, verbose=%v", workflows, engineOverride, verbose)
 
@@ -90,16 +104,21 @@ Note: To create a new workflow from scratch, use the 'new' command instead.`,
 			}
 
 			return RunAddInteractive(cmd.Context(), &AddInteractiveConfig{
-				WorkflowSpecs:          workflows,
-				Verbose:                verbose,
-				EngineOverride:         engineOverride,
-				NoGitattributes:        noGitattributes,
-				WorkflowDir:            workflowDir,
-				NoStopAfter:            noStopAfter,
-				StopAfter:              stopAfter,
-				SkipSecret:             skipSecret,
-				AppendText:             appendText,
-				DisableSecurityScanner: disableSecurityScanner,
+				WorkflowSpecs:                       workflows,
+				Verbose:                             verbose,
+				EngineOverride:                      engineOverride,
+				NoGitattributes:                     noGitattributes,
+				WorkflowDir:                         workflowDir,
+				NoStopAfter:                         noStopAfter,
+				StopAfter:                           stopAfter,
+				SkipSecret:                          skipSecret,
+				AppendText:                          appendText,
+				DisableSecurityScanner:              disableSecurityScanner,
+				DisableGitHubAppPermissionInference: noGitHubAppInference,
+				GhAwRef:                             resolvedGhAwRef,
+				AutoMerge:                           autoMerge,
+				CreatePR:                            createPR,
+				PRMessage:                           cmd.Flag("pr-message").Value.String(),
 			})
 		},
 	}
@@ -130,6 +149,16 @@ Note: To create a new workflow from scratch, use the 'new' command instead.`,
 	// Add no-security-scanner flag (--disable-security-scanner is kept as a deprecated alias
 	// for consistency with add and other install entry points)
 	addSecurityScannerFlag(cmd)
+
+	// Add no-config flag to allow disabling automatic inference of GitHub App
+	// permissions/events from resolved package workflows.
+	cmd.Flags().Bool("no-config", false, "Disable inferring GitHub App permissions/events from the package's workflows; use only permissions/events declared in aw.yml")
+	cmd.Flags().String("gh-aw-ref", "", "Pin compiled workflows to a branch, tag, or commit SHA of github/gh-aw; branch and tag names are resolved to an immutable full SHA")
+	cmd.Flags().Bool("create-pull-request", false, "Create a pull request instead of prompting for delivery")
+	addPRMessageFlag(cmd)
+	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")
+	_ = cmd.Flags().MarkHidden("pr")
+	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --pr or --create-pull-request)")
 
 	// Register completions
 	RegisterEngineFlagCompletion(cmd)

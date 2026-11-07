@@ -85,11 +85,12 @@ The `tools:` field configures which tools the coding agent may use.
 - `blocked-users:` - Usernames whose content is unconditionally blocked (array or GitHub Actions expression); these users receive integrity below `none` and are always denied
 - `approval-labels:` - Label names that elevate a content item's integrity to `approved` when present (array or GitHub Actions expression); does not override `blocked-users`
 - `trusted-users:` - Usernames elevated to `approved` integrity regardless of `author_association` (array or GitHub Actions expression); takes precedence over `min-integrity` but not over `blocked-users`; requires `min-integrity` to be set
-- `private-to-public-flows:` - Opt out of MCP Gateway cross-visibility protections (which block private-repo data from reaching public sinks). `allow` disables `forcePublicRepos` and sink-visibility enforcement for all servers (**not compatible with strict mode**); an array of MCP server IDs (e.g. `[github, my-server]`) exempts only those servers from sink-visibility enforcement (strict-mode compatible, keeps `forcePublicRepos`). Security-sensitive — only use when private→public flows are intended.
+- `private-to-public-flows:` - Opt out of MCP Gateway cross-visibility protections (which block private-repo data from reaching public sinks). `allow` disables `forcePublicRepos` and sink-visibility enforcement for all servers; an array of MCP server IDs (e.g. `[github, my-server]`) exempts only those servers from sink-visibility enforcement while keeping `forcePublicRepos`. Both forms are rejected in strict mode and warn in non-strict mode because action logs are public and agents may expose private data.
 - `toolsets:` - Enable specific GitHub toolset groups (single name string or array; a string is shorthand for a one-element array)
   - **Default toolsets** (when unspecified): `context`, `repos`, `issues`, `pull_requests` (excludes `users` as GitHub Actions tokens don't support user operations)
   - **Group aliases**: `default` (recommended action-friendly set), `action-friendly` (action-safe toolsets, excludes `users`), `all` (everything)
-  - **Individual toolsets**: `context`, `repos`, `issues`, `pull_requests`, `actions`, `code_security`, `dependabot`, `discussions`, `experiments`, `gists`, `labels`, `notifications`, `orgs`, `projects`, `secret_protection`, `security_advisories`, `stargazers`, `users`, `search`
+  - **Individual toolsets**: `context`, `repos`, `issues`, `pull_requests`, `actions`, `code_quality`, `code_security`, `copilot`, `copilot_issue_intents`, `copilot_spaces`, `dependabot`, `discussions`, `gists`, `git`, `github_support_docs_search`, `governance`, `labels`, `notifications`, `orgs`, `projects`, `secret_protection`, `security_advisories`, `stargazers`, `users`
+    Search tools are distributed across `repos`, `orgs`, `users`, and `issues`; there is no standalone `search` toolset.
   - Examples: `toolsets: [default]`, `toolsets: [default, discussions]`, `toolsets: [repos, issues]`
   - **Recommended**: Prefer `toolsets:` over `allowed:` for better organization and reduced configuration verbosity
 
@@ -119,12 +120,11 @@ The `tools:` field configures which tools the coding agent may use.
   tools:
     bash: ["*"]
   ```
-- `playwright:` - Browser automation for visual regression, accessibility, and end-to-end testing. Use `mode: cli` (recommended) — no Docker, runs `playwright-cli <command>` in bash, `localhost` reaches local servers directly. `mode: mcp` is deprecated (Docker-based). Pin a version with `version:` and restrict network to `local` + `playwright`.
+- `playwright:` - Browser automation for visual regression, accessibility, and end-to-end testing. The built-in integration uses `playwright-cli <command>` in bash, and `localhost` reaches local servers directly. `mode: mcp` is removed; use a custom `mcp-servers` entry if MCP is required. Pin the CLI with `version:` and restrict network to `local` + `playwright`.
 
   ```yaml
   tools:
     playwright:
-      mode: cli          # recommended: token-efficient CLI mode
       version: "0.1.11"  # optional: @playwright/cli npm package version
   ```
 - `timeout:` - Per-operation timeout in seconds for all tool and MCP calls (integer or expression, default: 60 s for all engines).
@@ -170,6 +170,28 @@ mcp-servers:
 ```
 
 `auth.type: github-oidc` uses GitHub Actions OIDC tokens for secure server-to-server authentication without static credentials. The `audience` field defaults to the server URL when omitted.
+
+- `required:` - Whether a stdio or HTTP MCP server must pass its startup connectivity check (boolean, default: `true`). Set `false` for an optional server so a failed startup check only logs a warning and the workflow continues without it, instead of failing the run.
+
+## Agent Plugins (`plugins:`)
+
+:::caution[Experimental]
+Compiling a workflow that uses `plugins:` emits a warning; the interface may change.
+:::
+
+Installs [Agent Plugins](https://agent-plugins.org) through the selected engine (top-level field, distinct from Pi's `engine.extensions`):
+
+```yaml
+plugins:
+  - octo-org/agent-plugin@v1
+  - octo-org/agent-plugins/plugins/example@main
+```
+
+- Entries use `owner/repository[/path]@ref`; `ref` is required (branch, tag, or 40-char commit SHA).
+- The compiler resolves every branch/tag to a commit SHA at compile time; unresolvable refs fail compilation, so generated workflows never install from a moving ref.
+- Supported by `copilot`, `claude`, and `codex` (each installs plugins its own way — see [syntax-engine.md](syntax-engine.md)); `gemini` and `pi` reject `plugins:` at compile time. Imported engine definitions opt in via `engine.behaviors.plugins` (see [configure-agentic-engine.md](configure-agentic-engine.md)).
+- Plugin object entries support per-entry `github-token` or `github-app` (mutually exclusive), so private plugin repositories are supported.
+- Merge behavior across imports: see the imports merge list above.
 
 ### Engine Network Permissions
 
@@ -240,8 +262,9 @@ The following frontmatter fields in imported files are merged into the importing
 - `steps:` - Steps appended in import order
 - `pre-agent-steps:` - Steps appended in import order
 - `post-steps:` - Steps appended in import order
-- `jobs.<job-id>.setup-steps` and `jobs.<job-id>.pre-steps` - Merged per job with imported steps first, then main workflow steps. Execution order is `setup-steps` before `pre-steps`.
-- `runtimes:`, `network:`, `permissions:`, `services:`, `cache:`, `features:`, `mcp-servers:`
+- `jobs.<job-id>.setup-steps`, `jobs.<job-id>.pre-steps`, and `jobs.activation.steps` - Merged per job with imported steps first, then main workflow steps. Execution order is `setup-steps` before `pre-steps`; `jobs.activation.steps` run later in the activation job before the activation artifact is staged.
+- `runtimes:`, `network:`, `permissions:`, `services:`, `cache:`, `features:`, `mcp-servers:`. Network allowlists and enabled `hosted-web` domain lists are combined; top-level hosted-web scalar configuration (such as `max-uses` or an explicit disablement) takes precedence.
+- `plugins:` - Union by plugin path; identical refs dedupe, compatible semantic versions select the highest, incompatible majors/non-semver conflicts fail compilation
 
 Example import file:
 
@@ -295,7 +318,7 @@ In the compiled workflow, the order is: copilot-setup-steps → imported steps f
 
 ## Permission Patterns
 
-**IMPORTANT**: Agentic workflows MUST NOT include write permissions (`issues: write`, `pull-requests: write`, `contents: write`). Safe-outputs provide these via separate secured jobs. Granting writes to the main AI job causes a compilation error.
+**IMPORTANT**: Agentic workflows should not include write permissions (`contents: write`, `issues: write`, `pull-requests: write`) on the main agent job. Safe-outputs provide these via separate secured jobs. In `strict: true` mode, granting any of these three write scopes to the main job is a compilation error; outside strict mode it compiles but is against the recommended security posture (see [workflow-constraints.md](workflow-constraints.md)).
 
 ### Read-Only Pattern
 

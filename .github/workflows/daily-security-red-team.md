@@ -13,13 +13,18 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 tracker-id: security-red-team
-engine: claude
+engine:
+  id: opencode
+model: copilot/auto
 strict: true
+network:
+  allowed:
+    - defaults
+    - github
+    - node
 tools:
-  cli-proxy: true
   cache-memory: true
   github:
     mode: gh-proxy
@@ -50,11 +55,13 @@ experiments:
     issue: 31673
 timeout-minutes: 60
 imports:
+  - shared/opencode.md
   - shared/security-analysis-base.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[security-red-team] "
       expires: 3d
+  - shared/reporting.md
 
   - shared/otlp.md
 evals:
@@ -62,14 +69,11 @@ evals:
     question: Did the agent perform a deep red teaming security scan of actions/setup/js and actions/setup/sh directories?
   - id: findings_reported_or_noop
     question: Were security findings (backdoors, secret leaks, malicious code) reported, or was noop used when no issues were detected?
+features:
+  gh-aw-detection: true
 ---
 
 ### Daily Security Red Team Agent
-
-**Report Formatting**: Use h3 (###) or lower for all headers in your report
-to maintain proper document hierarchy. Wrap long sections in
-`<details><summary>View Full Details</summary>` tags to improve readability.
-
 
 You are a specialized **Security Red Team Agent** performing deep security analysis on the codebase. Your mission is to identify backdoors, secret leaks, destructive code, and other malicious patterns in the `actions/setup/js` and `actions/setup/sh` directories.
 
@@ -311,8 +315,8 @@ while IFS= read -r file; do
   
   # Pattern 1: Secret exfiltration
   if grep -nE '(process\.env\.|os\.getenv|ENV\[)[^;]*\.(post|fetch|axios|request|curl|wget)' "$file" > /tmp/gh-aw/agent/pattern.txt; then
-    echo "⚠️  Potential secret exfiltration in $file"
-    FINDINGS+=("SECRET_EXFIL:$file:$(head -1 /tmp/gh-aw/agent/pattern.txt | cut -d: -f1)")
+    echo "⚠️  Potential secret egress candidate in $file"
+    FINDINGS+=("SECRET_EXFIL_CANDIDATE:$file:$(head -1 /tmp/gh-aw/agent/pattern.txt | cut -d: -f1)")
   fi
   
   # Pattern 2: Eval/exec with user input
@@ -426,8 +430,8 @@ while IFS= read -r file; do
   
   # High entropy might indicate obfuscation
   if [ "$ENTROPY" -gt 70 ]; then
-    echo "⚠️  High entropy detected in $file (entropy: $ENTROPY)"
-    FINDINGS+=("HIGH_ENTROPY:$file:0:entropy=$ENTROPY")
+    echo "⚠️  High entropy candidate detected in $file (entropy: $ENTROPY)"
+    FINDINGS+=("HIGH_ENTROPY_CANDIDATE:$file:0:entropy=$ENTROPY")
   fi
   
   # Check for long hex/base64 strings
@@ -570,7 +574,7 @@ echo "✅ Full comprehensive scan complete"
 
 #### Phase 4b: Iterative Re-Evaluation (variant: iterative only)
 
-{{#if experiments.reasoning_depth iterative}}
+{{#if experiments.reasoning_depth == 'iterative'}}
 Before proceeding to Phase 5, perform a **second-pass validation** of every finding collected so far:
 
 1. For each finding in `FINDINGS[]`, re-read the exact file and line cited.
@@ -582,6 +586,16 @@ Before proceeding to Phase 5, perform a **second-pass validation** of every find
 {{else}}
 <!-- single_pass: skip re-evaluation, proceed directly to Phase 5 -->
 {{/if}}
+
+#### Phase 4c: Evidence Validation (all scan variants)
+
+Before Phase 5, validate every candidate in `FINDINGS[]`, including in the `single_pass` variant. The iterative second pass is additional analysis, not a substitute for these checks:
+
+1. Verify that each cited path exists and that its line number is in range and points to the behavior being reported. Do not treat imports, comments, type declarations, or test fixtures alone as evidence of a production vulnerability.
+2. Treat regex matches, suspicious keywords, entropy scores, and long encoded strings as leads only. A heuristic match does not establish malicious behavior.
+3. For any `SECRET_EXFIL_CANDIDATE`, identify the sensitive value source and the outbound network sink, then trace the same value from source to sink. Cite the exact source and sink lines and explain the data flow. An environment-variable read, a network call, or high entropy on its own is insufficient. Promote the candidate to `SECRET_EXFIL` only when this path is verified; otherwise remove it from `FINDINGS[]` and record the reason in `$CACHE_DIR/dismissed-findings-${TIMESTAMP}.json`.
+4. Apply the same evidence standard to other finding types: retain only findings supported by the cited code and its behavior. If a candidate cannot be verified, do not report it as a confirmed issue.
+5. Ensure all remaining entries in `FINDINGS[]` are confirmed, correctly cited findings before running forensics or generating remediation tasks. If none remain, use the no-findings path in Phase 8.
 
 #### Phase 5: Compile and Report Findings
 
@@ -645,28 +659,34 @@ if [ ${#FINDINGS[@]} -gt 0 ]; then
   
   # Create issue using safe-outputs
   cat > /tmp/gh-aw/agent/security-issue.md <<EOF
-# 🚨 Security Red Team Findings - $(date +%Y-%m-%d)
+### 🚨 Security Red Team Findings - $(date +%Y-%m-%d)
 
 **Scan Mode**: $SCAN_MODE  
 **Technique**: $TECHNIQUE  
 **Files Analyzed**: $FILE_COUNT  
 **Findings**: ${#FINDINGS[@]}
 
-## 📋 Executive Summary
+### 📋 Executive Summary
 
-The daily security red team scan has detected **${#FINDINGS[@]}** potential security issues in the \`actions/setup/js\` and \`actions/setup/sh\` directories using the **$TECHNIQUE** technique.
+The daily security red team scan has detected **${#FINDINGS[@]}** validated security findings in the \`actions/setup/js\` and \`actions/setup/sh\` directories using the **$TECHNIQUE** technique.
 
-## 🔍 Detailed Findings
+<details>
+<summary><b>🔍 View Detailed Findings</b></summary>
 
 $FINDINGS_DETAILS
 
-## 🛠️ Remediation Tasks
+</details>
+
+<details>
+<summary><b>🛠️ View Remediation Tasks</b></summary>
 
 @pelikhan The following tasks have been generated to address the security findings. Please review and execute as appropriate:
 
 $FIX_TASKS
 
-## 📊 Analysis Metadata
+</details>
+
+### 📊 Analysis Metadata
 
 - **Repository**: ${{ github.repository }}
 - **Run ID**: ${{ github.run_id }}
@@ -675,7 +695,7 @@ $FIX_TASKS
 - **Scan Type**: $SCAN_MODE
 - **Cache Location**: /tmp/gh-aw/cache-memory/security-red-team
 
-## 🎯 Next Steps
+### 🎯 Next Steps
 
 1. **Triage**: Review each finding and determine if it's a true positive or false positive
 2. **Prioritize**: Address high-severity issues first (secret exfiltration, backdoors)

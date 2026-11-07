@@ -40,24 +40,32 @@ create_dir() {
   fi
 }
 
+# Git Bash does not automatically convert Windows environment-variable paths.
+# Preserve RUNNER_TEMP for JavaScript consumers, but use a Bash-compatible path here.
+if [[ "$(uname -o 2>/dev/null)" == "Msys" ]] && command -v cygpath >/dev/null 2>&1; then
+  RUNNER_TEMP_BASH="$(cygpath -u "${RUNNER_TEMP}")"
+else
+  RUNNER_TEMP_BASH="${RUNNER_TEMP}"
+fi
+
 # GH_AW_ROOT uses RUNNER_TEMP for write access on both GitHub-hosted and self-hosted runners.
 # RUNNER_TEMP is guaranteed to be set by GitHub Actions and is always writable.
-GH_AW_ROOT="${RUNNER_TEMP}/gh-aw"
+GH_AW_ROOT="${RUNNER_TEMP_BASH}/gh-aw"
 
 # Verify RUNNER_TEMP is set and the directory has write access
-if [ -z "${RUNNER_TEMP}" ]; then
+if [ -z "${RUNNER_TEMP_BASH}" ]; then
   echo "::error::RUNNER_TEMP environment variable is not set. This script must run in a GitHub Actions environment."
   exit 1
 fi
 
-if [ ! -d "${RUNNER_TEMP}" ]; then
-  echo "::error::RUNNER_TEMP directory does not exist: ${RUNNER_TEMP}"
+if [ ! -d "${RUNNER_TEMP_BASH}" ]; then
+  echo "::error::RUNNER_TEMP directory does not exist: ${RUNNER_TEMP_BASH}"
   exit 1
 fi
 
-if [ ! -w "${RUNNER_TEMP}" ]; then
-  echo "::error::RUNNER_TEMP directory is not writable: ${RUNNER_TEMP}"
-  echo "::error::The runner user ($(whoami)) does not have write access to ${RUNNER_TEMP}"
+if [ ! -w "${RUNNER_TEMP_BASH}" ]; then
+  echo "::error::RUNNER_TEMP directory is not writable: ${RUNNER_TEMP_BASH}"
+  echo "::error::The runner user ($(whoami)) does not have write access to ${RUNNER_TEMP_BASH}"
   exit 1
 fi
 
@@ -66,9 +74,9 @@ fi
 # (runtime tree). When RUNNER_TEMP=/tmp both paths collapse into /tmp/gh-aw, giving
 # the agent write access to compiled scripts, prompts, and MCP configs that must stay
 # immutable. Fail fast here rather than silently running with a broken security boundary.
-RESOLVED_RUNNER_TEMP="$(cd "${RUNNER_TEMP}" && pwd -P)"
+RESOLVED_RUNNER_TEMP="$(cd "${RUNNER_TEMP_BASH}" && pwd -P)"
 if [ -z "${RESOLVED_RUNNER_TEMP}" ]; then
-  echo "::error::Failed to resolve canonical path for RUNNER_TEMP: ${RUNNER_TEMP}"
+  echo "::error::Failed to resolve canonical path for RUNNER_TEMP: ${RUNNER_TEMP_BASH}"
   exit 1
 fi
 if [ "${RESOLVED_RUNNER_TEMP%/}" = "/tmp" ]; then
@@ -76,10 +84,13 @@ if [ "${RESOLVED_RUNNER_TEMP%/}" = "/tmp" ]; then
   exit 1
 fi
 
-debug_log "Using RUNNER_TEMP: ${RUNNER_TEMP} (resolved: ${RESOLVED_RUNNER_TEMP}, writable: yes)"
+debug_log "Using RUNNER_TEMP: ${RUNNER_TEMP_BASH} (resolved: ${RESOLVED_RUNNER_TEMP}, writable: yes)"
 
 # Get destination from input or use default
 DESTINATION="${INPUT_DESTINATION:-${GH_AW_ROOT}/actions}"
+if [[ "$(uname -o 2>/dev/null)" == "Msys" ]] && command -v cygpath >/dev/null 2>&1; then
+  DESTINATION="$(cygpath -u "${DESTINATION}")"
+fi
 
 # Get safe-output-custom-tokens flag from input (default: false)
 SAFE_OUTPUT_CUSTOM_TOKENS_ENABLED="${INPUT_SAFE_OUTPUT_CUSTOM_TOKENS:-false}"
@@ -153,7 +164,8 @@ fi
 FILE_COUNT_IN_DIR=$(ls -1 "${JS_SOURCE_DIR}" 2>/dev/null | wc -l)
 debug_log "Found ${FILE_COUNT_IN_DIR} files in ${JS_SOURCE_DIR}"
 
-# Copy all .cjs files from js/ to destination (excluding test files)
+# Copy all .cjs files from js/ to destination (excluding test files), including
+# shared runtime dependencies used by the Copilot harness and SDK driver.
 FILE_COUNT=0
 for file in "${JS_SOURCE_DIR}"/*.cjs; do
   if [ -f "$file" ]; then
@@ -198,6 +210,10 @@ fi
 
 echo "Successfully copied ${FILE_COUNT} files to ${DESTINATION}"
 
+if ! bash "${DESTINATION}/runtime_trust_inventory.sh"; then
+  echo "::warning::Runtime TLS inventory inspection failed; trust status unknown. Continuing setup; artifact-integrity checks remain required."
+fi
+
 # Copy prompt markdown files to their expected directory
 PROMPTS_DEST="${GH_AW_ROOT}/prompts"
 debug_log "Copying prompt markdown files to ${PROMPTS_DEST}"
@@ -231,8 +247,9 @@ MCP_SCRIPTS_FILES=(
   "mcp_scripts_mcp_server.cjs"
   "mcp_scripts_mcp_server_http.cjs"
   "mcp_scripts_tool_factory.cjs"
-  "mcp_scripts_validation.cjs"
   "mcp_server_core.cjs"
+  "levenshtein_distance.cjs"
+  "safe_output_names.cjs"
   "mcp_dependencies_manager.cjs"
   "mcp_logger.cjs"
   "mcp_http_transport.cjs"
@@ -243,16 +260,107 @@ MCP_SCRIPTS_FILES=(
   "mcp_handler_javascript.cjs"
   "mcp_handler_process.cjs"
   "read_buffer.cjs"
-  "generate_mcp_scripts_config.cjs"
   "setup_globals.cjs"
   "runtime_features.cjs"
   "github_rate_limit_logger.cjs"
   "error_helpers.cjs"
   "error_codes.cjs"
   "constants.cjs"
+  "close_older_entities.cjs"
+  "generate_footer.cjs"
+  "threat_detection_warning.cjs"
+  "model_attribution.cjs"
+  "model_costs.cjs"
+  "model_aliases.cjs"
   "mcp_enhanced_errors.cjs"
   "shim.cjs"
   "mcp-scripts-runner.cjs"
+  "add_mask_redaction.cjs"
+  "jsonl_helpers.cjs"
+  "schema-validation.cjs"
+  "add_labels_schema.cjs"
+  "json_schema_validation.cjs"
+  "memory_schema_contract.cjs"
+  "json_string_scanner.cjs"
+  "mask_value_matcher.cjs"
+  "aw_context.cjs"
+  "webhook_context.cjs"
+  "webhook_resource.cjs"
+  "gateway_command_webhook.cjs"
+  "github_notification_webhook.cjs"
+  "github_notification_webhooks.json"
+  "diagnostic_sanitization.cjs"
+  "experiment_helpers.cjs"
+  "finish_work_queue_claim.cjs"
+  "git_auth_env.cjs"
+  "glob_pattern_helpers.cjs"
+  "handler_auth.cjs"
+  "invocation_context_helpers.cjs"
+  "markdown_code_region_balancer.cjs"
+  "messages_core.cjs"
+  "pi_session_redaction.cjs"
+  "otlp_header_helpers.cjs"
+  "otlp.cjs"
+  "provider_issue_webhook.cjs"
+  "redact_secrets.cjs"
+  "safe_output_redaction.cjs"
+  "safe_outputs_tools.json"
+  "safe_outputs_config_redact.cjs"
+  "repo_helpers.cjs"
+  "safe_output_helpers.cjs"
+  "safe_output_manifest.cjs"
+  "safe_output_outcomes.cjs"
+  "safe_outputs_status.cjs"
+  "sanitize_content.cjs"
+  "sanitize_content_core.cjs"
+  "slash_command_matcher.cjs"
+  "staged_preview.cjs"
+  "work_queue_auth_cache.cjs"
+  "work_queue_binding.cjs"
+  "work_queue_checked_transport.cjs"
+  "work_queue_claim_adapters.cjs"
+  "work_queue_claim_scope.cjs"
+  "work_queue_codec.cjs"
+  "work_queue_control_receipts.cjs"
+  "work_queue_declared_verification.cjs"
+  "work_queue_delivery.cjs"
+  "work_queue_deployment.cjs"
+  "work_queue_deployment_control.cjs"
+  "work_queue_dependency_resolver.cjs"
+  "work_queue_dispatch.cjs"
+  "work_queue_dispatch_credential.cjs"
+  "dispatch_workflow_transport.cjs"
+  "work_queue_effect_client.cjs"
+  "work_queue_effect_resource.cjs"
+  "work_queue_expiration.cjs"
+  "work_queue_git_objects.cjs"
+  "work_queue_git_transport.cjs"
+  "work_queue_git_tree_adapter.cjs"
+  "work_queue_graph.cjs"
+  "work_queue_graphql_adapter.cjs"
+  "work_queue_indexes.cjs"
+  "work_queue_intents.cjs"
+  "work_queue_issue_contract.cjs"
+  "work_queue_limits.cjs"
+  "work_queue_logging.cjs"
+  "work_queue_mcp_server.cjs"
+  "work_queue_native.cjs"
+  "work_queue_native_creation_delivery.cjs"
+  "work_queue_policy.cjs"
+  "work_queue_policy_config.cjs"
+  "work_queue_pool_install.cjs"
+  "work_queue_provisioning.cjs"
+  "work_queue_read_retry.cjs"
+  "work_queue_reconciler.cjs"
+  "work_queue_replay.cjs"
+  "work_queue_resource_scope.cjs"
+  "work_queue_rest_adapter.cjs"
+  "work_queue_scheduler.cjs"
+  "work_queue_store.cjs"
+  "work_queue_telemetry.cjs"
+  "work_queue_summary_renderer.cjs"
+  "work_queue_host.cjs"
+  "work_queue_yaml.cjs"
 )
 
 MCP_SCRIPTS_COUNT=0
@@ -284,16 +392,26 @@ echo "Successfully copied ${MCP_SCRIPTS_COUNT} mcp-scripts files to ${MCP_SCRIPT
 SAFE_OUTPUTS_DEST="${GH_AW_ROOT}/safeoutputs"
 debug_log "Copying safe-outputs files to ${SAFE_OUTPUTS_DEST}"
 create_dir "${SAFE_OUTPUTS_DEST}"
+create_dir "${SAFE_OUTPUTS_DEST}/work-queue"
 
 SAFE_OUTPUTS_FILES=(
   "safe_outputs_mcp_server.cjs"
   "safe_outputs_mcp_server_http.cjs"
   "safe_outputs_mcp_arguments.cjs"
+  "optional_field_normalizer.cjs"
   "safe_outputs_bootstrap.cjs"
   "safe_outputs_tools_loader.cjs"
+  "safe_output_names.cjs"
   "safe_outputs_config.cjs"
+  "safe_output_redaction.cjs"
   "safe_outputs_config_redact.cjs"
   "safe_outputs_handlers.cjs"
+  "issue_artifacts.cjs"
+  "safe_output_submission.cjs"
+  "ledger_append.cjs"
+  "ledger_transactions.cjs"
+  "ledger_builtin.cjs"
+  "ledger_store.cjs"
   "symlink_guard.cjs"
   "intent_probe.cjs"
   "allowed_extensions_helpers.cjs"
@@ -309,12 +427,26 @@ SAFE_OUTPUTS_FILES=(
   "mcp_handler_javascript.cjs"
   "mcp_handler_process.cjs"
   "read_buffer.cjs"
-  "mcp_scripts_validation.cjs"
+  "memory_custom_validation.cjs"
+  "memory_schema_contract.cjs"
+  "memory_file_eligibility.cjs"
   "messages.cjs"
   "messages_core.cjs"
   "messages_footer.cjs"
+  "close_older_entities.cjs"
+  "generate_footer.cjs"
+  "report_ast.cjs"
+  "report_markdown.cjs"
+  "report_size.cjs"
+  "diagnostic_sanitization.cjs"
+  "ephemerals.cjs"
+  "safe_output_manifest.cjs"
+  "safe_output_outcomes.cjs"
+  "safe_outputs_status.cjs"
+  "project_timezone.cjs"
   "compact_numbers.cjs"
   "model_aliases.cjs"
+  "model_attribution.cjs"
   "messages_header.cjs"
   "messages_run_status.cjs"
   "messages_staged.cjs"
@@ -324,9 +456,15 @@ SAFE_OUTPUTS_FILES=(
   "estimate_tokens.cjs"
   "generate_git_patch.cjs"
   "generate_git_bundle.cjs"
+  "object_pack_transport.cjs"
+  "object_pack_fetch.cjs"
+  "object_pack_limits.cjs"
+  "workflow_file_exclusions.cjs"
   "git_patch_utils.cjs"
+  "commit_sha_helpers.cjs"
   "get_base_branch.cjs"
   "get_current_branch.cjs"
+  "child_process_timeouts.cjs"
   "normalize_branch_name.cjs"
   "write_large_content_to_file.cjs"
   "generate_compact_schema.cjs"
@@ -337,6 +475,8 @@ SAFE_OUTPUTS_FILES=(
   "error_codes.cjs"
   "constants.cjs"
   "git_helpers.cjs"
+  "git_auth_env.cjs"
+  "error_recovery.cjs"
   "checkout_manifest.cjs"
   "github_api_helpers.cjs"
   "find_repo_checkout.cjs"
@@ -350,6 +490,7 @@ SAFE_OUTPUTS_FILES=(
   "firewall_blocked_domains.cjs"
   "render_template.cjs"
   "ai_credits_context.cjs"
+  "harness_error_patterns.cjs"
   "numeric_limits.cjs"
   "is_truthy.cjs"
   "template_branch.cjs"
@@ -357,6 +498,7 @@ SAFE_OUTPUTS_FILES=(
   "missing_info_formatter.cjs"
   "sanitize_content.cjs"
   "sanitize_content_core.cjs"
+  "sanitize_label_content.cjs"
   "slash_command_matcher.cjs"
   "sanitize_title.cjs"
   "issue_title_dedup.cjs"
@@ -364,8 +506,75 @@ SAFE_OUTPUTS_FILES=(
   "markdown_code_region_balancer.cjs"
   "temporary_id.cjs"
   "invocation_context_helpers.cjs"
-  "repo_memory_patch_size.cjs"
   "data_schema_normalizer.cjs"
+  "aw_context.cjs"
+  "webhook_context.cjs"
+  "webhook_resource.cjs"
+  "gateway_command_webhook.cjs"
+  "github_notification_webhook.cjs"
+  "github_notification_webhooks.json"
+  "otlp_header_helpers.cjs"
+  "otlp.cjs"
+  "provider_issue_webhook.cjs"
+  "redact_secrets.cjs"
+  "experiment_helpers.cjs"
+  "safe_output_helpers.cjs"
+  "add_mask_redaction.cjs"
+  "jsonl_helpers.cjs"
+  "schema-validation.cjs"
+  "add_labels_schema.cjs"
+  "json_schema_validation.cjs"
+  "json_string_scanner.cjs"
+  "mask_value_matcher.cjs"
+  "pi_session_redaction.cjs"
+  "staged_preview.cjs"
+  "finish_work_queue_claim.cjs"
+  "work_queue_auth_cache.cjs"
+  "work_queue_binding.cjs"
+  "work_queue_checked_transport.cjs"
+  "work_queue_claim_adapters.cjs"
+  "work_queue_claim_scope.cjs"
+  "work_queue_codec.cjs"
+  "work_queue_control_receipts.cjs"
+  "work_queue_declared_verification.cjs"
+  "work_queue_delivery.cjs"
+  "work_queue_dependency_resolver.cjs"
+  "work_queue_host.cjs"
+  "work_queue_deployment.cjs"
+  "work_queue_deployment_control.cjs"
+  "work_queue_dispatch.cjs"
+  "work_queue_dispatch_credential.cjs"
+  "dispatch_workflow_transport.cjs"
+  "work_queue_effect_client.cjs"
+  "work_queue_effect_resource.cjs"
+  "work_queue_expiration.cjs"
+  "work_queue_git_objects.cjs"
+  "work_queue_git_transport.cjs"
+  "work_queue_git_tree_adapter.cjs"
+  "work_queue_graph.cjs"
+  "work_queue_graphql_adapter.cjs"
+  "work_queue_indexes.cjs"
+  "work_queue_intents.cjs"
+  "work_queue_issue_contract.cjs"
+  "work_queue_limits.cjs"
+  "work_queue_logging.cjs"
+  "work_queue_mcp_server.cjs"
+  "work_queue_native.cjs"
+  "work_queue_native_creation_delivery.cjs"
+  "work_queue_policy.cjs"
+  "work_queue_policy_config.cjs"
+  "work_queue_pool_install.cjs"
+  "work_queue_provisioning.cjs"
+  "work_queue_read_retry.cjs"
+  "work_queue_reconciler.cjs"
+  "work_queue_replay.cjs"
+  "work_queue_resource_scope.cjs"
+  "work_queue_rest_adapter.cjs"
+  "work_queue_scheduler.cjs"
+  "work_queue_store.cjs"
+  "work_queue_telemetry.cjs"
+  "work_queue_summary_renderer.cjs"
+  "work_queue_yaml.cjs"
 )
 
 SAFE_OUTPUTS_COUNT=0

@@ -8,32 +8,29 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
-	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
+	"github.com/github/gh-aw/pkg/linters/internal/coverage"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:seenmapbool")
+
 // Analyzer is the seen-map-bool analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "seenmapbool",
-	Doc:      "reports map[string]bool used as a set (values always true) where map[string]struct{} should be used instead",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/seenmapbool",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
+var Analyzer = analyzerutil.New("seenmapbool", "reports map[string]bool used as a set (values always true) where map[string]struct{} should be used instead", run)
+
+// hotThreshold gates findings on coverage data; see coverage package docs.
+var hotThreshold *int
+
+func init() {
+	hotThreshold = coverage.RegisterHotThresholdFlag(Analyzer)
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -43,15 +40,11 @@ func run(pass *analysis.Pass) (any, error) {
 		(*ast.FuncLit)(nil),
 	}
 
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		var body *ast.BlockStmt
 		switch fn := n.(type) {
 		case *ast.FuncDecl:
 			if fn.Body == nil {
-				return
-			}
-			pos := pass.Fset.PositionFor(fn.Pos(), false)
-			if filecheck.ShouldSkipFilename(pos.Filename, generatedFiles) {
 				return
 			}
 			body = fn.Body
@@ -61,10 +54,12 @@ func run(pass *analysis.Pass) (any, error) {
 			}
 			body = fn.Body
 		}
+		pos := pass.Fset.PositionFor(n.Pos(), false)
+		if filecheck.ShouldSkipFilename(pos.Filename, generatedFiles) {
+			return
+		}
 		inspectBody(pass, body, noLintIndex)
 	})
-
-	return nil, nil
 }
 
 // inspectBody walks a function body and reports map[string]bool variables
@@ -84,6 +79,10 @@ func inspectBody(pass *analysis.Pass, body *ast.BlockStmt, noLintIndex nolint.Di
 		if nolint.HasDirectiveForLinter(pass.Fset.PositionFor(declNode.Pos(), false), noLintIndex, "seenmapbool") {
 			continue
 		}
+		if !coverage.ShouldApply(pass, declNode.Pos(), *hotThreshold) {
+			continue
+		}
+		pkgLog.Printf("flagging map[string]bool used as set: %s", obj.Name())
 		pass.ReportRangef(
 			declNode,
 			"map[string]bool %q used as a set; use map[string]struct{} to avoid allocating a bool per entry",
@@ -108,10 +107,7 @@ func collectSeenMapCandidates(pass *analysis.Pass, body *ast.BlockStmt) map[type
 			if stmt.Tok.String() != ":=" {
 				return true
 			}
-			for i, lhs := range stmt.Lhs {
-				if i >= len(stmt.Rhs) {
-					break
-				}
+			for _, lhs := range stmt.Lhs {
 				ident, ok := lhs.(*ast.Ident)
 				if !ok || ident.Name == "_" {
 					continue
@@ -120,7 +116,7 @@ func collectSeenMapCandidates(pass *analysis.Pass, body *ast.BlockStmt) map[type
 				if obj == nil {
 					continue
 				}
-				if isMapStringBool(pass.TypesInfo.TypeOf(ident)) && isMapStringBoolExpr(stmt.Rhs[i]) {
+				if isMapStringBool(pass.TypesInfo.TypeOf(ident)) {
 					candidates[obj] = ident
 				}
 			}
@@ -158,11 +154,25 @@ func collectSeenMapCandidates(pass *analysis.Pass, body *ast.BlockStmt) map[type
 func findNonSetMaps(pass *analysis.Pass, body *ast.BlockStmt, candidates map[types.Object]ast.Node) map[types.Object]bool {
 	nonSetMaps := make(map[types.Object]bool)
 	ast.Inspect(body, func(n ast.Node) bool {
+		if valSpec, ok := n.(*ast.ValueSpec); ok {
+			for i, name := range valSpec.Names {
+				if i < len(valSpec.Values) {
+					markIfNonSetLiteral(pass, name, valSpec.Values[i], candidates, nonSetMaps)
+				}
+			}
+			return true
+		}
 		assign, ok := n.(*ast.AssignStmt)
 		if !ok {
 			return true
 		}
 		for i, lhs := range assign.Lhs {
+			if ident, ok := lhs.(*ast.Ident); ok {
+				if i < len(assign.Rhs) {
+					markIfNonSetLiteral(pass, ident, assign.Rhs[i], candidates, nonSetMaps)
+				}
+				continue
+			}
 			indexExpr, ok := lhs.(*ast.IndexExpr)
 			if !ok {
 				continue
@@ -187,6 +197,36 @@ func findNonSetMaps(pass *analysis.Pass, body *ast.BlockStmt, candidates map[typ
 	return nonSetMaps
 }
 
+// markIfNonSetLiteral marks the candidate named by ident as a non-set map when
+// the value it is initialized with is a composite literal containing an entry
+// whose value is not the literal true.
+func markIfNonSetLiteral(pass *analysis.Pass, ident *ast.Ident, value ast.Expr, candidates map[types.Object]ast.Node, nonSetMaps map[types.Object]bool) {
+	if ident.Name == "_" {
+		return
+	}
+	obj := pass.TypesInfo.ObjectOf(ident)
+	if obj == nil {
+		return
+	}
+	if _, isCandidate := candidates[obj]; !isCandidate {
+		return
+	}
+	lit, ok := value.(*ast.CompositeLit)
+	if !ok {
+		return
+	}
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		if !isBoolTrue(kv.Value) {
+			nonSetMaps[obj] = true
+			return
+		}
+	}
+}
+
 // isMapStringBool returns true if t is map[string]bool.
 func isMapStringBool(t types.Type) bool {
 	if t == nil {
@@ -202,39 +242,6 @@ func isMapStringBool(t types.Type) bool {
 	}
 	val, ok := m.Elem().(*types.Basic)
 	return ok && val.Kind() == types.Bool
-}
-
-// isMapStringBoolExpr reports whether expr is a make(map[string]bool, ...) call
-// or a map[string]bool{...} composite literal.
-func isMapStringBoolExpr(expr ast.Expr) bool {
-	switch e := expr.(type) {
-	case *ast.CallExpr:
-		ident, ok := e.Fun.(*ast.Ident)
-		if !ok || ident.Name != "make" {
-			return false
-		}
-		if len(e.Args) == 0 {
-			return false
-		}
-		return isMapStringBoolTypeExpr(e.Args[0])
-	case *ast.CompositeLit:
-		return isMapStringBoolTypeExpr(e.Type)
-	}
-	return false
-}
-
-// isMapStringBoolTypeExpr reports whether the AST node represents map[string]bool.
-func isMapStringBoolTypeExpr(expr ast.Expr) bool {
-	mapType, ok := expr.(*ast.MapType)
-	if !ok {
-		return false
-	}
-	keyIdent, ok := mapType.Key.(*ast.Ident)
-	if !ok || keyIdent.Name != "string" {
-		return false
-	}
-	valIdent, ok := mapType.Value.(*ast.Ident)
-	return ok && valIdent.Name == "bool"
 }
 
 // isBoolTrue reports whether expr is the boolean literal true.

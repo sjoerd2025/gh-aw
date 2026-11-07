@@ -117,7 +117,7 @@ The `user-rate-limit` frontmatter field prevents users from triggering workflows
 user-rate-limit:
   max-runs-per-window: 5        # Required: Maximum runs per window (1-10)
   window: 60    # Optional: Time window in minutes (default: 60, max: 180)
-  events: [workflow_dispatch, issue_comment]  # Optional: Specific events (auto-inferred if omitted)
+  events: [workflow_dispatch, issue_comment]  # Optional: Specific events (inferred from `on:` when omitted; fallback to all supported programmatic events)
   ignored-roles: [admin, maintain]  # Optional: Roles exempt from rate limiting (default: [admin, maintain, write])
 ```
 
@@ -145,6 +145,14 @@ When a run starts and the workflow has already consumed more than the threshold 
 - **Slash commands**: Runs triggered by slash commands — whether routed through the centralized dispatcher or compiled directly into the workflow — bypass the guardrail.
 - **Label commands**: Runs triggered by label commands bypass the guardrail in the same way.
 - **Centralized invocations**: `workflow_call` and `repository_dispatch` events always bypass the guardrail; the calling workflow manages its own budget.
+
+## GitHub API Quota Diagnostics
+
+GitHub API quota is separate from daily AI Credits. During daily AIC inspection, `quota_exhausted` means a rate-limit response or protective quota stop reports zero remaining requests; `quota_reserve` means inspection stopped at the protective reserve. `rate_limited` identifies a rate-limit response without claiming that missing quota headers mean zero. HTTP 401 is reported as `authentication_failed`; a 403 without rate-limit evidence is reported as `permission_denied`. Explicit access failures retain their authentication or permission classification even at an empty budget; a simultaneous quota guard still stops further reads.
+
+Daily AIC restore failures identify the stopped read (such as `current_run`) and attempt count in logs and the step summary. Review-fetch failures in `dismiss-pull-request-review` retain the PR and review boundary. Diagnostics include validated remaining, limit, used, UTC reset and `retry_not_before` metadata when supplied by that business response; unavailable metadata is `unknown`. A precheck from another client is not authoritative for the failed request's quota.
+
+Quota-limited accounting remains unverified and blocks agent startup; it is not a measured daily credit overrun. Reset and Retry-After timestamps are earliest retry constraints, not automatic retries or guarantees of available shared installation quota. Retry-After accepts numeric delay-seconds or HTTP-date syntax; malformed, zero, and expired values still restrict retries without publishing a future deadline.
 
 ## Example: Multiple Protection Layers
 
@@ -182,7 +190,7 @@ Start with conservative limits and increase as needed. Use environments for high
 
 **Workflow dispatch not triggering**: Verify max dispatch limit (default: 1), check 5-second delay, confirm target workflow has `on: workflow_dispatch`, or check pending environment approvals.
 
-## Related Documentation
+## Learn More
 
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Write operations with validation
 - [Concurrency Control](/gh-aw/reference/concurrency/) - Execution serialization

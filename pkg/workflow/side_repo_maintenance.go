@@ -144,7 +144,13 @@ func sideRepoAppTokenMintStepYAML(app *GitHubAppConfig, targetRepo string) strin
 	var c Compiler
 	lines := c.buildGitHubAppTokenMintStepWithMeta(
 		app,
-		nil, // no additional permission scoping; the app's installation grants determine access
+		NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+			PermissionActions:      PermissionRead,
+			PermissionContents:     PermissionWrite,
+			PermissionDiscussions:  PermissionWrite,
+			PermissionIssues:       PermissionWrite,
+			PermissionPullRequests: PermissionWrite,
+		}),
 		targetRepo,
 		targetRepo,
 		"Generate GitHub App token",
@@ -155,6 +161,7 @@ func sideRepoAppTokenMintStepYAML(app *GitHubAppConfig, targetRepo string) strin
 
 // generateAllSideRepoMaintenanceWorkflowsOptions configures side-repo maintenance workflow generation.
 type generateAllSideRepoMaintenanceWorkflowsOptions struct {
+	pinWarnings      map[string]bool
 	workflowDataList []*WorkflowData
 	workflowDir      string
 	version          string
@@ -164,6 +171,8 @@ type generateAllSideRepoMaintenanceWorkflowsOptions struct {
 	resolver         SHAResolver
 	hasExpires       bool
 	minExpiresDays   int
+	repoConfig       *RepoConfig
+	noLogo           bool
 }
 
 // generateAllSideRepoMaintenanceWorkflows detects SideRepoOps targets and
@@ -199,6 +208,9 @@ func generateSideRepoMaintenanceFiles(ctx context.Context, targets []SideRepoTar
 			resolver:       opts.resolver,
 			hasExpires:     opts.hasExpires,
 			minExpiresDays: opts.minExpiresDays,
+			repoConfig:     opts.repoConfig,
+			noLogo:         opts.noLogo,
+			pinWarnings:    opts.pinWarnings,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate side-repo maintenance workflow for %s: %w", target.Repository, err)
@@ -234,6 +246,7 @@ func isSideRepoMaintenanceWorkflowFile(name string) bool {
 // generateSideRepoMaintenanceWorkflowOptions configures generation of a single side-repo
 // maintenance workflow.
 type generateSideRepoMaintenanceWorkflowOptions struct {
+	pinWarnings    map[string]bool
 	target         SideRepoTarget
 	outPath        string
 	version        string
@@ -243,6 +256,8 @@ type generateSideRepoMaintenanceWorkflowOptions struct {
 	resolver       SHAResolver
 	hasExpires     bool
 	minExpiresDays int
+	repoConfig     *RepoConfig
+	noLogo         bool
 }
 
 // generateSideRepoMaintenanceWorkflow generates a workflow_call-based maintenance
@@ -255,7 +270,16 @@ func generateSideRepoMaintenanceWorkflow(
 	opts generateSideRepoMaintenanceWorkflowOptions,
 ) error {
 	renderCtx := newSideRepoMaintenanceRenderContext(ctx, opts)
-	content := buildSideRepoMaintenanceWorkflowYAML(renderCtx)
+	content, err := buildSideRepoMaintenanceWorkflowYAML(renderCtx)
+	if err != nil {
+		return fmt.Errorf("failed to finalize side-repo maintenance workflow YAML: %w", err)
+	}
+	if opts.repoConfig != nil {
+		content, err = mapPinnedUsesInYAML(content, opts.repoConfig.ActionPins, opts.repoConfig.ActionPinPrefixes, opts.pinWarnings, opts.resolver)
+		if err != nil {
+			return err
+		}
+	}
 	maintenanceLog.Printf("Writing side-repo maintenance workflow to %s", renderCtx.outPath)
 	if err := os.WriteFile(renderCtx.outPath, []byte(content), constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write side-repo maintenance workflow: %w", err)
@@ -280,6 +304,7 @@ type sideRepoMaintenanceRenderContext struct {
 	cronSchedule    string
 	scheduleDesc    string
 	formattedRunsOn string
+	noLogo          bool
 }
 
 func newSideRepoMaintenanceRenderContext(ctx context.Context, opts generateSideRepoMaintenanceWorkflowOptions) sideRepoMaintenanceRenderContext {
@@ -297,6 +322,7 @@ func newSideRepoMaintenanceRenderContext(ctx context.Context, opts generateSideR
 		minExpiresDays:  opts.minExpiresDays,
 		setupActionRef:  ResolveSetupActionReference(ctx, opts.actionMode, opts.version, opts.actionTag, opts.resolver),
 		formattedRunsOn: FormatRunsOn(nil, "ubuntu-latest"),
+		noLogo:          !shouldIncludeLockFileLogo(opts.repoConfig, opts.noLogo),
 	}
 	maintenanceLog.Printf("Building side-repo workflow content: repo=%s, actionMode=%s, hasExpires=%t", renderCtx.repoSlug, renderCtx.actionMode, renderCtx.hasExpires)
 	if opts.target.GitHubApp != nil && opts.target.GitHubToken == "" {
@@ -315,9 +341,9 @@ func newSideRepoMaintenanceRenderContext(ctx context.Context, opts generateSideR
 	return renderCtx
 }
 
-func buildSideRepoMaintenanceWorkflowYAML(renderCtx sideRepoMaintenanceRenderContext) string {
+func buildSideRepoMaintenanceWorkflowYAML(renderCtx sideRepoMaintenanceRenderContext) (string, error) {
 	var yaml strings.Builder
-	yaml.WriteString(buildSideRepoMaintenanceHeader(renderCtx.repoSlug))
+	yaml.WriteString(buildSideRepoMaintenanceHeader(renderCtx.repoSlug, !renderCtx.noLogo))
 	yaml.WriteString(buildSideRepoMaintenanceOnSection(renderCtx))
 	if renderCtx.hasExpires {
 		maintenanceLog.Printf("Including close-expired-entities job for %s (cron=%s)", renderCtx.repoSlug, renderCtx.cronSchedule)
@@ -327,12 +353,16 @@ func buildSideRepoMaintenanceWorkflowYAML(renderCtx sideRepoMaintenanceRenderCon
 	yaml.WriteString(buildCreateLabelsJob(renderCtx))
 	yaml.WriteString(buildActivityReportJob(renderCtx))
 	yaml.WriteString(buildValidateWorkflowsJob(renderCtx))
-	return yaml.String()
+	finalYAML, err := finalizeRunnerTempSafety(yaml.String())
+	if err != nil {
+		return "", fmt.Errorf("runner temp safety: %w", err)
+	}
+	return documentPermissionComments(finalYAML, "")
 }
 
-func buildSideRepoMaintenanceHeader(repoSlug string) string {
+func buildSideRepoMaintenanceHeader(repoSlug string, logo bool) string {
 	customInstructions := strings.ReplaceAll(sideRepoMaintenanceHeaderTemplate, "{REPO_SLUG}", repoSlug)
-	return GenerateWorkflowHeader("", "pkg/workflow/side_repo_maintenance.go", customInstructions)
+	return GenerateWorkflowHeader("", "pkg/workflow/side_repo_maintenance.go", customInstructions, logo)
 }
 
 func buildSideRepoMaintenanceOnSection(renderCtx sideRepoMaintenanceRenderContext) string {
@@ -345,9 +375,9 @@ on:
         description: 'Optional maintenance operation to run'
         required: false
         type: choice
-        default: ''
+        default: '` + maintenanceNoOperationValue + `'
         options:
-          - ''
+          - '` + maintenanceNoOperationValue + `'
           - 'safe_outputs'
           - 'create_labels'
           - 'activity_report'
@@ -563,6 +593,8 @@ func buildApplySafeOutputsStep(renderCtx sideRepoMaintenanceRenderContext) strin
 	return `      - name: Apply Safe Outputs
         uses: ` + getCachedActionPinFromResolver("actions/github-script", renderCtx.resolver) + `
         env:
+          GH_AW_JOB_CHECK_RUN_ID: ${{ job.check_run_id }}
+          GH_AW_WORKFLOW_ID: "agentics-maintenance-` + stringutil.SanitizeForFilename(renderCtx.repoSlug) + `"
           GH_TOKEN: ` + renderCtx.token + `
           GH_AW_RUN_URL: ${{ inputs.run_url }}
           GH_AW_TARGET_REPO_SLUG: "` + renderCtx.repoSlug + `"

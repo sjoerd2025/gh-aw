@@ -15,7 +15,6 @@ type UpdateIssuesConfig struct {
 	Status              *bool    `yaml:"status,omitempty"`                // Allow updating issue status (open/closed) - presence indicates field can be updated
 	Title               *bool    `yaml:"title,omitempty"`                 // Allow updating issue title - presence indicates field can be updated
 	Body                *bool    `yaml:"body,omitempty"`                  // Allow updating issue body - boolean value controls permission (defaults to true)
-	Footer              *string  `yaml:"footer,omitempty"`                // Controls whether AI-generated footer is added. When false, visible footer is omitted but XML markers are kept.
 	TitlePrefix         string   `yaml:"title-prefix,omitempty"`          // Required title prefix for issue validation - only issues with this prefix can be updated (deprecated: use required-title-prefix)
 	RequiredTitlePrefix string   `yaml:"required-title-prefix,omitempty"` // Title prefix the issue must have (preferred over title-prefix)
 	RequiredLabels      []string `yaml:"required-labels,omitempty"`       // Labels that must ALL be present on the issue
@@ -31,7 +30,7 @@ func (c *Compiler) parseUpdateIssuesConfig(outputMap map[string]any) *UpdateIssu
 				{Name: "status", Mode: FieldParsingKeyExistence, Dest: &cfg.Status},
 				{Name: "title", Mode: FieldParsingKeyExistence, Dest: &cfg.Title},
 				{Name: "body", Mode: FieldParsingBoolValue, Dest: &cfg.Body},
-				{Name: "footer", Mode: FieldParsingTemplatableBool, StringDest: &cfg.Footer},
+				updateEntityFooterField(&cfg.Footer),
 			}
 		}, func(configMap map[string]any, cfg *UpdateIssuesConfig) {
 			cfg.TitlePrefix = extractStringFromMap(configMap, "title-prefix", updateIssueLog)

@@ -28,17 +28,13 @@ permissions:
   pull-requests: read
   discussions: read
 
-sandbox:
-  agent:
-    sudo: false
 
 engine:
-  id: copilot
-  copilot-sdk: true
+  id: codex
+model: openai/gpt-5.6-sol
 
-max-tool-denials: 3
 imports:
-  - shared/mcp/markitdown.md
+  # Note: markitdown.md excluded — docker.io/mcp/markitdown has Critical/High CVEs (see #49515)
   - shared/reporting.md
 
   - shared/otlp.md
@@ -62,6 +58,11 @@ safe-outputs:
 timeout-minutes: 15
 strict: true
 
+evals:
+  - id: resource-query-answer
+    question: When resources are successfully converted, does the proposed response address the supplied query using their content? Return UNKNOWN when no resources can be converted.
+  - id: conversion-limitations-disclosed
+    question: When resource conversion fails, does the response disclose the resulting limitation rather than inventing resource content? Return UNKNOWN when no conversion fails.
 ---
 
 # Resource Summarizer Agent

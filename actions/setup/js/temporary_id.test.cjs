@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 // Mock core for loadTemporaryIdMap
 const mockCore = {
@@ -19,6 +22,21 @@ describe("temporary_id.cjs", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     delete process.env.GH_AW_TEMPORARY_ID_MAP;
+  });
+
+  describe("loadTemporaryIdMapFromFile", () => {
+    it("loads a map from a safe-output artifact file", async () => {
+      const { loadTemporaryIdMapFromFile } = await import("./temporary_id.cjs");
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "temporary-id-map-"));
+      try {
+        const mapPath = path.join(tempDir, "temporary-id-map.json");
+        fs.writeFileSync(mapPath, JSON.stringify({ aw_parent: { repo: "owner/repo", number: 42 } }));
+
+        expect(loadTemporaryIdMapFromFile(mapPath)).toEqual(new Map([["aw_parent", { repo: "owner/repo", number: 42 }]]));
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("generateTemporaryId", () => {
@@ -815,6 +833,31 @@ describe("temporary_id.cjs", () => {
       expect(refs.size).toBe(2);
       expect(refs.has("aw_aaaa12")).toBe(true);
       expect(refs.has("aw_bbbb12")).toBe(true);
+    });
+
+    it("should extract temporary IDs from Azure DevOps work-item fields", async () => {
+      const { extractTemporaryIdReferences } = await import("./temporary_id.cjs");
+
+      const refs = extractTemporaryIdReferences({
+        type: "ado_link_work_items",
+        id: "#aw_item1",
+        work_item_id: "#aw_item2",
+        source_id: "#aw_item3",
+        target_id: "#aw_item4",
+      });
+
+      expect(refs).toEqual(new Set(["aw_item1", "aw_item2", "aw_item3", "aw_item4"]));
+    });
+
+    it("should extract temporary IDs from blocked_by dependencies", async () => {
+      const { extractTemporaryIdReferences } = await import("./temporary_id.cjs");
+
+      const refs = extractTemporaryIdReferences({
+        type: "create_issue",
+        blocked_by: ["aw_prereq", "#aw_other"],
+      });
+
+      expect(refs).toEqual(new Set(["aw_prereq", "aw_other"]));
     });
 
     it("should handle # prefix in ID fields", async () => {

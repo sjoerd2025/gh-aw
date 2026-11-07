@@ -42,6 +42,7 @@ func TestShouldRunCompileUpdateCheck(t *testing.T) {
 	t.Setenv("CI", "")
 	t.Setenv("CONTINUOUS_INTEGRATION", "")
 	t.Setenv("GITHUB_ACTIONS", "")
+	t.Setenv("COPILOT_AGENT_SESSION_ID", "")
 	t.Setenv("GH_AW_MCP_SERVER", "")
 	t.Setenv(compileUpdateCheckDisableEnv, "")
 	assert.True(t, shouldRunCompileUpdateCheck(false), "check should run when not disabled")
@@ -142,6 +143,29 @@ func TestRunCompileUpdateCheck(t *testing.T) {
 	}
 }
 
+func TestRunCompileUpdateCheckProbesCurrentReleaseOnce(t *testing.T) {
+	originalVersion, originalRelease := GetVersion(), workflow.IsRelease()
+	originalURL, originalProbe := compileUpdateCheckLatestReleaseURL, compileUpdateCheckProbeURLFunc
+	t.Cleanup(func() {
+		SetVersionInfo(originalVersion)
+		workflow.SetIsRelease(originalRelease)
+		compileUpdateCheckLatestReleaseURL, compileUpdateCheckProbeURLFunc = originalURL, originalProbe
+	})
+	SetVersionInfo("v1.2.3")
+	workflow.SetIsRelease(true)
+	server, methods := newCompileUpdateCheckMethodServer(t, "v1.2.3", map[string]bool{"v1.2.3": true})
+	defer server.Close()
+	compileUpdateCheckLatestReleaseURL = server.URL + "/releases/latest"
+	compileUpdateCheckProbeURLFunc = func(tag string) string {
+		return fmt.Sprintf("%s/raw/%s/go.mod", server.URL, tag)
+	}
+	got, err := runCompileUpdateCheck(context.Background(), server.Client())
+	require.NoError(t, err)
+	require.Nil(t, got)
+	require.Len(t, methodsForPrefix(methods, "/raw/"), 1, "identical current/latest tags need only one probe")
+	require.Empty(t, methodsForPrefix(methods, "/github/gh-aw/releases/tag/"), "the redirect identifies the release without fetching its page")
+}
+
 func TestPrintCompileUpdateNotification(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -200,6 +224,7 @@ func TestPrintCompileUpdateNotification(t *testing.T) {
 }
 
 func TestIsMinorVersionBehind(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		current string
@@ -234,6 +259,7 @@ func TestIsMinorVersionBehind(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tt.want, isMinorVersionBehind(tt.current, tt.latest))
 		})
 	}
@@ -298,6 +324,7 @@ func TestStartCompileUpdateCheckDoesNotBlockShutdown(t *testing.T) {
 	t.Setenv("CI", "")
 	t.Setenv("CONTINUOUS_INTEGRATION", "")
 	t.Setenv("GITHUB_ACTIONS", "")
+	t.Setenv("COPILOT_AGENT_SESSION_ID", "")
 	t.Setenv("GH_AW_MCP_SERVER", "")
 	t.Setenv(compileUpdateCheckDisableEnv, "")
 	getCompileUpdateCheckFilePathFunc = func() string {
@@ -309,6 +336,8 @@ func TestStartCompileUpdateCheckDoesNotBlockShutdown(t *testing.T) {
 
 	unblockRequest := make(chan struct{}) // cleanup closes this to unblock any pending request
 	requestStarted := make(chan struct{}, 1)
+	requestCancelled := make(chan struct{})
+	requestBudget := make(chan time.Duration, 1)
 	t.Cleanup(func() {
 		close(unblockRequest)
 	})
@@ -316,12 +345,18 @@ func TestStartCompileUpdateCheckDoesNotBlockShutdown(t *testing.T) {
 	compileUpdateCheckHTTPClientFactory = func() *http.Client {
 		return &http.Client{
 			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				deadline, _ := req.Context().Deadline()
+				requestBudget <- time.Until(deadline)
 				select {
 				case requestStarted <- struct{}{}:
 				default:
 				}
-				<-unblockRequest
-				return nil, context.DeadlineExceeded
+				select {
+				case <-unblockRequest:
+				case <-req.Context().Done():
+					close(requestCancelled)
+				}
+				return nil, req.Context().Err()
 			}),
 		}
 	}
@@ -332,10 +367,18 @@ func TestStartCompileUpdateCheckDoesNotBlockShutdown(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("background update check did not start an HTTP request")
 	}
+	budget := <-requestBudget
+	require.Positive(t, budget)
+	require.LessOrEqual(t, budget, compileUpdateCheckTimeout, "all requests must share the total update-check budget")
 
 	start := time.Now()
 	finish()
 	assert.Less(t, time.Since(start), 100*time.Millisecond, "finish should not wait for a background update check")
+	select {
+	case <-requestCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("finish should cancel the outstanding network request")
+	}
 }
 
 func TestStartCompileUpdateCheckSilentlyHandlesLockedDownNetwork(t *testing.T) {
@@ -358,6 +401,7 @@ func TestStartCompileUpdateCheckSilentlyHandlesLockedDownNetwork(t *testing.T) {
 	t.Setenv("CI", "")
 	t.Setenv("CONTINUOUS_INTEGRATION", "")
 	t.Setenv("GITHUB_ACTIONS", "")
+	t.Setenv("COPILOT_AGENT_SESSION_ID", "")
 	t.Setenv("GH_AW_MCP_SERVER", "")
 	t.Setenv(compileUpdateCheckDisableEnv, "")
 	getCompileUpdateCheckFilePathFunc = func() string {

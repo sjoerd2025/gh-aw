@@ -2,6 +2,10 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { createRequire } from "module";
 import crypto from "crypto";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { spawnSync } from "child_process";
 
 const require = createRequire(import.meta.url);
 
@@ -29,10 +33,32 @@ const {
   mergeFallbackIssueLabels,
   sanitizeFallbackAssignees,
   neutralizeClosingKeywordsForIssueBody,
-  generatePatchPreview,
+  buildPatchPreviewBlocks,
+  buildFallbackIssueBlocks,
   buildManifestProtectionCreatePrUrl,
-  buildPushErrorSection,
+  buildPushErrorBlocks,
+  buildManualBranchRecoveryCommands,
+  buildManualBranchApplyCommands,
+  withTransientPushRetry,
 } = require("./create_pull_request_helpers.cjs");
+const { TransportIntegrityError } = require("./transport_integrity.cjs");
+const { renderReport } = require("./report_ast.cjs");
+
+function runGit(args, cwd) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  expect(result.status, `git ${args.join(" ")} failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
+  return result.stdout.trim();
+}
+
+function runShell(script, cwd) {
+  const result = spawnSync("bash", ["-c", `set -euo pipefail\n${script}`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  expect(result.status, `shell failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}\nscript:\n${script}`).toBe(0);
+  return result.stdout.trim();
+}
+
+function skipArtifactDownload(commands) {
+  return commands.replace(/^gh run download .*$/m, "# artifact already downloaded");
+}
 
 describe("create_pull_request_helpers - constants", () => {
   it("MANAGED_FALLBACK_ISSUE_LABEL is the correct triage label", () => {
@@ -43,6 +69,44 @@ describe("create_pull_request_helpers - constants", () => {
     expect(LABEL_MAX_RETRIES).toBeGreaterThan(0);
     expect(LABEL_INITIAL_DELAY_MS).toBeGreaterThan(0);
     expect(LABEL_MAX_DELAY_MS).toBeGreaterThan(LABEL_INITIAL_DELAY_MS);
+  });
+});
+
+describe("withTransientPushRetry", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("waits for the shared first retry delay before retrying workflows-scope timeouts", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const operation = vi.fn().mockRejectedValueOnce(new Error("Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required.")).mockResolvedValueOnce("ok");
+
+    const resultPromise = withTransientPushRetry(operation);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(operation).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(29999);
+    expect(operation).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(resultPromise).resolves.toBe("ok");
+    expect(operation).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry integrity errors whose artifact path resembles a workflows-scope timeout", async () => {
+    vi.useFakeTimers();
+    const error = new TransportIntegrityError("/tmp/unable to determine if workflow can be created or updated.patch");
+    const operation = vi.fn().mockRejectedValue(error);
+
+    const result = withTransientPushRetry(operation);
+    const rejection = expect(result).rejects.toBe(error);
+    await vi.runAllTimersAsync();
+    await rejection;
+
+    expect(operation).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
@@ -126,6 +190,117 @@ describe("createBundleTempRef", () => {
     expect(ref1).toBe("refs/bundles/create-pr-same-branch-aabbccdd");
     expect(ref2).toBe("refs/bundles/create-pr-same-branch-11223344");
   });
+});
+
+describe("manual branch recovery/apply commands", () => {
+  it("shell-quotes dynamic recovery arguments and resolves bundle heads", () => {
+    const commands = buildManualBranchRecoveryCommands({
+      hasBundleFile: true,
+      runId: "123; echo injected",
+      artifactFileName: "agent'changes.bundle",
+      branchName: "feature/branch'; echo injected",
+      baseBranch: "main",
+      tempRef: "refs/bundles/tmp'; echo injected",
+    });
+
+    expect(commands).toContain("git bundle list-heads");
+    expect(commands).toContain('$2 == "HEAD"');
+    expect(commands).toContain("gh run download '123; echo injected' -n agent -D '/tmp/agent-123; echo injected'");
+    expect(commands).toContain("bundle_path='/tmp/agent-123; echo injected/agent'\\''changes.bundle'");
+    expect(commands).toContain("target_ref='refs/heads/feature/branch'\\''; echo injected'");
+    expect(commands).not.toContain("refs/heads/feature/branch'; echo injected:");
+  });
+
+  it("manual recovery bundle commands work with a real HEAD-only bundle", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manual-recovery-head-bundle-"));
+    const artifactRunId = `head-only-recovery-${process.pid}-${Date.now()}`;
+    const artifactDir = path.join(os.tmpdir(), `agent-${artifactRunId}`);
+
+    try {
+      const workDir = path.join(tempRoot, "work");
+      const targetDir = path.join(tempRoot, "target");
+      fs.mkdirSync(artifactDir, { recursive: true });
+      fs.mkdirSync(workDir, { recursive: true });
+      fs.mkdirSync(targetDir, { recursive: true });
+
+      runGit(["init"], workDir);
+      runGit(["config", "user.email", "test@example.com"], workDir);
+      runGit(["config", "user.name", "Test User"], workDir);
+      fs.writeFileSync(path.join(workDir, "file.txt"), "updated\n");
+      runGit(["add", "file.txt"], workDir);
+      runGit(["commit", "-m", "bundle head"], workDir);
+      runGit(["bundle", "create", path.join(artifactDir, "head-only.bundle"), "HEAD"], workDir);
+
+      runGit(["init"], targetDir);
+      const commands = buildManualBranchRecoveryCommands({
+        hasBundleFile: true,
+        runId: artifactRunId,
+        artifactFileName: "head-only.bundle",
+        branchName: "feature/recovered",
+        tempRef: "refs/bundles/manual-recovery",
+      });
+
+      expect(runGit(["bundle", "list-heads", path.join(artifactDir, "head-only.bundle")], targetDir)).toMatch(/\sHEAD$/);
+      runShell(skipArtifactDownload(commands).replaceAll(`/tmp/agent-${artifactRunId}`, artifactDir), targetDir);
+
+      expect(fs.readFileSync(path.join(targetDir, "file.txt"), "utf8")).toBe("updated\n");
+      expect(runGit(["rev-parse", "feature/recovered"], targetDir)).toBe(runGit(["rev-parse", "HEAD"], workDir));
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+      fs.rmSync(artifactDir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  it("manual apply bundle commands work with a real HEAD-only bundle", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manual-apply-head-bundle-"));
+    const artifactRunId = `head-only-${process.pid}-${Date.now()}`;
+    const artifactDir = path.join(os.tmpdir(), `agent-${artifactRunId}`);
+
+    try {
+      const remoteDir = path.join(tempRoot, "remote.git");
+      const workDir = path.join(tempRoot, "work");
+      const targetDir = path.join(tempRoot, "target");
+      fs.mkdirSync(artifactDir, { recursive: true });
+
+      runGit(["init", "--bare", remoteDir], tempRoot);
+      fs.mkdirSync(workDir, { recursive: true });
+      runGit(["init"], workDir);
+      runGit(["config", "user.email", "test@example.com"], workDir);
+      runGit(["config", "user.name", "Test User"], workDir);
+      fs.writeFileSync(path.join(workDir, "file.txt"), "base\n");
+      runGit(["add", "file.txt"], workDir);
+      runGit(["commit", "-m", "base"], workDir);
+      runGit(["branch", "-M", "feature"], workDir);
+      runGit(["remote", "add", "origin", remoteDir], workDir);
+      runGit(["push", "-u", "origin", "feature"], workDir);
+
+      runGit(["clone", remoteDir, targetDir], tempRoot);
+      runGit(["checkout", "feature"], targetDir);
+
+      fs.writeFileSync(path.join(workDir, "file.txt"), "updated\n");
+      runGit(["commit", "-am", "update"], workDir);
+      runGit(["bundle", "create", path.join(artifactDir, "head-only.bundle"), "HEAD"], workDir);
+
+      const commands = buildManualBranchApplyCommands({
+        hasBundleFile: true,
+        runId: artifactRunId,
+        artifactFileName: "head-only.bundle",
+        branchName: "feature",
+        branchRemote: "origin",
+      });
+
+      expect(commands).toContain("git checkout -B 'feature' FETCH_HEAD");
+      expect(commands).toContain("git push 'origin' 'HEAD:refs/heads/feature'");
+      expect(runGit(["bundle", "list-heads", path.join(artifactDir, "head-only.bundle")], targetDir)).toMatch(/\sHEAD$/);
+      runShell(skipArtifactDownload(commands).replaceAll(`/tmp/agent-${artifactRunId}`, artifactDir), targetDir);
+
+      expect(fs.readFileSync(path.join(targetDir, "file.txt"), "utf8")).toBe("updated\n");
+      expect(runGit(["rev-parse", "feature"], targetDir)).toBe(runGit(["--git-dir", remoteDir, "rev-parse", "feature"], tempRoot));
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+      fs.rmSync(artifactDir, { recursive: true, force: true });
+    }
+  }, 60000);
 });
 
 // ---------------------------------------------------------------------------
@@ -392,52 +567,107 @@ describe("neutralizeClosingKeywordsForIssueBody", () => {
 });
 
 // ---------------------------------------------------------------------------
-// generatePatchPreview
+// buildPatchPreviewBlocks
 // ---------------------------------------------------------------------------
-describe("generatePatchPreview", () => {
-  it("returns empty string for empty/whitespace-only input", () => {
-    expect(generatePatchPreview("")).toBe("");
-    expect(generatePatchPreview("   ")).toBe("");
+describe("buildPatchPreviewBlocks", () => {
+  it("returns no blocks for empty/whitespace-only input", () => {
+    expect(buildPatchPreviewBlocks("")).toEqual([]);
+    expect(buildPatchPreviewBlocks("   ")).toEqual([]);
     // @ts-ignore
-    expect(generatePatchPreview(null)).toBe("");
+    expect(buildPatchPreviewBlocks(null)).toEqual([]);
   });
 
-  it("wraps content in a <details> block with a diff code fence", () => {
-    const result = generatePatchPreview("diff --git a/file b/file\n+changed");
-    expect(result).toContain("<details>");
-    expect(result).toContain("</details>");
-    expect(result).toContain("```diff");
-    expect(result).toContain("```");
+  it("returns typed details and diff code blocks that render as a fenced preview", () => {
+    const patch = "diff --git a/file b/file\n+changed";
+    const children = buildPatchPreviewBlocks(patch);
+    expect(children).toEqual([{ type: "details", summary: "Show patch (2 lines)", agentTainted: false, children: [{ type: "code_block", language: "diff", value: patch, agentTainted: true }] }]);
+    const { body } = renderReport({ type: "report", title: "Patch preview", children });
+    expect(body).toContain("<details>");
+    expect(body).toContain("</details>");
+    expect(body).toContain("```diff");
   });
 
   it("shows total line count in summary when under both limits", () => {
     const patch = Array.from({ length: 5 }, (_, i) => `line${i}`).join("\n");
-    const result = generatePatchPreview(patch);
-    expect(result).toContain("Show patch (5 lines)");
-    expect(result).not.toContain("truncated");
+    const result = buildPatchPreviewBlocks(patch);
+    expect(result).toMatchObject([{ summary: "Show patch (5 lines)", children: [{ value: patch }] }]);
   });
 
   it("truncates and indicates truncation when over 500 lines", () => {
-    const patch = Array.from({ length: 600 }, (_, i) => `line${i}`).join("\n");
-    const result = generatePatchPreview(patch);
-    expect(result).toContain("Show patch preview (500 of 600 lines)");
-    expect(result).toContain("... (truncated)");
-    // Content from line 500+ must not appear
-    expect(result).not.toContain("line500");
+    const patch = Array.from({ length: 600 }, (_, i) => (i === 500 ? "omitted-line" : "x")).join("\n");
+    const result = buildPatchPreviewBlocks(patch);
+    expect(result).toMatchObject([{ summary: "Show patch preview (500 of 600 lines)", children: [{ value: `${Array(500).fill("x").join("\n")}\n... (truncated)` }] }]);
   });
 
   it("truncates and indicates truncation when over 2000 characters", () => {
     // 3 lines totaling well over 2000 chars
     const longLine = "x".repeat(1000);
     const patch = `${longLine}\n${longLine}\n${longLine}`;
-    const result = generatePatchPreview(patch);
-    expect(result).toContain("... (truncated)");
+    const result = buildPatchPreviewBlocks(patch);
+    expect(result).toMatchObject([{ summary: "Show patch preview (2 of 3 lines)", children: [{ value: `${patch.slice(0, 2000)}\n... (truncated)` }] }]);
   });
 
   it("includes patch content in the output when within limits", () => {
     const patch = "diff --git a/foo b/foo\n+hello";
-    const result = generatePatchPreview(patch);
-    expect(result).toContain("+hello");
+    const result = buildPatchPreviewBlocks(patch);
+    expect(result).toMatchObject([{ children: [{ value: patch }] }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildFallbackIssueBlocks
+// ---------------------------------------------------------------------------
+describe("buildFallbackIssueBlocks", () => {
+  it.each([
+    ["manifest_protection_create_pr_fallback.md", "create-pull-request", "fallback-to-issue"],
+    ["manifest_protection_push_failed_fallback.md", "create-pull-request", "fallback-to-issue"],
+    ["manifest_protection_push_to_pr_fallback.md", "push-to-pull-request-branch", "fallback-to-issue"],
+    ["manifest_protection_request_review.md", "create-pull-request", "request-review"],
+    ["manifest_protection_request_changes_review.md", "create-pull-request", "request-review"],
+  ])("includes scoped exclusion guidance in %s", (template, safeOutput, policy) => {
+    const children = buildFallbackIssueBlocks(require.resolve(`../md/${template}`), {
+      files: { type: "inline_slot", children: [{ type: "code", value: ".changeset/release.md", agentTainted: true }] },
+      main_body: [],
+      footer: [],
+      create_pr_url: "https://github.com/my-org/my-repo/compare/main...feature?expand=1",
+      pull_number: "42",
+      pr_url: "https://github.com/my-org/my-repo/pull/42",
+      run_url: "https://github.com/my-org/my-repo/actions/runs/123",
+      apply_instructions: "git am changes.patch",
+      branch_name: "feature",
+      title: "Protected file changes",
+      base_branch: "main",
+      repo: "my-org/my-repo",
+    });
+    const yaml = `safe-outputs:\n  ${safeOutput}:\n    protected-files:\n      policy: ${policy}\n      exclude:\n        - .changeset/`;
+    const guidance = children.flatMap(block => (block.type === "details" ? block.children : [block]));
+    expect(guidance).toContainEqual({ type: "code_block", language: "yaml", value: yaml, agentTainted: false });
+    const { body } = renderReport({ type: "report", title: "Protected files", children });
+    expect(body).toContain("`.changeset/*`");
+    expect(body).toContain("not glob patterns");
+    expect(body).toContain("`allowed-files`");
+    expect(body).toContain("`gh aw compile`");
+    expect(body).not.toContain("protected-files: allowed");
+  });
+
+  it("composes protected-files fallback content as typed blocks with a compare link", () => {
+    const mainBody = { type: "paragraph", children: [{ type: "text", value: "Original PR description", agentTainted: true }], agentTainted: true };
+    const footer = { type: "paragraph", children: [{ type: "text", value: "Workflow footer", agentTainted: false }], agentTainted: false };
+    const createPrUrl = "https://github.com/my-org/my-repo/compare/main...feature?expand=1";
+    const children = buildFallbackIssueBlocks(require.resolve("../md/manifest_protection_create_pr_fallback.md"), {
+      main_body: [mainBody],
+      footer: [footer],
+      files: [{ type: "paragraph", children: [{ type: "code", value: ".github/workflows/test.yml", agentTainted: false }], agentTainted: false }],
+      create_pr_url: createPrUrl,
+    });
+
+    expect(children).toContainEqual(mainBody);
+    expect(children).toContainEqual(footer);
+    const { body } = renderReport({ type: "report", title: "Protected files", children });
+    expect(body).toContain(`[Create the pull request](${createPrUrl})`);
+    expect(body).toContain("Original PR description");
+    expect(body).toContain("`.github/workflows/test.yml`");
+    expect(body).toContain("Workflow footer");
   });
 });
 
@@ -483,9 +713,9 @@ describe("buildManifestProtectionCreatePrUrl", () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildPushErrorSection
+// buildPushErrorBlocks
 // ---------------------------------------------------------------------------
-describe("buildPushErrorSection", () => {
+describe("buildPushErrorBlocks", () => {
   const SIGNED_COMMITS_RAW =
     "pushSignedCommits: refusing unsigned push for branch 'my-branch': merge commit detected. " +
     "GitHub's createCommitOnBranch GraphQL mutation cannot represent merge commits, symlinks (mode 120000), " +
@@ -494,26 +724,39 @@ describe("buildPushErrorSection", () => {
     "or set signed-commits: false if the repository does not require signed commits.";
   const SIGNED_COMMITS_SANITIZED = SIGNED_COMMITS_RAW.replace(/\s+/g, " ").trim();
 
-  it("returns a generic fallback line for non-signed-commits errors", () => {
-    const raw = "Some other push error occurred";
+  it("returns a generic fallback paragraph using the sanitized message for other errors", () => {
+    const raw = "Some\nother\tpush error occurred";
     const sanitized = "Some other push error occurred";
-    const result = buildPushErrorSection(raw, sanitized);
-    expect(result).toBe(`> **Original error:** ${sanitized}`);
+    const result = buildPushErrorBlocks(raw, sanitized);
+    expect(result).toEqual([
+      {
+        type: "paragraph",
+        agentTainted: false,
+        children: [
+          { type: "strong", children: [{ type: "text", value: "Original error:", agentTainted: false }], agentTainted: false },
+          { type: "text", value: ` ${sanitized}`, agentTainted: true },
+        ],
+      },
+    ]);
   });
 
   it("returns structured markdown for a signed-commits refusal", () => {
-    const result = buildPushErrorSection(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
-    expect(result).toContain("> **Error:** Signed commit push refused");
+    const children = buildPushErrorBlocks(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
+    expect(children[0]).toMatchObject({ type: "paragraph", children: [{ type: "strong" }, { type: "text", value: " Signed commit push refused — merge commit detected", agentTainted: true }] });
+    const { body: result } = renderReport({ type: "report", title: "Push error", children });
+    expect(result).toContain("**Error:** Signed commit push refused");
     expect(result).not.toContain("Original error:");
   });
 
   it("extracts the cause from the error message", () => {
-    const result = buildPushErrorSection(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
+    const children = buildPushErrorBlocks(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
+    const { body: result } = renderReport({ type: "report", title: "Push error", children });
     expect(result).toContain("merge commit detected");
   });
 
   it("lists all unsupported commit shapes", () => {
-    const result = buildPushErrorSection(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
+    const children = buildPushErrorBlocks(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
+    const { body: result } = renderReport({ type: "report", title: "Push error", children });
     expect(result).toContain("Merge commits");
     expect(result).toContain("Symlinks");
     expect(result).toContain("Submodule entries");
@@ -521,14 +764,17 @@ describe("buildPushErrorSection", () => {
   });
 
   it("includes merge-commit-specific remediation (git rebase) and signed-commits: false", () => {
-    const result = buildPushErrorSection(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
+    const children = buildPushErrorBlocks(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
+    const { body: result } = renderReport({ type: "report", title: "Push error", children });
     expect(result).toContain("git rebase");
     expect(result).toContain("signed-commits: false");
   });
 
-  it("produces only blockquote lines (each line starts with '>')", () => {
-    const result = buildPushErrorSection(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
-    const lines = result.split("\n");
+  it("composes into a typed note alert with only blockquote lines", () => {
+    const children = buildPushErrorBlocks(SIGNED_COMMITS_RAW, SIGNED_COMMITS_SANITIZED);
+    const { body } = renderReport({ type: "report", title: "Push error", children: [{ type: "alert", kind: "NOTE", agentTainted: false, children }] });
+    expect(body).toContain("> [!NOTE]");
+    const lines = body.trimEnd().split("\n");
     for (const line of lines) {
       expect(line.startsWith(">")).toBe(true);
     }
@@ -537,14 +783,23 @@ describe("buildPushErrorSection", () => {
   it("falls back to generic error line for PushSignedCommitsPolicyViolation (no cannot-represent boilerplate)", () => {
     const raw = "pushSignedCommits: refusing unsigned push for branch 'my-branch': " + "E003: Signed-commit payload exceeds max-patch-files (10). Synthesized payload touches 15 file(s): a.txt, b.txt.";
     const sanitized = raw.replace(/\s+/g, " ").trim();
-    const result = buildPushErrorSection(raw, sanitized);
-    expect(result).toBe(`> **Original error:** ${sanitized}`);
+    const result = buildPushErrorBlocks(raw, sanitized);
+    expect(result).toMatchObject([
+      {
+        type: "paragraph",
+        children: [
+          { type: "strong", children: [{ value: "Original error:" }] },
+          { value: ` ${sanitized}`, agentTainted: true },
+        ],
+      },
+    ]);
   });
 
   it("uses a generic cause when the cause pattern does not match", () => {
     // Has the boilerplate but lacks the standard 'for branch ...' extraction pattern.
     const malformed = "pushSignedCommits: refusing unsigned push without branch info. " + "GitHub's createCommitOnBranch GraphQL mutation cannot represent merge commits.";
-    const result = buildPushErrorSection(malformed, malformed);
+    const children = buildPushErrorBlocks(malformed, malformed);
+    const { body: result } = renderReport({ type: "report", title: "Push error", children });
     expect(result).toContain("unsupported commit shape");
   });
 
@@ -555,7 +810,8 @@ describe("buildPushErrorSection", () => {
       "submodule entries (mode 160000), or executable bits (mode 100755). " +
       "Rewrite the commits to use only regular files (mode 100644) with no merge commits, " +
       "or set signed-commits: false if the repository does not require signed commits.";
-    const result = buildPushErrorSection(raw, raw);
+    const children = buildPushErrorBlocks(raw, raw);
+    const { body: result } = renderReport({ type: "report", title: "Push error", children });
     expect(result).toContain("merge commit detected");
     expect(result).not.toContain("unsupported commit shape");
   });
@@ -567,7 +823,8 @@ describe("buildPushErrorSection", () => {
       "submodule entries (mode 160000), or executable bits (mode 100755). " +
       "Rewrite the commits to use only regular files (mode 100644) with no merge commits, " +
       "or set signed-commits: false if the repository does not require signed commits.";
-    const result = buildPushErrorSection(raw, raw);
+    const children = buildPushErrorBlocks(raw, raw);
+    const { body: result } = renderReport({ type: "report", title: "Push error", children });
     expect(result).toContain("submodule change detected");
     expect(result).toContain("Remove the submodule entry");
     expect(result).not.toContain("git rebase");
@@ -580,7 +837,8 @@ describe("buildPushErrorSection", () => {
       "submodule entries (mode 160000), or executable bits (mode 100755). " +
       "Rewrite the commits to use only regular files (mode 100644) with no merge commits, " +
       "or set signed-commits: false if the repository does not require signed commits.";
-    const result = buildPushErrorSection(raw, raw);
+    const children = buildPushErrorBlocks(raw, raw);
+    const { body: result } = renderReport({ type: "report", title: "Push error", children });
     expect(result).toContain("symlink file mode requires git push fallback");
     expect(result).toContain("Remove the symlink");
     expect(result).not.toContain("git rebase");

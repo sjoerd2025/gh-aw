@@ -11,9 +11,6 @@ permissions:
   pull-requests: read
   discussions: read
 
-sandbox:
-  agent:
-    sudo: false
 
 engine:
   id: copilot
@@ -49,6 +46,7 @@ network:
     - defaults
     - python
 imports:
+  - shared/mcp-pagination.md
   - shared/github-guard-policy.md
   - shared/python-dataviz.md
   - ../skills/jqschema/SKILL.md

@@ -33,6 +33,12 @@ mcp-scripts:
 
 The agent can now call `greet-user` with a `name` parameter.
 
+## HTTP Transport Limits
+
+Generated workflows create a per-run API key and configure the MCP gateway to send it verbatim in the `Authorization` header. The HTTP server requires `GH_AW_MCP_SCRIPTS_API_KEY` at startup and rejects missing or incorrect request credentials with HTTP 401. `GET /health` and `OPTIONS` preflight requests remain unauthenticated.
+
+Request bodies are limited to 1 MiB, including chunked uploads. Oversized requests return HTTP 413; malformed JSON returns HTTP 400. Headers and body uploads each have a 30-second timeout. The upload deadline does not limit tool execution time.
+
 ## Tool Definition
 
 Each mcp-script tool requires a unique name and configuration:
@@ -179,11 +185,21 @@ mcp-scripts:
         type: number
         default: 42
         description: "This has a default value"
+      args:
+        type: array
+        items:
+          type: string
+        description: "An array of argument strings"
       choice-param:
         type: string
         enum: ["option1", "option2", "option3"]
         description: "Limited to specific values"
 ```
+
+Array parameters accept an optional `items: { type: string }` declaration to
+validate every element. Item types support `string`, `number`, `boolean`, `array`,
+and `object`; only the item `type` is supported. Omitting `items` leaves element
+types unrestricted. `items` requires the parameter's `type` to be `array`.
 
 ## Timeout Configuration
 
@@ -220,6 +236,35 @@ mcp-scripts:
 ```
 
 Secrets using `${{ secrets.* }}` are masked in logs.
+
+Each JavaScript, shell, Python, or Go invocation receives only its own declared bindings. Two tools can use the same variable name, such as `API_KEY`, with different secret expressions without overwriting or exposing each other's values. The compiler gives each binding a distinct server-side transport name; handlers receive the original declared names, not those transport names or the server's authentication key. Tool bindings are supplied only to the MCP scripts server startup step, not to the agent or gateway environment.
+
+Handlers also retain ordinary runtime variables: `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `GITHUB_WORKSPACE`, `RUNNER_TEMP`, `GOROOT`, `GOPATH`, `GOCACHE`, and `GOMODCACHE`. Other ambient variables, including job-level credentials and interpreter startup options, are not inherited.
+
+**Compatibility change:** handlers no longer inherit ambient proxy, TLS, registry, or GitHub metadata configuration. Variables such as `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `PYTHONPATH`, `PIP_INDEX_URL`, `NPM_CONFIG_REGISTRY`, `GOPROXY`, `GITHUB_REPOSITORY`, `GITHUB_SERVER_URL`, `GITHUB_API_URL`, and `GITHUB_RUN_ID` require explicit entries in each tool's `env:` block. For example:
+
+```aw wrap
+mcp-scripts:
+  corporate-fetch:
+    description: "Read an internal endpoint"
+    script: |
+      return await (await fetch("https://service.example.com/status")).json();
+    env:
+      NODE_EXTRA_CA_CERTS: "/etc/company-ca.pem"
+      GITHUB_REPOSITORY: "${{ github.repository }}"
+```
+
+Dependency installers use a separate allowlist, never tool bindings or server credentials. In addition to ordinary runtime variables, they retain these ambient installer settings:
+
+| Configuration | Variables |
+| --- | --- |
+| Proxy | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, and their lowercase equivalents |
+| Registry | `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `NPM_CONFIG_REGISTRY`, `npm_config_registry`, `GOPROXY` |
+| CA paths | `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `PIP_CERT`, `NPM_CONFIG_CAFILE`, `npm_config_cafile` |
+
+Installer URLs must use HTTP or HTTPS (proxies also support SOCKS5 and SOCKS5H), without userinfo, query strings, or fragments. `PIP_EXTRA_INDEX_URL` accepts space-separated URLs; `GOPROXY` accepts comma- or pipe-separated URLs and `direct`/`off`. Unsafe or malformed settings fail installation with a diagnostic naming only the variable, not its value. All forwarded settings must be non-secret; URL validation cannot identify arbitrary credentials embedded in endpoint paths. Credential-bearing URLs and credential-file overrides such as `PIP_CONFIG_FILE` or `NPM_CONFIG_USERCONFIG` are not supported by this environment forwarding mechanism.
+
+Recompile existing workflows to generate the per-tool transport bindings. Environment filtering is not a filesystem or network sandbox: trusted tools still run on the runner host and must not inspect other processes or credential files.
 
 ## Large Output Handling
 
@@ -268,14 +313,16 @@ Analyze provided text using the `analyze-text` tool and create a discussion with
 
 MCP Scripts tools run on the GitHub Actions **runner host** — outside the agent container — so they can access the runner's file system and environment but are isolated from the AI's own execution environment. Tools also provide secret isolation (only specified env vars are forwarded), process isolation (separate execution), and output sanitization (large outputs saved to files). Only predefined tools are available to agents.
 
+MCP script arguments are withheld from server logs, step summaries, and recent-tool-call diagnostics. Output payloads and error details are also withheld from server logs because they may echo arguments. Handlers receive the original inputs, and tool responses remain unchanged. Do not return secrets to the agent.
+
 ## Troubleshooting
 
-- **Tool Not Found**: Verify tool name matches exactly
-- **Script Errors**: Check workflow logs for syntax errors
-- **Secret Not Available**: Confirm secret name in repository/org settings
-- **Large Output**: Agent reads file path from response
+- **Tool Not Found**: The tool name the agent calls must exactly match the key under `mcp-scripts:` in frontmatter (case-sensitive). Check the agent's tool list in the run logs against your `mcp-scripts:` block.
+- **Script Errors**: Check the tool's error response for details. The `MCP Scripts` step logs tool names and execution status, but redacts payloads and error details that may contain secrets.
+- **Secret Not Available**: Confirm the secret referenced in `env:` (e.g., `${{ secrets.API_KEY }}`) is defined at the repository or organization level under **Settings > Secrets and variables > Actions**, and that its name matches exactly.
+- **Large Output**: When output exceeds 500 characters, the agent receives a file path instead of inline content (see [Large Output Handling](#large-output-handling)); read that file if the agent's response looks truncated.
 
-## Related Documentation
+## Learn More
 
 - [MCP Scripts Specification](/gh-aw/specs/mcp-scripts-specification/) - Formal W3C-style specification
 - [Tools](/gh-aw/reference/tools/) - Other tool configuration options

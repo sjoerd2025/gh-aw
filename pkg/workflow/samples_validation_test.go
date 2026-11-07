@@ -110,6 +110,44 @@ func TestValidateSafeOutputsSamples_SidecarStripped(t *testing.T) {
 	}
 }
 
+func TestValidateAddLabelsSamples_UsesConfiguredItemSchema(t *testing.T) {
+	cfg := &SafeOutputsConfig{
+		AddLabels: &AddLabelsConfig{
+			ItemSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+				},
+			},
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Samples: []map[string]any{
+					{"labels": []any{"bug"}},
+				},
+			},
+		},
+	}
+
+	err := validateAddLabelsItemSchemaAndSamples(cfg)
+	require.ErrorContains(t, err, "safe-outputs.add-labels.samples[0]")
+}
+
+func TestValidateAddLabelsSamples_UsesIssueIntentSchema(t *testing.T) {
+	enabled := true
+	cfg := &SafeOutputsConfig{
+		AddLabels: &AddLabelsConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				IssueIntent: &enabled,
+				Samples: []map[string]any{
+					{"labels": []any{map[string]any{"name": "bug"}}},
+				},
+			},
+		},
+	}
+
+	err := validateAddLabelsItemSchemaAndSamples(cfg)
+	require.ErrorContains(t, err, "safe-outputs.add-labels.samples[0]")
+}
+
 // TestCollectSampleEntries_DeterministicOrdering verifies that entries are
 // emitted in a stable order across runs (sorted by SafeOutputsConfig field name)
 // so that compiled YAML is deterministic.
@@ -146,6 +184,27 @@ func TestCollectSampleEntries_DeterministicOrdering(t *testing.T) {
 	if first[1].Tool != "create_issue" {
 		t.Errorf("expected second entry tool to be create_issue, got %q", first[1].Tool)
 	}
+}
+
+func TestCollectSampleEntries_ReportIncomplete(t *testing.T) {
+	cfg := &SafeOutputsConfig{
+		ReportIncomplete: &ReportIncompleteConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Samples: []map[string]any{
+					{
+						"reason":  "intentional sample",
+						"details": "replay this report_incomplete call",
+					},
+				},
+			},
+		},
+	}
+
+	entries := collectSampleEntries(cfg)
+	require.Len(t, entries, 1)
+	require.Equal(t, "report_incomplete", entries[0].Tool)
+	require.Equal(t, "intentional sample", entries[0].Arguments["reason"])
+	require.Equal(t, "replay this report_incomplete call", entries[0].Arguments["details"])
 }
 
 // TestCollectSampleEntries_SidecarPartitioning verifies that sidecar fields
@@ -185,6 +244,46 @@ func TestCollectSampleEntries_SidecarPartitioning(t *testing.T) {
 	if patch, ok := e.Sidecars["patch"].(string); !ok || !strings.HasPrefix(patch, "diff --git") {
 		t.Errorf("expected patch to be present in Sidecars as a git diff string, got %#v", e.Sidecars["patch"])
 	}
+}
+
+func TestCollectSampleEntries_DynamicWorkflowSamplesUseWorkflowToolName(t *testing.T) {
+	cfg := &SafeOutputsConfig{
+		DispatchWorkflow: &DispatchWorkflowConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Samples: []map[string]any{
+					{
+						"workflow_name": "dispatch-worker",
+						"inputs": map[string]any{
+							"sentinel": "dispatch-sample",
+						},
+						"ref": "main",
+					},
+				},
+			},
+		},
+		CallWorkflow: &CallWorkflowConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Samples: []map[string]any{
+					{
+						"workflow_name": "call-worker",
+						"inputs": map[string]any{
+							"sentinel": "call-sample",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	entries := collectSampleEntries(cfg)
+	require.Len(t, entries, 2)
+
+	// Sorted by struct field name, so CallWorkflow entry precedes DispatchWorkflow.
+	assert.Equal(t, "call_worker", entries[0].Tool)
+	assert.Equal(t, map[string]any{"sentinel": "call-sample"}, entries[0].Arguments)
+
+	assert.Equal(t, "dispatch_worker", entries[1].Tool)
+	assert.Equal(t, map[string]any{"sentinel": "dispatch-sample", "ref": "main"}, entries[1].Arguments)
 }
 
 // TestValidateSafeOutputsSamples_RuntimeExpressionsBypassValidation verifies
@@ -402,6 +501,17 @@ func TestValidateSafeOutputsSamples_DynamicToolsDeferredToRuntime(t *testing.T) 
 						"inputs": map[string]any{
 							"value": "ok",
 						},
+					},
+				},
+			},
+		},
+		ReplaceLabel: &ReplaceLabelConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Samples: []map[string]any{
+					{
+						"item_number":     "${{ github.event.issue.number }}",
+						"label_to_remove": "old",
+						"label_to_add":    "new",
 					},
 				},
 			},

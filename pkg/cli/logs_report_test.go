@@ -7,12 +7,127 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestNormalizeJobNamePreservesPeriods(t *testing.T) {
+	t.Parallel()
+
+	if got := normalizeJobName(" Worker.V1 "); got != "worker.v1" {
+		t.Errorf("normalizeJobName() = %q, want %q; periods are not separators in log job-name matching", got, "worker.v1")
+	}
+}
+
+func TestToolUsageSummariesShareStatsBase(t *testing.T) {
+	t.Parallel()
+
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[ToolUsageSummary](),
+		reflect.TypeFor[MCPToolSummary](),
+	} {
+		field, ok := typ.FieldByName("ToolUsageStatsBase")
+		if !ok || !field.Anonymous {
+			t.Fatalf("%s must embed ToolUsageStatsBase", typ.Name())
+		}
+	}
+}
+
+func TestToolUsageSummaryJSONSchemas(t *testing.T) {
+	t.Parallel()
+
+	stats := ToolUsageStatsBase{
+		ToolName:      "github.issue_read",
+		CallCount:     3,
+		MaxOutputSize: 1024,
+		MaxDuration:   "2s",
+	}
+
+	genericData, err := json.Marshal(ToolUsageSummary{ToolUsageStatsBase: stats, Runs: 2})
+	if err != nil {
+		t.Fatalf("failed to marshal generic tool summary: %v", err)
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(genericData, &generic); err != nil {
+		t.Fatalf("failed to decode generic tool summary: %v", err)
+	}
+	if generic["name"] != stats.ToolName || generic["total_calls"] != float64(stats.CallCount) || generic["runs"] != float64(2) {
+		t.Fatalf("unexpected generic tool summary JSON: %s", genericData)
+	}
+	if _, ok := generic["tool_name"]; ok {
+		t.Fatalf("generic tool summary must preserve its legacy JSON schema: %s", genericData)
+	}
+	var decodedGeneric ToolUsageSummary
+	if err := json.Unmarshal(genericData, &decodedGeneric); err != nil {
+		t.Fatalf("failed to unmarshal generic tool summary: %v", err)
+	}
+	if decodedGeneric.ToolUsageStatsBase != stats || decodedGeneric.Runs != 2 {
+		t.Fatalf("unexpected generic tool summary round trip: %+v", decodedGeneric)
+	}
+
+	mcpSummary := MCPToolSummary{
+		ServerName:    "github",
+		ToolName:      stats.ToolName,
+		CallCount:     stats.CallCount,
+		MaxOutputSize: stats.MaxOutputSize,
+		MaxDuration:   stats.MaxDuration,
+	}
+	mcpSummary.syncBaseFromFields()
+	mcpData, err := json.Marshal(mcpSummary)
+	if err != nil {
+		t.Fatalf("failed to marshal MCP tool summary: %v", err)
+	}
+	var mcp map[string]any
+	if err := json.Unmarshal(mcpData, &mcp); err != nil {
+		t.Fatalf("failed to decode MCP tool summary: %v", err)
+	}
+	if mcp["server_name"] != "github" || mcp["tool_name"] != stats.ToolName || mcp["call_count"] != float64(stats.CallCount) {
+		t.Fatalf("unexpected MCP tool summary JSON: %s", mcpData)
+	}
+}
+
+func TestToolUsageSummaryUnmarshalJSONCompatibility(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "legacy generic schema",
+			raw:  `{"name":"github.issue_read","total_calls":3,"runs":2,"max_output_size":1024,"max_duration":"2s"}`,
+		},
+		{
+			name: "mcp style schema",
+			raw:  `{"tool_name":"github.issue_read","call_count":3,"runs":2,"max_output_size":1024,"max_duration":"2s"}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var summary ToolUsageSummary
+			if err := json.Unmarshal([]byte(tc.raw), &summary); err != nil {
+				t.Fatalf("failed to unmarshal %s schema: %v", tc.name, err)
+			}
+			if summary.Name != "github.issue_read" || summary.TotalCalls != 3 {
+				t.Fatalf("unexpected compatibility fields: %+v", summary)
+			}
+			base := summary.ToolUsageStatsBase
+			if base.ToolName != summary.Name || base.CallCount != summary.TotalCalls {
+				t.Fatalf("base fields drifted from compatibility fields: %+v", summary)
+			}
+		})
+	}
+}
 
 // TestRenderLogsConsoleUnified tests the unified console rendering
 func TestRenderLogsConsoleUnified(t *testing.T) {
@@ -47,16 +162,16 @@ func TestRenderLogsConsoleUnified(t *testing.T) {
 			{
 				Name:          "github-mcp-server",
 				TotalCalls:    1500,
-				Runs:          5,
 				MaxOutputSize: 2500000,
 				MaxDuration:   "1m30s",
+				Runs:          5,
 			},
 			{
 				Name:          "playwright",
 				TotalCalls:    500,
-				Runs:          3,
 				MaxOutputSize: 512000,
 				MaxDuration:   "45s",
+				Runs:          3,
 			},
 		},
 		MissingTools: []MissingToolSummary{
@@ -83,16 +198,20 @@ func TestRenderLogsConsoleUnified(t *testing.T) {
 		},
 		MCPFailures: []MCPFailureSummary{
 			{
-				ServerName:       "github-mcp-server",
-				Count:            2,
-				Workflows:        []string{"workflow-a", "workflow-b"},
-				WorkflowsDisplay: "workflow-a, workflow-b",
+				ServerName: "github-mcp-server",
+				AggregatedSummaryBase: AggregatedSummaryBase{
+					Count:            2,
+					Workflows:        []string{"workflow-a", "workflow-b"},
+					WorkflowsDisplay: "workflow-a, workflow-b",
+				},
 			},
 			{
-				ServerName:       "playwright",
-				Count:            1,
-				Workflows:        []string{"browser-test"},
-				WorkflowsDisplay: "browser-test",
+				ServerName: "playwright",
+				AggregatedSummaryBase: AggregatedSummaryBase{
+					Count:            1,
+					Workflows:        []string{"browser-test"},
+					WorkflowsDisplay: "browser-test",
+				},
 			},
 		},
 		LogsLocation: "/tmp/logs",
@@ -108,6 +227,32 @@ func TestRenderLogsConsoleUnified(t *testing.T) {
 	var buf bytes.Buffer
 	renderLogsConsoleToWriter(&buf, data)
 	renderLogsConsoleToWriter(&buf, data)
+}
+
+func TestRenderLogsConsoleMCPFailureSchema(t *testing.T) {
+	var buf bytes.Buffer
+	renderLogsConsoleToWriter(&buf, LogsData{
+		MCPFailures: []MCPFailureSummary{{
+			ServerName: "github-mcp-server",
+			AggregatedSummaryBase: AggregatedSummaryBase{
+				Count:              2,
+				WorkflowsDisplay:   "workflow-a, workflow-b",
+				FirstReasonDisplay: "not part of the MCP failure schema",
+			},
+		}},
+	})
+
+	output := buf.String()
+	for _, expected := range []string{"MCP Server Failures", "Server", "Failures", "Workflows"} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("expected %q in MCP failure console output: %s", expected, output)
+		}
+	}
+	for _, unexpected := range []string{"Occurrences", "First Reason"} {
+		if strings.Contains(output, unexpected) {
+			t.Errorf("unexpected %q in MCP failure console output: %s", unexpected, output)
+		}
+	}
 }
 
 // TestBuildToolUsageSummaryPopulatesDisplay tests that buildToolUsageSummary works correctly
@@ -797,6 +942,60 @@ func TestAccessLogSummaryJSONUsesEmbeddedBaseFields(t *testing.T) {
 	}
 }
 
+// TestRunDataJSONIncludesZeroTokenUsageAndAIC is a regression guard for the bug where
+// TokenUsage/AIC used `omitempty` and silently dropped out of the JSON output whenever
+// a run genuinely recorded zero tokens, making "field absent" indistinguishable from
+// "no tokens recorded". Marshaling a zero-metric RunData must still surface both keys.
+func TestRunDataJSONIncludesZeroTokenUsageAndAIC(t *testing.T) {
+	run := RunData{
+		RunID:        1,
+		WorkflowName: "wf-1",
+		WorkflowPath: ".github/workflows/wf-1.md",
+		Status:       "completed",
+		TokenUsage:   0,
+		AIC:          0,
+	}
+
+	data, err := json.Marshal(run)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	tokenUsage, ok := got["token_usage"]
+	if !ok {
+		t.Fatalf("expected token_usage key to be present in %s", string(data))
+	}
+	if tokenUsage != float64(0) {
+		t.Fatalf("expected token_usage = 0, got %v", tokenUsage)
+	}
+
+	aic, ok := got["aic"]
+	if !ok {
+		t.Fatalf("expected aic key to be present in %s", string(data))
+	}
+	if aic != float64(0) {
+		t.Fatalf("expected aic = 0, got %v", aic)
+	}
+}
+
+func TestBuildLogsDataIncludesLedgerActivity(t *testing.T) {
+	transactionsAdded := 3
+	data := buildLogsData([]ProcessedRun{{
+		Run:    WorkflowRun{DatabaseID: 42},
+		Ledger: &LedgerActivity{TransactionsAdded: &transactionsAdded},
+	}}, t.TempDir(), nil)
+
+	require.Len(t, data.Runs, 1)
+	require.NotNil(t, data.Runs[0].Ledger)
+	require.NotNil(t, data.Runs[0].Ledger.TransactionsAdded)
+	assert.Equal(t, 3, *data.Runs[0].Ledger.TransactionsAdded)
+}
+
 // TestBuildFirewallLogSummaryWithSharedHelper tests firewall log summary with shared helper
 func TestBuildFirewallLogSummaryWithSharedHelper(t *testing.T) {
 	processedRuns := []ProcessedRun{
@@ -1154,6 +1353,43 @@ func TestBuildLogsDataDriverExitFailureClassification(t *testing.T) {
 		{Run: WorkflowRun{DatabaseID: 3, WorkflowName: "wf", Conclusion: "failure", Turns: 0, TurnsAvailable: true}},
 		// agent-logic: failed, agent ran
 		{Run: WorkflowRun{DatabaseID: 4, WorkflowName: "wf", Conclusion: "failure", Turns: 3, TurnsAvailable: true}},
+		// safe_outputs failed after successful agent execution, so this is not a driver exit.
+		{
+			Run: WorkflowRun{DatabaseID: 5, WorkflowName: "wf", Conclusion: "failure", Turns: 0, TurnsAvailable: true},
+			JobDetails: []JobInfoWithDuration{
+				{JobInfo: JobInfo{Name: "agent", Conclusion: "success"}},
+				{JobInfo: JobInfo{Name: "safe_outputs", Conclusion: "failure"}},
+			},
+		},
+		{
+			Run: WorkflowRun{DatabaseID: 6, WorkflowName: "wf", Conclusion: "failure", Turns: 0, TurnsAvailable: true},
+			JobDetails: []JobInfoWithDuration{
+				{JobInfo: JobInfo{Name: "agent", Conclusion: "success"}},
+				{JobInfo: JobInfo{Name: "safe outputs", Conclusion: "failure"}},
+			},
+		},
+		{
+			Run: WorkflowRun{DatabaseID: 7, WorkflowName: "wf", Conclusion: "failure", Turns: 0, TurnsAvailable: true},
+			JobDetails: []JobInfoWithDuration{
+				{JobInfo: JobInfo{Name: "agent", Conclusion: "success"}},
+				{JobInfo: JobInfo{Name: "safe-outputs", Conclusion: "failure"}},
+			},
+		},
+		{
+			Run: WorkflowRun{DatabaseID: 8, WorkflowName: "wf", Conclusion: "failure", Turns: 0, TurnsAvailable: true},
+			JobDetails: []JobInfoWithDuration{
+				{JobInfo: JobInfo{Name: "  AGENT  ", Conclusion: "success"}},
+				{JobInfo: JobInfo{Name: "  Safe Outputs  ", Conclusion: "failure"}},
+			},
+		},
+		{
+			// success run should never be classified as a failure kind.
+			Run: WorkflowRun{DatabaseID: 9, WorkflowName: "wf", Conclusion: "success", Turns: 0, TurnsAvailable: true},
+			JobDetails: []JobInfoWithDuration{
+				{JobInfo: JobInfo{Name: "agent", Conclusion: "success"}},
+				{JobInfo: JobInfo{Name: "safe_outputs", Conclusion: "failure"}},
+			},
+		},
 	}
 
 	data := buildLogsData(processedRuns, "/tmp/logs", nil)
@@ -1161,8 +1397,8 @@ func TestBuildLogsDataDriverExitFailureClassification(t *testing.T) {
 	if data.Summary.TotalDriverExitFailures != 2 {
 		t.Errorf("Expected TotalDriverExitFailures = 2, got %d", data.Summary.TotalDriverExitFailures)
 	}
-	if data.Summary.TotalAgentLogicFailures != 1 {
-		t.Errorf("Expected TotalAgentLogicFailures = 1, got %d", data.Summary.TotalAgentLogicFailures)
+	if data.Summary.TotalAgentLogicFailures != 5 {
+		t.Errorf("Expected TotalAgentLogicFailures = 5, got %d", data.Summary.TotalAgentLogicFailures)
 	}
 
 	// Verify per-run FailureKind
@@ -1181,6 +1417,32 @@ func TestBuildLogsDataDriverExitFailureClassification(t *testing.T) {
 	}
 	if byID[4].FailureKind != "agent_logic" {
 		t.Errorf("run 4 (failure, 3 turns): expected FailureKind=agent_logic, got %q", byID[4].FailureKind)
+	}
+	if byID[5].FailureKind != "agent_logic" {
+		t.Errorf("run 5 (safe_outputs failure after successful agent): expected FailureKind=agent_logic, got %q", byID[5].FailureKind)
+	}
+	if byID[6].FailureKind != "agent_logic" {
+		t.Errorf("run 6 (safe outputs failure after successful agent): expected FailureKind=agent_logic, got %q", byID[6].FailureKind)
+	}
+	if byID[7].FailureKind != "agent_logic" {
+		t.Errorf("run 7 (safe-outputs failure after successful agent): expected FailureKind=agent_logic, got %q", byID[7].FailureKind)
+	}
+	if byID[8].FailureKind != "agent_logic" {
+		t.Errorf("run 8 (spaced/cased safe outputs failure after successful agent): expected FailureKind=agent_logic, got %q", byID[8].FailureKind)
+	}
+	if byID[9].FailureKind != "" {
+		t.Errorf("run 9 (success with safe_outputs failure metadata): expected empty FailureKind, got %q", byID[9].FailureKind)
+	}
+}
+
+func TestIsSafeOutputsFailureAfterSuccessfulAgentIgnoresCancelled(t *testing.T) {
+	jobDetails := []JobInfoWithDuration{
+		{JobInfo: JobInfo{Name: "agent", Conclusion: "success"}},
+		{JobInfo: JobInfo{Name: "safe_outputs", Conclusion: "cancelled"}},
+	}
+
+	if isSafeOutputsFailureAfterSuccessfulAgent(jobDetails) {
+		t.Fatal("expected cancelled safe_outputs to not classify as safe_outputs failure")
 	}
 }
 

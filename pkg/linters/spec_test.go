@@ -13,11 +13,17 @@ import (
 	"github.com/github/gh-aw/pkg/linters"
 	"github.com/github/gh-aw/pkg/linters/appendbytestring"
 	"github.com/github/gh-aw/pkg/linters/appendoneelement"
+	"github.com/github/gh-aw/pkg/linters/blankassigncomma"
+	"github.com/github/gh-aw/pkg/linters/bufferresetbeforereuse"
+	"github.com/github/gh-aw/pkg/linters/bufioscannererunchecked"
 	"github.com/github/gh-aw/pkg/linters/bytesbufferstring"
 	"github.com/github/gh-aw/pkg/linters/bytescomparestring"
+	"github.com/github/gh-aw/pkg/linters/closeerrorunchecked"
+	"github.com/github/gh-aw/pkg/linters/consolestderr"
 	"github.com/github/gh-aw/pkg/linters/contextcancelnotdeferred"
 	"github.com/github/gh-aw/pkg/linters/ctxbackground"
 	"github.com/github/gh-aw/pkg/linters/deferinloop"
+	deferrerrorunchecked "github.com/github/gh-aw/pkg/linters/deferred-error-unchecked"
 	"github.com/github/gh-aw/pkg/linters/errorfwrapv"
 	"github.com/github/gh-aw/pkg/linters/errormessage"
 	"github.com/github/gh-aw/pkg/linters/errortypeassertion"
@@ -26,7 +32,13 @@ import (
 	"github.com/github/gh-aw/pkg/linters/execcommandwithoutcontext"
 	"github.com/github/gh-aw/pkg/linters/fileclosenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/fmterrorfnoverbs"
+	"github.com/github/gh-aw/pkg/linters/formatintitoa"
+	"github.com/github/gh-aw/pkg/linters/fprintferrorunchecked"
 	"github.com/github/gh-aw/pkg/linters/fprintlnsprintf"
+	"github.com/github/gh-aw/pkg/linters/generatedyamlheredoc"
+	"github.com/github/gh-aw/pkg/linters/globwalkignorederror"
+	"github.com/github/gh-aw/pkg/linters/goroutinemissingrecover"
+	"github.com/github/gh-aw/pkg/linters/goroutineresourceleak"
 	"github.com/github/gh-aw/pkg/linters/hardcodedfilepath"
 	"github.com/github/gh-aw/pkg/linters/httpnoctx"
 	"github.com/github/gh-aw/pkg/linters/httprespbodyclose"
@@ -38,17 +50,26 @@ import (
 	"github.com/github/gh-aw/pkg/linters/lenstringzero"
 	"github.com/github/gh-aw/pkg/linters/logfatallibrary"
 	"github.com/github/gh-aw/pkg/linters/manualmutexunlock"
+	"github.com/github/gh-aw/pkg/linters/manualpathconcat"
 	"github.com/github/gh-aw/pkg/linters/mapclearloop"
 	"github.com/github/gh-aw/pkg/linters/mapdeletecheck"
 	"github.com/github/gh-aw/pkg/linters/nilctxpassed"
 	"github.com/github/gh-aw/pkg/linters/osexitinlibrary"
 	"github.com/github/gh-aw/pkg/linters/osgetenvlibrary"
+	"github.com/github/gh-aw/pkg/linters/osisnotexist"
+	"github.com/github/gh-aw/pkg/linters/osopenreadallpreferreadfile"
 	"github.com/github/gh-aw/pkg/linters/ossetenvlibrary"
+	"github.com/github/gh-aw/pkg/linters/packagelevelmutableslicemap"
 	panicinlibrarycode "github.com/github/gh-aw/pkg/linters/panic-in-library-code"
 	"github.com/github/gh-aw/pkg/linters/rawloginlib"
+	"github.com/github/gh-aw/pkg/linters/readerstringconv"
+	reflectdeepequalusage "github.com/github/gh-aw/pkg/linters/reflect-deepequal-usage"
 	"github.com/github/gh-aw/pkg/linters/regexpcompileinfunction"
+	"github.com/github/gh-aw/pkg/linters/regexpdynamicpattern"
 	"github.com/github/gh-aw/pkg/linters/seenmapbool"
+	"github.com/github/gh-aw/pkg/linters/slicemakezerolength"
 	"github.com/github/gh-aw/pkg/linters/sortslice"
+	"github.com/github/gh-aw/pkg/linters/splitindexzero"
 	"github.com/github/gh-aw/pkg/linters/sprintfbool"
 	"github.com/github/gh-aw/pkg/linters/sprintferrdot"
 	"github.com/github/gh-aw/pkg/linters/sprintferrorsnew"
@@ -67,7 +88,14 @@ import (
 	"github.com/github/gh-aw/pkg/linters/timesleepnocontext"
 	"github.com/github/gh-aw/pkg/linters/tolowerequalfold"
 	"github.com/github/gh-aw/pkg/linters/trimleftright"
+	"github.com/github/gh-aw/pkg/linters/typeassertionnil"
+	"github.com/github/gh-aw/pkg/linters/typeassertionokdiscarded"
+	unchecked_deferredclose "github.com/github/gh-aw/pkg/linters/unchecked-deferred-close"
+	uncheckedsliceindex "github.com/github/gh-aw/pkg/linters/unchecked-slice-index"
+	"github.com/github/gh-aw/pkg/linters/uncheckedflushreturn"
 	"github.com/github/gh-aw/pkg/linters/uncheckedtypeassertion"
+	walkdirignoredeerror "github.com/github/gh-aw/pkg/linters/walk-dir-ignored-error"
+	"github.com/github/gh-aw/pkg/linters/walkfuncerrshadow"
 	"github.com/github/gh-aw/pkg/linters/wgdonenotdeferred"
 	"github.com/github/gh-aw/pkg/linters/writebytestring"
 )
@@ -85,28 +113,34 @@ type docAnalyzer struct {
 }
 
 // documentedAnalyzers returns the analyzer subpackages documented in the README
-// "Public API > Subpackages" table. The README documents 59 analyzers
+// "Public API > Subpackages" table. The README documents 87 analyzer
 // subpackages (the non-analyzer `internal` helper subpackage is excluded because
 // it exposes no Analyzer).
 //
 // Spec (README "Public API > Subpackages"):
 //
-//	appendbytestring, appendoneelement, bytesbufferstring, bytescomparestring, contextcancelnotdeferred, ctxbackground, deferinloop, errorfwrapv, excessivefuncparams, errormessage,
-//	errortypeassertion, errstringmatch, execcommandwithoutcontext, fileclosenotdeferred, fmterrorfnoverbs, fprintlnsprintf,
-//	hardcodedfilepath, httpnoctx, httprespbodyclose, httpstatuscode, ioutildeprecated, jsonmarshalignoredeerror, largefunc, lenstringsplit, lenstringzero,
-//	logfatallibrary, manualmutexunlock, mapclearloop, mapdeletecheck, nilctxpassed, osexitinlibrary, osgetenvlibrary, ossetenvlibrary, panic-in-library-code, rawloginlib,
-//	regexpcompileinfunction, seenmapbool, sortslice, sprintferrdot, sprintferrorsnew, sprintfbool, sprintfint, ssljson,
+//	appendbytestring, appendoneelement, blankassigncomma, bufferresetbeforereuse, bufioscannererunchecked, bytesbufferstring, bytescomparestring, closeerrorunchecked, contextcancelnotdeferred, ctxbackground, deferinloop, deferrerrorunchecked, errorfwrapv, excessivefuncparams, errormessage,
+//	errortypeassertion, errstringmatch, execcommandwithoutcontext, fileclosenotdeferred, fmterrorfnoverbs, formatintitoa, fprintferrorunchecked, fprintlnsprintf,
+//	generatedyamlheredoc, globwalkignorederror, goroutinemissingrecover, goroutineresourceleak, hardcodedfilepath, httpnoctx, httprespbodyclose, httpstatuscode, ioutildeprecated, jsonmarshalignoredeerror, largefunc, lenstringsplit, lenstringzero,
+//	logfatallibrary, manualmutexunlock, manualpathconcat, mapclearloop, mapdeletecheck, nilctxpassed, osexitinlibrary, osgetenvlibrary, osisnotexist, osopenreadallpreferreadfile, ossetenvlibrary, packagelevelmutableslicemap, panic-in-library-code, rawloginlib,
+//	readerstringconv, reflectdeepequalusage, regexpcompileinfunction, regexpdynamicpattern, seenmapbool, slicemakezerolength, sortslice, splitindexzero, sprintferrdot, sprintferrorsnew, sprintfbool, sprintfint, ssljson,
 //	strconvparseignorederror, stringbytesroundtrip, stringreplaceminusone, stringsconcatloop, stringscountcontains, stringsindexcontains, stringsindexhasprefix, stringsjoinone, timeafterleak, timesleepnocontext, timenowsub,
-//	tolowerequalfold, trimleftright, uncheckedtypeassertion, wgdonenotdeferred, writebytestring
+//	tolowerequalfold, trimleftright, typeassertionnil, typeassertionokdiscarded, unchecked_deferredclose, uncheckedflushreturn, uncheckedsliceindex, uncheckedtypeassertion, walkdirignoredeerror, walkfuncerrshadow, wgdonenotdeferred, writebytestring
 func documentedAnalyzers() []docAnalyzer {
 	return []docAnalyzer{
 		{"appendbytestring", appendbytestring.Analyzer},
 		{"appendoneelement", appendoneelement.Analyzer},
+		{"blankassigncomma", blankassigncomma.Analyzer},
+		{"bufferresetbeforereuse", bufferresetbeforereuse.Analyzer},
+		{"bufioscannererunchecked", bufioscannererunchecked.Analyzer},
 		{"bytesbufferstring", bytesbufferstring.Analyzer},
 		{"bytescomparestring", bytescomparestring.Analyzer},
+		{"closeerrorunchecked", closeerrorunchecked.Analyzer},
+		{"consolestderr", consolestderr.Analyzer},
 		{"contextcancelnotdeferred", contextcancelnotdeferred.Analyzer},
 		{"ctxbackground", ctxbackground.Analyzer},
 		{"deferinloop", deferinloop.Analyzer},
+		{"deferrerrorunchecked", deferrerrorunchecked.Analyzer},
 		{"errorfwrapv", errorfwrapv.Analyzer},
 		{"excessivefuncparams", excessivefuncparams.Analyzer},
 		{"errormessage", errormessage.Analyzer},
@@ -115,7 +149,13 @@ func documentedAnalyzers() []docAnalyzer {
 		{"execcommandwithoutcontext", execcommandwithoutcontext.Analyzer},
 		{"fileclosenotdeferred", fileclosenotdeferred.Analyzer},
 		{"fmterrorfnoverbs", fmterrorfnoverbs.Analyzer},
+		{"formatintitoa", formatintitoa.Analyzer},
+		{"fprintferrorunchecked", fprintferrorunchecked.Analyzer},
 		{"fprintlnsprintf", fprintlnsprintf.Analyzer},
+		{"generatedyamlheredoc", generatedyamlheredoc.Analyzer},
+		{"globwalkignorederror", globwalkignorederror.Analyzer},
+		{"goroutinemissingrecover", goroutinemissingrecover.Analyzer},
+		{"goroutineresourceleak", goroutineresourceleak.Analyzer},
 		{"hardcodedfilepath", hardcodedfilepath.Analyzer},
 		{"httpnoctx", httpnoctx.Analyzer},
 		{"httprespbodyclose", httprespbodyclose.Analyzer},
@@ -127,17 +167,26 @@ func documentedAnalyzers() []docAnalyzer {
 		{"lenstringzero", lenstringzero.Analyzer},
 		{"logfatallibrary", logfatallibrary.Analyzer},
 		{"manualmutexunlock", manualmutexunlock.Analyzer},
+		{"manualpathconcat", manualpathconcat.Analyzer},
 		{"mapclearloop", mapclearloop.Analyzer},
 		{"mapdeletecheck", mapdeletecheck.Analyzer},
 		{"nilctxpassed", nilctxpassed.Analyzer},
 		{"osexitinlibrary", osexitinlibrary.Analyzer},
 		{"osgetenvlibrary", osgetenvlibrary.Analyzer},
+		{"osisnotexist", osisnotexist.Analyzer},
+		{"osopenreadallpreferreadfile", osopenreadallpreferreadfile.Analyzer},
 		{"ossetenvlibrary", ossetenvlibrary.Analyzer},
+		{"packagelevelmutableslicemap", packagelevelmutableslicemap.Analyzer},
 		{"panic-in-library-code", panicinlibrarycode.Analyzer},
 		{"rawloginlib", rawloginlib.Analyzer},
+		{"readerstringconv", readerstringconv.Analyzer},
+		{"reflectdeepequalusage", reflectdeepequalusage.Analyzer},
 		{"regexpcompileinfunction", regexpcompileinfunction.Analyzer},
+		{"regexpdynamicpattern", regexpdynamicpattern.Analyzer},
 		{"seenmapbool", seenmapbool.Analyzer},
+		{"slicemakezerolength", slicemakezerolength.Analyzer},
 		{"sortslice", sortslice.Analyzer},
+		{"splitindexzero", splitindexzero.Analyzer},
 		{"sprintferrdot", sprintferrdot.Analyzer},
 		{"sprintferrorsnew", sprintferrorsnew.Analyzer},
 		{"sprintfbool", sprintfbool.Analyzer},
@@ -156,7 +205,14 @@ func documentedAnalyzers() []docAnalyzer {
 		{"timenowsub", timenowsub.Analyzer},
 		{"tolowerequalfold", tolowerequalfold.Analyzer},
 		{"trimleftright", trimleftright.Analyzer},
+		{"typeassertionnil", typeassertionnil.Analyzer},
+		{"typeassertionokdiscarded", typeassertionokdiscarded.Analyzer},
+		{"unchecked_deferredclose", unchecked_deferredclose.Analyzer},
+		{"uncheckedsliceindex", uncheckedsliceindex.Analyzer},
 		{"uncheckedtypeassertion", uncheckedtypeassertion.Analyzer},
+		{"uncheckedflushreturn", uncheckedflushreturn.Analyzer},
+		{"walkdirignoredeerror", walkdirignoredeerror.Analyzer},
+		{"walkfuncerrshadow", walkfuncerrshadow.Analyzer},
 		{"wgdonenotdeferred", wgdonenotdeferred.Analyzer},
 		{"writebytestring", writebytestring.Analyzer},
 	}
@@ -167,8 +223,10 @@ func documentedAnalyzers() []docAnalyzer {
 // `Analyzer` entry point of type *analysis.Analyzer with its Name and Run wired,
 // so each can be consumed by a go/analysis driver (multichecker/singlechecker).
 func TestSpec_PublicAPI_SubpackageAnalyzers(t *testing.T) {
+	t.Parallel()
 	for _, d := range documentedAnalyzers() {
 		t.Run(d.label, func(t *testing.T) {
+			t.Parallel()
 			require.NotNil(t, d.analyzer, "%s must expose a non-nil *analysis.Analyzer per the README Subpackages table", d.label)
 			assert.IsType(t, (*analysis.Analyzer)(nil), d.analyzer, "%s.Analyzer should be *analysis.Analyzer for go/analysis drivers", d.label)
 			assert.NotEmpty(t, d.analyzer.Name, "%s.Analyzer.Name should be set so go/analysis drivers can identify it", d.label)
@@ -182,6 +240,7 @@ func TestSpec_PublicAPI_SubpackageAnalyzers(t *testing.T) {
 // README "Namespace exports" table.
 // Spec: "ErrorMessageAnalyzer | Compatibility alias to pkg/linters/errormessage.Analyzer"
 func TestSpec_NamespaceExports_ErrorMessageAnalyzer(t *testing.T) {
+	t.Parallel()
 	require.NotNil(t, linters.ErrorMessageAnalyzer,
 		"linters.ErrorMessageAnalyzer must be a non-nil compatibility alias per the README")
 	assert.Same(t, errormessage.Analyzer, linters.ErrorMessageAnalyzer,
@@ -192,6 +251,7 @@ func TestSpec_NamespaceExports_ErrorMessageAnalyzer(t *testing.T) {
 // "8 parameters" threshold for the excessivefuncparams analyzer.
 // Spec: "excessivefuncparams ... defaults to 8 parameters (DefaultMaxParams)."
 func TestSpec_Constants_DefaultMaxParams(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, 8, excessivefuncparams.DefaultMaxParams,
 		"DefaultMaxParams should match the documented default of 8")
 }
@@ -200,6 +260,7 @@ func TestSpec_Constants_DefaultMaxParams(t *testing.T) {
 // "60 lines" threshold for the largefunc analyzer.
 // Spec: "largefunc ... defaults to 60 lines (DefaultMaxLines)."
 func TestSpec_Constants_DefaultMaxLines(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, 60, largefunc.DefaultMaxLines,
 		"DefaultMaxLines should match the documented default of 60")
 }
@@ -208,6 +269,7 @@ func TestSpec_Constants_DefaultMaxLines(t *testing.T) {
 // analyzer flag for excessivefuncparams.
 // Spec: "excessivefuncparams exposes a -max-params analyzer flag"
 func TestSpec_DesignDecision_MaxParamsFlag(t *testing.T) {
+	t.Parallel()
 	flag := excessivefuncparams.Analyzer.Flags.Lookup("max-params")
 	require.NotNil(t, flag, "excessivefuncparams should expose a -max-params flag per the spec")
 }
@@ -216,6 +278,7 @@ func TestSpec_DesignDecision_MaxParamsFlag(t *testing.T) {
 // analyzer flag for largefunc.
 // Spec: "largefunc exposes a -max-lines analyzer flag"
 func TestSpec_DesignDecision_MaxLinesFlag(t *testing.T) {
+	t.Parallel()
 	flag := largefunc.Analyzer.Flags.Lookup("max-lines")
 	require.NotNil(t, flag, "largefunc should expose a -max-lines flag per the spec")
 }
@@ -226,27 +289,13 @@ func TestSpec_DesignDecision_MaxLinesFlag(t *testing.T) {
 // `_ = <subpackage>.Analyzer` for the documented analyzers; this test exercises
 // the same pattern across all documented subpackages.
 func TestSpec_UsageExample_AnalyzersUsable(t *testing.T) {
+	t.Parallel()
 	for _, d := range documentedAnalyzers() {
 		assert.NotNil(t, d.analyzer, "documented Analyzer %q should be usable in a multichecker/singlechecker slice", d.label)
 	}
 }
 
-// TestSpec_DesignDecision_UniqueAnalyzerNames validates that each documented
-// subpackage exposes a distinct Analyzer.Name so they can coexist in a single
-// go/analysis driver (multichecker) without conflict.
-// Spec: "intentionally organized as a namespace ... so individual analyzers
-// remain isolated and independently testable."
-func TestSpec_DesignDecision_UniqueAnalyzerNames(t *testing.T) {
-	documented := documentedAnalyzers()
-	names := make(map[string]bool, len(documented))
-	for _, d := range documented {
-		names[d.analyzer.Name] = true
-	}
-	assert.Len(t, names, len(documented),
-		"each documented subpackage should expose a distinct Analyzer.Name")
-}
-
-// TestRegistryMatchesDocumentation validates that linters.All() (the canonical,
+// TestSpec_PublicAPI_All validates that linters.All() (the canonical,
 // importable registry) and documentedAnalyzers() (the spec_test hand-list
 // derived from the README Subpackages table) are equal sets — bidirectionally.
 //
@@ -254,7 +303,8 @@ func TestSpec_DesignDecision_UniqueAnalyzerNames(t *testing.T) {
 // cmd/linters/main.go without updating docs) causes this test to fail, closing
 // the recurring doc-sync drift gap (gh-aw#40436, #45185, #46131, #46527,
 // #46707, #46977).
-func TestRegistryMatchesDocumentation(t *testing.T) {
+func TestSpec_PublicAPI_All(t *testing.T) {
+	t.Parallel()
 	allAnalyzers := linters.All()
 	documented := documentedAnalyzers()
 

@@ -11,6 +11,7 @@ import (
 	"go/types"
 	"slices"
 	"strconv"
+	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -37,17 +38,175 @@ func RhsExprForIndex(rhs []ast.Expr, idx int) (ast.Expr, bool) {
 	case len(rhs) == 0:
 		return nil, false
 	case len(rhs) == 1 && idx == 0:
-		return rhs[0], true
-	case idx < len(rhs):
-		return rhs[idx], true
+		for _, expr := range rhs {
+			return expr, true
+		}
+	case idx >= 0 && idx < len(rhs):
+		for i, expr := range rhs {
+			if i == idx {
+				return expr, true
+			}
+		}
 	default:
 		return nil, false
 	}
+	return nil, false
+}
+
+// MatchDiscardedErrorCall reports whether stmt discards the error result of a
+// package-qualified call and resolves the function to its imported package.
+func MatchDiscardedErrorCall(pass *analysis.Pass, stmt ast.Stmt) (call *ast.CallExpr, pkgPath, funcName string, ok bool) {
+	if pass == nil || pass.TypesInfo == nil || stmt == nil {
+		return nil, "", "", false
+	}
+
+	switch stmt := stmt.(type) {
+	case *ast.AssignStmt:
+		if len(stmt.Lhs) != 2 || len(stmt.Rhs) != 1 {
+			return nil, "", "", false
+		}
+		var blankExpr ast.Expr
+		for i, lhs := range stmt.Lhs {
+			if i == 1 {
+				blankExpr = lhs
+				break
+			}
+		}
+		blank, isBlank := blankExpr.(*ast.Ident)
+		if !isBlank || blank.Name != "_" {
+			return nil, "", "", false
+		}
+		for _, rhs := range stmt.Rhs {
+			call, ok = UnwrapParenExpr(rhs).(*ast.CallExpr)
+			break
+		}
+	case *ast.ExprStmt:
+		call, ok = UnwrapParenExpr(stmt.X).(*ast.CallExpr)
+	default:
+		return nil, "", "", false
+	}
+	if !ok {
+		return nil, "", "", false
+	}
+	pkgPath, funcName, ok = PackageCall(pass, call)
+	if !ok {
+		return nil, "", "", false
+	}
+	return call, pkgPath, funcName, true
+}
+
+// PackageCall resolves a package-qualified call, including calls through a
+// local function-value alias with no writes or address escapes, and returns its
+// import path and function name. Mutable aliases are conservatively unresolved,
+// even at calls before a later write.
+func PackageCall(pass *analysis.Pass, call *ast.CallExpr) (pkgPath, funcName string, ok bool) {
+	if pass == nil || pass.TypesInfo == nil || call == nil {
+		return "", "", false
+	}
+	return packageFunction(pass, call.Fun, nil)
+}
+
+func packageFunction(pass *analysis.Pass, expr ast.Expr, seen map[types.Object]bool) (pkgPath, funcName string, ok bool) {
+	switch expr := UnwrapParenExpr(expr).(type) {
+	case *ast.SelectorExpr:
+		ident, ok := expr.X.(*ast.Ident)
+		if !ok {
+			return "", "", false
+		}
+		pkgName, ok := pass.TypesInfo.Uses[ident].(*types.PkgName)
+		if !ok || pkgName.Imported() == nil {
+			return "", "", false
+		}
+		fn, ok := pass.TypesInfo.Uses[expr.Sel].(*types.Func)
+		if !ok || fn.Pkg() != pkgName.Imported() {
+			return "", "", false
+		}
+		return fn.Pkg().Path(), fn.Name(), true
+	case *ast.Ident:
+		if fn, ok := pass.TypesInfo.Uses[expr].(*types.Func); ok && fn.Pkg() != nil {
+			signature, ok := fn.Type().(*types.Signature)
+			if ok && signature.Recv() == nil {
+				return fn.Pkg().Path(), fn.Name(), true
+			}
+		}
+		return packageFunctionAlias(pass, pass.TypesInfo.Uses[expr], seen)
+	}
+	return "", "", false
+}
+
+func packageFunctionAlias(pass *analysis.Pass, obj types.Object, seen map[types.Object]bool) (string, string, bool) {
+	variable, ok := obj.(*types.Var)
+	if !ok || !IsLocalObject(variable) {
+		return "", "", false
+	}
+	if seen == nil {
+		seen = make(map[types.Object]bool)
+	}
+	if seen[obj] {
+		return "", "", false
+	}
+	seen[obj] = true
+	var initializer ast.Expr
+	mutable := false
+	for _, file := range pass.Files {
+		ast.Inspect(file, func(node ast.Node) bool {
+			if mutable {
+				return false
+			}
+			if value := packageFunctionAliasInitializer(pass, node, obj); value != nil {
+				initializer = value
+			}
+			switch node := node.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range node.Lhs {
+					if ident, ok := UnwrapParenExpr(lhs).(*ast.Ident); ok && pass.TypesInfo.Uses[ident] == obj {
+						mutable = true
+					}
+				}
+			case *ast.RangeStmt:
+				for _, lhs := range []ast.Expr{node.Key, node.Value} {
+					if ident, ok := UnwrapParenExpr(lhs).(*ast.Ident); ok && pass.TypesInfo.Uses[ident] == obj {
+						mutable = true
+					}
+				}
+			case *ast.UnaryExpr:
+				if ident, ok := UnwrapParenExpr(node.X).(*ast.Ident); ok && node.Op == token.AND && pass.TypesInfo.Uses[ident] == obj {
+					mutable = true
+				}
+			}
+			return true
+		})
+	}
+	if mutable || initializer == nil {
+		return "", "", false
+	}
+	return packageFunction(pass, initializer, seen)
+}
+
+func packageFunctionAliasInitializer(pass *analysis.Pass, node ast.Node, obj types.Object) ast.Expr {
+	switch node := node.(type) {
+	case *ast.ValueSpec:
+		for i, name := range node.Names {
+			if pass.TypesInfo.Defs[name] == obj {
+				value, _ := RhsExprForIndex(node.Values, i)
+				return value
+			}
+		}
+	case *ast.AssignStmt:
+		for i, lhs := range node.Lhs {
+			ident, ok := lhs.(*ast.Ident)
+			if ok && (pass.TypesInfo.Uses[ident] == obj || pass.TypesInfo.Defs[ident] == obj) {
+				value, _ := RhsExprForIndex(node.Rhs, i)
+				return value
+			}
+		}
+	}
+	return nil
 }
 
 // IsStringLiteral reports whether expr is a string literal.
 func IsStringLiteral(expr ast.Expr) bool {
-	lit, ok := expr.(*ast.BasicLit)
+	lit, ok := UnwrapParenExpr(expr).(*ast.BasicLit)
 	return ok && lit.Kind == token.STRING
 }
 
@@ -105,8 +264,9 @@ func ContextParamName(pass *analysis.Pass, fn *ast.FuncType) (string, bool) {
 }
 
 // IsFmtErrorf reports whether call is a call to fmt.Errorf (including aliases).
+// A parenthesized callee such as (fmt.Errorf)(...) is also recognized.
 func IsFmtErrorf(pass *analysis.Pass, call *ast.CallExpr) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
@@ -136,7 +296,7 @@ func CalledOSFunc(pass *analysis.Pass, call *ast.CallExpr, allowedNames ...strin
 	}
 
 	var obj types.Object
-	switch fun := call.Fun.(type) {
+	switch fun := UnwrapParenExpr(call.Fun).(type) {
 	case *ast.SelectorExpr:
 		obj = pass.TypesInfo.Uses[fun.Sel]
 	case *ast.Ident:
@@ -303,11 +463,8 @@ func ImportedAs(file *ast.File, info *types.Info, importPath string) (string, bo
 		}
 		// Fallback: last segment of the path.
 		last := importPath
-		for j := len(importPath) - 1; j >= 0; j-- {
-			if importPath[j] == '/' {
-				last = importPath[j+1:]
-				break
-			}
+		if slash := strings.LastIndexByte(importPath, '/'); slash >= 0 {
+			last = importPath[slash+1:]
 		}
 		return last, true
 	}
@@ -382,11 +539,20 @@ func IsByteSlice(pass *analysis.Pass, expr ast.Expr) bool {
 
 // IsByteSliceConversion reports whether conv is a []byte or []uint8 conversion expression.
 func IsByteSliceConversion(pass *analysis.Pass, conv *ast.CallExpr) bool {
-	funTypeInfo, ok := pass.TypesInfo.Types[conv.Fun]
+	funTypeInfo, ok := pass.TypesInfo.Types[UnwrapParenExpr(conv.Fun)]
 	if !ok || !funTypeInfo.IsType() {
 		return false
 	}
 	return IsByteSlice(pass, conv)
+}
+
+// IsStringConversion reports whether conv is a string conversion expression.
+func IsStringConversion(pass *analysis.Pass, conv *ast.CallExpr) bool {
+	funTypeInfo, ok := pass.TypesInfo.Types[UnwrapParenExpr(conv.Fun)]
+	if !ok || !funTypeInfo.IsType() {
+		return false
+	}
+	return IsStringType(pass, conv)
 }
 
 // IsStringType reports whether expr has underlying type string (or a named string type).
@@ -429,7 +595,7 @@ func AsStringsMethodCall(pass *analysis.Pass, expr ast.Expr, methodName string) 
 	if !ok {
 		return nil, false
 	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != methodName {
 		return nil, false
 	}
@@ -442,9 +608,10 @@ func AsStringsMethodCall(pass *analysis.Pass, expr ast.Expr, methodName string) 
 // CallQualifierText returns the source text of the package qualifier in a
 // selector call such as pkg.Method(...). For example, for strings.Index(...)
 // it returns "strings" (or the local alias when the import is aliased).
-// Returns "" if call.Fun is not a *ast.SelectorExpr.
+// Returns "" if call.Fun (after unwrapping parentheses) is not a
+// *ast.SelectorExpr.
 func CallQualifierText(fset *token.FileSet, call *ast.CallExpr) string {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok {
 		return ""
 	}
@@ -461,6 +628,54 @@ func FileForPos(files []*ast.File, pos token.Pos) *ast.File {
 		}
 	}
 	return nil
+}
+
+// BuildParentMap constructs a map from each AST node to its direct parent node.
+func BuildParentMap(root ast.Node) map[ast.Node]ast.Node {
+	parents := make(map[ast.Node]ast.Node)
+	var stack []ast.Node
+
+	ast.Inspect(root, func(n ast.Node) bool {
+		if n == nil {
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			return false
+		}
+		if len(stack) > 0 {
+			parents[n] = stack[len(stack)-1] //nolint:uncheckedsliceindex // stack is non-empty
+		}
+		stack = append(stack, n)
+		return true
+	})
+
+	return parents
+}
+
+// TwoValueTypeAssertionOKIdent returns the ok identifier for a two-value type
+// assertion assignment or variable declaration.
+func TwoValueTypeAssertionOKIdent(typeAssert *ast.TypeAssertExpr, parents map[ast.Node]ast.Node) (*ast.Ident, bool) {
+	parent := parents[typeAssert]
+	for {
+		paren, ok := parent.(*ast.ParenExpr)
+		if !ok {
+			break
+		}
+		parent = parents[paren]
+	}
+
+	switch p := parent.(type) {
+	case *ast.AssignStmt:
+		if len(p.Lhs) == 2 && len(p.Rhs) == 1 {
+			okIdent, ok := p.Lhs[1].(*ast.Ident) //nolint:uncheckedsliceindex // len(p.Lhs) is checked above
+			return okIdent, ok
+		}
+	case *ast.ValueSpec:
+		if len(p.Names) == 2 && len(p.Values) == 1 {
+			return p.Names[1], true //nolint:uncheckedsliceindex // len(p.Names) is checked above
+		}
+	}
+	return nil, false
 }
 
 // CountPkgUsesInFile returns the number of times the package at pkgPath is
@@ -540,7 +755,15 @@ func AddImportEdit(pass *analysis.Pass, file *ast.File, pkg string) (analysis.Te
 			if !ok || genDecl.Tok != token.IMPORT || genDecl.Lparen.IsValid() {
 				continue
 			}
-			specText := NodeText(pass.Fset, genDecl.Specs[0])
+			var spec ast.Spec
+			for _, candidate := range genDecl.Specs {
+				spec = candidate
+				break
+			}
+			if spec == nil {
+				continue
+			}
+			specText := NodeText(pass.Fset, spec)
 			if specText == "" {
 				continue
 			}
@@ -654,23 +877,170 @@ func SwapImportEdits(fset *token.FileSet, file *ast.File, addPkg, removePkg stri
 	}
 }
 
-// BuildContainsFix builds the suggested fix rewriting a comparison to
-// strings.Contains. fixMessage is used as the SuggestedFix.Message field so
-// callers can identify the rewritten function (e.g. "Index" vs "Count").
-func BuildContainsFix(expr *ast.BinaryExpr, pkgText, sText, subText string, negated bool, fixMessage string) []analysis.SuggestedFix {
-	var replacement string
-	if negated {
-		replacement = "!" + pkgText + ".Contains(" + sText + ", " + subText + ")"
-	} else {
-		replacement = pkgText + ".Contains(" + sText + ", " + subText + ")"
+// UniverseErrorInterface returns the built-in error interface type, or nil if
+// it cannot be resolved from types.Universe.
+func UniverseErrorInterface() *types.Interface {
+	errorObj := types.Universe.Lookup("error")
+	if errorObj == nil {
+		return nil
+	}
+	iface, ok := errorObj.Type().Underlying().(*types.Interface)
+	if !ok {
+		return nil
+	}
+	return iface
+}
+
+// StringLitValue returns the unquoted string value of a string-literal AST node.
+func StringLitValue(expr ast.Expr) (string, bool) {
+	lit, ok := UnwrapParenExpr(expr).(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return "", false
+	}
+	s, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// ResolveFormatString resolves a fmt.Errorf-style format-string argument
+// expression into its literal text content. It handles plain string literals
+// as well as string concatenation via the `+` operator where all operands
+// are string literals (e.g. `"header\n" + "body %w"`).
+//
+// If any operand in a concatenated expression is not a string literal (e.g.
+// an identifier or function call), the format string cannot be fully resolved
+// at compile time (its format verbs and argument counts are unprovable), so ok
+// is false.
+func ResolveFormatString(expr ast.Expr) (value string, ok bool) {
+	if s, litOK := StringLitValue(expr); litOK {
+		return s, true
+	}
+	bin, isBin := expr.(*ast.BinaryExpr)
+	if !isBin || bin.Op != token.ADD {
+		return "", false
+	}
+	left, leftOK := ResolveFormatString(bin.X)
+	if !leftOK {
+		return "", false
+	}
+	right, rightOK := ResolveFormatString(bin.Y)
+	if !rightOK {
+		return "", false
+	}
+	return left + right, true
+}
+
+// IsInInitFunction reports whether cur is inside a top-level init() function.
+// Only top-level (no receiver) init functions are recognized; methods named
+// init are ordinary methods and are not exempt. A node whose innermost
+// enclosing function is a literal (e.g. a goroutine started from init) is not
+// considered to be in init.
+func IsInInitFunction(cur inspector.Cursor) bool {
+	for encl := range cur.Enclosing((*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)) {
+		decl, ok := encl.Node().(*ast.FuncDecl)
+		if !ok {
+			return false
+		}
+		return decl.Recv == nil && decl.Name != nil && decl.Name.Name == "init"
+	}
+	return false
+}
+
+// IsRegexpCompileCall reports whether call is a call to one of the named
+// functions on the standard "regexp" package. The package identity is resolved
+// via the type checker so aliased imports are handled and local identifiers
+// named "regexp" do not produce false positives.
+func IsRegexpCompileCall(pass *analysis.Pass, call *ast.CallExpr, names ...string) bool {
+	sel, ok := UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
+	if !ok || !slices.Contains(names, sel.Sel.Name) {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	if !ok || pass.TypesInfo == nil {
+		return false
+	}
+	obj := pass.TypesInfo.ObjectOf(ident)
+	if obj == nil {
+		return false
+	}
+	pkgName, ok := obj.(*types.PkgName)
+	if !ok || pkgName.Imported() == nil {
+		return false
+	}
+	return pkgName.Imported().Path() == "regexp"
+}
+
+// HasConstantStringArg reports whether the argument at argIdx of call is a
+// compile-time constant string, such as a string literal, a const identifier,
+// or an expression built entirely from constants (e.g. concatenation of string
+// literals/consts). Non-constant expressions such as fmt.Sprintf results,
+// concatenation involving variables, or function parameters return false.
+func HasConstantStringArg(pass *analysis.Pass, call *ast.CallExpr, argIdx int) bool {
+	if argIdx < 0 || argIdx >= len(call.Args) {
+		return false
 	}
 
-	return []analysis.SuggestedFix{{
-		Message: fixMessage,
-		TextEdits: []analysis.TextEdit{{
-			Pos:     expr.Pos(),
-			End:     expr.End(),
-			NewText: []byte(replacement),
-		}},
-	}}
+	arg := call.Args[argIdx]
+	if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+		return true
+	}
+
+	if pass.TypesInfo == nil {
+		return false
+	}
+	tv, ok := pass.TypesInfo.Types[arg]
+	if !ok || tv.Value == nil || tv.Type == nil {
+		return false
+	}
+
+	basic, ok := tv.Type.Underlying().(*types.Basic)
+	return ok && basic.Kind() == types.String
+}
+
+// NormalizeComparisonOperands returns (left, right) such that left is the
+// operand holding the strings.<methodName> call. When the call is on the right
+// side of expr the operands are swapped and flipped is true. Both operands are
+// unwrapped of any redundant parentheses before the check. If neither operand
+// is the target strings call, the original left/right order is preserved.
+func NormalizeComparisonOperands(pass *analysis.Pass, expr *ast.BinaryExpr, methodName string) (left, right ast.Expr, flipped bool) {
+	x := UnwrapParenExpr(expr.X)
+	y := UnwrapParenExpr(expr.Y)
+	if _, ok := AsStringsMethodCall(pass, x, methodName); ok {
+		return x, y, false
+	}
+	if _, ok := AsStringsMethodCall(pass, y, methodName); ok {
+		return y, x, true
+	}
+	return x, y, false
+}
+
+// SwapPkgImportEdits returns the TextEdits that add addPkg to file and, when
+// removeOrphaned is true, remove the now-unused removePkg import. The second
+// return value reports whether an import change was required; it is false only
+// when addPkg is already imported and removeOrphaned is false. A required
+// change may still yield no edits when the import section cannot be rewritten,
+// so callers must not assume a non-empty slice when it is true.
+func SwapPkgImportEdits(pass *analysis.Pass, file *ast.File, addPkg, removePkg string, removeOrphaned bool) ([]analysis.TextEdit, bool) {
+	_, addImported := ImportedAs(file, pass.TypesInfo, addPkg)
+	needAdd := !addImported
+
+	if !needAdd && !removeOrphaned {
+		return nil, false
+	}
+
+	switch {
+	case needAdd && removeOrphaned:
+		return SwapImportEdits(pass.Fset, file, addPkg, removePkg), true
+	case needAdd:
+		if edit, ok := AddImportEdit(pass, file, addPkg); ok {
+			return []analysis.TextEdit{edit}, true
+		}
+	default:
+		if edit, ok := RemoveImportEdit(pass.Fset, file, removePkg); ok {
+			return []analysis.TextEdit{edit}, true
+		}
+	}
+	return nil, true
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow/codemod"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,6 +28,7 @@ func baseFieldRemovalConfig() fieldRemovalCodemodConfig {
 }
 
 func TestNewFieldRemovalCodemod_Metadata(t *testing.T) {
+	t.Parallel()
 	cfg := baseFieldRemovalConfig()
 	codemod := newFieldRemovalCodemod(cfg)
 
@@ -38,6 +40,7 @@ func TestNewFieldRemovalCodemod_Metadata(t *testing.T) {
 }
 
 func TestNewFieldRemovalCodemod_ParentKeyMissing(t *testing.T) {
+	t.Parallel()
 	codemod := newFieldRemovalCodemod(baseFieldRemovalConfig())
 
 	content := `---
@@ -60,6 +63,7 @@ other: value
 }
 
 func TestNewFieldRemovalCodemod_ParentKeyWrongType(t *testing.T) {
+	t.Parallel()
 	codemod := newFieldRemovalCodemod(baseFieldRemovalConfig())
 
 	content := `---
@@ -82,6 +86,7 @@ parent: simple_string
 }
 
 func TestNewFieldRemovalCodemod_FieldKeyMissing(t *testing.T) {
+	t.Parallel()
 	codemod := newFieldRemovalCodemod(baseFieldRemovalConfig())
 
 	content := `---
@@ -107,6 +112,7 @@ parent:
 }
 
 func TestNewFieldRemovalCodemod_SuccessfulRemoval(t *testing.T) {
+	t.Parallel()
 	codemod := newFieldRemovalCodemod(baseFieldRemovalConfig())
 
 	content := `---
@@ -135,15 +141,16 @@ parent:
 }
 
 func TestNewFieldRemovalCodemod_PostTransformInvoked(t *testing.T) {
+	t.Parallel()
 	var postTransformCalled bool
 	var capturedFieldValue any
 
 	cfg := baseFieldRemovalConfig()
-	cfg.PostTransform = func(lines []string, frontmatter map[string]any, fieldValue any) []string {
+	cfg.PostEdit = func(f *codemod.Frontmatter, frontmatter map[string]any, fieldValue any) error {
 		postTransformCalled = true
 		capturedFieldValue = fieldValue
 		// Append a marker line so we can verify the hook ran
-		return append(lines, "# post-transform-marker")
+		return f.Comment([]string{"on"}, "post-transform-marker")
 	}
 
 	codemod := newFieldRemovalCodemod(cfg)
@@ -173,12 +180,13 @@ parent:
 }
 
 func TestNewFieldRemovalCodemod_PostTransformNotCalledWhenFieldAbsent(t *testing.T) {
+	t.Parallel()
 	var postTransformCalled bool
 
 	cfg := baseFieldRemovalConfig()
-	cfg.PostTransform = func(lines []string, frontmatter map[string]any, fieldValue any) []string {
+	cfg.PostEdit = func(f *codemod.Frontmatter, frontmatter map[string]any, fieldValue any) error {
 		postTransformCalled = true
-		return lines
+		return nil
 	}
 
 	codemod := newFieldRemovalCodemod(cfg)
@@ -206,6 +214,7 @@ parent:
 }
 
 func TestNewFieldRemovalCodemod_TableDriven(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		content     string
@@ -253,6 +262,7 @@ func TestNewFieldRemovalCodemod_TableDriven(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			codemod := newFieldRemovalCodemod(baseFieldRemovalConfig())
 
 			result, applied, err := codemod.Apply(tt.content, tt.frontmatter)

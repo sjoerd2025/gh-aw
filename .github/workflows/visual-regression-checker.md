@@ -15,13 +15,15 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   playwright:
-    mode: cli
   bash:
     - "npm *"
     - "npx *"
@@ -34,7 +36,12 @@ network:
     - playwright
     - local
     - node
+    - host.docker.internal
+jobs:
+  agent:
+    timeout-minutes: 15
 safe-outputs:
+  timeout-minutes: 10
   add-comment:
     max: 1
 timeout-minutes: 15
@@ -44,8 +51,17 @@ steps:
     with:
       persist-credentials: false
 
+  - name: Checkout agentics workflows
+    uses: actions/checkout@v7.0.1
+    with:
+      repository: githubnext/agentics
+      ref: main
+      path: .agentics
+      persist-credentials: false
+      sparse-checkout: workflows
+
   - name: Setup Node.js
-    uses: actions/setup-node@v7.0.0
+    uses: actions/setup-node@v7.1.0
     with:
       node-version: '24'
       cache: 'npm'
@@ -53,14 +69,20 @@ steps:
 
   - name: Install dependencies
     working-directory: ./docs
+    timeout-minutes: 5
     run: npm ci
 
   - name: Build documentation
     working-directory: ./docs
+    timeout-minutes: 5
+    env:
+      AGENTICS_WORKFLOWS_DIR: ${{ github.workspace }}/.agentics/workflows
     run: npm run build
 
   - name: Start docs server
     working-directory: ./docs
+    env:
+      AGENTICS_WORKFLOWS_DIR: ${{ github.workspace }}/.agentics/workflows
     run: |
       nohup npm run dev -- --host 0.0.0.0 --port 4321 > /tmp/gh-aw/agent/preview.log 2>&1 &
       PID=$!
@@ -68,9 +90,12 @@ steps:
       echo "Server PID: $PID"
 
   - name: Wait for server readiness
+    # runner-guard:ignore RGS-012 -- loopback-only port/readiness checks for the docs server started in this job; no external network or secrets are involved.
+    timeout-minutes: 2
     run: |
       MAX_WAIT=90
       WAITED=0
+      # runner-guard:ignore RGS-012 -- loopback-only port probe for the docs server started in this job; no external network or secret data is involved.
       until (echo > /dev/tcp/127.0.0.1/4321) > /dev/null 2>&1; do
         if [ -f /tmp/gh-aw/agent/server.pid ] && ! kill -0 "$(cat /tmp/gh-aw/agent/server.pid)" 2>/dev/null; then
           echo "Docs server process exited before opening port 4321" >&2
@@ -87,6 +112,7 @@ steps:
         sleep 3
       done
       WAITED=0
+      # runner-guard:ignore RGS-012 -- localhost readiness request to the docs server started above; response is discarded and no secrets are sent.
       until curl -sf http://localhost:4321/gh-aw/ > /dev/null 2>&1; do
         WAITED=$((WAITED + 3))
         if [ $WAITED -ge $MAX_WAIT ]; then
@@ -99,6 +125,13 @@ steps:
       done
       echo "Dev server is ready"
 
+evals:
+  - id: viewport-coverage
+    question: Does the agent output record screenshot results for each required mobile, tablet, and desktop viewport?
+  - id: findings-reported
+    question: When visual differences or accessibility issues are observed, does the proposed PR comment describe those observations? Return UNKNOWN when neither is observed.
+  - id: clean-run-noop
+    question: When all inspected pages have no visual differences or accessibility issues, does the agent request noop? Return UNKNOWN when that clean-run scenario is not established.
 ---
 
 # Visual Regression Checker

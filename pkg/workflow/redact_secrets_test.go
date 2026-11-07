@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goccy/go-yaml"
+
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/testutil"
@@ -323,5 +325,102 @@ Test workflow for secret redaction.
 	redactionSection := lockStr[redactionStepIdx:min(redactionStepIdx+500, len(lockStr))]
 	if !strings.Contains(redactionSection, "if: always()") {
 		t.Error("Expected redaction step to have 'if: always()' condition")
+	}
+}
+
+// parseGeneratedSteps parses generated step YAML into a list of step mappings so
+// tests can assert on the structure GitHub Actions will see rather than on the
+// raw text. The generated fragment is indented as list items under "steps:".
+func parseGeneratedSteps(t *testing.T, generated string) []map[string]any {
+	t.Helper()
+
+	var parsed struct {
+		Steps []map[string]any `yaml:"steps"`
+	}
+	if err := yaml.Unmarshal([]byte("steps:\n"+generated), &parsed); err != nil {
+		t.Fatalf("Generated steps are not valid YAML: %v\n%s", err, generated)
+	}
+	return parsed.Steps
+}
+
+func TestSecretRedactionRunsWithoutWorkflowSecrets(t *testing.T) {
+	var builder strings.Builder
+	compiler := NewCompiler()
+
+	compiler.generateSecretRedactionStep(&builder, "", &WorkflowData{})
+
+	output := builder.String()
+	if !strings.Contains(output, "const { main } = require('${{ runner.temp }}/gh-aw/actions/redact_secrets.cjs');") {
+		t.Error("Expected redaction script to run without workflow secret references")
+	}
+	if strings.Contains(output, "No secrets to redact") {
+		t.Error("Did not expect a no-op redaction step without workflow secret references")
+	}
+
+	steps := parseGeneratedSteps(t, output)
+	if len(steps) != 1 {
+		t.Fatalf("Expected exactly 1 generated step, got %d", len(steps))
+	}
+	// A bare "env:" would parse as null and fail workflow schema validation,
+	// so the key must be omitted entirely when there are no secrets to pass.
+	if env, ok := steps[0]["env"]; ok {
+		t.Errorf("Did not expect an env key without workflow secret references, got %#v", env)
+	}
+}
+
+func TestSecretRedactionEmitsEnvMappingWithWorkflowSecrets(t *testing.T) {
+	var builder strings.Builder
+	compiler := NewCompiler()
+
+	compiler.generateSecretRedactionStep(&builder, "${{ secrets.MY_TOKEN }}", &WorkflowData{})
+
+	steps := parseGeneratedSteps(t, builder.String())
+	if len(steps) != 1 {
+		t.Fatalf("Expected exactly 1 generated step, got %d", len(steps))
+	}
+	env, ok := steps[0]["env"].(map[string]any)
+	if !ok {
+		t.Fatalf("Expected env to be a mapping, got %#v", steps[0]["env"])
+	}
+	if env["GH_AW_SECRET_NAMES"] != "MY_TOKEN" {
+		t.Errorf("Expected GH_AW_SECRET_NAMES to list the secret, got %#v", env["GH_AW_SECRET_NAMES"])
+	}
+	if _, ok := env["SECRET_MY_TOKEN"]; !ok {
+		t.Errorf("Expected the secret value to be passed as SECRET_MY_TOKEN, got %#v", env)
+	}
+}
+
+func TestSecretRedactionPreparesFilesOnlyForCustomMasking(t *testing.T) {
+	tests := []struct {
+		name    string
+		masking *SecretMaskingConfig
+		prepare bool
+	}{
+		{name: "no custom masking"},
+		{name: "empty custom masking", masking: &SecretMaskingConfig{}},
+		{
+			name:    "configured custom masking",
+			masking: &SecretMaskingConfig{Steps: []map[string]any{{"name": "Custom masking", "run": "echo redacting"}}},
+			prepare: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var builder strings.Builder
+			compiler := NewCompiler()
+			compiler.generateSecretRedactionStep(&builder, "", &WorkflowData{SecretMasking: tt.masking})
+			steps := parseGeneratedSteps(t, builder.String())
+			with := steps[0]["with"].(map[string]any)
+			script := with["script"].(string)
+			if got := strings.Contains(script, "await main({ prepareForCustomMasking: true });"); got != tt.prepare {
+				t.Errorf("Expected custom masking preparation %v, got script:\n%s", tt.prepare, script)
+			}
+			if !tt.prepare && !strings.Contains(script, "await main();") {
+				t.Errorf("Expected default redaction without custom masking, got script:\n%s", script)
+			}
+			if tt.prepare && len(steps) != 2 {
+				t.Errorf("Expected built-in redaction and custom hook, got %d steps", len(steps))
+			}
+		})
 	}
 }

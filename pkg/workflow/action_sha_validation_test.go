@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +14,8 @@ import (
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
 )
 
 // TestGeneratedWorkflowsUseSHAs ensures that all generated workflows use SHAs instead of version tags
@@ -77,6 +80,167 @@ This is a test workflow to verify SHA pinning.
 	}
 
 	t.Logf("Found %d SHA-based action references", len(shaMatches))
+}
+
+func TestCompileWorkflowPreservesUnknownSHALabel(t *testing.T) {
+	const sha = "c19371144df3bb44fab255c43d04cbc2ab54d1c4"
+	for _, section := range []string{"steps", "pre-steps", "pre-agent-steps", "post-steps"} {
+		for _, tt := range []struct {
+			name    string
+			comment string
+			want    string
+		}{
+			{"labelled", " # v2.9.1", " # v2.9.1"},
+			{"unlabelled", "", ""},
+		} {
+			t.Run(section+"/"+tt.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "demo.md")
+				content := "---\non: workflow_dispatch\npermissions:\n  contents: read\nengine: copilot\n" + section + ":\n  - uses: Swatinem/rust-cache@" + sha + tt.comment + "\n---\n\nSay hello.\n"
+				if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := NewCompiler().CompileWorkflow(path); err != nil {
+					t.Fatal(err)
+				}
+				lock, err := os.ReadFile(stringutil.MarkdownToLockFile(path))
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := "uses: Swatinem/rust-cache@" + sha + tt.want
+				if !strings.Contains(string(lock), want+"\n") {
+					t.Fatalf("lock file missing %q", want)
+				}
+				if strings.Contains(string(lock), "uses: Swatinem/rust-cache@"+sha+" # "+sha) {
+					t.Fatal("lock file uses SHA as version comment")
+				}
+				manifest, err := ExtractGHAWManifestFromLockFile(string(lock))
+				if err != nil {
+					t.Fatal(err)
+				}
+				version := sha
+				if tt.comment != "" {
+					version = "v2.9.1"
+				}
+				found := false
+				for _, action := range manifest.Actions {
+					if action.Repo == "Swatinem/rust-cache" && action.SHA == sha {
+						found = true
+						if action.Version != version {
+							t.Errorf("manifest version = %q, want %q", action.Version, version)
+						}
+					}
+				}
+				if !found {
+					t.Fatal("missing action in manifest")
+				}
+			})
+		}
+	}
+}
+
+func TestCompileWorkflowPreservesImportedUnknownSHALabels(t *testing.T) {
+	const sha = "c19371144df3bb44fab255c43d04cbc2ab54d1c4"
+	tmpDir := t.TempDir()
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	if err := os.MkdirAll(workflowsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	importedWorkflow := `---
+steps:
+  - uses: Swatinem/rust-cache@` + sha + ` # v2.9.1
+pre-steps:
+  - uses: example/pre@` + sha + ` # v1.2.0
+pre-agent-steps:
+  - uses: example/pre-agent@` + sha + ` # v3.4.0
+post-steps:
+  - uses: example/post@` + sha + ` # v5.6.0
+---
+
+Shared steps.
+`
+	if err := os.WriteFile(filepath.Join(workflowsDir, "shared.md"), []byte(importedWorkflow), 0600); err != nil {
+		t.Fatal(err)
+	}
+	setupWorkflow := `name: Copilot Setup Steps
+on: workflow_dispatch
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: example/setup@` + sha + ` # v7.8.0
+`
+	if err := os.WriteFile(filepath.Join(workflowsDir, "copilot-setup-steps.yml"), []byte(setupWorkflow), 0600); err != nil {
+		t.Fatal(err)
+	}
+	workflow := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+imports:
+  - shared.md
+  - copilot-setup-steps.yml
+---
+
+Import steps.
+`
+	path := filepath.Join(workflowsDir, "demo.md")
+	if err := os.WriteFile(path, []byte(workflow), 0600); err != nil {
+		t.Fatal(err)
+	}
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chdir(originalDir); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	}()
+
+	if err := NewCompiler().CompileWorkflow(path); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.ReadFile(stringutil.MarkdownToLockFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockContent := string(lock)
+	expected := map[string]string{
+		"Swatinem/rust-cache": "v2.9.1",
+		"example/pre":         "v1.2.0",
+		"example/pre-agent":   "v3.4.0",
+		"example/post":        "v5.6.0",
+		"example/setup":       "v7.8.0",
+	}
+	for repo, version := range expected {
+		reference := "uses: " + repo + "@" + sha + " # " + version
+		if !strings.Contains(lockContent, reference) {
+			t.Errorf("lock file missing %q", reference)
+		}
+	}
+	manifest, err := ExtractGHAWManifestFromLockFile(lockContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for repo, version := range expected {
+		found := false
+		for _, action := range manifest.Actions {
+			if action.Repo == repo && action.SHA == sha {
+				found = true
+				if action.Version != version {
+					t.Errorf("%s manifest version = %q, want %q", repo, action.Version, version)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("missing %s action in manifest", repo)
+		}
+	}
 }
 
 // TestCompileWorkflowActionReferences tests that commonly used actions are pinned to SHAs
@@ -237,4 +401,133 @@ jobs:
 	// The test verifies the code compiles and runs without errors
 	// In CI with gh CLI access, the cache would be saved if updates were found
 	t.Logf("Validation completed successfully")
+}
+
+func TestCompiledWorkflowAppliesActionPinPrefixes(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"action_pin_prefixes": {"actions/": "mirror/actions-"}}`)
+	path := filepath.Join(dir, "test.md")
+	content := "---\non: push\nengine: copilot\npermissions:\n  contents: read\n---\n\n# Test\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	compiler.gitRoot = dir
+	if err := compiler.CompileWorkflow(path); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.ReadFile(stringutil.MarkdownToLockFile(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(lock), "uses: mirror/actions-") || strings.Contains(string(lock), "uses: actions/") {
+		t.Fatalf("expected all compiler-emitted actions to use the mirror: %s", lock)
+	}
+}
+
+func TestCompiledWorkflowPreservesParsedExactMappings(t *testing.T) {
+	for _, stringAPI := range []bool{false, true} {
+		t.Run(map[bool]string{false: "file", true: "string"}[stringAPI], func(t *testing.T) {
+			dir := t.TempDir()
+			checkoutVersion := latestActionVersionForRepo(t, "actions/checkout")
+			node := getActionPin("actions/setup-node")
+			nodeSHA, _, _ := strings.Cut(strings.TrimPrefix(node, "actions/setup-node@"), " ")
+			target := "actions/setup-node@" + nodeSHA
+			writeAWJSON(t, dir, `{"action_pins":{"actions/checkout@`+checkoutVersion+`":"`+target+`"},"action_pin_prefixes":{"actions/":"mirror/actions-"}}`)
+			imported := "---\nsteps:\n  - id: exact_imported\n    uses: actions/checkout@" + checkoutVersion + "\n    with:\n      persist-credentials: false\n---\n\nShared steps.\n"
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "shared.md"), []byte(imported), 0644))
+			onSection := "on: workflow_dispatch\n"
+			exactIDs := []string{"exact_custom", "exact_imported"}
+			if !stringAPI {
+				onSection = "on:\n  workflow_dispatch:\n  steps:\n    - id: exact_gate\n      uses: actions/checkout@" + checkoutVersion + "\n      with:\n        persist-credentials: false\n"
+				exactIDs = append(exactIDs, "exact_gate")
+			}
+			content := "---\n" + onSection + "imports:\n  - ./shared.md\nsteps:\n  - id: exact_custom\n    uses: actions/checkout@" + checkoutVersion +
+				"\n    with:\n      persist-credentials: false\n  - id: prefix_custom\n    uses: actions/setup-node@" + latestActionVersionForRepo(t, "actions/setup-node") +
+				"\nengine: copilot\npermissions:\n  contents: read\n---\n\nTest exact precedence.\n"
+			path := filepath.Join(dir, "test.md")
+			c := NewCompiler()
+			c.gitRoot = dir
+			var output string
+			if stringAPI {
+				data, err := c.ParseWorkflowString(content, path)
+				require.NoError(t, err)
+				output, err = c.CompileToYAML(data, path)
+				require.NoError(t, err)
+			} else {
+				require.NoError(t, os.WriteFile(path, []byte(content), 0644))
+				require.NoError(t, c.CompileWorkflow(path))
+				lock, err := os.ReadFile(stringutil.MarkdownToLockFile(path))
+				require.NoError(t, err)
+				output = string(lock)
+			}
+			var compiled struct {
+				Jobs map[string]struct {
+					Steps []struct{ ID, Uses string }
+				}
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(output), &compiled))
+			found := make(map[string]string)
+			for _, job := range compiled.Jobs {
+				for _, step := range job.Steps {
+					found[step.ID] = step.Uses
+				}
+			}
+			for _, id := range exactIDs {
+				require.Equal(t, target, found[id], id)
+			}
+			require.Equal(t, "mirror/actions-setup-node@"+nodeSHA, found["prefix_custom"])
+			require.NotContains(t, output, "[gh-aw-exact-pin]")
+		})
+	}
+}
+
+func TestCompiledWorkflowAppliesExactMappingsToGeneratedActions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.md")
+	content := "---\non: push\nengine: copilot\npermissions:\n  contents: read\n---\n\n# Test\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	compile := func() string {
+		t.Helper()
+		c := NewCompiler()
+		c.gitRoot = dir
+		if err := c.CompileWorkflow(path); err != nil {
+			t.Fatal(err)
+		}
+		lock, err := os.ReadFile(stringutil.MarkdownToLockFile(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(lock)
+	}
+	baseline := compile()
+	pinLines := regexp.MustCompile(`(?m)^        uses: (actions/[A-Za-z0-9._/-]+)@([a-f0-9]{40}) # (\S+)(?: \(source ([^)]+)\))?`)
+	matches := pinLines.FindAllStringSubmatch(baseline, -1)
+	if len(matches) == 0 {
+		t.Fatal("expected generated actions in baseline workflow")
+	}
+	mappings := make(map[string]string)
+	for _, match := range matches {
+		mappings[match[1]+"@"+match[3]] = "internal/" + strings.ReplaceAll(match[1], "/", "-") + "@" + match[2]
+		if match[4] != "" {
+			mappings[match[1]+"@"+match[4]] = mappings[match[1]+"@"+match[3]]
+		}
+	}
+	config, err := json.Marshal(map[string]any{"action_pins": mappings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAWJSON(t, dir, string(config))
+	mapped := compile()
+	if strings.Contains(mapped, "uses: actions/") {
+		t.Fatalf("compiler emitted unmapped actions:\n%s", mapped)
+	}
+	for _, target := range mappings {
+		if !strings.Contains(mapped, "uses: "+target) {
+			t.Errorf("mapped action missing: %s", target)
+		}
+	}
 }

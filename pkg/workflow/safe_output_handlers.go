@@ -2,8 +2,10 @@ package workflow
 
 import (
 	"reflect"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var safeOutputHandlerLog = logger.New("workflow:safe_output_handlers")
@@ -20,6 +22,60 @@ type safeOutputHandlerDescriptor struct {
 
 var safeOutputHandlers = []safeOutputHandlerDescriptor{
 	{
+		Key:         "ado-create-work-item",
+		StructField: "CreateWorkItems",
+		ToolName:    "ado_create_work_item",
+		NewConfig:   func() any { return &CreateWorkItemConfig{} },
+	},
+	{
+		Key:         "ado-update-work-item",
+		StructField: "UpdateWorkItems",
+		ToolName:    "ado_update_work_item",
+		NewConfig:   func() any { return &UpdateWorkItemConfig{} },
+	},
+	{
+		Key:         "ado-comment-on-work-item",
+		StructField: "CommentOnWorkItems",
+		ToolName:    "ado_comment_on_work_item",
+		NewConfig:   func() any { return &CommentOnWorkItemConfig{} },
+	},
+	{
+		Key:         "ado-assign-work-item",
+		StructField: "AssignWorkItems",
+		ToolName:    "ado_assign_work_item",
+		NewConfig:   func() any { return &AssignWorkItemConfig{} },
+	},
+	{
+		Key:         "ado-link-work-items",
+		StructField: "LinkWorkItems",
+		ToolName:    "ado_link_work_items",
+		NewConfig:   func() any { return &LinkWorkItemsConfig{} },
+	},
+	{
+		Key:         "ado-upload-workitem-attachment",
+		StructField: "UploadWorkItemAttachments",
+		ToolName:    "ado_upload_workitem_attachment",
+		NewConfig:   func() any { return &UploadWorkItemAttachmentConfig{} },
+	},
+	{
+		Key:         "linear-create-issue",
+		StructField: "LinearCreateIssue",
+		ToolName:    "linear_create_issue",
+		NewConfig:   func() any { return &LinearCreateIssueConfig{} },
+	},
+	{
+		Key:         "linear-add-comment",
+		StructField: "LinearAddComment",
+		ToolName:    "linear_add_comment",
+		NewConfig:   func() any { return &LinearTargetConfig{} },
+	},
+	{
+		Key:         "linear-update-issue",
+		StructField: "LinearUpdateIssue",
+		ToolName:    "linear_update_issue",
+		NewConfig:   func() any { return &LinearUpdateIssueConfig{} },
+	},
+	{
 		Key:         "create-issue",
 		StructField: "CreateIssues",
 		ToolName:    "create_issue",
@@ -30,6 +86,30 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			}
 			return NewPermissionsIssuesWrite()
 		},
+	},
+	{
+		Key:         "jira-create-issue",
+		StructField: "JiraCreateIssue",
+		ToolName:    "jira_create_issue",
+		NewConfig:   func() any { return &JiraSafeOutputConfig{} },
+	},
+	{
+		Key:         "jira-update-issue",
+		StructField: "JiraUpdateIssue",
+		ToolName:    "jira_update_issue",
+		NewConfig:   func() any { return &JiraSafeOutputConfig{} },
+	},
+	{
+		Key:         "jira-add-comment",
+		StructField: "JiraAddComment",
+		ToolName:    "jira_add_comment",
+		NewConfig:   func() any { return &JiraSafeOutputConfig{} },
+	},
+	{
+		Key:         "jira-add-label",
+		StructField: "JiraAddLabel",
+		ToolName:    "jira_add_label",
+		NewConfig:   func() any { return &JiraSafeOutputConfig{} },
 	},
 	{
 		Key:         "create-agent-session",
@@ -117,6 +197,27 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 		},
 	},
 	{
+		Key:         "approve-workflow-run",
+		StructField: "ApproveWorkflowRun",
+		ToolName:    "approve_workflow_run",
+		NewConfig:   func() any { return &ApproveWorkflowRunConfig{} },
+		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
+			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "ApproveWorkflowRun") {
+				return nil
+			}
+			// pull-requests write is only needed when the handler posts a comment on the
+			// pull request associated with the approved run; otherwise read is sufficient.
+			pullRequestsLevel := PermissionRead
+			if safeOutputs.ApproveWorkflowRun != nil && safeOutputs.ApproveWorkflowRun.Comment {
+				pullRequestsLevel = PermissionWrite
+			}
+			return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+				PermissionActions:      PermissionWrite,
+				PermissionPullRequests: pullRequestsLevel,
+			})
+		},
+	},
+	{
 		Key:         "dismiss-pull-request-review",
 		Aliases:     []string{"dismiss-review"},
 		StructField: "DismissPullRequestReview",
@@ -139,17 +240,6 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 				return nil
 			}
 			return buildAddCommentPermissions(safeOutputs.AddComments)
-		},
-	},
-	{
-		Key:         "comment-memory",
-		StructField: "CommentMemory",
-		NewConfig:   func() any { return &CommentMemoryConfig{} },
-		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
-			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CommentMemory") {
-				return nil
-			}
-			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -275,7 +365,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "AddLabels") {
 				return nil
 			}
-			return NewPermissionsIssuesWritePRWrite()
+			return buildAddLabelsPermissions(safeOutputs.AddLabels)
 		},
 	},
 	{
@@ -287,7 +377,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "RemoveLabels") {
 				return nil
 			}
-			return NewPermissionsIssuesWritePRWrite()
+			return buildRemoveLabelsPermissions(safeOutputs.RemoveLabels)
 		},
 	},
 	{
@@ -398,7 +488,10 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "MergePullRequest") {
 				return nil
 			}
-			return NewPermissionsContentsWritePRWrite()
+			permissions := NewPermissionsContentsWritePRWrite()
+			// Branch-policy check requirements are discovered at runtime.
+			permissions.Set(PermissionChecks, PermissionRead)
+			return permissions
 		},
 	},
 	{
@@ -415,12 +508,10 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 				permissions.Merge(NewPermissionsContentsWritePRWrite())
 			} else {
 				permissions.Merge(NewPermissionsContentsWrite())
+				permissions.Set(PermissionPullRequests, PermissionRead)
 			}
 			if safeOutputs.PushToPullRequestBranch.AllowWorkflows {
 				permissions.Set(PermissionWorkflows, PermissionWrite)
-			}
-			if getCheckBranchProtection(safeOutputs.PushToPullRequestBranch) {
-				permissions.Set(PermissionAdministration, PermissionRead)
 			}
 			return permissions
 		},
@@ -435,6 +526,11 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 		Key:         "upload-artifact",
 		StructField: "UploadArtifact",
 		ToolName:    "upload_artifact",
+	},
+	{
+		Key:         "upload-code-coverage",
+		StructField: "UploadCodeCoverage",
+		ToolName:    "upload_code_coverage",
 	},
 	{
 		Key:         "update-release",
@@ -505,10 +601,10 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "HideComment") {
 				return nil
 			}
-			if safeOutputs.HideComment.Discussions != nil && !*safeOutputs.HideComment.Discussions {
-				return NewPermissionsIssuesWrite()
+			if safeOutputs.HideComment.Discussions != nil && *safeOutputs.HideComment.Discussions {
+				return NewPermissionsIssuesWriteDiscussionsWrite()
 			}
-			return NewPermissionsIssuesWriteDiscussionsWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -536,15 +632,17 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 		NewConfig:   func() any { return &CallWorkflowConfig{} },
 	},
 	{
-		Key:         "missing-tool",
+		Key:         "report-missing-tool",
+		Aliases:     []string{"missing-tool"},
 		StructField: "MissingTool",
-		ToolName:    "missing_tool",
+		ToolName:    "report_missing_tool",
 		Builtin:     true,
 	},
 	{
-		Key:         "missing-data",
+		Key:         "report-missing-data",
+		Aliases:     []string{"missing-data"},
 		StructField: "MissingData",
-		ToolName:    "missing_data",
+		ToolName:    "report_missing_data",
 		Builtin:     true,
 	},
 	{
@@ -580,6 +678,17 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 	{
 		Key:         "report-incomplete",
 		StructField: "ReportIncomplete",
+		ToolName:    "report_incomplete",
+		Builtin:     true,
+		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
+			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "ReportIncomplete") || safeOutputs.ReportIncomplete == nil {
+				return nil
+			}
+			if safeOutputs.ReportIncomplete.CreateIssue != nil && strings.EqualFold(strings.TrimSpace(*safeOutputs.ReportIncomplete.CreateIssue), "false") {
+				return nil
+			}
+			return NewPermissionsIssuesWrite()
+		},
 	},
 	{
 		Key:         "threat-detection",
@@ -590,7 +699,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 var safeOutputHandlersByKey = buildSafeOutputHandlersByKey()
 
 func buildSafeOutputHandlersByKey() map[string]safeOutputHandlerDescriptor {
-	result := make(map[string]safeOutputHandlerDescriptor, safeAllocationCapacity(len(safeOutputHandlers), 1))
+	result := make(map[string]safeOutputHandlerDescriptor, typeutil.SafeAllocationCapacity(len(safeOutputHandlers), 1))
 	for _, handler := range safeOutputHandlers {
 		if handler.Key != "" {
 			result[handler.Key] = handler
@@ -658,6 +767,66 @@ func setSafeOutputField(config *SafeOutputsConfig, fieldName string, value any) 
 
 	field.Set(newValue)
 	return true
+}
+
+// getHandlerGitHubApp extracts the GitHubApp from the handler config at the given
+// SafeOutputsConfig field using reflection. It first looks for a direct GitHubApp
+// field, then falls back to the embedded BaseSafeOutputConfig.GitHubApp. Returns
+// nil if the field is absent, the handler is not configured, or no GitHubApp is set.
+func getHandlerGitHubApp(config *SafeOutputsConfig, fieldName string) *GitHubAppConfig {
+	field, ok := safeOutputPointerFieldValue(config, fieldName)
+	if !ok || field.IsNil() {
+		return nil
+	}
+	inner := field.Elem()
+	if !inner.IsValid() || inner.Kind() != reflect.Struct {
+		return nil
+	}
+	// Try direct GitHubApp field (for structs with an explicit GitHubApp field)
+	appField := inner.FieldByName("GitHubApp")
+	if !appField.IsValid() {
+		// Fall back to embedded BaseSafeOutputConfig.GitHubApp
+		baseField := inner.FieldByName("BaseSafeOutputConfig")
+		if !baseField.IsValid() || baseField.Kind() != reflect.Struct {
+			return nil
+		}
+		appField = baseField.FieldByName("GitHubApp")
+	}
+	if !appField.IsValid() || appField.IsNil() {
+		return nil
+	}
+	app, ok := appField.Interface().(*GitHubAppConfig)
+	if !ok || app == nil {
+		return nil
+	}
+	return app
+}
+
+// getHandlerGitHubToken extracts the GitHub token from the handler config at the
+// given SafeOutputsConfig field using reflection. It first looks for a direct
+// GitHubToken field, then falls back to the embedded BaseSafeOutputConfig.GitHubToken.
+// Returns an empty string if no handler token is set.
+func getHandlerGitHubToken(config *SafeOutputsConfig, fieldName string) string {
+	field, ok := safeOutputPointerFieldValue(config, fieldName)
+	if !ok || field.IsNil() {
+		return ""
+	}
+	inner := field.Elem()
+	if !inner.IsValid() || inner.Kind() != reflect.Struct {
+		return ""
+	}
+	tokenField := inner.FieldByName("GitHubToken")
+	if !tokenField.IsValid() {
+		baseField := inner.FieldByName("BaseSafeOutputConfig")
+		if !baseField.IsValid() || baseField.Kind() != reflect.Struct {
+			return ""
+		}
+		tokenField = baseField.FieldByName("GitHubToken")
+	}
+	if !tokenField.IsValid() || tokenField.Kind() != reflect.String {
+		return ""
+	}
+	return tokenField.String()
 }
 
 func mergeSafeOutputFieldIfNil(result, imported *SafeOutputsConfig, fieldName string) {

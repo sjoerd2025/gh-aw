@@ -19,14 +19,77 @@ func TestValidateFrontmatterSkills(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("rejects non-sha refs", func(t *testing.T) {
+	t.Run("accepts local path references", func(t *testing.T) {
 		err := validateFrontmatterSkills(map[string]any{
 			"skills": []any{
-				"githubnext/skills@main",
+				"skills/rig",
+				".github/skills/my-skill",
+				"./skills/my-skill",
+			},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("accepts object form with local path skill", func(t *testing.T) {
+		err := validateFrontmatterSkills(map[string]any{
+			"skills": []any{
+				map[string]any{
+					"skill": "skills/rig",
+				},
+			},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("rejects local path traversal segments", func(t *testing.T) {
+		err := validateFrontmatterSkills(map[string]any{
+			"skills": []any{
+				"skills/../rig",
+				"../skills/rig",
 			},
 		})
 		require.Error(t, err)
-		require.ErrorContains(t, err, "40-char-sha")
+		require.ErrorContains(t, err, "without '..' traversal segments")
+	})
+
+	t.Run("accepts non-sha refs (branch/tag)", func(t *testing.T) {
+		err := validateFrontmatterSkills(map[string]any{
+			"skills": []any{
+				"githubnext/skills@main",
+				"githubnext/skills/review/security@v1.2.3",
+				"githubnext/skills@release/1.0",
+			},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("accepts remote spec with no ref specified", func(t *testing.T) {
+		err := validateFrontmatterSkills(map[string]any{
+			"skills": []any{
+				"githubnext/skills@",
+				"githubnext/skills/review/security@",
+			},
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("rejects invalid remote spec shape", func(t *testing.T) {
+		err := validateFrontmatterSkills(map[string]any{
+			"skills": []any{
+				"owner@main",
+			},
+		})
+		require.Error(t, err)
+		require.ErrorContains(t, err, "owner/repo@<ref>")
+	})
+
+	t.Run("rejects ref with unsafe characters", func(t *testing.T) {
+		err := validateFrontmatterSkills(map[string]any{
+			"skills": []any{
+				"githubnext/skills@main; rm -rf /",
+			},
+		})
+		require.Error(t, err)
 	})
 
 	t.Run("rejects 39-char sha", func(t *testing.T) {
@@ -55,7 +118,7 @@ func TestValidateFrontmatterSkills(t *testing.T) {
 			},
 		})
 		require.Error(t, err)
-		require.ErrorContains(t, err, "40-char-sha")
+		require.ErrorContains(t, err, "does not support expressions")
 	})
 
 	t.Run("accepts empty skills array", func(t *testing.T) {
@@ -183,6 +246,36 @@ func TestValidateFrontmatterSkills(t *testing.T) {
 		require.ErrorContains(t, err, "mutually exclusive")
 	})
 
+}
+
+func TestParseSkillRefSpec(t *testing.T) {
+	const sha = "1f181b37d3fe5862ab590648f25a292e345b5de6"
+	tests := []struct {
+		name                               string
+		spec                               string
+		local, expression, remote, fullSHA bool
+		repoPath, ref                      string
+	}{
+		{name: "local path", spec: "./skills/my-skill", local: true},
+		{name: "bare expression", spec: "${{ github.sha }}", expression: true},
+		{name: "expression in path without @", spec: "skills/${{ inputs.name }}", expression: true},
+		{name: "expression", spec: "githubnext/skills@${{ github.sha }}", expression: true},
+		{name: "malformed remote", spec: "githubnext@main"},
+		{name: "unpinned remote", spec: " githubnext/skills@ ", remote: true, repoPath: "githubnext/skills"},
+		{name: "SHA-pinned remote", spec: "githubnext/skills@" + sha, remote: true, fullSHA: true, repoPath: "githubnext/skills", ref: sha},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed := parseSkillRefSpec(tt.spec)
+			require.Equal(t, tt.local, parsed.isLocal)
+			require.Equal(t, tt.expression, parsed.isExpression)
+			require.Equal(t, tt.remote, parsed.isRemote)
+			require.Equal(t, tt.fullSHA, parsed.isFullSHA)
+			require.Equal(t, tt.repoPath, parsed.repoPath)
+			require.Equal(t, tt.ref, parsed.ref)
+		})
+	}
 }
 
 func TestParseRawSkillReferences_ParsesGitHubApp(t *testing.T) {

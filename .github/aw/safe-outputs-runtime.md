@@ -4,6 +4,8 @@ description: Safe-output reference for runtime defaults, custom jobs, scripts, a
 
 # Safe Outputs: Runtime and Extensibility
 
+See [jobs.md](jobs.md) for the full compiler-generated job graph and which job each credential (`github-token`, `github-app`) configures.
+
 The `report-incomplete` safe-output is enabled by default and is distinct from `noop`. Use it when required tools or data are unavailable and the task cannot be meaningfully performed (e.g., MCP server crash, missing authentication, inaccessible repository). When an agent emits `report_incomplete`, gh-aw activates failure handling even when the agent process exits 0 — preventing empty outputs from being classified as successful, so every unrecoverable failure is tracked.
 
 **Per-handler modifiers** — most handlers accept `max`, `github-token`, `github-app`, and `staged` to override the global equivalents for that one output type. Two extras:
@@ -38,6 +40,15 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
 
   Post-processing GitHub Actions jobs registered as MCP tools. Agents call the tool by its normalized name (dashes → underscores, e.g., `send_notification`). The job runs after the agent completes with access to `$GH_AW_AGENT_OUTPUT` (agent output JSON path). Use to integrate Slack, Discord, external APIs, databases, or any service requiring secrets. Import from shared files via `imports:`.
 
+  Custom implementations should add a generated-by footer and workflow provenance annotations to published content; direct API calls omit them and lose provenance-based tracking. For GitHub issues, run the setup action, initialize `actions/setup/js/index.cjs` with `setupGlobals`, and call `createIssue`. See the [public issue-creation API](https://github.github.com/gh-aw/reference/custom-safe-outputs/#issue-creation-api).
+
+  Never read internal safe-output files (e.g., `/tmp/gh-aw/safeoutputs/output.json`) from `post-steps:`; paths and format are implementation details and the compiler rejects direct reads. Use a built-in handler or move processing into a `safe-outputs.jobs` job that reads `$GH_AW_AGENT_OUTPUT`.
+
+  Additional per-job properties:
+  - `needs:` (string or array) - sequence this job relative to other compiled jobs; valid targets are `agent`, `safe_outputs`, `detection`, `upload_assets`, `unlock`, or another job name (dashes normalized to underscores). Persists across recompiles, unlike hand-patching the lock file.
+  - `artifacts:` (array of strings) - filesystem paths/globs under `/tmp/gh-aw/` that this job's `inputs` reference so the compiler includes them in the unified agent artifact upload (paths the agent wrote at runtime are otherwise dropped). Directory entries must end with `/`; only secret-redaction-covered extensions (`.txt`, `.json`, `.log`, `.md`, `.mdx`, `.yml`, `.jsonl`, `.patch`) are persisted, and `..` or hidden-file segments are rejected at compile time.
+  - `outputs:` (object with optional `status` and `url` string mappings) - map step outputs to execution evidence for conclusion. Status is `success`, `failure`, `cancelled`, or `skipped`; absent status uses the Actions job result. Use `skipped` for previews. `url` is the canonical absolute resource URI returned by the service, recorded only for success. Conclusion includes these fields in `safe_output.result` unified-session events; failed or skipped jobs cannot claim successful creation.
+
 - `scripts:` - Inline JavaScript handlers running inside the safe-outputs job handler loop
 
   ```yaml
@@ -60,6 +71,8 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
 
   Unlike `jobs:` (which create separate GitHub Actions jobs), scripts execute in-process alongside built-in handlers. Write only the handler body — the compiler generates the outer wrapper with config input destructuring and `async function handleX(item, resolvedTemporaryIds) { ... }`. Script names with dashes are normalized to underscores (e.g., `post-slack-message` → `post_slack_message`). The handler receives `item` (runtime message with input values) and `resolvedTemporaryIds` (map of temporary IDs).
 
+  Return `{ success: true, url: canonicalResourceUri }` after the service confirms creation to persist execution status and resource identity in the safe-output manifest and unified session. Do not derive the URI from agent claims. Failures remain `safe_output.error` evidence; staged, skipped, and deferred operations do not become successful resource events.
+
 - `actions:` - Custom GitHub Actions mounted as MCP tools for the AI agent (resolved at compile time)
 
   ```yaml
@@ -73,6 +86,22 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
   ```
 
   Resolved at compile time — the compiler fetches `action.yml`, parses inputs, and exposes them as MCP tool parameters. The agent calls the action by its normalized name (dashes → underscores). Each action runs as an injected step in the safe-outputs job. Local actions (`./path/to/action`) are also supported.
+
+- `claim-adapters:` - Work-queue custom claim delivery adapters, each bound to one independently-verified effect (object)
+
+  ```yaml
+  safe-outputs:
+    claim-adapters:
+      post-review:
+        mode: prepared       # or "script"
+        effect-type: add_comment  # create_issue, update_issue, close_issue, add_comment, add_labels,
+                                   # remove_labels, replace_label, github_rest, git_tree, or github_graphql
+        target-repo: owner/repo   # fixed repository; expressions are rejected
+        field-map:
+          body: review_body
+  ```
+
+  Binds a work-queue worker's Claim output to a trusted, independently verified effect: prepared/script claim handlers never receive write credentials directly, and the safe-outputs handler applies and verifies the effect afterward instead of trusting job success. `effect-type` selects a native builtin (`create_issue` … `replace_label`, restricted to that handler's own fields) or a generic `github_rest`/`git_tree`/`github_graphql` effect, each requiring its matching `request`/`verifier`, `git-tree`, or `graphql` sub-config. `field-map` maps declared effect fields to adapter-supplied source fields; `expected` fixes literal field values instead of mapping them; a field cannot use both. `verifier-id` names the immutable effect-contract verifier (defaults to the normalized adapter name) and must not collide with an enabled native verifier for the same effect. See [work-queue.md](work-queue.md) for the Claim lifecycle this binds into.
 
 **Global Safe Output Configuration:**
 - `github-token:` - Custom GitHub token for all safe output jobs
@@ -91,6 +120,21 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
 - `allowed-domains:` - Allowed domains for URLs in safe output content (array)
   - URLs from unlisted domains are replaced with `(redacted)`
   - GitHub domains are always included by default
+- `data:` - Structured data configuration for body-based safe outputs (boolean, object, or GitHub Actions expression)
+  - Applies to `create-issue`, `add-comment`, `create-pull-request`, `create-pull-request-review-comment`, `submit-pull-request-review`, and `reply-to-pull-request-review-comment`
+  - `false` or omitted (default) - no structured `data` field accepted
+  - `true` - accept any object as the `data` field alongside `body`
+  - Inline schema object - enforce shape; supports full JSON Schema keywords (`type`, `properties`, `required`, `items`, `enum`, etc.) or shorthand (`{ verdict: string, score: number }`)
+  - `${{ ... }}` expression - resolves to one of the above at runtime
+  - Example:
+
+    ```yaml
+    safe-outputs:
+      data:
+        verdict: string
+        score: number
+      add-comment:
+    ```
 - `allowed-github-references:` - Allowed repositories for GitHub-style references (array)
   - Controls which GitHub references (`#123`, `owner/repo#456`) are allowed in workflow output
   - References to unlisted repositories are escaped with backticks to prevent timeline items
@@ -167,6 +211,8 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
 - `footer:` - Global footer control for all safe outputs (boolean, default: `true`)
   - When `false`, omits visible AI-generated footer content from all created/updated entities (issues, PRs, discussions, releases) while still including XML markers for searchability
   - Individual safe-output types can override this setting
+- `body-footer:` - Deterministic template appended to every body-producing safe output, additive with any handler-specific `body-footer:` (string)
+  - Appended even when `footer: false` omits the AI-generated footer
 - `staged:` - Preview mode for all safe outputs (boolean)
   - When `true`, emits step summary messages instead of making GitHub API calls; useful for testing without side effects
 - `env:` - Environment variables passed to all safe output jobs (object)
@@ -183,6 +229,10 @@ The `report-incomplete` safe-output is enabled by default and is distinct from `
       create-issue:
     ```
 
+- `steer:` - **Experimental.** Create a run-scoped issue during activation, before the agent starts, so users can steer the run via comments containing the keyword `steer` (boolean, default: `false`)
+  - Requires top-level `issues: read` permission (compiler errors instead of auto-adding it) and enables the GitHub MCP issues toolset for comment reads
+  - Activation/conclusion jobs need `issues: write` through the global `github-token` or `github-app` safe-output credential; on success the conclusion job closes the issue and links a created PR, on failure it retitles and updates the same issue instead of creating a second one
+  - Cannot be combined with `failure-issue-repo`; no steering issue is created in staged mode
 - `max-bot-mentions:` - Maximum bot trigger references (e.g. `@copilot`, `@github-actions`) allowed in output before all excess are escaped with backticks (integer or expression, default: 10)
   - Set to `0` to escape all bot trigger phrases
   - Example: `max-bot-mentions: 3`
@@ -200,10 +250,11 @@ safe-outputs:
     expires: ${{ inputs.expires-days }}
 ```
 
-Fields that influence permission computation (`add-comment.discussions`, `create-pull-request.fallback-as-issue`) remain literal booleans.
+Fields that influence permission computation (`add-comment.discussions`, `hide-comment.discussions`, `create-pull-request.fallback-as-issue`) remain literal booleans.
 
-- `timeout-minutes:` - Timeout for the safe-outputs job in minutes (integer, default: `45`)
+- `timeout-minutes:` - Timeout for the safe-outputs job in minutes (integer, default: `45`; implicit timeouts are capped at `15` on `ubuntu-slim`)
   - Increase for workflows with many sequential safe-output operations (e.g. `push-to-pull-request-branch` against large repositories)
+  - API-only safe-output jobs can use `ubuntu-slim` and cap an implicit timeout at 15 minutes; jobs that create or push pull requests use `ubuntu-latest` by default because they check out and publish repository code
 - `max-patch-size:` - Maximum allowed git patch size in kilobytes (integer, default: 4096 KB = 4 MB)
   - Patches exceeding this size are rejected to prevent accidental large changes
 - `max-patch-files:` - Maximum allowed number of unique files in a create-pull-request patch (integer, default: 100)
@@ -218,6 +269,8 @@ Fields that influence permission computation (`add-comment.discussions`, `create
 - `failure-issue-repo:` - Repository to create failure tracking issues in (string, format: `"owner/repo"`)
   - Defaults to the current repository when not specified
   - Use when the current repository has issues disabled: `failure-issue-repo: "myorg/infra-alerts"`
+- `report-failed-jobs:` - Controls whether failed non-builtin jobs (custom `jobs:` entries) are reported as issues (boolean, default: `true`)
+  - Set to `false` to disable failure-issue creation for custom job failures while keeping agent-failure reporting
 - `id-token:` - Override the id-token permission for the safe-outputs job (string: `"write"` or `"none"`)
   - `"write"`: force-enable `id-token: write` permission (required for OIDC authentication with cloud providers)
   - `"none"`: suppress automatic detection and prevent adding `id-token: write` even when vault/OIDC actions are detected in steps
@@ -238,6 +291,8 @@ Fields that influence permission computation (`add-comment.discussions`, `create
     - `private-key:` - GitHub App private key (required, e.g., `${{ secrets.APP_PRIVATE_KEY }}`)
     - `owner:` - Optional App installation owner (defaults to current repository owner)
     - `repositories:` - Optional list of repositories to grant access to
+    - `ignore-if-missing:` - When `true`, skip token minting instead of failing when `client-id`/`private-key` resolve empty (boolean, default: `false`)
+    - `permissions:` - Optional map of extra `permission-*` fields to merge into the minted token
   - Example:
 
     ```yaml
@@ -256,9 +311,11 @@ Fields that influence permission computation (`add-comment.discussions`, `create
     - `engine:` - AI engine for threat detection (engine config or `false` to disable AI detection)
     - `steps:` - Extra job steps to run before engine execution (array)
     - `post-steps:` - Extra job steps to run after engine execution (array)
+    - `ca-cert:` - Absolute host path to a CA certificate for the detection job's API proxy. Inherits `sandbox.agent.ca-cert` when unset/empty and the detection engine matches the agent engine; `false` disables inheritance. The certificate file must be created on the detection runner via `steps:` (fresh runner, not shared with the agent job). Requires AWF v0.28.10+.
     - `max-ai-credits:` - Per-run AIC budget for the detection engine (numeric only, no expressions; default `${{ vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS || '400' }}`)
     - `runs-on:` - Runner override for the detection job (defaults to `agent.runs-on`)
     - `continue-on-error:` - When `true` (default), detection failures emit a warning and proceed with a `needs-review` label; when `false`, failures block safe outputs (boolean or expression)
+    - `report-as-issue:` - When `true` (default), detection warnings/failures create or update the `[aw] Detection Runs` tracking issue; set `false` to keep detection and its enforcement active while skipping the tracking issue (results stay visible in Actions run diagnostics) (boolean). While enabled with runnable detection, the `conclusion` job requests `issues: write` (as does its token when `safe-outputs.github-app` is configured, so the App needs **Issues: write**); reusable-workflow callers must grant it through the caller chain. `false` drops only this detection-specific grant; other issue-writing outputs can still require it.
   - Example to disable AI-based detection (use custom steps only):
 
     ```yaml
@@ -281,3 +338,7 @@ The safe-outputs job emits named step outputs for the first successful result of
 | `create-pull-request` | `created_pr_number`, `created_pr_url` |
 | `add-comment` | `comment_id`, `comment_url` |
 | `push-to-pull-request-branch` | `push_commit_sha`, `push_commit_url` |
+
+### Code-Push Failure Handling
+
+If `create-pull-request` or `push-to-pull-request-branch` fails, remaining safe outputs still run; later `add_comment` outputs get a failure note, and the conclusion job reports details. No setting cancels selected outputs on code-push failure. To gate a later built-in output, have the agent pass the code-push call's `output_id` as `depends-on` (see [Shared Rules](safe-outputs.md#shared-rules)). Custom safe jobs reject `depends-on`; gate them with `needs: safe_outputs` and `if: needs.safe_outputs.outputs.code_push_failure_count == '0'`.

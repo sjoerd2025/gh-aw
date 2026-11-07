@@ -37,8 +37,27 @@ var checkoutManagerLog = logger.New("workflow:checkout_manager")
 //	      app-id: ${{ vars.APP_ID }}
 //	      private-key: ${{ secrets.APP_PRIVATE_KEY }}
 type CheckoutConfig struct {
+	// PullRequest controls generation of the compiler-generated PR branch checkout
+	// and its paired agent-config snapshot/restore steps. False disables those steps.
+	PullRequest *bool `json:"-"`
+
+	// PullRequestFloatingHead selects the current API head instead of event/review revision evidence.
+	PullRequestFloatingHead bool `json:"-"`
+
 	// Repository to checkout in owner/repo format. Defaults to the current repository.
 	Repository string `json:"repository,omitempty"`
+
+	// Multi explicitly enables runtime repository-list expansion.
+	Multi bool `json:"multi,omitempty"`
+
+	// AllowedRepos constrains repository-list expansion when Multi is enabled.
+	AllowedRepos []string `json:"allowed-repos,omitempty"`
+
+	// MaxRepos limits the number of unique repositories in a runtime checkout list.
+	MaxRepos *int `json:"max-repos,omitempty"`
+
+	// AllowPrivateRepos opts runtime lists into non-public targets on non-public hosts.
+	AllowPrivateRepos *bool `json:"allow-private-repos,omitempty"`
 
 	// Ref (branch, tag, or SHA) to checkout. Defaults to the ref that triggered the workflow.
 	Ref string `json:"ref,omitempty"`
@@ -117,30 +136,34 @@ type CheckoutConfig struct {
 }
 
 // checkoutKey uniquely identifies a checkout target used for grouping/deduplication.
-// Repository, path, and wiki are used as key fields — ref and token are settings
-// that can be merged across configs targeting the same (repository, path, wiki) tuple.
+// Repository, path, wiki, and multi are key fields — ref and token are settings
+// that can be merged across configs targeting the same target and checkout mode.
 // Wiki is included because a wiki checkout and a regular checkout of the same repository
 // at the same path must remain as separate steps.
 type checkoutKey struct {
 	repository string
 	path       string
 	wiki       bool
+	multi      bool
 }
 
 // resolvedCheckout is an internal merged checkout entry used by CheckoutManager.
 type resolvedCheckout struct {
-	key            checkoutKey
-	ref            string           // last non-empty ref wins
-	token          string           // last non-empty github-token wins
-	githubApp      *GitHubAppConfig // GitHub App config (first non-nil wins)
-	safeOutputApp  *GitHubAppConfig // safe_outputs-only GitHub App config (first non-nil wins)
-	fetchDepth     *int             // nil means use default (1)
-	sparsePatterns []string         // merged sparse-checkout patterns
-	submodules     string
-	lfs            bool
-	current        bool     // true if this checkout is the logical current repository
-	fetchRefs      []string // merged fetch ref patterns (see CheckoutConfig.Fetch)
-	cleanCreds     bool     // true enables persist-credentials + injected cleanup step
+	key               checkoutKey
+	ref               string           // last non-empty ref wins
+	token             string           // last non-empty github-token wins
+	githubApp         *GitHubAppConfig // GitHub App config (first non-nil wins)
+	safeOutputApp     *GitHubAppConfig // safe_outputs-only GitHub App config (first non-nil wins)
+	fetchDepth        *int             // nil means use default (1)
+	sparsePatterns    []string         // merged sparse-checkout patterns
+	submodules        string
+	lfs               bool
+	current           bool     // true if this checkout is the logical current repository
+	fetchRefs         []string // merged fetch ref patterns (see CheckoutConfig.Fetch)
+	cleanCreds        bool     // true enables persist-credentials + injected cleanup step
+	allowedRepos      []string // first-seen runtime repository allowlist
+	maxRepos          int      // smallest effective runtime repository limit
+	allowPrivateRepos bool     // every merged entry must explicitly opt in
 	// wiki is intentionally not stored here; use entry.key.wiki instead.
 }
 
@@ -191,6 +214,27 @@ type CheckoutManager struct {
 	// http.extraheader injection is required. Empty means "fall back to the
 	// actions/checkout default token".
 	pushToken string
+	// defaultPushToken, when set, overrides pushToken for the default workspace checkout only.
+	defaultPushToken string
+	// dynamicPushToken may reference same-job app-token outputs. Runtime checkouts
+	// retain it directly instead of relying on the static git-credential setup step.
+	dynamicPushToken string
+	// defaultRefOverride forces the workspace-root checkout to a compiler-generated
+	// ref, such as a branch allocated before agent execution.
+	defaultRefOverride string
+	// skipDefaultCheckout records that the caller does not emit the default
+	// workspace-root checkout step (e.g. permissions.contents: none, checkout: false).
+	// App-token minting steps for the default checkout entry are then suppressed as
+	// well, since no generated step references the minted token.
+	skipDefaultCheckout bool
+}
+
+// SetSkipDefaultCheckout records whether the caller emits the default workspace
+// checkout step. When skip is true, GitHub App token minting steps for the default
+// checkout entry are omitted because no step references those tokens.
+func (cm *CheckoutManager) SetSkipDefaultCheckout(skip bool) {
+	checkoutManagerLog.Printf("Setting skipDefaultCheckout: %t", skip)
+	cm.skipDefaultCheckout = skip
 }
 
 // NewCheckoutManager creates a new CheckoutManager pre-loaded with user-supplied
@@ -259,6 +303,20 @@ func (cm *CheckoutManager) SetPushToken(token string) {
 	cm.pushToken = token
 }
 
+// SetDefaultPushToken overrides the persisted credential of the default workspace
+// checkout without changing the credential of additional checkouts.
+func (cm *CheckoutManager) SetDefaultPushToken(token string) {
+	checkoutManagerLog.Printf("Setting defaultPushToken: present=%t", token != "")
+	cm.defaultPushToken = token
+}
+
+// SetDynamicPushToken overrides the fallback push credential for runtime checkouts
+// without changing the static checkout token or entries with their own auth.
+func (cm *CheckoutManager) SetDynamicPushToken(token string) {
+	checkoutManagerLog.Printf("Setting dynamicPushToken: present=%t", token != "")
+	cm.dynamicPushToken = token
+}
+
 // add processes a single CheckoutConfig and either creates a new entry or merges
 // it into an existing entry with the same key.
 func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
@@ -281,13 +339,21 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 		repository: normalizedRepo,
 		path:       normalizedPath,
 		wiki:       cfg.Wiki,
+		multi:      cfg.Multi,
 	}
+	maxRepos := defaultCheckoutMaxRepos
+	if cfg.MaxRepos != nil {
+		maxRepos = *cfg.MaxRepos
+	}
+	allowPrivateRepos := cfg.AllowPrivateRepos != nil && *cfg.AllowPrivateRepos
 
 	if idx, exists := cm.index[key]; exists {
 		// Merge into existing entry; first-seen wins for ref and token/app (auth is mutually exclusive:
 		// once either github-token or github-app is set for an entry, the other method is not added
 		// even if a later config provides it — this preserves the main workflow's auth choice).
 		entry := cm.ordered[idx]
+		entry.maxRepos = min(entry.maxRepos, maxRepos)
+		entry.allowPrivateRepos = entry.allowPrivateRepos && allowPrivateRepos
 		entry.fetchDepth = deeperFetchDepth(entry.fetchDepth, cfg.FetchDepth)
 		if cfg.Ref != "" && entry.ref == "" {
 			entry.ref = cfg.Ref // first-seen ref wins
@@ -322,16 +388,19 @@ func (cm *CheckoutManager) add(cfg *CheckoutConfig) {
 		checkoutManagerLog.Printf("Merged checkout for path=%q repository=%q", key.path, key.repository)
 	} else {
 		entry := &resolvedCheckout{
-			key:           key,
-			ref:           cfg.Ref,
-			token:         cfg.GitHubToken,
-			githubApp:     cfg.GitHubApp,
-			safeOutputApp: cfg.SafeOutputGitHubApp,
-			fetchDepth:    cfg.FetchDepth,
-			submodules:    cfg.Submodules,
-			lfs:           cfg.LFS,
-			current:       cfg.Current,
-			cleanCreds:    cfg.CleanGitCredentials,
+			key:               key,
+			ref:               cfg.Ref,
+			token:             cfg.GitHubToken,
+			githubApp:         cfg.GitHubApp,
+			safeOutputApp:     cfg.SafeOutputGitHubApp,
+			fetchDepth:        cfg.FetchDepth,
+			submodules:        cfg.Submodules,
+			lfs:               cfg.LFS,
+			current:           cfg.Current,
+			cleanCreds:        cfg.CleanGitCredentials,
+			allowedRepos:      cfg.AllowedRepos,
+			maxRepos:          maxRepos,
+			allowPrivateRepos: allowPrivateRepos,
 		}
 		if cfg.SparseCheckout != "" {
 			entry.sparsePatterns = mergeSparsePatterns(nil, cfg.SparseCheckout)
@@ -430,9 +499,25 @@ func (cm *CheckoutManager) ResolveSafeOutputCheckoutTokenExpression(targetRepo s
 	token := fmt.Sprintf("${{ steps.checkout-safe-output-app-token-%d.outputs.token }}", idx)
 	app := cm.ordered[idx].safeOutputApp
 	if app != nil && app.shouldIgnoreMissingKey() {
-		token = combineTokenExpressions(token, getEffectiveSafeOutputGitHubToken(""))
+		token = combineTokenExpressions(token, resolveSafeOutputGitHubToken(""))
 	}
 	return token, true
+}
+
+// resolveCheckoutAppTokenPermissions returns the permissions used when minting
+// checkout GitHub App tokens. Explicit target checkouts still need repository contents
+// access, even when permissions.contents is set to none to suppress the default
+// workflow-repository checkout, so contents is raised to read for token minting only.
+func resolveCheckoutAppTokenPermissions(data *WorkflowData) *Permissions {
+	perms := resolveCheckoutPermissions(data)
+	if level, exists := perms.Get(PermissionContents); exists && level != PermissionNone {
+		return perms
+	}
+
+	adjusted := NewPermissions()
+	adjusted.Merge(perms)
+	adjusted.Set(PermissionContents, PermissionRead)
+	return adjusted
 }
 
 // resolveCheckoutPermissions determines the permissions used when minting checkout
@@ -451,11 +536,15 @@ func resolveCheckoutPermissions(data *WorkflowData) *Permissions {
 }
 
 // GetCurrentRepository returns the repository slug for the checkout marked
-// current:true. Returns an empty string when no current checkout is configured
-// or when the current checkout targets the workflow repository.
+// current:true, including the .wiki suffix for wiki checkouts. Returns an empty
+// string when no current checkout is configured or when a non-wiki current
+// checkout targets the workflow repository.
 func (cm *CheckoutManager) GetCurrentRepository() string {
 	for _, entry := range cm.ordered {
 		if entry.current {
+			if entry.key.wiki {
+				return wikiRepository(entry.key.repository)
+			}
 			return entry.key.repository
 		}
 	}

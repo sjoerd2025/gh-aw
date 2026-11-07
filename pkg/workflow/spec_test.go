@@ -60,25 +60,6 @@ func TestSpec_Permissions_ContentsReadDiscussionsWrite(t *testing.T) {
 	assert.Equal(t, workflow.PermissionWrite, discussionsLevel, "discussions must be write")
 }
 
-// TestSpec_Permissions_ContentsReadIssuesWriteDiscussionsWrite validates the documented combination.
-// Spec: "NewPermissionsContentsReadIssuesWriteDiscussionsWrite — contents:read + issues:write + discussions:write"
-func TestSpec_Permissions_ContentsReadIssuesWriteDiscussionsWrite(t *testing.T) {
-	p := workflow.NewPermissionsContentsReadIssuesWriteDiscussionsWrite()
-	require.NotNil(t, p, "NewPermissionsContentsReadIssuesWriteDiscussionsWrite must return a non-nil Permissions")
-
-	contentsLevel, ok := p.Get(workflow.PermissionContents)
-	assert.True(t, ok, "contents scope must be present")
-	assert.Equal(t, workflow.PermissionRead, contentsLevel, "contents must be read")
-
-	issuesLevel, ok := p.Get(workflow.PermissionIssues)
-	assert.True(t, ok, "issues scope must be present")
-	assert.Equal(t, workflow.PermissionWrite, issuesLevel, "issues must be write")
-
-	discussionsLevel, ok := p.Get(workflow.PermissionDiscussions)
-	assert.True(t, ok, "discussions scope must be present")
-	assert.Equal(t, workflow.PermissionWrite, discussionsLevel, "discussions must be write")
-}
-
 // TestSpec_Permissions_ContentsReadPRWrite validates the documented permission combination.
 // Spec: "NewPermissionsContentsReadPRWrite — contents:read + pull-requests:write"
 func TestSpec_Permissions_ContentsReadPRWrite(t *testing.T) {
@@ -107,23 +88,6 @@ func TestSpec_Permissions_ContentsReadSecurityEventsWrite(t *testing.T) {
 	secLevel, ok := p.Get(workflow.PermissionSecurityEvents)
 	assert.True(t, ok, "security-events scope must be present")
 	assert.Equal(t, workflow.PermissionWrite, secLevel, "security-events must be write")
-}
-
-// TestSpec_Permissions_ContentsReadProjectsWrite validates the documented permission combination.
-// Spec: "NewPermissionsContentsReadProjectsWrite — contents:read + projects:write"
-// Note: organization-projects is a GitHub App-only scope per the spec.
-func TestSpec_Permissions_ContentsReadProjectsWrite(t *testing.T) {
-	p := workflow.NewPermissionsContentsReadProjectsWrite()
-	require.NotNil(t, p, "NewPermissionsContentsReadProjectsWrite must return a non-nil Permissions")
-
-	contentsLevel, ok := p.Get(workflow.PermissionContents)
-	assert.True(t, ok, "contents scope must be present")
-	assert.Equal(t, workflow.PermissionRead, contentsLevel, "contents must be read")
-
-	// Spec: the permissions factory uses "organization-projects" for GitHub App tokens
-	projLevel, ok := p.GetExplicit(workflow.PermissionOrganizationProj)
-	assert.True(t, ok, "organization-projects scope must be explicitly set")
-	assert.Equal(t, workflow.PermissionWrite, projLevel, "organization-projects must be write")
 }
 
 // TestSpec_SafeOutputs_SafeOutputsConfigFromKeys validates that SafeOutputsConfigFromKeys
@@ -266,15 +230,15 @@ func TestSpec_Engine_RegistryLookupAndIdentity(t *testing.T) {
 
 // TestSpec_Engine_DocumentedEnginesRegistered validates that every AI engine documented
 // in the workflow package README.md is registered and reports the documented identity.
-// Spec: the engine architecture lists copilot, claude, codex, gemini, opencode,
-// pi, and antigravity engines, each created by a New<Name>Engine constructor.
+// Spec: the engine architecture lists copilot, claude, codex, gemini,
+// and pi engines, each created by a New<Name>Engine constructor.
 func TestSpec_Engine_DocumentedEnginesRegistered(t *testing.T) {
 	registry := workflow.GetGlobalEngineRegistry()
 	require.NotNil(t, registry, "GetGlobalEngineRegistry() must return a non-nil registry")
 
 	documentedEngines := []string{
 		"copilot", "claude", "codex", "gemini",
-		"opencode", "pi", "antigravity",
+		"pi",
 	}
 
 	for _, id := range documentedEngines {
@@ -334,4 +298,58 @@ func TestSpec_ActionPinning_ActionMode(t *testing.T) {
 	mode := workflow.DetectActionMode("ignored-version")
 	assert.Equal(t, workflow.ActionModeRelease, mode,
 		"DetectActionMode must honor the GH_AW_ACTION_MODE override regardless of the version arg")
+}
+
+// TestSpec_Constants_LockSchemaVersions validates the documented lock schema
+// version values and supported-version set.
+func TestSpec_Constants_LockSchemaVersions(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  workflow.LockSchemaVersion
+		expected string
+	}{
+		{name: "legacy v1", version: workflow.LockSchemaV1, expected: "v1"},
+		{name: "strict-field v2", version: workflow.LockSchemaV2, expected: "v2"},
+		{name: "agent-metadata v3", version: workflow.LockSchemaV3, expected: "v3"},
+		{name: "current v4", version: workflow.LockSchemaV4, expected: "v4"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, string(tt.version),
+				"lock schema version must match the documented value")
+			assert.True(t, workflow.IsSchemaVersionSupported(tt.version),
+				"documented lock schema version %q must be supported", tt.version)
+		})
+	}
+}
+
+// TestSpec_Constants_TimeDeltaLimits validates the documented one-year bounds
+// for relative time delta units.
+func TestSpec_Constants_TimeDeltaLimits(t *testing.T) {
+	tests := []struct {
+		name     string
+		actual   int
+		expected int
+	}{
+		{name: "months", actual: workflow.MaxTimeDeltaMonths, expected: 12},
+		{name: "weeks", actual: workflow.MaxTimeDeltaWeeks, expected: 52},
+		{name: "days", actual: workflow.MaxTimeDeltaDays, expected: 365},
+		{name: "hours", actual: workflow.MaxTimeDeltaHours, expected: 8760},
+		{name: "minutes", actual: workflow.MaxTimeDeltaMinutes, expected: 525600},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.actual,
+				"%s time delta limit must match the documented value", tt.name)
+		})
+	}
+}
+
+// TestSpec_Environment_EmptyOverride validates the documented contract that an
+// empty environment override is allowed and means no override.
+func TestSpec_Environment_EmptyOverride(t *testing.T) {
+	assert.NoError(t, workflow.ValidateEnvironmentOverride(""),
+		"an empty environment override must be accepted as documented")
 }

@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -28,21 +27,27 @@ const workflowCompletionWaitTimeoutMinutes = 6 * 60
 // betweenWorkflowsDelay paces sequential workflow triggers to avoid overwhelming the GitHub API.
 const betweenWorkflowsDelay = 1 * time.Second
 
+// WorkflowRunFlags contains flags shared by interactive and non-interactive workflow runs.
+type WorkflowRunFlags struct {
+	Verbose        bool   // Enable verbose output
+	EngineOverride string // Override AI engine
+	RepoOverride   string // Target repository (owner/repo format)
+	RefOverride    string // Branch or tag name
+	AutoMergePRs   bool   // Auto-merge PRs created during execution
+	Push           bool   // Commit and push workflow files before running
+	DryRun         bool   // Validate without actually triggering
+	Approve        bool   // Approve safe update changes during compilation
+}
+
 // RunOptions contains all configuration options for running workflows
 type RunOptions struct {
+	WorkflowRunFlags
 	Enable            bool     // Enable the workflow if it's disabled
-	EngineOverride    string   // Override AI engine
-	RepoOverride      string   // Target repository (owner/repo format)
-	RefOverride       string   // Branch or tag name
-	AutoMergePRs      bool     // Auto-merge PRs created during execution
-	Push              bool     // Commit and push workflow files before running
 	WaitForCompletion bool     // Wait for workflow completion
 	RepeatCount       int      // Number of times to repeat (0 = run once)
 	Inputs            []string // Workflow inputs in key=value format
-	Verbose           bool     // Enable verbose output
-	DryRun            bool     // Validate without actually triggering
 	JSON              bool     // Output results in JSON format
-	Approve           bool     // Approve safe update changes during compilation
+	ExpectedRevision  string   // Require the returned native run to match this verified SHA without latest-run fallback.
 }
 
 // WorkflowRunResult contains the result of a single workflow run trigger for JSON output
@@ -85,7 +90,7 @@ func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunO
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Running workflow on GitHub Actions: "+workflowIdOrName))
 	}
 	if !isGHCLIAvailable() {
-		return errors.New("GitHub CLI (gh) is required but not available")
+		return errors.New("GitHub CLI (gh) is not available. Expected gh to be installed and on PATH before running workflows. Example: brew install gh")
 	}
 	prep, err := prepareWorkflowRun(ctx, workflowIdOrName, opts)
 	if err != nil {
@@ -113,7 +118,7 @@ func checkWorkflowRunContext(ctx context.Context, workflowIdOrName string) error
 	default:
 	}
 	if workflowIdOrName == "" {
-		return errors.New("workflow name or ID is required")
+		return errors.New("workflow name or ID is missing. Expected a workflow file name or numeric workflow ID. Example: gh aw run ci")
 	}
 	return nil
 }
@@ -121,10 +126,11 @@ func checkWorkflowRunContext(ctx context.Context, workflowIdOrName string) error
 func validateRunInputs(inputs []string) error {
 	for _, input := range inputs {
 		if !strings.Contains(input, "=") {
-			return fmt.Errorf("invalid input format '%s': expected key=value", input)
+			return fmt.Errorf("input '%s' is not in key=value format. Expected each --input value as key=value. Example: --input environment=staging", input)
 		}
-		if parts := strings.SplitN(input, "=", 2); parts[0] == "" {
-			return fmt.Errorf("invalid input format '%s': key cannot be empty", input)
+		key, _, _ := strings.Cut(input, "=")
+		if key == "" {
+			return fmt.Errorf("input '%s' has an empty key before '='. Expected a non-empty key in key=value format. Example: --input environment=staging", input)
 		}
 	}
 	return nil
@@ -134,7 +140,7 @@ func prepareWorkflowRun(ctx context.Context, workflowIdOrName string, opts RunOp
 	if err := validateWorkflowForRun(workflowIdOrName, opts); err != nil {
 		return nil, err
 	}
-	enableState, err := handleWorkflowEnablement(workflowIdOrName, opts)
+	enableState, err := handleWorkflowEnablement(ctx, workflowIdOrName, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +192,7 @@ func ensureWorkflowRunnable(workflowFile, workflowIdOrName string) error {
 		return fmt.Errorf("failed to check if workflow %s is runnable: %w", workflowFile, err)
 	}
 	if !runnable {
-		return fmt.Errorf("workflow '%s' cannot be run on GitHub Actions - it must have 'workflow_dispatch' trigger", workflowIdOrName)
+		return fmt.Errorf("workflow '%s' does not declare a workflow_dispatch trigger, so it cannot be run manually on GitHub Actions. Expected an `on: workflow_dispatch` trigger in the source workflow frontmatter, then recompile. Example:\non:\n  workflow_dispatch:\n\nRun: gh aw compile", workflowIdOrName)
 	}
 	executionLog.Printf("Workflow is runnable: %s", workflowFile)
 	return nil
@@ -215,11 +221,11 @@ func warnLocalWorkflowStatus(workflowFile string) {
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Consider pushing your changes before running the workflow"))
 }
 
-func handleWorkflowEnablement(workflowIdOrName string, opts RunOptions) (workflowEnableState, error) {
+func handleWorkflowEnablement(ctx context.Context, workflowIdOrName string, opts RunOptions) (workflowEnableState, error) {
 	if !opts.Enable {
 		return workflowEnableState{}, nil
 	}
-	wf, err := getWorkflowStatus(workflowIdOrName, opts.RepoOverride, opts.Verbose)
+	wf, err := getWorkflowStatus(ctx, workflowIdOrName, opts.RepoOverride, opts.Verbose)
 	if err != nil {
 		if opts.Verbose {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Could not check workflow status: %v", err)))
@@ -302,7 +308,6 @@ func maybeRecompileWorkflowOverride(ctx context.Context, lockFilePath string, op
 		Validate:             true,
 		Watch:                false,
 		WorkflowDir:          "",
-		SkipInstructions:     false,
 		NoEmit:               false,
 		Purge:                false,
 		TrialMode:            false,
@@ -393,7 +398,7 @@ func handleWorkflowDryRun(lockFileName string, args []string, opts RunOptions) e
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Dry run mode - command that would be executed:"))
 		fmt.Fprintln(os.Stderr, console.FormatCommandMessage("gh "+strings.Join(args, " ")))
 	}
-	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("✓ Validation passed for workflow: %s (dry run - not executed)", lockFileName)))
+	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Validation passed for workflow: %s (dry run - not executed)", lockFileName)))
 	return nil
 }
 
@@ -409,9 +414,17 @@ func executeWorkflowRun(ctx context.Context, lockFileName string, args []string,
 	if output != "" {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(output))
 	}
-	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Successfully triggered workflow: "+lockFileName))
+	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Triggered workflow: "+lockFileName))
 	executionLog.Printf("Workflow triggered successfully: %s", lockFileName)
 	runInfo, runErr := resolveWorkflowRunInfo(lockFileName, output, opts)
+	if opts.ExpectedRevision != "" {
+		if runErr != nil {
+			return nil, fmt.Errorf("workflow activation was accepted but its run identity is unresolved; do not redispatch: %w", runErr)
+		}
+		if err := verifyExpectedWorkflowRun(ctx, lockFileName, runInfo, opts); err != nil {
+			return nil, fmt.Errorf("workflow activation was accepted but run verification failed; do not redispatch: %w", err)
+		}
+	}
 	return &workflowRunExecutionResult{
 		runInfo:    runInfo,
 		runInfoErr: runErr,
@@ -430,6 +443,13 @@ func formatWorkflowRunError(err error) error {
 		fmt.Fprint(os.Stderr, getCodespacePermissionErrorMessage())
 		return errors.New("failed to run workflow on GitHub Actions: permission denied (403)")
 	}
+	lowerErrorMsg := strings.ToLower(errorMsg)
+	if strings.Contains(lowerErrorMsg, "not found on the default branch") {
+		return fmt.Errorf("failed to run workflow on GitHub Actions: %w\n%s", err, workflowDispatchRegistrationHint)
+	}
+	if strings.Contains(lowerErrorMsg, "does not have 'workflow_dispatch' trigger") {
+		return fmt.Errorf("failed to run workflow on GitHub Actions: %w\nThe workflow at the selected ref must declare on.workflow_dispatch. Add the trigger, recompile, and push the source and .lock.yml to that ref. Manual dispatch does not reproduce a pull_request_target event. See https://github.github.com/gh-aw/setup/cli/#run-from-a-feature-branch", err)
+	}
 	return fmt.Errorf("failed to run workflow on GitHub Actions: %w", err)
 }
 
@@ -438,14 +458,17 @@ func resolveWorkflowRunInfo(lockFileName, output string, opts RunOptions) (*Work
 		executionLog.Printf("Parsed run info from gh output: id=%d, url=%s", parsedRunInfo.DatabaseID, parsedRunInfo.URL)
 		return parsedRunInfo, nil
 	}
+	if opts.ExpectedRevision != "" {
+		return nil, errors.New("GitHub CLI did not return the activated run URL; refusing to select the latest workflow run")
+	}
 	return getLatestWorkflowRunWithRetry(lockFileName, opts.RepoOverride, opts.Verbose)
 }
 
 func handleWorkflowRunInfo(runInfo *WorkflowRunInfo, runErr error, opts RunOptions) {
 	if runErr == nil && runInfo != nil && runInfo.URL != "" {
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("🔗 View workflow run: "+runInfo.URL))
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("View workflow run: "+runInfo.URL))
 		executionLog.Printf("Workflow run URL: %s (ID: %d)", runInfo.URL, runInfo.DatabaseID)
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("💡 To analyze this run, use: %s audit %d", string(constants.CLIExtensionPrefix), runInfo.DatabaseID)))
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Analyze this run: %s audit %d", string(constants.CLIExtensionPrefix), runInfo.DatabaseID)))
 		return
 	}
 	if opts.Verbose && runErr != nil {
@@ -458,8 +481,14 @@ func waitForWorkflowRunCompletion(ctx context.Context, opts RunOptions, runInfo 
 		return nil
 	}
 	if runErr != nil {
+		if opts.ExpectedRevision != "" {
+			return runErr
+		}
 		printWorkflowRunInfoWarning(opts, runErr)
 		return nil
+	}
+	if opts.ExpectedRevision != "" && (opts.RepoOverride == "" || runInfo == nil || runInfo.DatabaseID <= 0) {
+		return errors.New("cannot wait without an exact verified dispatcher run identity and repository")
 	}
 	targetRepo := resolveWorkflowTargetRepo(opts)
 	if targetRepo == "" || runInfo == nil {
@@ -468,6 +497,9 @@ func waitForWorkflowRunCompletion(ctx context.Context, opts RunOptions, runInfo 
 	printWorkflowWaitMessage(opts.AutoMergePRs)
 	runIDStr := strconv.FormatInt(runInfo.DatabaseID, 10)
 	if err := WaitForWorkflowCompletion(ctx, targetRepo, runIDStr, workflowCompletionWaitTimeoutMinutes, opts.Verbose); err != nil {
+		if opts.ExpectedRevision != "" {
+			return fmt.Errorf("dispatcher wait failed; inspect the accepted activation before redispatching: %w", err)
+		}
 		if ctx.Err() != nil || errors.Is(err, ErrInterrupted) {
 			return err
 		}
@@ -505,7 +537,7 @@ func resolveWorkflowTargetRepo(opts RunOptions) string {
 }
 
 func printWorkflowWaitMessage(autoMerge bool) {
-	message := "Waiting for workflow completion..."
+	message := "Waiting for workflow to complete..."
 	if autoMerge {
 		message = "Auto-merge PRs enabled - waiting for workflow completion..."
 	}
@@ -546,7 +578,7 @@ func validateWorkflowsForRun(workflowNames []string, opts RunOptions) error {
 				return fmt.Errorf("failed to check if workflow '%s' is runnable: %w", workflowName, err)
 			}
 			if !runnable {
-				return fmt.Errorf("workflow '%s' cannot be run on GitHub Actions - it must have 'workflow_dispatch' trigger", workflowName)
+				return fmt.Errorf("workflow '%s' does not declare a workflow_dispatch trigger, so it cannot be run manually on GitHub Actions. Expected an `on: workflow_dispatch` trigger in the source workflow frontmatter, then recompile. Example:\non:\n  workflow_dispatch:\n\nRun: gh aw compile", workflowName)
 			}
 		}
 	}
@@ -607,9 +639,9 @@ func wrapRunWithJSONOutput(inner func() error, workflowNames []string, opts RunO
 				results[i].Error = runErr.Error()
 			}
 		}
-		jsonBytes, err := json.MarshalIndent(results, "", "  ")
+		jsonBytes, err := marshalIndentJSONOrWrap(results, "workflow run results")
 		if err != nil {
-			return fmt.Errorf("failed to marshal JSON: %w", err)
+			return err
 		}
 		fmt.Fprintln(os.Stdout, string(jsonBytes))
 		return runErr
@@ -619,7 +651,7 @@ func wrapRunWithJSONOutput(inner func() error, workflowNames []string, opts RunO
 // RunWorkflowsOnGitHub runs multiple agentic workflows on GitHub Actions, optionally repeating a specified number of times
 func RunWorkflowsOnGitHub(ctx context.Context, workflowNames []string, opts RunOptions) error {
 	if len(workflowNames) == 0 {
-		return errors.New("at least one workflow name or ID is required")
+		return errors.New("workflow list is empty. Expected at least one workflow file name or numeric workflow ID. Example: gh aw run ci")
 	}
 	select {
 	case <-ctx.Done():
@@ -658,12 +690,12 @@ func parseRunInfoFromOutput(output string) *WorkflowRunInfo {
 	if len(matches) < 2 {
 		return nil
 	}
-	runID, err := strconv.ParseInt(matches[1], 10, 64)
+	runID, err := strconv.ParseInt(matches[1], 10, 64) //nolint:uncheckedsliceindex // len(matches) is checked above.
 	if err != nil {
 		return nil
 	}
 	return &WorkflowRunInfo{
-		URL:        matches[0],
+		URL:        matches[0], //nolint:uncheckedsliceindex // len(matches) is checked above.
 		DatabaseID: runID,
 	}
 }

@@ -13,6 +13,7 @@ import (
 
 // TestExtractMissingToolsFromRun tests extracting missing tools from safe output artifact files
 func TestExtractMissingToolsFromRun(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory structure
 	tmpDir := testutil.TempDir(t, "test-*")
 
@@ -29,6 +30,13 @@ func TestExtractMissingToolsFromRun(t *testing.T) {
 		expectReason       string
 		expectAlternatives string
 	}{
+		{
+			name:              "canonical_report_missing_tool",
+			safeOutputContent: `{"items":[{"type":"report_missing_tool","tool":"terraform","reason":"Infrastructure automation needed","alternatives":"Manual setup"}],"errors":[]}`,
+			expected:          1,
+			expectTool:        "terraform",
+			expectReason:      "Infrastructure automation needed",
+		},
 		{
 			name: "single_missing_tool_in_safe_output",
 			safeOutputContent: `{
@@ -115,7 +123,7 @@ func TestExtractMissingToolsFromRun(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create the safe output artifact file
-			safeOutputFile := filepath.Join(tmpDir, constants.AgentOutputArtifactName)
+			safeOutputFile := filepath.Join(tmpDir, constants.AgentOutputArtifactName.String())
 			err := os.WriteFile(safeOutputFile, []byte(tt.safeOutputContent), 0o644)
 			if err != nil {
 				t.Fatalf("Failed to create test safe output file: %v", err)
@@ -163,6 +171,7 @@ func TestExtractMissingToolsFromRun(t *testing.T) {
 }
 
 func TestExtractMissingToolsFromRun_IncludesExperimentProvenance(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-*")
 
 	testRun := WorkflowRun{
@@ -197,7 +206,7 @@ func TestExtractMissingToolsFromRun_IncludesExperimentProvenance(t *testing.T) {
 		],
 		"errors": []
 	}`
-	if err := os.WriteFile(filepath.Join(tmpDir, constants.AgentOutputArtifactName), []byte(safeOutput), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmpDir, constants.AgentOutputArtifactName.String()), []byte(safeOutput), 0o644); err != nil {
 		t.Fatalf("Failed to create safe output file: %v", err)
 	}
 

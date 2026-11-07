@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { fileURLToPath } from "url";
+import path from "path";
 
 // Mock the global objects that GitHub Actions provides
 const mockCore = {
@@ -35,6 +37,8 @@ describe("generate_footer.cjs", () => {
   let generateXMLMarker;
   let generateWorkflowIdMarker;
   let generateWorkflowCallIdMarker;
+  let generateWorkflowCallIdReviewMarker;
+  let matchesWorkflowCallIdReviewMarker;
   let getWorkflowIdMarkerContent;
   let normalizeCloseOlderKey;
 
@@ -56,8 +60,35 @@ describe("generate_footer.cjs", () => {
     generateXMLMarker = module.generateXMLMarker;
     generateWorkflowIdMarker = module.generateWorkflowIdMarker;
     generateWorkflowCallIdMarker = module.generateWorkflowCallIdMarker;
+    generateWorkflowCallIdReviewMarker = module.generateWorkflowCallIdReviewMarker;
+    matchesWorkflowCallIdReviewMarker = module.matchesWorkflowCallIdReviewMarker;
     getWorkflowIdMarkerContent = module.getWorkflowIdMarkerContent;
     normalizeCloseOlderKey = module.normalizeCloseOlderKey;
+  });
+
+  describe("review provenance", () => {
+    it("encodes caller IDs and matches only exact standalone lines", () => {
+      const caller = 'owner/repo/Workflow "A"';
+      const marker = generateWorkflowCallIdReviewMarker(caller);
+      expect(marker).toBe('[gh-aw-workflow-call-id]: # "owner%2Frepo%2FWorkflow%20%22A%22"');
+      expect(matchesWorkflowCallIdReviewMarker(`Review\r\n${marker}`, caller)).toBe(true);
+      expect(matchesWorkflowCallIdReviewMarker(`Quoted ${marker}`, caller)).toBe(false);
+      expect(matchesWorkflowCallIdReviewMarker(marker + "more", caller)).toBe(false);
+      expect(matchesWorkflowCallIdReviewMarker(marker, "owner/repo/Other")).toBe(false);
+      expect(matchesWorkflowCallIdReviewMarker('[gh-aw-workflow-call-id]: # "%ZZ"', caller)).toBe(false);
+      expect(matchesWorkflowCallIdReviewMarker(generateWorkflowCallIdMarker(caller), caller)).toBe(true);
+    });
+
+    it("trusts only the last provenance marker", () => {
+      const callerA = "owner/repo/CallerA";
+      const callerB = "owner/repo/CallerB";
+      const forgedCallerAMarker = generateWorkflowCallIdReviewMarker(callerA);
+      const authoritativeCallerBMarker = generateWorkflowCallIdReviewMarker(callerB);
+      const body = `${forgedCallerAMarker}\nReview text\n${authoritativeCallerBMarker}`;
+
+      expect(matchesWorkflowCallIdReviewMarker(body, callerA)).toBe(false);
+      expect(matchesWorkflowCallIdReviewMarker(body, callerB)).toBe(true);
+    });
   });
 
   describe("generateXMLMarker", () => {
@@ -337,13 +368,27 @@ describe("generate_footer.cjs", () => {
   describe("generateExpiredEntityFooter", () => {
     let generateExpiredEntityFooter;
     let getExpiredEntityCautionAlert;
+    let originalPromptsDir;
 
     beforeEach(async () => {
+      // Point GH_AW_PROMPTS_DIR to the source md/ directory so getPromptPath()
+      // resolves to the local templates. This is needed because RUNNER_TEMP may be
+      // set but the runtime prompts directory is not populated in the test environment.
+      originalPromptsDir = process.env.GH_AW_PROMPTS_DIR;
+      process.env.GH_AW_PROMPTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "../md");
       // Reset modules and import fresh
       vi.resetModules();
       const freshModule = await import("./generate_footer.cjs");
       generateExpiredEntityFooter = freshModule.generateExpiredEntityFooter;
       getExpiredEntityCautionAlert = freshModule.getExpiredEntityCautionAlert;
+    });
+
+    afterEach(() => {
+      if (originalPromptsDir !== undefined) {
+        process.env.GH_AW_PROMPTS_DIR = originalPromptsDir;
+      } else {
+        delete process.env.GH_AW_PROMPTS_DIR;
+      }
     });
 
     it("should generate footer with 'Closed by' wording and workflow link", () => {
@@ -486,11 +531,24 @@ describe("generate_footer.cjs", () => {
         const result = getExpiredEntityCautionAlert("Test Workflow", "https://github.com/test/repo/actions/runs/123");
 
         expect(result).toContain("> [!WARNING]");
-        expect(result).toContain("threat detection engine error");
-        expect(result).toContain("<!-- gh-aw-threat-detected -->");
+        expect(result).toContain("> **Threat detection engine error**");
+        expect(result).toContain("What happened");
+        expect(result).toContain("<!-- gh-aw-threat-engine-error -->");
+        expect(result).not.toContain("<!-- gh-aw-threat-detected -->");
         expect(result).not.toContain("> [!CAUTION]");
         expect(result).not.toContain("agentic threat detected");
         expect(result).toContain("failed to produce results");
+      });
+
+      it.each(["agent_failure", "parse_error"])("should return warning alert for a warn-mode detection engine failure (failure/%s)", reason => {
+        process.env.GH_AW_DETECTION_CONCLUSION = "failure";
+        process.env.GH_AW_DETECTION_REASON = reason;
+
+        const result = getExpiredEntityCautionAlert("Test Workflow", "https://github.com/test/repo/actions/runs/123");
+
+        expect(result).toContain("> [!WARNING]");
+        expect(result).toContain("<!-- gh-aw-threat-engine-error -->");
+        expect(result).not.toContain("> [!CAUTION]");
       });
 
       it("should return warning alert for parse_error (tooling failure, not security finding)", () => {
@@ -500,7 +558,10 @@ describe("generate_footer.cjs", () => {
         const result = getExpiredEntityCautionAlert("Test Workflow", "https://github.com/test/repo/actions/runs/123");
 
         expect(result).toContain("> [!WARNING]");
-        expect(result).toContain("threat detection engine error");
+        expect(result).toContain("> **Threat detection engine error**");
+        expect(result).toContain("What happened");
+        expect(result).toContain("<!-- gh-aw-threat-engine-error -->");
+        expect(result).not.toContain("<!-- gh-aw-threat-detected -->");
         expect(result).not.toContain("> [!CAUTION]");
         expect(result).not.toContain("agentic threat detected");
         expect(result).toContain("could not be parsed");

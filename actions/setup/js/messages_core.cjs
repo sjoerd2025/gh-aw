@@ -143,7 +143,7 @@ function renderTemplateFromFile(templatePath, context) {
   try {
     template = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
   return renderTemplate(template, context);
 }
@@ -219,6 +219,33 @@ function buildProtectedFileList(files, githubServer, owner, repo, branch) {
     .join("\n");
 }
 
+/**
+ * @param {string[]} files
+ * @param {string} githubServer
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} branch
+ * @returns {import("./report_ast.cjs").ReportBlock[]}
+ */
+function buildProtectedFileBlocks(files, githubServer, owner, repo, branch) {
+  return [
+    {
+      type: "list",
+      ordered: false,
+      agentTainted: false,
+      items: files.map(file => [
+        {
+          type: "paragraph",
+          agentTainted: false,
+          children: file.includes("/")
+            ? [{ type: "link", url: `${githubServer}/${owner}/${repo}/blob/${encodePathSegments(branch)}/${encodePathSegments(file)}`, children: [{ type: "text", value: file, agentTainted: true }], agentTainted: false }]
+            : [{ type: "code", value: file, agentTainted: true }],
+        },
+      ]),
+    },
+  ];
+}
+
 module.exports = {
   getMessages,
   getPromptPath,
@@ -228,4 +255,5 @@ module.exports = {
   toSnakeCase,
   encodePathSegments,
   buildProtectedFileList,
+  buildProtectedFileBlocks,
 };

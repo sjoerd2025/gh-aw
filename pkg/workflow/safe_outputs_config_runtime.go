@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/github/gh-aw/pkg/sliceutil"
@@ -25,6 +24,7 @@ type SafeOutputStepConfig struct {
 	ContinueOnError            bool              // Whether to continue the job even if this step fails (continue-on-error: true)
 }
 
+//nolint:largefunc // Existing handler configuration assembly remains centralized and sequential.
 func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *WorkflowData) {
 	if data.SafeOutputs == nil {
 		safeOutputsConfigLog.Print("No safe-outputs configuration, skipping handler manager config")
@@ -37,6 +37,10 @@ func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *Workflow
 	// specific handlers at startup. Handler names are the reserved keys defined in handlerRegistry;
 	// non-handler keys ("mentions") are documented in safe_outputs_config_generation.go.
 	config := make(map[string]any)
+	if usesTokenBrokerTasks(data) {
+		config["_token_broker"] = map[string]bool{"copilot-task": true}
+	}
+	addWorkQueueClaimAdapterRuntimeConfig(config, data)
 
 	// Collect engine-specific manifest files and path prefixes (AgentFileProvider interface).
 	// These are merged with the global runtime-derived lists so that engine-specific
@@ -50,7 +54,7 @@ func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *Workflow
 	safeOutputs := data.SafeOutputs
 	if hasWorkflowCallTrigger(data.On) && safeOutputs.DispatchWorkflow != nil {
 		if safeOutputs.DispatchWorkflow.TargetRepoSlug == "" {
-			safeOutputs = safeOutputsWithDispatchTargetRepo(safeOutputs, "${{ needs.activation.outputs.target_repo }}")
+			safeOutputs = safeOutputsWithDispatchTargetRepo(safeOutputs, activationTargetRepoExpr)
 			safeOutputsConfigLog.Print("Injecting target_repo into dispatch_workflow config for workflow_call relay")
 		}
 		if safeOutputs.DispatchWorkflow.TargetRef == "" {
@@ -66,6 +70,13 @@ func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *Workflow
 		// 1. It returns a non-nil config (explicitly enabled, even if empty)
 		// 2. For auto-enabled handlers, include even with empty config
 		if handlerConfig != nil {
+			if safeOutputs.BodyFooter != "" {
+				handlerBodyFooter, isString := handlerConfig["body_footer"].(string)
+				if !isString {
+					handlerBodyFooter = ""
+				}
+				handlerConfig["body_footer"] = appendBodyFooters(handlerBodyFooter, safeOutputs.BodyFooter)
+			}
 			injectCurrentCheckoutPatchWorkspacePath(handlerName, handlerConfig, data)
 			injectCheckoutMapping(handlerName, handlerConfig, data)
 			// Augment protected-files protection with engine-specific files for handlers that use it.
@@ -75,8 +86,13 @@ func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *Workflow
 				excludeFiles := ParseStringArrayFromConfig(handlerConfig, "_protected_files_exclude", nil)
 				delete(handlerConfig, "_protected_files_exclude")
 
-				handlerConfig["protected_files"] = sliceutil.Exclude(fullManifestFiles, excludeFiles...)
-				filteredPrefixes := sliceutil.Exclude(fullPathPrefixes, excludeFiles...)
+				excludeNames, excludePaths := splitProtectedFilesExcludes(excludeFiles)
+				excludePaths = append(excludePaths, data.RepoProtectedFilesExclude...)
+				handlerConfig["protected_files"] = sliceutil.Exclude(fullManifestFiles, excludeNames...)
+				if len(excludePaths) > 0 {
+					handlerConfig["protected_files_path_exclude"] = excludePaths
+				}
+				filteredPrefixes := sliceutil.Exclude(fullPathPrefixes, excludeNames...)
 				if len(filteredPrefixes) > 0 {
 					handlerConfig["protected_path_prefixes"] = filteredPrefixes
 				} else {
@@ -84,7 +100,7 @@ func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *Workflow
 				}
 				// Compute which top-level dot-folder prefixes are excluded so the runtime
 				// dot-folder check can skip them.
-				if dotFolderExcludes := getDotFolderExcludes(excludeFiles); len(dotFolderExcludes) > 0 {
+				if dotFolderExcludes := getDotFolderExcludes(excludeNames); len(dotFolderExcludes) > 0 {
 					handlerConfig["protected_dot_folder_excludes"] = dotFolderExcludes
 				}
 			}
@@ -92,6 +108,13 @@ func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *Workflow
 			config[handlerName] = handlerConfig
 		}
 	}
+	if handlerConfig := buildCommentMemoryHandlerConfig(data.CommentMemoryConfig, safeOutputs.Footer, safeOutputs.BodyFooter); handlerConfig != nil {
+		config[commentMemoryHandlerKey] = handlerConfig
+	}
+	if handlerConfig := buildLedgerMutationHandlerConfig(data.RepoMemoryConfig); handlerConfig != nil {
+		config[ledgerMutationHandlerKey] = handlerConfig
+	}
+	addStandaloneLedgerConfigs(config, data.LedgerConfig)
 
 	// Include top-level mentions configuration so the handler manager can pass it to
 	// markdown-producing handlers that call sanitizeContent with allowed aliases.
@@ -105,7 +128,7 @@ func (c *Compiler) addHandlerManagerConfigEnvVar(steps *[]string, data *Workflow
 	// Only add the env var if there are handlers to configure
 	if len(config) > 0 {
 		safeOutputsConfigLog.Printf("Marshaling handler config with %d handlers", len(config))
-		configJSON, err := json.Marshal(config)
+		configJSON, err := marshalSafeOutputsConfig(config)
 		if err != nil {
 			safeOutputsConfigLog.Printf("Failed to marshal handler config: %v", err)
 			return
@@ -140,7 +163,11 @@ func buildMentionsHandlerConfig(m *MentionsConfig) map[string]any {
 		cfg["allowedTeams"] = m.AllowedTeams
 	}
 	if m.Max != nil {
-		cfg["max"] = *m.Max
+		if n := templatableIntValue(m.Max); n > 0 {
+			cfg["max"] = n
+		} else {
+			cfg["max"] = *m.Max
+		}
 	}
 	return cfg
 }

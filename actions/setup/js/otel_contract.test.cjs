@@ -19,6 +19,7 @@ const MANAGED_ENV_VARS = [
   "GITHUB_EVENT_NAME",
   "GITHUB_JOB",
   "GH_AW_AGENT_CONCLUSION",
+  "GH_AW_AIC",
 ];
 
 const originalEnv = {};
@@ -78,7 +79,7 @@ describe("gh-aw OpenTelemetry compatibility contract", () => {
         });
       }
       if (filePath === "/tmp/gh-aw/agent_usage.json") {
-        return JSON.stringify({ input_tokens: 100, output_tokens: 25 });
+        return JSON.stringify({ input_tokens: 100, output_tokens: 25, ai_credits: 0.125 });
       }
       if (filePath === "/tmp/gh-aw/agent_output.json") {
         return JSON.stringify({ items: [], errors: [] });
@@ -145,6 +146,12 @@ describe("gh-aw OpenTelemetry compatibility contract", () => {
     expect(agentAttrs["gen_ai.usage.input_tokens"]).toBe(100);
     expect(agentAttrs["gen_ai.usage.output_tokens"]).toBe(25);
     expect(agentAttrs["gen_ai.usage.total_tokens"]).toBe(125);
+    expect(agentAttrs["gh-aw.aic"]).toBe(0.125);
+    expect(agentAttrs["gh-aw.workflow.name"]).toBe("Customer OTEL Contract");
+    expect(agentAttrs["gh-aw.run.id"]).toBe("1234567890");
+    expect(agentAttrs["gh-aw.repository"]).toBe("github/gh-aw");
+    expect(spans[1].attributes).toContainEqual({ key: "gh-aw.aic", value: { doubleValue: 0.125 } });
+    expect(spans.filter(span => Object.hasOwn(attrsByKey(span), "gh-aw.aic"))).toHaveLength(1);
 
     const exportedPayloads = fetchMock.mock.calls.map(([, options]) => JSON.parse(String(options.body)));
     expect(exportedPayloads).toHaveLength(3);
@@ -153,5 +160,33 @@ describe("gh-aw OpenTelemetry compatibility contract", () => {
       expect(payload).not.toHaveProperty("schema");
       expect(payload).not.toHaveProperty("payload");
     }
+    expect(exportedPayloads.map(firstSpan).filter(span => Object.hasOwn(attrsByKey(span), "gh-aw.aic"))).toHaveLength(1);
+  });
+
+  it("exports not-evaluated eval status without fabricating UNKNOWN answers", async () => {
+    process.env.INPUT_JOB_NAME = "evals";
+    const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation(filePath => filePath === "/tmp/gh-aw/evals_status.json" || filePath === "/tmp/gh-aw/evals.jsonl");
+    const originalRead = readFileSyncSpy.getMockImplementation();
+    readFileSyncSpy.mockImplementation(filePath => {
+      if (filePath === "/tmp/gh-aw/evals_status.json") {
+        return JSON.stringify({ status: "not_evaluated", reason_code: "judge_failed", reason: "sensitive judge failure", model: "copilot/gpt-6-luna-decisions" });
+      }
+      if (filePath === "/tmp/gh-aw/evals.jsonl") {
+        return JSON.stringify({ id: "eval-1", answer: "YES" }) + "\n";
+      }
+      return originalRead(filePath);
+    });
+
+    await sendJobConclusionSpan("gh-aw.evals.conclusion");
+
+    for (const payload of [JSON.parse(String(fetchMock.mock.calls[0][1].body)), JSON.parse(String(appendFileSyncSpy.mock.calls[0][1]))]) {
+      const span = firstSpan(payload);
+      expect(attrsByKey(span)).toMatchObject({ "gh-aw.evals.status": "not_evaluated", "gh-aw.evals.reason_code": "judge_failed", "gh-aw.eval.model": "copilot/gpt-6-luna-decisions" });
+      expect(span.events.filter(event => event.name === "eval.status")).toHaveLength(1);
+      expect(attrsByKey(span.events.find(event => event.name === "eval.status"))["gh-aw.eval.model"]).toBe("copilot/gpt-6-luna-decisions");
+      expect(span.events.some(event => event.name === "eval.result")).toBe(false);
+      expect(JSON.stringify(payload)).not.toContain("sensitive");
+    }
+    existsSpy.mockRestore();
   });
 });

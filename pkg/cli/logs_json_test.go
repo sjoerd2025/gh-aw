@@ -12,11 +12,15 @@ import (
 	"time"
 
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestBuildLogsData tests the structured data creation for logs
 func TestBuildLogsData(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-*")
+	workingSetFactor := 2.5
 
 	// Create sample processed runs
 	processedRuns := []ProcessedRun{
@@ -60,6 +64,14 @@ func TestBuildLogsData(t *testing.T) {
 			},
 			MissingTools: []MissingToolReport{},
 			MCPFailures:  []MCPFailureReport{},
+			WorkingSet: &WorkingSetMetrics{
+				MeasurementState:      "measured",
+				RebuildFactor:         &workingSetFactor,
+				CumulativeInputTokens: 2500,
+				PeakInputTokens:       1000,
+				RebuildExcessTokens:   1500,
+				Invocations:           3,
+			},
 		},
 		{
 			Run: WorkflowRun{
@@ -128,19 +140,19 @@ func TestBuildLogsData(t *testing.T) {
 	if logsData.Summary.TotalMissingTools != 1 {
 		t.Errorf("Expected TotalMissingTools to be 1, got %d", logsData.Summary.TotalMissingTools)
 	}
-	if logsData.Summary.TotalEpisodes != 2 {
-		t.Errorf("Expected TotalEpisodes to be 2, got %d", logsData.Summary.TotalEpisodes)
+	if logsData.Summary.TotalEpisodes != 0 {
+		t.Errorf("Expected no episodes without canonical context, got %d", logsData.Summary.TotalEpisodes)
 	}
-	if logsData.Summary.HighConfidenceEpisodes != 2 {
-		t.Errorf("Expected HighConfidenceEpisodes to be 2, got %d", logsData.Summary.HighConfidenceEpisodes)
+	if logsData.Summary.HighConfidenceEpisodes != 0 {
+		t.Errorf("Expected no high-confidence episodes without canonical context, got %d", logsData.Summary.HighConfidenceEpisodes)
 	}
 
 	// Verify runs data
 	if len(logsData.Runs) != 2 {
 		t.Errorf("Expected 2 runs, got %d", len(logsData.Runs))
 	}
-	if len(logsData.Episodes) != 2 {
-		t.Fatalf("Expected 2 episodes, got %d", len(logsData.Episodes))
+	if len(logsData.Episodes) != 0 {
+		t.Fatalf("Expected no episodes without canonical context, got %d", len(logsData.Episodes))
 	}
 	if len(logsData.Edges) != 0 {
 		t.Fatalf("Expected 0 edges for standalone runs, got %d", len(logsData.Edges))
@@ -152,6 +164,9 @@ func TestBuildLogsData(t *testing.T) {
 	}
 	if logsData.Runs[0].TaskDomain == nil || logsData.Runs[0].TaskDomain.Name != "triage" {
 		t.Fatalf("Expected first run to include task domain, got %+v", logsData.Runs[0].TaskDomain)
+	}
+	if logsData.Runs[0].WorkingSet == nil || logsData.Runs[0].WorkingSet.RebuildFactor == nil || *logsData.Runs[0].WorkingSet.RebuildFactor != 2.5 {
+		t.Fatalf("Expected first run to include working-set rebuild metrics, got %+v", logsData.Runs[0].WorkingSet)
 	}
 	if logsData.Runs[0].BehaviorFingerprint == nil || logsData.Runs[0].BehaviorFingerprint.ResourceProfile != "lean" {
 		t.Fatalf("Expected first run to include behavior fingerprint, got %+v", logsData.Runs[0].BehaviorFingerprint)
@@ -190,6 +205,7 @@ func TestBuildLogsData(t *testing.T) {
 
 // TestRenderLogsJSON tests JSON output rendering
 func TestRenderLogsJSON(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-*")
 
 	// Create sample logs data
@@ -233,15 +249,15 @@ func TestRenderLogsJSON(t *testing.T) {
 		},
 		Episodes: []EpisodeData{
 			{
-				EpisodeID:       "standalone:12345",
-				Kind:            "standalone",
-				Confidence:      "high",
-				RunIDs:          []int64{12345},
-				WorkflowNames:   []string{"Test Workflow"},
-				PrimaryWorkflow: "Test Workflow",
-				TotalRuns:       1,
-				TotalTokens:     1000,
-				SuggestedRoute:  "workflow:Test Workflow",
+				EpisodeID:              "canonical-12345",
+				Kind:                   "standalone",
+				Confidence:             "high",
+				RunIDs:                 []int64{12345},
+				WorkflowNames:          []string{"Test Workflow"},
+				RepresentativeWorkflow: "Test Workflow",
+				TotalRuns:              1,
+				TotalTokens:            1000,
+				SuggestedRoute:         "workflow:Test Workflow",
 			},
 		},
 		Edges:        []EpisodeEdge{},
@@ -275,8 +291,8 @@ func TestRenderLogsJSON(t *testing.T) {
 	if parsedData.Runs[0].Comparison == nil || parsedData.Runs[0].Comparison.Baseline == nil || parsedData.Runs[0].Comparison.Baseline.Selection != "cohort_match" {
 		t.Fatalf("Expected comparison metadata to survive JSON round-trip, got %+v", parsedData.Runs[0].Comparison)
 	}
-	if len(parsedData.Episodes) != 1 || parsedData.Episodes[0].PrimaryWorkflow != "Test Workflow" {
-		t.Fatalf("Expected episode primary workflow to survive JSON round-trip, got %+v", parsedData.Episodes)
+	if len(parsedData.Episodes) != 1 || parsedData.Episodes[0].RepresentativeWorkflow != "Test Workflow" {
+		t.Fatalf("Expected episode representative workflow to survive JSON round-trip, got %+v", parsedData.Episodes)
 	}
 }
 
@@ -294,7 +310,32 @@ func writeTestAwInfo(t *testing.T, runDir string, payload map[string]any) {
 	}
 }
 
+func TestBuildLogsDataPreservesCanonicalContextFromAwInfo(t *testing.T) {
+	t.Parallel()
+
+	runDir := filepath.Join(t.TempDir(), "run-200")
+	expected := &AwContext{
+		Repo: "org/repo", RunID: "100", WorkflowID: "org/repo/.github/workflows/caller.yml@refs/heads/main",
+		WorkflowCallID: "100-1:caller", EpisodeID: "root-episode", HopID: "100-1:caller", ParentHopID: "50-1:root",
+		OriginEvent: "issues", RootRepo: "org/repo", RootWorkflowID: "org/repo/.github/workflows/root.yml@refs/heads/main", RootRunID: "50",
+	}
+	writeTestAwInfo(t, runDir, map[string]any{"engine_id": "copilot", "context": expected})
+	data := buildLogsData([]ProcessedRun{{Run: WorkflowRun{DatabaseID: 200, LogsPath: runDir}}}, runDir, nil)
+	require.Len(t, data.Runs, 1)
+	assert.Equal(t, expected, data.Runs[0].AwContext)
+	require.Len(t, data.Episodes, 1)
+	assert.Equal(t, expected.EpisodeID, data.Episodes[0].EpisodeID)
+
+	raw, err := json.Marshal(data)
+	require.NoError(t, err)
+	var decoded LogsData
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	assert.Equal(t, expected, decoded.Runs[0].AwContext)
+	assert.Equal(t, expected.EpisodeID, decoded.Episodes[0].EpisodeID)
+}
+
 func TestBuildLogsDataAggregatesDispatchEpisode(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-episode-*")
 	processedRuns := []ProcessedRun{
 		{
@@ -312,6 +353,7 @@ func TestBuildLogsDataAggregatesDispatchEpisode(t *testing.T) {
 				LogsPath:     filepath.Join(tmpDir, "run-2001"),
 			},
 			AgenticAssessments: []AgenticAssessment{{Kind: "resource_heavy_for_domain", Severity: "medium"}},
+			AwContext:          &AwContext{EpisodeID: "canonical", RunID: "2001"},
 		},
 		{
 			Run: WorkflowRun{
@@ -329,6 +371,7 @@ func TestBuildLogsDataAggregatesDispatchEpisode(t *testing.T) {
 				LogsPath:         filepath.Join(tmpDir, "run-2002"),
 			},
 			AwContext: &AwContext{
+				EpisodeID:      "canonical",
 				Repo:           "github/gh-aw",
 				RunID:          "2001",
 				WorkflowID:     "github/gh-aw/.github/workflows/orchestrator.yml@refs/heads/main",
@@ -381,8 +424,8 @@ func TestBuildLogsDataAggregatesDispatchEpisode(t *testing.T) {
 	if episode.EscalationReason != "repeated_resource_heavy_for_domain" {
 		t.Fatalf("Expected repeated_risky_runs escalation reason, got %s", episode.EscalationReason)
 	}
-	if episode.PrimaryWorkflow != "orchestrator" {
-		t.Fatalf("Expected primary workflow orchestrator, got %s", episode.PrimaryWorkflow)
+	if episode.RepresentativeWorkflow != "orchestrator" {
+		t.Fatalf("Expected representative workflow orchestrator, got %s", episode.RepresentativeWorkflow)
 	}
 	if episode.SuggestedRoute != "workflow:orchestrator" {
 		t.Fatalf("Expected suggested route workflow:orchestrator, got %s", episode.SuggestedRoute)
@@ -390,6 +433,7 @@ func TestBuildLogsDataAggregatesDispatchEpisode(t *testing.T) {
 }
 
 func TestBuildLogsDataJoinsWorkflowCallEpisode(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-workflow-call-*")
 	parentDir := filepath.Join(tmpDir, "run-3001")
 	childOneDir := filepath.Join(tmpDir, "run-3002")
@@ -402,6 +446,7 @@ func TestBuildLogsDataJoinsWorkflowCallEpisode(t *testing.T) {
 		"sha":         "abc123",
 		"actor":       "monalisa",
 		"run_attempt": "1",
+		"context":     &AwContext{EpisodeID: "canonical", RunID: "3001"},
 	}
 	writeTestAwInfo(t, parentDir, sharedInfo)
 	writeTestAwInfo(t, childOneDir, map[string]any{
@@ -413,6 +458,7 @@ func TestBuildLogsDataJoinsWorkflowCallEpisode(t *testing.T) {
 		"run_attempt": "1",
 		"event_name":  "workflow_call",
 		"target_repo": "github/platform-workflows",
+		"context":     &AwContext{EpisodeID: "canonical", RunID: "3001"},
 	})
 	writeTestAwInfo(t, childTwoDir, map[string]any{
 		"engine_id":   "copilot",
@@ -423,6 +469,7 @@ func TestBuildLogsDataJoinsWorkflowCallEpisode(t *testing.T) {
 		"run_attempt": "1",
 		"event_name":  "workflow_call",
 		"target_repo": "github/platform-workflows",
+		"context":     &AwContext{EpisodeID: "canonical", RunID: "3001"},
 	})
 
 	processedRuns := []ProcessedRun{
@@ -457,6 +504,7 @@ func TestBuildLogsDataJoinsWorkflowCallEpisode(t *testing.T) {
 }
 
 func TestBuildLogsDataDoesNotCoalesceWorkflowCallEpisodesWithoutRepositoryAndRef(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-workflow-call-low-info-*")
 	firstDir := filepath.Join(tmpDir, "run-5001")
 	secondDir := filepath.Join(tmpDir, "run-5002")
@@ -483,26 +531,17 @@ func TestBuildLogsDataDoesNotCoalesceWorkflowCallEpisodesWithoutRepositoryAndRef
 
 	logsData := buildLogsData(processedRuns, tmpDir, nil)
 
-	if logsData.Summary.TotalEpisodes != 2 {
-		t.Fatalf("Expected 2 separate workflow_call episodes, got %d", logsData.Summary.TotalEpisodes)
+	if logsData.Summary.TotalEpisodes != 0 {
+		t.Fatalf("Expected no episodes without canonical context, got %d", logsData.Summary.TotalEpisodes)
 	}
 	if len(logsData.Edges) != 0 {
 		t.Fatalf("Expected no workflow_call edges for low-information runs, got %d", len(logsData.Edges))
 	}
-	for _, episode := range logsData.Episodes {
-		if episode.Kind != "workflow_call" {
-			t.Fatalf("Expected workflow_call episode kind, got %s", episode.Kind)
-		}
-		if episode.Confidence != "low" {
-			t.Fatalf("Expected low-confidence workflow_call episode, got %s", episode.Confidence)
-		}
-		if episode.TotalRuns != 1 {
-			t.Fatalf("Expected isolated workflow_call episode, got %d runs", episode.TotalRuns)
-		}
-	}
+	assert.Len(t, logsData.Runs, 2, "uncorrelated runs still appear individually")
 }
 
-func TestBuildLogsDataAttachesWorkflowRunEpisode(t *testing.T) {
+func TestBuildLogsDataDoesNotInferWorkflowRunEpisode(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-workflow-run-*")
 	parentDir := filepath.Join(tmpDir, "run-4001")
 	childDir := filepath.Join(tmpDir, "run-4002")
@@ -532,23 +571,15 @@ func TestBuildLogsDataAttachesWorkflowRunEpisode(t *testing.T) {
 
 	logsData := buildLogsData(processedRuns, tmpDir, nil)
 
-	if len(logsData.Edges) != 1 {
-		t.Fatalf("Expected 1 workflow_run edge, got %d", len(logsData.Edges))
-	}
-	edge := logsData.Edges[0]
-	if edge.EdgeType != "workflow_run" {
-		t.Fatalf("Expected workflow_run edge, got %+v", edge)
-	}
-	if edge.Confidence != "medium" {
-		t.Fatalf("Expected medium-confidence workflow_run edge, got %+v", edge)
-	}
-	if logsData.Summary.TotalEpisodes != 1 {
-		t.Fatalf("Expected 1 merged workflow_run episode, got %d", logsData.Summary.TotalEpisodes)
-	}
+	assert.Empty(t, logsData.Edges)
+	assert.Empty(t, logsData.Episodes)
+	assert.Zero(t, logsData.Summary.TotalEpisodes)
+	assert.Len(t, logsData.Runs, 2, "matching revision metadata does not create canonical lineage")
 }
 
 // TestBuildMissingToolsSummary tests missing tools aggregation
 func TestBuildMissingToolsSummary(t *testing.T) {
+	t.Parallel()
 	processedRuns := []ProcessedRun{
 		{
 			Run: WorkflowRun{
@@ -621,6 +652,7 @@ func TestBuildMissingToolsSummary(t *testing.T) {
 
 // TestBuildLogsDataWithContinuation tests continuation field in logs data
 func TestBuildLogsDataWithContinuation(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-*")
 
 	// Create sample processed runs
@@ -715,6 +747,7 @@ func TestBuildLogsDataWithContinuation(t *testing.T) {
 // This mirrors the scenario fixed in issue #42994 where daily audits only received
 // partial run sets because the count cap was hit mid-range with no pagination signal.
 func TestBuildLogsDataWithCountLimitContinuation(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-*")
 
 	processedRuns := []ProcessedRun{
@@ -777,6 +810,7 @@ func TestBuildLogsDataWithCountLimitContinuation(t *testing.T) {
 
 // TestBuildLogsDataWithoutContinuation tests that continuation is omitted when nil
 func TestBuildLogsDataWithoutContinuation(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-*")
 
 	processedRuns := []ProcessedRun{
@@ -816,6 +850,7 @@ func TestBuildLogsDataWithoutContinuation(t *testing.T) {
 
 // TestBuildMCPFailuresSummary tests MCP failures aggregation
 func TestBuildMCPFailuresSummary(t *testing.T) {
+	t.Parallel()
 	processedRuns := []ProcessedRun{
 		{
 			Run: WorkflowRun{
@@ -873,12 +908,14 @@ func TestBuildMCPFailuresSummary(t *testing.T) {
 // TestBuildLogsDataRepositoryAndOrganizationFields verifies that repository and organization
 // fields are populated on both RunData and EpisodeData from aw_info.json.
 func TestBuildLogsDataRepositoryAndOrganizationFields(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-repo-org-*")
 	runDir := filepath.Join(tmpDir, "run-9001")
 
 	writeTestAwInfo(t, runDir, map[string]any{
 		"engine_id":  "copilot",
 		"repository": "myorg/myrepo",
+		"context":    &AwContext{EpisodeID: "canonical"},
 		"ref":        "refs/heads/main",
 		"sha":        "abc123",
 		"actor":      "monalisa",
@@ -930,6 +967,7 @@ func TestBuildLogsDataRepositoryAndOrganizationFields(t *testing.T) {
 // TestBuildLogsDataOrganizationEmptyWhenNoRepository verifies that organization is empty
 // when no repository is set (e.g., older aw_info.json without repository field).
 func TestBuildLogsDataOrganizationEmptyWhenNoRepository(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-no-repo-*")
 
 	processedRuns := []ProcessedRun{
@@ -941,6 +979,7 @@ func TestBuildLogsDataOrganizationEmptyWhenNoRepository(t *testing.T) {
 				Conclusion:   "success",
 				CreatedAt:    time.Date(2024, 3, 1, 10, 0, 0, 0, time.UTC),
 			},
+			AwContext: &AwContext{EpisodeID: "canonical"},
 		},
 	}
 
@@ -969,9 +1008,56 @@ func TestBuildLogsDataOrganizationEmptyWhenNoRepository(t *testing.T) {
 	}
 }
 
+func TestBuildLogsDataUsesGitHubRunMetadataWithoutAwInfo(t *testing.T) {
+	t.Parallel()
+	runDir := t.TempDir()
+	logsData := buildLogsData([]ProcessedRun{{
+		Run: WorkflowRun{
+			DatabaseID:   9003,
+			WorkflowName: "daily-report",
+			WorkflowPath: ".github/workflows/daily-report.lock.yml",
+			Status:       "completed",
+			Conclusion:   "failure",
+			Repository:   "myorg/myrepo",
+			Actor:        "octocat",
+			Attempt:      2,
+			HeadSha:      "abc123",
+			Event:        "schedule",
+			LogsPath:     runDir,
+		},
+	}}, runDir, nil)
+
+	require.Len(t, logsData.Runs, 1)
+	run := logsData.Runs[0]
+	assert.Equal(t, "myorg/myrepo", run.Repository)
+	assert.Equal(t, "myorg", run.Organization)
+	assert.Equal(t, "octocat", run.Actor)
+	assert.Equal(t, "2", run.RunAttempt)
+	assert.Equal(t, "abc123", run.SHA)
+	assert.Equal(t, "schedule", run.EventName)
+}
+
+func TestApplyGitHubMetadataToRunDataPreservesExistingValues(t *testing.T) {
+	t.Parallel()
+	runData := RunData{
+		Repository: "myorg/myrepo",
+		SHA:        "abc123",
+		Actor:      "octocat",
+		EventName:  "schedule",
+	}
+
+	applyGitHubMetadataToRunData(&runData, WorkflowRun{})
+
+	assert.Equal(t, "myorg/myrepo", runData.Repository)
+	assert.Equal(t, "abc123", runData.SHA)
+	assert.Equal(t, "octocat", runData.Actor)
+	assert.Equal(t, "schedule", runData.EventName)
+}
+
 // TestInferWorkflowPathFromDisplayName verifies that display names are correctly
 // slugified into conventional lock-file paths.
 func TestInferWorkflowPathFromDisplayName(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		displayName string
@@ -1022,6 +1108,7 @@ func TestInferWorkflowPathFromDisplayName(t *testing.T) {
 // TestBuildLogsDataInfersWorkflowPathFromAwInfo verifies that buildLogsData falls back
 // to inferring workflow_path from aw_info.json when the GitHub API returned an empty path.
 func TestBuildLogsDataInfersWorkflowPathFromAwInfo(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-infer-workflow-path-*")
 
 	// Create a run with an empty WorkflowPath (simulating what the GitHub API returns
@@ -1068,6 +1155,7 @@ func TestBuildLogsDataInfersWorkflowPathFromAwInfo(t *testing.T) {
 // TestBuildLogsDataPreservesExplicitWorkflowPath verifies that an explicit WorkflowPath
 // set by the GitHub API is never overwritten by the inference fallback.
 func TestBuildLogsDataPreservesExplicitWorkflowPath(t *testing.T) {
+	t.Parallel()
 	tmpDir := testutil.TempDir(t, "test-preserve-workflow-path-*")
 
 	explicitPath := ".github/workflows/custom-path.lock.yml"
@@ -1109,32 +1197,17 @@ func TestBuildLogsDataPreservesExplicitWorkflowPath(t *testing.T) {
 	}
 }
 
-// TestCompactLogsDataEpisodesEmptySliceNotNull verifies that compactLogsData produces
-// empty slices (not nil) for Episodes and Edges when all episodes are standalone.
-// nil slices marshal to JSON null, which breaks agent Python code that calls
-// len(d.get('episodes', [])) — the default [] is only used when the key is absent,
-// but null is a present key with a null value, causing a TypeError.
 func TestCompactLogsDataEpisodesEmptySliceNotNull(t *testing.T) {
-	data := LogsData{
-		Episodes: []EpisodeData{
-			{
-				EpisodeID: "standalone:1",
-				Kind:      "standalone",
-				TotalRuns: 1,
-			},
-		},
-		Edges: []EpisodeEdge{},
-	}
+	t.Parallel()
+	data := buildLogsData([]ProcessedRun{{Run: WorkflowRun{DatabaseID: 1}}}, t.TempDir(), nil)
 
 	compact := compactLogsData(data)
 
-	// After compaction with only standalone episodes, Episodes and Edges must be
-	// non-nil empty slices so JSON marshaling emits [] rather than null.
 	if compact.Episodes == nil {
-		t.Error("compactLogsData: Episodes must be an empty slice (not nil) when all episodes are standalone")
+		t.Error("compactLogsData: Episodes must be an empty slice when no canonical identity is recorded")
 	}
 	if compact.Edges == nil {
-		t.Error("compactLogsData: Edges must be an empty slice (not nil) when all episodes are standalone")
+		t.Error("compactLogsData: Edges must be an empty slice when no canonical identity is recorded")
 	}
 	if len(compact.Episodes) != 0 {
 		t.Errorf("compactLogsData: expected 0 episodes, got %d", len(compact.Episodes))
@@ -1152,4 +1225,32 @@ func TestCompactLogsDataEpisodesEmptySliceNotNull(t *testing.T) {
 	if !strings.Contains(jsonStr, `"edges":[]`) {
 		t.Errorf("expected JSON to contain \"edges\":[], got: %s", jsonStr)
 	}
+}
+
+func TestRenderLogsJSONIncludesMCPToolCalls(t *testing.T) {
+	t.Parallel()
+
+	logsData := buildLogsData([]ProcessedRun{{
+		Run: WorkflowRun{DatabaseID: 12345, WorkflowName: "Test Workflow"},
+		MCPToolUsage: &MCPToolUsageData{ToolCalls: []MCPToolCall{{
+			ToolCallID: "call-1",
+			Timestamp:  "2026-09-09T00:00:00Z",
+			ServerName: "github",
+			ToolName:   "issue_read",
+			InputSize:  100,
+			OutputSize: 200,
+			Duration:   "25ms",
+			Status:     "success",
+		}}},
+	}}, t.TempDir(), nil)
+
+	var output bytes.Buffer
+	require.NoError(t, renderLogsJSONToWriter(&output, logsData, false))
+
+	var rendered LogsData
+	require.NoError(t, json.Unmarshal(output.Bytes(), &rendered))
+	require.NotNil(t, rendered.MCPToolUsage)
+	require.Len(t, rendered.MCPToolUsage.ToolCalls, 1)
+	assert.Equal(t, "github", rendered.MCPToolUsage.ToolCalls[0].ServerName)
+	assert.Equal(t, "issue_read", rendered.MCPToolUsage.ToolCalls[0].ToolName)
 }

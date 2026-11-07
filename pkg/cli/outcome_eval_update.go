@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -14,17 +15,17 @@ var outcomeEvalUpdateLog = logger.New("cli:outcome_eval_update")
 
 var outcomeUpdateGHAPIGet = ghAPIGet
 
-func evalUpdateIssue(item CreatedItemReport, repoOverride string) OutcomeReport {
-	return evalRetainedUpdate(item, repoOverride, "issue", extractCurrentIssueUpdateState, false)
+func evalUpdateIssue(ctx context.Context, item CreatedItemReport, repoOverride string) OutcomeReport {
+	return evalRetainedUpdate(ctx, item, repoOverride, "issue", extractCurrentIssueUpdateState, false)
 }
 
-func evalUpdatePullRequest(item CreatedItemReport, repoOverride string) OutcomeReport {
-	return evalRetainedUpdate(item, repoOverride, "pull request", extractCurrentPullRequestUpdateState, true)
+func evalUpdatePullRequest(ctx context.Context, item CreatedItemReport, repoOverride string) OutcomeReport {
+	return evalRetainedUpdate(ctx, item, repoOverride, "pull request", extractCurrentPullRequestUpdateState, true)
 }
 
-type mutableStateLoader func(repo string, number int) (map[string]any, bool, error)
+type mutableStateLoader func(ctx context.Context, repo string, number int) (map[string]any, bool, error)
 
-func evalRetainedUpdate(item CreatedItemReport, repoOverride string, objectKind string, load mutableStateLoader, strongOnMerge bool) OutcomeReport {
+func evalRetainedUpdate(ctx context.Context, item CreatedItemReport, repoOverride string, objectKind string, load mutableStateLoader, strongOnMerge bool) OutcomeReport {
 	repo := resolveItemRepo(item, repoOverride)
 	num := resolveItemNumber(item)
 	outcomeEvalUpdateLog.Printf("Evaluating retained update: kind=%s, type=%s, repo=%s, num=%d", objectKind, item.Type, repo, num)
@@ -36,29 +37,19 @@ func evalRetainedUpdate(item CreatedItemReport, repoOverride string, objectKind 
 	}
 	if num == 0 || repo == "" {
 		outcomeEvalUpdateLog.Printf("Missing execution state: num=%d, repo=%s", num, repo)
-		report.Result = OutcomeUnknown
 		report.Detail = "missing execution state"
-		report.OutcomeEvaluation = OutcomeEvaluation{
-			OutcomeStatus:    OutcomeStatusUnknown,
-			EvidenceStrength: EvidenceNone,
-			Signal:           "missing_execution_state",
-		}
+		report.OutcomeEvaluation = outcomeEvidence(OutcomeStatusUnknown, EvidenceNone, "missing_execution_state")
 		return report
 	}
 	if item.BeforeState == nil || item.AfterState == nil {
-		report.Result = OutcomeUnknown
 		report.Detail = "missing execution state"
-		report.OutcomeEvaluation = OutcomeEvaluation{
-			OutcomeStatus:    OutcomeStatusUnknown,
-			EvidenceStrength: EvidenceNone,
-			Signal:           "missing_execution_state",
-		}
+		report.OutcomeEvaluation = outcomeEvidence(OutcomeStatusUnknown, EvidenceNone, "missing_execution_state")
 		return report
 	}
 
-	currentState, merged, err := load(repo, num)
+	currentState, merged, err := load(ctx, repo, num)
 	if err != nil {
-		report.Result = OutcomeError
+		report.OutcomeStatus = OutcomeStatusError
 		report.EvalError = err.Error()
 		return report
 	}
@@ -67,52 +58,29 @@ func evalRetainedUpdate(item CreatedItemReport, repoOverride string, objectKind 
 	outcomeEvalUpdateLog.Printf("State comparison for %s #%d: changed=%d, retained=%d, reverted=%d, replaced=%d, merged=%v",
 		objectKind, num, len(comparison.Changed), len(comparison.Retained), len(comparison.Reverted), len(comparison.Replaced), merged)
 	if len(comparison.Changed) == 0 {
-		report.Result = OutcomeUnknown
 		report.Detail = "no persisted state delta"
-		report.OutcomeEvaluation = OutcomeEvaluation{
-			OutcomeStatus:    OutcomeStatusUnknown,
-			EvidenceStrength: EvidenceNone,
-			Signal:           "no_state_delta",
-		}
+		report.OutcomeEvaluation = outcomeEvidence(OutcomeStatusUnknown, EvidenceNone, "no_state_delta")
 		return report
 	}
 
 	switch {
 	case len(comparison.Retained) == len(comparison.Changed):
-		report.Result = OutcomeAccepted
+		report.OutcomeStatus = OutcomeStatusAccepted
 		if strongOnMerge && merged {
 			report.Detail = objectKind + " update retained and merged"
-			report.OutcomeEvaluation = OutcomeEvaluation{
-				OutcomeStatus:    OutcomeStatusAccepted,
-				EvidenceStrength: EvidenceStrong,
-				Signal:           "state_retained_and_merged",
-			}
+			report.OutcomeEvaluation = outcomeEvidence(OutcomeStatusAccepted, EvidenceStrong, "state_retained_and_merged")
 			return report
 		}
 		report.Detail = objectKind + " update retained"
-		report.OutcomeEvaluation = OutcomeEvaluation{
-			OutcomeStatus:    OutcomeStatusAccepted,
-			EvidenceStrength: EvidenceMedium,
-			Signal:           "state_retained",
-		}
+		report.OutcomeEvaluation = outcomeEvidence(OutcomeStatusAccepted, EvidenceMedium, "state_retained")
 		return report
 	case len(comparison.Reverted) == len(comparison.Changed):
-		report.Result = OutcomeRejected
 		report.Detail = objectKind + " update reverted"
-		report.OutcomeEvaluation = OutcomeEvaluation{
-			OutcomeStatus:    OutcomeStatusRejected,
-			EvidenceStrength: EvidenceStrong,
-			Signal:           "state_reverted",
-		}
+		report.OutcomeEvaluation = outcomeEvidence(OutcomeStatusRejected, EvidenceStrong, "state_reverted")
 		return report
 	default:
-		report.Result = OutcomeRejected
 		report.Detail = objectKind + " update replaced"
-		report.OutcomeEvaluation = OutcomeEvaluation{
-			OutcomeStatus:    OutcomeStatusRejected,
-			EvidenceStrength: EvidenceStrong,
-			Signal:           "state_replaced",
-		}
+		report.OutcomeEvaluation = outcomeEvidence(OutcomeStatusRejected, EvidenceStrong, "state_replaced")
 		return report
 	}
 }
@@ -164,7 +132,9 @@ func mutableTrackedFields(itemType string) []string {
 
 func mutableStateEqual(field string, left any, right any) bool {
 	switch field {
-	case "labels", "assignees":
+	case "labels":
+		return slices.Equal(outcomeLabelNames(left), outcomeLabelNames(right))
+	case "assignees":
 		return slices.Equal(mutableStringSlice(left), mutableStringSlice(right))
 	case "draft":
 		return mutableBool(left) == mutableBool(right)
@@ -220,8 +190,8 @@ func mutableStringSlice(raw any) []string {
 	}
 }
 
-func extractCurrentIssueUpdateState(repo string, number int) (map[string]any, bool, error) {
-	issue, err := outcomeUpdateGHAPIGet(fmt.Sprintf("issues/%d", number), repo)
+func extractCurrentIssueUpdateState(ctx context.Context, repo string, number int) (map[string]any, bool, error) {
+	issue, err := outcomeUpdateGHAPIGet(ctx, fmt.Sprintf("issues/%d", number), repo)
 	if err != nil {
 		return nil, false, err
 	}
@@ -234,14 +204,14 @@ func extractCurrentIssueUpdateState(repo string, number int) (map[string]any, bo
 	}, false, nil
 }
 
-func extractCurrentPullRequestUpdateState(repo string, number int) (map[string]any, bool, error) {
-	pullRequest, err := outcomeUpdateGHAPIGet(fmt.Sprintf("pulls/%d", number), repo)
+func extractCurrentPullRequestUpdateState(ctx context.Context, repo string, number int) (map[string]any, bool, error) {
+	pullRequest, err := outcomeUpdateGHAPIGet(ctx, fmt.Sprintf("pulls/%d", number), repo)
 	if err != nil {
 		return nil, false, err
 	}
-	base, _ := pullRequest["base"].(map[string]any)
-	head, _ := pullRequest["head"].(map[string]any)
-	merged, _ := pullRequest["merged"].(bool)
+	base := outcomeValue[map[string]any](pullRequest["base"])
+	head := outcomeValue[map[string]any](pullRequest["head"])
+	merged := outcomeValue[bool](pullRequest["merged"])
 	return map[string]any{
 		"title":     mutableString(pullRequest["title"]),
 		"body_hash": mutableBodyHash(pullRequest["body"]),
@@ -253,7 +223,7 @@ func extractCurrentPullRequestUpdateState(repo string, number int) (map[string]a
 }
 
 func extractNamedItems(raw any, key string) []string {
-	items, _ := raw.([]any)
+	items := outcomeValue[[]any](raw)
 	out := make([]string, 0, len(items))
 	for _, item := range items {
 		if value := outcomeNestedString(item, key); value != "" {

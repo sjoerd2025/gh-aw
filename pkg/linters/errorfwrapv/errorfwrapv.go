@@ -7,35 +7,18 @@ package errorfwrapv
 import (
 	"errors"
 	"go/ast"
-	"go/token"
 	"go/types"
 	"strconv"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
-var errorIface = universeErrorInterface()
-
-// universeErrorInterface returns the built-in error interface type, or nil if
-// it cannot be resolved from types.Universe.
-func universeErrorInterface() *types.Interface {
-	errorObj := types.Universe.Lookup("error")
-	if errorObj == nil {
-		return nil
-	}
-
-	iface, ok := errorObj.Type().Underlying().(*types.Interface)
-	if !ok {
-		return nil
-	}
-
-	return iface
-}
+var errorIface = astutil.UniverseErrorInterface()
 
 type formatVerb struct {
 	argIdx int
@@ -47,37 +30,22 @@ type formatVerb struct {
 const formatArgOffset = 1
 
 // Analyzer is the errorfwrapv analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "errorfwrapv",
-	Doc:      "reports fmt.Errorf calls that pass error arguments without %w wrapping",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/errorfwrapv",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("errorfwrapv", "reports fmt.Errorf calls that pass error arguments without %w wrapping", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	if errorIface == nil {
 		return nil, errors.New("failed to resolve built-in error interface from types.Universe")
 	}
 
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeFmtErrorfCall(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeFmtErrorfCall checks whether a call expression is a fmt.Errorf that
@@ -98,12 +66,12 @@ func analyzeFmtErrorfCall(pass *analysis.Pass, n ast.Node, generatedFiles filech
 	if len(call.Args) == 0 {
 		return
 	}
-	lit, ok := call.Args[0].(*ast.BasicLit)
-	if !ok || lit.Kind != token.STRING {
+	formatStr, ok := astutil.ResolveFormatString(call.Args[0])
+	if !ok {
 		return
 	}
 
-	verbs := parseFormatVerbs(lit.Value)
+	verbs := parseFormatVerbs(formatStr)
 	errorArgVerbs, wrappedErrorArgs, hasVerbV := classifyErrorArgs(pass, call, verbs)
 
 	if hasVerbV {
@@ -184,11 +152,11 @@ func needsWrapping(verbs []rune) bool {
 	return false
 }
 
+// parseFormatVerbs scans a format string produced by astutil.ResolveFormatString
+// — the unquoted literal segments of a fmt.Errorf format-string argument,
+// concatenated in order — for format verbs.
 func parseFormatVerbs(s string) []formatVerb {
 	var verbs []formatVerb
-	if len(s) >= 2 {
-		s = s[1 : len(s)-1]
-	}
 
 	nextArgIdx := 0
 	for i := 0; i < len(s); i++ {
@@ -205,12 +173,6 @@ func parseFormatVerbs(s string) []formatVerb {
 
 		valueArgIdx := 0
 		hasExplicitValueArg := false
-		if idx, nextPos, ok := parseFormatArgIndex(s, i); ok {
-			valueArgIdx = idx
-			nextArgIdx = idx + 1
-			hasExplicitValueArg = true
-			i = nextPos
-		}
 		for i < len(s) {
 			switch s[i] {
 			case '-', '+', '#', '0', ' ':

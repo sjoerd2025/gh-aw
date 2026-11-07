@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 /**
  * Parse Threat Detection Results
  *
@@ -22,8 +23,43 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { listFilesRecursively } = require("./file_helpers.cjs");
 const { DETECTION_LOG_FILENAME, DETECTION_RESULT_FILENAME } = require("./constants.cjs");
 const { ERR_SYSTEM, ERR_PARSE, ERR_VALIDATION } = require("./error_codes.cjs");
+const { parseAPIProxyGuardRejectionFromEventLog, formatAPIProxyGuardRejection } = require("./ai_credits_context.cjs");
 
 const RESULT_PREFIX = "THREAT_DETECTION_RESULT:";
+
+/**
+ * Strip a single leading Markdown emphasis delimiter (bold `**`, italic `*`,
+ * bold `__`, or italic `_`) from the start of a string, if present.
+ *
+ * Detection models sometimes wrap the verdict line in Markdown emphasis, e.g.:
+ *   **THREAT_DETECTION_RESULT:{"prompt_injection":false,...}**
+ * This helper allows callers to recognize the RESULT_PREFIX immediately after
+ * such delimiters without treating arbitrary prose mentions of the prefix as
+ * an authoritative verdict (matching remains anchored to the start of the line).
+ *
+ * @param {string} text - Trimmed line to inspect
+ * @returns {string} The text with a single leading emphasis delimiter removed, if any
+ */
+function stripLeadingMarkdownEmphasis(text) {
+  return text.replace(/^(\*\*|\*|__|_)/, "");
+}
+
+/**
+ * Check whether a trimmed line begins with RESULT_PREFIX, optionally preceded
+ * by a single Markdown emphasis delimiter, and if so return the line with
+ * that delimiter stripped so downstream brace-counting extraction can operate
+ * on it directly. Returns null if the line does not begin with the prefix
+ * (with or without emphasis).
+ *
+ * @param {string} trimmedLine - A trimmed line to check
+ * @returns {string|null} The line with leading emphasis stripped, or null if not a match
+ */
+function matchResultPrefixLine(trimmedLine) {
+  if (trimmedLine.startsWith(RESULT_PREFIX)) return trimmedLine;
+  const stripped = stripLeadingMarkdownEmphasis(trimmedLine);
+  if (stripped !== trimmedLine && stripped.startsWith(RESULT_PREFIX)) return stripped;
+  return null;
+}
 
 /**
  * Extract a complete JSON object from a string that starts with RESULT_PREFIX,
@@ -130,8 +166,15 @@ function extractFromStreamJson(line) {
   // Assumes the first JSON object on the line is the event payload.
   const jsonStart = trimmed.indexOf("{");
   if (jsonStart === -1) return null;
-  const jsonText = trimmed.slice(jsonStart);
+  const event = iterateJsonlEvents(trimmed.slice(jsonStart)).next().value;
+  return event?.type === "json" ? extractFromStreamRecord(event.value) : null;
+}
 
+/**
+ * @param {any} obj Already decoded stream record.
+ * @returns {string|null}
+ */
+function extractFromStreamRecord(obj) {
   /**
    * @param {string} text
    * @returns {string|null}
@@ -161,7 +204,6 @@ function extractFromStreamJson(line) {
   }
 
   try {
-    const obj = JSON.parse(jsonText);
     // Only extract from the authoritative "result" summary, not "assistant" messages.
     // In stream-json mode, the same content appears in both; using only "result"
     // avoids double-counting.
@@ -177,17 +219,22 @@ function extractFromStreamJson(line) {
       // subsequent lines, then use brace-counting to locate the complete JSON object.
       const resultLines = obj.result.split("\n");
       let prefixLineIdx = -1;
+      /** @type {string | null} */
+      let strippedFirstLine = null;
       for (let i = 0; i < resultLines.length; i++) {
-        if (resultLines[i].trim().startsWith(RESULT_PREFIX)) {
+        const matched = matchResultPrefixLine(resultLines[i].trim());
+        if (matched !== null) {
           prefixLineIdx = i;
+          strippedFirstLine = matched;
           break;
         }
       }
       if (prefixLineIdx === -1) return null;
 
       // Rejoin all lines from the prefix line onward so that any JSON string
-      // values split by actual newlines are reassembled.
-      const joined = resultLines.slice(prefixLineIdx).join("\n").trim();
+      // values split by actual newlines are reassembled. Use the emphasis-
+      // stripped version of the first line so brace-counting starts cleanly.
+      const joined = [strippedFirstLine, ...resultLines.slice(prefixLineIdx + 1)].join("\n").trim();
 
       // Extract the complete JSON object using brace-counting.
       return extractResultFromText(joined);
@@ -225,7 +272,7 @@ function extractFromStreamJson(line) {
       }
     }
   } catch {
-    // Not valid JSON — not a stream-json line
+    // Not valid JSON — ignored, this is not a stream-json line.
   }
   return null;
 }
@@ -252,11 +299,18 @@ function parseDetectionLog(content) {
 
   // Phase 1: Try stream-json extraction (from "type":"result" lines only)
   const streamMatches = [];
-  for (const line of lines) {
-    const extracted = extractFromStreamJson(line);
+  const assistantChunks = [];
+  for (const event of iterateJsonlEvents(content, {
+    lineFilter: line => line.includes("{"),
+    lineTransform: line => line.slice(line.indexOf("{")),
+  })) {
+    if (event.type === "invalid") continue;
+    const extracted = extractFromStreamRecord(event.value);
     if (extracted) {
       streamMatches.push(extracted);
     }
+    const obj = event.value;
+    if (event.rawLine.trim().startsWith("{") && obj.type === "message" && obj.role === "assistant" && typeof obj.content === "string") assistantChunks.push(obj.content);
   }
 
   // Phase 2: If no stream-json result field matches, try assistant stream chunk matching.
@@ -267,20 +321,6 @@ function parseDetectionLog(content) {
   // Reassemble assistant chunks and parse the first complete verdict object.
   const assistantMatches = [];
   if (streamMatches.length === 0) {
-    const assistantChunks = [];
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("{")) continue;
-      try {
-        const obj = JSON.parse(trimmed);
-        if (obj.type === "message" && obj.role === "assistant" && typeof obj.content === "string") {
-          assistantChunks.push(obj.content);
-        }
-      } catch {
-        // Not valid JSON — ignore
-      }
-    }
-
     if (assistantChunks.length > 0) {
       const combinedAssistantText = assistantChunks.join("");
       const prefixIdx = combinedAssistantText.indexOf(RESULT_PREFIX);
@@ -300,8 +340,9 @@ function parseDetectionLog(content) {
   if (streamMatches.length === 0 && assistantMatches.length === 0) {
     let i = 0;
     while (i < lines.length) {
-      if (lines[i].trim().startsWith(RESULT_PREFIX)) {
-        const joined = lines.slice(i).join("\n").trim();
+      const matchedFirstLine = matchResultPrefixLine(lines[i].trim());
+      if (matchedFirstLine !== null) {
+        const joined = [matchedFirstLine, ...lines.slice(i + 1)].join("\n").trim();
         const extracted = extractResultFromText(joined);
         if (extracted !== null) {
           // Successfully extracted a complete JSON object; advance past consumed lines.
@@ -434,6 +475,28 @@ function parseStructuredResultFile(resultFilePath) {
 }
 
 /**
+ * Surface an AWF API proxy guardrail rejection (e.g. `max_cache_misses_exceeded`) in the
+ * detection job log. The proxy answers such requests with HTTP 403 and engines commonly
+ * report that as a generic authentication failure, so without this the detection job shows
+ * no trace of the guard that actually stopped the run.
+ *
+ * @param {string} [eventLogPathOverride] - Explicit proxy log path (tests); defaults to the known proxy log locations
+ * @returns {boolean} true when a guard rejection was found and reported
+ */
+function reportAPIProxyGuardRejection(eventLogPathOverride) {
+  /** @type {{ guard: string, counters: Record<string, string|number> } | null} */
+  let rejection = null;
+  try {
+    rejection = parseAPIProxyGuardRejectionFromEventLog(eventLogPathOverride);
+  } catch {
+    return false;
+  }
+  if (!rejection) return false;
+  core.warning(`AWF API proxy guardrail rejected detection requests: ${formatAPIProxyGuardRejection(rejection)}. This is a proxy policy outcome (HTTP 403), not an authentication failure.`);
+  return true;
+}
+
+/**
  * Main entry point for parsing threat detection results and concluding the detection job.
  *
  * This function consolidates three responsibilities previously split across two steps:
@@ -457,12 +520,18 @@ async function main() {
 
   /**
    * Helper to set detection failure/warning outputs based on continue-on-error mode.
-   * In warn mode: sets conclusion=warning, success=false, does NOT fail the job.
+   * In warn mode every failure (including detection engine failures with the
+   * tooling reasons agent_failure/parse_error) sets conclusion=warning,
+   * success=false, and does not fail the job, so safe outputs get the warn-mode
+   * policy (WTD1/WTD1a annotation, WTD2 conversion, WTD3 abort).
    * In error mode: sets conclusion=failure, success=false, fails the job.
    * @param {string} reason - Categorized reason (e.g. "threat_detected", "agent_failure", "parse_error")
    * @param {string} message - Human-readable error message
    */
   function setDetectionFailure(reason, message) {
+    if (reason === "agent_failure" || reason === "parse_error") {
+      reportAPIProxyGuardRejection();
+    }
     core.setOutput("reason", reason);
     core.exportVariable("GH_AW_DETECTION_REASON", reason);
     if (isWarnMode) {
@@ -651,4 +720,4 @@ async function main() {
   } // end runMain
 }
 
-module.exports = { main, parseDetectionLog, extractFromStreamJson, extractResultFromText, extractStructuredOutput, parseStructuredResultFile };
+module.exports = { main, reportAPIProxyGuardRejection, parseDetectionLog, extractFromStreamJson, extractResultFromText, extractStructuredOutput, parseStructuredResultFile };

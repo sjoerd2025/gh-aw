@@ -9,11 +9,14 @@ on:
   workflow_dispatch:
 
 permissions:
+  copilot-requests: write
   contents: read
+  issues: read
   pull-requests: read
 
 tracker-id: weekly-safe-outputs-spec-review
-engine: copilot
+engine: pi
+model: copilot/claude-opus-5.5
 strict: true
 
 network:
@@ -22,10 +25,8 @@ network:
     - github
 
 sandbox:
-  agent:  # Firewall enabled
+  agent:
     id: awf
-    sudo: false
-
 imports:
   - shared/github-guard-policy.md
 
@@ -43,6 +44,7 @@ tools:
       - pull_requests
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: 7d
     title-prefix: "[spec-review] "

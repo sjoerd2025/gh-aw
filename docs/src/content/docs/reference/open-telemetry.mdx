@@ -1,271 +1,393 @@
 ---
-title: OpenTelemetry Attribute Reference
-description: Exhaustive reference for built-in OpenTelemetry resource attributes, span attributes, outcome attributes, and trace artifacts emitted by GitHub Agentic Workflows.
+title: OpenTelemetry
+description: How to configure OpenTelemetry in GitHub Agentic Workflows for OTLP export, MCP-based trace reading, and custom spans.
 sidebar:
-  order: 205
+  order: 340
 ---
 
-This page is the low-level attribute inventory for built-in OpenTelemetry emitted by GitHub Agentic Workflows.
+OpenTelemetry is the observability layer for GitHub Agentic Workflows. It lets workflows export traces and spans to an external backend, and it gives workflows a way to read that telemetry back when they need to inspect behavior across runs.
 
-For setup and usage, see the [OpenTelemetry guide](/gh-aw/guides/open-telemetry/).
+This guide covers the two ways gh-aw uses OpenTelemetry:
 
-Unless stated otherwise, attributes are emitted only when the underlying value is available. Different spans carry different subsets of these fields.
+- [Write-side OTLP](#write-telemetry-through-otlp) sends new workflow spans to a backend such as Sentry.
+- [Read-side MCP](#read-telemetry-through-mcp) lets a workflow query traces and spans that already exist in that backend.
 
-## Resource attributes
+Keep reusable telemetry setup in [shared workflow files](/gh-aw/reference/imports/) when multiple workflows use the same configuration.
 
-Resource attributes identify the workflow run, repository, runner, and gh-aw environment attached to emitted spans.
+## Write telemetry through OTLP
 
-`observability.otlp.resource-attributes` can append custom resource attributes at runtime. Use static strings or GitHub Actions expressions. Do **not** use `secrets.*` or `vars.*` values for this field because resource attributes are exported to external observability backends and are not treated as secret values.
+Configure [`observability.otlp`](/gh-aw/reference/frontmatter/#observability-observability) in workflow frontmatter when the workflow should emit new spans. A typical Sentry setup looks like this:
+
+```aw wrap title=".github/workflows/daily-report.md"
+---
+network:
+  allowed:
+    - "*.sentry.io"
+observability:
+  otlp:
+    endpoint:
+      - url: ${{ secrets.GH_AW_OTEL_SENTRY_ENDPOINT }}
+        headers:
+          Authorization: ${{ secrets.GH_AW_OTEL_SENTRY_AUTHORIZATION }}
+---
+```
+
+Once configured, gh-aw exports built-in workflow spans such as setup and conclusion events to the configured OTLP backend.
+
+Use the bare secret expression for authorization headers, as shown above, rather than adding an authentication scheme prefix. For Sentry endpoints, gh-aw automatically rewrites `Authorization` to `x-sentry-auth`, so no prefix is needed.
+
+OTLP header credentials of at least four characters are masked before setup exports spans, including encoded Basic-auth credentials, decoded passwords, and JSON-escaped values. Artifact and step-summary redaction also derives these values from the configured headers rather than relying on setup logs or recognizable token prefixes. OTLP endpoint and header environment variables, including multi-endpoint aggregated headers, are excluded from the eval agent sandbox.
+
+If a credential was exposed in an earlier run, revoke or rotate it and remove the affected logs and artifacts. Updated redaction does not sanitize retained output from previous runs.
+
+HTTP 401 and 403 export failures are not retried with unchanged credentials. Check the affected collector's configured authorization header and telemetry-write permissions. Transient delivery failures retain bounded retries; a rejected endpoint does not block other configured endpoints or the local telemetry mirror, and export failure does not fail the functional workflow.
+
+### Protobuf encoding and Azure Monitor
+
+The gh-aw JavaScript exporter defaults to OTLP/HTTP JSON (`http/json`) for traces and opt-in [compact session logs](/gh-aw/reference/compiler-enterprise-environment-controls/#unified-session-logs). Set the standard protocol environment variable to use binary OTLP/HTTP protobuf instead:
+
+```yaml wrap
+env:
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+observability:
+  otlp:
+    endpoint: ${{ secrets.AZURE_MONITOR_OTLP_ENDPOINT }}
+    headers:
+      Authorization: ${{ secrets.AZURE_MONITOR_OTLP_AUTHORIZATION }}
+```
+
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` and `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`, when non-empty, take precedence over `OTEL_EXPORTER_OTLP_PROTOCOL` for their respective signals. A traces override does not affect logs, and a logs override does not affect traces. Set these overrides in workflow `env` when the signals need different encodings. All accept `http/json` or `http/protobuf`; gRPC is not supported by this helper. The selected encoding applies to all configured endpoints for that signal. Unsupported protocols and encoding errors produce an exporter diagnostic without retrying or silently falling back to JSON.
+
+To manage the protocol as a repository, organization, or enterprise Actions variable, use `gh aw env get` and `gh aw env update`. The defaults file field `default_otlp_protocol` maps to the standard `OTEL_EXPORTER_OTLP_PROTOCOL` variable:
+
+```bash
+gh aw env get defaults.yml
+```
+
+Set this field in the downloaded file, retaining any other defaults:
+
+```yaml
+default_otlp_protocol: http/protobuf
+```
+
+```bash
+gh aw env update defaults.yml --scope repo
+```
+
+As with other managed fields, setting it to `null` or omitting it deletes the variable at the selected scope. The compiler injects `${{ vars.OTEL_EXPORTER_OTLP_PROTOCOL }}` into workflow `env` unless that key is explicitly defined by the workflow. Recompile existing workflows once to add that lookup; subsequent variable updates take effect without recompilation.
+
+For [Azure Monitor native OTLP ingestion](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/opentelemetry-protocol-ingestion), use the traces endpoint from Application Insights **OTLP Connection Info**, or construct the Data Collection Endpoint / Data Collection Rule path:
+
+```text wrap
+https://<logs-dce-domain>/datacollectionRules/<dcr-immutable-id>/streams/Microsoft-OTLP-Traces/otlp/v1/traces
+```
+
+The exporter retains a complete `/v1/traces` path, including query parameters. For base endpoints, it appends `/v1/traces`. Set `AZURE_MONITOR_OTLP_AUTHORIZATION` to the complete `Bearer <access-token>` header value for a Microsoft Entra identity authorized to write to the DCR (typically **Monitoring Metrics Publisher**). Provision and refresh that token outside this helper; protobuf encoding does not provide Azure authentication or make an Application Insights connection string an OTLP endpoint.
+
+When compact session logs are enabled, the exporter selects the independent `Microsoft-OTLP-Logs` stream for the same DCE and DCR, preserving query parameters:
+
+```text wrap
+https://<logs-dce-domain>/datacollectionRules/<dcr-immutable-id>/streams/Microsoft-OTLP-Logs/otlp/v1/logs
+```
+
+The DCR must accept the logs stream as well as the traces stream. A complete logs endpoint is retained; generic collector endpoints use `/v1/logs` without Azure stream rewriting.
+
+Protobuf requests use `Content-Type: application/x-protobuf` with binary-safe direct and proxy transports. Traces encode `ExportTraceServiceRequest`; logs encode `ExportLogsServiceRequest`, including structured bodies and trace/span correlation. The encoder uses only Node.js built-ins, and the sanitized local `otel.jsonl` trace mirror remains raw OTLP JSON regardless of wire encoding. These settings configure gh-aw JavaScript telemetry; external engines and the MCP gateway retain their own exporter capabilities.
+
+Successful HTTP responses are inspected for OTLP `partialSuccess` in JSON or protobuf, for both traces and logs. JSON responses ignore unknown fields and treat `null` members as unset, following OTLP/ProtoJSON compatibility rules. Rejected spans or log records produce a warning with the signal-specific rejection count and increment `gh-aw.otlp.export_errors`; sanitized details appear in `gh-aw.otlp.export_error_details`. Warning-only partial success (zero rejected records with a collector message) warns without incrementing the error count. Collector messages are withheld because they may contain private data or credentials.
+
+Response diagnostics are limited to 64 KiB. Malformed, unsupported, oversized, or unreadable successful responses record an exporter error with acceptance marked unknown. The proxy-aware curl transport has a 10-second request timeout within a 15-second subprocess deadline; a body timeout after known HTTP success reports unknown acceptance without retrying. Empty responses and valid full-success responses remain successful. None of these successful HTTP responses are retried: resending records the collector already accepted could create duplicates. Export diagnostics remain nonfatal and do not prevent delivery to other configured endpoints.
+
+### Organization-wide defaults
+
+When a workflow does not configure `observability.otlp` (in its own frontmatter or through an import), the compiler falls back to a default OTLP configuration read from the GitHub Actions environment:
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `GH_AW_DEFAULT_OTLP_ENDPOINT` | Secret or variable | OTLP endpoint URL used when no endpoint is configured in frontmatter |
+| `GH_AW_DEFAULT_OTLP_HEADERS` | Secret | Exporter headers (`key=value` pairs, comma-separated) sent to that endpoint |
+
+Because both are resolved at run time, setting them at the repository or organization level enables telemetry for every agentic workflow without editing any workflow file.
+
+Behavior:
+
+- The endpoint secret takes precedence over the variable when both are set; clear both values to disable OTLP export.
+- When both endpoint values are unset, the endpoint resolves to an empty string and OTLP export is a no-op.
+- When an endpoint is set but `GH_AW_DEFAULT_OTLP_HEADERS` is empty, no span is exported to that endpoint from any job (setup, conclusion, outcome, or MCP gateway) — the runtime treats an endpoint without matching credentials as unconfigured rather than exporting unauthenticated telemetry. The agent job additionally fails with an error so the misconfiguration is visible instead of silently degrading to no telemetry.
+- Any `observability.otlp` configuration in frontmatter or an import overrides these defaults entirely.
+- If the workflow already defines any of the OTLP-related environment variables in its own `env:` block, the compiler skips injecting that specific variable instead of emitting a duplicate key.
+
+Set variables with `gh aw env update` or `gh variable set`. Set either value as a secret with `gh secret set`.
+
+### Google Workload Identity Federation
+
+For Google Cloud Telemetry, configure Google Workload Identity Federation instead of a static authorization header. gh-aw mints and exchanges a GitHub OIDC token in every span-emitting job, and automatically grants those jobs `id-token: write`. The workload identity principal needs permission to write telemetry and, when `service-account` is set, permission to impersonate that service account.
+
+Set `audience` to the workload identity provider resource name (`projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER`). gh-aw derives the GitHub OIDC audience (`https://iam.googleapis.com/...`) and the Google STS audience (`//iam.googleapis.com/...`) from it, so either fully-qualified form is also accepted.
+
+```yaml wrap
+observability:
+  otlp:
+    endpoint:
+      - url: https://telemetry.googleapis.com
+        headers:
+          x-goog-user-project: ${{ vars.GCP_PROJECT_ID }}
+    workload-identity:
+      provider: google
+      audience: ${{ vars.GCP_WIF_PROVIDER }}
+      service-account: ${{ vars.GCP_SA_EMAIL }}
+```
+
+## Read telemetry through MCP
+
+Configure [`mcp-servers`](/gh-aw/reference/frontmatter-full/) when the agent needs to inspect telemetry that already exists in the backend. A typical Sentry read setup looks like this:
+
+```aw wrap title=".github/workflows/telemetry-investigation.md"
+---
+mcp-servers:
+  sentry:
+    command: "npx"
+    args: ["@sentry/mcp-server@0.33.0"]
+    allowed:
+      - whoami
+      - find_organizations
+      - find_projects
+      - get_trace_details
+      - search_events
+      - search_issues
+    env:
+      SENTRY_ACCESS_TOKEN: ${{ secrets.SENTRY_ACCESS_TOKEN }}
+      SENTRY_HOST: ${{ env.SENTRY_HOST || 'sentry.io' }}
+---
+```
+
+## Custom span attributes
+
+`observability.otlp.attributes` attaches arbitrary key/value attributes to the job setup, job conclusion, and outcome summary spans:
+
+```yaml wrap
+observability:
+  otlp:
+    endpoint: ${{ secrets.OTLP_ENDPOINT }}
+    headers:
+      Authorization: ${{ secrets.OTLP_TOKEN }}
+    attributes:
+      deployment.environment: production
+      langfuse.session.id: "{{ gh-aw.episode.id }}"
+      langfuse.user.id: "{{ github.actor }}"
+      catalogue.version: "${{ github.aw.metadata.version }}"
+```
+
+Values are plain strings. Template expressions such as `{{ gh-aw.episode.id }}` or `{{ github.actor }}` are resolved from attributes already computed for the span. Empty values are omitted. Values of at least 4 characters are masked in runner logs; shorter values are not masked.
+
+Whole-value references in the form `${{ github.aw.metadata.<key> }}` resolve at compile time from the root workflow's top-level `metadata` map. They work in either custom attribute map, including in shared imported OTLP configuration, and support simple metadata keys such as `version`, `category`, and `owner`. The reference must occupy the entire attribute value; embedded references, nested selectors, missing metadata keys, and metadata values containing GitHub Actions expression delimiters are compile-time errors. Metadata remains string-only, and only explicitly referenced values are exported.
+
+## Custom resource attributes
+
+`observability.otlp.resource-attributes` appends additional resource attributes to the standard gh-aw and GitHub resource attribute set:
+
+```yaml wrap
+observability:
+  otlp:
+    endpoint: ${{ secrets.OTLP_ENDPOINT }}
+    resource-attributes:
+      service.namespace: platform-automation
+      deployment.environment: ${{ github.ref_name }}
+      catalogue.category: "${{ github.aw.metadata.category }}"
+```
+
+Use static strings or GitHub Actions expressions. Do **not** use `secrets.*` or `vars.*` values in `resource-attributes` because resource attributes are exported to external observability backends and are not treated as secret values.
+
+## Built-in telemetry emitted by gh-aw
+
+gh-aw emits a small set of built-in spans and trace artifacts once OTLP is configured.
+
+These fields are a compatibility contract. gh-aw may add OpenTelemetry-standard aliases over time, but existing span names, environment variables, JSONL shape, and documented attributes remain available for dashboards and customer backends.
+
+The built-in agent span uses OpenTelemetry [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) for standard model, token, and finish-reason fields. gh-aw also adds a small number of gh-aw-specific fields.
+
+You usually do not need to configure or memorize these built-in attributes. They are mainly useful when building backend queries, dashboards, or deeper debugging workflows. For the exhaustive built-in inventory, see the [OpenTelemetry attribute reference](/gh-aw/reference/open-telemetry-attributes/).
+
+**Trace files and artifacts**
+
+When observability is enabled, trace data is also mirrored to local JSONL files and uploaded in the `agent` artifact:
+
+- `otel.jsonl` for spans emitted by gh-aw JavaScript helpers
+
+Copilot CLI inherits the standard OpenTelemetry environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`) and exports its own spans directly to the configured OTLP backend. Query them there, filtered by the `github.run_id` resource attribute (see [ADR-34450](https://github.com/github/gh-aw/blob/main/docs/adr/34450-inject-otel-resource-attributes-for-child-otel-sdk-correlation.md)).
+
+See [Artifacts](/gh-aw/reference/artifacts/) for artifact download details.
+
+## Custom spans from shared imports
+
+Shared agentic workflow imports can emit their own OTLP spans alongside the built-in gh-aw telemetry. This lets third-party tools such as APM agents, data pipeline steps, and custom scanners attach their own measurements to the same distributed trace that gh-aw creates for each workflow run.
+
+**Quick start**
+
+The `otlp.cjs` helper provides a minimal, stable API. Use it in any `steps:` entry of a shared import:
+
+`logSpan` is also re-exported unchanged from the public `actions/setup/js/index.cjs` entry point: `const { logSpan } = require(process.env.RUNNER_TEMP + "/gh-aw/actions/index.cjs");`. Existing direct imports from `otlp.cjs` remain supported.
+
+```yaml wrap title=".github/workflows/shared/my-tool.md"
+---
+# My Tool — shared import that instruments its own telemetry
+
+steps:
+  - name: My Tool — do work and record telemetry
+    id: my-tool-run
+    uses: actions/github-script@v8
+    with:
+      script: |
+        const path = require('path');
+        const otlp = require(path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions', 'otlp.cjs'));
+
+        const startMs = Date.now();
+        // ... do your tool's work here (e.g. const result = await myTool.run()) ...
+        const endMs = Date.now();
+
+        await otlp.logSpan('my-tool', {
+          'my-tool.version':         '1.2.3',
+          'my-tool.items_processed': 42,
+          'my-tool.result':          'success',
+        }, { startMs, endMs });
+---
+
+My tool has run and its telemetry span will appear in the same distributed trace as the workflow run.
+```
+
+Import the shared file in any workflow alongside the OTLP configuration:
+
+```yaml wrap title=".github/workflows/my-workflow.md"
+---
+on:
+  schedule: daily
+engine: copilot
+imports:
+  - shared/otlp.md
+  - shared/my-tool.md
+---
+
+# Daily Report
+
+Run the daily report using my-tool results.
+```
+
+**`logSpan` API**
+
+```javascript
+const path = require('path');
+const otlp = require(path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions', 'otlp.cjs'));
+
+await otlp.logSpan(toolName, attributes, options);
+```
 
 <table>
   <thead>
     <tr>
-      <th>Attribute</th>
+      <th>Parameter</th>
+      <th>Type</th>
       <th>Description</th>
     </tr>
   </thead>
   <tbody>
-    <tr><td><code>service.name</code></td><td>OTel service name for the emitting component or workflow.</td></tr>
-    <tr><td><code>service.version</code></td><td>Version of the emitting gh-aw helper when available.</td></tr>
-    <tr><td><code>gh-aw.workflow.name</code></td><td>Workflow name.</td></tr>
-    <tr><td><code>gh-aw.repository</code></td><td>GitHub repository in <code>owner/repo</code> form.</td></tr>
-    <tr><td><code>gh-aw.run.id</code></td><td>GitHub Actions run ID.</td></tr>
-    <tr><td><code>gh-aw.engine.id</code></td><td>Raw gh-aw engine identifier when available.</td></tr>
-    <tr><td><code>github.run_id</code></td><td>GitHub run ID compatibility resource attribute.</td></tr>
-    <tr><td><code>github.repository</code></td><td>GitHub repository compatibility resource attribute.</td></tr>
-    <tr><td><code>github.run_attempt</code></td><td>GitHub Actions run attempt.</td></tr>
-    <tr><td><code>github.event_name</code></td><td>Triggering GitHub event name.</td></tr>
-    <tr><td><code>github.ref</code></td><td>Git ref for the run.</td></tr>
-    <tr><td><code>github.ref_name</code></td><td>Short Git ref name.</td></tr>
-    <tr><td><code>github.head_ref</code></td><td>Head ref for pull request-style events.</td></tr>
-    <tr><td><code>github.sha</code></td><td>Commit SHA.</td></tr>
-    <tr><td><code>github.job</code></td><td>GitHub Actions job ID.</td></tr>
-    <tr><td><code>github.workflow_ref</code></td><td>Workflow reference including path and ref.</td></tr>
-    <tr><td><code>github.actor_id</code></td><td>Numeric GitHub actor ID when available.</td></tr>
-    <tr><td><code>runner.os</code></td><td>Runner operating system.</td></tr>
-    <tr><td><code>runner.arch</code></td><td>Runner architecture.</td></tr>
-    <tr><td><code>runner.name</code></td><td>Runner name.</td></tr>
-    <tr><td><code>runner.environment</code></td><td>Runner environment classification.</td></tr>
-    <tr><td><code>gh-aw.awf.version</code></td><td>Workflow compiler version when available.</td></tr>
-    <tr><td><code>gh-aw.awmg.version</code></td><td>MCP gateway version when available.</td></tr>
-    <tr><td><code>deployment.environment</code></td><td><code>staging</code> or <code>production</code> depending on staged mode.</td></tr>
+    <tr><td><code>toolName</code></td><td><code>string</code></td><td>Logical name for the tool, for example <code>"my-scanner"</code>. Used as <code>service.name</code> and as the span name prefix <code>&lt;toolName&gt;.run</code>.</td></tr>
+    <tr><td><code>attributes</code></td><td><code>Record&lt;string, scalar&gt;</code></td><td>Domain-specific attributes emitted on the span. All env plumbing is handled automatically.</td></tr>
+    <tr><td><code>options.startMs</code></td><td><code>number</code></td><td>Span start time in milliseconds since epoch. Defaults to <code>Date.now()</code>.</td></tr>
+    <tr><td><code>options.endMs</code></td><td><code>number</code></td><td>Span end time in milliseconds since epoch. Defaults to <code>Date.now()</code>.</td></tr>
+    <tr><td><code>options.isError</code></td><td><code>boolean</code></td><td>When <code>true</code>, sets the span status to <code>ERROR</code>.</td></tr>
+    <tr><td><code>options.errorMessage</code></td><td><code>string</code></td><td>Human-readable status message included when <code>isError</code> is <code>true</code>.</td></tr>
+    <tr><td><code>options.traceId</code></td><td><code>string</code></td><td>Override trace ID. Defaults to <code>GITHUB_AW_OTEL_TRACE_ID</code>.</td></tr>
+    <tr><td><code>options.parentSpanId</code></td><td><code>string</code></td><td>Override parent span ID. Defaults to <code>GITHUB_AW_OTEL_PARENT_SPAN_ID</code>.</td></tr>
+    <tr><td><code>options.endpoint</code></td><td><code>string</code></td><td>Override OTLP endpoint. Defaults to <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>.</td></tr>
   </tbody>
 </table>
 
-## Workflow and job span attributes
+Here, `scalar` means `string`, `number`, or `boolean`.
 
-These attributes appear on built-in workflow setup, agent, and conclusion spans as applicable.
+`logSpan` is non-fatal and never throws. Export failures are surfaced as `console.warn`. When `GITHUB_AW_OTEL_TRACE_ID` is missing or invalid, the call returns silently.
+
+**Recording an error span**
+
+```javascript
+await otlp.logSpan('my-scanner', {
+  'my-scanner.items_scanned': 100,
+}, { isError: true, errorMessage: 'database connection timed out' });
+```
+
+**Practical notes**
+
+- Use `your-tool.` as a prefix for tool-specific attributes, for example `my-tool.items_processed`.
+- Use [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/) for cross-cutting concerns, for example `db.system` and `http.response.status_code`.
+- Avoid attribute names containing `token`, `secret`, `password`, `key`, or `auth`.
+
+Attribute values are sanitized automatically before the payload is exported or mirrored. Matching secret-like keys are redacted, and very long string values are truncated. The same sanitization is applied to both OTLP export and the local JSONL mirror.
+
+For debugging, every span emitted by `logSpan` is appended as a sanitized JSON line to `/tmp/gh-aw/otel.jsonl`, even when `OTEL_EXPORTER_OTLP_ENDPOINT` is not set. This file is included in the `agent` artifact when OTLP is enabled. Copilot CLI spans are not mirrored to a local file; they are exported directly to the configured OTLP backend and should be queried there.
+
+```bash
+# Download agent artifacts for a run
+gh aw logs <run-id> --artifacts agent
+
+# Inspect spans emitted by your tool
+cat otel.jsonl | jq 'select(.resourceSpans[].scopeSpans[].spans[].name | startswith("my-tool"))'
+```
+
+<details>
+  <summary>Advanced: low-level API</summary>
+
+For full control, use the lower-level helpers from `send_otlp_span.cjs` directly. The key environment variables set by the `actions/setup` step are:
 
 <table>
   <thead>
     <tr>
-      <th>Attribute</th>
+      <th>Variable</th>
       <th>Description</th>
     </tr>
   </thead>
   <tbody>
-    <tr><td><code>gh-aw.job.name</code></td><td>Job name when available.</td></tr>
-    <tr><td><code>gh-aw.workflow.name</code></td><td>Workflow name.</td></tr>
-    <tr><td><code>gh-aw.run.id</code></td><td>Run ID.</td></tr>
-    <tr><td><code>gh-aw.run.attempt</code></td><td>Run attempt number.</td></tr>
-    <tr><td><code>gh-aw.run.actor</code></td><td>GitHub actor login.</td></tr>
-    <tr><td><code>gh-aw.repository</code></td><td>Repository in <code>owner/repo</code> form.</td></tr>
-    <tr><td><code>gh-aw.cli.version</code></td><td>CLI/helper version when available.</td></tr>
-    <tr><td><code>gh-aw.event_name</code></td><td>Triggering event name.</td></tr>
-    <tr><td><code>gh-aw.deployment.state</code></td><td>Deployment mode/state for setup or conclusion spans.</td></tr>
-    <tr><td><code>gh-aw.workflow_run.conclusion</code></td><td>Workflow run conclusion when available.</td></tr>
-    <tr><td><code>gh-aw.staged</code></td><td>Boolean staged-mode flag.</td></tr>
-    <tr><td><code>gh-aw.trigger.item_type</code></td><td>Trigger target type, for example issue or pull request.</td></tr>
-    <tr><td><code>gh-aw.trigger.item_number</code></td><td>Trigger target number.</td></tr>
-    <tr><td><code>gh-aw.trigger.label</code></td><td>Matched trigger label when label-based triggering is used.</td></tr>
-    <tr><td><code>gh-aw.trigger.comment_id</code></td><td>Comment ID for comment-driven triggers.</td></tr>
-    <tr><td><code>gh-aw.frontmatter.source</code></td><td>Frontmatter source classification.</td></tr>
-    <tr><td><code>gh-aw.frontmatter.emoji</code></td><td>Configured frontmatter emoji when present.</td></tr>
-    <tr><td><code>gh-aw.frontmatter.body_modified</code></td><td>Whether frontmatter processing modified the body.</td></tr>
-    <tr><td><code>gh-aw.run.status</code></td><td>Final workflow run status.</td></tr>
-    <tr><td><code>gh-aw.error_count</code></td><td>Count of output errors captured by the helper.</td></tr>
-    <tr><td><code>gh-aw.warning_count</code></td><td>Count of warnings observed during the run.</td></tr>
-    <tr><td><code>gh-aw.permission_denied_count</code></td><td>Permission denials observed during execution.</td></tr>
-    <tr><td><code>gh-aw.steering_event_count</code></td><td>Count of steering events recorded during the run.</td></tr>
-    <tr><td><code>gh-aw.action_minutes</code></td><td>Elapsed runtime converted to minutes.</td></tr>
-    <tr><td><code>gh-aw.tracker.id</code></td><td>Tracker identifier when present.</td></tr>
-    <tr><td><code>gh-aw.aic</code></td><td>AI credits consumed for the run when available.</td></tr>
-    <tr><td><code>gh-aw.max_ai_credits</code></td><td>Configured max AI credits budget for the run when available.</td></tr>
-    <tr><td><code>gh-aw.max_ai_credits_exceeded</code></td><td>Whether the run exceeded the max AI credits budget.</td></tr>
-    <tr><td><code>gh-aw.ai_credits_rate_limit_error</code></td><td>Whether an AI-credits rate-limit or budget-exhaustion signal was detected.</td></tr>
-    <tr><td><code>gh-aw.turns</code></td><td>Total agent turns recorded for the run.</td></tr>
-    <tr><td><code>gh-aw.agent.conclusion</code></td><td>Normalized agent conclusion.</td></tr>
-    <tr><td><code>gh-aw.detection.conclusion</code></td><td>Detection subsystem conclusion when present.</td></tr>
-    <tr><td><code>gh-aw.detection.reason</code></td><td>Detection subsystem reason when present.</td></tr>
-    <tr><td><code>gh-aw.otlp.export_errors</code></td><td>Count of OTLP export errors seen during the run.</td></tr>
-    <tr><td><code>gh-aw.otlp.export_error_details</code></td><td>Serialized OTLP export error details when present.</td></tr>
-    <tr><td><code>gh-aw.error.count</code></td><td>Count of output errors on the conclusion span.</td></tr>
-    <tr><td><code>gh-aw.error.messages</code></td><td>Joined error messages when present.</td></tr>
-    <tr><td><code>gh-aw.output.item_count</code></td><td>Count of output items produced by the run.</td></tr>
-    <tr><td><code>gh-aw.output.item_types</code></td><td>Comma-separated output item types.</td></tr>
-    <tr><td><code>gh-aw.github.rate_limit.remaining</code></td><td>Last observed GitHub API rate limit remaining value.</td></tr>
-    <tr><td><code>gh-aw.github.rate_limit.limit</code></td><td>Last observed GitHub API rate limit ceiling.</td></tr>
-    <tr><td><code>gh-aw.github.rate_limit.used</code></td><td>Last observed GitHub API rate limit usage.</td></tr>
-    <tr><td><code>gh-aw.github.rate_limit.resource</code></td><td>GitHub rate limit resource bucket.</td></tr>
-    <tr><td><code>gh-aw.github.rate_limit.reset</code></td><td>GitHub rate limit reset timestamp.</td></tr>
+    <tr><td><code>GITHUB_AW_OTEL_TRACE_ID</code></td><td>32-character hex trace ID shared by all spans in this run.</td></tr>
+    <tr><td><code>GITHUB_AW_OTEL_PARENT_SPAN_ID</code></td><td>16-character hex span ID of the job setup span. Use it as <code>parentSpanId</code> to nest spans under it.</td></tr>
+    <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td>OTLP collector base URL.</td></tr>
+    <tr><td><code>OTEL_EXPORTER_OTLP_HEADERS</code></td><td>Comma-separated <code>key=value</code> authentication headers.</td></tr>
   </tbody>
 </table>
 
-## Agent and GenAI attributes
+```javascript
+const {
+  buildAttr, buildOTLPPayload, sendOTLPSpan,
+  generateSpanId, SPAN_KIND_CLIENT,
+} = require('/tmp/gh-aw/actions/send_otlp_span.cjs');
 
-These attributes carry model, token, and stop-reason data on built-in agent spans.
+const traceId      = process.env.GITHUB_AW_OTEL_TRACE_ID;
+const parentSpanId = process.env.GITHUB_AW_OTEL_PARENT_SPAN_ID;
+const endpoint     = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
 
-<table>
-  <thead>
-    <tr>
-      <th>Attribute</th>
-      <th>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><td><code>gen_ai.system</code></td><td>Compatibility GenAI system/provider name used by existing gh-aw dashboards and backends.</td></tr>
-    <tr><td><code>gh-aw.engine.id</code></td><td>Raw gh-aw engine identifier.</td></tr>
-    <tr><td><code>gen_ai.request.model</code></td><td>Requested model name.</td></tr>
-    <tr><td><code>gen_ai.operation.name</code></td><td>Always <code>chat</code> for built-in agent spans.</td></tr>
-    <tr><td><code>gen_ai.workflow.name</code></td><td>Workflow name repeated in GenAI namespace.</td></tr>
-    <tr><td><code>gen_ai.response.model</code></td><td>Resolved runtime model when available.</td></tr>
-    <tr><td><code>gen_ai.response.finish_reasons</code></td><td>Array of stop reasons, defaulting to <code>unknown</code> when needed.</td></tr>
-    <tr><td><code>gen_ai.usage.input_tokens</code></td><td>Input token count.</td></tr>
-    <tr><td><code>gen_ai.usage.output_tokens</code></td><td>Output token count.</td></tr>
-    <tr><td><code>gen_ai.usage.cache_read.input_tokens</code></td><td>Cache-read token count.</td></tr>
-    <tr><td><code>gen_ai.usage.cache_creation.input_tokens</code></td><td>Cache-write token count.</td></tr>
-    <tr><td><code>gen_ai.usage.total_tokens</code></td><td>Total input plus output tokens.</td></tr>
-  </tbody>
-</table>
+const setupSpanId = generateSpanId();
+const querySpanId = generateSpanId();
 
-## Workflow-call and episode attributes
+await sendOTLPSpan(endpoint, buildOTLPPayload({
+  traceId, spanId: setupSpanId, parentSpanId,
+  spanName: 'my-tool.setup', startMs: t0, endMs: t1,
+  serviceName: 'my-tool', kind: SPAN_KIND_CLIENT,
+  attributes: [buildAttr('my-tool.phase', 'setup')],
+  resourceAttributes: [buildAttr('my-tool.version', '1.2.3')],
+}));
 
-These attributes are emitted when a run participates in an episode or nested workflow-call structure.
+await sendOTLPSpan(endpoint, buildOTLPPayload({
+  traceId, spanId: querySpanId, parentSpanId: setupSpanId,
+  spanName: 'my-tool.query', startMs: t1, endMs: t2,
+  serviceName: 'my-tool', kind: SPAN_KIND_CLIENT,
+  attributes: [buildAttr('my-tool.query.rows', 1234)],
+}));
+```
 
-<table>
-  <thead>
-    <tr>
-      <th>Attribute</th>
-      <th>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><td><code>gh-aw.episode.id</code></td><td>Episode identifier used to roll up related runs.</td></tr>
-    <tr><td><code>gh-aw.episode.kind</code></td><td>Episode kind such as <code>run</code> or <code>workflow_call</code>.</td></tr>
-    <tr><td><code>gh-aw.hop.id</code></td><td>Current hop identifier within an episode.</td></tr>
-    <tr><td><code>gh-aw.hop.parent_id</code></td><td>Parent hop identifier when nested.</td></tr>
-    <tr><td><code>gh-aw.workflow_call.id</code></td><td>Current workflow-call hop identifier.</td></tr>
-    <tr><td><code>gh-aw.workflow_call.parent_id</code></td><td>Parent workflow-call hop identifier.</td></tr>
-    <tr><td><code>gh-aw.origin.event</code></td><td>Original triggering event for the root execution.</td></tr>
-    <tr><td><code>gh-aw.root.repo</code></td><td>Root repository for the episode.</td></tr>
-    <tr><td><code>gh-aw.root.workflow_id</code></td><td>Root workflow identifier.</td></tr>
-  </tbody>
-</table>
+</details>
 
-## Outcome summary attributes
+## Learn More
 
-These attributes appear on workflow-level outcome summary or conclusion spans.
-
-<table>
-  <thead>
-    <tr>
-      <th>Attribute</th>
-      <th>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><td><code>gh-aw.outcome.runs_checked</code></td><td>Number of runs checked while computing the summary.</td></tr>
-    <tr><td><code>gh-aw.outcome.total</code></td><td>Total evaluated outcomes.</td></tr>
-    <tr><td><code>gh-aw.outcome.accepted</code></td><td>Accepted outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.rejected</code></td><td>Rejected outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.ignored</code></td><td>Ignored outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.pending</code></td><td>Pending outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.noop</code></td><td>No-op outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.accepted_strong</code></td><td>Strongly accepted outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.accepted_medium</code></td><td>Medium-strength accepted outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.accepted_weak</code></td><td>Weakly accepted outcome count.</td></tr>
-    <tr><td><code>gh-aw.outcome.fallback_exists_only_count</code></td><td>Fallback exists-only acceptance count.</td></tr>
-    <tr><td><code>gh-aw.outcome.acceptance_rate</code></td><td>Accepted fraction.</td></tr>
-    <tr><td><code>gh-aw.outcome.waste_rate</code></td><td>Rejected fraction.</td></tr>
-    <tr><td><code>gh-aw.outcome.noop_rate</code></td><td>No-op fraction.</td></tr>
-    <tr><td><code>gh-aw.outcome.zero_touch_count</code></td><td>Zero-touch accepted count.</td></tr>
-    <tr><td><code>gh-aw.outcome.zero_touch_rate</code></td><td>Zero-touch acceptance fraction.</td></tr>
-    <tr><td><code>gh-aw.outcome.item_count</code></td><td>Number of evaluated items in the summary payload.</td></tr>
-    <tr><td><code>gh-aw.outcome.date</code></td><td>Summary date when present.</td></tr>
-    <tr><td><code>gh-aw.outcome.median_resolution_sec</code></td><td>Median resolution time in seconds.</td></tr>
-    <tr><td><code>gh-aw.outcome.events</code></td><td>Comma-separated event names represented in the summary.</td></tr>
-    <tr><td><code>gh-aw.outcome.workflows</code></td><td>Comma-separated workflow names represented in the summary.</td></tr>
-    <tr><td><code>gh-aw.outcome.types</code></td><td>Comma-separated outcome object types represented in the summary.</td></tr>
-  </tbody>
-</table>
-
-## Outcome per-item attributes
-
-These attributes appear on <code>gh-aw.outcome.evaluation</code> spans for individual evaluated items.
-
-<table>
-  <thead>
-    <tr>
-      <th>Attribute</th>
-      <th>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><td><code>gh-aw.outcome.type</code></td><td>Object type being evaluated.</td></tr>
-    <tr><td><code>gh-aw.outcome.result</code></td><td>Observed result classification.</td></tr>
-    <tr><td><code>gh-aw.outcome.outcome_status</code></td><td>Normalized outcome status.</td></tr>
-    <tr><td><code>gh-aw.outcome.evidence_strength</code></td><td>Evidence strength classification.</td></tr>
-    <tr><td><code>gh-aw.outcome.workflow</code></td><td>Source workflow name.</td></tr>
-    <tr><td><code>gh-aw.outcome.run_id</code></td><td>Source run ID.</td></tr>
-    <tr><td><code>gh-aw.outcome.repo</code></td><td>Repository associated with the item.</td></tr>
-    <tr><td><code>gh-aw.outcome.url</code></td><td>Primary URL for the evaluated object.</td></tr>
-    <tr><td><code>gh-aw.outcome.detail</code></td><td>Additional detail string.</td></tr>
-    <tr><td><code>gh-aw.outcome.signal</code></td><td>Signal that triggered evaluation.</td></tr>
-    <tr><td><code>gh-aw.outcome.created_at</code></td><td>Creation timestamp.</td></tr>
-    <tr><td><code>gh-aw.outcome.event</code></td><td>Outcome event label.</td></tr>
-    <tr><td><code>gh-aw.outcome.resolution_sec</code></td><td>Resolution time in seconds.</td></tr>
-    <tr><td><code>gh-aw.outcome.pending_age_sec</code></td><td>Age of a pending item in seconds.</td></tr>
-    <tr><td><code>gh-aw.outcome.review_comments</code></td><td>Review comment count.</td></tr>
-    <tr><td><code>gh-aw.outcome.changed_files</code></td><td>Changed file count.</td></tr>
-    <tr><td><code>gh-aw.outcome.additions</code></td><td>Added line count.</td></tr>
-    <tr><td><code>gh-aw.outcome.deletions</code></td><td>Deleted line count.</td></tr>
-    <tr><td><code>gh-aw.outcome.reactions_total</code></td><td>Total reaction count.</td></tr>
-    <tr><td><code>gh-aw.outcome.reactions_positive</code></td><td>Positive reaction count.</td></tr>
-    <tr><td><code>gh-aw.outcome.reactions_negative</code></td><td>Negative reaction count.</td></tr>
-    <tr><td><code>gh-aw.outcome.comments</code></td><td>Comment count.</td></tr>
-    <tr><td><code>gh-aw.outcome.zero_touch</code></td><td>Boolean zero-touch flag.</td></tr>
-  </tbody>
-</table>
-
-## Experiment attributes
-
-These attributes are emitted when experiments are active for a run.
-
-<table>
-  <thead>
-    <tr>
-      <th>Attribute</th>
-      <th>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr><td><code>gh-aw.experiment.&lt;name&gt;</code></td><td>Variant assigned for a named experiment.</td></tr>
-    <tr><td><code>gh-aw.experiments</code></td><td>Serialized map of valid experiment assignments.</td></tr>
-  </tbody>
-</table>
-
-## Trace files and artifacts
-
-When observability is enabled, trace data is also mirrored to local JSONL files and uploaded in the <code>agent</code> artifact:
-
-- <code>otel.jsonl</code> for spans emitted by gh-aw JavaScript helpers
-- <code>copilot-otel.jsonl</code> for spans emitted by Copilot CLI
-
-See the [OpenTelemetry guide](/gh-aw/guides/open-telemetry/) for setup and [Artifacts](/gh-aw/reference/artifacts/) for artifact download details.
-
-## Related documentation
-
-- [OpenTelemetry guide](/gh-aw/guides/open-telemetry/)
-- [Outcomes](/gh-aw/reference/outcomes/)
-- [Cost Management](/gh-aw/reference/cost-management/)
+- [OpenTelemetry attribute reference](/gh-aw/reference/open-telemetry-attributes/)
+- [Frontmatter](/gh-aw/reference/frontmatter/)
+- [Network](/gh-aw/reference/network/)
 - [Artifacts](/gh-aw/reference/artifacts/)
+- [Audit](/gh-aw/reference/audit/)
+- [Imports](/gh-aw/reference/imports/)

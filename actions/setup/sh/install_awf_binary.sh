@@ -2,13 +2,14 @@
 set +o histexpand
 
 # Install AWF (Agentic Workflow Firewall) with SHA256 checksum verification
-# Usage: install_awf_binary.sh VERSION
+# Usage: install_awf_binary.sh VERSION [--checksums-sha256 DIGEST] [--rootless]
 #
 # This script downloads the AWF bundle or binary from GitHub releases and verifies
 # its SHA256 checksum before installation to protect against supply chain attacks.
 #
 # Arguments:
 #   VERSION - AWF version to install (e.g., v0.25.10)
+#   --checksums-sha256 - Independently trusted checksums.txt digest for VERSION
 #
 # Install strategy:
 #   1. If Node.js >= 20 is available, download the lightweight awf-bundle.js (~357KB)
@@ -20,11 +21,16 @@ set +o histexpand
 #
 # Security features:
 #   - Downloads directly from GitHub releases
-#   - Verifies SHA256 checksum against official checksums.txt
+#   - Authenticates checksums.txt against a digest bundled in the trusted action
+#   - Helper-capable releases require workflow attestations and signed release identity
 #   - Fails fast if checksum verification fails
 #   - Eliminates trust dependency on installer scripts
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=actions/setup/sh/release_integrity.sh
+source "${SCRIPT_DIR}/release_integrity.sh"
 
 # Configuration
 AWF_VERSION="${1:-}"
@@ -35,12 +41,28 @@ AWF_LIB_DIR="/usr/local/lib/awf"
 
 # Parse flags from remaining arguments
 ROOTLESS=false
-for arg in "${@:2}"; do
-  case "$arg" in
-    --rootless) ROOTLESS=true ;;
-    *) echo "WARNING: Unknown argument: $arg" >&2 ;;
+AWF_CHECKSUMS_SHA256=""
+SEEN_CHECKSUMS_SHA256=false
+if [ "$#" -gt 0 ]; then shift; fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --rootless) ROOTLESS=true; shift ;;
+    --checksums-sha256)
+      if [ "$SEEN_CHECKSUMS_SHA256" = true ] || [ "$#" -lt 2 ]; then
+        echo "ERROR: --checksums-sha256 requires exactly one digest" >&2
+        exit 1
+      fi
+      AWF_CHECKSUMS_SHA256="$2"
+      SEEN_CHECKSUMS_SHA256=true
+      shift 2
+      ;;
+    *) echo "ERROR: Unknown AWF installer argument: $1" >&2; exit 1 ;;
   esac
 done
+if [ "$SEEN_CHECKSUMS_SHA256" = true ] && [[ ! "$AWF_CHECKSUMS_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "ERROR: --checksums-sha256 requires 64 lowercase hexadecimal characters" >&2
+  exit 1
+fi
 
 # In rootless mode, install into the user's home directory instead of /usr/local
 # so that standard GitHub-hosted runners (where /usr/local is root-owned) work
@@ -63,8 +85,22 @@ maybe_sudo() {
 
 if [ -z "$AWF_VERSION" ]; then
   echo "ERROR: AWF version is required"
-  echo "Usage: $0 VERSION [--rootless]"
+  echo "Usage: $0 VERSION [--checksums-sha256 DIGEST] [--rootless]"
   exit 1
+fi
+AWF_VERSION="v${AWF_VERSION#v}"
+if [[ ! "$AWF_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "ERROR: AWF version must be a pinned semantic release tag" >&2
+  exit 1
+fi
+CHECKSUMS_SHA256="$(release_artifact_sha256 "$AWF_REPO" "$AWF_VERSION" checksums.txt "$AWF_CHECKSUMS_SHA256")"
+# Releases before the authenticated helper contract remain supported by their
+# independently reviewed manifest pins. Helper-capable releases also require
+# signed identity metadata because the release workflow runs on a dispatch branch.
+REQUIRE_ATTESTATION=false
+IFS=. read -r version_major version_minor version_patch <<< "${AWF_VERSION#v}"
+if (( 10#$version_major > 0 || 10#$version_minor > 29 || (10#$version_minor == 29 && 10#$version_patch >= 5) )); then
+  REQUIRE_ATTESTATION=true
 fi
 
 # Detect OS and architecture
@@ -85,23 +121,26 @@ if [ "$ROOTLESS" = "true" ]; then
   fi
 fi
 
-# Clean up any stale AWF chroot directories left by previous runs before we
-# execute awf. Rootless AWF can fail its writeConfigs startup path with EACCES
-# when stale /tmp/awf-*-chroot-home or /tmp/awf-chroot-* directories remain
-# from earlier jobs on the same runner. Limit cleanup to directories owned by
-# root or the current runner user so we do not delete unrelated /tmp entries
-# that happen to match the name pattern.
-echo "Cleaning up stale AWF chroot directories..."
-if command -v sudo >/dev/null 2>&1; then
-  sudo find /tmp -maxdepth 1 -name 'awf-*-chroot-home' -type d \( -user root -o -user "$(id -un)" \) -exec rm -rf -- {} + || true
-  sudo find /tmp -maxdepth 1 -name 'awf-chroot-*' -type d \( -user root -o -user "$(id -un)" \) -exec rm -rf -- {} + || true
-else
-  echo "Warning: sudo is unavailable; skipping stale AWF chroot cleanup" >&2
-fi
+# Other invocations can share both /tmp and the runner UID. Neither a filename
+# pattern nor the filesystem owner proves that a chroot belongs to this install.
 
 # Download URLs
 BASE_URL="https://github.com/${AWF_REPO}/releases/download/${AWF_VERSION}"
 CHECKSUMS_URL="${BASE_URL}/checksums.txt"
+# Exponential backoff spans longer gateway outages than six fixed-delay attempts.
+# Bound stalled transfers without imposing a total timeout on large binaries.
+CURL_RETRY_OPTS=(--proto '=https' --proto-redir '=https' --retry 8 --retry-max-time 180 --connect-timeout 15)
+CURL_EXTRA_RETRY_OPTS=()
+# --retry-all-errors was added in curl 7.71, so it must not be passed to older curl
+# builds found on some self-hosted runners. Probe the help output instead of parsing
+# `curl --version`, which reports vendor-patched version strings that do not reliably
+# indicate option availability. Help categories (`curl --help all`) only exist since
+# curl 7.73, so fall back to plain `curl --help`, which lists every option on
+# older builds.
+if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors' ||
+  curl --help 2>/dev/null | grep -q -- '--retry-all-errors'; then
+  CURL_EXTRA_RETRY_OPTS+=(--retry-all-errors)
+fi
 
 # Platform-portable SHA256 function
 sha256_hash() {
@@ -116,23 +155,57 @@ sha256_hash() {
   fi
 }
 
-# Create temp directory
-TEMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TEMP_DIR"' EXIT
+# The AWF CLI uses TMPDIR for its chroot scratch directories. Persist a private
+# directory for subsequent workflow steps and leave cleanup to the scoped post step.
+create_awf_runtime_tmp
+
+# Create a private staging directory on the runner's job-owned filesystem.
+create_release_staging awf
+
+download_release_asset() {
+  local asset="$1"
+  local http_status="" curl_exit=0
+  local -a options=("${CURL_RETRY_OPTS[@]}")
+  case "$asset" in
+    awf-linux-*|awf-darwin-*) options+=(--speed-limit 1 --speed-time 60) ;;
+    *) options+=(--max-time 60) ;;
+  esac
+  # A missing optional bundle should fall back immediately, not retry HTTP 404.
+  if [ "$asset" != awf-bundle.js ]; then
+    options+=("${CURL_EXTRA_RETRY_OPTS[@]}")
+  fi
+  if http_status=$(curl -fsSL "${options[@]}" -o "${TEMP_DIR}/${asset}" \
+    --write-out '%{http_code}' "${BASE_URL}/${asset}"); then
+    return 0
+  else
+    curl_exit=$?
+  fi
+  echo "ERROR: Failed to download ${asset} from ${AWF_REPO} ${AWF_VERSION} (HTTP ${http_status:-000}, curl exit ${curl_exit})." >&2
+  if [ "$curl_exit" -eq 23 ]; then
+    echo "ERROR: Local write failure; check free disk space and permissions in ${TEMP_DIR}." >&2
+  fi
+  return "$curl_exit"
+}
 
 # Download checksums
 echo "Downloading checksums from ${CHECKSUMS_URL@Q}..."
-curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 180 -o "${TEMP_DIR}/checksums.txt" "${CHECKSUMS_URL}"
+download_release_asset checksums.txt
+verify_release_digest "${TEMP_DIR}/checksums.txt" "$CHECKSUMS_SHA256"
+if [ "$REQUIRE_ATTESTATION" = true ]; then
+  download_release_asset release-identity.txt
+  verify_release_identity "${TEMP_DIR}/checksums.txt" "${TEMP_DIR}/release-identity.txt" \
+    "$AWF_REPO" "$AWF_VERSION" "$CHECKSUMS_SHA256"
+fi
 
 verify_checksum() {
   local file="$1"
   local fname="$2"
 
   echo "Verifying SHA256 checksum for ${fname}..."
-  EXPECTED_CHECKSUM=$(awk -v fname="${fname}" '$2 == fname {print $1; exit}' "${TEMP_DIR}/checksums.txt" | tr 'A-F' 'a-f')
+  EXPECTED_CHECKSUM=$(awk -v fname="${fname}" '$2 == fname || $2 == "*" fname {count++; digest=$1} END {if (count == 1) print digest}' "${TEMP_DIR}/checksums.txt" | tr 'A-F' 'a-f')
 
-  if [ -z "$EXPECTED_CHECKSUM" ]; then
-    echo "ERROR: Could not find checksum for ${fname} in checksums.txt"
+  if [[ ! "$EXPECTED_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: Expected exactly one valid checksum for ${fname} in authenticated checksums.txt" >&2
     return 1
   fi
 
@@ -147,6 +220,9 @@ verify_checksum() {
   fi
 
   echo "✓ Checksum verification passed for ${fname}"
+  if [ "$REQUIRE_ATTESTATION" = true ]; then
+    verify_release_attestation "$file" "$AWF_REPO"
+  fi
 }
 
 # Check if Node.js >= 20 is available
@@ -174,15 +250,15 @@ install_bundle() {
 
   echo "Node.js >= 20 detected ($(node --version)), using lightweight bundle..."
   echo "Downloading bundle from ${bundle_url@Q}..."
-  if ! curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 180 -o "${TEMP_DIR}/${bundle_name}" "${bundle_url}"; then
+  if ! download_release_asset "${bundle_name}"; then
     echo "⚠ Bundle download failed (asset may not exist for this version)"
     return 1
   fi
 
   # Verify checksum
   if ! verify_checksum "${TEMP_DIR}/${bundle_name}" "${bundle_name}"; then
-    echo "⚠ Bundle checksum verification failed"
-    return 1
+    echo "ERROR: Bundle checksum verification failed; refusing fallback" >&2
+    exit 1
   fi
 
   # Install bundle to lib directory
@@ -213,7 +289,7 @@ install_linux_binary() {
 
   local binary_url="${BASE_URL}/${awf_binary}"
   echo "Downloading binary from ${binary_url@Q}..."
-  curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 180 -o "${TEMP_DIR}/${awf_binary}" "${binary_url}"
+  download_release_asset "${awf_binary}"
 
   # Verify checksum
   verify_checksum "${TEMP_DIR}/${awf_binary}" "${awf_binary}"
@@ -238,7 +314,7 @@ install_darwin_binary() {
 
   local binary_url="${BASE_URL}/${awf_binary}"
   echo "Downloading binary from ${binary_url@Q}..."
-  curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 180 -o "${TEMP_DIR}/${awf_binary}" "${binary_url}"
+  download_release_asset "${awf_binary}"
 
   # Verify checksum
   verify_checksum "${TEMP_DIR}/${awf_binary}" "${awf_binary}"

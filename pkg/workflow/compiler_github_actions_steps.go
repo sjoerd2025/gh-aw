@@ -1,10 +1,14 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
+	"path"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/parser"
 )
 
 var compilerGitHubActionsStepsLog = logger.New("workflow:compiler_github_actions_steps")
@@ -17,47 +21,34 @@ var compilerGitHubActionsStepsLog = logger.New("workflow:compiler_github_actions
 //
 // Returns a string containing the complete script content to be used in a github-script action's "script:" field.
 func generateGitHubScriptWithRequire(scriptPath string) string {
+	return generateGitHubScriptWithCredentialSource(scriptPath, false)
+}
+
+func generateGitHubScriptWithCredentialSource(scriptPath string, withCredentialSource bool) string {
 	compilerGitHubActionsStepsLog.Printf("Generating GitHub script step with require: %s", scriptPath)
 	var script strings.Builder
 
 	// Use the setup_globals helper to store GitHub Actions objects in global scope
 	script.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
-	script.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
-	script.WriteString("            const { main } = require('" + SetupActionDestination + "/" + scriptPath + "');\n")
+	setupCall := "            setupGlobals(core, github, context, exec, io, getOctokit"
+	if withCredentialSource {
+		setupCall += ", process.env.GH_AW_GITHUB_TOKEN_SOURCE"
+	}
+	script.WriteString(setupCall + ");\n")
+	script.WriteString("            const { main } = require('" + path.Join(SetupActionDestination, scriptPath) + "');\n")
 	script.WriteString("            await main();\n")
 
 	return script.String()
-}
-
-// generateInlineGitHubScriptStep generates a simple inline github-script step
-// for validation or utility operations that don't require artifact downloads.
-//
-// Parameters:
-//   - stepName: The name of the step (e.g., "Validate cache-memory file types")
-//   - script: The JavaScript code to execute (pre-formatted with proper indentation)
-//   - condition: Optional if condition (e.g., "always()"). Empty string means no condition.
-//
-// Returns a string containing the complete YAML for the github-script step.
-func generateInlineGitHubScriptStep(stepName, script, condition string, data *WorkflowData) string {
-	compilerGitHubActionsStepsLog.Printf("Generating inline GitHub script step: name=%q, condition=%q", stepName, condition)
-	var step strings.Builder
-
-	step.WriteString("      - name: " + stepName + "\n")
-	if condition != "" {
-		step.WriteString("        if: " + condition + "\n")
-	}
-	step.WriteString("        uses: " + getCachedActionPin("actions/github-script", data) + "\n")
-	step.WriteString("        with:\n")
-	step.WriteString("          script: |\n")
-	step.WriteString(script)
-
-	return step.String()
 }
 
 // generatePlaceholderSubstitutionStep generates a JavaScript-based step that performs
 // safe placeholder substitution using the substitute_placeholders script.
 // This replaces the multiple sed commands with a single JavaScript step.
 func generatePlaceholderSubstitutionStep(yaml *strings.Builder, expressionMappings []*ExpressionMapping, indent string, data *WorkflowData) {
+	generatePlaceholderSubstitutionStepForFile(yaml, expressionMappings, indent, data, "Substitute placeholders", constants.AwPromptsFileExpr)
+}
+
+func generatePlaceholderSubstitutionStepForFile(yaml *strings.Builder, expressionMappings []*ExpressionMapping, indent string, data *WorkflowData, name, promptFile string) {
 	if len(expressionMappings) == 0 {
 		return
 	}
@@ -65,15 +56,88 @@ func generatePlaceholderSubstitutionStep(yaml *strings.Builder, expressionMappin
 	compilerGitHubActionsStepsLog.Printf("Generating placeholder substitution step with %d mappings", len(expressionMappings))
 
 	// Use actions/github-script to perform the substitutions
-	yaml.WriteString(indent + "- name: Substitute placeholders\n")
-	fmt.Fprintf(yaml, indent+"  uses: %s\n", getCachedActionPin("actions/github-script", data))
+	yaml.WriteString(indent + "- name: " + name + "\n")
+	fmt.Fprintf(yaml, indent+"  uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	yaml.WriteString(indent + "  env:\n")
-	yaml.WriteString(indent + "    GH_AW_PROMPT: /tmp/gh-aw/aw-prompts/prompt.txt\n")
+	fmt.Fprintf(yaml, indent+"    GH_AW_PROMPT: %s\n", promptFile) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	generatePlaceholderEnvironment(yaml, expressionMappings, indent)
+	generatePlaceholderSubstitutionScript(yaml, expressionMappings, indent)
+}
 
+type inlineArtifactSubstitutionTarget struct {
+	Directory string
+	Extension string
+}
+
+func promptAuthorExpressions(mappings []*ExpressionMapping) map[string]string {
+	bindings := make(map[string]string)
+	for _, mapping := range mappings {
+		if mapping.Original == "" {
+			continue
+		}
+		binding := mapping.EnvVar
+		if mapping.IsLiteral {
+			binding = "__" + binding + "__"
+		}
+		bindings[stripExpressionWrapper(mapping.Original)] = binding
+	}
+	return bindings
+}
+
+func promptInterpolationOptions(mappings []*ExpressionMapping) string {
+	var options []string
+	if bindings := promptDeferredBindingsJSON(mappings); bindings != "{}" {
+		options = append(options, "deferredBindings: "+bindings)
+	}
+	if bindings := promptAuthorExpressions(mappings); len(bindings) > 0 {
+		encoded, _ := json.Marshal(bindings) //nolint:jsonmarshalignoredeerror // Marshaling string bindings cannot fail.
+		options = append(options, "authorExpressions: "+string(encoded))
+	}
+	return strings.Join(options, ", ")
+}
+
+// Only compiler-authored late bindings remain substitutable after interpolation.
+// Runtime values that merely resemble these placeholders stay literal.
+func promptDeferredBindingsJSON(mappings []*ExpressionMapping) string {
+	var bindings []string
+	for _, mapping := range mappings {
+		if mapping.IsLiteral && strings.HasPrefix(mapping.Content, "__GH_AW_DEFERRED_") && strings.HasSuffix(mapping.Content, "__") {
+			bindings = append(bindings, fmt.Sprintf("%q:%q", mapping.EnvVar, mapping.Content))
+		}
+	}
+	return "{" + strings.Join(bindings, ",") + "}"
+}
+
+func (c *Compiler) generateDeferredPromptSubstitutionStep(yaml *strings.Builder, data *WorkflowData) {
+	if len(data.DeferredPromptExpressions) == 0 {
+		return
+	}
+	yaml.WriteString("      - name: " + constants.DeferredPromptStepName + "\n")
+	yaml.WriteString("        id: " + constants.DeferredPromptStepID.String() + "\n")
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	yaml.WriteString("        env:\n")
+	fmt.Fprintf(yaml, "          GH_AW_PROMPT: %s\n", constants.AwPromptsFile) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	generatePlaceholderEnvironment(yaml, data.DeferredPromptExpressions, "      ")
+	engineID := ""
+	if data.EngineConfig != nil {
+		engineID = data.EngineConfig.ID
+	}
+	baseDir := engineConfigBaseDirForRegistry(c.engineRegistry, engineID)
+	generatePlaceholderSubstitutionScript(yaml, data.DeferredPromptExpressions, "      ",
+		inlineArtifactSubstitutionTarget{Directory: path.Join(baseDir, "agents"), Extension: parser.GetEngineSubAgentExt(engineID)},
+		inlineArtifactSubstitutionTarget{Directory: path.Join(baseDir, "skills"), Extension: engineInlineSkillExt(engineID)},
+	)
+}
+
+func generatePlaceholderEnvironment(yaml *strings.Builder, expressionMappings []*ExpressionMapping, indent string) {
 	// Add all environment variables
 	// For static values (wrapped in quotes), output them directly without ${{ }}
 	// For GitHub expressions, wrap them in ${{ }}
 	for _, mapping := range expressionMappings {
+		if mapping.IsLiteral {
+			writeYAMLEnv(yaml, indent+"    ", mapping.EnvVar, mapping.Content)
+			continue
+		}
 		content := mapping.Content
 		// Check if this is a static quoted value (starts and ends with quotes)
 		if (strings.HasPrefix(content, "'") && strings.HasSuffix(content, "'")) ||
@@ -86,29 +150,41 @@ func generatePlaceholderSubstitutionStep(yaml *strings.Builder, expressionMappin
 				escaped := strings.ReplaceAll(innerValue, `\`, `\\`)
 				escaped = strings.ReplaceAll(escaped, `"`, `\"`)
 				escaped = strings.ReplaceAll(escaped, "\n", `\n`)
-				fmt.Fprintf(yaml, indent+"    %s: \"%s\"\n", mapping.EnvVar, escaped)
+				fmt.Fprintf(yaml, indent+"    %s: \"%s\"\n", mapping.EnvVar, escaped) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 			} else {
-				fmt.Fprintf(yaml, indent+"    %s: %s\n", mapping.EnvVar, content)
+				fmt.Fprintf(yaml, indent+"    %s: %s\n", mapping.EnvVar, content) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 			}
 		} else {
 			// GitHub expression - wrap in ${{ }}
-			fmt.Fprintf(yaml, indent+"    %s: ${{ %s }}\n", mapping.EnvVar, content)
+			fmt.Fprintf(yaml, indent+"    %s: ${{ %s }}\n", mapping.EnvVar, content) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 		}
 	}
+}
 
+func generatePlaceholderSubstitutionScript(yaml *strings.Builder, expressionMappings []*ExpressionMapping, indent string, inlineArtifacts ...inlineArtifactSubstitutionTarget) {
 	yaml.WriteString(indent + "  with:\n")
 	yaml.WriteString(indent + "    script: |\n")
 
 	// Use setup_globals helper to make GitHub Actions objects available globally
-	yaml.WriteString(indent + "      const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
+	yaml.WriteString(indent + "      const { setupGlobals } = require('" + path.Join(SetupActionDestination, "setup_globals.cjs") + "');\n")
 	yaml.WriteString(indent + "      setupGlobals(core, github, context, exec, io, getOctokit);\n")
 	yaml.WriteString(indent + "      \n")
 	// Use require() to load script from copied files
-	yaml.WriteString(indent + "      const substitutePlaceholders = require('" + SetupActionDestination + "/substitute_placeholders.cjs');\n")
+	yaml.WriteString(indent + "      const substitutePlaceholders = require('" + path.Join(SetupActionDestination, "substitute_placeholders.cjs") + "');\n")
 	yaml.WriteString(indent + "      \n")
 	yaml.WriteString(indent + "      // Call the substitution function\n")
 	yaml.WriteString(indent + "      return await substitutePlaceholders({\n")
 	yaml.WriteString(indent + "        file: process.env.GH_AW_PROMPT,\n")
+	if bindings := promptDeferredBindingsJSON(expressionMappings); bindings != "{}" {
+		yaml.WriteString(indent + "        deferredBindings: " + bindings + ",\n")
+	}
+	if len(inlineArtifacts) > 0 {
+		targets := make([]string, 0, len(inlineArtifacts))
+		for _, target := range inlineArtifacts {
+			targets = append(targets, fmt.Sprintf(`{"directory":%q,"extension":%q}`, target.Directory, target.Extension))
+		}
+		fmt.Fprintf(yaml, indent+"        inlineArtifacts: [%s],\n", strings.Join(targets, ",")) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	}
 	yaml.WriteString(indent + "        substitutions: {\n")
 
 	for i, mapping := range expressionMappings {
@@ -116,7 +192,7 @@ func generatePlaceholderSubstitutionStep(yaml *strings.Builder, expressionMappin
 		if i == len(expressionMappings)-1 {
 			comma = ""
 		}
-		fmt.Fprintf(yaml, indent+"          %s: process.env.%s%s\n", mapping.EnvVar, mapping.EnvVar, comma)
+		fmt.Fprintf(yaml, indent+"          %s: process.env.%s%s\n", mapping.EnvVar, mapping.EnvVar, comma) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
 	}
 
 	yaml.WriteString(indent + "        }\n")

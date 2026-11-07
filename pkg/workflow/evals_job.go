@@ -19,7 +19,7 @@ func evalsBranchName(workflowID string) string {
 // buildEvalsJob creates a separate evals job that runs after the agent job (and detection
 // job when enabled), allowing it to run in parallel with safe_outputs.
 // The job downloads the agent artifact to access output files, runs a BinEval
-// multi-question evaluation via an agentic engine, and uploads evals.jsonl as an artifact.
+// multi-question evaluation via the Decisions API, and uploads evals.jsonl as an artifact.
 // Returns nil if evals are not declared in the workflow frontmatter.
 func (c *Compiler) buildEvalsJob(data *WorkflowData) (*Job, error) {
 	if !data.Evals.HasEvals() {
@@ -28,29 +28,14 @@ func (c *Compiler) buildEvalsJob(data *WorkflowData) (*Job, error) {
 	}
 	evalsJobLog.Print("Building evals job")
 
-	var steps []string
+	steps := c.buildEvalsPreparationSteps(data)
 
-	// Add setup action steps (installs the agentic engine helper scripts).
-	setupActionRef := c.resolveActionReference("./actions/setup", data)
-	if setupActionRef != "" || c.actionMode.IsScript() {
-		// For dev mode (local action path), checkout the actions folder first.
-		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
-		// Reuse the activation job trace ID so all jobs share one OTLP trace.
-		evalsTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
-		evalsParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, evalsTraceID, evalsParentSpanID)...)
-	}
-
-	// Download agent output artifact to access output files (prompt.txt, agent_output.json).
-	// Use activation-derived prefix since this job always depends on activation.
-	agentArtifactPrefix := artifactPrefixExprForDownstreamJob(data)
-	steps = append(steps, buildAgentOutputDownloadSteps(agentArtifactPrefix, c.getActionPin)...)
-
-	// Download experiment artifact so the evals agent can read the current variant assignments.
-	steps = append(steps, buildExperimentArtifactDownloadSteps(data, c.getActionPin)...)
-
-	// Add all evals steps: engine install, engine execution, parse, redact, upload.
+	// Add the standalone Decisions invocation and result publication steps.
 	steps = append(steps, c.buildEvalsJobSteps(data)...)
+
+	if c.actionMode.IsDev() {
+		steps = append(steps, c.generateRestoreActionsSetupStep())
+	}
 
 	// Determine job dependencies.
 	// Evals always depends on agent and activation, and additionally on detection when the detection job is enabled.
@@ -61,14 +46,13 @@ func (c *Compiler) buildEvalsJob(data *WorkflowData) (*Job, error) {
 	}
 	evalsJobLog.Printf("Evals job dependencies resolved: needs=%v", needs)
 
-	// Evals job condition: always run but skip if the agent job was skipped.
-	// This matches the detection job pattern so conclusion still sees a non-skipped evals result.
+	// Evals job condition: run only after the agent job succeeds.
 	alwaysFunc := BuildFunctionCall("always")
-	upstreamNotSkipped := BuildNotEquals(
+	agentSucceeded := BuildEquals(
 		BuildPropertyAccess(fmt.Sprintf("needs.%s.result", constants.AgentJobName)),
-		BuildStringLiteral("skipped"),
+		BuildStringLiteral("success"),
 	)
-	jobConditionNode := BuildAnd(alwaysFunc, upstreamNotSkipped)
+	jobConditionNode := BuildAnd(alwaysFunc, agentSucceeded)
 	jobCondition := RenderCondition(jobConditionNode)
 
 	// Determine runs-on: use evals override if set, otherwise ubuntu-latest.
@@ -77,19 +61,8 @@ func (c *Compiler) buildEvalsJob(data *WorkflowData) (*Job, error) {
 		runsOn = normalizeRunsOnSnippet(data.Evals.RunsOn)
 	}
 
-	// Determine permissions for the evals job (same rationale as the detection job).
-	copilotRequestsEnabled := hasCopilotRequestsWritePermission(data)
-	perms := NewPermissionsContentsRead()
-	if copilotRequestsEnabled {
-		perms.Set(PermissionCopilotRequests, PermissionWrite)
-	}
-	if data.EngineConfig != nil && data.EngineConfig.Auth != nil && data.EngineConfig.Auth.Type == "github-oidc" {
-		perms.Set(PermissionIdToken, PermissionWrite)
-	}
-	if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
-		perms.Set(PermissionIdToken, PermissionWrite)
-	}
-	permissions := perms.RenderToYAML()
+	evalsAuthData, permissions := c.buildEvalsJobPermissions(data)
+	steps = append(steps, c.buildTokenBrokerInvalidationStep(evalsAuthData)...)
 
 	job := &Job{
 		Name:        string(constants.EvalsJobName),
@@ -99,12 +72,52 @@ func (c *Compiler) buildEvalsJob(data *WorkflowData) (*Job, error) {
 		Environment: c.indentYAMLLines(data.Environment, "    "),
 		Permissions: permissions,
 		Outputs: map[string]string{
-			"aic": fmt.Sprintf("${{ steps.%s.outputs.aic }}", constants.ParseMCPGatewayStepID),
+			"aic": "${{ steps.parse_evals_token_usage.outputs.aic }}",
 		},
 		Steps: steps,
 	}
 
 	return job, nil
+}
+
+func (c *Compiler) buildEvalsPreparationSteps(data *WorkflowData) []string {
+	var steps []string
+
+	// Add setup action steps for the shared runtime scripts.
+	setupActionRef := c.resolveActionReference("./actions/setup", data)
+	if setupActionRef != "" || c.actionMode.IsScript() {
+		// For dev mode (local action path), checkout the actions folder first.
+		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
+		// Reuse the activation job trace ID so all jobs share one OTLP trace.
+		evalsTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
+		evalsParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
+		steps = append(steps, c.generateSetupStepForJob("evals", data, setupActionRef, SetupActionDestination, false, evalsTraceID, evalsParentSpanID, "")...)
+	}
+
+	// Download agent output for the shared evaluation evidence.
+	// Use activation-derived prefix since this job always depends on activation.
+	agentArtifactPrefix := artifactPrefixExprForDownstreamJob(data)
+	steps = append(steps, buildAgentOutputDownloadSteps(agentArtifactPrefix, c.getActionPin)...)
+
+	// Download the current experiment variant assignments.
+	return append(steps, buildExperimentArtifactDownloadSteps(data, c.getActionPin)...)
+}
+
+func (c *Compiler) buildEvalsJobPermissions(data *WorkflowData) (*WorkflowData, string) {
+	evalsAuthData := c.buildEvalsDecisionData(data)
+	brokeredInference := usesTokenBrokerInference(evalsAuthData)
+	copilotRequestsEnabled := evalsAuthData.AI == "copilot" && hasCopilotRequestsWritePermission(data) && !brokeredInference
+	perms := NewPermissionsContentsRead()
+	if copilotRequestsEnabled {
+		perms.Set(PermissionCopilotRequests, PermissionWrite)
+	}
+	if brokeredInference {
+		perms.Set(PermissionIdToken, PermissionWrite)
+	}
+	if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
+		perms.Set(PermissionIdToken, PermissionWrite)
+	}
+	return evalsAuthData, perms.RenderToYAML()
 }
 
 // buildPushEvalsStateJob creates a job that downloads the evals artifact and commits it to a
@@ -123,7 +136,7 @@ func (c *Compiler) buildPushEvalsStateJob(data *WorkflowData) (*Job, error) {
 		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 		traceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
 		parentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, traceID, parentSpanID)...)
+		steps = append(steps, c.generateSetupStepForJob("push_evals_state", data, setupActionRef, SetupActionDestination, false, traceID, parentSpanID, "")...)
 	}
 
 	steps = append(steps,
@@ -134,39 +147,20 @@ func (c *Compiler) buildPushEvalsStateJob(data *WorkflowData) (*Job, error) {
 		"          sparse-checkout: .\n",
 	)
 
-	steps = append(steps, c.generateGitConfigurationSteps()...)
+	steps = append(steps, c.generateGitConfigurationStepsWithToken("${{ github.token }}", "${{ github.repository }}")...)
 
-	evalsArtifactName := artifactPrefixExprForDownstreamJob(data) + constants.EvalsArtifactName
+	evalsArtifactName := artifactPrefixExprForDownstreamJob(data) + constants.EvalsArtifactName.String()
+	downloadAction := c.getActionPin("actions/download-artifact")
 	steps = append(steps,
 		"      - name: Download evals artifact\n",
-		fmt.Sprintf("        uses: %s\n", c.getActionPin("actions/download-artifact")),
+		fmt.Sprintf("        uses: %s\n", downloadAction),
 		"        continue-on-error: true\n",
 		"        with:\n",
-		fmt.Sprintf("          name: %s\n", evalsArtifactName),
-		fmt.Sprintf("          path: %s\n", evalsStateDir),
 	)
+	steps = append(steps, downloadArtifactInputLines(evalsArtifactName, downloadAction)...)
+	steps = append(steps, fmt.Sprintf("          path: %s\n", evalsStateDir))
 
-	branchName := evalsBranchName(data.WorkflowID)
-	steps = append(steps,
-		"      - name: Push evals results to git\n",
-		"        id: push_evals_state\n",
-		"        if: always()\n",
-		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
-		"        env:\n",
-		"          GH_TOKEN: ${{ github.token }}\n",
-		"          GITHUB_RUN_ID: ${{ github.run_id }}\n",
-		"          GITHUB_SERVER_URL: ${{ github.server_url }}\n",
-		fmt.Sprintf("          GH_AW_STATE_DIR: %s\n", evalsStateDir),
-		fmt.Sprintf("          GH_AW_STATE_BRANCH: %s\n", branchName),
-		fmt.Sprintf("          GH_AW_STATE_FILES: %s\n", constants.EvalsResultFilename),
-		"          GH_AW_STATE_LABEL: evals results\n",
-		"        with:\n",
-		"          script: |\n",
-		"            const { setupGlobals } = require('"+SetupActionDestination+"/setup_globals.cjs');\n",
-		"            setupGlobals(core, github, context, exec, io, getOctokit);\n",
-		"            const { main } = require('"+SetupActionDestination+"/push_experiment_state.cjs');\n",
-		"            await main();\n",
-	)
+	steps = append(steps, buildPushEvalsStateScript(data)...)
 
 	if c.actionMode.IsDev() {
 		steps = append(steps, c.generateRestoreActionsSetupStep())
@@ -189,4 +183,30 @@ func (c *Compiler) buildPushEvalsStateJob(data *WorkflowData) (*Job, error) {
 	}
 
 	return job, nil
+}
+
+// buildPushEvalsStateScript builds the step that pushes evals.jsonl to the evals state
+// branch. push_evals_state.cjs skips not-evaluated input (evals_status.json) before the
+// generic state writer runs, so the branch keeps answer history only.
+func buildPushEvalsStateScript(data *WorkflowData) []string {
+	return []string{
+		"      - name: Push evals results to git\n",
+		"        id: push_evals_state\n",
+		"        if: always()\n",
+		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
+		"        env:\n",
+		"          GH_TOKEN: ${{ github.token }}\n",
+		"          GITHUB_RUN_ID: ${{ github.run_id }}\n",
+		"          GITHUB_SERVER_URL: ${{ github.server_url }}\n",
+		fmt.Sprintf("          GH_AW_STATE_DIR: %s\n", evalsStateDir),
+		fmt.Sprintf("          GH_AW_STATE_BRANCH: %s\n", evalsBranchName(data.WorkflowID)),
+		fmt.Sprintf("          GH_AW_STATE_FILES: %s\n", constants.EvalsResultFilename),
+		"          GH_AW_STATE_LABEL: evals results\n",
+		"        with:\n",
+		"          script: |\n",
+		"            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n",
+		"            setupGlobals(core, github, context, exec, io, getOctokit);\n",
+		"            const { main } = require('" + SetupActionDestination + "/push_evals_state.cjs');\n",
+		"            await main();\n",
+	}
 }

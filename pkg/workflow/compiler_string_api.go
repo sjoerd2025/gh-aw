@@ -10,6 +10,7 @@ import (
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/stringutil"
+	"github.com/github/gh-aw/pkg/workflow/aw"
 )
 
 var compilerStringAPILog = logger.New("workflow:compiler_string_api")
@@ -20,6 +21,10 @@ func (c *Compiler) CompileToYAML(workflowData *WorkflowData, markdownPath string
 	compilerStringAPILog.Printf("CompileToYAML: markdownPath=%s", markdownPath)
 	c.markdownPath = markdownPath
 	c.skipHeader = true
+	c.configureGHESCompatibility()
+	if workflowData != nil {
+		workflowData.GHES = c.ghesArtifactCompat
+	}
 	// Clear contentOverride after compilation (set by ParseWorkflowString)
 	defer func() { c.contentOverride = "" }()
 
@@ -57,8 +62,9 @@ func (c *Compiler) CompileToYAML(workflowData *WorkflowData, markdownPath string
 func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*WorkflowData, error) {
 	workflowLog.Printf("ParseWorkflowString: parsing %d bytes with virtual path %s", len(content), virtualPath)
 
+	c.configureGHESCompatibility()
+
 	cleanPath := filepath.Clean(virtualPath)
-	contentBytes := []byte(content)
 
 	// Store content so downstream code can use it instead of reading from disk.
 	// Cleared in CompileToYAML after compilation completes.
@@ -68,17 +74,35 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 	// since runtime-import macros cannot resolve without filesystem access
 	c.inlinePrompt = true
 
-	// Parse frontmatter directly from content string
-	result, err := parser.ExtractFrontmatterFromContent(content)
+	parseResult, err := c.parseStringFrontmatter(content, cleanPath)
 	if err != nil {
-		frontmatterStart := 2
-		if result != nil && result.FrontmatterStart > 0 {
-			frontmatterStart = result.FrontmatterStart
-		}
-		return nil, c.createFrontmatterError(cleanPath, content, err, frontmatterStart)
+		return nil, err
 	}
+	ctx := newWorkflowBuildContext(parseResult)
+	if err := c.setupWorkflowBuildContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.validateStringWorkflowData(ctx.workflowData, cleanPath); err != nil {
+		return nil, err
+	}
+	if err := c.populateWorkflowBuildContext(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.applyDefaults(ctx.workflowData, cleanPath); err != nil {
+		return nil, err
+	}
+	return ctx.workflowData, nil
+}
 
-	if len(result.Frontmatter) == 0 {
+func (c *Compiler) parseStringFrontmatter(content, cleanPath string) (*frontmatterParseResult, error) {
+	// Parse frontmatter directly from content string
+	document, err := aw.Parse(content)
+	if err != nil {
+		return nil, c.createFrontmatterError(cleanPath, content, err, 2)
+	}
+	result := document.FrontmatterResult()
+
+	if !hasMeaningfulFrontmatter(result) {
 		return nil, errors.New("no frontmatter found")
 	}
 
@@ -109,7 +133,7 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 		return nil, &SharedWorkflowError{Path: cleanPath}
 	}
 
-	if err := c.validateEngineBeforeSchema(cleanPath, contentBytes, result, frontmatterForValidation); err != nil {
+	if err := c.validateEngineBeforeSchema(cleanPath, []byte(content), result, frontmatterForValidation); err != nil {
 		compilerStringAPILog.Printf("ParseWorkflowString: string engine pre-validation failed for %s", cleanPath)
 		return nil, err
 	}
@@ -123,61 +147,48 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 	compilerStringAPILog.Printf("ParseWorkflowString: frontmatter validated, frontmatter_fields=%d", len(frontmatterForValidation))
 
 	// Build parse result to reuse the rest of the orchestrator pipeline
-	parseResult := &frontmatterParseResult{
-		cleanPath:                cleanPath,
-		content:                  contentBytes,
-		frontmatterResult:        result,
-		frontmatterForValidation: frontmatterForValidation,
-		markdownDir:              filepath.Dir(cleanPath),
-		isSharedWorkflow:         false,
-	}
+	parsed := createFrontmatterParseResult(cleanPath, []byte(content), result, frontmatterForValidation)
+	parsed.document = document
+	return parsed, nil
+}
 
-	// Setup engine and process imports
-	engineSetup, err := c.setupEngineAndImports(parseResult.frontmatterResult, parseResult.cleanPath, parseResult.content, parseResult.markdownDir)
-	if err != nil {
-		return nil, err
-	}
-
-	// Process tools and markdown
-	toolsResult, err := c.processToolsAndMarkdown(parseResult.frontmatterResult, parseResult.cleanPath, parseResult.markdownDir, engineSetup.agenticEngine, engineSetup.engineSetting, engineSetup.importsResult)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build initial workflow data structure
-	workflowData := c.buildInitialWorkflowData(parseResult.frontmatterResult, toolsResult, engineSetup, engineSetup.importsResult)
-	workflowData.WorkflowID = GetWorkflowIDFromPath(cleanPath)
-
+func (c *Compiler) validateStringWorkflowData(workflowData *WorkflowData, cleanPath string) error {
 	// Validate bash tool configuration
 	if err := validateBashToolConfig(workflowData.ParsedTools, workflowData.Name); err != nil {
-		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+		return fmt.Errorf("%s: %w", cleanPath, err)
+	}
+
+	// Validate that cli-proxy is not enabled while shell execution is refused
+	if err := validateCLIProxyBashCompatibility(workflowData.Tools, workflowData.Name); err != nil {
+		return fmt.Errorf("%s: %w", cleanPath, err)
 	}
 
 	// Validate optional engine.mcp.session-timeout configuration.
 	if err := c.validateEngineMCPSessionTimeout(workflowData); err != nil {
-		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+		return fmt.Errorf("%s: %w", cleanPath, err)
 	}
 
 	// Validate optional engine.mcp.tool-timeout configuration.
 	if err := c.validateEngineMCPToolTimeout(workflowData); err != nil {
-		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+		return fmt.Errorf("%s: %w", cleanPath, err)
 	}
 
 	// Validate GitHub tool configuration
 	if err := validateGitHubToolConfig(workflowData.ParsedTools, workflowData.Name); err != nil {
-		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+		return fmt.Errorf("%s: %w", cleanPath, err)
 	}
 
 	// Validate GitHub tool read-only configuration
 	if err := validateGitHubReadOnly(workflowData.ParsedTools, workflowData.Name); err != nil {
-		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+		return fmt.Errorf("%s: %w", cleanPath, err)
 	}
 
 	// Validate GitHub guard policy configuration
 	if err := validateGitHubGuardPolicy(workflowData.ParsedTools, workflowData.Name); err != nil {
-		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+		return fmt.Errorf("%s: %w", cleanPath, err)
 	}
 	emitGitHubLockdownGuardPolicyWarning(c, workflowData.ParsedTools, cleanPath)
+	emitMinIntegrityNoneBashWarning(c, workflowData.ParsedTools, cleanPath)
 
 	// Validate integrity-reactions feature configuration
 	var gatewayConfig *MCPGatewayRuntimeConfig
@@ -185,42 +196,7 @@ func (c *Compiler) ParseWorkflowString(content string, virtualPath string) (*Wor
 		gatewayConfig = workflowData.SandboxConfig.MCP
 	}
 	if err := validateIntegrityReactions(workflowData.ParsedTools, workflowData.Name, workflowData, gatewayConfig); err != nil {
-		return nil, fmt.Errorf("%s: %w", cleanPath, err)
+		return fmt.Errorf("%s: %w", cleanPath, err)
 	}
-
-	// Setup action cache and resolver
-	actionCache, actionResolver := c.getSharedActionResolver()
-	workflowData.Ctx = c.ctx
-	workflowData.ActionCache = actionCache
-	workflowData.ActionResolver = actionResolver
-	workflowData.ActionPinWarnings = c.actionPinWarnings
-	workflowData.ActionPinMappings = c.getActionPinMappings()
-	workflowData.ContainerPinMappings = c.getContainerPinMappings()
-
-	// Extract YAML configuration sections
-	if err := c.extractYAMLSections(parseResult.frontmatterResult.Frontmatter, workflowData); err != nil {
-		return nil, fmt.Errorf("failed to extract YAML sections: %w", err)
-	}
-
-	// Merge features from imports
-	if len(engineSetup.importsResult.MergedFeatures) > 0 {
-		compilerStringAPILog.Printf("ParseWorkflowString: merging %d features from imports", len(engineSetup.importsResult.MergedFeatures))
-		mergedFeatures, err := c.MergeFeatures(workflowData.Features, engineSetup.importsResult.MergedFeatures)
-		if err != nil {
-			return nil, fmt.Errorf("failed to merge features from imports: %w", err)
-		}
-		workflowData.Features = mergedFeatures
-	}
-
-	// Process and merge custom steps
-	if err := c.processAndMergeSteps(parseResult.frontmatterResult.Frontmatter, workflowData, engineSetup.importsResult); err != nil {
-		return nil, err
-	}
-
-	// Apply defaults
-	if err := c.applyDefaults(workflowData, cleanPath); err != nil {
-		return nil, err
-	}
-
-	return workflowData, nil
+	return nil
 }

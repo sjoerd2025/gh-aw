@@ -1,5 +1,8 @@
 ---
 private: true
+engine:
+  id: copilot
+  copilot-sdk: true
 emoji: "🔧"
 name: Code Simplifier
 description: Analyzes recently modified code and creates pull requests with simplifications that improve clarity, consistency, and maintainability while preserving functionality
@@ -17,6 +20,7 @@ permissions:
 tracker-id: code-simplifier
 
 imports:
+  - shared/mcp-pagination.md
   - uses: shared/skip-if-issue-open.md
     with:
       title-prefix: "[code-simplifier]"
@@ -32,17 +36,15 @@ imports:
           - .github/extensions/
 
   - shared/otlp.md
+  - shared/graders.md
 network:
   allowed:
     - go
 
-sandbox:
-  agent:
-    sudo: false
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   bash: ["*"]
 
@@ -139,6 +141,7 @@ evals:
     question: Did the agent analyze recently modified code for simplification opportunities?
   - id: pr_created_or_noop
     question: Was a pull request created with simplifications, or was noop used when no improvements were needed?
+
 ---
 
 # Code Simplifier Agent
@@ -258,8 +261,8 @@ You MUST finish by calling exactly one safe-output tool:
 2. `noop` with the no-beneficial-simplifications message above
 3. `noop` with the run-budget-ceiling message above
 4. `create_pull_request` when meaningful validated simplifications are ready
-5. `missing_tool` when blocked by unavailable tooling
-6. `missing_data` when blocked by missing required data
+5. `report_missing_tool` when blocked by unavailable tooling
+6. `report_missing_data` when blocked by missing required data
 
 Do not finish with plain text only. The safe-output tool call is required.
 ## agent: `scope-filter`

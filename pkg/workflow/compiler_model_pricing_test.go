@@ -178,23 +178,63 @@ func TestResolveModelPricingIfMissing_AlreadyPresent(t *testing.T) {
 	}
 	called := false
 	c := &Compiler{}
-	c.SetModelPricingResolver(func(_ context.Context, _, _ string) (map[string]float64, bool) {
+	c.modelPricingResolver = func(_ context.Context, _, _ string) (map[string]float64, bool) {
 		called = true
 		return nil, false
-	})
+	}
 	result := c.resolveModelPricingIfMissing(existing, &WorkflowData{Model: "gpt-99", EngineConfig: &EngineConfig{ID: "codex"}})
 	assert.False(t, called, "resolver should not be called when pricing is already present")
 	assert.Equal(t, existing, result)
 }
 
+func TestResolveModelPricingIfMissing_ParameterizedModels(t *testing.T) {
+	for _, tc := range []struct {
+		engine, identifier, provider, model string
+	}{
+		{"codex", "gpt-6.1-sol?effort=high", "openai", "gpt-6.1-sol"},
+		{"codex", "openai/gpt-6.1-sol?effort=high&temperature=0.2", "openai", "gpt-6.1-sol"},
+		{"copilot", "gpt-6.1-sol?temperature=0.2", "github-copilot", "gpt-6.1-sol"},
+		{"copilot", "copilot/gpt-6.1-sol?effort=high", "github-copilot", "gpt-6.1-sol"},
+		{"copilot", "github-copilot/gpt-6.1-sol?effort=high", "github-copilot", "gpt-6.1-sol"},
+		{"copilot", "github_models/gpt-6.1-sol?effort=high", "github-copilot", "gpt-6.1-sol"},
+		{"codex", "openai/GPT_6.1_SOL?effort=high", "openai", "gpt_6.1_sol"},
+	} {
+		t.Run(tc.identifier, func(t *testing.T) {
+			called := false
+			c := &Compiler{}
+			c.modelPricingResolver = func(_ context.Context, provider, model string) (map[string]float64, bool) {
+				called = true
+				assert.Equal(t, tc.provider, provider)
+				assert.Equal(t, tc.model, model)
+				return map[string]float64{"input": 2e-06}, true
+			}
+			data := &WorkflowData{Model: tc.identifier, EngineConfig: &EngineConfig{ID: tc.engine}}
+			result := c.resolveModelPricingIfMissing(nil, data)
+			require.True(t, called)
+			models := result["providers"].(map[string]any)[tc.provider].(map[string]any)["models"].(map[string]any)
+			require.Len(t, models, 1)
+			require.Contains(t, models, tc.model)
+			for model := range models {
+				assert.NotContains(t, model, "?")
+			}
+
+			existing := mergeModelPricingIntoModelCosts(nil, tc.provider, tc.model, map[string]float64{"input": 9e-06})
+			called = false
+			assert.Equal(t, existing, c.resolveModelPricingIfMissing(existing, data))
+			assert.False(t, called, "base-model frontmatter pricing must take precedence")
+			assert.Equal(t, tc.identifier, data.Model, "pricing resolution must not change the execution identifier")
+		})
+	}
+}
+
 func TestResolveModelPricingIfMissing_InjectsFromResolver(t *testing.T) {
 	c := &Compiler{}
-	c.SetModelPricingResolver(func(_ context.Context, provider, model string) (map[string]float64, bool) {
+	c.modelPricingResolver = func(_ context.Context, provider, model string) (map[string]float64, bool) {
 		if provider == "anthropic" && model == "claude-new-model" {
 			return map[string]float64{"input": 3e-06, "output": 15e-06}, true
 		}
 		return nil, false
-	})
+	}
 
 	result := c.resolveModelPricingIfMissing(nil, &WorkflowData{Model: "claude-new-model", EngineConfig: &EngineConfig{ID: "claude"}})
 	require.NotNil(t, result)
@@ -206,9 +246,9 @@ func TestResolveModelPricingIfMissing_InjectsFromResolver(t *testing.T) {
 
 func TestResolveModelPricingIfMissing_ResolverReturnsNothing(t *testing.T) {
 	c := &Compiler{}
-	c.SetModelPricingResolver(func(_ context.Context, _, _ string) (map[string]float64, bool) {
+	c.modelPricingResolver = func(_ context.Context, _, _ string) (map[string]float64, bool) {
 		return nil, false
-	})
+	}
 	result := c.resolveModelPricingIfMissing(nil, &WorkflowData{Model: "mystery-model", EngineConfig: &EngineConfig{ID: "claude"}})
 	// Should return the original (nil) map unchanged.
 	assert.Nil(t, result)
@@ -216,11 +256,11 @@ func TestResolveModelPricingIfMissing_ResolverReturnsNothing(t *testing.T) {
 
 func TestResolveModelPricingIfMissing_SplitsQualifiedModelAndNormalizesProvider(t *testing.T) {
 	c := &Compiler{}
-	c.SetModelPricingResolver(func(_ context.Context, provider, model string) (map[string]float64, bool) {
+	c.modelPricingResolver = func(_ context.Context, provider, model string) (map[string]float64, bool) {
 		assert.Equal(t, "github-copilot", provider)
 		assert.Equal(t, "claude-sonnet-4.6", model)
 		return map[string]float64{"input": 3e-06}, true
-	})
+	}
 
 	result := c.resolveModelPricingIfMissing(nil, &WorkflowData{
 		Model:        "github_models/claude-sonnet-4.6",
@@ -236,10 +276,10 @@ func TestResolveModelPricingIfMissing_SplitsQualifiedModelAndNormalizesProvider(
 func TestResolveModelPricingIfMissing_SkipsWhenProviderCannotBeNormalized(t *testing.T) {
 	c := &Compiler{}
 	called := false
-	c.SetModelPricingResolver(func(_ context.Context, _, _ string) (map[string]float64, bool) {
+	c.modelPricingResolver = func(_ context.Context, _, _ string) (map[string]float64, bool) {
 		called = true
 		return map[string]float64{"input": 1e-06}, true
-	})
+	}
 
 	result := c.resolveModelPricingIfMissing(nil, &WorkflowData{
 		Model:        "claude-sonnet-4.6",
@@ -253,10 +293,10 @@ func TestResolveModelPricingIfMissing_SkipsWhenProviderCannotBeNormalized(t *tes
 func TestResolveModelPricingIfMissing_SkipsMalformedQualifiedModel(t *testing.T) {
 	c := &Compiler{}
 	called := false
-	c.SetModelPricingResolver(func(_ context.Context, _, _ string) (map[string]float64, bool) {
+	c.modelPricingResolver = func(_ context.Context, _, _ string) (map[string]float64, bool) {
 		called = true
 		return map[string]float64{"input": 1e-06}, true
-	})
+	}
 
 	assert.Nil(t, c.resolveModelPricingIfMissing(nil, &WorkflowData{Model: "/gpt-4.1", EngineConfig: &EngineConfig{}}))
 	assert.Nil(t, c.resolveModelPricingIfMissing(nil, &WorkflowData{Model: "openai/", EngineConfig: &EngineConfig{}}))
@@ -266,10 +306,10 @@ func TestResolveModelPricingIfMissing_SkipsMalformedQualifiedModel(t *testing.T)
 func TestResolveModelPricingIfMissing_SkipsDynamicAutoModelAlias(t *testing.T) {
 	c := &Compiler{}
 	called := false
-	c.SetModelPricingResolver(func(_ context.Context, _, _ string) (map[string]float64, bool) {
+	c.modelPricingResolver = func(_ context.Context, _, _ string) (map[string]float64, bool) {
 		called = true
 		return map[string]float64{"input": 1e-06}, true
-	})
+	}
 
 	assert.Nil(t, c.resolveModelPricingIfMissing(nil, &WorkflowData{
 		Model:        "auto",
@@ -277,6 +317,10 @@ func TestResolveModelPricingIfMissing_SkipsDynamicAutoModelAlias(t *testing.T) {
 	}))
 	assert.Nil(t, c.resolveModelPricingIfMissing(nil, &WorkflowData{
 		Model:        "github_models/auto",
+		EngineConfig: &EngineConfig{ID: "copilot"},
+	}))
+	assert.Nil(t, c.resolveModelPricingIfMissing(nil, &WorkflowData{
+		Model:        "copilot/auto?effort=high",
 		EngineConfig: &EngineConfig{ID: "copilot"},
 	}))
 	assert.False(t, called)

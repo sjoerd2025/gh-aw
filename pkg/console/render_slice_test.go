@@ -15,11 +15,12 @@ type SliceTestStruct struct {
 }
 
 func TestRenderSlice_EmptySlice(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	emptySlice := []int{}
 	val := reflect.ValueOf(emptySlice)
 
-	renderSlice(val, "Empty List", &output, 0)
+	renderSliceWithRenderer(val, "Empty List", &output, 0, RenderTable)
 
 	// Empty slice should produce no output
 	if output.String() != "" {
@@ -28,11 +29,12 @@ func TestRenderSlice_EmptySlice(t *testing.T) {
 }
 
 func TestRenderSlice_NoTitle(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	data := []int{1, 2, 3}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "", &output, 0)
+	renderSliceWithRenderer(val, "", &output, 0, RenderTable)
 
 	result := output.String()
 	// Should not have title header
@@ -46,11 +48,12 @@ func TestRenderSlice_NoTitle(t *testing.T) {
 }
 
 func TestRenderSlice_WithTitleDepth0(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	data := []string{"a", "b", "c"}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "My List", &output, 0)
+	renderSliceWithRenderer(val, "My List", &output, 0, RenderTable)
 
 	result := output.String()
 	// Depth 0 should use single # header
@@ -64,11 +67,12 @@ func TestRenderSlice_WithTitleDepth0(t *testing.T) {
 }
 
 func TestRenderSlice_WithTitleDepth1(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	data := []string{"x", "y"}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "Nested List", &output, 1)
+	renderSliceWithRenderer(val, "Nested List", &output, 1, RenderTable)
 
 	result := output.String()
 	// Depth 1 should use ## header (depth + 1 = 2 hashes)
@@ -78,11 +82,12 @@ func TestRenderSlice_WithTitleDepth1(t *testing.T) {
 }
 
 func TestRenderSlice_WithTitleDepth2(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	data := []int{10, 20}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "Deep List", &output, 2)
+	renderSliceWithRenderer(val, "Deep List", &output, 2, RenderTable)
 
 	result := output.String()
 	// Depth 2 should use ### header (depth + 1 = 3 hashes)
@@ -92,6 +97,7 @@ func TestRenderSlice_WithTitleDepth2(t *testing.T) {
 }
 
 func TestRenderSlice_SimpleTypesAsList(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		data     any
@@ -124,7 +130,7 @@ func TestRenderSlice_SimpleTypesAsList(t *testing.T) {
 			var output strings.Builder
 			val := reflect.ValueOf(tt.data)
 
-			renderSlice(val, "", &output, 0)
+			renderSliceWithRenderer(val, "", &output, 0, RenderTable)
 
 			result := output.String()
 			for _, expected := range tt.expected {
@@ -137,6 +143,7 @@ func TestRenderSlice_SimpleTypesAsList(t *testing.T) {
 }
 
 func TestRenderSlice_StructsAsTable(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	data := []SliceTestStruct{
 		{ID: 1, Name: "first"},
@@ -144,7 +151,7 @@ func TestRenderSlice_StructsAsTable(t *testing.T) {
 	}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "Test Table", &output, 0)
+	renderSliceWithRenderer(val, "Test Table", &output, 0, RenderTable)
 
 	result := output.String()
 
@@ -169,6 +176,7 @@ func TestRenderSlice_StructsAsTable(t *testing.T) {
 }
 
 func TestRenderSlice_PointerToStructsAsTable(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	data := []*SliceTestStruct{
 		{ID: 10, Name: "alpha"},
@@ -176,7 +184,7 @@ func TestRenderSlice_PointerToStructsAsTable(t *testing.T) {
 	}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "Pointer Table", &output, 0)
+	renderSliceWithRenderer(val, "Pointer Table", &output, 0, RenderTable)
 
 	result := output.String()
 
@@ -193,6 +201,7 @@ func TestRenderSlice_PointerToStructsAsTable(t *testing.T) {
 }
 
 func TestRenderSlice_DoublePointerToStructsAsTable(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 
 	// Create double pointer elements
@@ -209,7 +218,7 @@ func TestRenderSlice_DoublePointerToStructsAsTable(t *testing.T) {
 	val = reflect.Append(val, reflect.ValueOf(pps1))
 	val = reflect.Append(val, reflect.ValueOf(pps2))
 
-	renderSlice(val, "", &output, 0)
+	renderSliceWithRenderer(val, "", &output, 0, RenderTable)
 
 	result := output.String()
 
@@ -223,11 +232,12 @@ func TestRenderSlice_DoublePointerToStructsAsTable(t *testing.T) {
 }
 
 func TestRenderSlice_EmptyStructSliceAsTable(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	data := []SliceTestStruct{}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "Empty Structs", &output, 0)
+	renderSliceWithRenderer(val, "Empty Structs", &output, 0, RenderTable)
 
 	result := output.String()
 
@@ -238,11 +248,12 @@ func TestRenderSlice_EmptyStructSliceAsTable(t *testing.T) {
 }
 
 func TestRenderSlice_SingleElementList(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	data := []string{"only one"}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "Single Item", &output, 0)
+	renderSliceWithRenderer(val, "Single Item", &output, 0, RenderTable)
 
 	result := output.String()
 
@@ -255,6 +266,7 @@ func TestRenderSlice_SingleElementList(t *testing.T) {
 }
 
 func TestRenderSlice_MixedContentInList(t *testing.T) {
+	t.Parallel()
 	var output strings.Builder
 	// Test with various characters that might need formatting
 	data := []string{
@@ -266,7 +278,7 @@ func TestRenderSlice_MixedContentInList(t *testing.T) {
 	}
 	val := reflect.ValueOf(data)
 
-	renderSlice(val, "", &output, 0)
+	renderSliceWithRenderer(val, "", &output, 0, RenderTable)
 
 	result := output.String()
 

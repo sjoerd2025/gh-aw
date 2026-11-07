@@ -2,7 +2,8 @@
 private: true
 emoji: "📅"
 description: Daily report analyzing repository issues with clustering, metrics, and trend charts
-on: daily
+on:
+  workflow_dispatch:
 max-daily-ai-credits: 10000
 permissions:
   contents: read
@@ -20,8 +21,11 @@ strict: true
 tracker-id: daily-issues-report
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
+  work-queue:
+    worker: true
+    require-assignment: true
   cli-proxy: true
   github:
     mode: gh-proxy
@@ -33,21 +37,22 @@ runtimes:
     version: "22"
 experiments:
   output_format:
-    variants: [collapsible, inline]
-    description: "Test whether hiding report details behind a <details> block vs. presenting them inline affects discussion engagement"
-    hypothesis: "H0: no change in discussion engagement score. H1: inline format produces ≥20% higher reactions+replies by making charts and recommendations immediately visible"
+    variants: [collapsible, inline, ste]
+    description: "Test whether hiding report details behind a <details> block, presenting them inline, or writing in Simplified Technical English (STE) affects discussion engagement"
+    hypothesis: "H0: no change in discussion engagement score. H1: inline format produces ≥20% higher reactions+replies by making charts and recommendations immediately visible; ste format improves engagement via clearer, simpler language."
     metric: discussion_engagement_score
-    secondary_metrics: [output_length_chars, run_duration_ms]
+    secondary_metrics: [output_length_chars, run_duration_ms, "eval:output_format_adherence"]
     guardrail_metrics:
       - name: empty_output_rate
         threshold: "==0"
     min_samples: 30
-    weight: [50, 50]
+    weight: [34, 33, 33]
     start_date: "2026-05-07"
     issue: 30573
     analysis_type: mann_whitney
     tags: [output, readability, engagement]
 imports:
+  - shared/daily-report-worker.md
   - shared/github-guard-policy.md
   - uses: shared/daily-audit-base.md
     with:
@@ -65,6 +70,8 @@ evals:
     question: Did the workflow analyze the prefetched issues data and generate a clustered daily issues report with metrics and trends?
   - id: discussion-created
     question: Was a daily issues discussion created successfully with the report findings and recommendations?
+  - id: output_format_adherence
+    question: Does the report match the writing style expected for the assigned output_format variant (e.g., short active-voice sentences with one fact per sentence when the variant is "ste")?
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -263,19 +270,11 @@ Use the `upload asset` tool to upload both charts:
 2. Upload `/tmp/gh-aw/python/charts/issue_clusters.png`
 3. Collect the returned URLs for embedding in the discussion
 
-## Phase 5: Close Previous Discussions
-
-Before creating the new discussion, find and close previous daily issues discussions:
-
-1. Search for discussions with title prefix "[daily issues]"
-2. Close each found discussion with reason "OUTDATED"
-3. Add a closing comment: "This discussion has been superseded by a newer daily issues report."
-
-Use the `close_discussion` safe output for each discussion found.
-
-## Phase 6: Create Discussion Report
+## Phase 5: Create Discussion Report
 
 Create a new discussion with the comprehensive report.
+
+Older daily issues discussions are closed automatically by `close-older-discussions: true` via `shared/daily-audit-discussion.md`.
 
 **Formatting Guideline**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. The discussion title serves as h1, so all content headers should start at h3.
 
@@ -288,6 +287,15 @@ Create a new discussion with the comprehensive report.
 ### Discussion Format
 
 **Title**: `[daily issues] Daily Issues Report - YYYY-MM-DD`
+
+{{#if experiments.output_format == 'ste'}}
+**Simplified Technical English (STE) Variant**: Write every sentence in the body using Simplified Technical English rules:
+- Use short sentences. Limit each sentence to 20 words or fewer.
+- Write one fact per sentence.
+- Use active voice and present tense.
+- Use simple, familiar words. Do not use jargon.
+- Spell out each acronym on first use.
+{{/if}}
 
 **Body**:
 

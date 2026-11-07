@@ -21,7 +21,7 @@ func TestEngineCatalog_IDs(t *testing.T) {
 	require.NotEmpty(t, ids, "IDs() should return a non-empty list")
 
 	// Verify all built-in engines are present
-	expectedIDs := []string{"antigravity", "claude", "codex", "copilot", "gemini", "opencode", "pi"}
+	expectedIDs := []string{"agy", "claude", "codex", "copilot", "gemini", "pi"}
 	assert.Equal(t, expectedIDs, ids, "IDs() should return all built-in engines in sorted order")
 
 	// Verify the list is sorted
@@ -45,6 +45,19 @@ func TestEngineCatalog_All(t *testing.T) {
 		assert.Equal(t, ids[i], def.ID, "All()[%d].ID should match IDs()[%d]", i, i)
 		assert.NotEmpty(t, def.DisplayName, "All()[%d].DisplayName should not be empty", i)
 	}
+}
+
+func TestEngineCatalog_GeminiDeprecated(t *testing.T) {
+	catalog := NewEngineCatalog(NewEngineRegistry())
+	for _, def := range catalog.All() {
+		if def.ID == "gemini" {
+			assert.Contains(t, def.Description, "Deprecated")
+			assert.Contains(t, def.Description, "agy")
+			assert.Equal(t, NewGeminiEngine().GetDescription(), def.Description)
+			return
+		}
+	}
+	t.Fatal("deprecated Gemini engine must remain selectable")
 }
 
 // engineSchemaOneOfVariants parses the main workflow schema and returns the
@@ -82,7 +95,7 @@ func TestEngineCatalog_BuiltInsPresent(t *testing.T) {
 	registry := NewEngineRegistry()
 	catalog := NewEngineCatalog(registry)
 
-	expected := []string{"claude", "codex", "copilot", "gemini", "opencode", "pi"}
+	expected := []string{"claude", "codex", "copilot", "gemini", "pi"}
 	catalogIDs := catalog.IDs()
 	for _, id := range expected {
 		assert.Contains(t, catalogIDs, id,
@@ -90,14 +103,13 @@ func TestEngineCatalog_BuiltInsPresent(t *testing.T) {
 	}
 }
 
-// TestEngineCatalogMatchesSchema asserts that the engine_config schema has the expected
-// structure: a plain-string variant (for built-ins and named catalog entries), an
-// object-with-id variant, and an inline-definition variant (object-with-runtime).
+// TestEngineCatalogMatchesSchema asserts that the engine_config schema retains its
+// built-in, named, inline-definition, shared-workflow, and Pi configuration variants.
 // A failure here means the schema structure has changed unexpectedly.
 func TestEngineCatalogMatchesSchema(t *testing.T) {
 	variants := engineSchemaOneOfVariants(t)
 
-	require.Len(t, variants, 6, "engine_config oneOf should have exactly 6 variants: string, object-with-id, object-with-runtime, engine-definition, mcp-only, model-only")
+	require.Len(t, variants, 7, "engine_config oneOf should have exactly 7 variants: string, object-with-id, object-with-runtime, engine-definition, mcp-only, model-only, pi-options")
 
 	// Variant 0: plain string (no enum — allows built-ins and custom named catalog entries)
 	assert.Equal(t, "string", variants[0]["type"],
@@ -162,4 +174,19 @@ func TestEngineCatalogMatchesSchema(t *testing.T) {
 		"model-only variant must NOT have an 'id' property")
 	assert.NotContains(t, props5, "runtime",
 		"model-only variant must NOT have a 'runtime' property")
+
+	// Variant 6: Pi-specific options, including durable execution
+	assert.Equal(t, "object", variants[6]["type"],
+		"seventh variant should be type object (Pi options)")
+	props6, ok := variants[6]["properties"].(map[string]any)
+	require.True(t, ok, "seventh variant should have properties")
+	require.Len(t, props6, 1, "Pi options variant should only expose the 'pi' property")
+	piProp, ok := props6["pi"].(map[string]any)
+	require.True(t, ok, "pi property should be a map")
+	assert.Equal(t, "#/$defs/pi_engine_config", piProp["$ref"],
+		"pi property should reference the Pi configuration schema")
+	assert.Equal(t, []any{"pi"}, variants[6]["required"],
+		"Pi options variant must require the 'pi' property")
+	assert.Equal(t, false, variants[6]["additionalProperties"],
+		"Pi options variant must reject unknown properties")
 }

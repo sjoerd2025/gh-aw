@@ -4,16 +4,15 @@ emoji: "📦"
 description: Generates a comprehensive summary of GitHub Actions artifacts usage across all workflows in the repository
 on:
   workflow_dispatch:
-  schedule: weekly on sunday around 06:00
 max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
   copilot-requests: write
 engine:
-  id: copilot
-  copilot-sdk: true
-max-tool-denials: 3
+  id: codex
+  model-provider: openai
+model: openai/gpt-6-luna
 network:
   allowed:
     - defaults
@@ -21,26 +20,31 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 tools:
+  work-queue:
+    worker: true
+    require-assignment: true
   cli-proxy: true
   edit:
   bash: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [actions, repos]
 safe-outputs:
   create-discussion:
     expires: 1d
     category: "artifacts"
     max: 1
+    fallback-to-issue: false
     close-older-discussions: true
 timeout-minutes: 15
 strict: true
 imports:
+  - shared/daily-report-worker.md
   - shared/reporting.md
   - shared/safe-output-app.md
   - shared/otlp.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
 evals:
@@ -48,6 +52,7 @@ evals:
     question: Did the agent analyze GitHub Actions artifacts usage across all workflows in the repository?
   - id: summary_produced
     question: Was a comprehensive summary report of artifacts usage produced?
+
 ---
 
 ### Artifacts Summary
@@ -62,7 +67,7 @@ Generate a comprehensive summary table of GitHub Actions artifacts usage in the 
 #### Task Requirements
 
 1. **Analyze all workflows** in the repository to identify which ones generate artifacts
-2. **Collect artifact data** for recent workflow runs (last 30 days recommended)
+2. **Collect artifact data** for the 30-day window ending at midnight UTC after the assigned `report_date`; exclude runs outside that window
 3. **Generate a summary table** with the following columns:
    - Workflow Name
    - Total Artifacts Count
@@ -91,7 +96,7 @@ Please:
 
 #### Output Format
 
-Create an issue with a markdown table like this:
+Create a discussion titled "Artifacts Usage Report - [report_date]" with a markdown table like this:
 
 ```markdown
 # Artifacts Usage Report

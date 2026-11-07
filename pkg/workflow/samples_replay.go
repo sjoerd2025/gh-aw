@@ -3,7 +3,12 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
+	"sort"
 	"strings"
+
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 // SampleEntry is the per-call payload consumed by apply_samples.cjs.
@@ -17,6 +22,82 @@ type SampleEntry struct {
 	// Sidecars carries fields stripped from Arguments that need out-of-band
 	// pre-staging by the driver (e.g. `patch` for create_pull_request).
 	Sidecars map[string]any `json:"sidecars,omitempty"`
+}
+
+// samplesFeatureName is the frontmatter feature flag that opts a single
+// workflow into deterministic samples replay without passing the hidden
+// `gh aw compile --use-samples` flag. It exists so that a workflow which is
+// designed around `samples:` (e.g. the repository's own smoke tests) keeps a
+// stable compiled lock file under a plain `gh aw compile`.
+const samplesFeatureName = "samples"
+
+// samplesFeatureEnabled reports whether the workflow frontmatter declares
+// `features: { samples: true }`.
+func samplesFeatureEnabled(frontmatter map[string]any) bool {
+	if frontmatter == nil {
+		return false
+	}
+	features, ok := frontmatter["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	return samplesFeatureEnabledInMap(features)
+}
+
+// samplesFeatureEnabledInMap reports whether an already-extracted `features`
+// map (as opposed to a raw frontmatter document) enables samples replay.
+func samplesFeatureEnabledInMap(features map[string]any) bool {
+	if features == nil {
+		return false
+	}
+	enabled, ok := features[samplesFeatureName].(bool)
+	return ok && enabled
+}
+
+// samplesEnabled reports whether samples replay is active for the workflow
+// being compiled, either through the hidden `--use-samples` CLI flag or
+// through the per-workflow `features.samples: true` opt-in declared directly
+// in the main frontmatter. It does not see `features.samples: true` declared
+// only in an imported workflow; use samplesEnabledFromImports for that, once
+// imported features have been merged into WorkflowData.Features.
+func (c *Compiler) samplesEnabled(frontmatter map[string]any) bool {
+	return c.useSamples || samplesFeatureEnabled(frontmatter)
+}
+
+// samplesEnabledFromImports reports whether samples replay is active once
+// imported `features` maps have been folded into the main frontmatter's
+// features. It mirrors samplesEnabled, but also honours `features.samples:
+// true` declared only in an imported shared workflow, which the merge in
+// mergeImportedWorkflowConfiguration performs after the main frontmatter is
+// first extracted.
+func (c *Compiler) samplesEnabledFromImports(frontmatter map[string]any, importedFeatures []map[string]any) bool {
+	if c.samplesEnabled(frontmatter) {
+		return true
+	}
+	return slices.ContainsFunc(importedFeatures, samplesFeatureEnabledInMap)
+}
+
+// runtimeVisibleFeatures returns a copy of features with internal
+// compiler-only flags (currently just `samples`) removed. It is used
+// whenever WorkflowData.Features is serialized into runtime-visible
+// metadata (e.g. GH_AW_INFO_FEATURES), so that `features.samples: true`
+// stays a compiler knob rather than becoming part of the observable
+// runtime API.
+func runtimeVisibleFeatures(features map[string]any) map[string]any {
+	if len(features) == 0 {
+		return nil
+	}
+	if _, ok := features[samplesFeatureName]; !ok {
+		return features
+	}
+	result := make(map[string]any, len(features)-1)
+	for k, v := range features {
+		if k == samplesFeatureName {
+			continue
+		}
+		result[k] = v
+	}
+	return result
 }
 
 // collectSampleEntries walks the safe-outputs config and flattens every
@@ -39,10 +120,15 @@ func collectSampleEntries(config *SafeOutputsConfig) []SampleEntry {
 		}
 		sidecarKeys := sampleSidecarFields[toolName]
 		for _, sample := range base.Samples {
+			if dynamicEntry, ok := buildDynamicWorkflowSampleEntry(toolName, sample); ok {
+				entries = append(entries, dynamicEntry)
+				continue
+			}
+
 			args := make(map[string]any, len(sample))
 			var sidecars map[string]any
 			for k, v := range sample {
-				if sidecarKeys[k] {
+				if _, isSidecar := sidecarKeys[k]; isSidecar {
 					if sidecars == nil {
 						sidecars = make(map[string]any)
 					}
@@ -59,6 +145,43 @@ func collectSampleEntries(config *SafeOutputsConfig) []SampleEntry {
 		}
 	}
 	return entries
+}
+
+func buildDynamicWorkflowSampleEntry(toolName string, sample map[string]any) (SampleEntry, bool) {
+	if toolName != "dispatch_workflow" && toolName != "call_workflow" {
+		return SampleEntry{}, false
+	}
+
+	workflowName, _ := sample["workflow_name"].(string)
+	workflowName = strings.TrimSpace(workflowName)
+	if workflowName == "" {
+		return SampleEntry{}, false
+	}
+
+	args := map[string]any{}
+	if rawInputs, ok := sample["inputs"]; ok {
+		if inputs, ok := rawInputs.(map[string]any); ok {
+			maps.Copy(args, inputs)
+		}
+	}
+	if len(args) == 0 {
+		for k, v := range sample {
+			if k == "workflow_name" || k == "inputs" {
+				continue
+			}
+			args[k] = v
+		}
+	}
+	if toolName == "dispatch_workflow" {
+		if ref, ok := sample["ref"]; ok {
+			args["ref"] = ref
+		}
+	}
+
+	return SampleEntry{
+		Tool:      stringutil.NormalizeSafeOutputIdentifier(workflowName),
+		Arguments: args,
+	}, true
 }
 
 // collectSampleRepoTokens walks the workflow's checkout configs and returns
@@ -125,6 +248,25 @@ func marshalRepoTokens(m map[string]string) []byte {
 	return out
 }
 
+// writeSampleReplayInputEnvVars forwards GH_AW_INPUT_* vars referenced by the
+// safe-outputs config so the replay's safe_outputs_config.cjs can resolve
+// ${GH_AW_INPUT_…} placeholders (e.g. push-to-pull-request-branch's
+// `target: ${{ inputs.pull_request_number }}`), the same way the agentic
+// execution step does via applySafeOutputEnvToMap.
+func writeSampleReplayInputEnvVars(yaml *strings.Builder, inputEnvVars map[string]string) {
+	if len(inputEnvVars) == 0 {
+		return
+	}
+	names := make([]string, 0, len(inputEnvVars))
+	for name := range inputEnvVars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(yaml, "          %s: %s\n", name, inputEnvVars[name])
+	}
+}
+
 // generateSamplesReplayStep emits the YAML that replaces the agentic
 // `Execute coding agent` step when the hidden `gh aw compile --use-samples`
 // flag is used. It spawns the safe-outputs MCP server over stdio and feeds it
@@ -170,6 +312,7 @@ func (c *Compiler) generateSamplesReplayStep(yaml *strings.Builder, data *Workfl
 	fmt.Fprintf(yaml, "          GH_AW_AGENT_STDIO_LOG: %s\n", logFile)
 	yaml.WriteString("          GH_AW_SAFE_OUTPUTS_CONFIG_PATH: ${{ runner.temp }}/gh-aw/safeoutputs/config.json\n")
 	yaml.WriteString("          GH_AW_SAFE_OUTPUTS: ${{ runner.temp }}/gh-aw/safeoutputs/outputs.jsonl\n")
+	writeSampleReplayInputEnvVars(yaml, data.SafeOutputsInputEnvVars)
 	// GITHUB_TOKEN is the fallback used by apply_samples.cjs when resolving a
 	// pull-request head ref via the REST API for issue_comment / slash_command
 	// events. For cross-repo samples whose target repository has its own
@@ -186,4 +329,28 @@ func (c *Compiler) generateSamplesReplayStep(yaml *strings.Builder, data *Workfl
 	yaml.WriteString("          set -euo pipefail\n")
 	yaml.WriteString("          mkdir -p \"$(dirname \"$GH_AW_AGENT_STDIO_LOG\")\"\n")
 	yaml.WriteString("          node \"${RUNNER_TEMP}/gh-aw/actions/apply_samples.cjs\"\n")
+}
+
+// safeOutputsMissingSamples returns the frontmatter keys of enabled,
+// non-builtin safe outputs that declare no `samples:` entries. Under samples
+// replay these handlers are never exercised: the agent is replaced by the
+// deterministic driver, so a handler without samples silently produces no
+// output at all. The keys are returned in a deterministic (sorted) order.
+func safeOutputsMissingSamples(config *SafeOutputsConfig) []string {
+	if config == nil {
+		return nil
+	}
+	var keys []string
+	for _, handler := range safeOutputHandlers {
+		if handler.Builtin || handler.Key == "" || handler.StructField == "" || handler.ToolName == "" {
+			continue
+		}
+		base := extractBaseSafeOutputConfig(config, handler.StructField)
+		if base == nil || len(base.Samples) > 0 {
+			continue
+		}
+		keys = append(keys, toolDisplayKey(handler.Key))
+	}
+	sort.Strings(keys)
+	return keys
 }

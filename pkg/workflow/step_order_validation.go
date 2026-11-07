@@ -3,13 +3,16 @@ package workflow
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
+	"path"
 	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 )
+
+// This list must stay in sync with targetExtensions in actions/setup/js/redact_secrets.cjs.
+var secretRedactionScannedExtensions = [...]string{".txt", ".json", ".log", ".md", ".mdx", ".yml", ".jsonl", ".patch", ".html"}
 
 var stepOrderLog = logger.New("workflow:step_order_validation")
 
@@ -143,8 +146,10 @@ func (t *StepOrderTracker) ValidateStepOrdering() error {
 		)
 	}
 
-	// Check that all uploaded paths are covered by secret redaction
-	// Secret redaction scans all files in /tmp/gh-aw/ with extensions .txt, .json, .log
+	return t.validateArtifactPathsCovered(artifactUploads)
+}
+
+func (t *StepOrderTracker) validateArtifactPathsCovered(artifactUploads []StepRecord) error {
 	unscannable := t.findUnscannablePaths(artifactUploads)
 	if len(unscannable) > 0 {
 		return NewOperationError(
@@ -165,11 +170,12 @@ func (t *StepOrderTracker) findUnscannablePaths(artifactUploads []StepRecord) []
 
 	for _, upload := range artifactUploads {
 		for _, path := range upload.UploadPaths {
-			// Check if this path would be scanned by secret redaction
+			// Check if this path would be scanned by secret redaction, or is otherwise
+			// explicitly allowed to bypass scanning (e.g. binary bundle files).
 			// Secret redaction only scans:
 			// 1. Files under /tmp/gh-aw/
 			// 2. With extensions .txt, .json, .log
-			if !isPathScannedBySecretRedaction(path) {
+			if !isPathScannedBySecretRedaction(path) && !isKnownUnscannedButAllowedForUpload(path) {
 				unscannable = append(unscannable, path)
 			}
 		}
@@ -180,23 +186,25 @@ func (t *StepOrderTracker) findUnscannablePaths(artifactUploads []StepRecord) []
 
 // isPathScannedBySecretRedaction checks if a path would be scanned by the secret redaction step
 // or is otherwise safe to upload (known engine-controlled diagnostic paths).
-func isPathScannedBySecretRedaction(path string) bool {
+func isPathScannedBySecretRedaction(artifactPath string) bool {
 	// Exclusion patterns (paths starting with !) are not uploaded - they tell the artifact
 	// action to skip matching files. They do not need to be scanned by secret redaction.
-	if strings.HasPrefix(path, "!") {
+	if strings.HasPrefix(artifactPath, "!") {
 		return true
 	}
+
+	normalizedPath, isDirectory := normalizeArtifactPathForRedaction(artifactPath)
 
 	// Paths must be under /tmp/gh-aw/ or ${RUNNER_TEMP}/gh-aw/ to be scanned.
 	// Accept both literal paths and environment variable references.
 	// Engines that produce output outside /tmp/gh-aw/ must move their files into /tmp/gh-aw/
 	// via GetPreBundleSteps before the unified artifact upload (see gemini_engine.go).
-	if !strings.HasPrefix(path, constants.TmpGhAwDirSlash) && !strings.HasPrefix(path, constants.GhAwRootDirShellSlash) && !strings.HasPrefix(path, constants.GhAwRootDirSlash) {
+	if !isUnderSecretRedactionRoot(normalizedPath) {
 		// Check if it's an environment variable that might resolve to /tmp/gh-aw/ or ${RUNNER_TEMP}/gh-aw/
 		// For now, we'll allow ${{ env.* }} patterns through as we can't resolve them at compile time
 		// Assume environment variables that might contain /tmp/gh-aw or ${RUNNER_TEMP}/gh-aw paths are safe
 		// This is a conservative assumption - in practice these are controlled by the compiler
-		if strings.Contains(path, "${{ env.") {
+		if strings.Contains(normalizedPath, "${{ env.") {
 			return true
 		}
 
@@ -206,14 +214,52 @@ func isPathScannedBySecretRedaction(path string) bool {
 	// Path must have one of the scanned extensions that the redact_secrets step covers.
 	// .patch files are git-diff output written to /tmp/gh-aw/ by the safe-outputs MCP server
 	// and are covered by the redact_secrets step before the unified artifact is uploaded.
-	// .bundle files are git bundle files written to /tmp/gh-aw/ when patch-format: bundle is
-	// configured. They are binary files but must still pass through secret redaction.
-	ext := filepath.Ext(path)
-	scannedExtensions := []string{".txt", ".json", ".log", ".jsonl", ".patch", ".bundle"}
-	if slices.Contains(scannedExtensions, ext) {
+	ext := path.Ext(normalizedPath)
+	if slices.Contains(secretRedactionScannedExtensions[:], ext) {
 		return true
 	}
 
 	// If path is a directory (ends with /), we assume it contains scannable files
-	return strings.HasSuffix(path, "/")
+	return isDirectory
+}
+
+func normalizeArtifactPathForRedaction(artifactPath string) (normalizedPath string, isDirectory bool) {
+	normalizedSeparators := strings.ReplaceAll(artifactPath, `\`, "/")
+	// Keep UNC/double-slash paths uncleaned so path.Clean cannot collapse them
+	// into an approved local root that the redaction script does not scan.
+	if strings.HasPrefix(normalizedSeparators, "//") {
+		return normalizedSeparators, strings.HasSuffix(normalizedSeparators, "/")
+	}
+	return path.Clean(normalizedSeparators), strings.HasSuffix(normalizedSeparators, "/")
+}
+
+func isUnderSecretRedactionRoot(artifactPath string) bool {
+	roots := []string{
+		constants.TmpGhAwDirSlash,
+		constants.GhAwRootDirShellSlash,
+		constants.GhAwRootDirSlash,
+	}
+	for _, root := range roots {
+		normalizedRoot := strings.TrimSuffix(root, "/")
+		if artifactPath == normalizedRoot || strings.HasPrefix(artifactPath, normalizedRoot+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// isKnownUnscannedButAllowedForUpload reports whether a path is a known type of file
+// that is NOT text-scanned by the redact_secrets step, but is nevertheless explicitly
+// permitted in artifact uploads.
+//
+// Binary git bundles and object-pack recovery envelopes are not text-scanned.
+// Their paired .patch artifacts carry the diff or complete object preview.
+func isKnownUnscannedButAllowedForUpload(artifactPath string) bool {
+	normalizedPath, _ := normalizeArtifactPathForRedaction(artifactPath)
+	isUnderGhAwDir := isUnderSecretRedactionRoot(normalizedPath) ||
+		strings.Contains(normalizedPath, "${{ env.")
+	if !isUnderGhAwDir {
+		return false
+	}
+	return path.Ext(normalizedPath) == ".bundle"
 }

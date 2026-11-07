@@ -26,9 +26,7 @@ Run `gh aw compile <workflow-id>` after changing:
 
 ## No Recompile Required for Runtime Behavior
 
-Body-only edits take effect on the next run without recompilation.
-
-Edit the markdown body directly for:
+Body-only text edits take effect on the next run without recompilation:
 
 - agent instructions
 - task descriptions
@@ -36,7 +34,7 @@ Edit the markdown body directly for:
 - formatting guidance
 - clarifications and guardrails
 
-Body changes take effect on the next run.
+Exception: adding or changing GitHub Actions expressions or `{{#if}}` conditions in the body or local runtime imports requires recompilation — the compiler selects their bindings and fails on malformed conditions (see [context.md](context.md)).
 
 **Always run `gh aw compile` after any change** (frontmatter or body) to keep `.lock.yml` metadata in sync.
 
@@ -50,12 +48,33 @@ gh aw compile --purge
 
 Use `--strict` for production-quality validation.
 
+## Detect Stale Lock Files
+
+Run `gh aw list` from the repository root and check the `COMPILED` column. `No` means the source frontmatter does not match the existing `.lock.yml`; `N/A` means the lock file is missing.
+
+To inspect stale or missing lock files interactively, use `--stale`:
+
+```bash
+gh aw list --stale
+```
+
+For an automated check that fails when any lock file is stale or missing, use:
+
+```bash
+gh aw list --json | jq -e 'all(.[]; .compiled == "Yes")'
+```
+
+Recompile any stale workflows and commit each generated `.lock.yml` with its source:
+
+```bash
+gh aw compile <workflow-id>
+```
+
 ## Editing Rules
 
 - Smallest change that satisfies the request.
 - Preserve structure unless reorganization is the task.
 - Never leave a workflow broken.
-- Always run `gh aw compile <workflow-id>` after any change (frontmatter or body) to keep `.lock.yml` in sync.
 - If compile fails, fix all errors before stopping.
 - After any change, review the generated `.lock.yml`.
 

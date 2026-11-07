@@ -6,12 +6,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 )
 
 // compiler_activation_daily_aic contains daily AIC guardrail token and step builders.
 
 const dailyAICAppTokenStepID = "daily-aic-app-token"
+const dailyAICDefaultRepoMemoryID = "default"
+const admissionDailyAICFallbackIfExpr = "${{ env.GH_AW_ADMISSION_RESULT != 'admitted' && env.GH_AW_MAX_DAILY_AI_CREDITS != '' }}"
 
 // buildDailyAICAppTokenMintStep generates a GitHub App token mint step dedicated
 // to the daily AIC guardrail. The minted token is used only for the guardrail API
@@ -27,35 +31,25 @@ func (c *Compiler) buildDailyAICAppTokenMintStep(app *GitHubAppConfig) []string 
 	if app.shouldIgnoreMissingKey() {
 		guard := buildIgnoreIfMissingCondition(app)
 		steps = appendStepEnvAssignments(steps, guard.EnvAssignments)
-		if condition := combineGitHubIfExpressions(maxDailyAICreditsConfiguredIfExpr, guard.Condition); condition != "" {
+		if condition := combineGitHubIfExpressions(admissionDailyAICFallbackIfExpr, guard.Condition); condition != "" {
 			steps = append(steps, fmt.Sprintf("        if: %s\n", condition))
 		} else {
-			steps = append(steps, fmt.Sprintf("        if: %s\n", maxDailyAICreditsConfiguredIfExpr))
+			steps = append(steps, fmt.Sprintf("        if: %s\n", admissionDailyAICFallbackIfExpr))
 		}
 	} else {
-		steps = append(steps, fmt.Sprintf("        if: %s\n", maxDailyAICreditsConfiguredIfExpr))
+		steps = append(steps, fmt.Sprintf("        if: %s\n", admissionDailyAICFallbackIfExpr))
 	}
 	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/create-github-app-token")))
 	steps = append(steps, "        with:\n")
 	steps = append(steps, fmt.Sprintf("          client-id: %s\n", app.AppID))
 	steps = append(steps, fmt.Sprintf("          private-key: %s\n", app.PrivateKey))
+	steps = append(steps, "          skip-token-revoke: false\n")
 	owner := app.Owner
 	if owner == "" {
 		owner = "${{ github.repository_owner }}"
 	}
 	steps = append(steps, fmt.Sprintf("          owner: %s\n", owner))
-	if len(app.Repositories) == 1 && app.Repositories[0] == "*" {
-		// Org-wide access: omit repositories field entirely
-	} else if len(app.Repositories) == 1 {
-		steps = append(steps, fmt.Sprintf("          repositories: %s\n", app.Repositories[0]))
-	} else if len(app.Repositories) > 1 {
-		steps = append(steps, "          repositories: |-\n")
-		for _, repo := range app.Repositories {
-			steps = append(steps, fmt.Sprintf("            %s\n", repo))
-		}
-	} else {
-		steps = append(steps, "          repositories: ${{ github.event.repository.name }}\n")
-	}
+	steps = appendDailyAICAppRepositories(steps, app.Repositories)
 	steps = append(steps, "          github-api-url: ${{ github.api_url }}\n")
 	// Build permission fields: baseline is actions: read (required for guardrail script to read
 	// workflow run data). Merge any user-configured app.Permissions on top so callers can extend
@@ -76,6 +70,24 @@ func (c *Compiler) buildDailyAICAppTokenMintStep(app *GitHubAppConfig) []string 
 	}
 	for _, key := range sliceutil.SortedKeys(permissionFields) {
 		steps = append(steps, fmt.Sprintf("          %s: %s\n", key, permissionFields[key]))
+	}
+	return steps
+}
+
+func appendDailyAICAppRepositories(steps []string, repositories []string) []string {
+	if len(repositories) == 1 {
+		for _, repository := range repositories {
+			if repository != "*" {
+				steps = append(steps, fmt.Sprintf("          repositories: %s\n", repository))
+			}
+		}
+	} else if len(repositories) > 1 {
+		steps = append(steps, "          repositories: |-\n")
+		for _, repo := range repositories {
+			steps = append(steps, fmt.Sprintf("            %s\n", repo))
+		}
+	} else {
+		steps = append(steps, "          repositories: ${{ github.event.repository.name }}\n")
 	}
 	return steps
 }
@@ -105,46 +117,18 @@ func (c *Compiler) buildActivationDailyAICGuardrailStep(data *WorkflowData) []st
 		compilerActivationJobLog.Print("Prepending dedicated daily-AIC app-token mint step")
 		steps = append(steps, c.buildDailyAICAppTokenMintStep(data.MaxDailyAICreditsGitHubApp)...)
 	}
-	// Prepend cache restore step so cached AIC values from prior runs are available
-	// when the guardrail script runs, allowing it to skip artifact downloads.
-	if data.WorkflowID != "" {
-		sanitized := SanitizeWorkflowIDForCacheKey(data.WorkflowID)
-		cacheKeyPrefix := fmt.Sprintf("agentic-workflow-usage-%s-", sanitized)
-		steps = append(steps, "      - name: Restore daily AIC usage cache\n")
-		steps = append(steps, "        id: restore-daily-aic-cache\n")
-		steps = append(steps, fmt.Sprintf("        if: %s\n", maxDailyAICreditsConfiguredIfExpr))
-		steps = append(steps, "        continue-on-error: true\n")
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/cache/restore", data)))
-		steps = append(steps, "        with:\n")
-		steps = append(steps, fmt.Sprintf("          key: %s${{ github.run_id }}\n", cacheKeyPrefix))
-		steps = append(steps, fmt.Sprintf("          restore-keys: %s\n", cacheKeyPrefix))
-		steps = append(steps, "          path: /tmp/gh-aw/agentic-workflow-usage-cache.jsonl\n")
-		// Artifact-based fallback for cross-branch cache misses.
-		// GitHub Actions actions/cache is branch-scoped: caches written by the conclusion job
-		// on one PR branch are invisible to the activation job running on a different PR branch.
-		// This step downloads the most recent aic-usage-cache artifact uploaded by a prior
-		// conclusion job so that the guardrail script can skip per-run artifact downloads.
-		// Cache-miss detection is performed inside restore_aic_usage_cache_fallback.cjs using
-		// the cache restore outputs forwarded via env vars.
-		steps = append(steps, "      - name: Restore daily AIC usage cache (artifact fallback)\n")
-		steps = append(steps, "        id: restore-daily-aic-cache-fallback\n")
-		steps = append(steps, fmt.Sprintf("        if: %s\n", maxDailyAICreditsConfiguredIfExpr))
-		steps = append(steps, "        continue-on-error: true\n")
-		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
-		steps = append(steps, "        env:\n")
-		steps = append(steps, "          GH_AW_RESTORE_DAILY_AIC_CACHE_HIT: ${{ steps.restore-daily-aic-cache.outputs.cache-hit }}\n")
-		steps = append(steps, "          GH_AW_RESTORE_DAILY_AIC_CACHE_MATCHED_KEY: ${{ steps.restore-daily-aic-cache.outputs.cache-matched-key }}\n")
-		steps = append(steps, "        with:\n")
-		steps = append(steps, fmt.Sprintf("          github-token: %s\n", c.resolveDailyAICToken(data)))
-		steps = append(steps, "          script: |\n")
-		steps = append(steps, "            const { setupGlobals } = require('"+SetupActionDestination+"/setup_globals.cjs');\n")
-		steps = append(steps, "            setupGlobals(core, github, context, exec, io, getOctokit);\n")
-		steps = append(steps, "            const { main } = require('"+SetupActionDestination+"/restore_aic_usage_cache_fallback.cjs');\n")
-		steps = append(steps, "            await main();\n")
+	if entry, ok := dailyAICRepoMemoryEntry(data); ok {
+		steps = append(steps, c.buildDailyAICRepoMemoryCloneStep(entry)...)
+	}
+	// Only restore observations from a verified workflow-run artifact. Actions
+	// cache restore-key matches do not establish producer provenance or freshness.
+	if data.WorkflowID != "" && data.MaxDailyAICBackend != maxDailyAICBackendRepoMemory {
+		steps = append(steps, c.buildDailyAICScanObservationRestoreStep(data)...)
 	}
 	steps = append(steps, "      - name: Check daily workflow token guardrail\n")
-	steps = append(steps, "        id: daily-effective-workflow-guardrail\n")
-	steps = append(steps, fmt.Sprintf("        if: %s\n", maxDailyAICreditsConfiguredIfExpr))
+	steps = append(steps, "        id: daily-ai-credits-workflow-guardrail\n")
+	steps = append(steps, fmt.Sprintf("        if: %s\n", admissionDailyAICFallbackIfExpr))
+	steps = appendDailyAICContinueOnError(steps, data)
 	steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 	steps = append(steps, "        env:\n")
 	steps = append(steps, fmt.Sprintf("          GH_AW_WORKFLOW_NAME: %q\n", data.Name))
@@ -155,6 +139,16 @@ func (c *Compiler) buildActivationDailyAICGuardrailStep(data *WorkflowData) []st
 	steps = append(steps, fmt.Sprintf("          GH_AW_HAS_LABEL_COMMAND: %q\n", strconv.FormatBool(len(data.LabelCommand) > 0)))
 	steps = append(steps, fmt.Sprintf("          GH_AW_GITHUB_TOKEN: %s\n", c.resolveDailyAICToken(data)))
 	steps = append(steps, buildTemplatableIntEnvVar(maxDailyAICreditsEnvVar, data.MaxDailyAICredits)...)
+	if data.MaxDailyAICBackend != "" {
+		steps = append(steps, fmt.Sprintf("          %s: %q\n", maxDailyAICBackendEnvVar, data.MaxDailyAICBackend))
+	}
+	if data.MaxDailyAICBackend == maxDailyAICBackendRepoMemory {
+		steps = append(steps, "          GH_AW_DAILY_AIC_REPO_MEMORY_TRUSTED: ${{ steps.daily-aic-repo-memory-clone.outputs.cloned == 'true' }}\n          GH_AW_ALLOW_INSECURE_REPO_MEMORY_AIC: ${{ vars.GH_AW_ALLOW_INSECURE_REPO_MEMORY_AIC || 'false' }}\n          GH_AW_DAILY_AIC_REPO_MEMORY_BRANCH_MISSING: ${{ steps.daily-aic-repo-memory-clone.outcome == 'success' && steps.daily-aic-repo-memory-clone.outputs.cloned == 'false' }}\n")
+	}
+	if entry, ok := dailyAICRepoMemoryEntry(data); ok {
+		steps = append(steps, fmt.Sprintf("          GH_AW_DAILY_AIC_REPO_MEMORY_DIR: %s\n", dailyAICRepoMemoryDir(entry)))
+	}
+	steps = append(steps, fmt.Sprintf("          GH_AW_MAX_AI_CREDITS: %s\n", dailyAICMaxCreditsEnvValue(data)))
 	steps = append(steps, "        with:\n")
 	steps = append(steps, fmt.Sprintf("          github-token: %s\n", c.resolveDailyAICToken(data)))
 	steps = append(steps, "          script: |\n")
@@ -162,7 +156,129 @@ func (c *Compiler) buildActivationDailyAICGuardrailStep(data *WorkflowData) []st
 	steps = append(steps, "            setupGlobals(core, github, context, exec, io, getOctokit);\n")
 	steps = append(steps, "            const { main } = require('"+SetupActionDestination+"/check_daily_aic_workflow_guardrail.cjs');\n")
 	steps = append(steps, "            await main();\n")
+	if data.WorkflowID != "" && data.MaxDailyAICBackend != maxDailyAICBackendRepoMemory {
+		steps = append(steps, "      - name: Publish daily AIC scan observations\n")
+		steps = append(steps, "        if: always() && env.GH_AW_ADMISSION_RESULT != 'admitted' && env.GH_AW_MAX_DAILY_AI_CREDITS != ''\n")
+		steps = append(steps, "        continue-on-error: true\n")
+		steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/upload-artifact", data)))
+		steps = append(steps, "        with:\n")
+		steps = append(steps, "          name: aic-usage-scan-v2\n")
+		steps = append(steps, "          path: /tmp/gh-aw/agentic-workflow-usage-scan-v2.jsonl\n")
+		steps = append(steps, "          overwrite: true\n")
+		steps = append(steps, "          if-no-files-found: ignore\n")
+		steps = append(steps, "          retention-days: 3\n")
+	}
 	return steps
+}
+
+func (c *Compiler) buildDailyAICScanObservationRestoreStep(data *WorkflowData) []string {
+	return []string{
+		"      - name: Restore daily AIC scan observations\n",
+		"        id: restore-daily-aic-cache-fallback\n",
+		fmt.Sprintf("        if: %s\n", admissionDailyAICFallbackIfExpr),
+		fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)),
+		"        env:\n",
+		fmt.Sprintf("          GH_AW_HAS_SLASH_COMMAND: %q\n", strconv.FormatBool(len(data.Command) > 0)),
+		fmt.Sprintf("          GH_AW_HAS_LABEL_COMMAND: %q\n", strconv.FormatBool(len(data.LabelCommand) > 0)),
+		"        with:\n",
+		fmt.Sprintf("          github-token: %s\n", c.resolveDailyAICToken(data)),
+		"          script: |\n",
+		"            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n",
+		"            setupGlobals(core, github, context, exec, io, getOctokit);\n",
+		"            const { main } = require('" + SetupActionDestination + "/restore_aic_scan_cache.cjs');\n",
+		"            await main();\n",
+	}
+}
+
+// dailyAICRepoMemoryEntry selects the repo-memory ledger for the repo-memory
+// daily AIC backend. It prefers the memory with id "default" and otherwise
+// falls back to the first configured memory.
+func dailyAICRepoMemoryEntry(data *WorkflowData) (RepoMemoryEntry, bool) {
+	if data == nil || data.MaxDailyAICBackend != maxDailyAICBackendRepoMemory || data.RepoMemoryConfig == nil {
+		return RepoMemoryEntry{}, false
+	}
+	for _, memory := range data.RepoMemoryConfig.Memories {
+		if memory.ID == dailyAICDefaultRepoMemoryID {
+			return memory, true
+		}
+	}
+	return firstRepoMemoryEntry(data.RepoMemoryConfig.Memories)
+}
+
+func firstRepoMemoryEntry(memories []RepoMemoryEntry) (RepoMemoryEntry, bool) {
+	if len(memories) == 0 {
+		return RepoMemoryEntry{}, false
+	}
+	return memories[0], true //nolint:uncheckedsliceindex // len(memories) is checked above.
+}
+
+func dailyAICRepoMemoryDir(memory RepoMemoryEntry) string {
+	return constants.TmpRepoMemoryDir + memory.ID
+}
+
+// dailyAICLedgerHydrationDir returns a directory, distinct from the
+// agent-writable repo-memory artifact directory, into which the push_repo_memory
+// job clones a read-only snapshot of the committed ledger branch. This trusted
+// snapshot is used to hydrate the ledger before appending the current run's
+// entry, so accumulated history from other runs is never discarded.
+func dailyAICLedgerHydrationDir(memory RepoMemoryEntry) string {
+	return constants.TmpGhAwDir + "/daily-aic-ledger-source/" + memory.ID
+}
+
+// dailyAICRepoMemoryTargetRepo resolves the target repository reference for the
+// repo-memory ledger, matching the resolution used for the primary repo-memory
+// clone/push steps (defaulting to the current repository and appending ".wiki"
+// for wiki-backed memories).
+func dailyAICRepoMemoryTargetRepo(memory RepoMemoryEntry) string {
+	return repoMemoryTargetRepo(memory, PermissionRead)
+}
+
+func (c *Compiler) buildDailyAICRepoMemoryCloneStep(memory RepoMemoryEntry) []string {
+	targetRepo := dailyAICRepoMemoryTargetRepo(memory)
+	memoryLabel := "repo-memory"
+	if memory.Wiki {
+		memoryLabel = "wiki-memory"
+	}
+	memoryDir := dailyAICRepoMemoryDir(memory)
+	token := "${{ github.token }}"
+	if memory.githubApp(PermissionRead) != nil {
+		token = repoMemoryAppToken(memory, PermissionRead)
+	}
+	var steps []string
+	condition := admissionDailyAICFallbackIfExpr
+	if memory.githubApp(PermissionRead) != nil {
+		steps = append(steps, c.buildRepoMemoryAppTokenMintStep(memory, PermissionRead, string(constants.ActivationJobName), condition)...)
+	}
+	if targetCondition := repoMemoryAppTargetCondition(memory, PermissionRead); targetCondition != "" {
+		condition = combineGitHubIfExpressions(condition, targetCondition)
+	}
+	return append(steps, []string{
+		fmt.Sprintf("      - name: Clone daily AIC %s ledger (%s)\n", memoryLabel, memory.ID),
+		"        id: daily-aic-repo-memory-clone\n",
+		fmt.Sprintf("        if: %s\n", condition),
+		"        env:\n",
+		fmt.Sprintf("          GH_TOKEN: %s\n", token),
+		"          GITHUB_SERVER_URL: ${{ github.server_url }}\n",
+		fmt.Sprintf("          BRANCH_NAME: %s\n", memory.BranchName),
+		fmt.Sprintf("          TARGET_REPO: %s\n", targetRepo),
+		fmt.Sprintf("          MEMORY_DIR: %s\n", memoryDir),
+		fmt.Sprintf("          CREATE_ORPHAN: %t\n", memory.CreateOrphan),
+		"        run: bash \"${RUNNER_TEMP}/gh-aw/actions/clone_repo_memory_branch.sh\"\n",
+	}...)
+}
+
+func appendDailyAICContinueOnError(steps []string, data *WorkflowData) []string {
+	if data.MaxDailyAICContinueOnError {
+		return append(steps, "        continue-on-error: true\n")
+	}
+	return steps
+}
+
+func dailyAICMaxCreditsEnvValue(data *WorkflowData) string {
+	if data.EngineConfig != nil && data.EngineConfig.MaxAICredits != 0 {
+		return strconv.Quote(strconv.FormatInt(data.EngineConfig.MaxAICredits, 10))
+	}
+	return compilerenv.BuildDefaultMaxAICreditsExpression(strconv.FormatInt(constants.DefaultMaxAICredits, 10))
 }
 
 func buildDailyAICActivationJobEnv(data *WorkflowData) map[string]string {

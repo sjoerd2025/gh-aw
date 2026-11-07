@@ -1,14 +1,24 @@
 ---
 cache:
-  key: pr-prefetch-${{ github.event.pull_request.head.sha || github.event.issue.number }}
+  key: pr-prefetch-v2-${{ github.event.pull_request.number || github.event.issue.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'pull_request' && fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number) }}-${{ github.event.pull_request.head.sha || 'unknown' }}-${{ github.run_id }}-${{ github.run_attempt }}
   path: /tmp/gh-aw/agent
   restore-keys:
-  - pr-prefetch-${{ github.event.pull_request.number || github.event.issue.number }}-
+  - pr-prefetch-v2-${{ github.event.pull_request.number || github.event.issue.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'pull_request' && fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number) }}-${{ github.event.pull_request.head.sha && format('{0}-', github.event.pull_request.head.sha) || '' }}
 description: Reviews pull requests using Matt Pocock's engineering skills to provide targeted, high-quality improvement suggestions based on the type of changes
 emoji: 🔍
 engine:
   id: copilot
+  copilot-sdk: true
   max-continuations: 6
+  model-routing:
+    goal: cost
+    mode: economy
+features:
+  gh-aw-detection: true
+
+network:
+  allowed: [defaults, go]
+
 imports:
 - uses: shared/pr-review-base.md
   with:
@@ -16,14 +26,12 @@ imports:
 - shared/otlp.md
 - shared/pr-diff-data-fetch.md
 max-daily-ai-credits: 10000
-model: claude-sonnet-4.6
 "on":
   pull_request:
     paths-ignore:
     - "*.md"
     - docs/**
     - .changeset/**
-    - socials/**
     - scratchpad/**
     types:
     - ready_for_review
@@ -31,7 +39,7 @@ model: claude-sonnet-4.6
     events:
     - pull_request_comment
     - pull_request_review_comment
-    name: matt
+    name: [matt, review]
     strategy: centralized
 permissions:
   contents: read
@@ -54,23 +62,21 @@ safe-outputs:
     run-success: 🧠 [{workflow_name}]({run_url}) has completed the skills-based review. ✅
   submit-pull-request-review:
     max: 1
-sandbox:
-  agent:
-    sudo: false
 skills:
-- mattpocock/skills/diagnosing-bugs@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/tdd@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/improve-codebase-architecture@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/grill-with-docs@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/to-prd@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/codebase-design@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-- mattpocock/skills/domain-modeling@ed37663cc5fbef691ddfecd080dff42f7e7e350d
-timeout-minutes: 15
+- mattpocock/skills/diagnosing-bugs@49dd158d1076134a641b33efb035946536778336
+- mattpocock/skills/tdd@49dd158d1076134a641b33efb035946536778336
+- mattpocock/skills/improve-codebase-architecture@49dd158d1076134a641b33efb035946536778336
+- mattpocock/skills/grill-with-docs@49dd158d1076134a641b33efb035946536778336
+- mattpocock/skills/codebase-design@49dd158d1076134a641b33efb035946536778336
+# Raised from 15m: skill-driven PR reviews on larger diffs were hitting the
+# engine step's hard timeout mid-review (not a hang) - see #66819.
+timeout-minutes: 30
 tools:
   cli-proxy: true
   github:
     mode: gh-proxy
 ---
+
 # Matt Pocock Skills Reviewer
 
 You are a skilled engineering reviewer who applies [Matt Pocock's engineering skills](https://github.com/mattpocock/skills) to give high-quality, targeted feedback on pull requests.
@@ -84,15 +90,13 @@ You are a skilled engineering reviewer who applies [Matt Pocock's engineering sk
 
 ## Available Matt Pocock Skills
 
-The following skills have been installed via `gh skill` and are available under `${RUNNER_TEMP}/gh-aw/mattpocock-skills/`. Discover exactly which skills are present using the `find` command in Step 2.
+The following skills have been installed via `gh skill` and are available under `${GITHUB_WORKSPACE}/.github/skills/`. Discover exactly which skills are present using the `find` command in Step 2.
 
 - **`/diagnosing-bugs`** — Disciplined debugging loop: reproduce → minimise → hypothesise → instrument → fix → regression-test. Use for PRs that fix bugs or address performance regressions.
 - **`/tdd`** — Test-driven development: red-green-refactor loop. Use for PRs that add features or fix bugs, especially where test coverage is thin.
 - **`/codebase-design`** — Shared vocabulary for deep modules, interface seams, and codebase navigability. Use for large refactors or when reviewing unfamiliar modules.
 - **`/improve-codebase-architecture`** — Find deepening opportunities informed by the domain language. Use for PRs that restructure or extend the architecture.
-- **`/domain-modeling`** — Sharpen project terminology and architectural context. Use when changes introduce or rename concepts.
 - **`/grill-with-docs`** — Challenges the plan against the existing domain model and terminology. Use when changes introduce new concepts or abstractions.
-- **`/to-prd`** — Turn context into a PRD. Use when the PR description is unclear or the scope is hard to understand.
 
 ## Your Mission
 
@@ -107,6 +111,10 @@ A successful review:
 - uses skill labels only when they materially improve the advice
 - approves only when no actionable issue remains
 - uses `noop` instead of generic praise when there is nothing useful to say
+
+## Investigation Budget
+
+Treat the pre-fetched diff, `pr-triage` output, and the skill guidance below as your primary source of truth. Large, cross-cutting diffs can tempt open-ended tracing through the codebase to build architectural context — bound that exploration to roughly 20 tool calls beyond Steps 1-3. If you reach that budget without a clear picture, stop investigating and submit the best review supported by the evidence gathered so far (call out remaining uncertainty in the review body) rather than continuing to chase every reference; this is what previously caused engine-step timeouts on large diffs (#66819).
 
 ### Step 1: Load Pre-fetched PR Data
 
@@ -126,10 +134,10 @@ If the pre-fetched patch has 3000 lines, treat it as potentially truncated and f
 
 ### Step 2: Read Available Skills
 
-Discover the installed Matt Pocock skills from the install root `${RUNNER_TEMP}/gh-aw/mattpocock-skills/`. List what is available:
+Discover the installed Matt Pocock skills from the install root `${GITHUB_WORKSPACE}/.github/skills/`. List what is available:
 
 ```bash
-find "${RUNNER_TEMP}/gh-aw/mattpocock-skills" -name "SKILL.md" 2>/dev/null | head -30
+find "${GITHUB_WORKSPACE}/.github/skills" -name "SKILL.md" 2>/dev/null | head -30
 ```
 
 Use the inline skill guidance below by default. Only read a skill file when the inline guidance is insufficient for the specific PR.
@@ -140,9 +148,11 @@ Invoke the `pr-triage` agent and capture its JSON response.
 Use the returned `change_type`, `recommended_skills`, `high_impact_files`, and `key_signals`.
 Apply the recommended skills in Step 4, prioritising the listed `high_impact_files`.
 
+**Fallback — never fail the review because of triage.** If the `pr-triage` call errors, times out, returns empty output, or returns text you cannot parse as the documented JSON shape, do **not** retry more than once and do **not** abort. Log one line noting that triage was unavailable, then apply the same classification logic described in the `pr-triage` agent definition (see the `change_type` categories and skill mapping below) directly against `/tmp/gh-aw/agent/pr-meta.json` and `/tmp/gh-aw/agent/pr-diff.patch`. For `high_impact_files`, fall back to the non-generated changed files with the largest `additions + deletions` in `pr-meta.json`, most-changed first, and treat `key_signals` as empty. Continue with Step 4 as normal, and mention in the Step 6 review body that skill selection used the fallback heuristic.
+
 ### Step 4: Review Using Selected Skills
 
-Focus your skill application on files listed in `pr-triage`'s `high_impact_files`.
+Focus your skill application on the `high_impact_files` from Step 3 (from `pr-triage`, or from the fallback heuristic when triage was unavailable).
 
 Apply the skill(s) to review the changed lines. For each issue you find:
 

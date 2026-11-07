@@ -13,6 +13,7 @@ network:
   - defaults
   - github
 imports:
+- shared/reporting.md
 - uses: shared/skip-if-issue-open.md
   with:
     title-prefix: "[spec-librarian]"
@@ -46,28 +47,14 @@ safe-outputs:
     run-success: ✅ Specification review complete! [{workflow_name}]({run_url}) has audited all package specs. Report delivered! 📋
 description: Daily review of all package README.md specifications to detect inconsistencies, staleness, and cross-package conflicts
 emoji: 📚
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 name: Package Specification Librarian
 strict: true
 timeout-minutes: 25
 tools:
-  bash:
-  - find pkg -name "README.md" -type f
-  - find pkg -maxdepth 1 -type d
-  - find pkg/* -maxdepth 0 -type d
-  - cat pkg/*/README.md
-  - wc -l pkg/*/README.md
-  - head -n * pkg/*/*.go
-  - cat pkg/*/*.go
-  - wc -l pkg/*/*.go
-  - grep -rn "func [A-Z]" pkg --include="*.go"
-  - grep -rn "type [A-Z]" pkg --include="*.go"
-  - grep -rn "const [A-Z]" pkg --include="*.go"
-  - grep -rn "import " pkg --include="*.go"
-  - grep -rn "package " pkg --include="*.go"
-  - "git log --oneline --since=\"30 days ago\" -- pkg/*"
-  - "git log --oneline --since=\"7 days ago\" -- pkg/*/README.md"
-  - "git log -1 --format=%H -- pkg/*"
+  bash: ["*"]
   cli-proxy: true
   edit: null
   github:
@@ -75,9 +62,6 @@ tools:
     toolsets:
     - default
 tracker-id: spec-librarian
-sandbox:
-  agent:
-    sudo: false
 ---
 
 # Package Specification Librarian
@@ -255,10 +239,9 @@ The following specifications are outdated:
 1. **Be thorough**: Check ALL packages, not just a sample
 2. **Be precise**: Reference exact file paths, function names, and dates
 3. **Be actionable**: Every finding should have a clear recommendation
-4. **Report Formatting**: Use h3 (`###`) or lower for all headers in your report. Never use h1 (`#`) or h2 (`##`) — these are reserved for the issue title. Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability.
-5. **Use progressive disclosure**: Wrap details in `<details>` tags
-6. **One issue per run**: The `max: 1` limit ensures no issue spam
-7. **Skip if open**: The `skip-if-match` rule prevents duplicate issues
+4. **Use progressive disclosure**: Wrap details in `<details>` tags
+5. **One issue per run**: The `max: 1` limit ensures no issue spam
+6. **Skip if open**: The `skip-if-match` rule prevents duplicate issues
 
 ## Success Criteria
 

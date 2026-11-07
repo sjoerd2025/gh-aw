@@ -9,10 +9,12 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"slices"
 	"sort"
 	"testing"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/ast/inspector"
 )
 
 func typecheckSnippet(t *testing.T, src string) (*analysis.Pass, *ast.File) {
@@ -125,6 +127,93 @@ func TestRhsExprForIndex(t *testing.T) {
 	}
 }
 
+func TestMatchDiscardedErrorCall(t *testing.T) {
+	t.Parallel()
+
+	pass, file := typecheckSnippet(t, `package p
+import conv "strconv"
+type local struct{}
+func (local) Atoi(string) (int, error) { return 0, nil }
+func f() {
+	n, _ := conv.Atoi("1")
+	n, err := conv.Atoi("1")
+	var value local
+	n, _ = value.Atoi("1")
+	_ = n
+	_ = err
+}`)
+
+	var assigns []*ast.AssignStmt
+	ast.Inspect(file, func(node ast.Node) bool {
+		if assign, ok := node.(*ast.AssignStmt); ok {
+			if len(assign.Rhs) == 1 {
+				if _, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+					assigns = append(assigns, assign)
+				}
+			}
+		}
+		return true
+	})
+
+	if len(assigns) != 3 {
+		t.Fatalf("found %d assignments, want 3", len(assigns))
+	}
+
+	call, pkgPath, funcName, ok := MatchDiscardedErrorCall(pass, assigns[0])
+	if !ok {
+		t.Fatal("MatchDiscardedErrorCall() did not match aliased package call")
+	}
+	if call == nil || pkgPath != "strconv" || funcName != "Atoi" {
+		t.Fatalf("MatchDiscardedErrorCall() = (%v, %q, %q), want a strconv.Atoi call", call, pkgPath, funcName)
+	}
+	for _, assign := range assigns[1:] {
+		if call, pkgPath, funcName, ok := MatchDiscardedErrorCall(pass, assign); ok {
+			t.Errorf("MatchDiscardedErrorCall() = (%v, %q, %q, true), want no match", call, pkgPath, funcName)
+		}
+	}
+}
+
+func TestMatchDiscardedErrorCallParenthesized(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		stmt   string
+		wantOK bool
+	}{
+		{name: "bare", stmt: `conv.Atoi("1")`, wantOK: true},
+		{name: "parenthesized-bare", stmt: `(conv.Atoi("1"))`, wantOK: true},
+		{name: "nested-bare", stmt: `((conv.Atoi("1")))`, wantOK: true},
+		{name: "parenthesized-assignment", stmt: `_, _ = (conv.Atoi("1"))`, wantOK: true},
+		{name: "nested-assignment", stmt: `_, _ = ((conv.Atoi("1")))`, wantOK: true},
+		{name: "handled-error", stmt: `_, err = ((conv.Atoi("1")))`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pass, file := typecheckSnippet(t, `package p
+import conv "strconv"
+var err error
+func f() { `+tt.stmt+` }`)
+			var stmt ast.Stmt
+			ast.Inspect(file, func(node ast.Node) bool {
+				if fn, ok := node.(*ast.FuncDecl); ok {
+					stmt = fn.Body.List[0]
+					return false
+				}
+				return true
+			})
+			call, pkgPath, funcName, ok := MatchDiscardedErrorCall(pass, stmt)
+			if ok != tt.wantOK {
+				t.Fatalf("MatchDiscardedErrorCall() matched = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && (call == nil || pkgPath != "strconv" || funcName != "Atoi") {
+				t.Fatalf("MatchDiscardedErrorCall() = (%v, %q, %q), want a strconv.Atoi call", call, pkgPath, funcName)
+			}
+		})
+	}
+}
+
 func TestIsStringLiteral(t *testing.T) {
 	t.Parallel()
 
@@ -133,6 +222,13 @@ func TestIsStringLiteral(t *testing.T) {
 	}
 	if IsStringLiteral(&ast.BasicLit{Kind: token.INT, Value: "1"}) {
 		t.Fatal("did not expect int literal to be detected as string")
+	}
+	parenthesized := &ast.ParenExpr{X: &ast.ParenExpr{X: &ast.BasicLit{Kind: token.STRING, Value: `"alice"`}}}
+	if !IsStringLiteral(parenthesized) {
+		t.Fatal("expected parenthesized string literal to be detected")
+	}
+	if value, ok := StringLitValue(parenthesized); !ok || value != "alice" {
+		t.Fatalf("StringLitValue(parenthesized) = %q, %v", value, ok)
 	}
 }
 
@@ -329,6 +425,11 @@ func TestCalledOSFunc(t *testing.T) {
 	if fn, ok := CalledOSFunc(pass, call, "Getenv", "LookupEnv"); !ok || fn != osFunc {
 		t.Fatalf("CalledOSFunc() = (%#v, %v), want (%#v, true)", fn, ok, osFunc)
 	}
+	// parenthesized callee: (os.Getenv)(...)
+	parenCall := &ast.CallExpr{Fun: &ast.ParenExpr{X: call.Fun}}
+	if fn, ok := CalledOSFunc(pass, parenCall, "Getenv"); !ok || fn != osFunc {
+		t.Fatalf("CalledOSFunc() parenthesized = (%#v, %v), want (%#v, true)", fn, ok, osFunc)
+	}
 	if _, ok := CalledOSFunc(pass, call, "Setenv"); ok {
 		t.Fatal("CalledOSFunc() = ok=true for non-allowed name, want false")
 	}
@@ -440,6 +541,12 @@ func TestAsStringsMethodCall(t *testing.T) {
 		t.Fatal("AsStringsMethodCall(strings.Index, Count) = ok=true, want false")
 	}
 
+	// (strings.Index)(...) → parenthesized callee still matches
+	parenCall := &ast.CallExpr{Fun: &ast.ParenExpr{X: indexCall.Fun}}
+	if got, ok := AsStringsMethodCall(pass, parenCall, "Index"); !ok || got != parenCall {
+		t.Fatalf("AsStringsMethodCall((strings.Index), Index) = (%v, %v), want (%v, true)", got, ok, parenCall)
+	}
+
 	// other.Index does not match (wrong package)
 	if _, ok := AsStringsMethodCall(pass, makeCall(otherIdent, "Index"), "Index"); ok {
 		t.Fatal("AsStringsMethodCall(other.Index, Index) = ok=true, want false")
@@ -466,40 +573,16 @@ func TestCallQualifierText(t *testing.T) {
 		t.Fatalf("CallQualifierText = %q, want %q", got, "strings")
 	}
 
+	// parenthesized callee: (strings.Index)(...)
+	parenCall := &ast.CallExpr{Fun: &ast.ParenExpr{X: call.Fun}}
+	if got := CallQualifierText(fset, parenCall); got != "strings" {
+		t.Fatalf("CallQualifierText(parenthesized) = %q, want %q", got, "strings")
+	}
+
 	// non-selector call (e.g. dot-import): returns ""
 	directCall := &ast.CallExpr{Fun: ast.NewIdent("Index")}
 	if got := CallQualifierText(fset, directCall); got != "" {
 		t.Fatalf("CallQualifierText(non-selector) = %q, want %q", got, "")
-	}
-}
-
-func TestBuildContainsFix(t *testing.T) {
-	t.Parallel()
-
-	expr := &ast.BinaryExpr{
-		X:  ast.NewIdent("a"),
-		Op: token.NEQ,
-		Y:  ast.NewIdent("b"),
-	}
-
-	fixes := BuildContainsFix(expr, "strings", "s", "sub", false, "test message")
-	if len(fixes) != 1 {
-		t.Fatalf("got %d fixes, want 1", len(fixes))
-	}
-	if fixes[0].Message != "test message" {
-		t.Fatalf("Message = %q, want %q", fixes[0].Message, "test message")
-	}
-	if got := string(fixes[0].TextEdits[0].NewText); got != "strings.Contains(s, sub)" {
-		t.Fatalf("NewText = %q, want %q", got, "strings.Contains(s, sub)")
-	}
-
-	// negated
-	fixes = BuildContainsFix(expr, "strings", "s", "sub", true, "negated message")
-	if got := string(fixes[0].TextEdits[0].NewText); got != "!strings.Contains(s, sub)" {
-		t.Fatalf("negated NewText = %q, want %q", got, "!strings.Contains(s, sub)")
-	}
-	if fixes[0].Message != "negated message" {
-		t.Fatalf("negated Message = %q, want %q", fixes[0].Message, "negated message")
 	}
 }
 
@@ -509,13 +592,16 @@ func TestByteStringTypeHelpers(t *testing.T) {
 	const src = `package p
 
 func g(s string) []byte { return nil }
+func h(s string) string { return s }
 
 func f(s string, b []byte) {
 	type myString string
 	var ms myString
 
 	_ = []byte(s)
+	_ = string(b)
 	_ = g(s)
+	_ = h(s)
 	_ = b
 	_ = s
 	_ = ms
@@ -544,29 +630,37 @@ func f(s string, b []byte) {
 		}
 		rhsExprs = append(rhsExprs, assign.Rhs[0])
 	}
-	if len(rhsExprs) != 5 {
-		t.Fatalf("found %d assignment expressions in f, want 5", len(rhsExprs))
+	if len(rhsExprs) != 7 {
+		t.Fatalf("found %d assignment expressions in f, want 7", len(rhsExprs))
 	}
 
 	byteConv, ok := rhsExprs[0].(*ast.CallExpr)
 	if !ok {
 		t.Fatalf("rhs[0] type = %T, want *ast.CallExpr", rhsExprs[0])
 	}
-	gCall, ok := rhsExprs[1].(*ast.CallExpr)
+	stringConv, ok := rhsExprs[1].(*ast.CallExpr)
 	if !ok {
 		t.Fatalf("rhs[1] type = %T, want *ast.CallExpr", rhsExprs[1])
 	}
-	bIdent, ok := rhsExprs[2].(*ast.Ident)
+	gCall, ok := rhsExprs[2].(*ast.CallExpr)
 	if !ok {
-		t.Fatalf("rhs[2] type = %T, want *ast.Ident", rhsExprs[2])
+		t.Fatalf("rhs[2] type = %T, want *ast.CallExpr", rhsExprs[2])
 	}
-	sIdent, ok := rhsExprs[3].(*ast.Ident)
+	stringCall, ok := rhsExprs[3].(*ast.CallExpr)
 	if !ok {
-		t.Fatalf("rhs[3] type = %T, want *ast.Ident", rhsExprs[3])
+		t.Fatalf("rhs[3] type = %T, want *ast.CallExpr", rhsExprs[3])
 	}
-	msIdent, ok := rhsExprs[4].(*ast.Ident)
+	bIdent, ok := rhsExprs[4].(*ast.Ident)
 	if !ok {
 		t.Fatalf("rhs[4] type = %T, want *ast.Ident", rhsExprs[4])
+	}
+	sIdent, ok := rhsExprs[5].(*ast.Ident)
+	if !ok {
+		t.Fatalf("rhs[5] type = %T, want *ast.Ident", rhsExprs[5])
+	}
+	msIdent, ok := rhsExprs[6].(*ast.Ident)
+	if !ok {
+		t.Fatalf("rhs[6] type = %T, want *ast.Ident", rhsExprs[6])
 	}
 
 	if !IsByteSlice(pass, bIdent) {
@@ -581,6 +675,12 @@ func f(s string, b []byte) {
 	}
 	if IsByteSliceConversion(pass, gCall) {
 		t.Fatal("IsByteSliceConversion(g(s)) = true, want false")
+	}
+	if !IsStringConversion(pass, stringConv) {
+		t.Fatal("IsStringConversion(string(b)) = false, want true")
+	}
+	if IsStringConversion(pass, stringCall) {
+		t.Fatal("IsStringConversion(h(s)) = true, want false")
 	}
 
 	if !IsStringType(pass, sIdent) {
@@ -984,6 +1084,477 @@ func f() {}
 			got := applyTextEdits(t, fset, []byte(tt.src), edits)
 			if got != tt.want {
 				t.Fatalf("SwapImportEdits() result:\ngot:\n%s\nwant:\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUniverseErrorInterface(t *testing.T) {
+	t.Parallel()
+
+	iface := UniverseErrorInterface()
+	if iface == nil {
+		t.Fatal("UniverseErrorInterface() = nil, want the built-in error interface")
+	}
+	if iface.NumMethods() != 1 || iface.Method(0).Name() != "Error" {
+		t.Fatalf("UniverseErrorInterface() = %v, want interface with single Error method", iface)
+	}
+}
+
+func TestStringLitValue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		expr   ast.Expr
+		want   string
+		wantOK bool
+	}{
+		{
+			name:   "interpreted string literal",
+			expr:   &ast.BasicLit{Kind: token.STRING, Value: `"a\tb"`},
+			want:   "a\tb",
+			wantOK: true,
+		},
+		{
+			name:   "raw string literal",
+			expr:   &ast.BasicLit{Kind: token.STRING, Value: "`abc`"},
+			want:   "abc",
+			wantOK: true,
+		},
+		{
+			name: "non-string literal",
+			expr: &ast.BasicLit{Kind: token.INT, Value: "1"},
+		},
+		{
+			name: "unquotable literal",
+			expr: &ast.BasicLit{Kind: token.STRING, Value: `"unterminated`},
+		},
+		{
+			name: "not a literal",
+			expr: ast.NewIdent("x"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := StringLitValue(tt.expr)
+			if ok != tt.wantOK || got != tt.want {
+				t.Fatalf("StringLitValue() = (%q, %v), want (%q, %v)", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestResolveFormatString(t *testing.T) {
+	t.Parallel()
+
+	strLit := func(v string) ast.Expr { return &ast.BasicLit{Kind: token.STRING, Value: v} }
+	concat := func(exprs ...ast.Expr) ast.Expr {
+		result := exprs[0]
+		for _, e := range exprs[1:] {
+			result = &ast.BinaryExpr{X: result, Op: token.ADD, Y: e}
+		}
+		return result
+	}
+
+	tests := []struct {
+		name   string
+		expr   ast.Expr
+		want   string
+		wantOK bool
+	}{
+		{
+			name:   "plain string literal",
+			expr:   strLit(`"operation failed: %w"`),
+			want:   "operation failed: %w",
+			wantOK: true,
+		},
+		{
+			name:   "concatenation of two literals",
+			expr:   concat(strLit(`"a"`), strLit(`"b: %v"`)),
+			want:   "ab: %v",
+			wantOK: true,
+		},
+		{
+			name:   "concatenation with a leading non-literal identifier returns ok=false",
+			expr:   concat(ast.NewIdent("message"), strLit(`"\n\nOriginal error: %v"`)),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "opaque operand between literal segments returns ok=false",
+			expr:   concat(strLit(`"abc%"`), ast.NewIdent("errStr"), strLit(`"v..."`)),
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "concatenation of only non-literal identifiers",
+			expr:   concat(ast.NewIdent("a"), ast.NewIdent("b")),
+			wantOK: false,
+		},
+		{
+			name:   "non-ADD binary expression",
+			expr:   &ast.BinaryExpr{X: strLit(`"a"`), Op: token.SUB, Y: strLit(`"b"`)},
+			wantOK: false,
+		},
+		{
+			name:   "bare identifier",
+			expr:   ast.NewIdent("x"),
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := ResolveFormatString(tt.expr)
+			if ok != tt.wantOK || got != tt.want {
+				t.Fatalf("ResolveFormatString() = (%q, %v), want (%q, %v)", got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestIsRegexpCompileCall(t *testing.T) {
+	t.Parallel()
+
+	src := `package p
+
+import (
+	regexp "regexp"
+	other "strings"
+)
+
+func f(pattern string) {
+	_ = regexp.MustCompile(pattern)
+	_ = regexp.MustCompilePOSIX(pattern)
+	_ = other.Contains(pattern, pattern)
+	_, _ = (regexp.Compile)(pattern)
+}
+`
+	pass, file := typecheckSnippet(t, src)
+
+	var calls []*ast.CallExpr
+	ast.Inspect(file, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	if len(calls) != 4 {
+		t.Fatalf("found %d calls, want 4", len(calls))
+	}
+
+	names := []string{"MustCompile", "Compile"}
+	if !IsRegexpCompileCall(pass, calls[0], names...) {
+		t.Error("IsRegexpCompileCall(regexp.MustCompile, MustCompile/Compile) = false, want true")
+	}
+	if IsRegexpCompileCall(pass, calls[1], names...) {
+		t.Error("IsRegexpCompileCall(regexp.MustCompilePOSIX, MustCompile/Compile) = true, want false")
+	}
+	if !IsRegexpCompileCall(pass, calls[1], "MustCompilePOSIX") {
+		t.Error("IsRegexpCompileCall(regexp.MustCompilePOSIX, MustCompilePOSIX) = false, want true")
+	}
+	if IsRegexpCompileCall(pass, calls[2], "Contains") {
+		t.Error("IsRegexpCompileCall(strings.Contains, Contains) = true, want false")
+	}
+	if !IsRegexpCompileCall(pass, calls[3], names...) {
+		t.Error("IsRegexpCompileCall((regexp.Compile), MustCompile/Compile) = false, want true")
+	}
+	if IsRegexpCompileCall(&analysis.Pass{}, calls[0], names...) {
+		t.Error("IsRegexpCompileCall() with nil TypesInfo = true, want false")
+	}
+}
+
+func TestIsFmtErrorf(t *testing.T) {
+	t.Parallel()
+
+	src := `package p
+
+import (
+	"errors"
+	format "fmt"
+)
+
+func f() {
+	_ = format.Errorf("a")
+	_ = (format.Errorf)("b")
+	_ = errors.New("c")
+}
+`
+	pass, file := typecheckSnippet(t, src)
+
+	var calls []*ast.CallExpr
+	ast.Inspect(file, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	if len(calls) != 3 {
+		t.Fatalf("found %d calls, want 3", len(calls))
+	}
+
+	if !IsFmtErrorf(pass, calls[0]) {
+		t.Error("IsFmtErrorf(format.Errorf) = false, want true")
+	}
+	if !IsFmtErrorf(pass, calls[1]) {
+		t.Error("IsFmtErrorf((format.Errorf)) = false, want true")
+	}
+	if IsFmtErrorf(pass, calls[2]) {
+		t.Error("IsFmtErrorf(errors.New) = true, want false")
+	}
+}
+
+func TestHasConstantStringArg(t *testing.T) {
+	t.Parallel()
+
+	src := `package p
+
+const constPattern = "^a$"
+const constPrefix = "^"
+const constSuffix = "$"
+
+func sink(string) {}
+
+func f(dynamic string) {
+	sink("literal")
+	sink(constPattern)
+	sink(constPrefix + constSuffix)
+	sink(dynamic)
+}
+`
+	pass, file := typecheckSnippet(t, src)
+
+	var calls []*ast.CallExpr
+	ast.Inspect(file, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	if len(calls) != 4 {
+		t.Fatalf("found %d calls, want 4", len(calls))
+	}
+
+	if !HasConstantStringArg(pass, calls[0], 0) {
+		t.Error("HasConstantStringArg(literal) = false, want true")
+	}
+	if !HasConstantStringArg(pass, calls[1], 0) {
+		t.Error("HasConstantStringArg(const ident) = false, want true")
+	}
+	if !HasConstantStringArg(pass, calls[2], 0) {
+		t.Error("HasConstantStringArg(const concat) = false, want true")
+	}
+	if HasConstantStringArg(pass, calls[3], 0) {
+		t.Error("HasConstantStringArg(variable) = true, want false")
+	}
+	if HasConstantStringArg(&analysis.Pass{}, calls[3], 0) {
+		t.Error("HasConstantStringArg() with nil TypesInfo = true, want false")
+	}
+	// Out-of-range indexes must not panic.
+	if HasConstantStringArg(pass, calls[0], 1) || HasConstantStringArg(pass, calls[0], -1) {
+		t.Error("HasConstantStringArg() with out-of-range index = true, want false")
+	}
+}
+
+func TestNormalizeComparisonOperands(t *testing.T) {
+	t.Parallel()
+
+	src := `package p
+
+import "strings"
+
+func f(s, sub string) {
+	_ = strings.Index(s, sub) == 0
+	_ = 0 == (strings.Index(s, sub))
+	_ = len(s) == 0
+}
+`
+	pass, file := typecheckSnippet(t, src)
+
+	var binaries []*ast.BinaryExpr
+	ast.Inspect(file, func(n ast.Node) bool {
+		if bin, ok := n.(*ast.BinaryExpr); ok {
+			binaries = append(binaries, bin)
+		}
+		return true
+	})
+	if len(binaries) != 3 {
+		t.Fatalf("found %d binary expressions, want 3", len(binaries))
+	}
+
+	left, _, flipped := NormalizeComparisonOperands(pass, binaries[0], "Index")
+	if flipped {
+		t.Error("NormalizeComparisonOperands(call on left) flipped = true, want false")
+	}
+	if _, ok := AsStringsMethodCall(pass, left, "Index"); !ok {
+		t.Error("NormalizeComparisonOperands(call on left) left is not the strings.Index call")
+	}
+
+	left, _, flipped = NormalizeComparisonOperands(pass, binaries[1], "Index")
+	if !flipped {
+		t.Error("NormalizeComparisonOperands(parenthesized call on right) flipped = false, want true")
+	}
+	if _, ok := AsStringsMethodCall(pass, left, "Index"); !ok {
+		t.Error("NormalizeComparisonOperands(parenthesized call on right) did not unwrap parentheses")
+	}
+
+	left, _, flipped = NormalizeComparisonOperands(pass, binaries[2], "Index")
+	if flipped {
+		t.Error("NormalizeComparisonOperands(no call) flipped = true, want false")
+	}
+	if _, ok := AsStringsMethodCall(pass, left, "Index"); ok {
+		t.Error("NormalizeComparisonOperands(no call) unexpectedly matched strings.Index")
+	}
+}
+
+func TestIsInInitFunction(t *testing.T) {
+	t.Parallel()
+
+	src := `package p
+
+func init() {
+	println("in init")
+	go func() {
+		println("in func lit inside init")
+	}()
+}
+
+func regular() {
+	println("in regular")
+}
+
+func initWithLit() {
+	go func() {
+		println("in func lit")
+	}()
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "snippet.go", src, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("ParseFile() error = %v", err)
+	}
+	insp := inspector.New([]*ast.File{file})
+
+	var got []bool
+	for cur := range insp.Root().Preorder((*ast.CallExpr)(nil)) {
+		call, ok := cur.Node().(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		if ident, ok := call.Fun.(*ast.Ident); !ok || ident.Name != "println" {
+			continue
+		}
+		got = append(got, IsInInitFunction(cur))
+	}
+
+	want := []bool{true, false, false, false}
+	if !slices.Equal(got, want) {
+		t.Fatalf("IsInInitFunction() = %v, want %v", got, want)
+	}
+}
+
+func TestSwapPkgImportEdits(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		src            string
+		removeOrphaned bool
+		wantNeeded     bool
+		want           string
+	}{
+		{
+			name: "add only",
+			src: `package p
+
+import "fmt"
+
+func f() { fmt.Println() }
+`,
+			wantNeeded: true,
+			want: `package p
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func f() { fmt.Println() }
+`,
+		},
+		{
+			name: "add and remove orphaned",
+			src: `package p
+
+import "fmt"
+
+func f() {}
+`,
+			removeOrphaned: true,
+			wantNeeded:     true,
+			want: `package p
+
+import "strconv"
+
+func f() {}
+`,
+		},
+		{
+			name: "remove orphaned only",
+			src: `package p
+
+import (
+	"fmt"
+	"strconv"
+)
+
+func f() {}
+`,
+			removeOrphaned: true,
+			wantNeeded:     true,
+			want: `package p
+
+import (
+	"strconv"
+)
+
+func f() {}
+`,
+		},
+		{
+			name: "nothing needed",
+			src: `package p
+
+import "strconv"
+
+func f() {}
+`,
+			wantNeeded: false,
+			want: `package p
+
+import "strconv"
+
+func f() {}
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fset, file, pass := parseSnippet(t, tt.src)
+			edits, needed := SwapPkgImportEdits(pass, file, "strconv", "fmt", tt.removeOrphaned)
+			if needed != tt.wantNeeded {
+				t.Fatalf("SwapPkgImportEdits() needed = %v, want %v", needed, tt.wantNeeded)
+			}
+			got := applyTextEdits(t, fset, []byte(tt.src), edits)
+			if got != tt.want {
+				t.Fatalf("SwapPkgImportEdits() result:\ngot:\n%s\nwant:\n%s", got, tt.want)
 			}
 		})
 	}

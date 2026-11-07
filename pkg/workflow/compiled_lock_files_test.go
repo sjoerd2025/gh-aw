@@ -3,17 +3,196 @@
 package workflow
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // workflowsDir is the path to the .github/workflows directory relative to this test file.
 const workflowsDir = "../../.github/workflows"
+
+func TestSmokeAndCoverageFailureContracts(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		required []string
+		rejected []string
+	}{
+		{
+			name: "purelock",
+			required: []string{
+				`> "$GITHUB_WORKSPACE/coverage/purelock-cobertura.xml"`,
+				`file: "coverage/purelock-cobertura.xml"`,
+				"If generation or upload fails, call `report_incomplete`",
+			},
+			rejected: []string{
+				`file: "/tmp/gh-aw/purelock/cobertura.xml"`,
+				`> "$RUNNER_TEMP/gh-aw/safeoutputs/upload-code-coverage/`,
+			},
+		},
+		{
+			name: "smoke-pi",
+			required: []string{
+				"Wait for each tool result",
+				"Only after the file creation and readback succeed",
+				"provided tool-call API",
+				"do not use `require`",
+				"return only their actual file contents and command output",
+			},
+			rejected: []string{"sequentially in a single turn"},
+		},
+		{
+			name: "smoke-pydantic",
+			required: []string{
+				"run: mkdir -p generated_reports",
+				"generated_reports/smoke-pydantic-${{ github.run_id }}.txt",
+				"Wait for success, then use `read_file`",
+				"mark this test as failed and report the concrete error",
+			},
+		},
+		{
+			name: "daily-workflow-security-model",
+			required: []string{
+				"  - shared/tla-plus.md",
+			},
+		},
+		{
+			name: "shared/tla-plus",
+			required: []string{
+				`bash "$trusted/.github/scripts/install_tla_runtime.sh" /tmp/gh-aw/agent/tla-tools`,
+				"TLC 2.19",
+			},
+			rejected: []string{"releases/download/v1.8.0", "curl", "011267fca25d0752cf18894dd585cd28b96960c112ea8a20b823ea770e7e10cd"},
+		},
+		{
+			name: "daily-work-queue-formal-verification",
+			required: []string{
+				`bash "$trusted/.github/scripts/install_tla_runtime.sh" "$RUNNER_TEMP/tla-tools" --jar-only`,
+				`printf 'TLA2TOOLS_JAR=%s/tla-tools/tla2tools.jar\n'`,
+			},
+			rejected: []string{"curl", "releases/download/"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(workflowsDir, test.name+".md"))
+			require.NoError(t, err)
+			for _, required := range test.required {
+				assert.Contains(t, string(content), required)
+			}
+			for _, rejected := range test.rejected {
+				assert.NotContains(t, string(content), rejected)
+			}
+		})
+	}
+}
+
+func TestTLARuntimeRejectsTamperedCheckout(t *testing.T) {
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		t.Skip("sha256sum is required by the Linux workflow")
+	}
+	for _, workflow := range []struct {
+		path string
+		step string
+	}{
+		{"shared/tla-plus.md", "Prepare pinned TLA+ runtime"},
+		{"daily-work-queue-formal-verification.md", "Download pinned TLC"},
+	} {
+		content, err := os.ReadFile(filepath.Join(workflowsDir, workflow.path))
+		require.NoError(t, err)
+		section := strings.SplitN(string(content), "name: "+workflow.step, 2)
+		require.Len(t, section, 2)
+		section = strings.SplitN(section[1], "run: |\n", 2)
+		require.Len(t, section, 2)
+		var script strings.Builder
+		for line := range strings.SplitSeq(section[1], "\n") {
+			if strings.TrimSpace(line) == "---" || strings.HasPrefix(strings.TrimSpace(line), "- name:") {
+				break
+			}
+			script.WriteString(strings.TrimSpace(line) + "\n")
+		}
+		for _, tampered := range []string{".github/scripts/install_tla_runtime.sh", "actions/setup/sh/release_integrity.sh"} {
+			t.Run(workflow.path+"/"+tampered, func(t *testing.T) {
+				root := t.TempDir()
+				workspace := filepath.Join(root, "workspace")
+				for _, path := range []string{".github/scripts/install_tla_runtime.sh", "actions/setup/sh/release_integrity.sh"} {
+					data, err := os.ReadFile(filepath.Join("../..", path))
+					require.NoError(t, err)
+					if path == tampered {
+						data = []byte("touch \"$RUNNER_TEMP/executed\"\n")
+					}
+					dest := filepath.Join(workspace, path)
+					require.NoError(t, os.MkdirAll(filepath.Dir(dest), 0o755))
+					require.NoError(t, os.WriteFile(dest, data, 0o644))
+				}
+				bin := filepath.Join(root, "bin")
+				require.NoError(t, os.Mkdir(bin, 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(bin, "curl"), []byte("#!/bin/sh\ntouch \"$RUNNER_TEMP/executed\"\nexit 1\n"), 0o755))
+				cmd := exec.Command("bash", "-c", script.String())
+				cmd.Env = append(os.Environ(), "GITHUB_WORKSPACE="+workspace, "RUNNER_TEMP="+root, "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+				output, err := cmd.CombinedOutput()
+				require.Error(t, err, string(output))
+				assert.Contains(t, string(output), "FAILED")
+				_, err = os.Stat(filepath.Join(root, "executed"))
+				assert.True(t, os.IsNotExist(err), "untrusted code or download ran")
+			})
+		}
+	}
+}
+
+func TestTLARuntimeWorkflowContracts(t *testing.T) {
+	pins := make(map[string]string)
+	for _, path := range []string{
+		"../../.github/scripts/install_tla_runtime.sh",
+		"../../actions/setup/sh/release_integrity.sh",
+	} {
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+		pins[filepath.Base(path)] = fmt.Sprintf("%x", sha256.Sum256(content))
+	}
+	for _, name := range []string{
+		"daily-formal-spec-verifier",
+		"daily-tlc-test-expert",
+		"daily-workflow-security-model",
+		"daily-work-queue-formal-verification",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join(workflowsDir, name+".lock.yml"))
+			require.NoError(t, err)
+			lock := string(content)
+			for _, rejected := range []string{
+				"releases/download/v1.8.0",
+				"011267fca25d0752cf18894dd585cd28b96960c112ea8a20b823ea770e7e10cd",
+			} {
+				assert.NotContains(t, lock, rejected)
+			}
+			stepName := "Prepare pinned TLA+ runtime"
+			if name == "daily-work-queue-formal-verification" {
+				stepName = "Download pinned TLC"
+			}
+			parts := strings.SplitN(lock, "- name: "+stepName, 2)
+			require.Len(t, parts, 2)
+			step := strings.ReplaceAll(strings.SplitN(parts[1], "\n      - name:", 2)[0], `\"`, `"`)
+			for file, pin := range pins {
+				assert.Contains(t, step, pin)
+				assert.Contains(t, step, `"$trusted/`+map[string]string{
+					"install_tla_runtime.sh": ".github/scripts/",
+					"release_integrity.sh":   "actions/setup/sh/",
+				}[file]+file+`"`)
+			}
+			verify := strings.Index(step, "sha256sum --check --strict")
+			install := strings.Index(step, `bash "$trusted/.github/scripts/install_tla_runtime.sh"`)
+			require.NotEqual(t, -1, verify)
+			require.Greater(t, install, verify)
+		})
+	}
+}
 
 // lockFileOutputMapping describes what outputs a compiled lock file must expose, derived from
 // the SafeOutputsConfig parsed from the source .md file.
@@ -140,6 +319,25 @@ func TestCompiledLockFiles_SafeOutputsJobOutputs(t *testing.T) {
 	t.Logf("Validated safe_outputs job outputs for %d workflow(s)", checkedWorkflows)
 }
 
+func TestSmokeClaudeAllowsRequiredChromeServiceDomains(t *testing.T) {
+	data, err := NewCompiler().ParseWorkflowFile(filepath.Join(workflowsDir, "smoke-claude.md"))
+	require.NoError(t, err, "should parse smoke-claude workflow")
+	require.NotNil(t, data.NetworkPermissions, "smoke-claude should configure network permissions")
+
+	for _, domain := range []string{
+		"content-autofill.googleapis.com",
+		"www.google.com",
+		"accounts.google.com",
+		"android.clients.google.com",
+		"www.gstatic.com",
+	} {
+		assert.Contains(t, data.NetworkPermissions.Allowed, domain,
+			"smoke-claude should allow the Chrome service domain %s", domain)
+	}
+	assert.NotContains(t, data.NetworkPermissions.Allowed, "chrome",
+		"smoke-claude should not allow the broad chrome network ecosystem")
+}
+
 func TestCompiledLockFiles_SmokePiOmitsYoloArg(t *testing.T) {
 	lockPath := filepath.Join(workflowsDir, "smoke-pi.lock.yml")
 	lockBytes, err := os.ReadFile(lockPath)
@@ -149,14 +347,14 @@ func TestCompiledLockFiles_SmokePiOmitsYoloArg(t *testing.T) {
 		"smoke-pi should not pass a redundant --yolo arg because Pi runs in yolo mode by default")
 }
 
-func TestCompiledLockFiles_SmokePiKeepsCLIProxySafeoutputsWiring(t *testing.T) {
+func TestCompiledLockFiles_SmokePiUsesNativeMCPSafeoutputsWiring(t *testing.T) {
 	sourcePath := filepath.Join(workflowsDir, "smoke-pi.md")
 	sourceBytes, err := os.ReadFile(sourcePath)
 	require.NoError(t, err, "should read smoke-pi source workflow")
 
 	source := string(sourceBytes)
-	assert.Contains(t, source, "cli-proxy: true",
-		"smoke-pi source workflow should keep cli-proxy enabled so safeoutputs CLI wrappers are generated")
+	assert.NotContains(t, source, "cli-proxy: true",
+		"smoke-pi exercises native MCP rather than hiding MCP servers behind CLI wrappers")
 
 	lockPath := filepath.Join(workflowsDir, "smoke-pi.lock.yml")
 	lockBytes, err := os.ReadFile(lockPath)
@@ -164,11 +362,66 @@ func TestCompiledLockFiles_SmokePiKeepsCLIProxySafeoutputsWiring(t *testing.T) {
 
 	lockContent := string(lockBytes)
 	assert.Contains(t, lockContent, "Mount MCP servers as CLIs",
-		"smoke-pi lock file should mount MCP servers as CLI wrappers")
-	assert.Contains(t, lockContent, `GH_AW_MCP_CLI_SERVERS='["safeoutputs"]'`,
-		"smoke-pi lock file should request the safeoutputs CLI wrapper")
-	assert.Contains(t, lockContent, `export PATH="${RUNNER_TEMP}/gh-aw/mcp-cli/bin:$PATH"`,
-		"smoke-pi lock file should add mounted MCP CLI wrappers to PATH before executing Pi")
+		"the infrastructure CLI fallback remains available alongside native MCP")
+	assert.Contains(t, lockContent, "export GH_AW_PI_NATIVE_MCP=1",
+		"native Pi must retain infrastructure servers even when CLI fallbacks are mounted")
+	assert.Contains(t, lockContent, "pi_runtime.cjs",
+		"Pi must prepare the scoped gateway MCP configuration")
+	assert.Contains(t, lockContent, "--extension builtin:mcp",
+		"Pi must load the native MCP extension")
+	assert.Contains(t, lockContent, safeOutputsMCPTransportPromptFile,
+		"native MCP safe-output guidance must be included")
+}
+
+func TestCompiledLockFiles_CLIEngineInstallStepNamesIncludeCLISuffix(t *testing.T) {
+	tests := []struct {
+		lockFile    string
+		wantNames   []string
+		absentNames []string
+	}{
+		{
+			lockFile: "smoke-crush.lock.yml",
+			wantNames: []string{
+				"Install Crush CLI",
+			},
+			absentNames: []string{
+				"Install Crush",
+			},
+		},
+		{
+			lockFile: "smoke-opencode.lock.yml",
+			wantNames: []string{
+				"Install OpenCode CLI",
+			},
+			absentNames: []string{
+				"Install OpenCode",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.lockFile, func(t *testing.T) {
+			lockPath := filepath.Join(workflowsDir, tt.lockFile)
+			lockBytes, err := os.ReadFile(lockPath)
+			require.NoError(t, err, "should read %s", tt.lockFile)
+
+			stepNames := map[string]bool{}
+			for line := range strings.SplitSeq(string(lockBytes), "\n") {
+				line = strings.TrimSpace(line)
+				name, ok := strings.CutPrefix(line, "- name: ")
+				if ok {
+					stepNames[name] = true
+				}
+			}
+
+			for _, wantName := range tt.wantNames {
+				assert.Contains(t, stepNames, wantName)
+			}
+			for _, absentName := range tt.absentNames {
+				assert.NotContains(t, stepNames, absentName)
+			}
+		})
+	}
 }
 
 // TestCompiledLockFiles_WorkflowCallOutputs validates that compiled lock files for workflows
@@ -448,4 +701,36 @@ func TestCompiledLockFiles_SmokeCallWorkflowForwardsPayload(t *testing.T) {
 		assert.Contains(t, lockContent, "payload: ${{ needs.safe_outputs.outputs.call_workflow_payload }}", "call-workflow job should forward payload from safe_outputs")
 		assert.Contains(t, lockContent, "${{ fromJSON(needs.safe_outputs.outputs.call_workflow_payload)['task-description'] }}", "call-workflow job should forward task-description from the handler payload")
 	})
+}
+
+// TestCompiledLockFiles_EngineExecutionStepNamesMatchAuditConstant verifies that every
+// continue-on-error evals and detection engine step keeps a name that gh aw audit
+// recognizes through constants.IsEngineExecutionStepName.
+func TestCompiledLockFiles_EngineExecutionStepNamesMatchAuditConstant(t *testing.T) {
+	lockFiles, err := filepath.Glob(filepath.Join(workflowsDir, "*.lock.yml"))
+	require.NoError(t, err, "should list lock files")
+
+	checked := 0
+	for _, lockFile := range lockFiles {
+		lockBytes, err := os.ReadFile(lockFile)
+		require.NoError(t, err, "should read lock file %s", lockFile)
+		lines := strings.Split(string(lockBytes), "\n")
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed != "id: evals_agentic_execution" && trimmed != "id: detection_agentic_execution" {
+				continue
+			}
+			stepName := ""
+			for j := i - 1; j >= 0; j-- {
+				if name, ok := strings.CutPrefix(strings.TrimSpace(lines[j]), "- name: "); ok {
+					stepName = name
+					break
+				}
+			}
+			assert.True(t, constants.IsEngineExecutionStepName(stepName),
+				"%s: step %q (%s) must match constants.IsEngineExecutionStepName", filepath.Base(lockFile), stepName, trimmed)
+			checked++
+		}
+	}
+	assert.Positive(t, checked, "should find at least one evals or detection engine execution step")
 }

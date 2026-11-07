@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"fmt"
+	"path"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -33,16 +35,43 @@ func (c *Compiler) addActivationReactionStep(ctx *activationJobBuildContext) {
 }
 
 func (c *Compiler) addActivationSecretValidationStep(ctx *activationJobBuildContext) {
-	secretValidationStep := ctx.engine.GetSecretValidationStep(ctx.data)
-	if len(secretValidationStep) == 0 {
-		compilerActivationJobLog.Printf("Skipped validate-secret step (engine does not require secret validation)")
+	var stepIDs []string
+	if secretValidationStep := ctx.engine.GetSecretValidationStep(ctx.data); len(secretValidationStep) > 0 {
+		for _, line := range secretValidationStep {
+			ctx.steps = append(ctx.steps, line+"\n")
+		}
+		stepIDs = append(stepIDs, "validate-secret")
+	}
+	for _, step := range buildFallbackProviderValidationSteps(ctx.data) {
+		for _, line := range step {
+			ctx.steps = append(ctx.steps, line+"\n")
+			if id, ok := strings.CutPrefix(line, "        id: "); ok {
+				stepIDs = append(stepIDs, id)
+			}
+		}
+	}
+	for i, secretValidationStep := range buildSafeOutputSecretValidationSteps(ctx.data) {
+		for _, line := range secretValidationStep {
+			ctx.steps = append(ctx.steps, line+"\n")
+		}
+		stepIDs = append(stepIDs, safeOutputSecretValidationStepID(i))
+	}
+	if len(stepIDs) == 0 {
+		compilerActivationJobLog.Printf("Skipped secret validation steps (no required secrets)")
 		return
 	}
-	for _, line := range secretValidationStep {
-		ctx.steps = append(ctx.steps, line+"\n")
+	if len(stepIDs) == 1 && stepIDs[0] == "validate-secret" { //nolint:uncheckedsliceindex // len(stepIDs) guarantees index 0 is in range
+		ctx.outputs["secret_verification_result"] = "${{ steps.validate-secret.outputs.verification_result }}"
+		compilerActivationJobLog.Printf("Added engine secret validation step to activation job")
+		return
 	}
-	ctx.outputs["secret_verification_result"] = "${{ steps.validate-secret.outputs.verification_result }}"
-	compilerActivationJobLog.Printf("Added validate-secret step to activation job")
+
+	failureChecks := make([]string, 0, len(stepIDs))
+	for _, stepID := range stepIDs {
+		failureChecks = append(failureChecks, fmt.Sprintf("steps.%s.outcome == 'failure'", stepID))
+	}
+	ctx.outputs["secret_verification_result"] = fmt.Sprintf("${{ (%s) && 'failed' || 'success' }}", strings.Join(failureChecks, " || "))
+	compilerActivationJobLog.Printf("Added %d secret validation step(s) to activation job", len(stepIDs))
 }
 
 // addActivationOAuthTokenCheckStep adds a step to the activation job that checks
@@ -50,25 +79,40 @@ func (c *Compiler) addActivationSecretValidationStep(ctx *activationJobBuildCont
 // OAuth tokens. OAuth tokens (gho_...) are not suitable for automation as they are
 // typically over-provisioned.
 func (c *Compiler) addActivationOAuthTokenCheckStep(ctx *activationJobBuildContext) {
-	compilerActivationJobLog.Print("Adding OAuth token check step to activation job")
+	var envLines []string
 
-	// Resolve COPILOT_GITHUB_TOKEN expression, respecting engine.env overrides.
-	copilotTokenExpr := fmt.Sprintf("${{ secrets.%s }}", constants.CopilotGitHubToken)
-	if overrides := getEngineEnvOverrides(ctx.data); overrides != nil {
-		if override, ok := overrides[constants.CopilotGitHubToken]; ok {
-			copilotTokenExpr = override
+	// Skip COPILOT_GITHUB_TOKEN when permissions.copilot-requests is write: in that
+	// mode the Copilot engine authenticates via ${{ github.token }} (org-billed,
+	// PAT-free) and does not reference secrets.COPILOT_GITHUB_TOKEN anywhere else in
+	// the compiled workflow, so checking it here would needlessly re-introduce the
+	// secret reference into the lock file and its gh-aw-manifest.
+	if !hasCopilotRequestsWritePermission(ctx.data) {
+		// Resolve COPILOT_GITHUB_TOKEN expression, respecting engine.env overrides.
+		copilotTokenExpr := fmt.Sprintf("${{ secrets.%s }}", constants.CopilotGitHubToken)
+		if overrides := getEngineEnvOverrides(ctx.data); overrides != nil {
+			if override, ok := overrides[constants.CopilotGitHubToken]; ok {
+				copilotTokenExpr = override
+			}
 		}
+		envLines = appendEnvVarLine(envLines, constants.CopilotGitHubToken, copilotTokenExpr)
 	}
+	envLines = appendEnvVarLine(envLines, constants.EnvVarGitHubToken, fmt.Sprintf("${{ secrets.%s }}", constants.EnvVarGitHubToken))
+	envLines = appendEnvVarLine(envLines, constants.EnvVarGitHubMCPServerToken, fmt.Sprintf("${{ secrets.%s }}", constants.EnvVarGitHubMCPServerToken))
+
+	if len(envLines) == 0 {
+		compilerActivationJobLog.Print("Skipped OAuth token check step (no secrets to check)")
+		return
+	}
+
+	compilerActivationJobLog.Print("Adding OAuth token check step to activation job")
 
 	ctx.steps = append(ctx.steps, "      - name: Check for OAuth tokens\n")
 	ctx.steps = append(ctx.steps, "        id: check-oauth-tokens\n")
 	ctx.steps = append(ctx.steps, "        run: bash \"${RUNNER_TEMP}/gh-aw/actions/check_oauth_tokens.sh\"\n")
 	ctx.steps = append(ctx.steps, "        env:\n")
-	for _, envLine := range appendEnvVarLine([]string{}, constants.CopilotGitHubToken, copilotTokenExpr) {
+	for _, envLine := range envLines {
 		ctx.steps = append(ctx.steps, envLine+"\n")
 	}
-	ctx.steps = append(ctx.steps, fmt.Sprintf("          %s: ${{ secrets.%s }}\n", constants.EnvVarGitHubToken, constants.EnvVarGitHubToken))
-	ctx.steps = append(ctx.steps, fmt.Sprintf("          %s: ${{ secrets.%s }}\n", constants.EnvVarGitHubMCPServerToken, constants.EnvVarGitHubMCPServerToken))
 }
 
 func (c *Compiler) addActivationCrossRepoGuidanceStep(ctx *activationJobBuildContext) {
@@ -108,6 +152,7 @@ func (c *Compiler) addActivationRepositoryAndOutputSteps(ctx *activationJobBuild
 	compilerActivationJobLog.Printf("Adding activation repository/output steps: stale_check_disabled=%t, needs_text_output=%t, lock_for_agent=%t",
 		data.StaleCheckDisabled, data.NeedsTextOutput, data.LockForAgent)
 	c.addActivationCheckoutAndBaseRestoreStep(ctx)
+	c.addActivationSteeringIssueStep(ctx)
 	c.addActivationLockFileStep(ctx)
 	c.addActivationVersionCheckStep(ctx)
 	if err := c.addActivationTextOutputStep(ctx); err != nil {
@@ -125,12 +170,12 @@ func (c *Compiler) addActivationCheckoutAndBaseRestoreStep(ctx *activationJobBui
 	data := ctx.data
 	checkoutSteps := c.generateCheckoutGitHubFolderForActivation(data)
 	ctx.steps = append(ctx.steps, checkoutSteps...)
-	if len(checkoutSteps) > 0 {
+	if len(checkoutSteps) > 0 && (!isPRCheckoutDisabled(data) || dynamicWorkflowsEnabled(ctx.engine, data.EngineConfig)) {
 		compilerActivationJobLog.Print("Adding step to save agent config folders for base branch restoration")
-		registry := GetGlobalEngineRegistry()
+		folders, files := resolveAgentManifestPaths(c.engineRegistry, data)
 		ctx.steps = append(ctx.steps, generateSaveBaseGitHubFoldersStep(
-			registry.GetAllAgentManifestFolders(),
-			registry.GetAllAgentManifestFiles(),
+			folders,
+			files,
 		)...)
 	}
 }
@@ -165,72 +210,114 @@ func (c *Compiler) addActivationVersionCheckStep(ctx *activationJobBuildContext)
 	ctx.steps = append(ctx.steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", ctx.data)))
 	ctx.steps = append(ctx.steps, "        env:\n")
 	ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_AW_COMPILED_VERSION: \"%s\"\n", c.version))
+	ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_AW_HAS_SAFE_OUTPUTS: \"%t\"\n", ctx.data.SafeOutputs != nil))
+	ctx.steps = append(ctx.steps, buildTemplatableBoolEnvVar("GH_AW_BLOCKED_VERSION_REPORT_AS_ISSUE", activationBlockedVersionReportAsIssueValue(ctx))...)
+	ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_AW_WORKFLOW_NAME: %q\n", ctx.data.Name))
 	ctx.steps = append(ctx.steps, "        with:\n")
 	ctx.steps = append(ctx.steps, "          script: |\n")
 	ctx.steps = append(ctx.steps, generateGitHubScriptWithRequire("check_version_updates.cjs"))
 }
 
-func (c *Compiler) addActivationSkillInstallSteps(ctx *activationJobBuildContext) error {
-	skillRefs := append([]SkillReference(nil), ctx.data.SkillReferences...)
-	if len(skillRefs) == 0 && len(ctx.data.Skills) > 0 {
-		skillRefs = make([]SkillReference, 0, len(ctx.data.Skills))
-		for _, skill := range ctx.data.Skills {
-			if strings.TrimSpace(skill) == "" {
-				continue
-			}
-			skillRefs = append(skillRefs, SkillReference{Skill: skill})
-		}
+// frontmatterSkillStepName builds a human-readable step name for installing a
+// frontmatter skill, including the skill identifier (with any trailing
+// "@<sha>" pin stripped) so a reader doesn't have to cross-reference the
+// workflow's skills: frontmatter list to map index -> skill. Falls back to the
+// numbered form when the skill identifier is empty.
+func frontmatterSkillStepName(skill string, stepNumber int) string {
+	identifier := strings.TrimSpace(skill)
+	if identifier == "" {
+		return fmt.Sprintf("Install frontmatter skill %d", stepNumber)
 	}
+	if at := strings.LastIndex(identifier, "@"); at > 0 {
+		identifier = identifier[:at]
+	}
+	return fmt.Sprintf("%q", "Install frontmatter skill: "+identifier)
+}
+
+func (c *Compiler) addActivationSkillInstallSteps(ctx *activationJobBuildContext) {
+	skillRefs := activationSkillReferences(ctx.data)
 	if len(skillRefs) == 0 {
-		return nil
+		return
 	}
 
 	engineID := resolveActivationEngineID(ctx.data)
-	skillDir := GetEngineSkillDir(engineID)
+	skillDir := path.Join(engineConfigBaseDirForRegistry(c.engineRegistry, engineID), "skills")
 	skillInstallAgentName := ""
-	if engine, err := GetGlobalEngineRegistry().GetEngine(strings.ToLower(engineID)); err == nil {
+	if engine, err := c.engineRegistry.GetEngine(strings.ToLower(engineID)); err == nil {
 		skillInstallAgentName = engine.GetGHSkillAgentName()
 	}
 
-	ctx.steps = append(ctx.steps, "      - name: Upgrade gh CLI for frontmatter skills\n")
-	ctx.steps = append(ctx.steps, fmt.Sprintf("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/ensure_gh_cli_min_version.sh\" \"%s\"\n", constants.GhSkillsMinVersion))
+	c.addActivationSkillUpgradeStep(ctx)
 
 	for i, skillRef := range skillRefs {
-		tokenExpr := c.resolveActivationToken(ctx.data)
-		if skillRef.GitHubToken != "" {
-			tokenExpr = skillRef.GitHubToken
-		}
-		if skillRef.GitHubApp != nil {
-			stepNumber := i + 1
-			stepID := fmt.Sprintf("frontmatter-skill-app-token-%d", stepNumber)
-			ctx.steps = append(ctx.steps, c.buildGitHubAppTokenMintStepWithMeta(
-				skillRef.GitHubApp,
-				nil,
-				"",
-				"",
-				fmt.Sprintf("Generate GitHub App token for frontmatter skill %d", stepNumber),
-				stepID,
-			)...)
-			stepTokenExpr := fmt.Sprintf("${{ steps.%s.outputs.token }}", stepID)
-			if skillRef.GitHubApp.shouldIgnoreMissingKey() {
-				tokenExpr = combineTokenExpressions(stepTokenExpr, c.resolveActivationToken(ctx.data))
-			} else {
-				tokenExpr = stepTokenExpr
-			}
-		}
-		ctx.steps = append(ctx.steps, fmt.Sprintf("      - name: Install frontmatter skill %d\n", i+1))
-		ctx.steps = append(ctx.steps, "        env:\n")
-		ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_TOKEN: %s\n", tokenExpr))
-		ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_INFO_ENGINE_ID", engineID))
-		ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_GH_SKILL_AGENT_NAME", skillInstallAgentName))
-		ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_SKILL_DIR", skillDir))
-		ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_FRONTMATTER_SKILLS", skillRef.Skill))
-		ctx.steps = append(ctx.steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", ctx.data)))
-		ctx.steps = append(ctx.steps, "        with:\n")
-		ctx.steps = append(ctx.steps, "          script: |\n")
-		ctx.steps = append(ctx.steps, generateGitHubScriptWithRequire("install_frontmatter_skills.cjs"))
+		c.addActivationSingleSkillInstallStep(ctx, skillRef, i+1, engineID, skillInstallAgentName, skillDir)
 	}
 
+	c.addActivationSkillFailureCollectionStep(ctx)
+}
+
+func activationSkillReferences(data *WorkflowData) []SkillReference {
+	skillRefs := append([]SkillReference(nil), data.SkillReferences...)
+	if len(skillRefs) > 0 || len(data.Skills) == 0 {
+		return skillRefs
+	}
+	skillRefs = make([]SkillReference, 0, len(data.Skills))
+	for _, skill := range data.Skills {
+		if strings.TrimSpace(skill) == "" {
+			continue
+		}
+		skillRefs = append(skillRefs, SkillReference{Skill: skill})
+	}
+	return skillRefs
+}
+
+func (c *Compiler) addActivationSkillUpgradeStep(ctx *activationJobBuildContext) {
+	ctx.steps = append(ctx.steps, "      - name: Upgrade gh CLI for frontmatter skills\n")
+	ctx.steps = append(ctx.steps, fmt.Sprintf("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/ensure_gh_cli_min_version.sh\" \"%s\"\n", constants.GhSkillsMinVersion))
+}
+
+func (c *Compiler) addActivationSingleSkillInstallStep(ctx *activationJobBuildContext, skillRef SkillReference, stepNumber int, engineID, skillInstallAgentName, skillDir string) {
+	tokenExpr := c.resolveFrontmatterSkillToken(ctx, skillRef, stepNumber)
+	ctx.steps = append(ctx.steps, fmt.Sprintf("      - name: %s\n", frontmatterSkillStepName(skillRef.Skill, stepNumber)))
+	ctx.steps = append(ctx.steps, "        env:\n")
+	ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_TOKEN: %s\n", tokenExpr))
+	ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_INFO_ENGINE_ID", engineID))
+	ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_GH_SKILL_AGENT_NAME", skillInstallAgentName))
+	ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_SKILL_DIR", skillDir))
+	ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_SKILL_INSTALL_INDEX", strconv.Itoa(stepNumber)))
+	ctx.steps = append(ctx.steps, formatYAMLEnv("          ", "GH_AW_FRONTMATTER_SKILLS", skillRef.Skill))
+	ctx.steps = append(ctx.steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", ctx.data)))
+	ctx.steps = append(ctx.steps, "        with:\n")
+	ctx.steps = append(ctx.steps, "          script: |\n")
+	ctx.steps = append(ctx.steps, generateGitHubScriptWithRequire("install_frontmatter_skills.cjs"))
+}
+
+func (c *Compiler) resolveFrontmatterSkillToken(ctx *activationJobBuildContext, skillRef SkillReference, stepNumber int) string {
+	tokenExpr := c.resolveActivationToken(ctx.data)
+	if skillRef.GitHubToken != "" {
+		tokenExpr = skillRef.GitHubToken
+	}
+	if skillRef.GitHubApp == nil {
+		return tokenExpr
+	}
+	stepID := fmt.Sprintf("frontmatter-skill-app-token-%d", stepNumber)
+	ctx.steps = append(ctx.steps, c.buildGitHubAppTokenMintStepForJob(
+		"activation",
+		skillRef.GitHubApp,
+		nil,
+		"",
+		"",
+		fmt.Sprintf("Generate GitHub App token for frontmatter skill %d", stepNumber),
+		stepID,
+	)...)
+	stepTokenExpr := fmt.Sprintf("${{ steps.%s.outputs.token }}", stepID)
+	if skillRef.GitHubApp.shouldIgnoreMissingKey() {
+		return combineTokenExpressions(stepTokenExpr, c.resolveActivationToken(ctx.data))
+	}
+	return stepTokenExpr
+}
+
+func (c *Compiler) addActivationSkillFailureCollectionStep(ctx *activationJobBuildContext) {
 	// Collect skill install failures written by each install step into a shared file.
 	// Runs with if: always() so failures are captured even if a prior step was unexpectedly hard-failed.
 	ctx.steps = append(ctx.steps, "      - name: Collect skill install failures\n")
@@ -243,8 +330,6 @@ func (c *Compiler) addActivationSkillInstallSteps(ctx *activationJobBuildContext
 
 	ctx.outputs["skill_install_failure_count"] = "${{ steps.collect-skill-install-failures.outputs.failure_count || '0' }}"
 	ctx.outputs["skill_install_errors"] = "${{ steps.collect-skill-install-failures.outputs.errors || '' }}"
-
-	return nil
 }
 
 func (c *Compiler) addActivationTextOutputStep(ctx *activationJobBuildContext) error {
@@ -306,15 +391,16 @@ func (c *Compiler) addActivationStatusCommentStep(ctx *activationJobBuildContext
 	ctx.steps = append(ctx.steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", ctx.data)))
 	ctx.steps = append(ctx.steps, "        env:\n")
 	ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_AW_WORKFLOW_NAME: %q\n", ctx.data.Name))
+	if ctx.data.FrontmatterEmoji != "" {
+		ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_AW_WORKFLOW_EMOJI: %q\n", ctx.data.FrontmatterEmoji))
+	}
 	if ctx.data.TrackerID != "" {
 		ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_AW_TRACKER_ID: %q\n", ctx.data.TrackerID))
 	}
 	if ctx.data.LockForAgent {
 		ctx.steps = append(ctx.steps, "          GH_AW_LOCK_FOR_AGENT: \"true\"\n")
 	}
-	if err := addActivationSafeOutputMessagesEnv(ctx); err != nil {
-		return err
-	}
+	addActivationSafeOutputMessagesEnv(ctx)
 	ctx.steps = append(ctx.steps, "        with:\n")
 	commentToken := c.resolveActivationToken(ctx.data)
 	if commentToken != "${{ secrets.GITHUB_TOKEN }}" {
@@ -328,18 +414,16 @@ func (c *Compiler) addActivationStatusCommentStep(ctx *activationJobBuildContext
 	return nil
 }
 
-func addActivationSafeOutputMessagesEnv(ctx *activationJobBuildContext) error {
+func addActivationSafeOutputMessagesEnv(ctx *activationJobBuildContext) {
 	if ctx.data.SafeOutputs == nil || ctx.data.SafeOutputs.Messages == nil {
-		return nil
+		return
 	}
-	messagesJSON, err := serializeMessagesConfig(ctx.data.SafeOutputs.Messages)
-	if err != nil {
-		return fmt.Errorf("failed to serialize messages config for activation job: %w", err)
-	}
+	// serializeMessagesConfig uses json.Marshal on a struct containing only strings and bools,
+	// so it cannot fail in practice; the error is intentionally ignored here.
+	messagesJSON, _ := serializeMessagesConfig(ctx.data.SafeOutputs.Messages)
 	if messagesJSON != "" {
 		ctx.steps = append(ctx.steps, fmt.Sprintf("          GH_AW_SAFE_OUTPUT_MESSAGES: %q\n", messagesJSON))
 	}
-	return nil
 }
 
 func (c *Compiler) addActivationIssueLockStep(ctx *activationJobBuildContext) {

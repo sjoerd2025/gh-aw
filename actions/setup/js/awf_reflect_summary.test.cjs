@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "fs";
+import os from "os";
+import path from "path";
 
 const mockCore = {
   info: vi.fn(),
@@ -11,7 +13,9 @@ const mockCore = {
 
 global.core = mockCore;
 
-const REFLECT_PATH = "/tmp/gh-aw/sandbox/firewall/awf-reflect.json";
+const REFLECT_PATH = "/tmp/gh-aw/agent/awf-reflect.json";
+const LEGACY_REFLECT_PATH = path.join(process.env.RUNNER_TEMP || os.tmpdir(), "awf-reflect.json");
+const REFLECT_ARTIFACT_PATH = "/tmp/gh-aw/sandbox/firewall/awf-reflect.json";
 const CONFIG_PATH = "/tmp/gh-aw/awf-config.json";
 const MODELS_PATH = "/tmp/gh-aw/sandbox/firewall/models.json";
 
@@ -96,15 +100,23 @@ describe("awf_reflect_summary.cjs", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     fs.mkdirSync("/tmp/gh-aw/sandbox/firewall", { recursive: true });
+    fs.mkdirSync(path.dirname(REFLECT_PATH), { recursive: true });
     module = await import("./awf_reflect_summary.cjs");
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     if (fs.existsSync(CONFIG_PATH)) {
       fs.unlinkSync(CONFIG_PATH);
     }
     if (fs.existsSync(REFLECT_PATH)) {
       fs.unlinkSync(REFLECT_PATH);
+    }
+    if (fs.existsSync(LEGACY_REFLECT_PATH)) {
+      fs.unlinkSync(LEGACY_REFLECT_PATH);
+    }
+    if (fs.existsSync(REFLECT_ARTIFACT_PATH)) {
+      fs.unlinkSync(REFLECT_ARTIFACT_PATH);
     }
     if (fs.existsSync(MODELS_PATH)) {
       fs.unlinkSync(MODELS_PATH);
@@ -127,6 +139,15 @@ describe("awf_reflect_summary.cjs", () => {
       expect(result).not.toBeNull();
       expect(result.endpoints).toHaveLength(5);
       expect(result.models_fetch_complete).toBe(true);
+    });
+    it("reads legacy runner-temp data when no sandbox payload exists", () => {
+      fs.writeFileSync(LEGACY_REFLECT_PATH, JSON.stringify(SAMPLE_REFLECT), "utf8");
+      expect(module.readReflectData()).toEqual(SAMPLE_REFLECT);
+    });
+    it("prefers fresh sandbox data over legacy payloads", () => {
+      fs.writeFileSync(LEGACY_REFLECT_PATH, '{"endpoints":[]}', "utf8");
+      fs.writeFileSync(REFLECT_PATH, JSON.stringify(SAMPLE_REFLECT), "utf8");
+      expect(module.readReflectData()).toEqual(SAMPLE_REFLECT);
     });
   });
 
@@ -371,6 +392,7 @@ describe("awf_reflect_summary.cjs", () => {
 
       await module.main();
 
+      expect(JSON.parse(fs.readFileSync(REFLECT_ARTIFACT_PATH, "utf8"))).toEqual(SAMPLE_REFLECT);
       expect(mockCore.summary.addRaw).toHaveBeenCalledTimes(1);
       const summary = mockCore.summary.addRaw.mock.calls[0][0];
       expect(summary).toContain("AWF API proxy");
@@ -381,6 +403,18 @@ describe("awf_reflect_summary.cjs", () => {
       expect(mockCore.info).toHaveBeenCalledTimes(2);
       expect(mockCore.info).toHaveBeenCalledWith(summary);
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("AWF reflect summary written"));
+    });
+
+    it("writes step summary when staging the artifact fails", async () => {
+      fs.writeFileSync(REFLECT_PATH, JSON.stringify(SAMPLE_REFLECT), "utf8");
+      vi.spyOn(fs, "copyFileSync").mockImplementationOnce(() => {
+        throw new Error("EROFS: read-only file system");
+      });
+
+      await module.main();
+
+      expect(mockCore.summary.write).toHaveBeenCalledTimes(1);
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Unable to stage AWF reflect data"));
     });
   });
 });

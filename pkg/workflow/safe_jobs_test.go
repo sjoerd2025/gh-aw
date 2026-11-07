@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,7 +71,7 @@ func TestParseSafeJobsConfig(t *testing.T) {
 	}
 
 	// Test runs-on
-	if deployJob.RunsOn != "ubuntu-latest" {
+	if deployJob.RunsOn != "runs-on: ubuntu-latest" {
 		t.Errorf("Expected runs-on to be 'ubuntu-latest', got %v", deployJob.RunsOn)
 	}
 
@@ -146,6 +147,71 @@ func TestParseSafeJobsConfig(t *testing.T) {
 	if len(deployJob.Steps) != 1 {
 		t.Fatalf("Expected 1 step, got %d", len(deployJob.Steps))
 	}
+}
+
+func TestBuildSafeJobsDefaultsEmptyRunsOn(t *testing.T) {
+	for name, runsOn := range map[string]any{
+		"empty scalar": "",
+		"empty array":  []any{},
+		"empty label":  []any{""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := NewCompiler()
+			safeJobs := c.parseSafeJobsConfig(map[string]any{
+				"notify": map[string]any{"runs-on": runsOn},
+			})
+			_, err := c.buildSafeJobs(&WorkflowData{
+				Name:        "test-workflow",
+				SafeOutputs: &SafeOutputsConfig{Jobs: safeJobs},
+			}, false)
+
+			require.NoError(t, err)
+			job, exists := c.jobManager.GetJob("notify")
+			require.True(t, exists)
+			require.Equal(t, "runs-on: ubuntu-latest", job.RunsOn)
+		})
+	}
+}
+
+func TestBuildSafeJobsAttributionMetadata(t *testing.T) {
+	c := NewCompiler()
+	c.markdownPath = ".github/workflows/custom-finding.md"
+	data := &WorkflowData{
+		Name:      "Custom Finding",
+		TrackerID: "tracking-123",
+		Model:     "test-model",
+		EngineConfig: &EngineConfig{
+			ID:      "copilot",
+			Version: "1.0.0",
+		},
+		SafeOutputs: &SafeOutputsConfig{
+			Jobs: map[string]*SafeJobConfig{
+				"publish-finding": {
+					Env: map[string]string{"CUSTOM_VALUE": "preserved"},
+					Steps: []any{map[string]any{
+						"run": "echo finding",
+						"env": map[string]any{"GH_AW_WORKFLOW_NAME": "Step override"},
+					}},
+				},
+			},
+			Staged: templatableBoolPtr("true"),
+		},
+	}
+
+	_, err := c.buildSafeJobs(data, false)
+	require.NoError(t, err)
+	job, exists := c.jobManager.GetJob("publish_finding")
+	require.True(t, exists)
+	require.Equal(t, `"custom-finding"`, job.Env["GH_AW_WORKFLOW_ID"])
+	require.Equal(t, `"Custom Finding"`, job.Env["GH_AW_WORKFLOW_NAME"])
+	require.Equal(t, `"${{ github.repository }}/custom-finding"`, job.Env["GH_AW_CALLER_WORKFLOW_ID"])
+	require.Equal(t, `"tracking-123"`, job.Env["GH_AW_TRACKER_ID"])
+	require.Equal(t, `"copilot"`, job.Env["GH_AW_ENGINE_ID"])
+	require.Equal(t, `"test-model"`, job.Env["GH_AW_ENGINE_MODEL"])
+	require.Equal(t, `"true"`, job.Env["GH_AW_SAFE_OUTPUTS_STAGED"])
+	steps := strings.Join(job.Steps, "")
+	require.Contains(t, steps, "CUSTOM_VALUE: preserved")
+	require.Contains(t, steps, "GH_AW_WORKFLOW_NAME: Step override")
 }
 
 func TestParseSafeJobsConfigMax(t *testing.T) {
@@ -232,7 +298,7 @@ func TestBuildSafeJobs(t *testing.T) {
 		SafeOutputs: &SafeOutputsConfig{
 			Jobs: map[string]*SafeJobConfig{
 				"deploy": {
-					RunsOn: "ubuntu-latest",
+					RunsOn: "runs-on: ubuntu-latest",
 					If:     "github.event.issue.number",
 					Env: map[string]string{
 						"DEPLOY_ENV": "production",
@@ -366,6 +432,171 @@ safe-outputs:
 	require.Less(t, alphaIdx, zebraIdx, "conclusion job should list safe-jobs in deterministic sorted order")
 }
 
+func TestParseAndBuildSafeJobsRunsOnList(t *testing.T) {
+	c := NewCompiler()
+
+	safeJobs := c.parseSafeJobsConfig(map[string]any{
+		"deploy": map[string]any{
+			"runs-on": []any{"self-hosted", "linux"},
+			"steps": []any{
+				map[string]any{"run": "echo 'Deploying'"},
+			},
+		},
+	})
+
+	require.Equal(t, "runs-on:\n      - self-hosted\n      - linux", safeJobs["deploy"].RunsOn)
+
+	workflowData := &WorkflowData{
+		Name:        "test-workflow",
+		SafeOutputs: &SafeOutputsConfig{Jobs: safeJobs},
+	}
+
+	_, err := c.buildSafeJobs(workflowData, false)
+	require.NoError(t, err)
+
+	jobs := c.jobManager.GetAllJobs()
+	require.Len(t, jobs, 1)
+
+	var job *Job
+	for _, j := range jobs {
+		job = j
+		break
+	}
+
+	// Multiple labels parsed as a list are rendered as a YAML list.
+	require.Equal(t, "runs-on:\n      - self-hosted\n      - linux", job.RunsOn)
+}
+
+func TestParseAndBuildSafeJobsRunsOnObject(t *testing.T) {
+	tests := []struct {
+		name     string
+		runsOn   map[string]any
+		expected string
+	}{
+		{
+			name:     "group only",
+			runsOn:   map[string]any{"group": "safe-job-runners"},
+			expected: "runs-on:\n      group: safe-job-runners",
+		},
+		{
+			name: "group and labels",
+			runsOn: map[string]any{
+				"group":  "safe-job-runners",
+				"labels": []any{"linux", "x64"},
+			},
+			expected: "runs-on:\n      group: safe-job-runners\n      labels:\n        - linux\n        - x64",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewCompiler()
+			safeJobs := c.parseSafeJobsConfig(map[string]any{
+				"deploy": map[string]any{
+					"runs-on": tt.runsOn,
+					"steps":   []any{map[string]any{"run": "echo 'Deploying'"}},
+				},
+			})
+
+			_, err := c.buildSafeJobs(&WorkflowData{
+				Name:        "test-workflow",
+				SafeOutputs: &SafeOutputsConfig{Jobs: safeJobs},
+			}, false)
+			require.NoError(t, err)
+
+			jobs := c.jobManager.GetAllJobs()
+			require.Len(t, jobs, 1)
+			for _, job := range jobs {
+				require.Equal(t, tt.expected, job.RunsOn)
+			}
+		})
+	}
+}
+
+func TestBuildSafeJobsRejectsEmptyRunsOnObject(t *testing.T) {
+	c := NewCompiler()
+	safeJobs := c.parseSafeJobsConfig(map[string]any{
+		"deploy": map[string]any{
+			"runs-on": map[string]any{},
+			"steps":   []any{map[string]any{"run": "echo 'Deploying'"}},
+		},
+	})
+
+	_, err := c.buildSafeJobs(&WorkflowData{
+		Name:        "test-workflow",
+		SafeOutputs: &SafeOutputsConfig{Jobs: safeJobs},
+	}, false)
+	require.ErrorContains(t, err, "invalid runs-on for safe-job 'deploy'")
+	require.ErrorContains(t, err, "runs-on object is empty")
+}
+
+func TestCompileSafeJobRunsOnObject(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "safe-job-runs-on-object")
+	workflowPath := filepath.Join(tmpDir, "safe-job-runs-on-object.md")
+	content := `---
+on: workflow_dispatch
+permissions: read-all
+engine: copilot
+safe-outputs:
+  jobs:
+    notify:
+      runs-on:
+        group: safe-job-runners
+        labels: [linux]
+      inputs:
+        message:
+          description: Message
+      steps:
+        - run: echo hi
+---
+
+# Test
+`
+	require.NoError(t, os.WriteFile(workflowPath, []byte(content), 0o644))
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(workflowPath))
+
+	compiled, err := os.ReadFile(filepath.Join(tmpDir, "safe-job-runs-on-object.lock.yml"))
+	require.NoError(t, err)
+	notifyJob := extractJobSection(string(compiled), "notify")
+	require.Contains(t, notifyJob, "    runs-on:\n      group: safe-job-runners\n      labels:\n        - linux")
+}
+
+func TestParseAndBuildSafeJobsSingleRunsOnList(t *testing.T) {
+	c := NewCompiler()
+
+	safeJobs := c.parseSafeJobsConfig(map[string]any{
+		"deploy": map[string]any{
+			"runs-on": []any{"self-hosted"},
+			"steps": []any{
+				map[string]any{"run": "echo 'Deploying'"},
+			},
+		},
+	})
+
+	require.Equal(t, "runs-on:\n      - self-hosted", safeJobs["deploy"].RunsOn)
+
+	workflowData := &WorkflowData{
+		Name:        "test-workflow",
+		SafeOutputs: &SafeOutputsConfig{Jobs: safeJobs},
+	}
+
+	_, err := c.buildSafeJobs(workflowData, false)
+	require.NoError(t, err)
+
+	jobs := c.jobManager.GetAllJobs()
+	require.Len(t, jobs, 1)
+
+	var job *Job
+	for _, j := range jobs {
+		job = j
+		break
+	}
+
+	require.Equal(t, "runs-on:\n      - self-hosted", job.RunsOn)
+}
+
 func TestBuildSafeJobsWithNoConfiguration(t *testing.T) {
 	c := NewCompiler()
 
@@ -403,7 +634,7 @@ func TestBuildSafeJobsWithoutCustomIfCondition(t *testing.T) {
 		SafeOutputs: &SafeOutputsConfig{
 			Jobs: map[string]*SafeJobConfig{
 				"notify": {
-					RunsOn: "ubuntu-latest",
+					RunsOn: "runs-on: ubuntu-latest",
 					// No custom 'if' condition
 					Inputs: map[string]*InputDefinition{
 						"message": {
@@ -454,7 +685,7 @@ func TestBuildSafeJobsWithDashesInName(t *testing.T) {
 		SafeOutputs: &SafeOutputsConfig{
 			Jobs: map[string]*SafeJobConfig{
 				"send-notification": {
-					RunsOn: "ubuntu-latest",
+					RunsOn: "runs-on: ubuntu-latest",
 					Steps: []any{
 						map[string]any{
 							"name": "Send notification",
@@ -578,21 +809,21 @@ func TestExtractSafeJobsFromFrontmatter(t *testing.T) {
 		t.Error("Expected 'deploy' job to exist")
 	}
 
-	if deployJob.RunsOn != "ubuntu-latest" {
-		t.Errorf("Expected runs-on to be 'ubuntu-latest', got '%s'", deployJob.RunsOn)
+	if deployJob.RunsOn != "runs-on: ubuntu-latest" {
+		t.Errorf("Expected runs-on to be 'ubuntu-latest', got '%v'", deployJob.RunsOn)
 	}
 }
 
 func TestMergeSafeJobs(t *testing.T) {
 	base := map[string]*SafeJobConfig{
 		"deploy": {
-			RunsOn: "ubuntu-latest",
+			RunsOn: "runs-on: ubuntu-latest",
 		},
 	}
 
 	additional := map[string]*SafeJobConfig{
 		"test": {
-			RunsOn: "ubuntu-latest",
+			RunsOn: "runs-on: ubuntu-latest",
 		},
 	}
 
@@ -609,7 +840,7 @@ func TestMergeSafeJobs(t *testing.T) {
 	// Test conflict detection
 	conflicting := map[string]*SafeJobConfig{
 		"deploy": {
-			RunsOn: "windows-latest",
+			RunsOn: "runs-on: windows-latest",
 		},
 	}
 
@@ -631,7 +862,7 @@ func TestMergeSafeJobsFromIncludedConfigs(t *testing.T) {
 	topSafeJobs := map[string]*SafeJobConfig{
 		"deploy": {
 			Name:   "Deploy Application",
-			RunsOn: "ubuntu-latest",
+			RunsOn: "runs-on: ubuntu-latest",
 		},
 	}
 
@@ -682,8 +913,8 @@ func TestMergeSafeJobsFromIncludedConfigs(t *testing.T) {
 		t.Error("Expected 'test' job from includes to exist")
 	}
 
-	if testJob.RunsOn != "ubuntu-latest" {
-		t.Errorf("Expected test job runs-on to be 'ubuntu-latest', got '%s'", testJob.RunsOn)
+	if testJob.RunsOn != "runs-on: ubuntu-latest" {
+		t.Errorf("Expected test job runs-on to be 'ubuntu-latest', got '%v'", testJob.RunsOn)
 	}
 
 	notifyJob, exists := result["notify"]
@@ -727,7 +958,7 @@ func TestBuildSafeJobsEnvExpressionHoisting(t *testing.T) {
 		SafeOutputs: &SafeOutputsConfig{
 			Jobs: map[string]*SafeJobConfig{
 				"publish": {
-					RunsOn: "ubuntu-latest",
+					RunsOn: "runs-on: ubuntu-latest",
 					Env: map[string]string{
 						"GH_TOKEN":   "${{ github.token }}",
 						"STATIC_VAR": "literal-value",
@@ -909,4 +1140,259 @@ func TestSafeJobsInputTypes(t *testing.T) {
 	if envInput.Type != "environment" {
 		t.Errorf("Expected type 'environment', got %s", envInput.Type)
 	}
+}
+
+func TestMergeSafeJobsFromIncludedConfigsRejectsMacOSRunner(t *testing.T) {
+	c := NewCompiler()
+
+	_, err := c.mergeSafeJobsFromIncludedConfigs(nil, []string{`{
+"jobs": {
+"notify": {
+"runs-on": "macos-latest"
+}
+}
+}`})
+
+	require.ErrorContains(t, err, "safe-outputs.jobs.notify.runs-on")
+}
+
+func TestParseSafeJobsConfigArtifacts(t *testing.T) {
+	c := NewCompiler()
+
+	t.Run("valid artifacts are parsed", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{
+					"/tmp/gh-aw/agent/review-bundles/",
+					"/tmp/gh-aw/agent/review-bundles/*.json",
+				},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists, "Expected 'publish' job to exist")
+		require.Equal(t, []string{
+			"/tmp/gh-aw/agent/review-bundles/",
+			"/tmp/gh-aw/agent/review-bundles/*.json",
+		}, job.Artifacts)
+		require.NoError(t, job.artifactsError)
+	})
+
+	t.Run("path outside /tmp/gh-aw/ is rejected", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{"/tmp/other/path"},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.Error(t, job.artifactsError)
+		require.ErrorContains(t, job.artifactsError, "/tmp/gh-aw/")
+	})
+
+	t.Run("non-string entry is rejected", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{123},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.Error(t, job.artifactsError)
+	})
+
+	t.Run("path traversal segments are rejected", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{"/tmp/gh-aw/../outside.json"},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.Error(t, job.artifactsError)
+		require.ErrorContains(t, job.artifactsError, "..")
+	})
+
+	t.Run("GitHub Actions expressions are rejected", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{"/tmp/gh-aw/${{ '..' }}/outside.json"},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.Error(t, job.artifactsError)
+		require.ErrorContains(t, job.artifactsError, "must be literal")
+	})
+
+	t.Run("control characters are rejected", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{"/tmp/gh-aw/agent/output.json\n/tmp/outside.json"},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.Error(t, job.artifactsError)
+		require.ErrorContains(t, job.artifactsError, "control characters")
+	})
+
+	t.Run("double dots within a filename are accepted", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{"/tmp/gh-aw/agent/bundle..json"},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.NoError(t, job.artifactsError)
+	})
+
+	t.Run("hidden file path is rejected", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{"/tmp/gh-aw/agent/bundle/.manifest"},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.Error(t, job.artifactsError)
+		require.ErrorContains(t, job.artifactsError, "hidden")
+	})
+
+	t.Run("hidden directory path is rejected", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{"/tmp/gh-aw/agent/.cache/data.json"},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.Error(t, job.artifactsError)
+		require.ErrorContains(t, job.artifactsError, "hidden")
+	})
+
+	t.Run("unscannable path is rejected", func(t *testing.T) {
+		result := c.parseSafeJobsConfig(map[string]any{
+			"publish": map[string]any{
+				"artifacts": []any{"/tmp/gh-aw/agent/review-bundle-data"},
+			},
+		})
+
+		job, exists := result["publish"]
+		require.True(t, exists)
+		require.Error(t, job.artifactsError)
+		require.ErrorContains(t, job.artifactsError, "secret redaction")
+	})
+}
+
+func TestBuildSafeJobsRejectsInvalidArtifacts(t *testing.T) {
+	data := &WorkflowData{
+		SafeOutputs: &SafeOutputsConfig{
+			Jobs: map[string]*SafeJobConfig{
+				"publish": {
+					Inputs: map[string]*InputDefinition{
+						"message": {Description: "msg", Type: "string"},
+					},
+				},
+			},
+		},
+	}
+	data.SafeOutputs.Jobs["publish"].artifactsError = errors.New("bad artifact")
+
+	c := NewCompiler()
+	_, err := c.buildSafeJobs(data, false)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "invalid artifacts for safe-job 'publish'")
+}
+
+func TestCollectSafeJobArtifactPaths(t *testing.T) {
+	paths := collectSafeJobArtifactPaths(map[string]*SafeJobConfig{
+		"zeta": {Artifacts: []string{"/tmp/gh-aw/agent/zeta/"}},
+		"alpha": {Artifacts: []string{
+			"/tmp/gh-aw/agent/alpha/",
+			"/tmp/gh-aw/agent/alpha/extra.json",
+		}},
+	})
+
+	require.Equal(t, []string{
+		"/tmp/gh-aw/agent/alpha/**/*.txt",
+		"/tmp/gh-aw/agent/alpha/**/*.json",
+		"/tmp/gh-aw/agent/alpha/**/*.log",
+		"/tmp/gh-aw/agent/alpha/**/*.md",
+		"/tmp/gh-aw/agent/alpha/**/*.mdx",
+		"/tmp/gh-aw/agent/alpha/**/*.yml",
+		"/tmp/gh-aw/agent/alpha/**/*.jsonl",
+		"/tmp/gh-aw/agent/alpha/**/*.patch",
+		"/tmp/gh-aw/agent/alpha/**/*.html",
+		"/tmp/gh-aw/agent/alpha/extra.json",
+		"/tmp/gh-aw/agent/zeta/**/*.txt",
+		"/tmp/gh-aw/agent/zeta/**/*.json",
+		"/tmp/gh-aw/agent/zeta/**/*.log",
+		"/tmp/gh-aw/agent/zeta/**/*.md",
+		"/tmp/gh-aw/agent/zeta/**/*.mdx",
+		"/tmp/gh-aw/agent/zeta/**/*.yml",
+		"/tmp/gh-aw/agent/zeta/**/*.jsonl",
+		"/tmp/gh-aw/agent/zeta/**/*.patch",
+		"/tmp/gh-aw/agent/zeta/**/*.html",
+	}, paths)
+}
+
+func TestMCPLogArtifactPathsRemainIncluded(t *testing.T) {
+	c := NewCompiler()
+	jobs := c.parseSafeJobsConfig(map[string]any{
+		"direct": map[string]any{"artifacts": []any{"/tmp/gh-aw/aw-mcp/logs/runs.json"}},
+		"broad":  map[string]any{"artifacts": []any{"/tmp/gh-aw/"}},
+	})
+
+	require.NoError(t, jobs["direct"].artifactsError)
+	require.NoError(t, jobs["broad"].artifactsError)
+	paths := collectSafeJobArtifactPaths(jobs)
+	require.Contains(t, paths, "/tmp/gh-aw/aw-mcp/logs/runs.json")
+	require.Contains(t, paths, "/tmp/gh-aw/**/*.json")
+}
+
+func TestCompileSafeJobArtifactsIncludedInAgentUpload(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "safe-job-artifacts")
+	workflowPath := filepath.Join(tmpDir, "safe-job-artifacts.md")
+	content := `---
+on: workflow_dispatch
+permissions: read-all
+engine: copilot
+safe-outputs:
+  jobs:
+    publish-review-bundle:
+      description: "Publish a prepared directory as a workflow artifact"
+      runs-on: ubuntu-latest
+      artifacts:
+        - /tmp/gh-aw/agent/review-bundles/
+      inputs:
+        source_dir:
+          description: "Directory containing prepared files"
+          required: true
+          type: string
+      steps:
+        - run: echo hi
+---
+
+# Test
+`
+	require.NoError(t, os.WriteFile(workflowPath, []byte(content), 0o644))
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(workflowPath))
+
+	compiled, err := os.ReadFile(filepath.Join(tmpDir, "safe-job-artifacts.lock.yml"))
+	require.NoError(t, err)
+	agentJob := extractJobSection(string(compiled), "agent")
+	require.Contains(t, agentJob, "/tmp/gh-aw/agent/review-bundles/**/*.json")
+	require.NotContains(t, agentJob, "\n            /tmp/gh-aw/agent/review-bundles/\n")
 }

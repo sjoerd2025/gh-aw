@@ -4,6 +4,7 @@ emoji: "🧪"
 name: Smoke Workflow Call
 description: Reusable workflow to validate checkout from fork works correctly in workflow_call context
 on:
+  schedule: every 2 days
   workflow_call:
     inputs:
       payload:
@@ -24,20 +25,28 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine: claude
 strict: true
 network:
   allowed:
     - defaults
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   bash:
-    - "git status"
-    - "git log *"
-    - "git branch *"
-    - "git remote *"
-    - "echo *"
+    - "git status:*"
+    - "git log:*"
+    - "git branch:*"
+    - "git remote:*"
+    - "echo:*"
+evals:
+  - id: checkout_evidence
+    question: Does the output show the required git status, branch, remote, and log checks rather than assuming checkout succeeded?
+  - id: checkout_report_accuracy
+    question: Does the requested comment's checkout status agree with the observed git command results?
+  - id: task_binding
+    question: Does the requested comment identify this invocation's supplied task-description rather than another invocation's task?
 safe-outputs:
   allowed-domains: [default-safe-outputs]
   add-comment:
@@ -52,6 +61,9 @@ safe-outputs:
 timeout-minutes: 10
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Workflow Call Checkout Validation

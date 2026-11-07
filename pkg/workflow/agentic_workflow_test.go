@@ -3,13 +3,111 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/parser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAgenticWorkflowsWriteToolsSchema(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value any
+		valid bool
+	}{
+		{"default", nil, true},
+		{"enabled", true, true},
+		{"disabled", false, true},
+		{"object defaults", map[string]any{}, true},
+		{"opt in", map[string]any{"allow-write-tools": true}, true},
+		{"opt out", map[string]any{"allow-write-tools": false}, true},
+		{"non boolean", map[string]any{"allow-write-tools": "true"}, false},
+		{"caller flag", map[string]any{"allow_write_tools": true}, false},
+		{"unknown", map[string]any{"trusted": true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := parser.ValidateMainWorkflowFrontmatterWithSchemaAndLocation(map[string]any{
+				"on": "workflow_dispatch", "tools": map[string]any{"agentic-workflows": tc.value},
+			}, "test.md")
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestAgenticWorkflowsWriteToolsRendering(t *testing.T) {
+	for _, mode := range []ActionMode{ActionModeDev, ActionModeRelease, ActionModeScript, ActionModeAction} {
+		for _, format := range []string{"json", "toml"} {
+			for _, allow := range []bool{false, true} {
+				t.Run(string(mode)+"/"+format+"/"+map[bool]string{false: "default", true: "opt-in"}[allow], func(t *testing.T) {
+					data := workflowDataWithAgenticWorkflows()
+					data.ActionMode = mode
+					data.Tools["agentic-workflows"] = map[string]any{"allow-write-tools": allow}
+					renderer := buildMCPRendererFactory(data, format, false, false)(true)
+					var output strings.Builder
+					renderer.RenderAgenticWorkflowsMCP(&output)
+					if allow {
+						assert.Contains(t, output.String(), `"mcp-server", "--validate-actor", "--allow-write-tools"`)
+					} else {
+						assert.NotContains(t, output.String(), "--allow-write-tools")
+					}
+					if !mode.IsDev() || allow {
+						assert.Contains(t, output.String(), "--validate-actor")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAgenticWorkflowsWriteToolsCompile(t *testing.T) {
+	for _, config := range []string{"", "true", "{}", "{allow-write-tools: false}", "{allow-write-tools: true}"} {
+		t.Run(config, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "test.md")
+			require.NoError(t, os.WriteFile(path, []byte("---\non: workflow_dispatch\npermissions:\n  actions: read\ntools:\n  agentic-workflows: "+config+"\n---\nTest local compile.\n"), 0o600))
+			compiler := NewCompiler()
+			compiler.SetActionMode(ActionModeRelease)
+			require.NoError(t, compiler.CompileWorkflow(path))
+			lock, err := os.ReadFile(strings.TrimSuffix(path, ".md") + ".lock.yml")
+			require.NoError(t, err)
+			assert.Equal(t, strings.Contains(config, ": true"), strings.Contains(string(lock), "--allow-write-tools"))
+			assert.Contains(t, string(lock), "--validate-actor")
+			tools, err := ParseToolsConfig(map[string]any{"agentic-workflows": map[string]any{"allow-write-tools": true}})
+			require.NoError(t, err)
+			assert.True(t, tools.AgenticWorkflows.Enabled)
+			assert.True(t, tools.AgenticWorkflows.AllowWriteTools)
+			assert.Equal(t, map[string]any{"allow-write-tools": true}, tools.ToMap()["agentic-workflows"])
+		})
+	}
+}
+
+func TestDailyCLIToolsTesterPolicy(t *testing.T) {
+	path := filepath.Join("..", "..", ".github", "workflows", "daily-cli-tools-tester.md")
+	source, err := os.ReadFile(path)
+	require.NoError(t, err)
+	compiler := NewCompiler(WithWorkflowIdentifier("daily-cli-tools-tester"))
+	data, err := compiler.ParseWorkflowFile(path)
+	require.NoError(t, err)
+	assert.True(t, parseAgenticWorkflowsTool(data.Tools["agentic-workflows"]).AllowWriteTools)
+	prompt := string(source)
+	assert.Contains(t, prompt, "dry_run: true")
+	assert.Contains(t, prompt, "strict: true")
+	assert.Contains(t, prompt, "never list, search, or read that raw directory")
+	assert.Contains(t, prompt, "if session policy permits reading it")
+	assert.Contains(t, prompt, "A later `noop` must not override that incomplete status or claim success")
+	assert.NotContains(t, prompt, "find /tmp/gh-aw/aw-mcp/logs/")
+	assert.NotContains(t, prompt, "ls -R /tmp/gh-aw/aw-mcp/logs/")
+	assert.NotContains(t, prompt, "Trigger it")
+	assert.NotContains(t, prompt, "run one bulk compile")
+}
 
 // Helper functions for test setup
 
@@ -190,18 +288,10 @@ func TestAgenticWorkflowsInstallStepIncludesGHToken(t *testing.T) {
 		"install step should not use mutable latest CLI version")
 
 	// Verify follow-up copy/verification commands are present
-	assert.Contains(t, result, "Copy gh-aw binary for MCP server",
-		"MCP setup should include a step to copy gh-aw binary for MCP server containerization")
-	assert.Contains(t, result, "gh aw --version",
-		"install step should include command to verify gh-aw installation")
-
-	// Verify the binary copy command is present for MCP server containerization
-	assert.Contains(t, result, "find \"${GH_CONFIG_DIR}/extensions/gh-aw\"",
-		"install step should search GH_CONFIG_DIR extensions when gh-aw is not on PATH")
-	assert.Contains(t, result, "GH_AW_BIN=\"${GITHUB_WORKSPACE}/gh-aw\"",
-		"install step should fall back to workspace-built gh-aw binary in dev workflows")
-	assert.Contains(t, result, "cp \"$GH_AW_BIN\" \"${RUNNER_TEMP}/gh-aw/gh-aw\"",
-		"install step should copy gh-aw binary to ${RUNNER_TEMP}/gh-aw for MCP server containerization")
+	assert.Contains(t, result, "Copy gh-aw binary for MCP Server",
+		"MCP setup should include a step to copy gh-aw binary for MCP Server containerization")
+	assert.Contains(t, result, "bash \"${RUNNER_TEMP}/gh-aw/actions/copy_gh_aw_binary_for_mcp.sh\"",
+		"install step should invoke shared copy_gh_aw_binary_for_mcp.sh helper")
 }
 
 func TestAgenticWorkflowsInstallStepPresentWithoutImport(t *testing.T) {

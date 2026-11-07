@@ -24,9 +24,6 @@ permissions:
   actions: read
   issues: read
 
-sandbox:
-  agent:
-    sudo: false
 
 engine: copilot
 timeout-minutes: 20
@@ -271,10 +268,10 @@ jobs:
           echo "✓ Binaries built successfully"
 
       - name: Setup Docker Buildx (pre-validation)
-        uses: docker/setup-buildx-action@v4.2.0
+        uses: docker/setup-buildx-action@v4.4.1
 
       - name: Build Docker image (validation only)
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           platforms: linux/amd64
@@ -285,7 +282,7 @@ jobs:
           cache-from: type=gha
 
       - name: Upload release binaries
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: release-binaries-${{ needs.config.outputs.release_tag }}
           path: dist/
@@ -316,7 +313,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Download release binaries
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: release-binaries-${{ needs.config.outputs.release_tag }}
           path: dist/
@@ -330,6 +327,33 @@ jobs:
             exit 1
           }
           Write-Host "Found $($binaries.Count) Windows binaries to scan."
+
+          # Verify every Windows binary against the release checksum manifest
+          # before asking Defender to inspect it.
+          $checksumPath = Join-Path "dist" "checksums.txt"
+          if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
+            Write-Error "Release checksum manifest not found: $checksumPath"
+            exit 1
+          }
+          $expectedHashes = @{}
+          foreach ($line in Get-Content -LiteralPath $checksumPath) {
+            if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$') {
+              $expectedHashes[[IO.Path]::GetFileName($Matches[2])] = $Matches[1].ToUpperInvariant()
+            }
+          }
+          foreach ($binary in $binaries) {
+            $expectedHash = $expectedHashes[$binary.Name]
+            if (-not $expectedHash) {
+              Write-Error "No checksum entry found for $($binary.Name)"
+              exit 1
+            }
+            $actualHash = (Get-FileHash -LiteralPath $binary.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($actualHash -ne $expectedHash) {
+              Write-Error "Release checksum mismatch for $($binary.Name): expected $expectedHash, got $actualHash"
+              exit 1
+            }
+            Write-Host "Verified release checksum for $($binary.Name): $actualHash"
+          }
 
           # Resolve MpCmdRun.exe path with fallback to ProgramFiles(x86).
           $mpCmdRun = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
@@ -591,10 +615,10 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Download release binaries
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: release-binaries-${{ needs.config.outputs.release_tag }}
           path: dist/
@@ -605,15 +629,56 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.config.outputs.release_tag }}
         run: |
-          echo "Creating GitHub release: $RELEASE_TAG"
+          log_diagnostic() {
+            local description="$1"
+            shift
+            local output
+            local status
+
+            echo "::group::${description}"
+            set +e
+            output=$("$@" 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            echo "Exit status: $status"
+            echo "::endgroup::"
+          }
+
+          echo "Creating GitHub release: $RELEASE_TAG (repository: $GITHUB_REPOSITORY)"
+          echo "::group::Release creation context"
+          gh --version
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "Tag target: $(git rev-list -n 1 "$RELEASE_TAG")"
+          echo "Release assets:"
+          ls -lh dist/
+          sha256sum dist/*
+          echo "::endgroup::"
           
           # Create release with binaries (SBOM files will be added later)
-          gh release create "$RELEASE_TAG" \
+          set +e
+          release_create_output=$(gh release create "$RELEASE_TAG" \
             dist/* \
             --title "$RELEASE_TAG" \
             --generate-notes \
             --prerelease \
-            --latest=false
+            --latest=false 2>&1)
+          release_create_status=$?
+          set -e
+          printf '%s\n' "$release_create_output"
+
+          if [ "$release_create_status" -ne 0 ]; then
+            echo "Error: gh release create failed with exit status $release_create_status"
+            log_diagnostic "Release lookup after failed creation" \
+              gh release view "$RELEASE_TAG" --json databaseId,tagName,targetCommitish,isDraft,isPrerelease,url
+            log_diagnostic "Release API response after failed creation" \
+              gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
+            log_diagnostic "Tag API response after failed creation" \
+              gh api --include "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG"
+            log_diagnostic "GitHub API rate limit after failed creation" \
+              gh api rate_limit --jq '.resources.core | {limit, remaining, reset}'
+            exit "$release_create_status"
+          fi
           
           # Get release ID (retry to handle eventual consistency)
           MAX_ATTEMPTS=5
@@ -649,14 +714,14 @@ jobs:
         run: go mod download
 
       - name: Generate SBOM (SPDX format)
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@v0.24.3
         with:
           artifact-name: sbom.spdx.json
           output-file: sbom.spdx.json
           format: spdx-json
 
       - name: Generate SBOM (CycloneDX format)
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@v0.24.3
         with:
           artifact-name: sbom.cdx.json
           output-file: sbom.cdx.json
@@ -672,7 +737,7 @@ jobs:
           echo "✓ No secrets detected in SBOM files"
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: sbom-artifacts
           path: |
@@ -681,10 +746,10 @@ jobs:
           retention-days: 90  # Long retention since SBOMs are not attached to the release
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v4.2.0
+        uses: docker/setup-buildx-action@v4.4.1
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4.4.0
+        uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -704,7 +769,7 @@ jobs:
 
       - name: Build and push Docker image (amd64)
         id: build
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           platforms: linux/amd64
@@ -985,13 +1050,16 @@ evals:
   - id: community-attribution
     question: Does the agent output include attribution to community contributors in the release highlights?
 
+sandbox:
+  agent:
+    runtime: docker
 ---
 
 # Release Highlights Generator
 
 Generate an engaging release highlights summary for **$GITHUB_REPOSITORY** release `${RELEASE_TAG}`.
 
-**Release ID**: ${{ needs.release.outputs.release_id }}
+Read the **release ID** from the `id` field in `/tmp/gh-aw/agent/release-data/current_release.json`.
 
 ## Data Available
 
@@ -1125,36 +1193,32 @@ Dependency updates and internal improvements to keep things running smoothly.
 
 ## Output Format
 
-**CRITICAL**: You MUST call the `update_release` MCP tool to update the release with the generated highlights.
+**CRITICAL**: You MUST submit `update_release` through the configured safe-output transport to update the release with the generated highlights.
 
 **HOW TO CALL THE TOOL:**
 
-The `update_release` tool is an **MCP (Model Context Protocol) tool**, not a bash command or file operation.
+Follow the runtime's safe-output transport instructions. If a native `update_release` function is explicitly exposed, pass its fields directly. Otherwise, use the `safeoutputs` CLI through Bash with one single-quoted JSON argument:
 
-**✅ CORRECT - Call the MCP tool directly:**
+```bash
+safeoutputs update_release '{"tag":"v0.93.1","operation":"prepend","body":"## 🌟 Release Highlights\n\n### ✨ What\u0027s New\n\n[Your complete markdown highlights here]"}'
+```
 
-```
-safeoutputs/update_release(
-  tag="v0.38.1",
-  operation="prepend",
-  body="## 🌟 Release Highlights\n\n[Your complete markdown highlights here]"
-)
-```
+Replace the example tag with the actual release tag and supply the complete highlights. Inside the CLI JSON argument, encode apostrophes as `\u0027`, without surrounding the escape with apostrophes: use `What\u0027s New`, never `What'\u0027's New`. Closing and reopening shell quotes around the escape strips its backslash and publishes `Whatu0027s New`. Keep newlines encoded as `\n`; Unicode can remain literal. Native tool fields use ordinary text instead of shell quoting.
 
 **❌ INCORRECT - DO NOT:**
 - Write JSON files manually (e.g., `/tmp/gh-aw/agent/safeoutputs/update_release_001.json`)
-- Use bash to simulate tool calls
 - Create scripts that write to outputs.jsonl
-- Use any file operations - the MCP tool handles everything
+- Use authenticated GitHub commands as a substitute for the safe-output transport
+- Use file operations to submit outputs - the configured transport handles persistence
 
 **Required Parameters:**
-- `tag` - Release tag from `${RELEASE_TAG}` environment variable (e.g., "v0.38.1")
+- `tag` - Release tag from `${RELEASE_TAG}` environment variable (e.g., "v0.93.1")
 - `operation` - Must be `"prepend"` to add before existing notes
 - `body` - Complete markdown content (include all formatting, emojis, links)
 
-**IMPORTANT**: The tool is accessed via the MCP gateway as `safeoutputs/update_release`. When you call this tool, the MCP server automatically writes to `/opt/gh-aw/safeoutputs/outputs.jsonl`.
+**IMPORTANT**: A successful safe-output call records the update for the publishing job; do not submit duplicate calls or write output files yourself.
 
-**WARNING**: If you don't call the MCP tool properly, the release notes will NOT be updated!
+**WARNING**: If the configured transport is unavailable or rejects the call, report the failure rather than claiming the release notes were updated.
 
 **Documentation Base URLs:**
 - User docs: `https://github.github.com/gh-aw/`

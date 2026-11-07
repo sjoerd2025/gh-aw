@@ -9,6 +9,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { ERR_API, SAFE_OUTPUT_E010, RATE_LIMIT_EXCEEDED } = require("./error_codes.cjs");
 const { logRetryEvent } = require("./github_rate_limit_logger.cjs");
+const { performance } = require("node:perf_hooks");
 
 /**
  * Configuration for retry behavior
@@ -19,6 +20,11 @@ const { logRetryEvent } = require("./github_rate_limit_logger.cjs");
  * @property {number} backoffMultiplier - Backoff multiplier for exponential backoff (default: 2)
  * @property {number} jitterMs - Maximum random jitter in milliseconds added to each retry delay (default: 100)
  * @property {(error: any) => boolean} shouldRetry - Function to determine if error is retryable
+ * @property {(ms: number, signal?: AbortSignal) => Promise<void>} [sleep] - Override retry waits, honoring the signal when a deadline is configured
+ * @property {number} [timeoutMs] - Maximum duration of each operation in milliseconds
+ * @property {number} [deadline] - Absolute monotonic deadline for operations and retry waits
+ * @property {() => number} [now] - Monotonic clock used with timeouts and deadlines (default: performance.now)
+ * @property {() => Error} [timeoutError] - Create an operation-specific timeout error
  */
 
 /**
@@ -60,6 +66,9 @@ const RATE_LIMIT_RETRY_CONFIG = {
  * @type {string[]}
  */
 const RATE_LIMIT_INDICATORS = ["rate limit", "secondary rate limit", "abuse detection", "too many requests"];
+const TRANSIENT_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+const WORKFLOWS_SCOPE_TIMEOUT_INDICATORS = ["`workflows` scope may be required", "unable to determine if workflow can be created or updated"];
 
 /**
  * @param {string} messageLower - Lower-cased error message
@@ -75,8 +84,10 @@ function hasRateLimitIndicator(messageLower) {
  * @returns {boolean} True if the error is transient and should be retried
  */
 function isTransientError(error) {
+  if (error?.code === "ERR_TRANSPORT_INTEGRITY") return false;
   const errorMsg = getErrorMessage(error);
   const errorMsgLower = errorMsg.trimStart().toLowerCase();
+  const status = error?.response?.status ?? error?.status ?? null;
 
   // GitHub REST APIs may crash and return an HTML error page (e.g. the "Unicorn!"
   // 500 page) instead of JSON. Detect this by checking for an HTML doctype at the
@@ -89,6 +100,12 @@ function isTransientError(error) {
   // not descriptive enough (e.g. Octokit errors with status 429 and a generic
   // "Request failed" message). Must be checked before the text patterns.
   if (isRateLimitError(error)) {
+    return true;
+  }
+
+  // Fetch and Octokit errors do not consistently include the status text in
+  // their message, so classify standard transient HTTP statuses directly.
+  if (TRANSIENT_HTTP_STATUSES.has(Number(status))) {
     return true;
   }
 
@@ -115,25 +132,107 @@ function isTransientError(error) {
 /**
  * Sleep for a specified duration
  * @param {number} ms - Duration in milliseconds
+ * @param {AbortSignal} [signal] - Cancel the wait
  * @returns {Promise<void>}
  */
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const cancel = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", cancel);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", cancel, { once: true });
+  });
 }
 
 /**
- * Extract the Retry-After delay in milliseconds from a GitHub API rate-limit error.
+ * Bound an operation and cancel its transport or timer when its budget expires.
+ * The operation must honor its signal; the race and clock check also reject late
+ * results from noncooperative operations.
+ * @template T
+ * @param {(signal?: AbortSignal) => Promise<T>} operation
+ * @param {Partial<RetryConfig>} config
+ * @returns {Promise<T>}
+ */
+async function runWithinRetryBudget(operation, config) {
+  if (config.timeoutMs === undefined && config.deadline === undefined) return operation();
+  const now = config.now || (() => performance.now());
+  const start = now();
+  if (!Number.isFinite(start)) throw new RangeError(`${ERR_API}: Retry clock must return a finite number`);
+  const deadline = Math.min(config.deadline ?? Infinity, start + (config.timeoutMs ?? Infinity));
+  const remaining = deadline - start;
+  if (remaining > MAX_TIMER_DELAY_MS) throw new RangeError(`${ERR_API}: Retry deadline must be within ${MAX_TIMER_DELAY_MS}ms`);
+  const timeoutError = config.timeoutError ? config.timeoutError() : new Error(`${ERR_API}: Operation timeout exceeded`);
+  if (remaining <= 0) throw timeoutError;
+  const controller = new AbortController();
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort(timeoutError);
+        reject(timeoutError);
+      }, remaining);
+    });
+    const result = await Promise.race([operation(controller.signal), timeout]);
+    if (now() >= deadline) throw timeoutError;
+    return result;
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
+/**
+ * Read a response header from either a Fetch Headers instance or a plain object.
+ * @param {Headers|Record<string, any>|null|undefined} headers
+ * @param {string} name
+ * @returns {any}
+ */
+function getHeader(headers, name) {
+  if (!headers) return null;
+  if (typeof headers.get === "function") {
+    return headers.get(name);
+  }
+  const matchingKey = Object.keys(headers).find(key => key.toLowerCase() === name);
+  return matchingKey === undefined ? null : headers[matchingKey];
+}
+
+/**
+ * Determine whether an error response represents a GitHub rate-limit condition.
+ * @param {any} error - The error to classify
+ * @returns {{headers: Headers|Record<string, any>|null, isRateLimit: boolean}}
+ */
+function getRateLimitErrorDetails(error) {
+  const status = error?.response?.status ?? error?.status ?? null;
+  const headers = error?.response?.headers ?? error?.headers ?? null;
+  const remainingHeader = getHeader(headers, "x-ratelimit-remaining");
+  const remainingExhausted = remainingHeader != null && parseInt(remainingHeader, 10) === 0;
+  return { headers, isRateLimit: status === 429 || (status === 403 && remainingExhausted) };
+}
+
+/**
+ * Extract the Retry-After delay in milliseconds from a retryable HTTP error.
  *
- * Only applies when the response status indicates a rate-limit condition:
+ * Applies when the response status indicates a rate-limit condition or service
+ * unavailability:
  *   - HTTP 429 (Too Many Requests)
  *   - HTTP 403 with `x-ratelimit-remaining: 0` (GitHub secondary rate limit)
+ *   - HTTP 503 (Service Unavailable)
  *
  * In those cases GitHub returns one of two headers:
- *   - `retry-after`       – integer seconds to wait (per RFC 6585)
+ *   - `retry-after`       – integer seconds OR HTTP-date to wait until
  *   - `x-ratelimit-reset` – Unix timestamp (seconds) when the quota resets
  *
- * For any other status (5xx transient errors, etc.) returns null so normal
- * exponential backoff applies.
+ * For any other status returns null so normal exponential backoff applies.
  *
  * @param {any} error - The error object from a failed GitHub API call
  * @returns {number|null} Milliseconds to wait, or null if not a rate-limit response
@@ -141,29 +240,35 @@ function sleep(ms) {
 function getRetryAfterMs(error) {
   // Octokit surfaces response headers via error.response.headers or error.headers
   const status = error?.response?.status ?? error?.status ?? null;
-  const headers = error?.response?.headers ?? error?.headers ?? null;
+  const { headers, isRateLimit } = getRateLimitErrorDetails(error);
   if (!headers) return null;
 
   // Only honour rate-limit headers for genuine rate-limit responses.
   // GitHub uses 429 for primary rate limits and 403 for secondary rate limits
   // (the latter always sets x-ratelimit-remaining to "0").
-  const remainingHeader = headers["x-ratelimit-remaining"];
-  const isRateLimitStatus = status === 429 || (status === 403 && remainingHeader != null && parseInt(remainingHeader, 10) === 0);
+  const retryAfter = getHeader(headers, "retry-after");
+  const supportsRetryAfter = isRateLimit || status === 503;
 
-  if (!isRateLimitStatus) return null;
+  if (!supportsRetryAfter) return null;
 
-  // retry-after: number of seconds (highest priority)
-  const retryAfter = headers["retry-after"];
+  // retry-after: number of seconds OR HTTP-date (highest priority)
   if (retryAfter != null) {
     const seconds = parseInt(retryAfter, 10);
     if (!Number.isNaN(seconds) && seconds > 0) {
       return seconds * 1000;
     }
+    const retryAtMs = Date.parse(String(retryAfter));
+    if (!Number.isNaN(retryAtMs)) {
+      const waitMs = retryAtMs - Date.now();
+      if (waitMs > 0) {
+        return waitMs;
+      }
+    }
   }
 
   // x-ratelimit-reset: Unix timestamp — derive wait time from clock delta
-  const resetAt = headers["x-ratelimit-reset"];
-  if (resetAt != null) {
+  const resetAt = getHeader(headers, "x-ratelimit-reset");
+  if (isRateLimit && resetAt != null) {
     const resetTimestampMs = parseInt(resetAt, 10) * 1000;
     if (!Number.isNaN(resetTimestampMs)) {
       const waitMs = resetTimestampMs - Date.now();
@@ -182,12 +287,7 @@ function getRetryAfterMs(error) {
  * @returns {boolean} True when the error indicates primary or secondary rate limiting
  */
 function isRateLimitError(error) {
-  const status = error?.response?.status ?? error?.status ?? null;
-  const headers = error?.response?.headers ?? error?.headers ?? null;
-  const remainingHeader = headers?.["x-ratelimit-remaining"];
-  const retryAfterHeader = headers?.["retry-after"];
-  const hasRateLimitHeaders = status === 403 && (retryAfterHeader != null || (remainingHeader != null && parseInt(remainingHeader, 10) === 0));
-  if (status === 429 || hasRateLimitHeaders) {
+  if (getRateLimitErrorDetails(error).isRateLimit) {
     return true;
   }
 
@@ -196,9 +296,19 @@ function isRateLimitError(error) {
 }
 
 /**
+ * Determine whether an error indicates GitHub could not complete its workflow-permission check.
+ * @param {unknown} error - The error to classify
+ * @returns {boolean} True when the message matches the workflows-scope timeout condition
+ */
+function isWorkflowsScopeTimeoutError(error) {
+  const errorMsg = getErrorMessage(error).toLowerCase();
+  return WORKFLOWS_SCOPE_TIMEOUT_INDICATORS.some(pattern => errorMsg.includes(pattern));
+}
+
+/**
  * Execute an operation with retry logic and exponential backoff
  * @template T
- * @param {() => Promise<T>} operation - The async operation to execute
+ * @param {(signal?: AbortSignal) => Promise<T>} operation - The async operation to execute; honor the signal when a timeout or deadline is configured
  * @param {Partial<RetryConfig>} [config] - Retry configuration (optional)
  * @param {string} [operationName] - Name of the operation for logging
  * @returns {Promise<T>} The result of the operation
@@ -206,6 +316,8 @@ function isRateLimitError(error) {
  */
 async function withRetry(operation, config = {}, operationName = "operation") {
   const fullConfig = { ...DEFAULT_RETRY_CONFIG, ...config };
+  validateRetryConfig(operation, fullConfig);
+  const now = fullConfig.now || (() => performance.now());
   let lastError;
   let delay = fullConfig.initialDelayMs;
 
@@ -213,13 +325,19 @@ async function withRetry(operation, config = {}, operationName = "operation") {
     try {
       if (attempt > 0) {
         const jitter = fullConfig.jitterMs > 0 ? Math.floor(Math.random() * fullConfig.jitterMs) : 0;
-        const delayWithJitter = delay + jitter;
+        const delayWithJitter = Math.min(delay + jitter, fullConfig.maxDelayMs);
         core.info(`Retry attempt ${attempt}/${fullConfig.maxRetries} for ${operationName} after ${delayWithJitter}ms delay`);
         logRetryEvent(lastError, operationName, attempt, delayWithJitter);
-        await sleep(delayWithJitter);
+        await runWithinRetryBudget(
+          signal => {
+            const wait = fullConfig.sleep || sleep;
+            return signal ? wait(delayWithJitter, signal) : wait(delayWithJitter);
+          },
+          { ...fullConfig, timeoutMs: undefined }
+        );
       }
 
-      const result = await operation();
+      const result = await runWithinRetryBudget(operation, fullConfig);
 
       if (attempt > 0) {
         core.info(`✓ ${operationName} succeeded on retry attempt ${attempt}`);
@@ -231,7 +349,7 @@ async function withRetry(operation, config = {}, operationName = "operation") {
       const errorMsg = getErrorMessage(error);
 
       // Check if this error should be retried
-      if (!fullConfig.shouldRetry(error)) {
+      if (error?.code === "ERR_TRANSPORT_INTEGRITY" || (fullConfig.deadline !== undefined && now() >= fullConfig.deadline) || !fullConfig.shouldRetry(error)) {
         core.debug(`${operationName} failed with non-retryable error: ${errorMsg}`);
         throw enhanceError(error, {
           operation: operationName,
@@ -288,6 +406,49 @@ async function withRetry(operation, config = {}, operationName = "operation") {
 
   // This should never be reached, but TypeScript needs it
   throw lastError;
+}
+
+/**
+ * Reject invalid retry configuration before starting an operation.
+ * @param {unknown} operation
+ * @param {RetryConfig} config
+ */
+function validateRetryConfig(operation, config) {
+  if (typeof operation !== "function") {
+    throw new TypeError("Retry operation must be a function");
+  }
+
+  for (const key of ["maxRetries", "initialDelayMs", "maxDelayMs", "jitterMs"]) {
+    const value = config[key];
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(`Retry configuration ${key} must be a non-negative safe integer`);
+    }
+  }
+  for (const key of ["initialDelayMs", "maxDelayMs", "jitterMs"]) {
+    if (config[key] > MAX_TIMER_DELAY_MS) {
+      throw new RangeError(`Retry configuration ${key} must not exceed ${MAX_TIMER_DELAY_MS}`);
+    }
+  }
+  if (!Number.isFinite(config.backoffMultiplier) || config.backoffMultiplier < 1) {
+    throw new RangeError("Retry configuration backoffMultiplier must be a finite number greater than or equal to 1");
+  }
+  if (typeof config.shouldRetry !== "function") {
+    throw new TypeError("Retry configuration shouldRetry must be a function");
+  }
+  if (config.sleep !== undefined && typeof config.sleep !== "function") {
+    throw new TypeError("Retry configuration sleep must be a function");
+  }
+  if (config.timeoutMs !== undefined && (!Number.isSafeInteger(config.timeoutMs) || config.timeoutMs < 0 || config.timeoutMs > MAX_TIMER_DELAY_MS)) {
+    throw new RangeError(`${ERR_API}: Retry configuration timeoutMs must be a non-negative safe integer not exceeding ${MAX_TIMER_DELAY_MS}`);
+  }
+  if (config.deadline !== undefined && !Number.isFinite(config.deadline)) {
+    throw new RangeError(`${ERR_API}: Retry configuration deadline must be finite`);
+  }
+  for (const key of ["now", "timeoutError"]) {
+    if (config[key] !== undefined && typeof config[key] !== "function") {
+      throw new TypeError(`${ERR_API}: Retry configuration ${key} must be a function`);
+    }
+  }
 }
 
 /**
@@ -407,6 +568,7 @@ module.exports = {
   withRetry,
   sleep,
   isTransientError,
+  isWorkflowsScopeTimeoutError,
   getRetryAfterMs,
   enhanceError,
   createValidationError,

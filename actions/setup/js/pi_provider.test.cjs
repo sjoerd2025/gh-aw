@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import childProcess from "node:child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -7,11 +8,13 @@ describe("pi_provider.cjs", () => {
   let module;
   let originalEnv;
   let originalFetch;
+  let originalExitCode;
   let stderrOutput;
 
   beforeEach(async () => {
     originalEnv = { ...process.env };
     originalFetch = global.fetch;
+    originalExitCode = process.exitCode;
     stderrOutput = [];
     vi.spyOn(process.stderr, "write").mockImplementation(msg => {
       stderrOutput.push(String(msg));
@@ -23,6 +26,7 @@ describe("pi_provider.cjs", () => {
   afterEach(() => {
     process.env = originalEnv;
     global.fetch = originalFetch;
+    process.exitCode = originalExitCode;
     vi.restoreAllMocks();
   });
 
@@ -55,9 +59,9 @@ describe("pi_provider.cjs", () => {
     expect(calls).toEqual([
       ["github-copilot", { apiKey: "copilot-token", api: "openai-completions", baseUrl: "https://copilot.example.test" }],
       ["copilot", { apiKey: "copilot-token", api: "openai-completions", baseUrl: "https://copilot.example.test" }],
-      ["anthropic", { apiKey: "anthropic-token", api: "anthropic", baseUrl: "https://anthropic.example.test" }],
-      ["openai", { apiKey: "codex-token", api: "openai-completions", baseUrl: "https://openai.example.test" }],
-      ["codex", { apiKey: "codex-token", api: "openai-completions", baseUrl: "https://openai.example.test" }],
+      ["anthropic", { apiKey: "anthropic-token", api: "anthropic-messages", baseUrl: "https://anthropic.example.test" }],
+      ["openai", { apiKey: "codex-token", api: "openai-responses", baseUrl: "https://openai.example.test" }],
+      ["codex", { apiKey: "codex-token", api: "openai-responses", baseUrl: "https://openai.example.test" }],
     ]);
   });
 
@@ -116,10 +120,180 @@ describe("pi_provider.cjs", () => {
     expect(stderrOutput.some(line => line.includes("provider_response provider=copilot model=claude-sonnet-4 status=503 method=POST url=http://api-proxy:10002/v1/chat/completions response_headers=content-type,x-request-id"))).toBe(true);
   });
 
-  it("logs assistant inference errors with the last request target", async () => {
+  it("includes the provider status and redacted response message in the incomplete report", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-provider-"));
+    process.env.GH_AW_SAFE_OUTPUTS = path.join(tempDir, "outputs.jsonl");
+    process.env.GH_AW_SAFEOUTPUTS_CLI = "safeoutputs";
+    process.env.OPENAI_API_KEY = "provider-secret-value";
+    const execFileSync = vi.spyOn(childProcess, "execFileSync").mockReturnValue("");
+
+    const handlers = {};
+    const pi = {
+      registerProvider: vi.fn(),
+      on: vi.fn((event, handler) => {
+        handlers[event] = handler;
+      }),
+    };
+    const ctx = {
+      model: {
+        provider: "openai",
+        id: "gpt-5.4",
+        api: "openai-responses",
+        baseUrl: "https://api.openai.com/v1",
+      },
+    };
+
+    module.default(pi);
+    await handlers.before_provider_request({}, ctx);
+    await handlers.after_provider_response({ status: 429, headers: {} }, ctx);
+    await handlers.message_end({
+      message: {
+        role: "assistant",
+        provider: "openai",
+        model: "gpt-5.4",
+        stopReason: "error",
+        errorMessage: '429: {"message":"rate limited","api_key":"provider-secret-value"}',
+      },
+    });
+    await handlers.agent_settled();
+
+    const reportArgs = execFileSync.mock.calls.find(([, args]) => args[0] === "report_incomplete")?.[1];
+    expect(reportArgs.join(" ")).toContain("HTTP 429");
+    expect(reportArgs.join(" ")).toContain("rate limited");
+    expect(reportArgs.join(" ")).not.toContain("provider-secret-value");
+    expect(stderrOutput.some(line => line.includes("provider_error provider=openai model=gpt-5.4 api=openai-responses status=429") && line.includes("rate limited"))).toBe(true);
+    expect(stderrOutput.some(line => line.includes("provider-secret-value"))).toBe(false);
+  });
+
+  it("resolves native Anthropic requests to the Messages API", () => {
+    expect(
+      module.resolveProviderRequestTarget({
+        api: "anthropic-messages",
+        baseUrl: "http://api-proxy:10001",
+      })
+    ).toEqual({
+      api: "anthropic-messages",
+      method: "POST",
+      url: "http://api-proxy:10001/v1/messages",
+    });
+  });
+
+  it("keeps legacy Anthropic requests on the compatibility endpoint", () => {
+    expect(
+      module.resolveProviderRequestTarget({
+        api: "anthropic",
+        baseUrl: "http://anthropic.example.test",
+      })
+    ).toEqual({
+      api: "anthropic",
+      method: "POST",
+      url: "http://anthropic.example.test/messages",
+    });
+  });
+
+  it("fails the run when every provider request fails", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-provider-"));
+    process.env.GH_AW_SAFE_OUTPUTS = path.join(tempDir, "outputs.jsonl");
+    process.env.GH_AW_SAFEOUTPUTS_CLI = "true";
+
+    const handlers = {};
+    const pi = {
+      registerProvider: vi.fn(),
+      on: vi.fn((event, handler) => {
+        handlers[event] = handler;
+      }),
+    };
+    const ctx = {
+      model: {
+        provider: "aw-gateway",
+        id: "claude-sonnet-5",
+        api: "anthropic-messages",
+        baseUrl: "http://api-proxy:10001",
+      },
+    };
+
+    module.default(pi);
+    await handlers.before_provider_request({ type: "before_provider_request", payload: {} }, ctx);
+    await handlers.after_provider_response({ type: "after_provider_response", status: 404, headers: {} }, ctx);
+    await handlers.agent_settled();
+
+    expect(process.exitCode).toBe(1);
+    expect(stderrOutput.some(line => line.includes("report_incomplete emitted via safeoutputs CLI"))).toBe(true);
+  });
+
+  it("does not fail the run when a provider request succeeds after a failure", async () => {
+    const handlers = {};
+    const pi = {
+      registerProvider: vi.fn(),
+      on: vi.fn((event, handler) => {
+        handlers[event] = handler;
+      }),
+    };
+    const ctx = {
+      model: {
+        provider: "aw-gateway",
+        id: "claude-sonnet-5",
+        api: "anthropic-messages",
+        baseUrl: "http://api-proxy:10001",
+      },
+    };
+
+    module.default(pi);
+    await handlers.before_provider_request({ type: "before_provider_request", payload: {} }, ctx);
+    await handlers.after_provider_response({ type: "after_provider_response", status: 503, headers: {} }, ctx);
+    await handlers.before_provider_request({ type: "before_provider_request", payload: {} }, ctx);
+    await handlers.after_provider_response({ type: "after_provider_response", status: 200, headers: {} }, ctx);
+    await handlers.agent_settled();
+
+    expect(process.exitCode).toBe(originalExitCode);
+  });
+
+  it("fails the run when a successful response ends with a stream error", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-provider-"));
+    process.env.GH_AW_SAFE_OUTPUTS = path.join(tempDir, "outputs.jsonl");
+    process.env.GH_AW_SAFEOUTPUTS_CLI = "true";
+
+    const handlers = {};
+    const pi = {
+      registerProvider: vi.fn(),
+      on: vi.fn((event, handler) => {
+        handlers[event] = handler;
+      }),
+    };
+    const ctx = {
+      model: {
+        provider: "aw-gateway",
+        id: "claude-sonnet-5",
+        api: "anthropic-messages",
+        baseUrl: "http://api-proxy:10001",
+      },
+    };
+
+    module.default(pi);
+    await handlers.before_provider_request({}, ctx);
+    await handlers.after_provider_response({ status: 200, headers: {} }, ctx);
+    await handlers.message_end({
+      message: {
+        role: "assistant",
+        provider: "aw-gateway",
+        model: "claude-sonnet-5",
+        stopReason: "error",
+        errorMessage: "stream interrupted",
+      },
+    });
+    await handlers.agent_settled();
+
+    expect(process.exitCode).toBe(1);
+  });
+
+  // Triggers the message_end infrastructure-error handler with a given stand-in
+  // GH_AW_SAFEOUTPUTS_CLI override ('true' simulates a successful CLI call, 'false'
+  // simulates a failed one) and returns the handlers/stderr output for assertions.
+  async function triggerConnectionError(cliOverride) {
     process.env.GH_AW_PI_MODEL = "copilot/claude-sonnet-4";
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-provider-"));
     process.env.GH_AW_SAFE_OUTPUTS = path.join(tempDir, "outputs.jsonl");
+    process.env.GH_AW_SAFEOUTPUTS_CLI = cliOverride;
 
     const handlers = {};
     const pi = {
@@ -150,14 +324,31 @@ describe("pi_provider.cjs", () => {
         errorMessage: "Connection error.",
       },
     });
+    await handlers.agent_settled();
+  }
+
+  it("logs assistant inference errors with the last request target", async () => {
+    // 'true' is a stand-in safeoutputs CLI binary that always exits 0, simulating a
+    // successful emission through the CLI channel instead of a direct fs append.
+    await triggerConnectionError("true");
 
     expect(
       stderrOutput.some(line =>
         line.includes('provider_error provider=aw-gateway model=claude-sonnet-4 api=openai-completions status=no-response method=POST url=http://api-proxy:10002/v1/chat/completions response_headers=none error="Connection error."')
       )
     ).toBe(true);
-    expect(fs.readFileSync(process.env.GH_AW_SAFE_OUTPUTS, "utf8")).toContain('"type":"report_incomplete"');
-    expect(fs.readFileSync(process.env.GH_AW_SAFE_OUTPUTS, "utf8")).toContain("Pi provider request failed before safe outputs were emitted");
+    // Emission goes through the safeoutputs CLI channel (not a direct fs append), so it
+    // survives the read-only sandbox mount that backs GH_AW_SAFE_OUTPUTS in production.
+    expect(stderrOutput.some(line => line.includes("report_incomplete emitted via safeoutputs CLI"))).toBe(true);
+  });
+
+  it("logs a failure when the safeoutputs CLI channel is unavailable (e.g. read-only sandbox)", async () => {
+    // 'false' is a stand-in safeoutputs CLI binary that always exits 1, simulating a
+    // failed CLI invocation without ever touching the filesystem directly.
+    await triggerConnectionError("false");
+
+    expect(stderrOutput.some(line => line.includes("report_incomplete emission failed"))).toBe(true);
+    expect(fs.existsSync(process.env.GH_AW_SAFE_OUTPUTS)).toBe(false);
   });
 
   it("skips synthetic report_incomplete emission when safe outputs already exist", () => {
@@ -166,9 +357,11 @@ describe("pi_provider.cjs", () => {
     process.env.GH_AW_SAFE_OUTPUTS = safeOutputsPath;
     fs.writeFileSync(safeOutputsPath, '{"type":"add_comment","body":"done"}\n');
 
-    module.emitInfrastructureIncompleteIfNoSafeOutputs("temporary outage", () => {});
+    const logs = [];
+    module.emitInfrastructureIncompleteIfNoSafeOutputs("temporary outage", message => logs.push(message));
 
     expect(fs.readFileSync(safeOutputsPath, "utf8")).toBe('{"type":"add_comment","body":"done"}\n');
+    expect(logs.some(m => m.includes("skipped: safe outputs already recorded"))).toBe(true);
   });
 
   it("calls /reflect on the management port (10000) when AWF_REFLECT_ENABLED is set", async () => {
@@ -190,13 +383,13 @@ describe("pi_provider.cjs", () => {
 
     module.default(pi);
     await handlers.agent_start();
-    await handlers.agent_end();
+    await handlers.agent_settled();
 
     expect(fetchedUrls.every(url => url === "http://api-proxy:10000/reflect")).toBe(true);
     expect(fetchedUrls.length).toBe(2);
   });
 
-  it("logs reflect failure context when the /reflect call fails", async () => {
+  it.each(["agent_start", "agent_settled"])("logs reflect failure context in %s when the /reflect call fails", async phase => {
     process.env.GH_AW_PI_MODEL = "copilot/claude-sonnet-4";
     process.env.AWF_REFLECT_ENABLED = "1";
     global.fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
@@ -210,13 +403,13 @@ describe("pi_provider.cjs", () => {
     };
 
     module.default(pi);
-    await handlers.agent_start();
+    await handlers[phase]();
 
+    const reflectOutputPath = "/tmp/gh-aw/agent/awf-reflect.json";
     expect(
-      stderrOutput.some(line =>
-        line.includes('reflect_failure phase=agent_start provider=copilot model=copilot/claude-sonnet-4 url=http://api-proxy:10000/reflect output=/tmp/gh-aw/sandbox/firewall/awf-reflect.json reason=request_failed error="ECONNREFUSED"')
-      )
+      stderrOutput.some(line => line.includes(`reflect_failure phase=${phase} provider=copilot model=copilot/claude-sonnet-4 url=http://api-proxy:10000/reflect output=${reflectOutputPath} reason=request_failed error="ECONNREFUSED"`))
     ).toBe(true);
+    expect(process.exitCode).toBe(originalExitCode);
   });
 
   it("skips /reflect when AWF_REFLECT_ENABLED is not set", async () => {
@@ -234,7 +427,7 @@ describe("pi_provider.cjs", () => {
 
     module.default(pi);
     await handlers.agent_start();
-    await handlers.agent_end();
+    await handlers.agent_settled();
 
     expect(global.fetch).not.toHaveBeenCalled();
   });

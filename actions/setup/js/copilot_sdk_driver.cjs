@@ -5,7 +5,8 @@
  *
  * Minimal standalone program launched by copilot_harness.cjs.  Reads
  * configuration from environment variables, delegates the full session
- * lifecycle to copilot_sdk_session.cjs, and exits with the session's exit code.
+ * lifecycle to copilot_sdk_session.cjs, and exits with the session's exit code
+ * (COPILOT_MODEL_VERIFICATION_EXIT_CODE when main-session model verification fails).
  *
  *   GH_AW_PROMPT                            — path to the prompt file
  *   COPILOT_SDK_URI                          — SDK server URI (set by the harness)
@@ -13,6 +14,8 @@
  *   COPILOT_MODEL                            — model override (optional)
  *   GH_AW_COPILOT_SDK_MULTI_PROVIDER_JSON   — JSON-encoded multi-provider config (required).
  *                                             Shape: { model, providers: NamedProviderConfig[], models: ProviderModelConfig[] }
+ *   GH_AW_COPILOT_SDK_SUBAGENT_MODELS       — JSON map of custom agent name → model resolved by the harness (optional)
+ *   GH_AW_COPILOT_CONFIGURED_MODEL          — requested model (`auto` when routed) recorded with main-session model observation (set by the harness)
  *   GH_AW_COPILOT_SDK_SERVER_ARGS           — JSON-encoded allow-tool sidecar args (set by the engine)
  *
  * The sidecar is started and stopped by the harness; the driver only opens a
@@ -27,14 +30,17 @@
 "use strict";
 
 const fs = require("fs");
-const { runWithCopilotSDK, extractPromptFromArgs } = require("./copilot_sdk_session.cjs");
+const { runWithCopilotSDK, extractPromptFromArgs, isCopilotSDKBareMode, resolveCopilotSDKWorkingDirectory } = require("./copilot_sdk_session.cjs");
 const { parsePermissionConfigFromServerArgs } = require("./copilot_sdk_permissions.cjs");
-const { parseMultiProviderJson } = require("./copilot_sdk_multi_provider.cjs");
+const { parseCopilotSDKToolConfig, loadCopilotSDKMCPServers } = require("./copilot_sdk_tool_config.cjs");
+const { parseMultiProviderJson, qualifyModelForMultiProvider } = require("./copilot_sdk_multi_provider.cjs");
 const { applyModelFallback } = require("./model_fallback.cjs");
+const { resolveRoutingReasoningEffort } = require("./copilot_routing_effort.cjs");
+const { getErrorMessage } = require("./error_helpers.cjs");
 
 // Re-export the session and permission helpers so that existing callers that
 // require("./copilot_sdk_driver.cjs") (e.g. copilot_harness.cjs) continue to work.
-module.exports = { extractPromptFromArgs, runWithCopilotSDK, parsePermissionConfigFromServerArgs, parseMultiProviderJson };
+module.exports = { extractPromptFromArgs, runWithCopilotSDK, parsePermissionConfigFromServerArgs, parseCopilotSDKToolConfig, parseMultiProviderJson };
 
 // ---------------------------------------------------------------------------
 // Standalone entry point
@@ -84,7 +90,7 @@ async function main() {
   try {
     prompt = fs.readFileSync(promptFile, "utf8");
   } catch (err) {
-    process.stderr.write(`[copilot-sdk-driver] error: failed to read prompt file ${promptFile}: ${err}\n`);
+    process.stderr.write(`[copilot-sdk-driver] error: failed to read prompt file ${promptFile}: ${getErrorMessage(err)}\n`);
     process.exit(1);
   }
 
@@ -104,28 +110,24 @@ async function main() {
   const providers = multiProviderConfig.providers;
   /** @type {import("@github/copilot-sdk").ProviderModelConfig[]} */
   const sdkModels = multiProviderConfig.models;
-  let model = applyModelFallback(process.env, "COPILOT_MODEL", log) || multiProviderConfig.model || undefined;
+  const routingEnabled = process.env.GH_AW_MODEL_ROUTING === "1";
+  let model = (routingEnabled ? process.env.COPILOT_MODEL : applyModelFallback(process.env, "COPILOT_MODEL", log)) || multiProviderConfig.model || undefined;
+  const qualifiedModel = qualifyModelForMultiProvider(model, multiProviderConfig);
+  if (!qualifiedModel) throw new Error(`Cannot qualify session model "${model || "(none)"}" against the configured provider models`);
+  model = qualifiedModel;
+  const reasoningEffort = resolveRoutingReasoningEffort(process.env);
   log(`multi-provider mode: ${providers.length} providers, ${sdkModels.length} models, model=${model ?? "(env)"}`);
   for (const p of providers) {
     log(`  provider: name=${p.name} type=${p.type} baseUrl=${p.baseUrl}${p.wireApi ? ` wireApi=${p.wireApi}` : ""}`);
   }
 
-  // --- Build permission config from sidecar server args ----------------
-  // GH_AW_COPILOT_SDK_SERVER_ARGS holds the JSON-encoded --allow-tool flags
-  // that the Go engine passed to the sidecar. Mirror those same rules in the
-  // SDK session so the driver's onPermissionRequest handler aligns with the
-  // sidecar's pre-configured allow list (e.g. shell(safeoutputs:*) for
-  // workflows with safe-outputs enabled and a restricted bash allowlist).
-  const permissionConfig = parsePermissionConfigFromServerArgs(process.env.GH_AW_COPILOT_SDK_SERVER_ARGS);
-  if (permissionConfig) {
-    if (permissionConfig.allowAllTools) {
-      log("permission config: allow-all-tools (sidecar launched with --allow-all-tools)");
-    } else {
-      log(`permission config: ${(permissionConfig.allowedTools ?? []).length} allow-tool entries from GH_AW_COPILOT_SDK_SERVER_ARGS`);
-    }
-  } else {
-    log("permission config: none (onPermissionRequest will use unrestricted behavior)");
-  }
+  // --- Read compiler-owned tool and permission configuration ------------
+  // One structured contract controls visibility, registration, and permission
+  // enforcement. Missing or invalid contracts fail before session creation.
+  const toolConfig = parseCopilotSDKToolConfig(process.env.GH_AW_COPILOT_SDK_TOOL_CONFIG);
+  const mcpServers = loadCopilotSDKMCPServers(toolConfig);
+  const permissionConfig = toolConfig.permissions;
+  log(`permission config: ${permissionConfig.allowedTools.length} compiler-owned allow-tool entries`);
 
   // --- Run SDK session -------------------------------------------------
 
@@ -134,10 +136,15 @@ async function main() {
     prompt,
     logger: log,
     model,
+    reasoningEffort,
     connectionToken,
     providers,
     models: sdkModels,
     permissionConfig,
+    toolConfig,
+    mcpServers,
+    workingDirectory: resolveCopilotSDKWorkingDirectory(),
+    bare: isCopilotSDKBareMode(process.env.GH_AW_COPILOT_SDK_SERVER_ARGS, log),
   });
 
   process.exit(result.exitCode);
@@ -145,7 +152,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch(err => {
-    process.stderr.write(`[copilot-sdk-driver] unhandled error: ${err instanceof Error ? err.stack : String(err)}\n`);
+    process.stderr.write(`[copilot-sdk-driver] unhandled error: ${err instanceof Error && err.stack ? err.stack : getErrorMessage(err)}\n`);
     process.exit(1);
   });
 }

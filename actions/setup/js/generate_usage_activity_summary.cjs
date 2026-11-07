@@ -5,12 +5,28 @@
 // usage-activity-summary/v1 structure:
 //   firewall: total/allowed/blocked request counters
 //   session: aggregate Copilot session event counters
-//   gateway: total/failed tool-call counters with per-server breakdown
+//   gateway: tool-call counts, sizes, durations, and per-server/tool breakdowns
+//   integrity: aggregate DIFC filtering counts from gateway/RPC logs
+//   steering: aggregate AWF steering-event counts by event type
 //   safe_outputs: total item count and per-type breakdown from safe-output-items manifest
+//   memory_saves: per-memory push job/step outcomes and confirmed save status
+//   ledger: number of recorded ledger append transactions
+//   experiments: A/B experiment variant assignments for the current run
+//   working_set: cumulative input-token traffic relative to peak invocation input
+//   friction: precomputed cost of wasted work (AIC canonical) with attribution states
 
+const { iterateJsonl, iterateLines } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
-const { globSync } = require("node:fs");
 const path = require("path");
+const { readExperimentAssignments } = require("./experiment_helpers.cjs");
+const { countSteeringEventsByTypeInApiProxyJsonl } = require("./steering_helpers.cjs");
+const { calculateWorkingSetFromJSONL } = require("./working_set_metrics.cjs");
+const { computeFrictionCost } = require("./friction_cost_metrics.cjs");
+const { formatAIC } = require("./model_costs.cjs");
+const { getErrorMessage } = require("./error_helpers.cjs");
+const { parseDetectionLog, parseStructuredResultFile } = require("./parse_threat_detection_results.cjs");
+const { normalizeCopilotSession, copilotSessionContext } = require("./copilot_session.cjs");
+const { sessionToolSuccess } = require("./agent_session.cjs");
 
 require("./shim.cjs");
 
@@ -23,6 +39,216 @@ const LOCALHOST_CLIENT_PREFIX = "::1:";
 const PLACEHOLDER_DOMAIN_KEY = "-";
 const PLACEHOLDER_DEST_KEY = "-:-";
 const ERROR_DOMAIN_PREFIX = "error:";
+const AGENT_TOKEN_USAGE_PATH = "/tmp/gh-aw/usage/agent/token_usage.jsonl";
+const DETECTION_DIR = "/tmp/gh-aw/threat-detection";
+const DETECTION_USAGE_RESULT_PATH = "/tmp/gh-aw/usage/detection/detection_result.json";
+const RPC_EVENT_TO_TYPE = { rpc_request: "REQUEST", rpc_response: "RESPONSE", difc_filtered: "DIFC_FILTERED" };
+const API_PROXY_EVENT_LOG_PATHS = [
+  "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/events.jsonl",
+  "/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/events.jsonl",
+  "/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/events.jsonl",
+  "/tmp/gh-aw/firewall-audit-logs/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/firewall-audit-logs/api-proxy-logs/events.jsonl",
+  "/tmp/gh-aw/firewall-logs/api-proxy-logs/event-logs.jsonl",
+  "/tmp/gh-aw/firewall-logs/api-proxy-logs/events.jsonl",
+];
+
+function findFiles(rootDir, shouldIncludeFile, maxDepth = Number.POSITIVE_INFINITY, currentDepth = 0) {
+  if (!fs.existsSync(rootDir)) {
+    return [];
+  }
+
+  const files = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(rootDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
+    if (entry.isDirectory()) {
+      if (currentDepth < maxDepth) {
+        files.push(...findFiles(entryPath, shouldIncludeFile, maxDepth, currentDepth + 1));
+      }
+    } else if (entry.isFile() && shouldIncludeFile(entry)) {
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
+
+function findPrefixedDirectories(parentDir, prefix) {
+  if (!fs.existsSync(parentDir)) {
+    return [];
+  }
+  let entries;
+  try {
+    entries = fs.readdirSync(parentDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries.filter(entry => entry.isDirectory() && entry.name.startsWith(prefix)).map(entry => path.join(parentDir, entry.name));
+}
+
+/**
+ * @param {string} [tokenUsagePath]
+ * @returns {{ workingSet: ReturnType<typeof calculateWorkingSetFromJSONL>["workingSet"], ignoredRecords: number }}
+ */
+function parseWorkingSetMetrics(tokenUsagePath = AGENT_TOKEN_USAGE_PATH) {
+  if (!fs.existsSync(tokenUsagePath)) {
+    return calculateWorkingSetFromJSONL("");
+  }
+  try {
+    return calculateWorkingSetFromJSONL(fs.readFileSync(tokenUsagePath, "utf-8"));
+  } catch (err) {
+    throw new Error(`Failed to read working-set token usage from ${tokenUsagePath}: ${getErrorMessage(err)}`, { cause: err });
+  }
+}
+
+/**
+ * Read the agent token-usage JSONL used by friction-cost attribution.
+ *
+ * @param {string} [tokenUsagePath]
+ * @returns {{ content: string, available: boolean }}
+ */
+function readTokenUsageContent(tokenUsagePath = AGENT_TOKEN_USAGE_PATH) {
+  if (!fs.existsSync(tokenUsagePath)) {
+    return { content: "", available: false };
+  }
+  try {
+    return { content: fs.readFileSync(tokenUsagePath, "utf-8"), available: true };
+  } catch {
+    return { content: "", available: false };
+  }
+}
+
+/**
+ * Compute the precomputed friction-cost section for the usage activity summary.
+ * Never throws: friction is an additive section and must not fail summary generation.
+ *
+ * @param {{ gateway: any, integrity: any, session: any, firewall: any }} activity
+ * @param {string} [tokenUsagePath]
+ * @returns {Record<string, any>}
+ */
+function buildFrictionSummary(activity, tokenUsagePath = AGENT_TOKEN_USAGE_PATH) {
+  const { content, available } = readTokenUsageContent(tokenUsagePath);
+  const { friction, warnings } = computeFrictionCost({
+    gateway: activity.gateway,
+    integrity: activity.integrity,
+    session: activity.session,
+    firewall: activity.firewall,
+    tokenUsageContent: content,
+    tokenUsageAvailable: available,
+  });
+  for (const warning of warnings) {
+    core.warning(warning);
+  }
+  return friction;
+}
+
+/**
+ * Render friction-cost data as a collapsed GitHub step summary section.
+ *
+ * @param {Record<string, any>} friction
+ * @returns {string}
+ */
+function buildFrictionStepSummary(friction) {
+  if (!friction || typeof friction !== "object") return "";
+
+  const state = typeof friction.measurement_state === "string" ? friction.measurement_state : "unavailable";
+  const cost = friction.cost && typeof friction.cost === "object" ? friction.cost : {};
+  const aic = Number.isFinite(cost.aic) ? formatAIC(cost.aic) || "0" : "unavailable";
+  const occurrences = Number.isFinite(friction.counted_occurrences) ? friction.counted_occurrences.toLocaleString() : "0";
+  const tokens = Number.isFinite(cost.tokens?.total) ? cost.tokens.total.toLocaleString() : "0";
+  const turns = Number.isFinite(cost.turns) ? cost.turns.toLocaleString() : "0";
+  const toolCalls = Number.isFinite(cost.tool_calls) ? cost.tool_calls.toLocaleString() : "0";
+  const latency = Number.isFinite(cost.latency_ms) ? `${cost.latency_ms.toLocaleString()} ms` : "0 ms";
+  const ratio = state !== "unavailable" && Number.isFinite(friction.friction_ratio) ? `${(friction.friction_ratio * 100).toFixed(1)}%` : "unavailable";
+  const lines = [
+    "<details>",
+    `<summary>Friction Cost: ${aic} AIC (${state})</summary>`,
+    "",
+    "### Friction Cost",
+    "",
+    "| AI credits | Run cost ratio | Counted occurrences | Tokens | Turns | Tool calls | Latency |",
+    "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    `| ${aic} | ${ratio} | ${occurrences} | ${tokens} | ${turns} | ${toolCalls} | ${latency} |`,
+  ];
+
+  if (Array.isArray(friction.drivers) && friction.drivers.length > 0) {
+    lines.push("", "#### Drivers", "", "| Driver | Source | State | Occurrences | AI credits |", "| --- | --- | --- | ---: | ---: |");
+    for (const driver of friction.drivers) {
+      const driverAIC = Number.isFinite(driver.cost?.aic) ? formatAIC(driver.cost.aic) || "0" : "unavailable";
+      const driverOccurrences = Number.isFinite(driver.counted_occurrences) ? driver.counted_occurrences.toLocaleString() : "0";
+      lines.push(`| \`${driver.driver || "unknown"}\` | \`${driver.source || "unknown"}\` | \`${driver.state || "unavailable"}\` | ${driverOccurrences} | ${driverAIC} |`);
+    }
+  }
+
+  lines.push("", "</details>", "");
+  return lines.join("\n");
+}
+
+/**
+ * Determine whether a trailing-newline separator is needed before appending to an
+ * existing file, without reading the whole file into memory (step summary files can
+ * grow large over a run).
+ *
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function needsLeadingNewlineSeparator(filePath) {
+  let fd;
+  try {
+    const { size } = fs.statSync(filePath);
+    if (size === 0) return false;
+    fd = fs.openSync(filePath, "r");
+    const buffer = Buffer.alloc(1);
+    fs.readSync(fd, buffer, 0, 1, size - 1);
+    return buffer.toString("utf8") !== "\n";
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/**
+ * Append the rendered friction-cost section to $GITHUB_STEP_SUMMARY when the
+ * GITHUB_STEP_SUMMARY env var is set (the normal Actions runner case, including under
+ * `github-script`). Otherwise falls back to `core.summary.addRaw`/`write` when that API is
+ * available, and is a no-op when neither is usable — this script normally runs as a plain
+ * `node` process where `core.summary` is not provided by the shim.
+ *
+ * @param {string} section
+ * @returns {Promise<void>}
+ */
+async function writeFrictionStepSummary(section) {
+  if (!section) return;
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  if (summaryPath) {
+    try {
+      const separator = needsLeadingNewlineSeparator(summaryPath) ? "\n" : "";
+      fs.appendFileSync(summaryPath, `${separator}${section}`, "utf8");
+    } catch (err) {
+      core.warning(`Failed to append friction-cost step summary: ${getErrorMessage(err)}`);
+    }
+    return;
+  }
+  if (core.summary && typeof core.summary.addRaw === "function") {
+    await core.summary.addRaw(section).write();
+  }
+}
 
 /**
  * Check if a Squid decision indicates an allowed request
@@ -92,16 +318,18 @@ function parseFirewallLogs() {
     requests_by_domain: {},
   };
 
-  // The sandbox firewall logs may be emitted in nested directories (for example,
-  // api-proxy-logs/*.log), so these patterns are intentionally recursive.
-  const firewallPaths = ["/tmp/gh-aw/sandbox/firewall/logs/**/*.log", "/tmp/gh-aw/threat-detection/sandbox/firewall/logs/**/*.log", "/tmp/gh-aw/squid-logs-*/**/*.log", "/tmp/gh-aw/threat-detection/squid-logs-*/**/*.log"];
+  const firewallLogDirs = [
+    "/tmp/gh-aw/sandbox/firewall/logs",
+    "/tmp/gh-aw/threat-detection/sandbox/firewall/logs",
+    ...findPrefixedDirectories("/tmp/gh-aw", "squid-logs-"),
+    ...findPrefixedDirectories("/tmp/gh-aw/threat-detection", "squid-logs-"),
+  ];
 
-  for (const pattern of firewallPaths) {
-    const files = globSync(pattern);
-    for (const logPath of files) {
+  for (const logDir of firewallLogDirs) {
+    for (const logPath of findFiles(logDir, entry => entry.name.endsWith(".log"))) {
       try {
         const content = fs.readFileSync(logPath, "utf-8");
-        const lines = content.split("\n");
+        const lines = iterateLines(content);
 
         for (const raw of lines) {
           const line = raw.trim();
@@ -202,7 +430,7 @@ function parseFirewallLogs() {
 /**
  * Parse Copilot session event logs and aggregate counters
  */
-function parseSessionLogs() {
+function parseSessionLogs(sessionLogDirs = ["/tmp/gh-aw/sandbox/agent/logs/copilot-session-state", "/tmp/gh-aw/threat-detection/sandbox/agent/logs/copilot-session-state"]) {
   const session = {
     total_events: 0,
     session_starts: 0,
@@ -214,32 +442,24 @@ function parseSessionLogs() {
     tool_execution_completes: 0,
     failed_tool_executions: 0,
   };
+  const skills = new Map();
 
-  const sessionPaths = ["/tmp/gh-aw/sandbox/agent/logs/copilot-session-state/*/events.jsonl", "/tmp/gh-aw/threat-detection/sandbox/agent/logs/copilot-session-state/*/events.jsonl"];
-
-  for (const pattern of sessionPaths) {
-    const files = globSync(pattern);
-    for (const eventsPath of files) {
+  for (const logDir of sessionLogDirs) {
+    for (const eventsPath of findFiles(logDir, entry => entry.name === "events.jsonl", 1)) {
       try {
+        const pendingTools = new Map();
+        const sourceSessions = new Map();
+        const childSessions = new Map();
+        const entries = [];
         const content = fs.readFileSync(eventsPath, "utf-8");
-        const lines = content.split("\n");
-
-        for (const raw of lines) {
-          const line = raw.trim();
-          if (!line || !line.startsWith("{")) {
-            continue;
-          }
-
-          let entry;
-          try {
-            entry = JSON.parse(line);
-          } catch {
-            continue;
-          }
+        for (const entry of iterateJsonl(content, { lineFilter: line => line.startsWith("{") })) {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
 
           const eventType = String(entry.type || "")
             .trim()
             .toLowerCase();
+          entries.push({ ...entry, type: eventType });
+          if (entry.copilotProjection) continue;
           session.total_events += 1;
 
           if (eventType === "session.start") {
@@ -259,10 +479,61 @@ function parseSessionLogs() {
             session.tool_execution_starts += 1;
           } else if (eventType === "tool.execution_complete") {
             session.tool_execution_completes += 1;
-            const data = entry.data || {};
-            const success = typeof data === "object" ? data.success !== false : true;
-            if (!success) {
+          }
+        }
+
+        for (const entry of normalizeCopilotSession(entries)) {
+          if (entry.copilotProjection) continue;
+          /** @type {Record<string, any>} */
+          const data = entry.data;
+          const context = copilotSessionContext(entry);
+          const provenance = entry.provenance && typeof entry.provenance === "object" ? entry.provenance : {};
+          const sourceKey = JSON.stringify(["component" in provenance ? provenance.component : undefined, "phase" in provenance ? provenance.phase : undefined, "path" in provenance ? provenance.path : undefined]);
+          const childKey = JSON.stringify([sourceKey, context.agentId, context.parentToolUseId]);
+          if (["session.start", "session.init"].includes(entry.type) && context.sessionId !== undefined) {
+            if (context.agentId !== undefined || context.parentToolUseId) childSessions.set(childKey, context.sessionId);
+            else sourceSessions.set(sourceKey, context.sessionId);
+          }
+          const sessionId = context.sessionId !== undefined ? context.sessionId : childSessions.has(childKey) ? childSessions.get(childKey) : sourceSessions.get(sourceKey);
+          const scope = JSON.stringify([sourceKey, sessionId, context.agentId, context.parentToolUseId]);
+          const pending = pendingTools.get(scope) || [];
+          const toolName = typeof data.toolName === "string" ? data.toolName.trim().toLowerCase() : undefined;
+          if (entry.type === "tool.execution_start") {
+            let skillName;
+            if (toolName === "skill") {
+              const input = data.input && typeof data.input === "object" ? data.input : {};
+              skillName = String(input.skill || "").trim();
+              if (skillName) {
+                const aggregate = skills.get(skillName) || {
+                  name: skillName,
+                  invocation_count: 0,
+                  failed_count: 0,
+                  first_timestamp: String(entry.timestamp || ""),
+                  last_timestamp: String(entry.timestamp || ""),
+                };
+                aggregate.invocation_count += 1;
+                const timestamp = String(entry.timestamp || "");
+                if (timestamp && (!aggregate.first_timestamp || timestamp < aggregate.first_timestamp)) {
+                  aggregate.first_timestamp = timestamp;
+                }
+                if (timestamp && (!aggregate.last_timestamp || timestamp > aggregate.last_timestamp)) {
+                  aggregate.last_timestamp = timestamp;
+                }
+                skills.set(skillName, aggregate);
+              }
+            }
+            pending.push({ id: data.toolCallId, toolName, skillName });
+            pendingTools.set(scope, pending);
+          } else if (entry.type === "tool.execution_complete") {
+            const candidates = pending.filter(tool => (data.toolCallId !== undefined ? tool.id === data.toolCallId : tool.id === undefined && (toolName === undefined || tool.toolName === toolName)));
+            // A nameless, ID-less completion is attributable only when unambiguous.
+            const start = data.toolCallId !== undefined || toolName !== undefined || candidates.length === 1 ? candidates[0] : undefined;
+            if (start) pending.splice(pending.indexOf(start), 1);
+            if (sessionToolSuccess(data) === false) {
               session.failed_tool_executions += 1;
+              if (start?.skillName && skills.has(start.skillName)) {
+                skills.get(start.skillName).failed_count += 1;
+              }
             }
           }
         }
@@ -273,147 +544,445 @@ function parseSessionLogs() {
     }
   }
 
+  if (skills.size > 0) {
+    session.skills = {
+      total_invocations: Array.from(skills.values()).reduce((total, skill) => total + skill.invocation_count, 0),
+      unique_skills: skills.size,
+      items: Array.from(skills.values()).sort((left, right) => left.name.localeCompare(right.name)),
+    };
+  }
   return session.total_events > 0 ? session : null;
 }
 
 /**
- * Parse MCP gateway logs and aggregate tool call counts
+ * Parse the first AWF API proxy event log with steering events.
+ *
+ * @param {string[]} eventLogPaths
+ * @returns {{ total_events: number, event_counts: Record<string, number> } | null}
  */
-function parseGatewayLogs() {
-  const gateway = { total_calls: 0, failed_calls: 0, servers: {} };
-  const gatewayPaths = [];
-
-  const pathPairs = [
-    ["/tmp/gh-aw/sandbox/agent/logs/mcp-logs/gateway.jsonl", "/tmp/gh-aw/sandbox/agent/logs/gateway.jsonl"],
-    ["/tmp/gh-aw/threat-detection/sandbox/agent/logs/mcp-logs/gateway.jsonl", "/tmp/gh-aw/threat-detection/sandbox/agent/logs/gateway.jsonl"],
-  ];
-
-  for (const [modernPath, legacyPath] of pathPairs) {
-    if (fs.existsSync(modernPath)) {
-      gatewayPaths.push(modernPath);
-    } else if (fs.existsSync(legacyPath)) {
-      gatewayPaths.push(legacyPath);
-    }
-  }
-
-  for (const gatewayPath of gatewayPaths) {
-    if (!fs.existsSync(gatewayPath)) {
-      continue;
-    }
-
+function parseSteeringEvents(eventLogPaths = API_PROXY_EVENT_LOG_PATHS) {
+  for (const eventLogPath of eventLogPaths) {
     try {
-      const content = fs.readFileSync(gatewayPath, "utf-8");
-      const lines = content.split("\n");
-
-      for (const raw of lines) {
-        const line = raw.trim();
-        if (!line || !line.startsWith("{")) {
-          continue;
-        }
-
-        let entry;
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          continue;
-        }
-
-        const event = String(entry.event || "")
-          .trim()
-          .toLowerCase();
-        if (!["tool_call", "rpc_call", "request"].includes(event)) {
-          continue;
-        }
-
-        gateway.total_calls += 1;
-
-        const status = String(entry.status || "")
-          .trim()
-          .toLowerCase();
-        const level = String(entry.level || "")
-          .trim()
-          .toLowerCase();
-        const errorText = String(entry.error || "").trim();
-        const failed = status === "error" || errorText !== "" || level === "error";
-
-        if (failed) {
-          gateway.failed_calls += 1;
-        }
-
-        // gateway.jsonl has server_name for modern logs and server_id in
-        // some compatibility/transition paths; keep fallback ordering explicit.
-        const serverName = String(entry.server_name || entry.server_id || "unknown");
-
-        if (!gateway.servers[serverName]) {
-          gateway.servers[serverName] = { tool_call_count: 0, failed_calls: 0 };
-        }
-
-        gateway.servers[serverName].tool_call_count += 1;
-        if (failed) {
-          gateway.servers[serverName].failed_calls += 1;
-        }
+      const stat = fs.statSync(eventLogPath);
+      if (!stat || stat.size <= 0) {
+        continue;
       }
-    } catch (err) {
-      // Skip files that can't be read
-      continue;
+      const eventCounts = countSteeringEventsByTypeInApiProxyJsonl(fs.readFileSync(eventLogPath, "utf-8"));
+      const totalEvents = Object.values(eventCounts).reduce((total, count) => total + count, 0);
+      if (totalEvents > 0) {
+        return { total_events: totalEvents, event_counts: eventCounts };
+      }
+    } catch {
+      // Ignore missing or unreadable candidate files and try the next layout.
     }
   }
-
-  if (gateway.total_calls > 0) {
-    return {
-      total_calls: gateway.total_calls,
-      failed_calls: gateway.failed_calls,
-      servers: Object.entries(gateway.servers)
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([serverName, bucket]) => ({
-          server_name: serverName,
-          tool_call_count: bucket.tool_call_count,
-          failed_calls: bucket.failed_calls,
-        })),
-    };
-  }
-
   return null;
 }
+
+/**
+ * @param {unknown} value
+ * @returns {number}
+ */
+function nonNegativeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {number}
+ */
+function jsonByteLength(value) {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? 0 : Buffer.byteLength(serialized, "utf8");
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * @param {Map<string, number>} counts
+ * @returns {Record<string, number>}
+ */
+function sortedCounts(counts) {
+  return Object.fromEntries(Array.from(counts.entries()).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+/**
+ * @param {any} gateway
+ * @param {string} serverName
+ */
+function getGatewayServer(gateway, serverName) {
+  let server = gateway.servers.get(serverName);
+  if (!server) {
+    server = {
+      server_name: serverName,
+      request_count: 0,
+      tool_call_count: 0,
+      failed_calls: 0,
+      total_input_size: 0,
+      total_output_size: 0,
+      max_input_size: 0,
+      max_output_size: 0,
+      total_duration_ms: 0,
+    };
+    gateway.servers.set(serverName, server);
+  }
+  return server;
+}
+
+/**
+ * @param {any} gateway
+ * @param {string} serverName
+ * @param {string} toolName
+ */
+function getGatewayTool(gateway, serverName, toolName) {
+  const key = JSON.stringify([serverName, toolName]);
+  let tool = gateway.tools.get(key);
+  if (!tool) {
+    tool = {
+      server_name: serverName,
+      tool_name: toolName,
+      call_count: 0,
+      failed_calls: 0,
+      total_input_size: 0,
+      total_output_size: 0,
+      max_input_size: 0,
+      max_output_size: 0,
+      total_duration_ms: 0,
+      max_duration_ms: 0,
+    };
+    gateway.tools.set(key, tool);
+  }
+  return tool;
+}
+
+/**
+ * @param {any} gateway
+ * @param {string} serverName
+ * @param {string} toolName
+ * @param {number} inputSize
+ * @param {string} timestamp
+ */
+function recordGatewayToolCall(gateway, serverName, toolName, inputSize, timestamp) {
+  const server = getGatewayServer(gateway, serverName);
+  const tool = getGatewayTool(gateway, serverName, toolName);
+  const call = {
+    tool_call_id: `call-${gateway.tool_calls.length + 1}`,
+    timestamp,
+    server_name: serverName,
+    tool_name: toolName,
+    request_size: inputSize,
+    response_size: 0,
+    duration_ms: 0,
+    outcome: "incomplete",
+  };
+  gateway.tool_calls.push(call);
+  gateway.total_calls += 1;
+  gateway.total_input_size += inputSize;
+  gateway.max_input_size = Math.max(gateway.max_input_size, inputSize);
+  server.request_count += 1;
+  server.tool_call_count += 1;
+  server.total_input_size += inputSize;
+  server.max_input_size = Math.max(server.max_input_size, inputSize);
+  tool.call_count += 1;
+  tool.total_input_size += inputSize;
+  tool.max_input_size = Math.max(tool.max_input_size, inputSize);
+  return call;
+}
+
+/**
+ * @param {any} gateway
+ * @param {string} serverName
+ * @param {string} toolName
+ * @param {{failed: boolean, outputSize: number, durationMs: number}} result
+ * @param {{response_size: number, duration_ms: number, outcome: string}} call
+ */
+function recordGatewayToolResult(gateway, serverName, toolName, result, call) {
+  const server = getGatewayServer(gateway, serverName);
+  const tool = getGatewayTool(gateway, serverName, toolName);
+  if (result.failed) {
+    gateway.failed_calls += 1;
+    server.failed_calls += 1;
+    tool.failed_calls += 1;
+  }
+  gateway.total_output_size += result.outputSize;
+  gateway.max_output_size = Math.max(gateway.max_output_size, result.outputSize);
+  gateway.total_duration_ms += result.durationMs;
+  gateway.max_duration_ms = Math.max(gateway.max_duration_ms, result.durationMs);
+  server.total_output_size += result.outputSize;
+  server.max_output_size = Math.max(server.max_output_size, result.outputSize);
+  server.total_duration_ms += result.durationMs;
+  tool.total_output_size += result.outputSize;
+  tool.max_output_size = Math.max(tool.max_output_size, result.outputSize);
+  tool.total_duration_ms += result.durationMs;
+  tool.max_duration_ms = Math.max(tool.max_duration_ms, result.durationMs);
+  call.response_size = result.outputSize;
+  call.duration_ms = result.durationMs;
+  call.outcome = result.failed ? "failure" : "success";
+}
+
+/**
+ * @param {any} integrity
+ * @param {Record<string, any>} entry
+ */
+function recordIntegrityFilteredEvent(integrity, entry) {
+  const serverName = String(entry.server_id || entry.server_name || "unknown").trim() || "unknown";
+  const toolName = String(entry.tool_name || "unknown").trim() || "unknown";
+  const reason = String(entry.reason || "unknown").trim() || "unknown";
+  integrity.total_filtered += 1;
+  integrity.filtered_server_counts.set(serverName, (integrity.filtered_server_counts.get(serverName) || 0) + 1);
+  integrity.filtered_tool_counts.set(toolName, (integrity.filtered_tool_counts.get(toolName) || 0) + 1);
+  integrity.filtered_reason_counts.set(reason, (integrity.filtered_reason_counts.get(reason) || 0) + 1);
+}
+
+/**
+ * @param {Record<string, any>} entry
+ * @returns {string}
+ */
+function getRpcMessageType(entry) {
+  if (typeof entry.type === "string" && entry.type) {
+    return entry.type.toUpperCase();
+  }
+  const event = typeof entry.event === "string" ? entry.event.toLowerCase() : "";
+  return RPC_EVENT_TO_TYPE[event] || event.toUpperCase();
+}
+
+/**
+ * @param {any} activity
+ * @param {string} content
+ */
+function parseGatewayJSONL(activity, content) {
+  for (const entry of iterateJsonl(content, { lineFilter: line => line.startsWith("{") })) {
+    try {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      if (getRpcMessageType(entry) === "DIFC_FILTERED") {
+        recordIntegrityFilteredEvent(activity.integrity, entry);
+        continue;
+      }
+      const event = String(entry.event || "")
+        .trim()
+        .toLowerCase();
+      const method = String(entry.method || "")
+        .trim()
+        .toLowerCase();
+      if (event !== "tool_call" && method !== "tools/call") {
+        continue;
+      }
+      const serverName = String(entry.server_name || entry.server_id || "").trim();
+      const toolName = String(entry.tool_name || entry.method || "").trim();
+      if (!serverName || !toolName) {
+        continue;
+      }
+      const inputSize = nonNegativeNumber(entry.input_size);
+      const outputSize = nonNegativeNumber(entry.output_size);
+      const durationMs = nonNegativeNumber(entry.duration);
+      const status = String(entry.status || "")
+        .trim()
+        .toLowerCase();
+      const level = String(entry.level || "")
+        .trim()
+        .toLowerCase();
+      const failed = status === "error" || String(entry.error || "").trim() !== "" || level === "error";
+      const call = recordGatewayToolCall(activity.gateway, serverName, toolName, inputSize, String(entry.timestamp || ""));
+      recordGatewayToolResult(activity.gateway, serverName, toolName, { failed, outputSize, durationMs }, call);
+    } catch {
+      continue;
+    }
+  }
+}
+
+/**
+ * @param {any} activity
+ * @param {string} content
+ */
+function parseRPCMessagesJSONL(activity, content) {
+  const pending = new Map();
+  for (const entry of iterateJsonl(content, { lineFilter: line => line.startsWith("{") })) {
+    try {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const messageType = getRpcMessageType(entry);
+      if (messageType === "DIFC_FILTERED") {
+        recordIntegrityFilteredEvent(activity.integrity, entry);
+        continue;
+      }
+      const serverName = String(entry.server_id || entry.server_name || "").trim();
+      const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : null;
+      if (!serverName || !payload) {
+        continue;
+      }
+      if (String(entry.direction || "").toUpperCase() === "OUT" && messageType === "REQUEST" && payload.method === "tools/call") {
+        const toolName = String(payload.params?.name || "").trim();
+        if (!toolName) {
+          continue;
+        }
+        const inputSize = jsonByteLength(payload.params?.arguments ?? payload.params);
+        const call = recordGatewayToolCall(activity.gateway, serverName, toolName, inputSize, String(entry.timestamp || ""));
+        if (payload.id !== null && payload.id !== undefined) {
+          const key = JSON.stringify([serverName, payload.id]);
+          pending.set(key, {
+            serverName,
+            toolName,
+            timestampMs: Date.parse(entry.timestamp),
+            call,
+          });
+        }
+        continue;
+      }
+      if (String(entry.direction || "").toUpperCase() !== "IN" || messageType !== "RESPONSE" || payload.id === null || payload.id === undefined) {
+        continue;
+      }
+      const key = JSON.stringify([serverName, payload.id]);
+      const request = pending.get(key);
+      if (!request) {
+        continue;
+      }
+      pending.delete(key);
+      const responseTimestampMs = Date.parse(entry.timestamp);
+      const durationMs = Number.isFinite(request.timestampMs) && Number.isFinite(responseTimestampMs) ? Math.max(0, responseTimestampMs - request.timestampMs) : 0;
+      const hasRPCError = payload.error !== null && payload.error !== undefined;
+      const failed = hasRPCError || payload.result?.isError === true;
+      const outputSize = jsonByteLength(hasRPCError ? payload.error : payload.result);
+      recordGatewayToolResult(activity.gateway, request.serverName, request.toolName, { failed, outputSize, durationMs }, request.call);
+    } catch {
+      continue;
+    }
+  }
+}
+
+/**
+ * Parse MCP gateway/RPC logs and aggregate tool-call and integrity-filter metrics.
+ */
+function parseGatewayActivity(logRoots = ["/tmp/gh-aw", "/tmp/gh-aw/threat-detection", "/tmp/gh-aw/sandbox/agent/logs", "/tmp/gh-aw/threat-detection/sandbox/agent/logs"]) {
+  const activity = {
+    gateway: {
+      total_calls: 0,
+      failed_calls: 0,
+      total_input_size: 0,
+      total_output_size: 0,
+      max_input_size: 0,
+      max_output_size: 0,
+      total_duration_ms: 0,
+      max_duration_ms: 0,
+      servers: new Map(),
+      tools: new Map(),
+      tool_calls: [],
+    },
+    integrity: {
+      total_filtered: 0,
+      filtered_server_counts: new Map(),
+      filtered_tool_counts: new Map(),
+      filtered_reason_counts: new Map(),
+    },
+  };
+
+  for (const root of logRoots) {
+    const gatewayPath = [path.join(root, "mcp-logs/gateway.jsonl"), path.join(root, "gateway.jsonl")].find(candidate => fs.existsSync(candidate));
+    const rpcPath = [path.join(root, "mcp-logs/rpc-messages.jsonl"), path.join(root, "rpc-messages.jsonl")].find(candidate => fs.existsSync(candidate));
+    const selectedPath = gatewayPath || rpcPath;
+    if (!selectedPath) {
+      continue;
+    }
+    try {
+      const content = fs.readFileSync(selectedPath, "utf-8");
+      if (gatewayPath) {
+        parseGatewayJSONL(activity, content);
+      } else {
+        parseRPCMessagesJSONL(activity, content);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  const gateway =
+    activity.gateway.total_calls > 0
+      ? {
+          total_calls: activity.gateway.total_calls,
+          failed_calls: activity.gateway.failed_calls,
+          total_input_size: activity.gateway.total_input_size,
+          total_output_size: activity.gateway.total_output_size,
+          avg_input_size: Math.round(activity.gateway.total_input_size / activity.gateway.total_calls),
+          avg_output_size: Math.round(activity.gateway.total_output_size / activity.gateway.total_calls),
+          max_input_size: activity.gateway.max_input_size,
+          max_output_size: activity.gateway.max_output_size,
+          total_duration_ms: activity.gateway.total_duration_ms,
+          max_duration_ms: activity.gateway.max_duration_ms,
+          tool_calls: activity.gateway.tool_calls,
+          servers: Array.from(activity.gateway.servers.values())
+            .sort((left, right) => left.server_name.localeCompare(right.server_name))
+            .map(server => ({
+              ...server,
+              avg_input_size: server.tool_call_count > 0 ? Math.round(server.total_input_size / server.tool_call_count) : 0,
+              avg_output_size: server.tool_call_count > 0 ? Math.round(server.total_output_size / server.tool_call_count) : 0,
+              avg_duration_ms: server.tool_call_count > 0 ? server.total_duration_ms / server.tool_call_count : 0,
+            })),
+          tools: Array.from(activity.gateway.tools.values())
+            .sort((left, right) => left.server_name.localeCompare(right.server_name) || left.tool_name.localeCompare(right.tool_name))
+            .map(tool => ({
+              ...tool,
+              avg_input_size: tool.call_count > 0 ? Math.round(tool.total_input_size / tool.call_count) : 0,
+              avg_output_size: tool.call_count > 0 ? Math.round(tool.total_output_size / tool.call_count) : 0,
+              avg_duration_ms: tool.call_count > 0 ? tool.total_duration_ms / tool.call_count : 0,
+            })),
+        }
+      : null;
+  const integrity =
+    activity.integrity.total_filtered > 0
+      ? {
+          total_filtered: activity.integrity.total_filtered,
+          filtered_server_counts: sortedCounts(activity.integrity.filtered_server_counts),
+          filtered_tool_counts: sortedCounts(activity.integrity.filtered_tool_counts),
+          filtered_reason_counts: sortedCounts(activity.integrity.filtered_reason_counts),
+        }
+      : null;
+  return { gateway, integrity };
+}
+
+function parseGatewayLogs() {
+  return parseGatewayActivity().gateway;
+}
+
+const MANIFEST_FILE_PATH = "/tmp/gh-aw/safe-output-items.jsonl";
 
 /**
  * Parse the safe-output-items manifest and aggregate item counts by type.
  * Reads the JSONL file written by the safe_outputs job and downloaded into
  * the conclusion job via the safe-outputs-items artifact.
  *
+ * Three distinct return states let callers distinguish artifact provenance:
+ *   • returns null                          → manifest file not found
+ *   • returns { total_items: 0, ... }       → manifest present but contained no loggable items
+ *   • returns { total_items: N, ... }       → manifest present with N items
+ *   • throws                                → manifest file exists but could not be read
+ *
  * @param {string} [manifestPath] - Path to the manifest file (defaults to MANIFEST_FILE_PATH)
- * @returns {{ total_items: number, items_by_type: Record<string, number> } | null}
+ * @returns {{ total_items: number, items_by_type: Record<string, number>, items: Array<Record<string, any>> } | null}
  */
-const MANIFEST_FILE_PATH = "/tmp/gh-aw/safe-output-items.jsonl";
-
 function parseSafeOutputsManifest(manifestPath = MANIFEST_FILE_PATH) {
   if (!fs.existsSync(manifestPath)) {
     return null;
   }
 
+  // Let read errors propagate so the caller can distinguish "unreadable file"
+  // from "file present but no items" — both previously collapsed to null.
   let content;
   try {
     content = fs.readFileSync(manifestPath, "utf-8");
-  } catch (err) {
-    return null;
+  } catch (error) {
+    throw new Error(`Failed to read safe output manifest ${manifestPath}`, { cause: error });
   }
 
   const itemsByType = {};
+  const items = [];
   let totalItems = 0;
 
-  for (const raw of content.split("\n")) {
-    const line = raw.trim();
-    if (!line || !line.startsWith("{")) {
-      continue;
-    }
-
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
+  for (const entry of iterateJsonl(content)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const itemType = String(entry.type || "").trim();
     if (!itemType) {
       continue;
@@ -421,23 +990,117 @@ function parseSafeOutputsManifest(manifestPath = MANIFEST_FILE_PATH) {
 
     totalItems += 1;
     itemsByType[itemType] = (itemsByType[itemType] || 0) + 1;
-  }
-
-  if (totalItems === 0) {
-    return null;
+    items.push(entry);
   }
 
   return {
     total_items: totalItems,
     items_by_type: itemsByType,
+    items,
   };
+}
+
+function parseLedgerCompaction(value = process.env.GH_AW_LEDGER_COMPACTION) {
+  if (!value) return null;
+  try {
+    const compaction = JSON.parse(value);
+    if (
+      !compaction ||
+      typeof compaction !== "object" ||
+      !["before", "after", "selected", "records", "retired"].every(key => Number.isSafeInteger(compaction[key]) && compaction[key] >= 0) ||
+      !(compaction.replacement === null || typeof compaction.replacement === "string") ||
+      typeof compaction.changed !== "boolean"
+    ) {
+      return null;
+    }
+    return {
+      before: compaction.before,
+      after: compaction.after,
+      selected: compaction.selected,
+      records: compaction.records,
+      replacement: compaction.replacement,
+      retired: compaction.retired,
+      changed: compaction.changed,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function ledgerActivityFromSafeOutputs(safeOutputs, compaction = parseLedgerCompaction()) {
+  if (safeOutputs === null && compaction === null) return null;
+  const activity = {};
+  if (safeOutputs !== null) {
+    activity.transactions_added = safeOutputs.items_by_type.ledger_mutation || 0;
+  }
+  if (compaction !== null) {
+    activity.compaction = compaction;
+  }
+  return activity;
+}
+
+/**
+ * Parse A/B experiment assignments for the current run.
+ * Reads the assignments.json file written by pick_experiment.cjs.
+ * Returns null when no experiments are active for this run.
+ *
+ * @returns {{ assignments: Record<string, string> } | null}
+ */
+function parseExperimentsData() {
+  const assignments = readExperimentAssignments();
+  if (!assignments || Object.keys(assignments).length === 0) {
+    return null;
+  }
+  return { assignments };
 }
 
 /**
  * Main function to generate usage activity summary
  */
-function main() {
+function writeDetectionUsageResult(detectionDir = DETECTION_DIR, outputPath = DETECTION_USAGE_RESULT_PATH) {
+  const jobResult = process.env.GH_AW_DETECTION_JOB_RESULT || "";
+  if (!["success", "failure", "cancelled", "skipped"].includes(jobResult)) {
+    return;
+  }
+
+  const result = {
+    job_result: jobResult,
+    conclusion: ["success", "failure", "warning", "skipped"].includes(process.env.GH_AW_DETECTION_CONCLUSION || "") ? process.env.GH_AW_DETECTION_CONCLUSION : "",
+    reason: ["threat_detected", "agent_failure", "parse_error", "detection_skipped"].includes(process.env.GH_AW_DETECTION_REASON || "") ? process.env.GH_AW_DETECTION_REASON : "",
+  };
+  if (jobResult !== "skipped") {
+    const structured = parseStructuredResultFile(path.join(detectionDir, "detection_result.json"));
+    let parsed = structured;
+    if (!parsed?.verdict) {
+      const logPath = path.join(detectionDir, "detection.log");
+      if (fs.existsSync(logPath)) {
+        try {
+          parsed = parseDetectionLog(fs.readFileSync(logPath, "utf8"));
+        } catch {
+          parsed = null;
+        }
+      }
+    }
+    if (parsed?.verdict) {
+      const { prompt_injection, secret_leak, malicious_patch } = parsed.verdict;
+      result.prompt_injection = prompt_injection;
+      result.secret_leak = secret_leak;
+      result.malicious_patch = malicious_patch;
+    }
+  }
+  try {
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, JSON.stringify(result), "utf8");
+  } catch (err) {
+    throw new Error(`Failed to write detection usage result at ${outputPath}: ${getErrorMessage(err)}`, { cause: err });
+  }
+}
+
+async function main() {
+  writeDetectionUsageResult();
   const summary = { schema: "usage-activity-summary/v1" };
+  const memorySaves = require("./memory_save_results.cjs").readMemorySaveResults();
+  if (memorySaves.length) summary.memory_saves = memorySaves;
 
   // Parse firewall logs
   const firewall = parseFirewallLogs();
@@ -448,19 +1111,88 @@ function main() {
   // Parse session logs
   const session = parseSessionLogs();
   if (session) {
+    if (session.skills) {
+      summary.skills = session.skills;
+      delete session.skills;
+    }
     summary.session = session;
   }
 
-  // Parse gateway logs
-  const gateway = parseGatewayLogs();
-  if (gateway) {
-    summary.gateway = gateway;
+  // Parse gateway/RPC logs once for both MCP and integrity-filter aggregates.
+  const gatewayActivity = parseGatewayActivity();
+  if (gatewayActivity.gateway) {
+    summary.gateway = gatewayActivity.gateway;
+  }
+  if (gatewayActivity.integrity) {
+    summary.integrity = gatewayActivity.integrity;
   }
 
-  // Parse safe outputs manifest
-  const safeOutputs = parseSafeOutputsManifest();
-  if (safeOutputs) {
-    summary.safe_outputs = safeOutputs;
+  const steering = parseSteeringEvents();
+  if (steering) {
+    summary.steering = steering;
+  }
+
+  // Parse safe outputs manifest.
+  // parseSafeOutputsManifest() has three distinct outcomes that drive the three
+  // states downstream consumers need to distinguish:
+  //   • safe_outputs absent        → manifest not found (artifact download failed or job never ran)
+  //   • safe_outputs.total_items == 0 → manifest present, no items logged
+  //   • safe_outputs.total_items > 0  → manifest present with N items
+  // A read error is kept separate: it logs a warning but omits safe_outputs so
+  // the consumer cannot mistake a broken artifact for a legitimately empty one.
+  /** @type {ReturnType<typeof parseSafeOutputsManifest>} */
+  let safeOutputs = null;
+  try {
+    safeOutputs = parseSafeOutputsManifest();
+    if (safeOutputs === null) {
+      core.info(`safe-output-items manifest not found at ${MANIFEST_FILE_PATH} — safe-outputs-items artifact may not have been downloaded`);
+    } else {
+      summary.safe_outputs = safeOutputs;
+      if (safeOutputs.total_items === 0) {
+        core.info(`safe-output-items manifest: 0 item(s) logged (file present but contained no loggable items)`);
+      } else {
+        core.info(`safe-output-items manifest: ${safeOutputs.total_items} item(s) logged (types: ${Object.keys(safeOutputs.items_by_type).join(", ")})`);
+      }
+    }
+  } catch (err) {
+    core.warning(`safe-output-items manifest could not be read from ${MANIFEST_FILE_PATH}: ${getErrorMessage(err)} — safe_outputs omitted from summary`);
+  }
+  const ledger = ledgerActivityFromSafeOutputs(safeOutputs);
+  if (ledger) {
+    summary.ledger = ledger;
+  }
+
+  // Include A/B experiment assignments so the CLI can read them from the usage artifact.
+  const experiments = parseExperimentsData();
+  if (experiments) {
+    summary.experiments = experiments;
+  }
+
+  // Compute run-level Working-Set Rebuild Factor after the agent token-usage
+  // file has been copied into the compact usage artifact.
+  try {
+    const { workingSet, ignoredRecords } = parseWorkingSetMetrics();
+    summary.working_set = workingSet;
+    if (ignoredRecords > 0) {
+      core.warning(`Working-set rebuild measurement ignored ${ignoredRecords} malformed or unsupported token-usage record(s)`);
+    }
+  } catch (err) {
+    summary.working_set = calculateWorkingSetFromJSONL("").workingSet;
+    core.warning(`Working-set rebuild measurement unavailable: ${getErrorMessage(err)}`);
+  }
+
+  // Compute precomputed friction cost from every activity section already parsed.
+  // Consumers that only download the usage artifact read this instead of re-deriving
+  // friction from raw logs, so it is written even when no friction was detected.
+  try {
+    summary.friction = buildFrictionSummary({
+      gateway: summary.gateway || null,
+      integrity: summary.integrity || null,
+      session: summary.session || null,
+      firewall: summary.firewall || null,
+    });
+  } catch (err) {
+    core.warning(`Friction-cost measurement unavailable: ${getErrorMessage(err)}`);
   }
 
   // Write summary to file
@@ -468,14 +1200,41 @@ function main() {
   try {
     fs.writeFileSync(outputPath, JSON.stringify(summary, null, 2), "utf-8");
   } catch (err) {
-    throw new Error(`Failed to write file ${outputPath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to write file ${outputPath}: ${getErrorMessage(err)}`, { cause: err });
   }
   core.info(outputPath);
+
+  if (summary.friction) {
+    await writeFrictionStepSummary(buildFrictionStepSummary(summary.friction));
+  }
 }
 
 // Run main function
 if (require.main === module) {
-  main();
+  main().catch(err => {
+    console.error(err instanceof Error && err.stack ? err.stack : getErrorMessage(err));
+    process.exitCode = 1;
+  });
 }
 
-module.exports = { parseFirewallLogs, parseSessionLogs, parseGatewayLogs, parseSafeOutputsManifest, MANIFEST_FILE_PATH };
+module.exports = {
+  main,
+  writeDetectionUsageResult,
+  parseFirewallLogs,
+  parseSessionLogs,
+  parseSteeringEvents,
+  parseGatewayLogs,
+  parseGatewayActivity,
+  parseSafeOutputsManifest,
+  parseLedgerCompaction,
+  ledgerActivityFromSafeOutputs,
+  parseExperimentsData,
+  calculateWorkingSetFromJSONL,
+  parseWorkingSetMetrics,
+  buildFrictionSummary,
+  buildFrictionStepSummary,
+  writeFrictionStepSummary,
+  readTokenUsageContent,
+  AGENT_TOKEN_USAGE_PATH,
+  MANIFEST_FILE_PATH,
+};

@@ -53,6 +53,9 @@ Resolution supports two modes:
 | `ExtractVersion` | `func(uses string) string` | Extracts the version from a `uses` reference |
 | `ResolveActionPin` | `func(actionRepo, version string, ctx *PinContext) (string, error)` | Resolves a pinned reference with optional dynamic SHA lookup and fallback behavior |
 | `ResolveLatestActionPin` | `func(repo string, ctx *PinContext) string` | Resolves a pinned reference for the latest known version, preferring cache/dynamic resolution when available |
+| `ApplyContainerPinMapping` | `func(image string, ctx *PinContext) string` | Applies `PinContext.Mappings` remapping rules to a container image reference before lookup |
+| `ApplyResolvedActionPinPrefix` | `func(repo, pinnedRef string, ctx *PinContext) string` | Applies an action repository mapping to an already-resolved reference while retaining its pinned SHA and version label. |
+| `ResolveGHESActionPin` | `func(repo string) (string, bool)` | Returns a GHES-compatible pin for a repository when one is required. |
 
 ## Usage Examples
 

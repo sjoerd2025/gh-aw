@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -149,30 +150,27 @@ func (c *Compiler) generateSecretRedactionStep(yaml *strings.Builder, yamlConten
 	// This is important for validation to ensure the step ordering is correct
 	c.stepOrderTracker.RecordSecretRedaction("Redact secrets in logs")
 
-	// If no secrets found, we still generate the step but it will be a no-op at runtime
-	// This ensures consistent step ordering and validation
-	if len(secretReferences) == 0 {
-		secretMaskingLog.Print("No secrets found, generating no-op redaction step")
-		// Generate a minimal no-op redaction step for validation purposes
-		yaml.WriteString("      - name: Redact secrets in logs\n")
-		yaml.WriteString("        if: always()\n")
-		yaml.WriteString("        run: echo 'No secrets to redact'\n")
+	secretMaskingLog.Printf("Generating redaction step for %d secret(s)", len(secretReferences))
+	yaml.WriteString("      - name: Redact secrets in logs\n")
+	yaml.WriteString("        if: always()\n")
+	fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
+	yaml.WriteString("        with:\n")
+	yaml.WriteString("          script: |\n")
+
+	// Load redact_secrets script from external file
+	// Use setupGlobals helper to attach GitHub Actions builtin objects to global scope
+	yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
+	yaml.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
+	yaml.WriteString("            const { main } = require('${{ runner.temp }}/gh-aw/actions/redact_secrets.cjs');\n")
+	if data.SecretMasking != nil && len(data.SecretMasking.Steps) > 0 {
+		yaml.WriteString("            await main({ prepareForCustomMasking: true });\n")
 	} else {
-		secretMaskingLog.Printf("Generating redaction step for %d secret(s)", len(secretReferences))
-		yaml.WriteString("      - name: Redact secrets in logs\n")
-		yaml.WriteString("        if: always()\n")
-		fmt.Fprintf(yaml, "        uses: %s\n", getCachedActionPin("actions/github-script", data))
-		yaml.WriteString("        with:\n")
-		yaml.WriteString("          script: |\n")
-
-		// Load redact_secrets script from external file
-		// Use setupGlobals helper to attach GitHub Actions builtin objects to global scope
-		yaml.WriteString("            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n")
-		yaml.WriteString("            setupGlobals(core, github, context, exec, io, getOctokit);\n")
-		yaml.WriteString("            const { main } = require('${{ runner.temp }}/gh-aw/actions/redact_secrets.cjs');\n")
 		yaml.WriteString("            await main();\n")
+	}
 
-		// Add environment variables
+	// Add environment variables (only when secrets are present, since a step's
+	// `env` must be a mapping and an empty `env:` parses as null)
+	if len(secretReferences) > 0 {
 		yaml.WriteString("        env:\n")
 
 		// Pass the list of secret names as a comma-separated string
@@ -197,10 +195,65 @@ func (c *Compiler) generateSecretRedactionStep(yaml *strings.Builder, yamlConten
 	// Inject custom secret masking steps if configured
 	if data.SecretMasking != nil && len(data.SecretMasking.Steps) > 0 {
 		secretMaskingLog.Printf("Injecting %d custom secret masking steps", len(data.SecretMasking.Steps))
-		for _, step := range data.SecretMasking.Steps {
-			c.generateCustomSecretMaskingStep(yaml, step, data)
+		for i, id := range customSecretMaskingStepIDs(data) {
+			if i >= 0 && i < len(data.SecretMasking.Steps) {
+				trackedStep := maps.Clone(data.SecretMasking.Steps[i])
+				trackedStep["id"] = id
+				c.generateCustomSecretMaskingStep(yaml, trackedStep, data)
+			}
 		}
 	}
+}
+
+// customSecretMaskingStepIDs preserves explicit IDs and assigns stable, non-conflicting
+// IDs to unnamed hooks so their actual outcomes can gate artifact uploads.
+func customSecretMaskingStepIDs(data *WorkflowData) []string {
+	if data.SecretMasking == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(data.SecretMasking.Steps))
+	used := map[string]struct{}{"redact_secrets": {}}
+	for _, step := range data.SecretMasking.Steps {
+		id := ""
+		if configuredID, ok := step["id"].(string); ok {
+			id = configuredID
+		}
+		ids = append(ids, id)
+		if id != "" {
+			used[id] = struct{}{}
+		}
+	}
+	for i, id := range ids {
+		if id != "" {
+			continue
+		}
+		base := fmt.Sprintf("redact_secrets_custom_%d", i)
+		candidate := base
+		for suffix := 1; ; suffix++ {
+			if _, exists := used[candidate]; !exists {
+				break
+			}
+			candidate = base + strings.Repeat("_", suffix)
+		}
+		ids[i] = candidate
+		used[candidate] = struct{}{}
+	}
+	return ids
+}
+
+func secretRedactionSuccessCondition(data *WorkflowData) string {
+	return secretMaskingSuccessCondition(data) + " && steps.validate_recovery_envelopes.outcome == 'success'"
+}
+
+func secretMaskingSuccessCondition(data *WorkflowData) string {
+	var condition strings.Builder
+	condition.WriteString("steps.redact_secrets.outcome == 'success'")
+	for _, id := range customSecretMaskingStepIDs(data) {
+		condition.WriteString(" && steps.")
+		condition.WriteString(id)
+		condition.WriteString(".outcome == 'success'")
+	}
+	return condition.String()
 }
 
 // generateCustomSecretMaskingStep generates a custom secret masking step from configuration

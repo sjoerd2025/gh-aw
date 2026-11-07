@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 // Create a temporary template file used by "new issue" tests
 const tmpDir = os.tmpdir();
 const testTemplatePath = path.join(tmpDir, "test_missing_issue_template.md");
-fs.writeFileSync(testTemplatePath, "# Missing Items\n\n{{test_list}}\n");
+fs.writeFileSync(testTemplatePath, "# Missing Items\n\n{test_list}\n");
 
 // Mock globals before importing the module
 const mockCore = {
@@ -354,7 +354,7 @@ describe("missing_issue_helpers.cjs - buildMissingIssueHandler", () => {
       await handler(defaultMessage);
 
       const commentBody = mockGithub.rest.issues.createComment.mock.calls[0][0].body;
-      expect(commentBody).toContain("### 1. item-one");
+      expect(commentBody).toContain("### 1\\. item-one");
       expect(commentBody).toContain("**Reason:** not found");
     });
   });
@@ -458,6 +458,33 @@ describe("missing_issue_helpers.cjs - buildMissingIssueHandler", () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain("API rate limit exceeded");
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("Failed to create or update issue"));
+    });
+  });
+  describe("configured body footer", () => {
+    it("appends the configured footer to the new issue body", async () => {
+      mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+        data: { total_count: 0, items: [] },
+      });
+      mockGithub.rest.issues.create.mockResolvedValue({
+        data: { number: 90, html_url: "https://github.com/owner/repo/issues/90" },
+      });
+
+      const handler = await buildMissingIssueHandler(makeOptions())({ body_footer: "Configured footer" });
+      await handler(defaultMessage);
+
+      expect(mockGithub.rest.issues.create).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining("Configured footer") }));
+    });
+
+    it("appends the configured footer to the existing issue comment", async () => {
+      mockGithub.rest.search.issuesAndPullRequests.mockResolvedValue({
+        data: { total_count: 1, items: [{ number: 91, html_url: "https://github.com/owner/repo/issues/91" }] },
+      });
+      mockGithub.rest.issues.createComment.mockResolvedValue({ data: {} });
+
+      const handler = await buildMissingIssueHandler(makeOptions())({ body_footer: "Configured footer" });
+      await handler(defaultMessage);
+
+      expect(mockGithub.rest.issues.createComment).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining("Configured footer") }));
     });
   });
 });

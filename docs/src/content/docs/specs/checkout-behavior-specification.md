@@ -7,9 +7,9 @@ sidebar:
 
 # Checkout Behavior Specification
 
-**Version**: 1.1.0  
+**Version**: 1.3.4<br>
 **Status**: Working Draft  
-**Publication Date**: 2026-07-08  
+**Publication Date**: 2026-10-24<br>
 **Editor**: GitHub Agentic Workflows Team  
 **This Version**: [checkout-behavior-specification](/gh-aw/specs/checkout-behavior-specification/)  
 **Latest Published Version**: This document
@@ -18,7 +18,7 @@ sidebar:
 
 ## Abstract
 
-This specification defines normative checkout behavior in GitHub Agentic Workflows (`gh-aw`) for activation, agent, and `safe_outputs` jobs. It specifies credential and token precedence, `github-token` and `github-app` resolution, trial mode behavior, side-repo targeting, sparse/shallow/fetch semantics, symlink handling during sparse activation checkout, submodule cleanup semantics, and checkout-manifest behavior used by safe output handlers.
+This specification defines normative checkout behavior in GitHub Agentic Workflows for activation, agent, and `safe_outputs` jobs. It specifies credential and token precedence, `github-token` and `github-app` resolution, trial mode behavior, side-repo targeting, sparse/shallow/fetch semantics, symlink handling during sparse activation checkout, submodule cleanup semantics, and checkout-manifest behavior used by safe output handlers.
 
 ## Status of This Document
 
@@ -82,19 +82,103 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 ### 3.1 Checkout Entry Parsing
 
 `checkout:` MUST accept either a single object or an array of objects.  
-Each entry MAY define: `repository`, `ref`, `path`, `github-token` (or legacy `token`), `github-app` (or deprecated alias `app`), `safe-outputs-github-app`, `fetch-depth`, `fetch`, `sparse-checkout`, `submodules`, `lfs`, `current`, `wiki`, and `force-clean-git-credentials`.
+Each entry MAY define: `repository` (or `repo`), `multi`, `allowed-repos`, `max-repos`, `allow-private-repos`, `ref`, `path`, `github-token` (or legacy `token`), `github-app` (or deprecated alias `app`), `safe-outputs-github-app`, `fetch-depth`, `fetch`, `sparse-checkout`, `submodules`, `lfs`, `current`, `wiki`, and `force-clean-git-credentials`.
 
 `github-token` and `github-app` MUST be mutually exclusive per entry.
 
 `safe-outputs-github-app` applies only to safe_outputs git auth/token resolution. It MUST NOT change agent/activation checkout authentication behavior.
 
+#### Runtime Repository Lists
+
+`repo` MUST be accepted as an alias for `repository`; specifying both MUST fail.
+`multi` MUST be a literal boolean and MUST default to false. Only `multi: true`
+MUST enable repository-list expansion and the multi-repo restrictions in this
+subsection. Neither an expression selector nor `allowed-repos` alone MUST
+implicitly enable multi mode. Without multi mode, an explicit `repository` or
+`repo` MUST resolve to exactly one `owner/repo` slug; empty, malformed, wildcard,
+and multiple resolved slugs (including duplicates) MUST fail before checkout.
+Literal lists MUST fail compilation. Runtime expression values MUST be validated
+as data before `actions/checkout` in both agent and safe-output jobs.
+Single-repository expressions MUST NOT require an allowlist, a non-root path
+prefix, visibility preflight, private-target opt-in, or explicit App scoping.
+Normal single-checkout LFS, submodule, `current`, and `wiki` support MUST remain
+available. Multi-only policy fields MUST NOT activate or constrain a single
+checkout; their declared types still apply.
+`repository` and `repo` MUST select explicit repository names, not wildcard
+patterns. Literal repository wildcards MUST fail at compile time, and wildcard
+values in expression-resolved lists MUST fail at runtime. Wildcards MUST only
+be used in `allowed-repos`; the allowlist MUST NOT discover or select repositories.
+An entry with `multi: true` MUST expand its repository value as newline-separated
+`owner/repo` slugs at runtime. List expansion MUST require a non-empty allowlist
+and a literal, non-root path prefix. Each repository MUST be checked out under
+`<prefix>/<owner>/<repo>`. Matching and deduplication MUST be case-insensitive.
+Scoped wildcard patterns such as `owner/*` or `*/repo` MAY be used. Unrestricted
+patterns such as `*` or `*/*` MUST be rejected at compile time for literal values
+and at runtime for expression-resolved values.
+An empty selected list MUST NOT select every allowed repository.
+`allowed-repos` expressions MUST be standalone references to trusted repository
+or organization variables. Caller-controlled inputs, step/job outputs, computed
+expressions, and expressions embedded in literal text MUST fail compilation.
+
+`max-repos` MUST be a positive literal integer no greater than 9007199254740991
+and MUST require `allowed-repos`. Each runtime entry MUST default to a limit of
+10 unique selected slugs after case-insensitive deduplication. Oversized lists
+MUST fail in full before metadata requests or checkout action generation, not
+truncate. Agent and safe_outputs jobs MUST enforce the same limit. Separate
+runtime entries MAY have independent limits.
+
+Before checkout, the runtime MUST verify every selected repository against the
+allowlist and GitHub API metadata. Redirected canonical names MUST be checked
+again. A disallowed repository MUST fail the checkout job before creating any
+selected checkout and MUST be included in the agent failure issue according to
+the workflow's failure-reporting settings, including safe-output checkout failures.
+Runtime lists MUST reject private/internal targets by default. An entry MAY
+explicitly opt in with the literal boolean `allow-private-repos: true`, which
+MUST require `allowed-repos`. Expressions and non-boolean values MUST fail
+compilation; malformed runtime flag values MUST fail before authenticated reads.
+The opt-in MUST permit non-public targets only on private/internal hosts.
+If the workflow repository is public, non-public targets MUST be rejected even
+when the flag is true, regardless of the checkout credential's access.
+Agent and safe_outputs jobs MUST enforce the same policy. Ordinary static
+checkout behavior MUST remain unchanged. Missing or unverifiable visibility
+MUST fail closed. Runtime lists MUST reject enabled submodules at compilation and
+runtime regardless of host visibility, because repository-controlled submodule
+URLs can bypass the repository allowlist. Generated dynamic checkout actions
+MUST disable submodules. Static checkout submodule support MUST remain unchanged.
+Configured follow-up fetches MUST explicitly disable submodule recursion, even
+when local Git configuration enables it. Repository `.gitmodules` content MUST
+remain unchanged; generated checkout/finalization steps MUST NOT initialize it.
+Runtime lists MUST reject `lfs: true` at compilation and runtime regardless of
+host visibility, because repository-controlled LFS endpoints can bypass the
+repository allowlist. Generated dynamic checkout actions MUST disable LFS.
+Existing target directories and symlinked path ancestors MUST be rejected.
+
+Runtime lists MUST NOT support `current: true` or `wiki: true`. GitHub App auth
+MUST specify its installation owner and repository scope explicitly. The agent
+and safe_outputs jobs MUST use identical expanded checkout paths, and the
+checkout manifest MUST record each expanded repository and default branch.
+Both jobs MUST build their own manifest after checkout finalization and before
+repository-targeting handlers run, independent of bounded workspace discovery.
+Runtime safe-output checkouts MUST use the effective PR checkout token,
+including global safe-output GitHub App authentication, while preserving
+explicit per-entry credential overrides and their configured fallbacks.
+Before agent execution, finalization MUST explicitly clean and verify the git
+configs of every validated runtime checkout and its submodules, independent of
+workspace discovery depth. Missing or unverifiable configs MUST fail closed.
+Safe-output jobs MUST retain their intended authenticated-write credentials.
+
 ### 3.2 Entry Merge Rules
 
-Entries with the same `(repository, path, wiki)` key MUST merge with these rules:
+Entries with the same `(repository, path, wiki, multi)` key MUST merge with these rules.
+Single and multi entries MUST remain distinct; an imported multi entry MUST NOT
+silently turn a single entry into a repository list:
 
 - `fetch-depth`: deepest wins (`0` wins over all)
 - `ref`: first non-empty wins
 - auth (`github-token` vs `github-app`): first auth wins
+- runtime `allowed-repos`: first entry wins; later entries MUST NOT broaden the allowlist
+- runtime `max-repos`: smallest effective limit wins, including the default for omitted values
+- runtime `allow-private-repos`: logical AND; every merged entry MUST explicitly set `true`, with omitted values treated as `false`
 - safe_outputs auth (`safe-outputs-github-app`): first non-empty wins
 - sparse patterns: union
 - fetch refs: union
@@ -108,6 +192,10 @@ Entries with the same `(repository, path, wiki)` key MUST merge with these rules
 - **Agent job** MUST generate default checkout plus additional checkouts from `CheckoutManager`, with `persist-credentials: false` by default.
 - **safe_outputs job** MUST reuse the same checkout generators but set keep-credentials mode for push/fetch use and inject a `Configure Git credentials` step.
 
+For activation checkouts, the compiler MUST select `github.event.pull_request.base.sha` when the active event is `pull_request`, `pull_request_review`, or `pull_request_review_comment`, provided the pull-request payload exists. The expression MUST guard access to the pull-request payload by event name and nullability. Trigger detection MUST match exact names: `pull_request_target` alone MUST NOT enable this pin. On other events, including non-PR events in a mixed-trigger workflow, checkout MUST retain its existing ref (`github.sha` for the standard activation checkout or the resolved callee checkout SHA for `workflow_call`). This checkout occurs before runtime imports and skills are loaded; restoring agent configuration after the PR checkout is not a substitute for pinning activation.
+
+For cross-repository `workflow_call`, activation MUST retain the same-repository checkout condition whenever its token can resolve to the repository-scoped `GITHUB_TOKEN`, including the `on.github-app.ignore-if-missing` fallback. A missing optional App credential MUST NOT cause a cross-repository sparse checkout attempt with `GITHUB_TOKEN`.
+
 ### 3.4 Checkout Manifest
 
 For non-default cross-repo checkouts, the compiler MUST emit a checkout manifest step.  
@@ -115,6 +203,22 @@ Runtime lookup (`find_repo_checkout`) MUST prefer manifest paths and MUST reject
 
 Checkout-manifest generation MUST include enough per-checkout auth metadata to resolve default branches and safe_outputs repo targeting without relying on implicit defaults.  
 The manifest (or manifest-construction env) MUST NOT persist resolved token values to disk.
+
+### 3.5 Workspace Git-Scan Fallback
+
+When no usable manifest entry exists for a requested `owner/repo` target, runtime lookup MAY fall back to scanning `$GITHUB_WORKSPACE` for git repositories and matching them by `remote.origin.url`. This fallback exists because repositories cloned by a `steps:` entry or a manual `actions/checkout` are absent from the manifest.
+
+The fallback is an agent-influenced trust boundary: the agent can write anywhere under `$GITHUB_WORKSPACE`, while the safe-outputs MCP server that performs the lookup holds the GitHub token. Implementations MUST therefore satisfy all of the following:
+
+- **Manifest precedence**: the scan MUST run only after manifest lookup fails to yield an existing, in-workspace path.
+- **Scan confinement**: the scan MUST NOT descend outside `$GITHUB_WORKSPACE` and MUST NOT follow symbolic links out of it.
+- **Scoped ownership trust**: the safe-outputs MCP server container runs under a uid that differs from the runner user owning workspace clones, so `git config --get` would otherwise fail git's dubious-ownership check and silently report a missing remote. The implementation MUST scope the `safe.directory` override to that single read-only invocation (for example via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` on the child process environment) and MUST NOT mutate the process environment or grant process-wide trust to scanned directories.
+- **Read-only discovery**: discovery MUST use only git commands that cannot execute repository-supplied programs (no hooks, pagers, filesystem monitors, or credential helpers).
+- **Remote host constraint**: a scanned repository MUST be bound to an `owner/repo` slug only when its `remote.origin.url` host matches the host of `GITHUB_SERVER_URL` or `github.com`; remotes on other hosts MUST be ignored.
+- **Deferred durable trust**: durable `safe.directory` trust MUST be granted only to the resolved checkout directory, after cross-repository allowlist validation, at the point where git write operations are performed.
+- **Non-disclosing failure**: the not-found error MUST name the requested slug and the supported remediation (`checkout:` entry or workspace clone) without returning scanned filesystem paths to the agent.
+
+See also Threat T7 and requirements RCR1–RCR7 in the [Safe Outputs MCP Gateway Specification](/gh-aw/specs/safe-outputs-specification/).
 
 ---
 
@@ -177,6 +281,11 @@ When safe_outputs checkout retention is enabled, checkouts without explicit entr
 
 - Default shallow behavior MUST be `fetch-depth: 1` when unset.
 - Additional `fetch:` refs MUST emit a follow-up `git fetch` step per checkout entry.
+- Static and runtime-selected checkouts MUST check each `fetch:` pattern independently with authenticated `git ls-remote --exit-code` before fetching that pattern separately.
+- A discovery exit status of `2` (no matching remote refs), or a successful discovery containing no complete ref names matching the source refspec, MUST skip only that pattern, including literal branch names and glob patterns, and MUST NOT prevent other patterns from being fetched. Suffix-only matches MUST NOT count. An unmatched pattern MUST NOT create a local ref.
+- Other discovery failures and all fetch failures, including authentication and network errors, MUST fail the step rather than being treated as unmatched patterns.
+- Discovery MUST use the same checkout authentication as the follow-up fetch and MUST stream ref-listing stdout without buffering the complete remote ref list.
+- Expression-valued fetch patterns MUST be passed as data. Generated shell steps MUST pass them through environment variables and quoted expansions, never interpolate expression results into shell source.
 - Follow-up fetch MUST mirror effective depth (omit `--depth` only when effective depth is `0`).
 - Follow-up fetch MUST inject credentials via command-level `http.extraheader` and MUST NOT persist credentials to git config.
 
@@ -203,6 +312,15 @@ When `force-clean-git-credentials: true` is set (and keep-credentials-for-push i
 
 - `.git/config`
 - `.git/modules/**/config`
+
+Cleanup MUST complete and its credential-removal postcondition MUST be verified
+before untrusted agent execution starts. Generated checkout-time and final
+pre-agent cleanup steps MUST NOT ignore errors. Verification MUST reject
+remaining credential helpers, HTTP authentication headers, authenticated
+remote/push/rewrite URLs, and invalid or unreadable effective git configurations.
+Verification MUST include referenced config files, MUST NOT log token values,
+and MUST remove temporary verification snapshots before returning. No git config
+files is a valid no-op; cleanup failure is not.
 
 ---
 
@@ -267,6 +385,12 @@ When `GH_AW_TARGET_REPO_SLUG` is set but equals `GITHUB_REPOSITORY`, the impleme
 - **T-CHK-013**: Checkout-manifest generation includes safe_outputs auth metadata without persisting resolved tokens
 - **T-CHK-014**: Checkout-manifest path resolution MUST reject paths that are absolute (e.g., `/etc/passwd`) or escape the workspace root (e.g., `../../sensitive`); rejected paths MUST produce an error and MUST NOT be used for checkout or file lookup
 - **T-CHK-015**: `push_to_pull_request_branch` uses side-repo checkout from `GH_AW_TARGET_REPO_SLUG` only when it differs from `GITHUB_REPOSITORY`; emits debug log and ignores it when they match
+- **T-CHK-016**: Workspace git-scan fallback reads `remote.origin.url` with a per-invocation `safe.directory` override (process environment unchanged), and ignores scanned repositories whose remote host is neither `GITHUB_SERVER_URL`'s host nor `github.com`
+- **T-CHK-017**: Activation sparse checkout pins supported pull-request events to the base SHA, retains non-PR and `workflow_call` fallback refs, excludes `pull_request_target`, and preserves the same-repo guard for optional App token fallback
+- **T-CHK-018**: Checkout-time and final cleanup fail closed on helper failure or residual credentials, including included config files; successful verified cleanup and the no-checkout case remain usable
+- **T-CHK-019**: Runtime private/internal targets require literal per-entry opt-in and a non-public host; public hosts reject them even with opt-in, merged entries cannot broaden access, and denials reach agent failure issues
+- **T-CHK-020**: Only literal `multi: true` enables lists; omitted/false mode accepts single-repository expressions without multi restrictions, rejects empty/multiple/wildcard resolved slugs before either job's checkout, and remains distinct when imports merge
+- **T-CHK-021**: Static and runtime-selected checkouts skip unmatched literal and glob fetch patterns, including suffix-only discovery matches, without blocking matching patterns; preserve authentication and effective depth; stream discovery stdout with bounded memory; treat expression results as data; and fail on discovery errors other than status `2` or on any fetch error
 
 ### 7.2 Compliance Checklist
 
@@ -275,6 +399,7 @@ When `GH_AW_TARGET_REPO_SLUG` is set but equals `GITHUB_REPOSITORY`, the impleme
 | Checkout parse + merge semantics | T-CHK-001, T-CHK-002 | C1 | Required |
 | Agent vs safe_outputs credential lifecycle | T-CHK-003, T-CHK-004 | C1/C2 | Required |
 | Sparse/shallow/fetch semantics | T-CHK-005, T-CHK-006 | C1 | Required |
+| Independent fetch patterns and unmatched-ref handling | T-CHK-021 | C1/C2 | Required |
 | Manifest path safety | T-CHK-007 | C2 | Required |
 | Trial and side-repo behavior | T-CHK-008, T-CHK-009 | C1 | Required |
 | Submodule cleanup behavior | T-CHK-010 | C1/C2 | Required |
@@ -282,6 +407,11 @@ When `GH_AW_TARGET_REPO_SLUG` is set but equals `GITHUB_REPOSITORY`, the impleme
 | Checkout-manifest generation requirements | T-CHK-013 | C1/C2 | Required |
 | Checkout-manifest path-escape rejection | T-CHK-014 | C2 | Required |
 | `push_to_pull_request_branch` side-repo cwd resolution | T-CHK-015 | C2 | Required |
+| Workspace git-scan fallback trust scoping and host constraint | T-CHK-016 | C2 | Required |
+| Activation checkout ref and fallback provenance | T-CHK-017 | C1 | Required |
+| Verified fail-closed credential cleanup | T-CHK-018 | C1/C2 | Required |
+| Explicit private checkout opt-in and public-host isolation | T-CHK-019 | C1/C2 | Required |
+| Explicit multi opt-in and single-repository enforcement | T-CHK-020 | C1/C2 | Required |
 
 ### 7.3 Safeguards
 
@@ -291,7 +421,9 @@ The following MUST-level norms govern credential and token safety during checkou
 
 2. **Manifest path rejection**: Checkout-manifest paths that are absolute or that escape the workspace root MUST be rejected before any file I/O is performed against them. The rejection MUST produce an actionable error message (see §3.4 and T-CHK-014).
 
-3. **Credential cleanup**: When `force-clean-git-credentials: true` is active and `keep-credentials-for-push` is not, all credential-bearing git config sections MUST be removed from `.git/config` and `.git/modules/**/config` before the agent step completes.
+3. **Credential cleanup**: When `force-clean-git-credentials: true` is active and `keep-credentials-for-push` is not, all credential-bearing git config sections MUST be removed from `.git/config` and `.git/modules/**/config` and their absence verified before the untrusted agent starts. Failure MUST block agent execution.
+
+4. **Scan trust scoping**: The workspace git-scan fallback MUST NOT grant process-wide git ownership trust to scanned directories, and MUST NOT bind a scanned directory to an `owner/repo` slug when its remote host is neither the host of `GITHUB_SERVER_URL` nor `github.com` (see §3.5 and T-CHK-016).
 
 ---
 
@@ -312,6 +444,7 @@ The following MUST-level norms govern credential and token safety during checkou
 - `actions/setup/js/find_repo_checkout.cjs`
 - `actions/setup/sh/configure_git_credentials.sh`
 - `actions/setup/sh/clean_git_credentials.sh`
+- `actions/setup/sh/verify_git_credentials.sh`
 
 ### Informative References
 
@@ -322,6 +455,38 @@ The following MUST-level norms govern credential and token safety during checkou
 ---
 
 ## 9. Change Log
+
+### Version 1.3.4 (Working Draft)
+
+- Required independent discovery and fetching of additional refs for static and
+  runtime-selected checkouts, skipping only unmatched patterns while preserving
+  fatal errors, authentication, depth, and bounded discovery output; added T-CHK-021.
+
+### Version 1.3.3 (Working Draft)
+
+- Required explicit `multi: true` for repository lists and scoped all list-only
+  restrictions to that mode. Restored ordinary single-repository expressions,
+  required runtime cardinality validation in both jobs, and added T-CHK-020.
+
+### Version 1.3.2 (Working Draft)
+
+- Required explicit `allow-private-repos` opt-in for runtime private/internal
+  targets, conservative merged policy, and unconditional public-host rejection;
+  added T-CHK-019 for both checkout jobs and trusted failure reporting.
+
+### Version 1.3.1 (Working Draft)
+
+- Required verified credential removal before agent execution and fail-closed
+  cleanup errors; added T-CHK-018 for cleanup failure and residual credentials.
+
+### Version 1.3.0 (Working Draft)
+
+- Specified activation checkout base-SHA pinning, event and payload guards, and same-repository token fallback; added T-CHK-017.
+
+### Version 1.2.0 (Working Draft)
+
+- Added §3.5: workspace git-scan fallback requirements covering manifest precedence, scan confinement, per-invocation `safe.directory` scoping, read-only discovery, remote host constraint, deferred durable trust, and non-disclosing failure messages.
+- Added T-CHK-016 to §7.1 and the §7.2 compliance checklist, and a scan trust-scoping safeguard to §7.3.
 
 ### Version 1.1.0 (Working Draft)
 

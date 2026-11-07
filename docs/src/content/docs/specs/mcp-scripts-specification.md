@@ -308,6 +308,13 @@ inputs:
 - `enum: [...]` - Restrict to specific values
 - `description: "..."` - Help text for agent tool selection
 
+Array parameters MAY declare `items: { type: string }` to constrain every
+element's type. The item schema supports only `type`, using the supported types
+listed above, and requires an explicit parameter `type: array`. When declared,
+implementations MUST publish `items` in the tool's input schema and reject
+elements of a different type before invoking the handler. Without `items`,
+array element types remain unrestricted.
+
 ### 4.5 Environment Variables
 
 Environment variables provide secret access to tools:
@@ -322,7 +329,7 @@ env:
 - Environment variable values MAY contain GitHub Actions secret expressions (`${{ secrets.NAME }}`)
 - Secret expressions MUST be resolved during compilation
 - Secrets MUST be masked in logs
-- Only explicitly declared environment variables are available to tools
+- Only explicitly declared secret/configuration bindings and the ordinary runtime variables listed in [Environment Variables](/gh-aw/reference/mcp-scripts/#environment-variables-env) are available to tool processes
 
 ### 4.6 Timeout Configuration
 
@@ -362,13 +369,13 @@ Implementations SHOULD validate:
 5. **Timeout Reasonableness**: Timeout values are reasonable for tool purpose (warn if >600 seconds)
 
 **Sync note (2026-05-28)**: SM-IS-01 enforcement is now implemented across all MCP transport paths. `validateStringInputLengths`
-has been added to `actions/setup/js/mcp_scripts_validation.cjs` and is called by both the HTTP server
+has been added to `actions/setup/js/schema-validation.cjs` and is called by both the HTTP server
 in `actions/setup/js/mcp_scripts_mcp_server_http.cjs` and the shared stdio/core server in
 `actions/setup/js/mcp_server_core.cjs` immediately after required-field validation.
 Any string-typed input parameter whose UTF-8 byte length exceeds `MAX_STRING_INPUT_BYTES` (10 KB =
 10,240 bytes) causes the tool invocation to be rejected with a descriptive error before the handler
 is called. Implementations MUST NOT silently truncate oversized inputs. Verified by unit tests in
-`actions/setup/js/mcp_scripts_validation.test.cjs`. Closes
+`actions/setup/js/schema-validation.test.cjs`. Closes
 [#35257](https://github.com/github/gh-aw/issues/35257).
 
 ---
@@ -449,7 +456,7 @@ The `data.recoverable` field MUST conform to the following requirements:
 Each tool invocation MUST be isolated:
 
 - **Process Isolation**: Shell/Python/Go tools execute in separate containers
-- **Environment Isolation**: Only declared environment variables are available
+- **Environment Isolation**: Only the tool's declared bindings and the ordinary runtime allowlist are inherited
 - **Filesystem Isolation**: Tools have access only to their execution environment
 - **Network Isolation**: Tools inherit network permissions from workflow configuration
 
@@ -806,10 +813,14 @@ mcp-scripts:
 
 Implementations MUST:
 
-1. **Explicit Access**: Only environment variables declared in `env:` are available to tools
+1. **Explicit Access**: Only secret/configuration bindings declared in the tool's `env:` are available, alongside the ordinary runtime allowlist
 2. **Secret Masking**: Secrets referenced via `${{ secrets.NAME }}` are masked in logs
 3. **No Global Access**: Tools cannot access workflow secrets not explicitly declared
 4. **Environment Isolation**: Each tool has isolated environment variable namespace
+
+The compiler MUST assign distinct server-side transport references to each `(tool name, variable name)` pair. Identical variable names with different secret expressions MUST remain distinct through startup and invocation. JavaScript, shell, Python, and Go handlers MUST construct fresh child environments from the ordinary runtime allowlist and only their own resolved bindings; they MUST NOT inherit server authentication keys, sibling transport references, or arbitrary job credentials. Missing transport references MUST produce an explicit error. Dependency installers MUST receive only the ordinary runtime allowlist and the separate non-credential installer configuration allowlist documented in [Environment Variables](/gh-aw/reference/mcp-scripts/#environment-variables-env), not tool secrets or server credentials. Unsafe installer configuration MUST fail explicitly without reporting its value. Existing workflows require recompilation to generate these transport references.
+
+This environment boundary does not provide a filesystem or network sandbox. The current handlers execute trusted code in separate processes on the runner host.
 
 ### 7.2 Process Isolation
 
@@ -837,7 +848,7 @@ Implementations MUST:
 3. Prevent code injection via input validation
 4. Apply length limits to string inputs (MUST enforce a maximum input string length of at least 10KB)
 
-**SM-IS-01**: Implementations MUST enforce a maximum input string length of at least 10KB for each string-typed input parameter. Inputs exceeding the configured maximum MUST be rejected with a validation error before the tool script is invoked. Implementations MUST NOT silently truncate oversized inputs. The limit is enforced via `validateStringInputLengths` in `actions/setup/js/mcp_scripts_validation.cjs` (`MAX_STRING_INPUT_BYTES` = 10,240 bytes). **Status: Implemented 2026-05-28.**
+**SM-IS-01**: Implementations MUST enforce a maximum input string length of at least 10KB for each string-typed input parameter. Inputs exceeding the configured maximum MUST be rejected with a validation error before the tool script is invoked. Implementations MUST NOT silently truncate oversized inputs. The limit is enforced via `validateStringInputLengths` in `actions/setup/js/schema-validation.cjs` (`MAX_STRING_INPUT_BYTES` = 10,240 bytes). **Status: Implemented 2026-05-28.**
 
 ### 7.4 Output Sanitization
 
@@ -1650,7 +1661,7 @@ Sync follow-up tasks:
 | Marker | Implementation File(s) | Enforcement Path |
 |---|---|---|
 | SM-JS-01 | `pkg/workflow/mcp_scripts_generator.go`, `actions/setup/js/mcp_server_core.cjs` | `GenerateMCPScriptJavaScriptToolScript` emits per-tool JS handlers; `loadToolHandlers` in `mcp_server_core.cjs` executes handlers in isolated subprocesses |
-| SM-IS-01 | `actions/setup/js/mcp_scripts_mcp_server_http.cjs`, `actions/setup/js/mcp_server_core.cjs`, `actions/setup/js/mcp_scripts_validation.cjs` | `validateStringInputLengths` called after `validateRequiredFields` in both the HTTP server (`createMCPServer`) and the stdio/core server (`handleMessage`); rejects any string-typed input parameter whose UTF-8 byte length exceeds `MAX_STRING_INPUT_BYTES` (10,240 bytes). **Status: Implemented 2026-05-28.** |
+| SM-IS-01 | `actions/setup/js/mcp_scripts_mcp_server_http.cjs`, `actions/setup/js/mcp_server_core.cjs`, `actions/setup/js/schema-validation.cjs` | `validateStringInputLengths` called after `validateRequiredFields` in both the HTTP server (`createMCPServer`) and the stdio/core server (`handleMessage`); rejects any string-typed input parameter whose UTF-8 byte length exceeds `MAX_STRING_INPUT_BYTES` (10,240 bytes). **Status: Implemented 2026-05-28.** |
 | SM-03 | `actions/setup/js/mcp_server_core.cjs`, `actions/setup/js/mcp_scripts_mcp_server_http.cjs` | Tool-call response path serializes handler output before returning MCP `content`; raw passthrough handling is centralized in server transport/handler pipeline |
 
 ### Implementation Notes
@@ -1679,8 +1690,11 @@ Sync follow-up tasks:
   `MCPScriptsMode` constants for transport mode selection.
 
 - **§7 — Security Model**: Secret environment variable injection is performed by
-  `collectMCPScriptsSecrets` in `mcp_scripts_renderer.go`. The rendered gateway config
-  includes a `guard` block to restrict tool access to declared inputs only.
+  `collectMCPScriptsSecrets` in `mcp_scripts_renderer.go`, using the same per-tool
+  transport names as `GenerateMCPScriptsToolsConfig`. `loadToolHandlers` passes each
+  tool's references to its language handler; `createToolEnvironment` in
+  `mcp_handler_process.cjs` resolves only those references and the runtime allowlist.
+  The rendered gateway config includes a `guard` block to restrict tool access to declared inputs only.
 
 - **§8 — Large Output Handling**: Output truncation thresholds are defined as constants in
   `mcp_scripts_generator.go`. The HTTP transport implementation in
@@ -1708,8 +1722,8 @@ sandbox with the following constraints:
   `context.WithTimeout` wrapping the subprocess. Exceeding the timeout causes the tool to
   return an MCP error response with code `-32001`.
 - **Secret access**: Secrets are injected as environment variables only if declared in the
-  tool's `env:` field. No other environment variables from the runner are forwarded into
-  the Go sandbox.
+  tool's `env:` field, alongside ordinary runtime variables. Go runs in a separate
+  process on the runner host, not a credential-isolated filesystem sandbox.
 
 ### Norms Audit (2026-06-01)
 

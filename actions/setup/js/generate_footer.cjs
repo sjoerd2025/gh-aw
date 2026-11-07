@@ -1,7 +1,8 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { getDetectionReasonText, getThreatDetectedMarker, isToolingFailureReason } = require("./threat_detection_warning.cjs");
+const { getDetectionReasonText, getThreatDetectedMarker, isToolingFailureReason, getEffectiveDetectionConclusion } = require("./threat_detection_warning.cjs");
+const { getPromptPath, renderTemplateFromFile } = require("./messages_core.cjs");
 
 /**
  * Generates a standalone workflow-id XML comment marker for searchability.
@@ -53,10 +54,12 @@ function matchesWorkflowId(body, workflowId) {
  * @returns {string} XML comment marker with workflow metadata
  */
 function generateXMLMarker(workflowName, runUrl) {
+  const { resolveEffectiveModel, validateModelIdentifier } = require("./model_attribution.cjs");
   // Read engine metadata from environment variables
   const engineId = process.env.GH_AW_ENGINE_ID || "";
   const engineVersion = process.env.GH_AW_ENGINE_VERSION || "";
-  const engineModel = process.env.GH_AW_ENGINE_MODEL || "";
+  const attribution = resolveEffectiveModel();
+  const engineModel = attribution.model || (attribution.routing ? attribution.requestedModel : validateModelIdentifier(process.env.GH_AW_ENGINE_MODEL));
   const trackerId = process.env.GH_AW_TRACKER_ID || "";
   const runId = process.env.GITHUB_RUN_ID || "";
   const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
@@ -86,6 +89,12 @@ function generateXMLMarker(workflowName, runUrl) {
   if (engineModel) {
     parts.push(`model: ${engineModel}`);
   }
+  if (attribution.routing?.status === "selected") {
+    if (attribution.effort) parts.push(`effort: ${attribution.effort}`);
+    parts.push("routed: true");
+  } else if (attribution.routing) {
+    parts.push(`routed: ${attribution.routing.status}`);
+  }
 
   // Add numeric run ID if available
   if (runId) {
@@ -113,12 +122,7 @@ function generateXMLMarker(workflowName, runUrl) {
  * admonition is used so reviewers can distinguish "detection engine crashed" from "detection
  * engine found something". Actual threat findings (threat_detected) keep [!CAUTION].
  *
- * Note: This function is intentionally kept inline (not imported from messages_footer.cjs)
- * because importing messages_footer.cjs here would cause the bundler to inline
- * messages_core.cjs which contains 'GH_AW_SAFE_OUTPUT_MESSAGES:' in a warning message,
- * breaking tests that check for env var declarations.
- *
- * Warning reason text and threat marker formatting are centralized in
+ * Note: Warning reason text and threat marker formatting are centralized in
  * threat_detection_warning.cjs to keep warning-mode messaging consistent.
  *
  * @param {string} workflowName - Name of the workflow
@@ -126,16 +130,16 @@ function generateXMLMarker(workflowName, runUrl) {
  * @returns {string} Alert markdown or empty string
  */
 function getExpiredEntityCautionAlert(workflowName, runUrl) {
-  const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION;
-  if (detectionConclusion !== "warning") {
+  const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
+  if (getEffectiveDetectionConclusion(process.env.GH_AW_DETECTION_CONCLUSION, detectionReason) !== "warning") {
     return "";
   }
-  const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
   const reasonText = getDetectionReasonText(detectionReason);
+  const context = { threat_detected_marker: getThreatDetectedMarker(detectionReason), reason_text: reasonText, run_url: runUrl };
   if (isToolingFailureReason(detectionReason)) {
-    return `> [!WARNING]\n> threat detection engine error\n> The threat detection engine encountered an error and could not complete analysis. This is a tooling failure, not a security finding.\n> ${getThreatDetectedMarker(detectionReason)}\n>\n> <details>\n> <summary>Details</summary>\n>\n> ${reasonText}\n>\n> Review the [workflow run logs](${runUrl}) for details.\n> </details>`;
+    return renderTemplateFromFile(getPromptPath("threat_detection_engine_error.md"), context).trimEnd();
   }
-  return `> [!CAUTION]\n> agentic threat detected\n> Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.\n> ${getThreatDetectedMarker(detectionReason)}\n>\n> <details>\n> <summary>Details</summary>\n>\n> ${reasonText}\n>\n> Review the [workflow run logs](${runUrl}) for details.\n> </details>`;
+  return renderTemplateFromFile(getPromptPath("threat_detection_caution.md"), context).trimEnd();
 }
 
 /**
@@ -173,6 +177,43 @@ function generateExpiredEntityFooter(workflowName, runUrl, workflowId) {
  */
 function generateWorkflowCallIdMarker(callerWorkflowId) {
   return `<!-- gh-aw-workflow-call-id: ${callerWorkflowId} -->`;
+}
+
+/**
+ * GitHub strips HTML comments from review bodies, but retains Markdown reference
+ * definitions. Encode the caller ID so it cannot alter the reference syntax.
+ * @param {string} callerWorkflowId
+ * @returns {string}
+ */
+function generateWorkflowCallIdReviewMarker(callerWorkflowId) {
+  return `[gh-aw-workflow-call-id]: # "${encodeURIComponent(callerWorkflowId)}"`;
+}
+
+/**
+ * Match only a complete provenance line, including legacy review markers.
+ * @param {string|null|undefined} body
+ * @param {string} callerWorkflowId
+ * @returns {boolean}
+ */
+function matchesWorkflowCallIdReviewMarker(body, callerWorkflowId) {
+  if (!body || !callerWorkflowId) return false;
+  const legacyMarker = generateWorkflowCallIdMarker(callerWorkflowId);
+  const lines = body.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const marker = line.trim();
+    const legacyMatch = marker.match(/^<!-- gh-aw-workflow-call-id: (.*) -->$/);
+    if (legacyMatch) return marker === legacyMarker;
+    const match = marker.match(/^\[gh-aw-workflow-call-id\]: # "([^"]+)"$/);
+    if (match) {
+      try {
+        return decodeURIComponent(match[1]) === callerWorkflowId;
+      } catch {
+        return false;
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -297,6 +338,8 @@ module.exports = {
   generateXMLMarker,
   generateWorkflowIdMarker,
   generateWorkflowCallIdMarker,
+  generateWorkflowCallIdReviewMarker,
+  matchesWorkflowCallIdReviewMarker,
   getWorkflowIdMarkerContent,
   matchesWorkflowId,
   isValidWorkflowId,

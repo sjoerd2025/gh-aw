@@ -10,9 +10,8 @@ var hideCommentLog = logger.New("workflow:hide_comment")
 type HideCommentConfig struct {
 	BaseSafeOutputConfig   `yaml:",inline"`
 	SafeOutputTargetConfig `yaml:",inline"`
-	SafeOutputFilterConfig `yaml:",inline"`
 	AllowedReasons         []string `yaml:"allowed-reasons,omitempty"` // List of allowed reasons for hiding comments (default: all reasons allowed)
-	Discussions            *bool    `yaml:"discussions,omitempty"`     // When false, excludes discussions:write permission. Default (nil or true) includes discussions:write for GitHub Apps with Discussions permission.
+	Discussions            *bool    `yaml:"discussions,omitempty"`     // When true, includes discussions:write permission. Default (nil or false) excludes discussions:write.
 }
 
 // parseHideCommentConfig handles hide-comment configuration
@@ -30,6 +29,9 @@ func (c *Compiler) parseHideCommentConfig(outputMap map[string]any) *HideComment
 				return nil // Invalid configuration (e.g., wildcard target-repo), return nil to cause validation error
 			}
 			hideCommentConfig.SafeOutputTargetConfig = targetConfig
+			if discussions, ok := configMap["discussions"].(bool); ok {
+				hideCommentConfig.Discussions = &discussions
+			}
 
 			// Parse allowed-reasons
 			if allowedReasons, exists := configMap["allowed-reasons"]; exists {
@@ -45,7 +47,7 @@ func (c *Compiler) parseHideCommentConfig(outputMap map[string]any) *HideComment
 			// Parse common base fields with default max of 5
 			c.parseBaseSafeOutputConfig(configMap, &hideCommentConfig.BaseSafeOutputConfig, 5)
 
-			hideCommentLog.Printf("Parsed hide-comment config: max=%d, target_repo=%s",
+			hideCommentLog.Printf("Parsed hide-comment config: max=%v, target_repo=%s",
 				hideCommentConfig.Max, hideCommentConfig.TargetRepoSlug)
 		} else {
 			// If configData is nil or not a map, still set the default max

@@ -12,6 +12,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/gitutil"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
@@ -95,14 +96,14 @@ func InstallShellCompletion(verbose bool, rootCmd CommandProvider) error {
 	// For now, we only use the CommandProvider interface methods
 	cmd, ok := rootCmd.(*cobra.Command)
 	if !ok {
-		return errors.New("rootCmd must be a *cobra.Command")
+		return errors.New("rootCmd should be a *cobra.Command; call ShellCompletion with the root Cobra command")
 	}
 
 	shellType := DetectShell()
 	shellCompletionLog.Printf("Detected shell type: %s", shellType)
 
 	if shellType == ShellUnknown {
-		return errors.New("could not detect shell type. Please install completions manually using: gh aw completion <shell>")
+		return errors.New("could not detect shell type — expected SHELL, BASH_VERSION, ZSH_VERSION, or FISH_VERSION to identify the shell; install completions manually using an explicit shell, for example: gh aw completion bash")
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Detected shell: %s", shellType)))
@@ -117,8 +118,19 @@ func InstallShellCompletion(verbose bool, rootCmd CommandProvider) error {
 	case ShellPowerShell:
 		return installPowerShellCompletion(verbose, cmd)
 	default:
-		return fmt.Errorf("shell completion not supported for: %s", shellType)
+		return fmt.Errorf("shell completion not supported for %s — expected one of bash, zsh, fish, or powershell; choose a supported shell, for example: gh aw completion bash", shellType)
 	}
+}
+
+// validateRcPath cleans a shell rc file path (for example /home/user/.bashrc) and ensures it is
+// absolute before it is read. It returns the cleaned path or an actionable error.
+func validateRcPath(rcName string, rcPath string) (string, error) {
+	cleanPath := filepath.Clean(rcPath)
+	if !filepath.IsAbs(cleanPath) {
+		shellCompletionLog.Printf("Invalid %s path (not absolute): %s", rcName, rcPath)
+		return "", fmt.Errorf("%s path %q is not an absolute path — expected an absolute path such as '/home/user/.%s'; set $HOME to an absolute home directory and retry", rcName, rcPath, rcName)
+	}
+	return cleanPath, nil
 }
 
 // installBashCompletion installs bash completion
@@ -128,16 +140,16 @@ func installBashCompletion(verbose bool, cmd *cobra.Command) error {
 	// Generate completion script using Cobra
 	var buf bytes.Buffer
 	if err := cmd.GenBashCompletion(&buf); err != nil {
-		return fmt.Errorf("failed to generate bash completion: %w", err)
+		return fmt.Errorf("bash completion generation error: %w; check that the command is initialized and retry: gh aw completion bash", err)
 	}
 
 	completionScript := buf.String()
 
 	// Determine installation path
 	var completionPath string
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := gitutil.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
 	// Try to determine the best location for bash completions
@@ -172,7 +184,7 @@ func installBashCompletion(verbose bool, cmd *cobra.Command) error {
 	if strings.HasPrefix(completionDir, homeDir) {
 		// Use restrictive permissions (0750) following principle of least privilege
 		if err := os.MkdirAll(completionDir, constants.DirPermSensitive); err != nil {
-			return fmt.Errorf("failed to create completion directory: %w", err)
+			return fmt.Errorf("create completion directory %q error: %w; check that the parent directory exists and is writable, then retry", completionDir, err)
 		}
 	}
 
@@ -185,14 +197,14 @@ func installBashCompletion(verbose bool, cmd *cobra.Command) error {
 		completionPath = filepath.Join(homeDir, ".bash_completion.d", "gh-aw")
 		// Use restrictive permissions (0750) following principle of least privilege
 		if err := os.MkdirAll(filepath.Dir(completionPath), constants.DirPermSensitive); err != nil {
-			return fmt.Errorf("failed to create user completion directory: %w", err)
+			return fmt.Errorf("create user completion directory %q error: %w; check that the home directory is writable, then retry", filepath.Dir(completionPath), err)
 		}
 		// Use restrictive permissions (0600) following principle of least privilege
 		if err := os.WriteFile(completionPath, []byte(completionScript), constants.FilePermSensitive); err != nil {
-			return fmt.Errorf("failed to write completion file: %w", err)
+			return fmt.Errorf("write completion file %q error: %w; check that the directory is writable, then retry", completionPath, err)
 		}
 	} else if err != nil {
-		return fmt.Errorf("failed to write completion file: %w", err)
+		return fmt.Errorf("write completion file %q error: %w; check that the directory is writable, then retry", completionPath, err)
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Installed bash completion to: "+completionPath))
@@ -202,10 +214,9 @@ func installBashCompletion(verbose bool, cmd *cobra.Command) error {
 	if strings.HasPrefix(completionPath, homeDir) {
 		// For user-level installations, check if .bashrc sources the completion directory
 		// Clean and validate the path to prevent path traversal
-		cleanBashrcPath := filepath.Clean(bashrcPath)
-		if !filepath.IsAbs(cleanBashrcPath) {
-			shellCompletionLog.Printf("Invalid bashrc path (not absolute): %s", bashrcPath)
-			return fmt.Errorf("invalid bashrc path: %s", bashrcPath)
+		cleanBashrcPath, err := validateRcPath("bashrc", bashrcPath)
+		if err != nil {
+			return err
 		}
 		// #nosec G304 -- bashrcPath is constructed from trusted os.UserHomeDir() and a constant filename
 		bashrcContent, err := os.ReadFile(cleanBashrcPath)
@@ -241,15 +252,15 @@ func installZshCompletion(verbose bool, cmd *cobra.Command) error {
 	// Generate completion script using Cobra
 	var buf bytes.Buffer
 	if err := cmd.GenZshCompletion(&buf); err != nil {
-		return fmt.Errorf("failed to generate zsh completion: %w", err)
+		return fmt.Errorf("zsh completion generation error: %w; check that the command is initialized and retry: gh aw completion zsh", err)
 	}
 
 	completionScript := buf.String()
 
 	// Determine installation path
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := gitutil.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
 	// Check for fpath directories
@@ -259,14 +270,14 @@ func installZshCompletion(verbose bool, cmd *cobra.Command) error {
 	userCompletionDir := filepath.Join(homeDir, ".zsh", "completions")
 	// Use restrictive permissions (0750) following principle of least privilege
 	if err := os.MkdirAll(userCompletionDir, constants.DirPermSensitive); err != nil {
-		return fmt.Errorf("failed to create completion directory: %w", err)
+		return fmt.Errorf("create completion directory %q error: %w; check that the home directory is writable, then retry", userCompletionDir, err)
 	}
 	completionPath = filepath.Join(userCompletionDir, "_gh-aw")
 
 	// Write completion file
 	// Use restrictive permissions (0600) following principle of least privilege
 	if err := os.WriteFile(completionPath, []byte(completionScript), constants.FilePermSensitive); err != nil {
-		return fmt.Errorf("failed to write completion file: %w", err)
+		return fmt.Errorf("write completion file %q error: %w; check that the directory is writable, then retry", completionPath, err)
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Installed zsh completion to: "+completionPath))
@@ -274,10 +285,9 @@ func installZshCompletion(verbose bool, cmd *cobra.Command) error {
 	// Check if .zshrc configures fpath
 	zshrcPath := filepath.Join(homeDir, ".zshrc")
 	// Clean and validate the path to prevent path traversal
-	cleanZshrcPath := filepath.Clean(zshrcPath)
-	if !filepath.IsAbs(cleanZshrcPath) {
-		shellCompletionLog.Printf("Invalid zshrc path (not absolute): %s", zshrcPath)
-		return fmt.Errorf("invalid zshrc path: %s", zshrcPath)
+	cleanZshrcPath, err := validateRcPath("zshrc", zshrcPath)
+	if err != nil {
+		return err
 	}
 	// #nosec G304 -- zshrcPath is constructed from trusted os.UserHomeDir() and a constant filename
 	zshrcContent, err := os.ReadFile(cleanZshrcPath)
@@ -310,22 +320,22 @@ func installFishCompletion(verbose bool, cmd *cobra.Command) error {
 	// Generate completion script using Cobra
 	var buf bytes.Buffer
 	if err := cmd.GenFishCompletion(&buf, true); err != nil {
-		return fmt.Errorf("failed to generate fish completion: %w", err)
+		return fmt.Errorf("fish completion generation error: %w; check that the command is initialized and retry: gh aw completion fish", err)
 	}
 
 	completionScript := buf.String()
 
 	// Determine installation path
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := gitutil.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
 	// Fish completion directory
 	completionDir := filepath.Join(homeDir, ".config", "fish", "completions")
 	// Use restrictive permissions (0750) following principle of least privilege
 	if err := os.MkdirAll(completionDir, constants.DirPermSensitive); err != nil {
-		return fmt.Errorf("failed to create completion directory: %w", err)
+		return fmt.Errorf("create completion directory %q error: %w; check that the home directory is writable, then retry", completionDir, err)
 	}
 
 	completionPath := filepath.Join(completionDir, "gh-aw.fish")
@@ -333,7 +343,7 @@ func installFishCompletion(verbose bool, cmd *cobra.Command) error {
 	// Write completion file
 	// Use restrictive permissions (0600) following principle of least privilege
 	if err := os.WriteFile(completionPath, []byte(completionScript), constants.FilePermSensitive); err != nil {
-		return fmt.Errorf("failed to write completion file: %w", err)
+		return fmt.Errorf("write completion file %q error: %w; check that the directory is writable, then retry", completionPath, err)
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Installed fish completion to: "+completionPath))
@@ -357,7 +367,7 @@ func installPowerShellCompletion(verbose bool, cmd *cobra.Command) error {
 	var profileBuf bytes.Buffer
 	profileCmd.Stdout = &profileBuf
 	if err := profileCmd.Run(); err != nil {
-		return fmt.Errorf("failed to get PowerShell profile path: %w", err)
+		return fmt.Errorf("PowerShell profile path lookup error: %w; ensure PowerShell is installed and available on PATH, then retry", err)
 	}
 
 	profilePath := strings.TrimSpace(profileBuf.String())
@@ -389,7 +399,7 @@ func UninstallShellCompletion(verbose bool) error {
 	shellCompletionLog.Printf("Detected shell type: %s", shellType)
 
 	if shellType == ShellUnknown {
-		return errors.New("could not detect shell type. Please uninstall completions manually")
+		return errors.New("could not detect shell type — expected SHELL, BASH_VERSION, ZSH_VERSION, or FISH_VERSION to identify the shell; uninstall completions manually for your shell")
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Detected shell: %s", shellType)))
@@ -404,7 +414,7 @@ func UninstallShellCompletion(verbose bool) error {
 	case ShellPowerShell:
 		return uninstallPowerShellCompletion(verbose)
 	default:
-		return fmt.Errorf("shell completion not supported for: %s", shellType)
+		return fmt.Errorf("shell completion not supported for %s — expected one of bash, zsh, fish, or powershell; choose a supported shell, for example: gh aw completion uninstall --shell bash", shellType)
 	}
 }
 
@@ -412,9 +422,9 @@ func UninstallShellCompletion(verbose bool) error {
 func uninstallBashCompletion(verbose bool) error {
 	shellCompletionLog.Print("Uninstalling bash completion")
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := gitutil.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
 	// Check all possible locations where completion might be installed
@@ -475,9 +485,9 @@ func uninstallBashCompletion(verbose bool) error {
 func uninstallZshCompletion(verbose bool) error {
 	shellCompletionLog.Print("Uninstalling zsh completion")
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := gitutil.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
 	// Check possible locations
@@ -490,7 +500,7 @@ func uninstallZshCompletion(verbose bool) error {
 	shellCompletionLog.Printf("Found completion file at: %s", completionPath)
 
 	if err := os.Remove(completionPath); err != nil {
-		return fmt.Errorf("failed to remove completion file: %w", err)
+		return fmt.Errorf("remove completion file %q error: %w; check that the file is writable, then retry", completionPath, err)
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Removed zsh completion from: "+completionPath))
@@ -503,9 +513,9 @@ func uninstallZshCompletion(verbose bool) error {
 func uninstallFishCompletion(verbose bool) error {
 	shellCompletionLog.Print("Uninstalling fish completion")
 
-	homeDir, err := os.UserHomeDir()
+	homeDir, err := gitutil.UserHomeDir()
 	if err != nil {
-		return fmt.Errorf("failed to get home directory: %w", err)
+		return err
 	}
 
 	completionPath := filepath.Join(homeDir, ".config", "fish", "completions", "gh-aw.fish")
@@ -517,7 +527,7 @@ func uninstallFishCompletion(verbose bool) error {
 	shellCompletionLog.Printf("Found completion file at: %s", completionPath)
 
 	if err := os.Remove(completionPath); err != nil {
-		return fmt.Errorf("failed to remove completion file: %w", err)
+		return fmt.Errorf("remove completion file %q error: %w; check that the file is writable, then retry", completionPath, err)
 	}
 
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Removed fish completion from: "+completionPath))
@@ -541,7 +551,7 @@ func uninstallPowerShellCompletion(verbose bool) error {
 	var profileBuf bytes.Buffer
 	profileCmd.Stdout = &profileBuf
 	if err := profileCmd.Run(); err != nil {
-		return fmt.Errorf("failed to get PowerShell profile path: %w", err)
+		return fmt.Errorf("PowerShell profile path lookup error: %w; ensure PowerShell is installed and available on PATH, then retry", err)
 	}
 
 	profilePath := strings.TrimSpace(profileBuf.String())

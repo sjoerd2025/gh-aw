@@ -53,6 +53,27 @@ describe("comment_limit_helpers", () => {
       expect(() => enforceCommentLimits(mentions)).toThrow(/E007.*mentions/i);
     });
 
+    it("should not count mentions inside inline markdown code", () => {
+      const mentionsInCode = Array.from({ length: MAX_MENTIONS + 2 }, (_, i) => `\`@user${i}\``).join(" ");
+      expect(() => enforceCommentLimits(mentionsInCode)).not.toThrow();
+    });
+
+    it("should not count mentions inside html code tags", () => {
+      const mentionsInCodeTags = Array.from({ length: MAX_MENTIONS + 2 }, (_, i) => `<code>@user${i}</code>`).join(" ");
+      expect(() => enforceCommentLimits(mentionsInCodeTags)).not.toThrow();
+    });
+
+    it("should still count live mentions outside code regions", () => {
+      const liveMentions = Array.from({ length: MAX_MENTIONS + 1 }, (_, i) => `@user${i}`).join(" ");
+      const body = `${liveMentions} \`@inert0\` <code>@inert1</code>`;
+      expect(() => enforceCommentLimits(body)).toThrow(/E007.*mentions/i);
+    });
+
+    it("should not count email addresses as mentions", () => {
+      const emails = Array.from({ length: MAX_MENTIONS + 1 }, (_, i) => `user${i}@example.com`).join(" ");
+      expect(() => enforceCommentLimits(emails)).not.toThrow();
+    });
+
     it("should accept comment with exactly maximum links", () => {
       const links = Array.from({ length: MAX_LINKS }, (_, i) => `https://example.com/${i}`).join(" ");
       expect(() => enforceCommentLimits(links)).not.toThrow();
@@ -68,6 +89,29 @@ describe("comment_limit_helpers", () => {
       const httpLinks = Array.from({ length: 21 }, (_, i) => `http://example.org/${i}`).join(" ");
       const mixed = `${httpsLinks} ${httpLinks}`;
       expect(() => enforceCommentLimits(mixed)).toThrow(/E008.*51.*links/i);
+    });
+
+    it("should enforce custom limits and count repeated URLs", () => {
+      const links = "https://example.com/screenshot ".repeat(75);
+      expect(() => enforceCommentLimits(links, { maxLinks: 75 })).not.toThrow();
+      expect(() => enforceCommentLimits(links, { maxLinks: 74 })).toThrow(/E008.*75.*maximum is 74/);
+      expect(() => enforceCommentLimits(links, { maxLinks: 10 })).toThrow(/E008.*maximum is 10/);
+    });
+
+    it.each(["[a](https://a.example)[b](https://b.example)", "[a](https://example.com)[b](https://example.com)", "https://a.examplehttp://b.example"])("should count adjacent URL occurrences in %s", body => {
+      expect(() => enforceCommentLimits(body, { maxLinks: 2 })).not.toThrow();
+      expect(() => enforceCommentLimits(body, { maxLinks: 1 })).toThrow(/E008.*2 links.*maximum is 1/);
+    });
+
+    it("should not count URL schemes without a non-whitespace suffix", () => {
+      expect(() => enforceCommentLimits("https:// http://\nhttps://", { maxLinks: 0 })).not.toThrow();
+    });
+
+    it("should exclude metadata links without exempting final length or mentions", () => {
+      const linkBody = "https://example.com/screenshot ".repeat(50);
+      expect(() => enforceCommentLimits(`${linkBody} https://example.com/footer`, { linkBody })).not.toThrow();
+      expect(() => enforceCommentLimits("a".repeat(MAX_COMMENT_LENGTH + 1), { linkBody })).toThrow(/E006/);
+      expect(() => enforceCommentLimits("@user ".repeat(11), { linkBody })).toThrow(/E007/);
     });
 
     it("should include actual values in error messages", () => {

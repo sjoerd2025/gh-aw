@@ -29,8 +29,8 @@ function getErrorMessage(error) {
   let message;
   if (error instanceof Error) {
     message = error.message;
-  } else if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
-    message = error.message;
+  } else if (error && typeof error === "object" && "message" in error) {
+    message = typeof error.message === "string" ? error.message : String(error.message);
   } else {
     message = String(error);
   }
@@ -80,4 +80,16 @@ function isRateLimitError(error) {
   return /\bapi rate limit\b|\brate limit exceeded\b/i.test(errorMessage);
 }
 
-module.exports = { getErrorMessage, isHtmlContent, isLockedError, isRateLimitError };
+/**
+ * Check for an Undici connection timeout by code or message.
+ * @param {unknown} error - The error value to check
+ * @returns {boolean} True if the error is a connection timeout
+ */
+function isConnectTimeoutError(error) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  return ("code" in error && error.code === "UND_ERR_CONNECT_TIMEOUT") || ("message" in error && error.message === "Connect Timeout Error");
+}
+
+module.exports = { getErrorMessage, isHtmlContent, isLockedError, isRateLimitError, isConnectTimeoutError };

@@ -321,6 +321,21 @@ describe("parse_claude_log.cjs", () => {
       expect(result.maxTurnsHit).toBe(false);
     });
 
+    it("should use canonical result accounting even when native metadata follows it", () => {
+      process.env.GH_AW_MAX_TURNS = "5";
+      const result = parseClaudeLog(
+        JSON.stringify([
+          { type: "result", num_turns: 5, total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 } },
+          { type: "claude.observation", id: "native-last", data: { details: false } },
+        ])
+      );
+      expect(result.maxTurnsHit).toBe(true);
+      expect(result.markdown).toContain("**Turns:** 5");
+      expect(result.markdown).toContain("**Total Cost:** $0.0000");
+      expect(result.logEntries.map(event => event.type)).toEqual(["session.result", "claude.observation"]);
+      expect(result.logEntries.at(-1).id).toBe("native-last");
+    });
+
     it("should render error messages from errors array", () => {
       const logWithErrors = JSON.stringify([
         { type: "system", subtype: "init", session_id: "test-errors", tools: ["Bash"], model: "claude-sonnet-4-20250514" },
@@ -380,11 +395,19 @@ describe("parse_claude_log.cjs", () => {
 
       const markdownCall = mockCore.summary.addRaw.mock.calls[0];
       expect(markdownCall[0]).toContain("```");
-      expect(markdownCall[0]).toContain("Conversation:");
+      expect(markdownCall[0]).toContain("<details><summary>Unified session</summary>");
+      expect(markdownCall[0]).toContain("<details><summary>Session overview</summary>");
+      expect(markdownCall[0]).toContain("### Conversation");
+      expect(markdownCall[0]).toContain("<details><summary>Full timeline</summary>");
+      expect(markdownCall[0]).toContain("session.init");
+      expect(markdownCall[0]).toContain("session.result");
       expect(markdownCall[0]).toContain("Statistics:");
+      expect(markdownCall[0]).toContain("Turns: 1");
+      expect(markdownCall[0]).toContain("Tokens: 75 total (50 in / 25 out)");
+      expect(markdownCall[0]).toContain("Cost: $0.0010");
       expect(mockCore.info).toHaveBeenCalled();
 
-      const infoCall = mockCore.info.mock.calls.find(call => call[0].includes("=== Claude Execution Summary ==="));
+      const infoCall = mockCore.info.mock.calls.find(call => call[0].includes("Records: 2 (agent=2)"));
       expect(infoCall).toBeDefined();
       expect(infoCall[0]).toContain("Model: claude-sonnet-4-20250514");
     });

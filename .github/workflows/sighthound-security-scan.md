@@ -10,6 +10,13 @@ permissions:
   contents: read
   issues: read
   actions: read
+  copilot-requests: write
+engine:
+  id: codex
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 strict: true
 if: needs.sighthound_scan.outputs.actionable_findings_detected == 'true'
 jobs:
@@ -123,7 +130,7 @@ jobs:
           echo "value=sighthound-results-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
 
       - name: Upload Sighthound results artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ steps.artifact_name.outputs.value }}
           path: /tmp/gh-aw/agent/sighthound
@@ -132,11 +139,21 @@ jobs:
 
 steps:
   - name: Download Sighthound artifact
-    uses: actions/download-artifact@v8.0.1
+    uses: actions/download-artifact@v8.0.2
     with:
       name: ${{ needs.sighthound_scan.outputs.artifact_name }}
       path: /tmp/gh-aw/agent/sighthound
 
+tools:
+  bash: false
+  cli-proxy: false
+mcp-scripts:
+  read-sighthound-findings:
+    description: Read the pre-filtered actionable Sighthound findings.
+    run: cat /tmp/gh-aw/agent/sighthound/actionable.json
+  read-sighthound-summary:
+    description: Read the Sighthound scan summary.
+    run: cat /tmp/gh-aw/agent/sighthound/summary.md
 safe-outputs:
   create-issue:
     max: 1
@@ -144,6 +161,8 @@ safe-outputs:
     close-older-issues: true
     title-prefix: "[sighthound] "
   noop:
+imports:
+  - shared/reporting.md
 ---
 
 # Sighthound Security Scan Triage
@@ -154,7 +173,7 @@ The `sighthound_scan` job ran Sighthound and pre-filtered findings. Read the fil
 
 ## Task
 
-1. Read `/tmp/gh-aw/agent/sighthound/actionable.json` and `/tmp/gh-aw/agent/sighthound/summary.md`.
+1. Call `mcp__mcpscripts__read-sighthound-findings` and `mcp__mcpscripts__read-sighthound-summary` to read the scan inputs. GitHub-backed Codex has no shell tool; use these file-specific MCP tools instead.
 2. Select up to 5 findings with the highest severity from `actionable.json`. If there are no findings, call `noop`.
 3. Call `create_issue` with:
    - title: `Security findings in ${{ github.repository }}`

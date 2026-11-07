@@ -20,6 +20,14 @@ func isBuiltinJobName(jobName string) bool {
 // The bulk of the construction is delegated to focused helpers in compiler_main_job_helpers.go.
 func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (*Job, error) {
 	workflowLog.Printf("Building main job for workflow: %s", data.Name)
+	hasDependencyCaches := false
+	if data.Cache != "" {
+		caches, err := parseCacheStepConfigs(data.Cache)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse cache configuration: %w", err)
+		}
+		hasDependencyCaches = len(caches) > 0
+	}
 	var steps []string
 
 	setupActionRef := c.resolveActionReference("./actions/setup", data)
@@ -28,7 +36,7 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		steps = append(steps, c.generateCheckoutActionsFolder(data)...)
 		agentTraceID := fmt.Sprintf("${{ needs.%s.outputs.setup-trace-id }}", constants.ActivationJobName)
 		agentParentSpanID := setupParentSpanNeedsExpr(constants.ActivationJobName)
-		steps = append(steps, c.generateSetupStep(data, setupActionRef, SetupActionDestination, false, agentTraceID, agentParentSpanID)...)
+		steps = append(steps, c.generateSetupStepForJob("agent", data, setupActionRef, SetupActionDestination, false, agentTraceID, agentParentSpanID, "")...)
 	}
 	// Set runtime paths that depend on RUNNER_TEMP via $GITHUB_ENV.
 	// These cannot be set in job-level env: because the runner context is not
@@ -37,8 +45,9 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		compilerMainJobLog.Print("Adding runtime-paths step for safe-outputs")
 		steps = append(steps, c.generateSetRuntimePathsStep()...)
 	}
-
 	jobCondition := c.buildMainJobCondition(data, activationJobCreated)
+	depends, engineEnvContent := c.buildMainJobDependencies(data, activationJobCreated)
+	c.warnBuiltinJobEnvReferences(depends, engineEnvContent)
 
 	// Build agent step content (checkout app tokens minted here to avoid masked-value drops).
 	var stepBuilder strings.Builder
@@ -48,9 +57,6 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 	if stepsContent := stepBuilder.String(); stepsContent != "" {
 		steps = append(steps, stepsContent)
 	}
-
-	depends, engineEnvContent := c.buildMainJobDependencies(data, activationJobCreated)
-	c.warnBuiltinJobEnvReferences(depends, engineEnvContent)
 
 	outputs := c.buildMainJobOutputs(data)
 	env := c.buildMainJobEnv(data)
@@ -65,19 +71,29 @@ func (c *Compiler) buildMainJob(data *WorkflowData, activationJobCreated bool) (
 		steps = append(steps, c.generateScriptModeCleanupStep())
 	}
 
+	cacheMode := ""
+	if !data.GHES && (data.DryRun || (IsDetectionJobEnabled(data.SafeOutputs) && !hasDependencyCaches)) {
+		// Restore-only actions alone do not restrict the job's scoped cache token.
+		// Dependency caches use the runner's trigger-scoped default instead:
+		// trusted events can save, while low-trust events retain read-only access.
+		cacheMode = "read"
+	}
+
 	compilerMainJobLog.Printf("Built main job: steps=%d, needs=%v, outputs=%d", len(steps), depends, len(outputs))
 	return &Job{
-		Name:        string(constants.AgentJobName),
-		If:          jobCondition,
-		RunsOn:      c.indentYAMLLines(data.RunsOn, "    "),
-		Environment: c.indentYAMLLines(data.Environment, "    "),
-		Container:   c.indentYAMLLines(data.Container, "    "),
-		Services:    c.indentYAMLLines(data.Services, "    "),
-		Permissions: c.indentYAMLLines(permissions, "    "),
-		Concurrency: c.indentYAMLLines(agentConcurrency, "    "),
-		Env:         env,
-		Steps:       steps,
-		Needs:       depends,
-		Outputs:     outputs,
+		Name:                     string(constants.AgentJobName),
+		If:                       jobCondition,
+		RunsOn:                   c.indentYAMLLines(data.RunsOn, "    "),
+		Environment:              c.indentYAMLLines(data.Environment, "    "),
+		Container:                c.indentYAMLLines(data.Container, "    "),
+		Services:                 c.indentYAMLLines(data.Services, "    "),
+		Permissions:              c.indentYAMLLines(permissions, "    "),
+		CacheMode:                cacheMode,
+		Concurrency:              c.indentYAMLLines(agentConcurrency, "    "),
+		Env:                      env,
+		Steps:                    steps,
+		Needs:                    depends,
+		Outputs:                  outputs,
+		TimeoutMinutesExpression: resolveAgentJobTimeoutValue(data),
 	}, nil
 }

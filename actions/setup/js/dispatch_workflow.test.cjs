@@ -1,6 +1,20 @@
 // @ts-check
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { main } from "./dispatch_workflow.cjs";
+import { dispatchWorkflow } from "./dispatch_workflow_transport.cjs";
+import { extractCreatedItemFromResult } from "./safe_output_manifest.cjs";
+import { withClaimExecution } from "./work_queue_claim_scope.cjs";
+import { queueFixture } from "./work_queue_lifecycle.test_helpers.cjs";
+import { fakeGitHub } from "./work_queue_store_checks.cjs";
+import { replayTransactions } from "./work_queue_replay.cjs";
+import { main as writeSnapshot } from "./write_work_queue_snapshot.cjs";
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+
+const { registerQueueLedgerClient } = createRequire(import.meta.url)("./work_queue_git_transport.cjs");
+
+const temporaryDirectory = prefix => fs.mkdtempSync(path.join(fs.realpathSync(process.cwd()), `.gh-aw-${prefix}-`));
 
 // Mock dependencies
 global.core = {
@@ -34,10 +48,34 @@ global.github = {
         },
       }),
     },
+    pulls: {
+      get: vi.fn(),
+    },
   },
 };
 
 describe("dispatch_workflow handler factory", () => {
+  it("uses the shared transport with queue retries disabled and privacy-preserving diagnostics", async () => {
+    const secret = "private-assignment-token-and-response";
+    const error = { status: 422, response: { data: { message: `Unexpected inputs provided: ${secret} return_run_details` }, headers: { authorization: secret } } };
+    const post = vi.fn().mockRejectedValue(error);
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      await expect(
+        dispatchWorkflow({ rest: { actions: { createWorkflowDispatch: post } } }, { ref: "refs/tags/pinned", inputs: { work_queue_assignment: secret }, return_run_details: true, headers: { authorization: secret } })
+      ).rejects.toBe(error);
+      expect(post).toHaveBeenCalledTimes(1);
+      const output = stderr.mock.calls.map(call => call[0]).join("");
+      expect(output).toContain("input_count=1");
+      expect(output).toContain("http_status=422");
+      expect(output).toContain("unexpected_inputs=true");
+      expect(output).not.toContain(secret);
+      expect(output).not.toContain("pinned");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.GITHUB_REF = "refs/heads/main";
@@ -45,6 +83,226 @@ describe("dispatch_workflow handler factory", () => {
     // Reset shared context to a known baseline so tests are order-independent
     global.context.ref = "refs/heads/main";
     global.context.payload = { repository: { default_branch: "main" } };
+    delete global.getOctokit;
+  });
+
+  it("validates the protected selected client on the direct native route before one durable START and POST", async () => {
+    const previousGithub = global.github;
+    const previousContext = global.context;
+    for (const kind of ["github_token", "github_app", "authenticated"]) {
+      for (const mode of ["approved", "rejected", "wrong-principal", "wrong-client", "missing-binding"]) {
+        if (kind === "authenticated" && mode === "wrong-client") continue;
+        const root = temporaryDirectory("direct-dispatch-credential");
+        const fixture = queueFixture({ granted: false, count: 1, workerPrincipal: "22" });
+        const native = fakeGitHub(fixture.transactions);
+        let identities = 0;
+        let posts = 0;
+        const publisher = {
+          rest: {
+            git: native.githubClient.rest.git,
+            repos: { ...native.githubClient.rest.repos, ...fixture.githubClient.rest.repos },
+            actions: {
+              ...native.githubClient.rest.actions,
+              ...fixture.githubClient.rest.actions,
+              createWorkflowDispatch: async () => {
+                throw new Error("The separate publisher client must never POST");
+              },
+            },
+          },
+        };
+        registerQueueLedgerClient(publisher, publisher);
+        const login = kind === "github_token" ? "github-actions[bot]" : kind === "github_app" ? "approved-worker[bot]" : "approved-pat-owner";
+        const identity = async () => {
+          identities++;
+          return { status: 200, data: { id: mode === "wrong-principal" ? "11" : "22", login, type: kind === "authenticated" ? "User" : "Bot" } };
+        };
+        const dispatchClient = {
+          auth: async () => ({ type: "token", token: mode === "wrong-client" ? "different-token" : "protected-selected-token" }),
+          rest: {
+            git: fixture.githubClient.rest.git,
+            repos: publisher.rest.repos,
+            users: { getByUsername: identity, getAuthenticated: identity },
+            actions: {
+              createWorkflowDispatch: async () => {
+                posts++;
+                expect(identities).toBe(1);
+                const state = replayTransactions(native.log());
+                const dispatch = [...state.dispatches.values()][0];
+                expect(dispatch.state).toBe("started");
+                expect(dispatch.sender.run_attempt).toBe(2);
+                expect(dispatch.sender.principal).toBe("11");
+                expect(native.log().find(commit => commit.request.kind === "dispatch_next").actor.run_attempt).toBe(1);
+                if (mode === "rejected") throw { status: 422, response: { status: 422, headers: { "x-github-request-id": "provider-rejection" } } };
+                return { status: 200, data: { workflow_run_id: "42", run_url: "https://api.github.com/repos/owner/repo/actions/runs/42", html_url: "https://github.com/owner/repo/actions/runs/42" } };
+              },
+              getWorkflowRun: async () => {
+                throw new Error("Launch verification must read immutable attempt 1, not the latest run");
+              },
+              getWorkflowRunAttempt: async parameters => {
+                expect(parameters).toMatchObject({ owner: "owner", repo: "repo", run_id: "42", attempt_number: 1 });
+                const dispatch = [...replayTransactions(native.log()).dispatches.values()][0];
+                return { status: 200, data: { ...fixture.nativeRun(), display_title: `gh-aw work-queue ${dispatch.dispatch_id}` } };
+              },
+            },
+          },
+        };
+        try {
+          const snapshotPath = path.join(root, "snapshot.json");
+          const origin = await writeSnapshot({
+            githubClient: publisher,
+            context: fixture.dispatcherContext,
+            workflowRef: `owner/repo/.github/workflows/dispatcher.lock.yml@${"a".repeat(40)}`,
+            snapshotPath,
+            role: "dispatcher",
+            core: global.core,
+          });
+          fixture.dispatcherContext.runAttempt = 2;
+          global.github = publisher;
+          global.context = fixture.dispatcherContext;
+          global.getOctokit = () => dispatchClient;
+          vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+          vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "dispatcher");
+          vi.stubEnv("GH_AW_WORK_QUEUE_SNAPSHOT", snapshotPath);
+          vi.stubEnv("GH_AW_WORK_QUEUE_INTENT_ORIGIN", JSON.stringify(origin.origin));
+          vi.stubEnv("GITHUB_WORKFLOW_REF", `owner/repo/.github/workflows/dispatcher.lock.yml@${"a".repeat(40)}`);
+          const config = {
+            work_queue_enabled: true,
+            work_queue_workflows: ["worker"],
+            aw_context_workflows: ["worker"],
+            "github-token": "protected-selected-token",
+            ...(mode === "missing-binding" ? {} : { work_queue_dispatch_credential: { kind, ...(kind === "github_app" ? { app_slug: "approved-worker" } : {}) } }),
+          };
+          const message = { type: "work_queue_dispatch_next", intent_id: "direct-credential", pool: "default", max_claims: 1, max_dispatches: 1 };
+          const handler = await main(config);
+          const result = await handler(message, {});
+          if (mode === "rejected") {
+            expect(result.success).toBe(false);
+            expect(posts).toBe(1);
+            expect([...replayTransactions(native.log()).dispatches.values()][0]).toMatchObject({ state: "rejected", released: true });
+            expect([...replayTransactions(native.log()).claims.values()][0].state).toBe("cancelled");
+            expect((await handler(message, {})).success).toBe(false);
+            expect(posts).toBe(1);
+          } else if (mode === "approved") {
+            expect(result.success, JSON.stringify(result)).toBe(true);
+            expect(posts).toBe(1);
+            const dispatch = [...replayTransactions(native.log()).dispatches.values()][0];
+            expect(dispatch.state).toBe("bound");
+            expect(dispatch.run.principal).toBe("22");
+            const retry = await main(config);
+            await retry(message, {});
+            expect(posts).toBe(1);
+            expect(
+              native
+                .log()
+                .flatMap(commit => commit.operations)
+                .filter(operation => operation.kind === "Dispatch" && operation.state === "started")
+            ).toHaveLength(1);
+          } else {
+            expect(posts).toBe(0);
+            expect(
+              native
+                .log()
+                .flatMap(commit => commit.operations)
+                .some(operation => operation.kind === "Dispatch" && operation.state === "started")
+            ).toBe(false);
+            if (mode !== "wrong-principal") expect(identities).toBe(0);
+          }
+        } finally {
+          vi.unstubAllEnvs();
+          global.github = previousGithub;
+          global.context = previousContext;
+          delete global.getOctokit;
+          fs.rmSync(root, { recursive: true, force: true });
+        }
+      }
+    }
+  });
+
+  it("rejects agent-selected Work and forged assignments before any POST", async () => {
+    const handler = await main({ workflows: ["worker"], workflow_files: { worker: ".lock.yml" }, work_queue_enabled: true, work_queue_workflows: ["worker"] });
+    for (const key of ["work_queue", "work_claim", "work_queue_claim", "work_queue_assignment"]) {
+      expect((await handler({ workflow_name: "worker", inputs: { [key]: { work_id: "chosen" } } }, {})).success).toBe(false);
+    }
+    expect(global.github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects every assignment alias on protected observer dispatches before any POST", async () => {
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+    vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "observer");
+    const handler = await main({ workflows: ["ordinary"], workflow_files: { ordinary: ".lock.yml" } });
+    try {
+      for (const key of ["work_queue", "work_claim", "work_queue_claim", "work_queue_assignment"]) {
+        const result = await handler({ workflow_name: "ordinary", inputs: { [key]: {} } }, {});
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(/Agent-supplied queue assignments/);
+      }
+      expect(global.github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("retains main's disabled input conversion and reserved keys despite stray queue context", async () => {
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "false");
+    vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "worker");
+    global.context.payload.inputs = { work_queue_assignment: null };
+    try {
+      const handler = await main({ workflows: ["ordinary"], workflow_files: { ordinary: ".lock.yml" } });
+      const result = await handler({ workflow_name: "ordinary", inputs: { work_claim: { note: "ordinary input" }, work_queue_assignment: "ordinary input", work_queue_claim: "ignored reserved input", count: 2, flag: false } }, {});
+      expect(result.success).toBe(true);
+      expect(global.github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          inputs: { work_claim: '{"note":"ordinary input"}', work_queue_assignment: "ordinary input", count: "2", flag: "false" },
+        })
+      );
+      const denied = await main({ workflows: ["ordinary"] });
+      expect((await denied({ workflow_name: "ordinary", inputs: { work_queue: {} } }, {})).error).toMatch(/Work queue dispatch requires/);
+      expect(global.github.rest.actions.createWorkflowDispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("requires an immutable scheduler assignment even for ordinary/staged calls to a queue worker", async () => {
+    for (const staged of [false, true]) {
+      const handler = await main({ workflows: ["worker"], workflow_files: { worker: ".lock.yml" }, work_queue_enabled: true, work_queue_workflows: ["worker"], staged });
+      expect((await handler({ workflow_name: "worker", inputs: { task: "unassigned" } }, {})).success).toBe(false);
+    }
+    expect(global.github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("rejects ordinary allowed targets in queue mode and scoped execution even without a serialized queue flag", async () => {
+    const message = { type: "dispatch_workflow", workflow_name: "ordinary", inputs: { task: "delegate" } };
+    for (const staged of [false, true]) {
+      const handler = await main({ workflows: ["ordinary"], work_queue_enabled: true, staged });
+      expect((await handler(message, {})).success).toBe(false);
+    }
+    const fixture = queueFixture({ count: 1, bound: true });
+    const scoped = await main({ workflows: ["ordinary"] });
+    expect((await withClaimExecution({ assignment: fixture.assignment, claim_handle: "h1" }, () => scoped(message, {}))).success).toBe(false);
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+    try {
+      expect((await scoped(message, {})).success).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(global.github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("preserves explicitly configured ordinary observer outputs without granting queue controls or assignment downgrade", async () => {
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", "true");
+    vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "observer");
+    try {
+      const handler = await main({ workflows: ["ordinary"], workflow_files: { ordinary: ".lock.yml" }, work_queue_enabled: true, max: 3 });
+      const result = await handler({ type: "dispatch_workflow", workflow_name: "ordinary", inputs: {} }, {});
+      expect(result.success, result.error).toBe(true);
+      expect((await handler({ type: "dispatch_workflow", workflow_name: "unapproved", inputs: {} }, {})).success).toBe(false);
+      global.context.payload.inputs = { work_queue_assignment: null };
+      await expect(handler({ type: "dispatch_workflow", workflow_name: "ordinary", inputs: {} }, {})).rejects.toThrow();
+      expect(global.github.rest.actions.createWorkflowDispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("should create a handler function", async () => {
@@ -76,6 +334,7 @@ describe("dispatch_workflow handler factory", () => {
 
     expect(result.success).toBe(true);
     expect(result.workflow_name).toBe("test-workflow");
+    expect(result.repo).toBe("test-owner/test-repo");
     expect(result.run_id).toBe(123456);
     // Should use the extension from config
     expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith({
@@ -454,6 +713,262 @@ describe("dispatch_workflow handler factory", () => {
     });
   });
 
+  it("should prioritize message ref over configured and environment refs", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    process.env.GITHUB_HEAD_REF = "pr-branch";
+
+    const config = {
+      "target-ref": "refs/heads/config-branch",
+      allowed_refs: ["refs/heads/agent-*"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+      aw_context_workflows: ["test-workflow"],
+    };
+    const handler = await main(config);
+
+    await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "test-workflow",
+        ref: "agent-branch",
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      workflow_id: "test-workflow.lock.yml",
+      ref: "refs/heads/agent-branch",
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
+      return_run_details: true,
+    });
+  });
+
+  it("should use message ref as-is when it is already a full ref", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    delete process.env.GITHUB_HEAD_REF;
+
+    const config = {
+      allowed_refs: ["refs/tags/*"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+      aw_context_workflows: ["test-workflow"],
+    };
+    const handler = await main(config);
+
+    await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "test-workflow",
+        ref: "refs/tags/v1.2.3",
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      workflow_id: "test-workflow.lock.yml",
+      ref: "refs/tags/v1.2.3",
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
+      return_run_details: true,
+    });
+  });
+
+  it("should expand tags/ prefix in message ref to refs/tags/", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    delete process.env.GITHUB_HEAD_REF;
+
+    const config = {
+      allowed_refs: ["tags/v*"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+      aw_context_workflows: ["test-workflow"],
+    };
+    const handler = await main(config);
+
+    await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "test-workflow",
+        ref: "tags/v1.2.3",
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      workflow_id: "test-workflow.lock.yml",
+      ref: "refs/tags/v1.2.3",
+      inputs: expect.objectContaining({ aw_context: expect.any(String) }),
+      return_run_details: true,
+    });
+  });
+
+  it("should reject message ref when allowed-refs is not configured", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    delete process.env.GITHUB_HEAD_REF;
+
+    const config = {
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+      aw_context_workflows: ["test-workflow"],
+    };
+    const handler = await main(config);
+
+    const result = await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "test-workflow",
+        ref: "agent-branch",
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "message.ref is not allowed unless 'allowed-refs' is configured in safe-outputs.dispatch-workflow",
+    });
+    expect(github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("should reject message ref when it does not match allowed-refs", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    delete process.env.GITHUB_HEAD_REF;
+
+    const config = {
+      allowed_refs: ["release/*"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+      aw_context_workflows: ["test-workflow"],
+    };
+    const handler = await main(config);
+
+    const result = await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "test-workflow",
+        ref: "feature/new-ui",
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "Ref 'refs/heads/feature/new-ui' is not in allowed-refs: refs/heads/release/*",
+    });
+    expect(github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("should reject message ref when allowed-refs is an empty array", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    delete process.env.GITHUB_HEAD_REF;
+
+    const config = {
+      allowed_refs: [],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+    };
+    const handler = await main(config);
+
+    const result = await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "test-workflow",
+        ref: "some-branch",
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "message.ref is not allowed unless 'allowed-refs' is configured in safe-outputs.dispatch-workflow",
+    });
+    expect(github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("should warn and fall back to default ref when message.ref is a non-string", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    delete process.env.GITHUB_HEAD_REF;
+
+    const config = {
+      allowed_refs: ["refs/heads/*"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+    };
+    const handler = await main(config);
+
+    const result = await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "test-workflow",
+        ref: 42,
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(result.success).toBe(true);
+    expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("non-string"));
+    expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ref: "refs/heads/main",
+      })
+    );
+  });
+
+  it("should reject bare branch name when allowed-refs only permits tags", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    delete process.env.GITHUB_HEAD_REF;
+
+    const config = {
+      allowed_refs: ["refs/tags/*"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+    };
+    const handler = await main(config);
+
+    const result = await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "test-workflow",
+        ref: "main",
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "Ref 'refs/heads/main' is not in allowed-refs: refs/tags/*",
+    });
+    expect(github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
   it("should handle PR context with slashes in branch names", async () => {
     process.env.GITHUB_REF = "refs/pull/456/merge";
     process.env.GITHUB_HEAD_REF = "feature/add-new-feature";
@@ -484,6 +999,147 @@ describe("dispatch_workflow handler factory", () => {
       inputs: expect.objectContaining({ aw_context: expect.any(String) }),
       return_run_details: true,
     });
+  });
+
+  it("should resolve an omitted ref to the PR head for issue_comment events", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    global.context.eventName = "issue_comment";
+    global.context.payload.issue = {
+      number: 456,
+      pull_request: {
+        url: "https://api.github.com/repos/test-owner/test-repo/pulls/456",
+      },
+    };
+    github.rest.pulls.get.mockResolvedValueOnce({
+      data: {
+        head: {
+          ref: "feature/add-new-feature",
+        },
+      },
+    });
+
+    const handler = await main({
+      allowed_refs: ["**"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+    });
+
+    const result = await handler({ type: "dispatch_workflow", workflow_name: "test-workflow", inputs: {} }, {});
+
+    expect(result.success).toBe(true);
+    expect(github.rest.pulls.get).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      pull_number: 456,
+    });
+    expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ref: "refs/heads/feature/add-new-feature",
+      })
+    );
+  });
+
+  it("should apply allowed-refs to an omitted ref resolved from a PR issue_comment", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    global.context.eventName = "issue_comment";
+    global.context.payload.issue = {
+      number: 456,
+      pull_request: {
+        url: "https://api.github.com/repos/test-owner/test-repo/pulls/456",
+      },
+    };
+    github.rest.pulls.get.mockResolvedValueOnce({
+      data: {
+        head: {
+          ref: "feature/add-new-feature",
+        },
+      },
+    });
+
+    const handler = await main({
+      allowed_refs: ["release/*"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+    });
+
+    const result = await handler({ type: "dispatch_workflow", workflow_name: "test-workflow", inputs: {} }, {});
+
+    expect(result).toEqual({
+      success: false,
+      error: "Ref 'refs/heads/feature/add-new-feature' is not in allowed-refs: refs/heads/release/*",
+    });
+    expect(github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("should fail the dispatch when the PR head ref is missing", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    global.context.eventName = "issue_comment";
+    global.context.payload.issue = {
+      number: 456,
+      pull_request: {
+        url: "https://api.github.com/repos/test-owner/test-repo/pulls/456",
+      },
+    };
+    github.rest.pulls.get.mockResolvedValueOnce({ data: { head: {} } });
+
+    const handler = await main({
+      allowed_refs: ["**"],
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+    });
+
+    const result = await handler({ type: "dispatch_workflow", workflow_name: "test-workflow", inputs: {} }, {});
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Unable to resolve head ref for pull request #456");
+    expect(github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
+  it("should retry ref resolution after a failed pull request lookup", async () => {
+    process.env.GITHUB_REF = "refs/heads/main";
+    global.context.eventName = "issue_comment";
+    global.context.payload.issue = {
+      number: 456,
+      pull_request: {
+        url: "https://api.github.com/repos/test-owner/test-repo/pulls/456",
+      },
+    };
+    github.rest.pulls.get.mockRejectedValueOnce(new Error("API unavailable")).mockResolvedValueOnce({
+      data: {
+        head: {
+          ref: "feature/add-new-feature",
+        },
+      },
+    });
+
+    const handler = await main({
+      allowed_refs: ["**"],
+      max: 2,
+      workflows: ["test-workflow"],
+      workflow_files: {
+        "test-workflow": ".lock.yml",
+      },
+    });
+
+    const message = { type: "dispatch_workflow", workflow_name: "test-workflow", inputs: {} };
+    const firstResult = await handler(message, {});
+    expect(firstResult.success).toBe(false);
+    expect(firstResult.error).toContain("API unavailable");
+
+    const secondResult = await handler(message, {});
+    expect(secondResult.success).toBe(true);
+    expect(github.rest.pulls.get).toHaveBeenCalledTimes(2);
+    expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ref: "refs/heads/feature/add-new-feature",
+      })
+    );
   });
 
   it("should use repository default branch when no GITHUB_REF is set", async () => {
@@ -595,6 +1251,7 @@ describe("dispatch_workflow handler factory", () => {
     const result = await handler({ type: "dispatch_workflow", workflow_name: "test-workflow", inputs: {} }, {});
 
     expect(result.success).toBe(true);
+    expect(result.repo).toBe("test-owner/test-repo");
     expect(result.run_id).toBeUndefined();
   });
 
@@ -676,6 +1333,12 @@ describe("dispatch_workflow handler factory", () => {
     const result = await handler({ type: "dispatch_workflow", workflow_name: "platform-worker", inputs: {} }, {});
 
     expect(result.success).toBe(true);
+    expect(result.repo).toBe("platform-org/platform-repo");
+    expect(extractCreatedItemFromResult("dispatch_workflow", result)).toMatchObject({
+      repo: "platform-org/platform-repo",
+      target: { provider: "github", repository: "platform-org/platform-repo" },
+      metadata: { run_id: 123456 },
+    });
     // Must dispatch to the configured target-repo, NOT context.repo
     expect(github.rest.actions.createWorkflowDispatch).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -764,6 +1427,7 @@ describe("dispatch_workflow handler factory", () => {
     const result = await handler({ type: "dispatch_workflow", workflow_name: "test-workflow", inputs: {} }, {});
 
     expect(result.success).toBe(true);
+    expect(result.repo).toBe("test-owner/test-repo");
     // Must emit a warning about the invalid slug including the bad value and the fallback
     expect(core.warning).toHaveBeenCalledWith(expect.stringMatching(/Invalid 'target-repo' configuration value 'not-a-valid-slug'.*falling back.*test-owner\/test-repo/));
     // Must fall back to context.repo
@@ -799,6 +1463,34 @@ describe("dispatch_workflow handler factory", () => {
         ref: "refs/heads/feature-branch",
       })
     );
+  });
+
+  it("should apply allowed-refs to an explicit ref when target-ref is configured", async () => {
+    const config = {
+      "target-repo": "other-org/other-repo",
+      allowed_repos: ["other-org/other-repo"],
+      allowed_refs: ["release/*"],
+      "target-ref": "refs/heads/feature-branch",
+      workflows: ["target-workflow"],
+      workflow_files: { "target-workflow": ".lock.yml" },
+    };
+    const handler = await main(config);
+
+    const result = await handler(
+      {
+        type: "dispatch_workflow",
+        workflow_name: "target-workflow",
+        ref: "untrusted-branch",
+        inputs: {},
+      },
+      {}
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "Ref 'refs/heads/untrusted-branch' is not in allowed-refs: refs/heads/release/*",
+    });
+    expect(github.rest.actions.createWorkflowDispatch).not.toHaveBeenCalled();
   });
 
   it("should use caller GITHUB_REF when dispatching to same repo without target-ref", async () => {

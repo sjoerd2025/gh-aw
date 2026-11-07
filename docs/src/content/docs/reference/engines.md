@@ -1,556 +1,328 @@
 ---
-title: AI Engines (aka Coding Agents)
-description: Complete guide to AI engines (coding agents) usable with GitHub Agentic Workflows, including Copilot, Claude, Codex, Gemini, OpenCode, and Pi with their specific configuration options.
+title: AI Engines
+description: Select an AI engine, compare supported features, and configure shared engine options.
 sidebar:
   order: 600
 ---
 
-GitHub Agentic Workflows use [AI Engines](/gh-aw/reference/glossary/#engine) (normally a coding agent) to interpret and execute natural language instructions.
+An engine runs a workflow's Markdown instructions with its configured tools, sandbox, and safe outputs. This page covers selection and shared configuration. Use the individual references for engine-specific settings.
 
-## Available Coding Agents
+<span id="which-engine-should-i-choose"></span>
 
-Set `engine:` in your workflow frontmatter and configure the corresponding secret:
+## Built-in AI engines
 
-| Engine | `engine:` value | Required Secret |
-|--------|-----------------|-----------------|
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli) (default) | `copilot` | [`copilot-requests: write`](/gh-aw/reference/auth/#copilot-requests-write-permission) (recommended) or [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token) |
-| [Claude by Anthropic (Claude Code)](https://www.anthropic.com/index/claude) | `claude` | [`ANTHROPIC_API_KEY`](/gh-aw/reference/auth/#anthropic_api_key) (standard) or [`engine.auth` Anthropic WIF](/gh-aw/reference/auth/#anthropic-workload-identity-federation-wif) (keyless) |
-| [OpenAI Codex](https://openai.com/blog/openai-codex) | `codex` | [OPENAI_API_KEY](/gh-aw/reference/auth/#openai_api_key) |
-| [Google Gemini CLI](https://github.com/google-gemini/gemini-cli) | `gemini` | [`GEMINI_API_KEY`](/gh-aw/reference/auth/#gemini_api_key) (standard) or [`engine.auth` Google WIF](/gh-aw/reference/auth/#google-workload-identity-federation-wif) (keyless) |
-| [OpenCode](https://opencode.ai) (experimental) | `opencode` | [COPILOT_GITHUB_TOKEN](/gh-aw/reference/auth/#copilot_github_token) |
-| [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) (experimental) | `pi` | [COPILOT_GITHUB_TOKEN](/gh-aw/reference/auth/#copilot_github_token) (default); switches to provider-specific secret when `model:` uses `provider/model` format |
+| Engine | Selection | Get started | Technical reference |
+| --- | --- | --- | --- |
+| GitHub Copilot (default) | `engine: copilot` or omit `engine` | [Copilot setup](/gh-aw/engines/copilot/) | [Copilot reference](/gh-aw/reference/engines/copilot/) |
+| Claude Code | `engine: claude` | [Claude setup](/gh-aw/engines/claude/) | [Claude reference](/gh-aw/reference/engines/claude/) |
+| OpenAI Codex | `engine: codex` | [Codex setup](/gh-aw/engines/codex/) | [Codex reference](/gh-aw/reference/engines/codex/) |
+| Gemini CLI (deprecated) | `engine: gemini` | [Gemini setup](/gh-aw/engines/gemini/) | [Gemini reference](/gh-aw/reference/engines/gemini/) |
+| Pi | `engine: pi` | [Pi setup](/gh-aw/engines/pi/) | [Pi reference](/gh-aw/reference/engines/pi/) |
+| Agy (experimental) | `engine: agy` | [Agy setup](/gh-aw/engines/agy/) | [Agy reference](/gh-aw/reference/engines/agy/) |
 
-Copilot CLI is the default — `engine:` can be omitted when using Copilot. See the linked authentication docs for secret setup instructions.
+For imported engine definitions and third-party samples, see [Custom AI engines](/gh-aw/reference/third-party-agent/). Switching engines may require different credentials, models, tools, and network rules.
 
-## Which engine should I choose?
+## Data handling before setup
 
-Choose the engine that best matches your needs and existing AI account: Copilot supports the broadest gh-aw feature set, including custom agents and autopilot-style continuations; Claude offers stronger control over turn limits (`max-turns`) for long reasoning sessions; and Gemini or Codex fit well when those models are already part of existing tooling or budget decisions. You can switch later by changing only `engine:` and the corresponding secret.
+The engine, inference provider, and enabled tools determine where repository context is processed. Review provider terms, retention, accessible repository content, outbound destinations, and artifact access before enabling a workflow. Credentials and identity mechanisms are documented in [Authentication](/gh-aw/reference/auth/).
 
 ## Engine Feature Comparison
 
-Not all features are available across all engines. The table below summarizes per-engine support for commonly used workflow options:
+| Feature | Copilot | Claude | Codex | Gemini | Pi | Agy |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Top-level `max-turns` | Yes | Yes | Yes | Yes | Yes | No |
+| `max-continuations` | Yes | No | No | No | No | No |
+| `tools.web-fetch` | SDK only | Yes | Yes | Yes | Yes | Cannot disable |
+| Native `tools.web-search` | No | Yes | Yes | No | No | Cannot disable |
+| Native `engine.agent` selection | Yes | No | No | No | No | No |
+| `engine.api-target` | Yes | Yes | Yes | Yes | Yes | No |
+| `engine.bare` | Yes | Yes | No | No | Yes | No |
+| Custom `engine.harness` | Yes | Yes | Yes | No | No | No |
+| Per-command bash allowlist | Yes | Yes | No | Yes | Yes | No |
+| Native MCP | Yes | Yes | Yes | Yes | Yes | Production-conformance gated |
+| Agent Plugins (`plugins`) | Yes | Yes | Yes | No | No | No |
+| Artifact-backed `engine.durable` | Session (CLI/SDK) | Session | Session | Session | Native durable tasks | Session |
 
-| Feature | Copilot | Claude | Codex | Gemini | OpenCode | Pi |
-|---------|:-------:|:------:|:-----:|:------:|:--------:|:--:|
-| `max-turns` (AWF invocation cap; `max-runs` deprecated) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `max-turns` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| `max-continuations` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `tools.web-fetch` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `tools.web-search` | via MCP | via MCP | ✅ (opt-in) | via MCP | via MCP | via MCP |
-| `engine.agent` (custom agent file) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `engine.api-target` (custom endpoint) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `engine.bare` (disable context loading) | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| `engine.harness` (custom harness script) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Tools allowlist | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+Codex can disable shell execution but cannot enforce a command allowlist. Agy rejects unsupported tool restrictions rather than ignoring them. See individual references for provider-specific web access, bare-mode behavior, and dynamic workflows.
 
-`max-turns` (default `500`, legacy alias `max-runs`) and `max-ai-credits` (default `1000`) are top-level frontmatter fields supported by all engines. `engine.max-turns` is a deprecated nested alias that still limits Claude iterations when present; `max-continuations` enables Copilot autopilot mode. Codex `web-search` is opt-in via `tools: web-search:`; other engines use a third-party MCP server — see [Using Web Search](/gh-aw/reference/web-search/). `engine.agent`, `engine.bare`, and `engine.harness` are described below.
+`max-turns` defaults to `500` (legacy alias `max-runs`); `max-ai-credits` defaults to `1000`. These are top-level fields, not `engine` properties. Agy supports credit/cache-miss limits but not `max-turns`. `engine.max-turns` is a deprecated Claude-only iteration limit. [Agent Plugins](/gh-aw/reference/frontmatter/#agent-plugins-plugins) remain experimental.
 
 ## Extended Coding Agent Configuration
 
-Workflows can specify extended configuration for the coding agent:
+String form selects a built-in engine. Object form adds settings:
 
-```yaml wrap
+```yaml
 engine:
   id: copilot
-  version: latest                       # defaults to latest
-  model: gpt-5                          # example override; omit to use engine default
-  command: /usr/local/bin/copilot       # custom executable path
-  args: ["--add-dir", "/workspace"]     # custom CLI arguments
-  agent: agent-id                       # custom agent file identifier
-  api-target: api.acme.ghe.com          # custom API endpoint hostname (GHEC/GHES)
+  model: opus
+  env:
+    DEBUG_MODE: "true"
 ```
+
+| Field | Contract |
+| --- | --- |
+| `id` | Built-in ID, or the ID of an [imported definition](/gh-aw/reference/third-party-agent/). |
+| `model` | Exact model ID, alias, or provider-prefixed selection; may also be top-level `model`. |
+| `version` | Override the compiler-pinned CLI version. |
+| `cooldown` | Minimum release age in nonnegative integer days; defaults to `3`. Explicit `0` is rejected in strict mode. |
+| `env` | Runtime environment values; [scope and precedence](/gh-aw/reference/environment-variables/) still apply. |
+| `args` | Ordered arguments passed to the native CLI before its prompt argument. |
+| `command` | Replacement executable; skips the engine installer, not AWF installation. |
+| `api-target` | Endpoint hostname, where supported; see below. |
+| `harness` | Replacement wrapper or retry settings for Copilot, Claude, and Codex. |
+| `durable` | Artifact-backed session continuation with optional `retention-days` (1–90, default `7`). |
+
+Engine-specific options such as `agent`, `copilot-sdk`, `driver`, `dynamic-workflows`, `permission-mode`, `config`, and `extensions` are documented in each engine reference. Agy rejects most overrides.
+
+### Durable runs
+
+> [!WARNING]
+> Durable mode is experimental for all engines, including Pi. Enabling
+> `engine.durable` emits a compile-time warning. Configuration and behavior may
+> change without deprecation.
+
+All built-in engines support artifact-backed continuation:
+
+```aw
+engine:
+  id: copilot
+  durable:
+    retention-days: 7
+```
+
+The compiler restores an explicit parent from `aw_context`, or the last successful run of the same workflow on the same branch. Reruns prefer a checkpoint from an earlier attempt of the same run. Retention remains subject to repository and organization policy. No memory tool is required, and durable mode does not dispatch another run automatically.
+
+| Engine | Persisted state | Continuation |
+| --- | --- | --- |
+| Copilot CLI and SDK | Native session-state files and exact session ID | CLI `--session-id`; SDK `resumeSession` |
+| Claude | Project transcripts, task state, and exact session ID | CLI `--resume <id>` |
+| Codex | Native and archived rollout sessions and exact thread ID | CLI `exec resume <id>` |
+| Gemini | Native temporary session storage and project registry | Prompt points to restored session files |
+| Agy | Native conversation databases | Prompt points to restored session files |
+| Pi | Official Pi Durable task journal and checkpoint | Native task continuation; see [Pi durable runs](/gh-aw/reference/engines/pi/#durable-runs) |
+
+Copilot, Claude, and Codex resume the exact recorded native session with the current workflow prompt and freshly configured credentials, models, and tool policy. Gemini and Agy receive restoration metadata without a forced CLI continuation argument. Continuation guidance limits use to metadata unless historical facts are independently verified against trusted sources for the current task. It does not direct the agent to ingest restored text as prompts or instructions.
+
+Enabling `engine.durable` opts into reusing potentially attacker-influenced history across runs. Guidance to treat restored files as untrusted factual data is advisory, not deterministic instruction/data isolation; native session resume also reintroduces prior history. Durable continuation does not eliminate cross-run prompt injection.
+
+The first run starts normally when no prior run or implicit checkpoint exists. No continuation notice or resume argument is added without history. Missing explicit-parent artifacts, corrupt restored sessions, and API authorization failures remain errors rather than silently starting unrelated conversations.
+
+This restores session files, not workspace edits, credentials, or exactly-once tool execution. Pi additionally preserves pending tasks using its native durable library. Existing unified session capture and trace propagation remain enabled; restored Copilot events are excluded from current-run capture and model verification.
+
+Threat detection uses a separate fresh session and does not inherit the primary agent's durable state.
+
+Built-in session-based durable mode rejects replacement commands, drivers, and harnesses because their session files may differ. Ordinary CLI arguments remain supported, but native session selectors and flags that disable persistence cannot override compiler-managed continuation. Copilot cannot override `COPILOT_HOME` because durable mode collects its standard native session directory. Pi has [additional restrictions](/gh-aw/reference/engines/pi/#durable-runs). [Imported engines](/gh-aw/reference/third-party-agent/#durable-execution) must declare their own durable files and execution behavior; unsupported definitions still fail compilation.
+
+Checkpoint artifacts are published after secret redaction and integrity validation. Cancellation or hard runner loss can prevent publication; only the last published checkpoint can be restored.
+
+Artifacts contain restorable session content, not just integrity metadata, and may expose sensitive history to anyone with artifact access. Secret scanning and redaction are heuristic: they do not guarantee removal of PII, unknown token formats, or secrets in unsupported encodings. Enable durable mode only when the workflow's session content is suitable for the repository's artifact access and retention policies.
 
 ### Pinning a Specific Engine Version
 
-By default, workflows install the latest available version of each engine CLI. To pin to a specific version, set `version` to the desired release:
+The compiler pins a CLI release. Override it with `engine.version`, then recompile:
 
-| Engine | `id` | Example `version` |
-|--------|------|-------------------|
-| GitHub Copilot CLI | `copilot` | `"0.0.422"` |
-| Claude Code | `claude` | `"2.1.70"` |
-| Codex | `codex` | `"0.111.0"` |
-| Gemini CLI | `gemini` | `"0.31.0"` |
-| OpenCode | `opencode` | `"0.1.0"` |
-| Pi | `pi` | `"0.72.1"` |
-
-```yaml wrap
+```yaml
 engine:
   id: copilot
-  version: "0.0.422"
+  version: "1.0.101"
 ```
 
-Pinning is useful when you need reproducible builds or want to avoid breakage from a new CLI release while testing. Remember to update the pinned version periodically to pick up bug fixes and new features.
+<span id="parameterized-versions"></span>
 
-`version` also accepts a GitHub Actions expression string, enabling `workflow_call` reusable workflows to parameterize the engine version via caller inputs. Expressions are passed injection-safely through an environment variable rather than direct shell interpolation:
+Versions can use GitHub Actions expressions; the runtime passes them through environment variables rather than shell interpolation. Copilot expression values must resolve to trusted cached releases or built-in manifest pins. Other Copilot releases require a literal version and [checksum pin](/gh-aw/reference/engines/copilot/#copilot-release-checksum-pins). Agy accepts only its verified releases.
 
-```yaml wrap
-on:
-  workflow_call:
-    inputs:
-      engine-version:
-        type: string
-        default: latest
+### Engine release-age cooldown
 
----
+Compiler-managed engine installs require releases to be at least **3 days** old by default. Configure a different age with `engine.cooldown`:
 
+```aw
 engine:
   id: copilot
-  version: ${{ inputs.engine-version }}
+  cooldown: 7
 ```
 
-### Copilot Custom Configuration
+The value must be a nonnegative integer number of days, not a boolean, string, duration, or expression. `cooldown: 0` disables the age check only when `strict: false`; strict mode rejects explicit zero. Omitting the field retains the default, including string-form and inline engine configurations.
 
-Use `agent` to reference a custom agent file in `.github/agents/` (omit the `.agent.md` extension):
+Claude, Codex, Pi, Gemini, and behavior-defined npm installs pass this age to npm through `NPM_CONFIG_MIN_RELEASE_AGE`, including compiler-managed microVM staging. Copilot's native installer checks GitHub release publication metadata before activating a cached CLI or downloading an archive, including musl guest binaries. Missing or invalid metadata fails the installation. The cooldown also applies to pinned versions and runtime version expressions; it does not replace checksum verification or version pins.
 
-```yaml wrap
-engine:
-  id: copilot
-  agent: technical-doc-writer  # .github/agents/technical-doc-writer.agent.md
-```
+npm enforces the cooldown through its built-in `min-release-age` setting at installation time; no custom version-check script is generated. Node.js runtime overrides must provide npm **11.10.0 or later** to support this setting. Older npm versions may ignore it.
 
-See [Copilot Agent Files](/gh-aw/reference/copilot-custom-agents/) for details.
+The policy covers compiler-managed npm and Copilot release installs, not arbitrary shell installers, custom `engine.command` executables, pre-agent steps, extensions, or other externally managed installation methods. Runtime dependency cooldowns remain separately configured by `runtimes.<id>.cooldown` (a boolean).
+
+Engine definitions that set `behaviors.installation.cooldown` use deprecated metadata that is ignored. Set `engine.cooldown` in the workflow instead. A value of `0` disables the policy only outside strict mode; strict mode rejects zero.
 
 ### Engine Environment Variables
 
-All engines support custom environment variables through the `env` field:
-
-```yaml wrap
-engine:
-  id: copilot
-  env:
-    DEBUG_MODE: "true"
-    AWS_REGION: us-west-2
-    CUSTOM_API_ENDPOINT: https://api.example.com
-```
-
-Environment variables can also be defined at workflow, job, step, and other scopes. See [Environment Variables](/gh-aw/reference/environment-variables/) for complete documentation on precedence and all 13 env scopes.
+Use `engine.env` for engine-only runtime values. Use top-level `env` for all workflow steps; see [environment variable scope and precedence](/gh-aw/reference/environment-variables/).
 
 ### Enterprise API Endpoint (`api-target`)
 
-The `api-target` field specifies a custom API endpoint hostname for the agentic engine. Use this when running workflows against GitHub Enterprise Cloud (GHEC), GitHub Enterprise Server (GHES), or any custom AI endpoint.
+`api-target` is a hostname, without protocol or path, and must be permitted by `network.allowed`:
 
-For a complete setup and debugging walkthrough for GHE Cloud with data residency, see [Debugging GHE Cloud with Data Residency](/gh-aw/troubleshooting/debug-ghe/).
-
-The value must be a hostname only — no protocol or path (e.g., `api.acme.ghe.com`, not `https://api.acme.ghe.com/v1`). The field works with any engine.
-
-**Example** — specify a GHEC or GHES Copilot endpoint (use `api.enterprise.githubcopilot.com` for GHES):
-
-```yaml wrap
+```yaml
 engine:
   id: copilot
   api-target: api.acme.ghe.com
 network:
-  allowed:
-    - defaults
-    - acme.ghe.com
-    - api.acme.ghe.com
+  allowed: [defaults, acme.ghe.com, api.acme.ghe.com]
 ```
 
-The specified hostname must also be listed in `network.allowed` for the firewall to permit outbound requests.
+For GHES Copilot use `api.enterprise.githubcopilot.com`. See [GHE Cloud troubleshooting](/gh-aw/troubleshooting/debug-ghe/) for data-residency setup. Agy does not support `api-target`.
 
 #### Custom API Endpoints via Environment Variables
 
-Set a base URL environment variable in `engine.env` to route API calls to an internal LLM router, Azure OpenAI deployment, or corporate proxy. AWF automatically extracts the hostname and applies it to the API proxy. The target domain must also appear in `network.allowed`.
+| Engine | Base URL variable |
+| --- | --- |
+| Copilot | `GITHUB_COPILOT_BASE_URL` |
+| Claude | `ANTHROPIC_BASE_URL` |
+| Codex | `OPENAI_BASE_URL` |
+| Gemini | `GEMINI_API_BASE_URL` |
 
-| Engine | Environment variable |
-|--------|---------------------|
-| `codex` | `OPENAI_BASE_URL` |
-| `claude` | `ANTHROPIC_BASE_URL` |
-| `copilot` | `GITHUB_COPILOT_BASE_URL` |
-| `gemini` | `GEMINI_API_BASE_URL` |
+Set the URL through `engine.env` and allow its domain in `network.allowed`. AWF derives the proxy target from it. Copilot's `api-target` takes precedence over `GITHUB_COPILOT_BASE_URL`. Pi's additional provider routing is in its [reference](/gh-aw/reference/engines/pi/#additional-providers).
 
-```yaml wrap
-engine:
-  id: codex
-  model: gpt-4o
-  env:
-    OPENAI_BASE_URL: "https://llm-router.internal.example.com/v1"
-    OPENAI_API_KEY: ${{ secrets.LLM_ROUTER_KEY }}
-
-network:
-  allowed:
-    - github.com
-    - llm-router.internal.example.com
-```
-
-`GITHUB_COPILOT_BASE_URL` is a fallback — if both it and `engine.api-target` are set, `engine.api-target` takes precedence.
-
-### Copilot Bring Your Own Key (BYOK) Mode
-
-The Copilot engine supports routing requests to an external LLM provider instead of GitHub's default routing. This is useful when you want to use a different model or provider (e.g., OpenAI, Anthropic, Azure OpenAI, or a local Ollama/vLLM instance) while still using the Copilot CLI tooling.
-
-Set `COPILOT_PROVIDER_BASE_URL` in `engine.env` to activate BYOK mode. The credential variables `COPILOT_PROVIDER_BASE_URL`, `COPILOT_PROVIDER_API_KEY`, and `COPILOT_PROVIDER_BEARER_TOKEN` are explicitly allowed to carry `${{ secrets.* }}` references in `engine.env` under strict mode — they are not leaked to the agent container. Other `COPILOT_PROVIDER_*` variables hold non-sensitive configuration and can be set as plain strings. When `COPILOT_PROVIDER_BASE_URL` is a literal URL, gh-aw automatically adds its provider hostname to the AWF allow-list for both the main agent run and the threat-detection Copilot step. When it is supplied via a secret or variable expression, add the provider hostname explicitly to `network.allowed` so the threat-detection step can reuse that concrete host safely.
-
-| Variable | Required | Description |
-|---|---|---|
-| `COPILOT_PROVIDER_BASE_URL` | ✅ for BYOK | Base URL of the external provider (e.g. `https://api.openai.com/v1` or `https://RESOURCE.openai.azure.com/openai/v1` for Azure Foundry OpenAI) |
-| `COPILOT_MODEL` | ✅ for BYOK | Model to use (e.g. `claude-sonnet-4`, `gpt-4o`); required by most providers |
-| `COPILOT_PROVIDER_API_KEY` | Optional | API key for cloud providers (OpenAI, Anthropic, etc.); not needed for local providers |
-| `COPILOT_PROVIDER_BEARER_TOKEN` | Optional | Bearer token alternative to `COPILOT_PROVIDER_API_KEY`; takes precedence when set |
-| `COPILOT_PROVIDER_TYPE` | Optional | Provider format: `openai` (default), `azure`, or `anthropic` |
-| `COPILOT_PROVIDER_WIRE_API` | Optional | Wire API variant: `completions` (default) or `responses` (for GPT-5 series) |
-| `COPILOT_PROVIDER_MODEL_ID` | Optional | Model ID sent on the wire when it differs from `COPILOT_MODEL` (e.g. an Azure deployment name) |
-| `COPILOT_PROVIDER_WIRE_MODEL` | Optional | Alternative to `COPILOT_PROVIDER_MODEL_ID` for overriding the wire model |
-| `COPILOT_PROVIDER_MAX_PROMPT_TOKENS` | Optional | Override the maximum prompt token limit (otherwise resolved from model catalog) |
-| `COPILOT_PROVIDER_MAX_OUTPUT_TOKENS` | Optional | Override the maximum output token limit |
-
-**Example:**
-
-```yaml wrap
-engine:
-  id: copilot
-  env:
-    COPILOT_PROVIDER_BASE_URL: ${{ secrets.PROVIDER_BASE_URL }}   # REQUIRED — activates BYOK
-    COPILOT_MODEL: claude-sonnet-4                                # REQUIRED for most providers
-    COPILOT_PROVIDER_API_KEY: ${{ secrets.PROVIDER_API_KEY }}     # OPTIONAL for local providers
-    COPILOT_PROVIDER_TYPE: anthropic                              # OPTIONAL — default: openai
-
-network:
-  allowed:
-    - defaults
-    - your-provider-domain.example.com
-```
-
-> [!NOTE]
-> Credentials are kept out of the agent container — only a dummy API key activating the AWF BYOK detection path is visible to the agent process; the real credential is isolated in the AWF API proxy sidecar. See [AWF sandbox architecture](/gh-aw/reference/sandbox/).
-
-#### Azure Foundry OpenAI
-
-Azure Foundry OpenAI supports the newer OpenAI v1 URL style. Set
-`COPILOT_PROVIDER_BASE_URL` to the resource endpoint with the `/openai/v1`
-path, then choose one authentication method:
-
-```yaml wrap
-engine:
-  id: copilot
-  model: o4-mini-aw
-  env:
-    COPILOT_PROVIDER_BASE_URL: https://RESOURCE.openai.azure.com/openai/v1
-    COPILOT_PROVIDER_API_KEY: ${{ secrets.FOUNDRY_API_KEY }}
-    COPILOT_PROVIDER_WIRE_API: responses
-
-network:
-  allowed:
-    - defaults
-    - RESOURCE.openai.azure.com
-```
-
-When the Azure deployment name differs from the Azure model ID, keep
-`engine.model` on the model ID that Azure exposes from `/openai/v1/models` and
-set `COPILOT_PROVIDER_MODEL_ID` to the deployment name that Azure expects on
-the wire.
-
-For Entra authentication, omit `COPILOT_PROVIDER_API_KEY` and configure
-GitHub OIDC in `engine.auth`:
-
-```yaml wrap
-permissions:
-  id-token: write
-
-engine:
-  id: copilot
-  model: o4-mini-aw
-  auth:
-    type: github-oidc
-  env:
-    COPILOT_PROVIDER_BASE_URL: https://RESOURCE.openai.azure.com/openai/v1
-    COPILOT_PROVIDER_WIRE_API: responses
-
-network:
-  allowed:
-    - defaults
-    - RESOURCE.openai.azure.com
-```
-
-See [How to use Azure OpenAI with Copilot BYOK](/gh-aw/guides/azure-openai-byok/)
-for deployment-name mapping, `responses` API guidance for GPT-5 and o-series
-models, and Azure-specific troubleshooting.
+For `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`, gh-aw disables automatic model fallback by default so provider-specific model IDs pass through unchanged. Explicit [`sandbox.agent.model-fallback`](/gh-aw/reference/sandbox/#model-fallback-sandboxagentmodel-fallback) overrides that default. If proxy-side model steering is incompatible with the endpoint, use [`sandbox.agent.token-steering: false`](/gh-aw/reference/sandbox/#token-steering-sandboxagenttoken-steering).
 
 ### Engine Command-Line Arguments
 
-All engines support custom command-line arguments through the `args` field, injected before the prompt:
-
-```yaml wrap
-engine:
-  id: copilot
-  args: ["--add-dir", "/workspace", "--verbose"]
-```
-
-Arguments are added in order and placed before the `--prompt` flag. Consult the specific engine's CLI documentation for available flags.
+`engine.args` is an ordered array of native CLI arguments, inserted before the prompt argument. Consult the selected CLI's documentation for available flags; Agy rejects this setting.
 
 ### Custom Engine Command
 
-Override the default engine executable using the `command` field. Useful for testing pre-release versions, custom builds, or non-standard installations. Installation steps are automatically skipped.
-
-```yaml wrap
-engine:
-  id: copilot
-  command: /usr/local/bin/copilot-dev  # absolute path
-  args: ["--verbose"]
-```
+`engine.command` replaces the executable and skips the engine installer, not AWF installation. Provision it in setup steps and ensure it satisfies the selected engine's version/configuration contract. Agy checks the verified executable version; Copilot checksum pins cannot be combined with `command`.
 
 ### Custom Harness Script (`harness`)
 
-The `harness` field lets you replace the built-in Node.js harness wrapper that the Copilot engine uses to launch the CLI. Use this when you need to customize startup behavior, inject pre/post hooks, or test an alternative harness implementation.
+Copilot, Claude, and Codex accept a replacement harness provisioned in `${RUNNER_TEMP}/gh-aw/actions/`, for example through `pre-agent-steps`:
 
-```yaml wrap
+```yaml
 engine:
   id: copilot
   harness:
     use: custom_copilot_harness.cjs
 ```
 
-The `use` value must be a bare filename — no directory separators, no `..`, and no shell metacharacters. It must end with `.js`, `.cjs`, or `.mjs`. When `harness.use` is set, AWF automatically ensures Node 24 is available in the runner environment.
+`use` must start with a letter, digit, or underscore, end in `.js`, `.cjs`, or `.mjs`, and contain no directory separators, `..`, or shell metacharacters. Selecting it does not copy a repository file. Node 24 is provisioned automatically. A replacement owns its retry, timeout, prompt-delivery, and tool-policy behavior.
+
+### Harness Retry and Post-result Watchdog Policy
+
+The built-in Copilot, Claude, and Codex harnesses accept:
+
+| `engine.harness` field | Default | Meaning |
+| --- | --- | --- |
+| `max-retries` | `3` | Retries after the initial attempt; `0` disables. |
+| `initial-delay-ms` | `5000` | First retry delay. |
+| `backoff-multiplier` | `2` | Exponential delay multiplier. |
+| `max-delay-ms` | `60000` | Delay cap. |
+| `watchdog-timeout` | `120` | Post-result idle timeout; literal integers are seconds. |
+
+All accept integers or Actions expressions. A watchdog expression must already be in milliseconds. Explicit `engine.env.GH_AW_HARNESS_*` values override these fields; see [runtime tuning variables](/gh-aw/reference/environment-variables/#harness-settings-and-runtime-tuning-variables).
+
+The watchdog arms after a terminal safe output, not diagnostic reports such as `report_incomplete`. Any stdout/stderr activity resets it. It can terminate a quiet process still doing useful work and treat that termination as success if a terminal output exists. Claude counts only terminal outputs from the current attempt; its [resume rules](/gh-aw/reference/engines/claude/#harness-recovery) also apply.
+
+Threat detection defaults to zero retries; configure its engine explicitly to change that. Model fallback below retries individual inference requests, not whole agent attempts.
+
+### Model aliases
 
 > [!NOTE]
-> `engine.harness` is currently only applied during Copilot engine execution. Setting it on other engines has no effect.
+> The Copilot model catalog offered to a workflow can differ by organization and lag the models available to that organization's Copilot seats. Availability depends on the agentic-workflows integration, not just organization policy; a model listed by this repository's daily inventory is not necessarily offered to another workflow. An exact Copilot ID missing from a complete live catalog means that model is **not offered to this workflow**. Prefer aliases such as `opus` and `sonnet` over exact Copilot IDs so resolution selects an available model. Run `gh aw audit <run-url> --models` for a detailed report of that run's model information, including its catalog, discovery status, supported endpoints, and recorded routing and usage. Missing or incomplete discovery does not confirm model absence.
 
-**Validation rules for `harness.use`:**
+Copilot, Claude, Codex, Pi, and Agy resolve aliases against the configured provider's live AWF `/reflect` catalog before execution:
 
-| Rule | Valid example | Invalid example |
-|------|--------------|-----------------|
-| Bare filename only | `my_harness.cjs` | `subdir/harness.cjs` |
-| No path traversal | `harness.mjs` | `../harness.cjs` |
-| Must start with `[A-Za-z0-9_]` | `harness.js` | `-harness.cjs` |
-| Must end with `.js`, `.cjs`, or `.mjs` | `wrapper.cjs` | `harness.sh` |
+- Built-in aliases such as `opus`/`small`, workflow-defined `models:`, and their globs select the newest live match.
+- A `provider/` prefix restricts the lookup; otherwise the engine's configured provider applies.
+- Exact live IDs take precedence over an alias of the same name. Unrecognized exact IDs are not rewritten by alias resolution. Pi checks exact IDs before launch; Copilot, Claude, and Codex fail on the first unavailable-model request.
+- Parameters such as `?effort=` are retained. `auto` keeps its engine/provider-specific meaning.
+- Missing alias matches fail with `model_unavailable`; incomplete discovery fails alias resolution with `catalog_unavailable`.
 
-### Harness Retry Policy
+Gemini and declarative engines pass model names through unchanged and warn about gh-aw aliases. AWF can independently rewrite unrecognized models on non-Copilot providers; disable [`sandbox.agent.model-fallback`](/gh-aw/reference/sandbox/#model-fallback-sandboxagentmodel-fallback) when exact routing is required.
 
-The built-in Copilot, Claude, and Codex harnesses default to **3 retries** after the initial run (4 total attempts), with exponential backoff starting at 5 s (capped at 60 s). Use sub-keys under `engine.harness` to widen the retry window without replacing the harness:
+Resolution produces `model.resolution` evidence in `usage/aw_session.jsonl`. See [Model Aliases](/gh-aw/reference/model-tables/) for the catalog and [Model Routing](/gh-aw/reference/model-routing/) for experimental per-run model/effort selection on Copilot-backed Copilot, Claude, Codex, and Pi.
 
-```yaml wrap
+### Ordered model fallback (`fallback-models`)
+
+```yaml
 engine:
   id: copilot
-  harness:
-    max-retries: 6
-    initial-delay-ms: 10000
-    backoff-multiplier: 2
-    max-delay-ms: 180000
+  model: grok-4.7
+  fallback-models: [gpt-5.6-luna, mai-code-1.1-flash]
 ```
 
-All four fields accept a literal integer or a GitHub Actions expression (e.g. `${{ vars.MY_RETRIES }}`):
+All built-in engines accept ordered, concrete same-provider alternatives with AWF v0.28.31+ and a compatible API-proxy image. AWF retries the failed request without restarting the agent, preserving policy and budget checks. An explicit chain disables automatic middle-power substitution.
 
-| Sub-key | Default | Description |
-|---|---|---|
-| `max-retries` | `3` | Maximum retry attempts after the initial run (0 = no retries) |
-| `initial-delay-ms` | `5000` | Delay in ms before the first retry |
-| `backoff-multiplier` | `2` | Multiplier applied to the delay after each retry |
-| `max-delay-ms` | `60000` | Maximum delay cap in ms |
+Fallback covers server errors, request timeouts, unsupported models, and model-availability HTTP 400 errors. Authentication failures, HTTP 429, policy/guardrail failures, cancellation, and job timeouts do not switch models. Exhausted chains fail the run.
 
-You can also set the underlying `GH_AW_HARNESS_*` env vars directly via `engine.env` when you need expression-level control. Explicit `engine.env` values take precedence over `engine.harness` sub-key values.
+Unqualified alternatives inherit the primary provider. Prefixes must match it; credentials follow that provider's normal configuration. Cross-provider chains, fallback aliases, missing compatible AWF, and combinations with `engine.model-routing` fail compilation. Custom harnesses/drivers can use AWF fallback without implementing switching.
 
-### Copilot SDK Support
-
-Enable `engine.copilot-sdk: true` to run Copilot in SDK mode.
-In this mode, the harness starts a local sidecar and runs the
-SDK driver process instead of the default CLI-only flow.
-
-Use top-level `max-tool-denials` to stop SDK inference when
-tool requests are repeatedly denied. The default is `5`.
-This field is only supported when `engine.id: copilot` and
-`engine.copilot-sdk: true`.
-
-Use `engine.driver` to replace the built-in
-`copilot_sdk_driver.cjs` implementation. On the Copilot engine,
-setting `engine.driver` also enables `engine.copilot-sdk: true`:
-
-```yaml wrap
-engine:
-  id: copilot
-  driver: .github/drivers/custom-copilot-driver.js
-max-tool-denials: 8
-```
-
-`engine.driver` must be a **relative path from the workspace root**
-(no absolute paths, `..`, backslashes, or shell metacharacters). It supports:
-
-- script filenames ending with `.js`, `.cjs`, `.mjs`,
-  `.py`, `.ts`, `.mts`, or `.rb`
-- bare command names without an extension (resolved from
-  `PATH`)
-- inline source blocks using exactly one of `node:`,
-  `python:`, `go:`, or `java:`
-
-Inline driver sources are materialized into runtime files under
-`${GITHUB_WORKSPACE}/.gh-aw/copilot-sdk/` before execution.
-This lets the agent emit a complete Copilot SDK driver inline in
-workflow frontmatter:
-
-```yaml wrap
-engine:
-  id: copilot
-  driver:
-    python: |
-      import sys
-      print("hello from inline driver", file=sys.stderr)
-```
-
-See [Copilot SDK Driver Specification](/gh-aw/specs/copilot-sdk-driver-specification/)
-for the full driver contract.
-
-#### SDK driver environment variables
-
-The specification defines the driver environment contract.
-In SDK mode, gh-aw injects required runtime values:
-
-- `GH_AW_PROMPT`
-- `COPILOT_SDK_URI`
-- `COPILOT_CONNECTION_TOKEN`
-
-`COPILOT_MODEL` is required and must be set to the model to use
-(e.g. `gpt-4o`, `claude-sonnet-4`). Drivers MUST fail fast when
-it is not set.
-
-For runtime controls, the driver should consume:
-
-- `COPILOT_SDK_SEND_TIMEOUT_MS`
-- `COPILOT_SDK_LOG_LEVEL`
-
-In gh-aw, `COPILOT_SDK_SEND_TIMEOUT_MS` is usually injected
-automatically from workflow `timeout-minutes` (via
-`GH_AW_TIMEOUT_MINUTES`) with safety headroom. Override it in
-`engine.env` only when you need a custom SDK send timeout.
-`COPILOT_SDK_LOG_LEVEL` is a host-provided driver control and
-should be honored when gh-aw passes it to the driver process.
-
-Do not set `COPILOT_CONNECTION_TOKEN` manually. The harness
-generates it per run and passes the same token to both the
-sidecar and driver process.
-
-```yaml wrap
-engine:
-  id: copilot
-  driver: .github/drivers/my_driver.ts
-  model: gpt-5
-  env:
-    COPILOT_SDK_SEND_TIMEOUT_MS: "900000"
-    COPILOT_SDK_LOG_LEVEL: info
-```
+`token-usage.jsonl` records the serving model and `model_fallback` evidence for post-run attribution. This does not change harness retries or prove that every configured alternative was exercised.
 
 ### Bare Mode (`bare`)
 
-Set `engine.bare: true` to disable automatic loading of context and custom instructions by the engine. Use this when the workflow prompt is fully self-contained and you want to prevent the engine from reading memory files, AGENTS.md, or built-in system prompts that would otherwise be loaded automatically.
+`engine.bare: true` disables ambient discovery in Copilot, Claude, and Pi; default false. Copilot suppresses custom instructions. Claude skips ambient discovery but keeps explicitly installed workflow skills/plugins, with a minimal native tool set. Pi retains managed infrastructure and explicitly loaded workflow skills. See individual references for delegation and dynamic-workflow restrictions.
 
-```yaml wrap
-engine:
-  id: claude
-  bare: true
-```
-
-The underlying mechanism is engine-specific:
-
-| Engine | Effect |
-|--------|--------|
-| Copilot | Passes `--no-custom-instructions` — suppresses `.github/AGENTS.md` and user-level custom instructions |
-| Claude | Passes `--bare` — suppresses CLAUDE.md memory files |
-| Codex | Passes `--no-system-prompt` — suppresses the default system prompt |
-| Gemini | Sets `GEMINI_SYSTEM_MD=/dev/null` — overrides the built-in system prompt with an empty file |
-
-Defaults to `false`.
-
-### Pi Extensions (`extensions`)
-
-The Pi engine supports loading additional plugins via `engine.extensions`. Each entry is an npm package name installed with `pi install <extension>` before the agent runs. Only the Pi engine reads this field; other engines ignore it.
-
-```yaml wrap
-engine:
-  id: pi
-  extensions:
-    - "@pi/web-search"
-    - "@pi/file-browser"
-```
-
-Each listed extension produces one additional install step in the compiled workflow. If `engine.command` is set, the same executable is used to install the extensions.
+<span id="job-level-timeout-timeout-minutes"></span>
+<span id="per-tool-call-timeout-toolstimeout"></span>
+<span id="per-engine-timeout-controls"></span>
 
 ## Timeout Configuration
 
-Repositories with long build or test cycles require careful timeout tuning at multiple levels. This section documents the timeout knobs available for each engine.
+| Setting | Default | Scope |
+| --- | --- | --- |
+| `timeout-minutes` | `20` | Entire agent job. |
+| `tools.timeout` | `60` seconds for Claude/Codex | Supported tool operations; Codex native MCP calls, not shell commands. |
+| `tools.startup-timeout` | `120` seconds for Codex | MCP server startup; explicit Codex server config takes precedence. |
+| `max-turns` | `500` | AWF invocation cap, except unsupported Agy. |
+| `max-continuations` | Unset | Copilot autopilot continuation budget. |
 
-### Job-Level Timeout (`timeout-minutes`)
+Claude receives top-level `max-turns` automatically; no duplicate `CLAUDE_CODE_MAX_TURNS` is needed. Copilot and Gemini retain native tool-limit behavior. See [tool timeouts](/gh-aw/reference/tools/#tool-timeout-configuration) and [long builds](/gh-aw/reference/sandbox/#long-build-times).
 
-`timeout-minutes` sets the maximum wall-clock time for the entire agent job. This is the primary knob for repositories with long build times. The default is 20 minutes.
+## Configuration conformance workflows
 
-```yaml wrap
-timeout-minutes: 60   # allow up to 60 minutes for the agent job
-```
+Repository `engine-conformance-<id>.md` workflows are manual configuration smoke tests. They check file/shell/MCP probes and typed results using recorded receipts, not an agent's success claim. Safe outputs are staged; missing credentials fail activation. Reports are retained for two days.
 
-See [Long Build Times](/gh-aw/reference/sandbox/#long-build-times) in the Sandbox reference for recommended values and concrete examples, including a 30-minute C++ workflow.
+These tests do not establish security, model quality, SDK/driver coverage, or provider compliance with a requested model. Agy's [production gate](/gh-aw/reference/engines/agy/#troubleshooting-and-conformance) is separate from its native authentication probe.
 
-### Per-Tool-Call Timeout (`tools.timeout`)
+<span id="experimental-agy-authentication-gate"></span>
+<span id="learn-more"></span>
 
-`tools.timeout` limits how long any single tool invocation may run, in seconds. Useful when individual `bash` commands (builds, test suites) take longer than an engine's default:
+## Engine-specific sections
 
-```yaml wrap
-tools:
-  timeout: 300   # 5 minutes per tool call
-```
+The following anchors retain links to sections moved from this page.
 
-Defaults: Claude `60s`, Codex `120s`. Other engines (Copilot, Gemini) are engine-managed and not enforced by gh-aw. See [Tool Timeout Configuration](/gh-aw/reference/tools/#tool-timeout-configuration) for full documentation including `tools.startup-timeout`.
+### Copilot Custom Configuration
 
-### Per-Engine Timeout Controls
+See [Copilot custom agents](/gh-aw/reference/engines/copilot/#copilot-custom-configuration).
 
-| Knob | Copilot | Claude | Codex/Gemini/OpenCode | Purpose |
-|---|:---:|:---:|:---:|---|
-| `timeout-minutes` | ✅ | ✅ | ✅ | Job-level wall clock |
-| `tools.timeout` | ✅ | ✅ | ✅ | Per tool-call limit (seconds) |
-| `tools.startup-timeout` | ✅ | ✅ | ✅ | MCP server startup limit |
-| `max-turns` | ❌ | ✅ | ❌ | Iteration budget |
-| `max-continuations` | ✅ | ❌ | ❌ | Autopilot run budget |
+### Copilot release checksum pins
 
-Copilot uses `max-continuations` for autopilot runs; Claude uses `max-turns` to cap iterations. Codex, Gemini, and OpenCode rely solely on `timeout-minutes` and `tools.timeout`.
+See [Copilot release integrity](/gh-aw/reference/engines/copilot/#copilot-release-checksum-pins).
 
-```yaml wrap
-# Claude — combine iteration cap with per-tool timeout
-engine:
-  id: claude
-max-turns: 20
-tools:
-  timeout: 600
-timeout-minutes: 60
-```
+<span id="azure-foundry-openai"></span>
 
-When `max-turns` is set in frontmatter, gh-aw passes it to Claude automatically — no need to also set the `CLAUDE_CODE_MAX_TURNS` env var.
+### Copilot Bring Your Own Key (BYOK) Mode
 
-## Claude Tool Enforcement Security Model
+See [Copilot BYOK](/gh-aw/reference/engines/copilot/#copilot-bring-your-own-key-byok-mode).
 
-Claude Code accepts a `--permission-mode` flag that determines whether the declared `tools:` allowlist is enforced. Set `engine.permission-mode` to one of `auto`, `acceptEdits`, `plan`, or `bypassPermissions`:
+### Copilot SDK Support
 
-```yaml wrap
-engine:
-  id: claude
-  permission-mode: auto
-```
+<span id="sdk-driver-environment-variables"></span>
 
-`engine.permission-mode` takes precedence over any `--permission-mode` flag supplied through `engine.args`. When unset, the default is `acceptEdits` (or `auto` when `tools.edit: false`). gh-aw **does not** derive `bypassPermissions` implicitly from unrestricted bash — set it explicitly.
+See [Copilot SDK configuration](/gh-aw/reference/engines/copilot/#copilot-sdk-support).
 
-| `engine.permission-mode` | Effective mode | `--allowed-tools` enforced? | Gateway `allowed:` enforced? |
-|---|---|:---:|:---:|
-| unset (default) | `acceptEdits` | ✅ Yes | ✅ Yes |
-| unset, with `tools.edit: false` | `auto` | ✅ Yes | ✅ Yes |
-| `auto` | `auto` | ✅ Yes | ✅ Yes |
-| `acceptEdits` | `acceptEdits` | ✅ Yes | ✅ Yes |
-| `plan` | `plan` | ✅ Yes | ✅ Yes |
-| `bypassPermissions` | `bypassPermissions` | ❌ No | ✅ Yes |
+### Pi Extensions (`extensions`)
 
-### Gateway-side enforcement
+See [Pi packages](/gh-aw/reference/engines/pi/#pi-extensions-extensions).
 
-The MCP gateway's `allowed:` filter is the sole effective tool boundary in `bypassPermissions` mode (and a second layer of enforcement otherwise). Always specify `allowed:` on each `mcp-servers:` entry to restrict which MCP tools are reachable:
+### Claude Tool Enforcement Security Model
 
-```yaml wrap
-mcp-servers:
-  notion:
-    container: "mcp/notion"
-    allowed: ["search_pages", "get_page"]   # enforced at gateway level
-```
+<span id="gateway-side-enforcement"></span>
 
-> [!WARNING]
-> Do not rely on `tools:` or `mcp-servers: allowed:` for security guarantees in `bypassPermissions` mode. The agent can already run arbitrary shell commands when unrestricted bash is granted, so `--allowed-tools` provides no meaningful additional boundary.
+See [Claude permissions and gateway enforcement](/gh-aw/reference/engines/claude/#claude-tool-enforcement-security-model).
 
-## Related Documentation
+### Shared imported engines
 
-- [Frontmatter](/gh-aw/reference/frontmatter/) - Complete configuration reference
-- [Tools](/gh-aw/reference/tools/) - Available tools and MCP servers
-- [Security Guide](/gh-aw/introduction/architecture/) - Security considerations for AI engines
-- [MCPs](/gh-aw/guides/mcps/) - Model Context Protocol setup and configuration
-- [Long Build Times](/gh-aw/reference/sandbox/#long-build-times) - Timeout tuning for large repositories
-- [Self-Hosted Runners](/gh-aw/reference/self-hosted-runners/) - Fast hardware for long-running workflows
+See [Custom AI engines](/gh-aw/reference/third-party-agent/#shared-imported-engines).
+
+### Unsupported engine samples
+
+See [third-party samples](/gh-aw/reference/third-party-agent/#unsupported-engine-samples),
+including the experimental Atomic declarative engine.

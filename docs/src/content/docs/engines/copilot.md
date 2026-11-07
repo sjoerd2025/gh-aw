@@ -1,51 +1,51 @@
 ---
-title: Run GitHub Copilot agents in GitHub Actions with gh-aw
-description: Configure gh-aw to run GitHub Copilot agents in GitHub Actions using Markdown workflows, GitHub triggers, and safe outputs.
+title: Using GitHub Copilot with GitHub Agentic Workflows
+description: Authenticate GitHub Copilot and run your first GitHub Agentic Workflow.
 ---
 
-GitHub Copilot is the default gh-aw engine and runs GitHub Copilot agents inside a GitHub Actions workflow. gh-aw provides the Markdown workflow format, event routing, sandbox controls, and safe outputs so the agent can analyze repository state and propose changes without direct write access.
+Run repository automation with your GitHub Copilot account. Copilot is the default engine; you do not need to select it explicitly.
 
-## Setup
+## Connect your account
 
-Set `engine: copilot` or omit `engine:` because Copilot is the default. For organization-billed usage, grant `copilot-requests: write`; otherwise provide a `COPILOT_GITHUB_TOKEN` secret. See [Copilot authentication](/gh-aw/reference/auth/#copilot_github_token) for both paths.
+Grant [`copilot-requests: write`](/gh-aw/reference/auth/#copilot-requests-write-permission) for organization-billed inference, as in the example below. To use a personal Copilot subscription instead, configure [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token).
+
+## Run a daily report
+
+After [setting up gh-aw](/gh-aw/setup/quick-start/), save this workflow:
 
 ```aw wrap title=".github/workflows/daily-status.md"
 ---
 on:
+  workflow_dispatch:
   schedule: daily
-
 permissions:
   contents: read
   issues: read
   pull-requests: read
   copilot-requests: write
-
 engine: copilot
-
+tools:
+  github:
+    toolsets: [issues, pull_requests]
 safe-outputs:
   create-issue:
     title-prefix: "[status] "
-    labels: [report]
-    close-older-issues: true
 ---
 
-# Daily Repository Status
+# Daily repository status
 
-Analyze the repository and create a concise daily status report covering:
-- Open issues and their priority
-- Recent PR activity
-- Upcoming work items
+Summarize open issues and recent pull request activity in one concise issue.
 ```
 
-## When to choose gh-aw vs. GitHub Copilot's native @copilot assignment
+Compile with `gh aw compile daily-status`, then commit and push both the Markdown and generated lock file. Run it from the repository's Actions tab or wait for its schedule.
 
-Choose gh-aw for scheduled or event-driven automation, Markdown-defined workflows, and validated safe outputs. Choose GitHub Copilot's native `@copilot` assignment when the task is interactive PR-level coding assistance driven directly from the pull request conversation.
+## Capabilities and limitations
 
-## Related pages
+For web search, configure an [MCP search server](/gh-aw/reference/web-search/). SDK mode, dynamic workflows, BYOK providers, and custom agents are covered in the [Copilot reference](/gh-aw/reference/engines/copilot/).
 
-- [Quick start](/gh-aw/setup/quick-start/)
-- [Engine reference](/gh-aw/reference/engines/)
-- [AI issue triage](/gh-aw/guides/ai-issue-triage/)
-- [Automated AI pull request review](/gh-aw/guides/automated-pr-review/)
-- [AI-generated release notes and reports](/gh-aw/guides/ai-release-notes/)
-- [Keeping documentation up to date automatically](/gh-aw/guides/docs-automation/)
+## Next steps
+
+- [GitHub Copilot technical reference](/gh-aw/reference/engines/copilot/)
+- [Create a workflow](/gh-aw/setup/creating-workflows/)
+- [Workflow examples](/gh-aw/gallery/)
+- [Compare engines](/gh-aw/reference/engines/#engine-feature-comparison)

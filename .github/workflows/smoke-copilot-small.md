@@ -3,6 +3,7 @@ private: true
 emoji: "🪶"
 description: Smoke Copilot Small
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-copilot-small
     strategy: centralized
@@ -19,10 +20,24 @@ model: small
 engine:
   id: copilot
   bare: true
+imports:
+  - shared/smoke-test-brevity.md
+  - shared/reporting.md
+  - shared/playwright-title-test.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: copilot-events
 tools:
   bash:
     - "*"
   edit:
+evals:
+  - id: haiku_file_readback
+    question: Does the output show readback of the run-specific file containing exactly three lines of a software-testing haiku?
+  - id: bash_calculation
+    question: Does the output show a bash calculation of 6 times 7 returning 42?
+  - id: browser_title_comparison
+    question: Does the output show that the JavaScript-rendered page title obtained with Playwright was compared for exact equality with the expected fixture title?
 safe-outputs:
   create-issue:
     expires: 2h
@@ -33,11 +48,12 @@ safe-outputs:
 timeout-minutes: 10
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Copilot Small Model Validation
-
-**IMPORTANT: Keep all outputs extremely short and concise.**
 
 ## Tasks
 

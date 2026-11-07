@@ -2,10 +2,12 @@ package workflow
 
 import (
 	"context"
+	"time"
 
 	actionpins "github.com/github/gh-aw/pkg/actionpins"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/workflow/aw"
 )
 
 var workflowDataLog = logger.New("workflow:workflow_data")
@@ -34,8 +36,14 @@ type SkipIfCheckFailingConfig struct {
 	AllowPending bool     // if true, pending/in-progress checks are not treated as failing (default: treat pending as failing)
 }
 type WorkflowData struct {
+	RepoProtectedFilesExclude      []string     // Repository-root path globs from aw.json, additive to handler exclusions
+	SourceDocument                 *aw.Document // Authored source before preprocessing, import merging, or defaults
+	WorkQueuePolicy                *WorkQueuePolicyConfig
+	workQueueRepoIssuesConfigured  bool
+	DryRun                         bool // Disable compiler-managed GitHub mutations while retaining local diagnostics
 	Name                           string
 	WorkflowID                     string           // workflow identifier derived from markdown filename (basename without extension)
+	CompiledVersion                string           // gh-aw compiler version emitted to generated install steps as GH_AW_COMPILED_VERSION (release tag for releases, "dev" for non-release builds) so the install script can resolve a compat.json window at runtime without churn
 	TrialMode                      bool             // whether the workflow is running in trial mode
 	TrialLogicalRepo               string           // target repository slug for trial mode (owner/repo)
 	UseSamples                     bool             // whether the agentic step should be replaced by a deterministic samples replay driver (hidden feature)
@@ -43,24 +51,39 @@ type WorkflowData struct {
 	FrontmatterEmoji               string           // emoji field from frontmatter (for display in footers and UI)
 	FrontmatterYAML                string           // raw frontmatter YAML content (rendered as comment in lock file for reference)
 	FrontmatterHash                string           // SHA-256 hash of frontmatter (computed before job building, used to derive stable heredoc delimiters)
+	BodyHash                       string           // SHA-256 hash of the markdown body (computed before job building)
 	FrontmatterFieldLines          map[string]int   // absolute 1-based line numbers of top-level frontmatter keys in the source file (populated by parser)
 	RawMarkdown                    string           // raw markdown body before include expansion, used for frontmatter hash computation without re-reading the file
 	Description                    string           // optional description rendered as comment in lock file
+	Intent                         string           // optional intent (durable outcome the workflow exists to achieve) rendered as comment in lock file
+	Docs                           string           // optional human-facing documentation URL preserved in lock metadata
 	Source                         string           // optional source field (owner/repo@ref/path) rendered as comment in lock file
 	Redirect                       string           // optional redirect field describing a moved workflow location
 	TrackerID                      string           // optional tracker identifier for created assets (min 8 chars, alphanumeric + hyphens/underscores)
-	MaxDailyAICredits              *string          // optional 24-hour per-workflow ET threshold (numeric string or GitHub Actions expression)
+	MaxDailyAICredits              *string          // optional 24-hour per-workflow AIC threshold (numeric string or GitHub Actions expression)
+	MaxDailyAICreditsExplicit      bool             // daily limit came from workflow/import configuration rather than the runtime default
+	MaxDailyAICBackend             string           // optional backend for the daily AIC guardrail ("repo-memory" for git-backed JSONL ledger)
 	MaxDailyAICreditsGitHubApp     *GitHubAppConfig // optional GitHub App for minting the token used by the daily AIC guardrail
+	MaxDailyAICContinueOnError     bool             // when true, unknown/unverifiable daily AIC accounting is a warning instead of failing closed
 	ImportedFiles                  []string         // list of files imported via imports field (rendered as comment in lock file)
 	Skills                         []string         // skill specs from frontmatter (owner/repo@sha or owner/repo/skill/path@sha)
 	SkillReferences                []SkillReference
+	Plugins                        []string
+	PluginReferences               []PluginReference
 	ImportedMarkdown               string   // Only imports WITH inputs (for compile-time substitution)
 	ImportPaths                    []string // Import file paths for runtime-import macro generation (imports without inputs)
 	PromptImports                  []parser.PromptImportEntry
-	MainWorkflowMarkdown           string         // main workflow markdown without imports (for runtime-import)
-	IncludedFiles                  []string       // list of files included via @include directives (rendered as comment in lock file)
-	ImportInputs                   map[string]any // input values from imports with inputs (for github.aw.inputs.* substitution)
+	MainWorkflowMarkdown           string               // main workflow markdown without imports (for runtime-import)
+	MainWorkflowPromptPath         string               // compiler-selected author source, not a runtime-import fragment
+	DeferredPromptExpressions      []*ExpressionMapping // prompt values resolved after activation in the agent job
+	IncludedFiles                  []string             // list of files included via @include directives (rendered as comment in lock file)
+	ImportInputs                   map[string]any       // input values from imports with inputs (for github.aw.inputs.* substitution)
 	On                             string
+	AdmissionEnabled               bool // Opt-in from on.admission or repository admission configuration
+	TokenBrokerEnabled             bool // True when at least one token-broker capability is enabled
+	TokenBrokerCopilotRequest      bool // Use the broker for Copilot inference authentication in supported jobs
+	TokenBrokerCopilotTask         bool // Use the broker for Copilot task creation and assignment
+	WebhookSubscriptions           []WebhookSubscription
 	Permissions                    string
 	Network                        string // top-level network permissions configuration
 	Concurrency                    string // workflow-level concurrency configuration
@@ -70,7 +93,8 @@ type WorkflowData struct {
 	If                             string
 	TimeoutMinutes                 string
 	CustomSteps                    string
-	PreSteps                       string // steps to run at the very start of the agent job, before checkout
+	PreSteps                       string // authored/imported steps to run at the very start of the agent job, before checkout
+	GeneratedPreSteps              string // compiler-owned pre-steps, kept separate from authored/imported steps for effect validation
 	PreAgentSteps                  string // steps to run immediately before the agent execution step
 	PostSteps                      string // steps to run after AI execution
 	RunsOn                         string
@@ -81,14 +105,22 @@ type WorkflowData struct {
 	Tools                          map[string]any
 	LSP                            map[string]LSPServerConfig // top-level LSP server configuration for Copilot CLI
 	ParsedTools                    *Tools                     // Structured tools configuration (NEW: parsed from Tools map)
+	LedgerConfig                   *LedgerToolConfig          // Standalone Git-backed ledger configuration
+	ExplicitlyDisabledTools        map[string]struct{}        // tool names explicitly set to false before default resolution mutates/removes their map entries
+	BashDisabled                   bool                       // true when tools.bash was fully and explicitly refused (bash: false, or bash: []) after default-tool resolution; used by engines that can fully disable shell execution (e.g. Codex's features.shell_tool=false), see EngineCapabilities.BashDisable
 	MarkdownContent                string
+	SubAgentModels                 []parser.SubAgentModel // models declared by inline and imported sub-agents
+	SubAgents                      []parser.InlineSubAgent
 	AI                             string        // "claude" or "codex" (for backwards compatibility)
 	Model                          string        // Top-level LLM model override (from frontmatter model: field or imports)
 	EngineConfig                   *EngineConfig // Extended engine configuration
-	AgentFile                      string        // Path to custom agent file (from imports)
-	AgentImportSpec                string        // Original import specification for agent file (e.g., "owner/repo/path@ref")
-	RepositoryImports              []string      // Repository-only imports (format: "owner/repo@ref") for .github folder merging
+	durableExecutionPlan           *DurableExecutionPlan
+	engineDefinition               *EngineDefinition // Per-workflow metadata, retained across batch compiler registry resets
+	AgentFile                      string            // Path to custom agent file (from imports)
+	AgentImportSpec                string            // Original import specification for agent file (e.g., "owner/repo/path@ref")
+	RepositoryImports              []string          // Repository-only imports (format: "owner/repo@ref") for .github folder merging
 	StopTime                       string
+	Cooldown                       time.Duration                   // minimum time between completed runs that executed the agent job
 	SkipIfMatch                    *SkipIfMatchConfig              // skip-if-match configuration with query and max threshold
 	SkipIfNoMatch                  *SkipIfNoMatchConfig            // skip-if-no-match configuration with query and min threshold
 	SkipIfCheckFailing             *SkipIfCheckFailingConfig       // skip-if-check-failing configuration
@@ -100,6 +132,7 @@ type WorkflowData struct {
 	OnRestoreMemory                bool                            // enable memory restore in pre-activation for on.steps via on.restore-memory (default false)
 	OnPermissions                  *Permissions                    // additional permissions for the pre-activation job from on.permissions
 	OnNeeds                        []string                        // custom workflow jobs that pre_activation/activation should depend on from on.needs
+	AmbientFolders                 []string                        // workspace-relative folders to bundle in the activation artifact and restore before the agent runs
 	ManualApproval                 string                          // environment name for manual approval from on: section
 	Command                        []string                        // for /command trigger support - multiple command names
 	CommandEvents                  []string                        // events where command should be active (nil = all events)
@@ -111,7 +144,7 @@ type WorkflowData struct {
 	LabelCommandDecentralized      bool                            // when true, label_command uses decentralized dispatch routing via agentic_commands.yml
 	LabelCommandOtherEvents        map[string]any                  // for merging label-command with other events
 	LabelCommandRemoveLabel        bool                            // whether to automatically remove the triggering label (default: true)
-	AIReaction                     string                          // AI reaction type like "eyes", "heart", etc.
+	AIReaction                     ReactionType                    // AI reaction type like "eyes", "heart", etc.
 	ReactionIssues                 *bool                           // whether reactions are allowed on issues/issue_comment triggers (default: true)
 	ReactionPullRequests           *bool                           // whether reactions are allowed on pull_request/pull_request_review_comment triggers (default: true)
 	ReactionDiscussions            *bool                           // whether reactions are allowed on discussion/discussion_comment triggers (default: true)
@@ -124,6 +157,7 @@ type WorkflowData struct {
 	TopLevelGitHubApp              *GitHubAppConfig                // top-level github-app fallback for all nested github-app token minting operations
 	LockForAgent                   bool                            // whether to lock the issue during agent workflow execution
 	Jobs                           map[string]any                  // custom job configurations with dependencies
+	AgentJobNeeds                  []string                        // resolved direct dependencies of the agent job
 	Cache                          string                          // cache configuration
 	NeedsTextOutput                bool                            // whether the workflow uses ${{ needs.task.outputs.text }}
 	NetworkPermissions             *NetworkPermissions             // parsed network permissions
@@ -132,11 +166,14 @@ type WorkflowData struct {
 	SafeOutputs                    *SafeOutputsConfig              // output configuration for automatic output routes
 	SafeOutputsInputEnvVars        map[string]string               // GH_AW_INPUT_* env vars referenced by safe-outputs config; populated during MCP setup generation so renderers can forward them to the nested container
 	MCPScripts                     *MCPScriptsConfig               // mcp-scripts configuration for custom MCP tools
+	Enclaves                       EnclavesConfig                  // AWF-owned private repository enclave executors
 	LabelNames                     []string                        // label names that must match for pull_request_target labeled events (on.labels)
 	Roles                          []string                        // permission levels required to trigger workflow
 	Bots                           []string                        // allow list of bot identifiers that can trigger workflow
 	RateLimit                      *RateLimitConfig                // rate limiting configuration for workflow triggers
 	CacheMemoryConfig              *CacheMemoryConfig              // parsed cache-memory configuration
+	DriveMemoryConfig              *DriveMemoryConfig              // parsed drive-memory configuration
+	CommentMemoryConfig            *CommentMemoryConfig            // parsed tools.comment-memory configuration
 	RepoMemoryConfig               *RepoMemoryConfig               // parsed repo-memory configuration
 	Runtimes                       map[string]any                  // runtime version overrides from frontmatter
 	ToolsTimeout                   string                          // timeout for tool/MCP operations: numeric string (seconds) or GitHub Actions expression (empty = use engine default)
@@ -157,6 +194,7 @@ type WorkflowData struct {
 	OTLPEndpoint                   string                          // resolved OTLP endpoint (from observability.otlp.endpoint, including imports; set by injectOTLPConfig)
 	OTLPHeaders                    string                          // normalized OTLP headers in key=value,key=value format (from observability.otlp.headers, including imports; set by injectOTLPConfig)
 	OTLPEndpoints                  string                          // JSON-encoded array of all OTLP endpoints (from observability.otlp.endpoints; set by injectOTLPConfig as GH_AW_OTLP_ENDPOINTS)
+	OTLPUsesEnterpriseDefaults     bool                            // true when the OTLP endpoint/headers come from the enterprise default vars/secrets rather than frontmatter (set by injectOTLPConfig)
 	ResolvedMCPServers             map[string]any                  // fully merged mcp-servers from main workflow and all imports (for mcp inspect)
 	ActionPinWarnings              map[string]bool                 // cache of already-warned action pin failures (key: "repo@version")
 	ActionMode                     ActionMode                      // action mode for workflow compilation (dev, release, script)
@@ -165,6 +203,7 @@ type WorkflowData struct {
 	CheckoutConfigs                []*CheckoutConfig               // user-configured checkout settings from frontmatter
 	CheckoutDisabled               bool                            // true when checkout: false is set in frontmatter, or auto-disabled for pull_request_target
 	CheckoutExplicitlyDisabled     bool                            // true only when checkout: false is explicitly set in frontmatter (not auto-disabled)
+	CheckoutSkipDefault            bool                            // true when permissions.contents: none skips only the default workflow-repository checkout
 	IsPullRequestTarget            bool                            // true when the workflow's on: triggers contain pull_request_target (but NOT pull_request)
 	HasDispatchItemNumber          bool                            // true when workflow_dispatch has item_number input (generated by label trigger shorthand)
 	ConcurrencyJobDiscriminator    string                          // optional discriminator expression appended to job-level concurrency groups (from concurrency.job-discriminator)
@@ -173,6 +212,7 @@ type WorkflowData struct {
 	UpdateCheckDisabled            bool                            // true when check-for-updates: false is set in frontmatter (disables version check step in activation job)
 	StaleCheckDisabled             bool                            // true when on.stale-check: false is set in frontmatter (disables frontmatter hash check step in activation job)
 	StaleCheckFull                 bool                            // true when on.stale-check: full is set in frontmatter (enables body hash check alongside frontmatter hash check)
+	ReportBlockedVersionDisabled   bool                            // true when on.report-blocked-version: false is set in frontmatter (disables the blocked-version notification issue in activation, independent of check-for-updates and safe-outputs.report-failure-as-issue)
 	EngineConfigSteps              []map[string]any                // steps returned by engine.RenderConfig — prepended before execution steps
 	ServicePortExpressions         string                          // comma-separated ${{ job.services['<id>'].ports['<port>'] }} expressions for AWF --allow-host-service-ports
 	RunInstallScripts              bool                            // true when runtimes.node.run-install-scripts: true is set (main workflow and/or imports); disables --ignore-scripts on generated npm install steps
@@ -183,7 +223,7 @@ type WorkflowData struct {
 	CachedConcurrencyGroupExprErr  error                           // cached result of validateConcurrencyGroupExpression(ConcurrencyGroupExpr); nil = valid; populated by applyDefaults
 	Experiments                    map[string][]string             // A/B testing experiments: maps experiment name to variant list (from frontmatter)
 	ExperimentConfigs              map[string]*ExperimentConfig    // Full A/B experiment metadata (populated alongside Experiments)
-	ExperimentsStorage             string                          // "cache" or "repo" (default "repo"); controls how experiment state is persisted across runs
+	ExperimentsStorage             ExperimentStorageMode           // "cache" or "repo" (default "repo"); controls how experiment state is persisted across runs
 	CachedConcurrencyGroupExprSet  bool                            // true once CachedConcurrencyGroupExprErr has been populated; distinguishes "valid (nil)" from "not yet computed"
 	CachedParsedToolsets           []string                        // cached result of ParseGitHubToolsets for the GitHub tool (for performance optimization); populated by applyDefaults
 	CachedAllowedDomainsStr        string                          // cached allowed-domains string for sanitization (for performance optimization); computed once and reused across multiple compilation steps
@@ -197,8 +237,13 @@ type WorkflowData struct {
 	ModelPolicyBlocked             []string                        // merged models.blocked policy list (union across imports + main frontmatter)
 	DefaultAiCreditsPricing        *AiCreditsPricingConfig         // fallback per-token pricing from frontmatter models.default-ai-credits-pricing; used by AWF API proxy for unrecognized models
 	ActionPinMappings              map[string]string               // action-pin redirect table from aw.json action_pins: maps "owner/repo@version" → "owner/repo@version"
+	generatedActionRefs            map[string]struct{}             // compiler-owned references, including tag fallbacks when SHA resolution is unavailable
+	ActionPinPrefixes              map[string]string               // repository-prefix redirects from aw.json action_pin_prefixes
+	ActionPinSourceVersions        map[string]string               // inline labels for frontmatter steps already pinned by SHA
 	ContainerPinMappings           map[string]string               // container-pin redirect table from aw.json container_pins: maps source image → replacement image
+	GHES                           bool                            // select action versions compatible with GitHub Enterprise Server
 	Evals                          *EvalsConfig                    // BinEval evaluation configuration parsed from frontmatter evals field
+	Graders                        *GradersConfig                  // Deterministic graders configuration parsed from frontmatter graders field
 	ExcludedEnv                    []string                        // additional env var names to exclude from agent container via AWF --exclude-env (from frontmatter excluded-env field)
 }
 
@@ -223,8 +268,10 @@ func (d *WorkflowData) PinContext() *actionpins.PinContext {
 		StrictMode:        d.StrictMode,
 		EnforcePinned:     true,
 		AllowActionRefs:   d.AllowActionRefs,
+		GHES:              d.GHES,
 		Warnings:          d.ActionPinWarnings,
 		Mappings:          d.ActionPinMappings,
+		SourceVersions:    d.ActionPinSourceVersions,
 		ContainerMappings: d.ContainerPinMappings,
 		RecordResolutionFailure: func(f actionpins.ResolutionFailure) {
 			d.ActionResolutionFailures = append(d.ActionResolutionFailures, GHAWManifestResolutionFailure{
@@ -234,6 +281,7 @@ func (d *WorkflowData) PinContext() *actionpins.PinContext {
 			})
 		},
 	}
+	pinCtx.PrefixMappings = d.ActionPinPrefixes
 	// Only set Resolver if non-nil to avoid passing a typed nil interface value
 	// (which would be non-nil in actionpins but crash on method call).
 	if d.ActionResolver != nil {

@@ -11,10 +11,34 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestValidateGitHubCLIProxyVersion(t *testing.T) {
+	workflowData := &WorkflowData{
+		Tools: map[string]any{
+			"github": map[string]any{"mode": "gh-proxy"},
+		},
+	}
+	require.NoError(t, validateGitHubCLIProxyVersion(workflowData))
+
+	workflowData.NetworkPermissions = &NetworkPermissions{
+		Firewall: &FirewallConfig{Enabled: true},
+	}
+	require.NoError(t, validateGitHubCLIProxyVersion(workflowData))
+
+	workflowData.NetworkPermissions.Firewall.Version = "v0.28.12"
+	err := validateGitHubCLIProxyVersion(workflowData)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tools.github.mode: gh-proxy requires AWF v0.28.13 or newer")
+	assert.Contains(t, err.Error(), "gh issue list or gh pr list")
+
+	workflowData.NetworkPermissions.Firewall.Version = "v0.28.13"
+	require.NoError(t, validateGitHubCLIProxyVersion(workflowData))
+}
 
 // TestValidateExpressions tests expression safety and runtime-import validation.
 func TestValidateExpressions(t *testing.T) {
@@ -138,39 +162,126 @@ func TestValidateFeatureConfig(t *testing.T) {
 }
 
 func TestEmitExperimentalFeatureWarningsGHAWDetection(t *testing.T) {
-	t.Setenv("GH_AW_FEATURES", "")
 	tests := []struct {
-		name          string
-		features      map[string]any
-		expectWarning bool
+		name            string
+		features        map[string]any
+		envFeatures     string
+		expectedEnabled bool
 	}{
 		{
-			name: "gh-aw-detection enabled produces experimental warning",
+			name:            "explicitly enabled",
+			expectedEnabled: true,
 			features: map[string]any{
 				"gh-aw-detection": true,
 			},
-			expectWarning: true,
 		},
 		{
-			name: "gh-aw-detection disabled does not produce experimental warning",
+			name:            "explicitly disabled",
+			expectedEnabled: false,
 			features: map[string]any{
 				"gh-aw-detection": false,
 			},
-			expectWarning: false,
 		},
 		{
-			name:          "no gh-aw-detection does not produce experimental warning",
-			features:      nil,
-			expectWarning: false,
+			name:            "enabled by default",
+			expectedEnabled: true,
+		},
+		{
+			name:            "enabled through environment",
+			envFeatures:     "gh-aw-detection",
+			expectedEnabled: true,
+		},
+		{
+			name:            "frontmatter overrides environment",
+			expectedEnabled: false,
+			features: map[string]any{
+				"gh-aw-detection": false,
+			},
+			envFeatures: "gh-aw-detection",
 		},
 	}
 
-	expectedMessage := "Using experimental feature: gh-aw-detection"
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GH_AW_FEATURES", tt.envFeatures)
+			workflowData := &WorkflowData{
+				Features: tt.features,
+			}
+			assert.Equal(t, tt.expectedEnabled, isFeatureEnabled(constants.GHAWDetectionFeatureFlag, workflowData))
+
+			for _, batchMode := range []bool{false, true} {
+				compiler := NewCompiler()
+				compiler.SetBatchMode(batchMode)
+				var output bytes.Buffer
+				compiler.emitExperimentalFeatureWarningsTo(workflowData, &output)
+
+				assert.Empty(t, output.String(), "batch mode: %t", batchMode)
+				assert.Zero(t, compiler.GetWarningCount(), "batch mode: %t", batchMode)
+				assert.Zero(t, compiler.GetExperimentalWarningCount(), "batch mode: %t", batchMode)
+				assert.Empty(t, compiler.GetExperimentalFeatureUsage(), "batch mode: %t", batchMode)
+			}
+		})
+	}
+}
+
+func TestEmitGeneralToolWarningsCloudHypervisorDoesNotWarn(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{
+		SandboxConfig: &SandboxConfig{
+			Agent: &AgentSandboxConfig{
+				Runtime: AgentRuntimeCloudHypervisor,
+			},
+		},
+	}
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	t.Cleanup(func() {
+		os.Stderr = oldStderr
+		_ = r.Close()
+	})
+
+	compiler.emitGeneralToolWarnings(workflowData, "test.md")
+
+	require.NoError(t, w.Close())
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, r)
+	require.NoError(t, err)
+	stderrOutput := buf.String()
+
+	assert.NotContains(t, stderrOutput, "sandbox.agent.runtime: cloud-hypervisor")
+	assert.Zero(t, compiler.GetWarningCount())
+}
+
+func TestEmitGeneralToolWarningsIgnoredFilesystemAllowWrite(t *testing.T) {
+	tests := []struct {
+		name          string
+		runtime       AgentRuntime
+		expectWarning bool
+	}{
+		{name: "docker runtime warns", runtime: AgentRuntimeDocker, expectWarning: true},
+		{name: "default runtime warns", runtime: "", expectWarning: true},
+		{name: "cloud-hypervisor runtime does not warn", runtime: AgentRuntimeCloudHypervisor, expectWarning: false},
+	}
+
+	const expectedMessage = "sandbox.agent.config.filesystem.allow-write is ignored for this runtime"
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			compiler := NewCompiler()
 			workflowData := &WorkflowData{
-				Features: tt.features,
+				SandboxConfig: &SandboxConfig{
+					Agent: &AgentSandboxConfig{
+						Runtime: tt.runtime,
+						Config: &SandboxRuntimeConfig{
+							Filesystem: &SRTFilesystemConfig{AllowWrite: []string{"/tmp/gh-aw/agent"}},
+						},
+					},
+				},
 			}
 
 			oldStderr := os.Stderr
@@ -179,14 +290,14 @@ func TestEmitExperimentalFeatureWarningsGHAWDetection(t *testing.T) {
 			os.Stderr = w
 			t.Cleanup(func() {
 				os.Stderr = oldStderr
-				_ = w.Close()
 				_ = r.Close()
 			})
 
-			compiler.emitExperimentalFeatureWarnings(workflowData)
+			compiler.emitGeneralToolWarnings(workflowData, "test.md")
 
 			require.NoError(t, w.Close())
 			os.Stderr = oldStderr
+
 			var buf bytes.Buffer
 			_, err = io.Copy(&buf, r)
 			require.NoError(t, err)
@@ -194,10 +305,8 @@ func TestEmitExperimentalFeatureWarningsGHAWDetection(t *testing.T) {
 
 			if tt.expectWarning {
 				assert.Contains(t, stderrOutput, expectedMessage)
-				assert.Positive(t, compiler.GetWarningCount())
 			} else {
 				assert.NotContains(t, stderrOutput, expectedMessage)
-				assert.Zero(t, compiler.GetWarningCount())
 			}
 		})
 	}
@@ -301,6 +410,101 @@ func TestValidatePermissions(t *testing.T) {
 						"otlp": map[string]any{
 							"github-app": map[string]any{},
 						},
+					},
+				},
+			},
+			shouldError:     false,
+			wantPermissions: true,
+		},
+		{
+			name: "http mcp github-oidc requires id-token write",
+			workflowData: &WorkflowData{
+				Name:            "Test",
+				MarkdownContent: "# Test",
+				AI:              "copilot",
+				Permissions:     "permissions:\n  contents: read\n",
+				Tools: map[string]any{
+					"oidc-server": map[string]any{
+						"type": "http",
+						"url":  "https://my-server.example.com/mcp",
+						"auth": map[string]any{
+							"type": "github-oidc",
+						},
+					},
+				},
+			},
+			shouldError:     true,
+			errorContains:   "mcp-servers.<name>.auth.type: github-oidc requires permissions.id-token: write",
+			wantPermissions: false,
+		},
+		{
+			name: "http mcp github-oidc with id-token write succeeds",
+			workflowData: &WorkflowData{
+				Name:            "Test",
+				MarkdownContent: "# Test",
+				AI:              "copilot",
+				Permissions:     "permissions:\n  contents: read\n  id-token: write\n",
+				Tools: map[string]any{
+					"oidc-server": map[string]any{
+						"type": "http",
+						"url":  "https://my-server.example.com/mcp",
+						"auth": map[string]any{
+							"type":     "github-oidc",
+							"audience": "https://my-server.example.com",
+						},
+					},
+				},
+			},
+			shouldError:     false,
+			wantPermissions: true,
+		},
+		{
+			name: "http mcp github-oidc with legacy AWF version is rejected",
+			workflowData: &WorkflowData{
+				Name:            "Test",
+				MarkdownContent: "# Test",
+				AI:              "copilot",
+				Permissions:     "permissions:\n  contents: read\n  id-token: write\n",
+				Tools: map[string]any{
+					"oidc-server": map[string]any{
+						"type": "http",
+						"url":  "https://my-server.example.com/mcp",
+						"auth": map[string]any{
+							"type": "github-oidc",
+						},
+					},
+				},
+				NetworkPermissions: &NetworkPermissions{
+					Firewall: &FirewallConfig{
+						Enabled: true,
+						Version: "v0.25.2", // older than AWFExcludeEnvMinVersion (v0.25.3)
+					},
+				},
+			},
+			shouldError:     true,
+			errorContains:   "mcp-servers.<name>.auth.type: github-oidc requires AWF v0.25.3 or newer",
+			wantPermissions: false,
+		},
+		{
+			name: "http mcp github-oidc with minimum required AWF version succeeds",
+			workflowData: &WorkflowData{
+				Name:            "Test",
+				MarkdownContent: "# Test",
+				AI:              "copilot",
+				Permissions:     "permissions:\n  contents: read\n  id-token: write\n",
+				Tools: map[string]any{
+					"oidc-server": map[string]any{
+						"type": "http",
+						"url":  "https://my-server.example.com/mcp",
+						"auth": map[string]any{
+							"type": "github-oidc",
+						},
+					},
+				},
+				NetworkPermissions: &NetworkPermissions{
+					Firewall: &FirewallConfig{
+						Enabled: true,
+						Version: "v0.25.3", // exactly AWFExcludeEnvMinVersion
 					},
 				},
 			},
@@ -445,7 +649,7 @@ func TestValidatePermissions_UsesCachedPermissionScopeValidation(t *testing.T) {
 	require.ErrorContains(t, err, cachedErr.Error())
 }
 
-func TestValidatePermissions_EmitsCopilotRequestsTipOncePerMarkdownPath(t *testing.T) {
+func TestValidatePermissions_EmitsCopilotRequestsTipOncePerCompiler(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "perms-tip-once-test")
 	markdownPath := filepath.Join(tmpDir, "test.md")
 
@@ -465,10 +669,188 @@ func TestValidatePermissions_EmitsCopilotRequestsTipOncePerMarkdownPath(t *testi
 		require.NoError(t, err)
 		_, err = compiler.validatePermissions(workflowData, markdownPath)
 		require.NoError(t, err)
+		compiler.ResetWarningCount()
+		_, err = compiler.validatePermissions(workflowData, filepath.Join(tmpDir, "another.md"))
+		require.NoError(t, err)
 	})
 
 	const tipText = "Tip: set permissions.copilot-requests: write to use GitHub Actions token-based inference"
-	assert.Equal(t, 1, strings.Count(stderr, tipText), "copilot-requests tip should be emitted only once per markdown path")
+	assert.Equal(t, 1, strings.Count(stderr, tipText), "copilot-requests tip should be emitted only once across workflows")
+	assert.Contains(t, stderr, "To suppress this tip when using a PAT, set permissions.copilot-requests: none")
+
+	stderr = testutil.CaptureStderr(t, func() {
+		_, err := NewCompiler().validatePermissions(workflowData, markdownPath)
+		require.NoError(t, err)
+	})
+	assert.Equal(t, 1, strings.Count(stderr, tipText), "a new compiler should emit the tip again")
+}
+
+func TestValidatePermissions_BatchCollectsCopilotRequestsTip(t *testing.T) {
+	workflowData := &WorkflowData{
+		AI:           "copilot",
+		Permissions:  "permissions:\n  contents: read\n",
+		EngineConfig: &EngineConfig{ID: "copilot"},
+	}
+	compiler := NewCompiler()
+	compiler.SetBatchMode(true)
+	compiler.SetQuiet(true)
+
+	stderr := testutil.CaptureStderr(t, func() {
+		for _, path := range []string{"first.md", "second.md"} {
+			_, err := compiler.validatePermissions(workflowData, path)
+			require.NoError(t, err)
+		}
+	})
+
+	assert.Empty(t, stderr)
+	assert.True(t, compiler.CopilotRequestsTipNeeded())
+}
+
+func TestValidatePermissions_QuietSuppressesCopilotRequestsTip(t *testing.T) {
+	workflowData := &WorkflowData{
+		Name:        "Test",
+		AI:          "copilot",
+		Permissions: "permissions:\n  contents: read\n",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+	}
+	compiler := NewCompiler()
+	compiler.SetQuiet(true)
+
+	stderr := testutil.CaptureStderr(t, func() {
+		_, err := compiler.validatePermissions(workflowData, "test.md")
+		require.NoError(t, err)
+	})
+
+	assert.NotContains(t, stderr, "Tip: set permissions.copilot-requests: write")
+}
+
+func TestEmitGeneralToolWarnings_PiThreatDetectionAuthWarning(t *testing.T) {
+	tests := []struct {
+		name        string
+		data        *WorkflowData
+		wantWarning bool
+	}{
+		{
+			name: "warns without Copilot authentication",
+			data: &WorkflowData{
+				AI:           "pi",
+				EngineConfig: &EngineConfig{ID: "pi"},
+				Permissions:  "permissions:\n  contents: read\n",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+			},
+			wantWarning: true,
+		},
+		{
+			name: "does not warn with copilot requests permission",
+			data: &WorkflowData{
+				AI:           "pi",
+				EngineConfig: &EngineConfig{ID: "pi"},
+				Permissions:  "permissions:\n  contents: read\n  copilot-requests: write\n",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+			},
+		},
+		{
+			name: "warns when token is configured only on the main Pi engine",
+			data: &WorkflowData{
+				AI: "pi",
+				EngineConfig: &EngineConfig{
+					ID: "pi",
+					Env: map[string]string{
+						"COPILOT_GITHUB_TOKEN": "${{ secrets.DETECTION_COPILOT_TOKEN }}",
+					},
+				},
+				Permissions: "permissions:\n  contents: read\n",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{},
+				},
+			},
+			wantWarning: true,
+		},
+		{
+			name: "does not warn with explicit detection Copilot token",
+			data: &WorkflowData{
+				AI:           "pi",
+				EngineConfig: &EngineConfig{ID: "pi"},
+				Permissions:  "permissions:\n  contents: read\n",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{
+						EngineConfig: &EngineConfig{
+							ID: "copilot",
+							Env: map[string]string{
+								"COPILOT_GITHUB_TOKEN": "${{ secrets.DETECTION_COPILOT_TOKEN }}",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "does not warn with Copilot BYOK credentials",
+			data: &WorkflowData{
+				AI: "pi",
+				EngineConfig: &EngineConfig{
+					ID: "pi",
+				},
+				Permissions: "permissions:\n  contents: read\n",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{
+						EngineConfig: &EngineConfig{
+							Env: map[string]string{
+								constants.CopilotProviderBaseURL:     "https://provider.example.com/v1",
+								constants.CopilotProviderAPIKey:      "${{ secrets.PROVIDER_API_KEY }}",
+								constants.CopilotProviderBearerToken: "",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "does not warn when threat detection is disabled",
+			data: &WorkflowData{
+				AI:           "pi",
+				EngineConfig: &EngineConfig{ID: "pi"},
+				Permissions:  "permissions:\n  contents: read\n",
+			},
+		},
+		{
+			name: "does not warn for a non-Copilot detection override",
+			data: &WorkflowData{
+				AI:           "pi",
+				EngineConfig: &EngineConfig{ID: "pi"},
+				Permissions:  "permissions:\n  contents: read\n",
+				SafeOutputs: &SafeOutputsConfig{
+					ThreatDetection: &ThreatDetectionConfig{
+						EngineConfig: &EngineConfig{ID: "codex"},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			stderr := testutil.CaptureStderr(t, func() {
+				compiler.emitGeneralToolWarnings(tt.data, "test.md")
+			})
+
+			const warning = "Threat detection for engine: pi runs on the GitHub Copilot CLI."
+			if tt.wantWarning {
+				assert.Contains(t, stderr, warning)
+				assert.Equal(t, 1, compiler.GetWarningCount())
+			} else {
+				assert.NotContains(t, stderr, warning)
+				assert.Zero(t, compiler.GetWarningCount())
+			}
+		})
+	}
 }
 
 func TestShouldEmitCopilotRequestsEnableTip(t *testing.T) {
@@ -534,7 +916,7 @@ func TestShouldEmitCopilotRequestsEnableTip(t *testing.T) {
 	}
 }
 
-func TestValidateToolConfiguration_EmitsSandboxWarningBeforeThreatDetectionError(t *testing.T) {
+func TestValidateToolConfiguration_DoesNotWarnForDisabledSandbox(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "tool-warning-test")
 	markdownPath := filepath.Join(tmpDir, "test.md")
 
@@ -544,7 +926,7 @@ func TestValidateToolConfiguration_EmitsSandboxWarningBeforeThreatDetectionError
 	workflowData := &WorkflowData{
 		Name: "Test",
 		Features: map[string]any{
-			"dangerously-disable-sandbox-agent": "controlled environment with no internet access",
+			"dangerously-disable-sandbox-agent": true,
 		},
 		SandboxConfig: &SandboxConfig{
 			Agent: &AgentSandboxConfig{Disabled: true},
@@ -562,8 +944,8 @@ func TestValidateToolConfiguration_EmitsSandboxWarningBeforeThreatDetectionError
 
 	require.Error(t, validateErr)
 	require.ErrorContains(t, validateErr, "threat detection requires sandbox.agent")
-	assert.Contains(t, stderr, "Agent sandbox disabled (sandbox.agent: false)")
-	assert.Equal(t, initialWarnings+1, compiler.GetWarningCount())
+	assert.NotContains(t, stderr, "sandbox.agent: false")
+	assert.Equal(t, initialWarnings, compiler.GetWarningCount())
 }
 
 // TestWarnPromptTmpPaths tests the /tmp path heuristic used by the compiler.

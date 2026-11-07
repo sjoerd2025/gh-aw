@@ -19,6 +19,54 @@ func TestLoadRepoConfig_FileNotFound(t *testing.T) {
 	assert.Nil(t, cfg.Maintenance, "maintenance config should be nil when file is absent")
 }
 
+func TestLoadRepoConfig_ProtectedFiles(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+		want    []string
+		invalid bool
+	}{
+		{name: "omitted", content: `{}`},
+		{name: "empty object", content: `{"protected_files":{}}`},
+		{name: "empty list", content: `{"protected_files":{"exclude":[]}}`, want: []string{}},
+		{name: "path globs", content: `{"protected_files":{"exclude":[".changeset/*.md","docs/**","README.md"]}}`, want: []string{".changeset/*.md", "docs/**", "README.md"}},
+		{name: "extension and directory scopes", content: `{"protected_files":{"exclude":["**/*.md","_/**","-/**","1/**"]}}`, want: []string{"**/*.md", "_/**", "-/**", "1/**"}},
+		{name: "bare wildcard", content: `{"protected_files":{"exclude":["*"]}}`, invalid: true},
+		{name: "bare wildcard mixed with scoped globs", content: `{"protected_files":{"exclude":[".changeset/*.md","*"]}}`, invalid: true},
+		{name: "recursive wildcard", content: `{"protected_files":{"exclude":["**"]}}`, invalid: true},
+		{name: "recursive path wildcard", content: `{"protected_files":{"exclude":["**/*"]}}`, invalid: true},
+		{name: "wildcard-only path", content: `{"protected_files":{"exclude":["*/**/*"]}}`, invalid: true},
+		{name: "rooted catch-all", content: `{"protected_files":{"exclude":["/**"]}}`, invalid: true},
+		{name: "extension catch-all", content: `{"protected_files":{"exclude":["**.*"]}}`, invalid: true},
+		{name: "dot-folder catch-all", content: `{"protected_files":{"exclude":[".*/**"]}}`, invalid: true},
+		{name: "rooted path glob", content: `{"protected_files":{"exclude":["/.changeset/*.md"]}}`, invalid: true},
+		{name: "rooted filename", content: `{"protected_files":{"exclude":["/README.md"]}}`, invalid: true},
+		{name: "leading whitespace", content: `{"protected_files":{"exclude":[" docs/**"]}}`, invalid: true},
+		{name: "trailing whitespace", content: `{"protected_files":{"exclude":["docs/** "]}}`, invalid: true},
+		{name: "embedded whitespace", content: `{"protected_files":{"exclude":["docs/a b.md"]}}`, invalid: true},
+		{name: "embedded tab", content: `{"protected_files":{"exclude":["docs/\tfile.md"]}}`, invalid: true},
+		{name: "embedded newline", content: `{"protected_files":{"exclude":["docs/\nfile.md"]}}`, invalid: true},
+		{name: "not an object", content: `{"protected_files":true}`, invalid: true},
+		{name: "unknown policy", content: `{"protected_files":{"policy":"allowed"}}`, invalid: true},
+		{name: "not a list", content: `{"protected_files":{"exclude":".changeset/*.md"}}`, invalid: true},
+		{name: "non-string entry", content: `{"protected_files":{"exclude":[1]}}`, invalid: true},
+		{name: "empty entry", content: `{"protected_files":{"exclude":[""]}}`, invalid: true},
+		{name: "blank entry", content: `{"protected_files":{"exclude":[" "]}}`, invalid: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeAWJSON(t, dir, tt.content)
+			cfg, err := LoadRepoConfig(dir)
+			if tt.invalid {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.ProtectedFiles.Exclude)
+		})
+	}
+}
+
 func TestLoadRepoConfig_MaintenanceFalse(t *testing.T) {
 	dir := t.TempDir()
 	writeAWJSON(t, dir, `{"maintenance": false}`)
@@ -60,6 +108,64 @@ func TestLoadRepoConfig_EmptyObject(t *testing.T) {
 	assert.False(t, cfg.MaintenanceDisabled, "maintenance should be enabled by default")
 	assert.Nil(t, cfg.Maintenance, "maintenance config should be nil when not specified")
 	assert.True(t, cfg.IsHelpCommandEnabled(), "help command should be enabled by default")
+}
+
+func TestLoadRepoConfig_StrictTrue(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"strict": true}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "aw.json should accept strict: true")
+	assert.True(t, cfg.Strict, "strict mode should be enforced")
+}
+
+func TestLoadRepoConfig_RequireSelfHostedRunners(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"require_self_hosted_runners": true}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err)
+	assert.True(t, cfg.RequireSelfHostedRunners)
+}
+
+func TestLoadRepoConfig_LockFileLogo(t *testing.T) {
+	assert.True(t, (*RepoConfig)(nil).IsLockFileLogoEnabled())
+	for _, tt := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"missing file", "", true},
+		{"omitted", `{}`, true},
+		{"enabled", `{"lock_file_logo": true}`, true},
+		{"disabled", `{"lock_file_logo": false}`, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.content != "" {
+				writeAWJSON(t, dir, tt.content)
+			}
+			cfg, err := LoadRepoConfig(dir)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.IsLockFileLogoEnabled())
+		})
+	}
+	for _, value := range []string{`"false"`, `0`, `null`} {
+		t.Run("invalid "+value, func(t *testing.T) {
+			dir := t.TempDir()
+			writeAWJSON(t, dir, `{"lock_file_logo": `+value+`}`)
+			_, err := LoadRepoConfig(dir)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestLoadRepoConfig_StrictFalseRejected(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"strict": false}`)
+
+	_, err := LoadRepoConfig(dir)
+	assert.Error(t, err, "aw.json should reject strict: false")
 }
 
 func TestLoadRepoConfig_HelpCommandFalse(t *testing.T) {
@@ -104,6 +210,18 @@ func TestLoadRepoConfig_ActionFailureIssueExpires(t *testing.T) {
 	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
 	assert.Equal(t, 72, cfg.Maintenance.ActionFailureIssueExpires, "action_failure_issue_expires should be parsed from aw.json")
 	assert.Equal(t, 72, cfg.ActionFailureIssueExpiresHours(), "accessor should return configured expiration")
+	assert.True(t, cfg.IsActionFailureIssueExpiresExplicit(), "explicit action_failure_issue_expires should be flagged as explicit")
+}
+
+func TestLoadRepoConfig_ActionFailureIssueExpiresNotExplicitWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"runs_on": "ubuntu-latest"}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err, "valid aw.json should load without error")
+	require.NotNil(t, cfg.Maintenance, "maintenance config should be set")
+	assert.Equal(t, DefaultActionFailureIssueExpiresHours, cfg.ActionFailureIssueExpiresHours(), "accessor should fall back to default")
+	assert.False(t, cfg.IsActionFailureIssueExpiresExplicit(), "action_failure_issue_expires should not be flagged explicit when absent from aw.json")
 }
 
 func TestLoadRepoConfig_MaintenanceCompileConfig(t *testing.T) {
@@ -210,7 +328,7 @@ func TestLoadRepoConfig_ContainerPinsKeyNoDigestAllowed(t *testing.T) {
 		},
 		{
 			name: "image without tag accepted",
-			key:  `"mcr.microsoft.com/playwright/mcp"`,
+			key:  `"alpine"`,
 		},
 		{
 			name:    "digest-pinned key rejected",
@@ -294,7 +412,27 @@ func TestLoadRepoConfig_DisabledJobs(t *testing.T) {
 	require.Len(t, cfg.Maintenance.DisabledJobs, 2, "disabled_jobs should be parsed")
 	assert.True(t, cfg.Maintenance.IsJobDisabled("close-expired-entities"), "hyphenated job name should match")
 	assert.True(t, cfg.Maintenance.IsJobDisabled("label_apply_safe_outputs"), "underscored lookup should match hyphen/underscore equivalently")
+	assert.False(t, cfg.Maintenance.IsJobDisabled("close.expired.entities"), "periods should not match hyphenated job names")
 	assert.False(t, cfg.Maintenance.IsJobDisabled("create_labels"), "unlisted jobs should remain enabled")
+}
+
+func TestLoadRepoConfig_DisabledManualMaintenanceJobs(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"maintenance": {"disabled_jobs": [
+		"run_operation", "update_pull_request_branches", "validate_workflows",
+		"activity_report", "forecast_report", "close_agentic_workflows_issues",
+		"create_labels", "cleanup-cache-memory"
+	]}}`)
+
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err)
+	for _, job := range []string{
+		"run_operation", "update_pull_request_branches", "validate_workflows",
+		"activity_report", "forecast_report", "close_agentic_workflows_issues",
+		"create_labels", "cleanup_cache_memory",
+	} {
+		assert.True(t, cfg.Maintenance.IsJobDisabled(job), "expected %s to be disabled", job)
+	}
 }
 
 func TestLoadRepoConfig_DisabledJobsRejectsInvalidOrDuplicateValues(t *testing.T) {
@@ -311,12 +449,17 @@ func TestLoadRepoConfig_DisabledJobsRejectsInvalidOrDuplicateValues(t *testing.T
 		{
 			name:     "normalization-equivalent duplicate rejected",
 			awJSON:   `{"maintenance": {"disabled_jobs": ["close-expired-entities", "close_expired_entities"]}}`,
-			contains: "duplicate entries",
+			contains: "duplicate maintenance.disabled_jobs entries",
 		},
 		{
 			name:     "unknown job rejected",
 			awJSON:   `{"maintenance": {"disabled_jobs": ["apply_safe_outputz"]}}`,
-			contains: "unrecognized job",
+			contains: "unrecognized maintenance.disabled_jobs entry",
+		},
+		{
+			name:     "operation name is not a job ID",
+			awJSON:   `{"maintenance": {"disabled_jobs": ["validate"]}}`,
+			contains: `unrecognized maintenance.disabled_jobs entry "validate"`,
 		},
 	}
 
@@ -410,7 +553,7 @@ func TestLoadRepoConfig_InvalidUTC(t *testing.T) {
 
 	_, err := LoadRepoConfig(dir)
 	require.Error(t, err, "invalid timezone should return an error")
-	require.ErrorContains(t, err, "utc must be a numeric UTC offset")
+	require.ErrorContains(t, err, "must be a numeric UTC offset")
 }
 
 // TestFormatRunsOn tests the YAML serialisation of runs-on values.
@@ -504,6 +647,23 @@ func TestLoadRepoConfig_AutoUpgradeCron(t *testing.T) {
 		assert.Empty(t, cfg.AutoUpgradeCron, "AutoUpgradeCron should be empty when cron is omitted")
 	})
 
+	t.Run("object form loads upgrade options", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{"auto_upgrade": {"options": ["--pre-releases"]}}`)
+
+		cfg, err := LoadRepoConfig(dir)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"--pre-releases"}, cfg.AutoUpgradeOptions)
+	})
+
+	t.Run("rejects unsupported upgrade options", func(t *testing.T) {
+		dir := t.TempDir()
+		writeAWJSON(t, dir, `{"auto_upgrade": {"options": ["--unknown"]}}`)
+
+		_, err := LoadRepoConfig(dir)
+		assert.Error(t, err, "unsupported auto-upgrade options should return an error")
+	})
+
 	t.Run("boolean true has no cron", func(t *testing.T) {
 		dir := t.TempDir()
 		writeAWJSON(t, dir, `{"auto_upgrade": true}`)
@@ -588,6 +748,18 @@ func TestLoadRepoConfig_ActionPins(t *testing.T) {
 		_, err := LoadRepoConfig(dir)
 		assert.Error(t, err, "value without @version should fail schema validation")
 	})
+}
+
+func TestLoadRepoConfig_ActionPinPrefixes(t *testing.T) {
+	dir := t.TempDir()
+	writeAWJSON(t, dir, `{"action_pin_prefixes": {"actions/": "mirror/actions-"}}`)
+	cfg, err := LoadRepoConfig(dir)
+	require.NoError(t, err)
+	assert.Equal(t, "mirror/actions-", cfg.ActionPinPrefixes["actions/"])
+
+	writeAWJSON(t, dir, `{"action_pin_prefixes": {"actions/": "mirror/actions-@v4"}}`)
+	_, err = LoadRepoConfig(dir)
+	require.Error(t, err, "prefix values must not contain action versions")
 }
 
 func TestValidateCronExpression(t *testing.T) {

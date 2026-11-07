@@ -2,17 +2,23 @@ package workflow
 
 import (
 	"fmt"
-	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 )
 
 var onNeedsValidationLog = logger.New("workflow:on_needs_validation")
 
-var onNeedsOutputExpressionPattern = regexp.MustCompile(`^\$\{\{\s*needs\.([A-Za-z_][A-Za-z0-9_-]*)\.outputs\.[A-Za-z_][A-Za-z0-9_-]*\s*\}\}$`)
+var onNeedsOutputExpressionPattern = actionslanguageservice.ReferencePattern(true, false, func(path []string) []string {
+	if len(path) == 4 && strings.EqualFold(path[0], "needs") && strings.EqualFold(path[2], "outputs") && credentialIdentifier(path[1], true) && credentialIdentifier(path[3], true) {
+		return []string{path[1]}
+	}
+	return nil
+})
 
 func (c *Compiler) validateOnNeeds(data *WorkflowData) error {
 	if data == nil {
@@ -22,6 +28,10 @@ func (c *Compiler) validateOnNeeds(data *WorkflowData) error {
 	onNeedsValidationLog.Printf("Validating on.needs: %d target(s), %d job(s)", len(data.OnNeeds), len(data.Jobs))
 
 	if err := validateOnNeedsTargets(data); err != nil {
+		return err
+	}
+
+	if err := c.validatePromptNeedsAvailableBeforeActivation(data); err != nil {
 		return err
 	}
 
@@ -36,6 +46,73 @@ func (c *Compiler) validateOnNeeds(data *WorkflowData) error {
 	return nil
 }
 
+func (c *Compiler) validatePromptNeedsAvailableBeforeActivation(data *WorkflowData) error {
+	if data == nil || len(data.Jobs) == 0 {
+		return nil
+	}
+
+	allowed := c.activationDependencySetForPromptNeeds(data)
+	runtimeMarkdown := c.collectRuntimeImportMarkdownForCompilerAnalysis(data)
+	promptMarkdown := data.MarkdownContent + "\n" + data.ImportedMarkdown + "\n" + runtimeMarkdown
+	extractor := NewExpressionExtractor()
+	mappings, err := extractor.ExtractExpressions(wrapExpressionsInTemplateConditionals(promptMarkdown))
+	if err != nil {
+		return err
+	}
+	beforeActivation := make([]string, 0, len(allowed))
+	for jobName := range allowed {
+		beforeActivation = append(beforeActivation, jobName)
+	}
+	for _, mapping := range mappings {
+		if canDeferPromptExpression(mapping, mappings, data.Jobs, beforeActivation, promptMarkdown) {
+			runtimeMarkdown = strings.ReplaceAll(runtimeMarkdown, mapping.Original, "")
+		}
+	}
+	for _, jobName := range extractNeedsJobReferencesFromPrompt(runtimeMarkdown) {
+		if _, isCustomJob := data.Jobs[jobName]; !isCustomJob || setutil.Contains(allowed, jobName) {
+			continue
+		}
+		return fmt.Errorf(
+			"prompt references needs.%s.* but custom job %q is not available before activation. Add it to on.needs, remove its explicit needs so gh-aw can add it automatically, or avoid evaluating it during activation",
+			jobName,
+			jobName,
+		)
+	}
+	return nil
+}
+
+func (c *Compiler) activationDependencySetForPromptNeeds(data *WorkflowData) map[string]struct{} {
+	allowed := make(map[string]struct{})
+	for _, jobName := range data.OnNeeds {
+		allowed[jobName] = struct{}{}
+	}
+	for _, jobName := range c.getCustomJobsDependingOnPreActivation(data.Jobs) {
+		allowed[jobName] = struct{}{}
+	}
+	for _, jobName := range c.getCustomJobsReferencedInPromptWithNoActivationDep(data) {
+		allowed[jobName] = struct{}{}
+	}
+	return allowed
+}
+
+func extractNeedsJobReferencesFromPrompt(promptContent string) []string {
+	seen := make(map[string]struct{})
+	var jobNames []string
+	for _, path := range interpolationReferences(wrapExpressionsInTemplateConditionals(promptContent)) {
+		if len(path) < 3 || !strings.EqualFold(path[0], "needs") {
+			continue
+		}
+		jobName := path[1]
+		if setutil.Contains(seen, jobName) {
+			continue
+		}
+		seen[jobName] = struct{}{}
+		jobNames = append(jobNames, jobName)
+	}
+	sort.Strings(jobNames)
+	return jobNames
+}
+
 func validateOnNeedsTargets(data *WorkflowData) error {
 	if len(data.OnNeeds) == 0 {
 		return nil
@@ -44,7 +121,7 @@ func validateOnNeedsTargets(data *WorkflowData) error {
 	customJobs := make(map[string]struct {
 	}, len(data.Jobs))
 	for jobName := range data.Jobs {
-		if isReservedOnNeedsTarget(jobName) {
+		if isReservedOnNeedsTarget(jobName, data.Jobs) {
 			continue
 		}
 		customJobs[jobName] = struct {
@@ -52,7 +129,7 @@ func validateOnNeedsTargets(data *WorkflowData) error {
 	}
 
 	for _, need := range data.OnNeeds {
-		if isReservedOnNeedsTarget(need) {
+		if isReservedOnNeedsTarget(need, data.Jobs) {
 			return fmt.Errorf(
 				"on.needs: built-in job %q is not allowed. Expected one of the workflow's custom jobs. Example: on.needs: [secrets_fetcher]",
 				need,
@@ -112,7 +189,7 @@ func (c *Compiler) validateOnGitHubAppNeedsExpressions(data *WorkflowData) error
 			continue
 		}
 
-		if isReservedOnNeedsTarget(jobName) {
+		if isReservedOnNeedsTarget(jobName, data.Jobs) {
 			return fmt.Errorf("on.github-app.%s: built-in job %q is not allowed in needs expressions", fieldName, jobName)
 		}
 		if _, exists := data.Jobs[jobName]; !exists {
@@ -197,7 +274,7 @@ func validateOnNeedsDependencyChain(
 	defer delete(visiting, current)
 
 	for _, dep := range parseNeedsField(jobConfig["needs"]) {
-		if isReservedOnNeedsTarget(dep) {
+		if isReservedOnNeedsTarget(dep, allJobs) {
 			return fmt.Errorf(
 				"on.needs: job %q depends on built-in job %q. Dependencies for on.needs jobs must be custom jobs that run before activation",
 				current,
@@ -245,7 +322,9 @@ func extractNeedsJobFromOutputExpression(value string) (string, bool) {
 	return match[1], true
 }
 
-func isReservedOnNeedsTarget(jobName string) bool {
+// isReservedOnNeedsTarget treats generated maintenance job names as reserved
+// only when the workflow does not author a custom job with that name.
+func isReservedOnNeedsTarget(jobName string, authoredJobs map[string]any) bool {
 	switch jobName {
 	case string(constants.AgentJobName),
 		string(constants.ActivationJobName),
@@ -255,11 +334,13 @@ func isReservedOnNeedsTarget(jobName string) bool {
 		string(constants.SafeOutputsJobName),
 		"safe-outputs",
 		string(constants.DetectionJobName),
-		string(constants.UnlockJobName),
-		"push_repo_memory",
-		"update_cache_memory":
+		string(constants.UnlockJobName):
 		return true
 	default:
-		return false
+		if _, authored := authoredJobs[jobName]; authored {
+			return false
+		}
+		_, maintenance := constants.MaintenanceJobDependencies[jobName]
+		return maintenance
 	}
 }

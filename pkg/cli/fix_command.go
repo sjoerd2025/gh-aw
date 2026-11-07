@@ -12,7 +12,7 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/workflow/aw"
 	"github.com/spf13/cobra"
 )
 
@@ -20,16 +20,19 @@ var fixLog = logger.New("cli:fix_command")
 
 // FixConfig contains configuration for the fix command
 type FixConfig struct {
-	WorkflowIDs        []string
-	Write              bool
-	Verbose            bool
-	WorkflowDir        string   // Custom workflow directory
-	DisabledCodemodIDs []string // Codemod IDs to skip
+	WorkflowIDs                []string
+	Write                      bool
+	Verbose                    bool
+	WorkflowDir                string   // Custom workflow directory
+	DisabledCodemodIDs         []string // Codemod IDs to skip
+	SkipInstructionFileUpdates bool
+	// OnApplied receives fixes only after the workflow migration completes successfully.
+	OnApplied func(file string, fixes []string)
 }
 
 // RunFix runs the fix command with the given configuration
 func RunFix(config FixConfig) error {
-	return runFixCommand(config.WorkflowIDs, config.Write, config.Verbose, config.WorkflowDir, config.DisabledCodemodIDs)
+	return runFixCommandWithResults(config.WorkflowIDs, config.Write, config.Verbose, config.WorkflowDir, config.DisabledCodemodIDs, config.SkipInstructionFileUpdates, config.OnApplied)
 }
 
 // NewFixCommand creates the fix command
@@ -78,7 +81,7 @@ all steps and additionally:
 				return listAvailableCodemods()
 			}
 
-			return runFixCommand(args, write, verbose, dir, disabledCodemods)
+			return runFixCommand(args, write, verbose, dir, disabledCodemods, false)
 		},
 	}
 
@@ -115,7 +118,11 @@ func listAvailableCodemods() error {
 }
 
 // runFixCommand runs the fix command on specified or all workflows
-func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir string, disabledCodemodIDs []string) error {
+func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir string, disabledCodemodIDs []string, skipInstructionFileUpdates bool) error {
+	return runFixCommandWithResults(workflowIDs, write, verbose, workflowDir, disabledCodemodIDs, skipInstructionFileUpdates, nil)
+}
+
+func runFixCommandWithResults(workflowIDs []string, write bool, verbose bool, workflowDir string, disabledCodemodIDs []string, skipInstructionFileUpdates bool, onApplied func(string, []string)) error { //nolint:largefunc // Existing command orchestration remains centralized.
 	fixLog.Printf("Running fix command: workflowIDs=%v, write=%v, verbose=%v, workflowDir=%s, disabledCodemodIDs=%v", workflowIDs, write, verbose, workflowDir, disabledCodemodIDs)
 
 	// Set up workflow directory (using default if not specified)
@@ -142,7 +149,7 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 		}
 	} else {
 		// Process all workflows in the workflow directory
-		files, err = getMarkdownWorkflowFiles(workflowDir)
+		files, err = getMarkdownWorkflowFilesRecursively(workflowDir)
 		if err != nil {
 			return err
 		}
@@ -183,30 +190,38 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 			continue
 		}
 
+		if write && fixed && onApplied != nil {
+			onApplied(file, appliedFixes)
+		}
 		totalFiles++
 		if fixed {
 			totalFixed++
 			if !write {
+				relativePath, relErr := filepath.Rel(workflowDir, file)
+				if relErr != nil {
+					relativePath = filepath.Base(file)
+				}
 				workflowsNeedingFixes = append(workflowsNeedingFixes, workflowFixInfo{
-					File:  filepath.Base(file),
+					File:  relativePath,
 					Fixes: appliedFixes,
 				})
 			}
 		}
 	}
 
-	// Update prompt and skill files (similar to init command)
-	// This ensures the latest templates are always used
-	fixLog.Print("Updating prompt and skill files")
+	if !skipInstructionFileUpdates {
+		// Update prompt and skill files (similar to init command)
+		// This ensures the latest templates are always used
+		fixLog.Print("Updating prompt and skill files")
 
-	// Update dispatcher skill
-	if err := ensureAgenticWorkflowsDispatcher(verbose, false, write); err != nil {
-		fixLog.Printf("Failed to update dispatcher skill: %v", err)
-		fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update dispatcher skill: %v", err)))
-	}
-	if err := ensureAgenticWorkflowsAgent(verbose, write); err != nil {
-		fixLog.Printf("Failed to update agentic workflows custom agent: %v", err)
-		fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to update agentic workflows custom agent: %v", err)))
+		if err := ensureAgenticWorkflowsDispatcher(verbose, false, write); err != nil {
+			fixLog.Printf("Failed to update dispatcher skill: %v", err)
+			fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Failed to update dispatcher skill: %v", err)))
+		}
+		if err := ensureAgenticWorkflowsAgent(verbose, write); err != nil {
+			fixLog.Printf("Failed to update agentic workflows custom agent: %v", err)
+			fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Failed to update agentic workflows custom agent: %v", err)))
+		}
 	}
 
 	// Delete old template files from pkg/cli/templates/ (only with --write)
@@ -214,16 +229,16 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 		fixLog.Print("Cleaning up old template files")
 		if err := deleteOldTemplateFiles(verbose); err != nil {
 			fixLog.Printf("Failed to delete old template files: %v", err)
-			fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to delete old template files: %v", err)))
+			fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Failed to delete old template files: %v", err)))
 		}
 	}
 
 	// Delete old agent files if write flag is set
-	if write {
+	if write && !skipInstructionFileUpdates {
 		fixLog.Print("Deleting old agent files")
 		if err := deleteLegacyAgentFiles(verbose); err != nil {
 			fixLog.Printf("Failed to delete old agent files: %v", err)
-			fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to delete old agent files: %v", err)))
+			fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Failed to delete old agent files: %v", err)))
 		}
 	}
 
@@ -234,7 +249,7 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 		if write {
 			if err := os.Remove(schemaPath); err != nil {
 				fixLog.Printf("Failed to delete schema file: %v", err)
-				fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to delete deprecated schema file: %v", err)))
+				fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(fmt.Sprintf("Failed to delete deprecated schema file: %v", err)))
 			} else {
 				fixLog.Print("Deleted deprecated schema file")
 				if verbose {
@@ -250,9 +265,10 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 	fmt.Fprintln(os.Stderr, "")
 	if write {
 		if totalFixed > 0 {
-			fmt.Fprintf(os.Stderr, "%s\n", console.FormatSuccessMessage(fmt.Sprintf("✓ Fixed %d of %d workflow files", totalFixed, totalFiles)))
+			fmt.Fprintf(os.Stderr, "%s\n", console.FormatSuccessMessage(fmt.Sprintf("Applied fixes to %d of %d workflow files", totalFixed, totalFiles)))
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Run gh aw compile --strict to check for remaining errors."))
 		} else if totalGuidedErrors == 0 && totalProcessingErrors == 0 {
-			fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("✓ No fixes needed"))
+			fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("No fixes needed"))
 		}
 	} else {
 		if totalFixed > 0 {
@@ -267,10 +283,10 @@ func runFixCommand(workflowIDs []string, write bool, verbose bool, workflowDir s
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Or fix them individually:"))
 			fmt.Fprintln(os.Stderr, "")
 			for _, wf := range workflowsNeedingFixes {
-				fmt.Fprintf(os.Stderr, "  gh aw fix %s --write\n", strings.TrimSuffix(wf.File, ".md"))
+				fmt.Fprintf(os.Stderr, "  gh aw fix %s --write\n", strings.TrimSuffix(filepath.ToSlash(wf.File), ".md"))
 			}
 		} else if totalGuidedErrors == 0 && totalProcessingErrors == 0 {
-			fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("✓ No workflow fixes needed"))
+			fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("No workflow fixes needed"))
 		}
 	}
 
@@ -306,44 +322,13 @@ func processWorkflowFileWithInfo(filePath string, codemods []Codemod, write bool
 		return false, nil, fmt.Errorf("failed to read file: %w", err)
 	}
 
-	originalContent := string(content)
-	currentContent := originalContent
-
-	// Track what was applied
-	var appliedCodemods []string
-	var hasChanges bool
-
-	// Apply each codemod
-	for _, codemod := range codemods {
-		fixLog.Printf("Attempting codemod: %s", codemod.ID)
-
-		// Re-parse frontmatter for each codemod to get fresh state
-		currentResult, err := parser.ExtractFrontmatterFromContent(currentContent)
-		if err != nil {
-			fixLog.Printf("Failed to parse frontmatter for codemod %s: %v", codemod.ID, err)
-			continue
-		}
-
-		newContent, applied, err := codemod.Apply(currentContent, currentResult.Frontmatter)
-		if err != nil {
-			fixLog.Printf("Codemod %s failed: %v", codemod.ID, err)
-			wrappedErr := fmt.Errorf("codemod %s failed: %w", codemod.ID, err)
-			if codemod.Guided {
-				return false, nil, &GuidedError{Cause: wrappedErr}
-			}
-			return false, nil, wrappedErr
-		}
-
-		if applied {
-			currentContent = newContent
-			appliedCodemods = append(appliedCodemods, codemod.Name)
-			hasChanges = true
-			fixLog.Printf("Applied codemod: %s", codemod.ID)
-		}
+	currentContent, appliedCodemods, err := applyCodemodsUntilStable(string(content), filePath, codemods)
+	if err != nil {
+		return false, nil, err
 	}
 
 	// If no changes, report and return
-	if !hasChanges {
+	if len(appliedCodemods) == 0 {
 		if verbose {
 			fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage(fmt.Sprintf("  %s - no fixes needed", filepath.Base(filePath))))
 		}
@@ -367,13 +352,68 @@ func processWorkflowFileWithInfo(filePath string, codemods []Codemod, write bool
 			fmt.Fprintf(os.Stderr, "    • %s\n", codemodName)
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage("⚠ "+fileName))
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatWarningMessage(""+fileName))
 		for _, codemodName := range appliedCodemods {
 			fmt.Fprintf(os.Stderr, "    • %s\n", codemodName)
 		}
 	}
 
 	return true, appliedCodemods, nil
+}
+
+const maxCodemodPasses = 3
+
+func applyCodemodsUntilStable(content, filePath string, codemods []Codemod) (string, []string, error) {
+	currentContent := content
+	var appliedCodemods []string
+	// Repeat the registry because a later codemod can enable an earlier one.
+	// Repeated content or reaching the pass limit indicates a non-converging registry.
+	seen := make(map[string]struct{})
+	for pass := range maxCodemodPasses {
+		if _, exists := seen[currentContent]; exists {
+			return "", nil, fmt.Errorf("codemods did not converge for %s", filepath.Base(filePath))
+		}
+		seen[currentContent] = struct{}{}
+		passStart := currentContent
+		for _, codemod := range codemods {
+			fixLog.Printf("Attempting codemod: %s", codemod.ID)
+
+			// Re-parse frontmatter for each codemod to get fresh state
+			currentResult, err := aw.Parse(currentContent)
+			if err != nil {
+				fixLog.Printf("Failed to parse frontmatter for codemod %s: %v", codemod.ID, err)
+				return "", nil, fmt.Errorf("parsing AW document for codemod %s: %w", codemod.ID, err)
+			}
+
+			newContent, applied, err := func() (string, bool, error) {
+				if codemod.ApplyWithContext != nil {
+					return codemod.ApplyWithContext(currentContent, currentResult.Frontmatter, filePath)
+				}
+				return codemod.Apply(currentContent, currentResult.Frontmatter)
+			}()
+			if err != nil {
+				fixLog.Printf("Codemod %s failed: %v", codemod.ID, err)
+				wrappedErr := fmt.Errorf("codemod %s failed: %w", codemod.ID, err)
+				if codemod.Guided {
+					return "", nil, &GuidedError{Cause: wrappedErr}
+				}
+				return "", nil, wrappedErr
+			}
+
+			if applied && newContent != currentContent {
+				currentContent = newContent
+				appliedCodemods = append(appliedCodemods, codemod.Name)
+				fixLog.Printf("Applied codemod: %s", codemod.ID)
+			}
+		}
+		if currentContent == passStart {
+			break
+		}
+		if pass == maxCodemodPasses-1 {
+			return "", nil, fmt.Errorf("codemods did not converge for %s", filepath.Base(filePath))
+		}
+	}
+	return currentContent, appliedCodemods, nil
 }
 
 const scaffoldedSerenaSharedWorkflow = `---

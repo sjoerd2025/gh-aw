@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import os from "os";
 import fs from "fs";
 import path from "path";
+import gooseSessions from "./fixtures/goose_ci_sessions.cjs";
+import piStream from "./fixtures/pi_ci_stream.cjs";
 
 let parseMaxAICreditsExceededFromAuditLog;
 let resolveAICreditsFailureState;
@@ -17,6 +19,8 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
     delete process.env.GH_AW_AIC;
     delete process.env.GH_AW_MAX_AI_CREDITS;
     delete process.env.GH_AW_AI_CREDITS_RATE_LIMIT_ERROR;
+    delete process.env.GH_AW_AGENT_CONCLUSION;
+    delete process.env.GH_AW_AWF_CONFIG_PATH;
     const mod = await import("./ai_credits_context.cjs");
     const exports = mod.default || mod;
     parseMaxAICreditsExceededFromAuditLog = exports.parseMaxAICreditsExceededFromAuditLog;
@@ -30,6 +34,8 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
     delete process.env.GH_AW_AIC;
     delete process.env.GH_AW_MAX_AI_CREDITS;
     delete process.env.GH_AW_AI_CREDITS_RATE_LIMIT_ERROR;
+    delete process.env.GH_AW_AGENT_CONCLUSION;
+    delete process.env.GH_AW_AWF_CONFIG_PATH;
   });
 
   function writeAuditLog(lines) {
@@ -39,6 +45,26 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
     fs.writeFileSync(logPath, lines.map(l => JSON.stringify(l)).join("\n") + "\n", "utf8");
     process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
     return logPath;
+  }
+
+  /**
+   * @param {unknown[]} lines
+   */
+  function writeTokenUsageLog(lines) {
+    const tokenUsageDir = path.join(tmpDir, "sandbox", "firewall", "audit", "api-proxy-logs");
+    fs.mkdirSync(tokenUsageDir, { recursive: true });
+    fs.writeFileSync(path.join(tokenUsageDir, "token-usage.jsonl"), lines.map(l => JSON.stringify(l)).join("\n") + "\n", "utf8");
+    process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
+  }
+
+  function writeAWFConfig(maxAiCredits) {
+    fs.writeFileSync(path.join(tmpDir, "awf-config.json"), JSON.stringify({ apiProxy: { enabled: true, maxAiCredits } }));
+    process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
+  }
+
+  function writeAgentStdio(content) {
+    fs.writeFileSync(path.join(tmpDir, "agent-stdio.log"), content, "utf8");
+    process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
   }
 
   describe("parseMaxAICreditsExceededFromAuditLog", () => {
@@ -102,9 +128,72 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
       writeAuditLog([{ type: "response", ai_credits_rate_limit_error: true, ai_credits: 105000, max_ai_credits: 100000 }]);
       expect(parseMaxAICreditsExceededFromAuditLog()).toBe(false);
     });
+
+    it("detects max_ai_credits_exceeded when trusted token-usage total reaches configured cap", () => {
+      writeAuditLog([{ type: "response", status: 200, max_ai_credits: 300 }]);
+      writeTokenUsageLog([
+        { status: 200, ai_credits_total: 299.5 },
+        { status: 200, ai_credits_total: 300 },
+      ]);
+      expect(parseMaxAICreditsExceededFromAuditLog()).toBe(true);
+    });
+
+    it("does not detect max_ai_credits_exceeded when trusted token-usage total is below cap", () => {
+      writeAuditLog([{ type: "response", status: 200, max_ai_credits: 300 }]);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 299.9 }]);
+      expect(parseMaxAICreditsExceededFromAuditLog()).toBe(false);
+    });
+
+    it("uses the compiled AWF cap when the audit log contains only network access entries", () => {
+      writeAuditLog([{ event: "http_access", status: 200 }]);
+      writeAWFConfig(240);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 240.22396 }]);
+      expect(parseMaxAICreditsExceededFromAuditLog()).toBe(true);
+    });
+
+    it("reads an explicit AWF config path when agent output is not configured", () => {
+      writeAWFConfig(240);
+      process.env.GH_AW_AWF_CONFIG_PATH = path.join(tmpDir, "awf-config.json");
+      delete process.env.GH_AW_AGENT_OUTPUT;
+      const auditPath = writeAuditLog([{ event: "http_access", status: 200 }]);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 240.22396 }]);
+      delete process.env.GH_AW_AGENT_OUTPUT;
+      expect(parseMaxAICreditsExceededFromAuditLog(auditPath)).toBe(true);
+    });
+
+    it.each([0, -1])("does not infer budget exhaustion with disabled cap %s", maxAiCredits => {
+      writeAuditLog([{ event: "http_access", status: 200 }]);
+      writeAWFConfig(maxAiCredits);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 240.22396 }]);
+      expect(parseMaxAICreditsExceededFromAuditLog()).toBe(false);
+    });
   });
 
   describe("resolveAICreditsFailureState maxAICreditsExceeded", () => {
+    const retryDiagnosticPrefixes = [
+      ...["", " (total retry wait time: 380.35 seconds)", " (Request-ID ABC123)", " (total retry wait time: 380.35 seconds) (Request-ID AC21:F5CEC:33A719:40DD88:6A83AA27)"].flatMap(metadata =>
+        ["", "."].map(punctuation => `Failed to get response from the AI model; retried 5 times${metadata}${punctuation} Last error: CAPIError: 429 Maximum AI credits exceeded`)
+      ),
+      "Execution failed: CAPIError: 429 Maximum AI credits exceeded",
+      "[sdk-driver] error: CAPIError: 429 Maximum AI credits exceeded",
+      "[copilot-sdk-driver] [sdk-driver] error: CAPIError: 429 Maximum AI credits exceeded",
+      "[copilot-sdk-driver] unhandled error: Error: CAPIError: 429 Maximum AI credits exceeded",
+      "[copilot-sdk-driver] error: API Error: 403 Maximum AI credits exceeded",
+      "[sdk-driver] error: Maximum AI credits exceeded",
+    ];
+    const piError = piStream.failure.find(event => event.type === "message_end" && event.message?.stopReason === "error").message;
+    const nativeErrorLines = [
+      ...["message_end", "turn_end"].map(type => message => JSON.stringify({ type, message: { ...piError, errorMessage: `403: ${message}` } })),
+      message => JSON.stringify({ type: "message_end", message: { ...piError, errorMessage: `403: ${JSON.stringify({ message })}` } }),
+      message => JSON.stringify({ ...gooseSessions.terminalFailure.at(-1), error: gooseSessions.terminalFailure.at(-1).error.replace("Maximum AI credits exceeded.", message) }),
+      message => JSON.stringify({ type: "session.error", data: { errorType: "sdk_driver", message: `API Error: 403 ${message}` } }),
+      message => JSON.stringify({ type: "session.error", data: { errorType: "sdk_driver", message: `CAPIError: 429 ${message}` } }),
+      message =>
+        `[gh-aw/pi-provider] 2026-10-16T14:00:00.000Z provider_error provider=copilot model=auto api=openai-responses status=403 method=POST url=http://api-proxy:10002/responses response_headers=content-type error=${JSON.stringify(message)}`,
+      message =>
+        `[gh-aw/pi-provider] 2026-10-16T14:00:00.000Z provider_error provider=copilot model=auto api=openai-responses status=403 method=POST url=http://api-proxy:10002/responses response_headers=content-type error=${JSON.stringify(JSON.stringify({ error: { message } }))}`,
+    ];
+
     it("returns maxAICreditsExceeded: true when budget_exceeded event is present", () => {
       writeAuditLog([{ event: "budget_exceeded", reason: "hard_limit", forced_termination: true, ai_credits: 105000, max_ai_credits: 100000 }]);
       const result = resolveAICreditsFailureState();
@@ -115,6 +204,62 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
       writeAuditLog([{ type: "request", ai_credits: 5000 }]);
       const result = resolveAICreditsFailureState();
       expect(result.maxAICreditsExceeded).toBe(false);
+    });
+
+    it("reports token totals against the compiled cap for a failed run with local proxy HTTP 403 evidence", () => {
+      writeAuditLog([{ event: "http_access", status: 200 }]);
+      writeAWFConfig(240);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 240.22396 }]);
+      writeAgentStdio("Authentication failed with provider at http://172.30.0.30:10002 (HTTP 403).");
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: "240.22396",
+        maxAICredits: "240",
+        aiCreditsRateLimitError: false,
+        maxAICreditsExceeded: true,
+      });
+    });
+
+    it("does not infer budget exhaustion from token totals without local proxy rejection evidence", () => {
+      writeAuditLog([{ event: "http_access", status: 200 }]);
+      writeAWFConfig(240);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 240.22396 }]);
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(false);
+    });
+
+    it("does not treat an unrelated provider HTTP 403 as local proxy rejection evidence", () => {
+      writeAuditLog([{ event: "http_access", status: 200 }]);
+      writeAWFConfig(240);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 240.22396 }]);
+      writeAgentStdio("Authentication failed with provider at https://api.github.com (HTTP 403).");
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(false);
+    });
+
+    it("uses trusted token totals when only the conclusion environment supplies the cap", () => {
+      writeAuditLog([{ event: "http_access", status: 200 }]);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 240.22396 }]);
+      writeAgentStdio("Authentication failed with provider at http://api-proxy:10002 (HTTP 403).");
+      process.env.GH_AW_MAX_AI_CREDITS = "240";
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(true);
+    });
+
+    it("does not infer budget exhaustion from environment totals alone", () => {
+      writeAuditLog([{ event: "http_access", status: 200 }]);
+      process.env.GH_AW_AIC = "240.22396";
+      process.env.GH_AW_MAX_AI_CREDITS = "240";
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(false);
+    });
+
+    it.each(["success", ""])("does not report budget failure for a completed run with conclusion %s", conclusion => {
+      writeAuditLog([{ event: "http_access", status: 200 }]);
+      writeAWFConfig(240);
+      writeTokenUsageLog([{ status: 200, ai_credits_total: 240.22396 }]);
+      process.env.GH_AW_AGENT_CONCLUSION = conclusion;
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(false);
     });
 
     it("maxAICreditsExceeded is independent of aiCreditsRateLimitError", () => {
@@ -134,15 +279,46 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
       expect(result.maxAICreditsExceeded).toBe(true);
     });
 
-    it("detects max-ai-credits exceeded signal from agent-stdio log", () => {
-      // Set GH_AW_AGENT_OUTPUT so the derived stdio-log path resolves to tmpDir.
-      process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
-      fs.writeFileSync(path.join(tmpDir, "agent-stdio.log"), "Failed to get response from the AI model; retried 5 times. Last error: CAPIError: 429 Maximum AI credits exceeded (1002.381900 / 1000).", "utf8");
+    it.each(retryDiagnosticPrefixes)("detects max-ai-credits exceeded signal from native retry diagnostic: %s", prefix => {
+      writeAgentStdio(`${prefix} (1002.381900 / 1000).`);
       const result = resolveAICreditsFailureState();
       expect(result.aiCredits).toBe("1002.381900");
       expect(result.maxAICredits).toBe("1000");
       expect(result.aiCreditsRateLimitError).toBe(true);
       expect(result.maxAICreditsExceeded).toBe(true);
+    });
+
+    it.each(retryDiagnosticPrefixes.flatMap(prefix => ["8.75 / 1000", "0 / 1000", "1 / 0"].map(pair => `${prefix} (${pair}).`)))("rejects under-cap or invalid credit pairs in native retry diagnostics: %s", diagnostic => {
+      writeAgentStdio(diagnostic);
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: "",
+        maxAICredits: "",
+        aiCreditsRateLimitError: false,
+        maxAICreditsExceeded: false,
+      });
+    });
+
+    it.each(
+      retryDiagnosticPrefixes.flatMap(prefix => {
+        const diagnostic = `${prefix} (1002.381900 / 1000).`;
+        return [
+          `Review example: "${diagnostic}"`,
+          JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: diagnostic }] } }),
+          JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: diagnostic }] } }),
+          JSON.stringify({ type: "item.completed", item: { type: "command_execution", aggregated_output: diagnostic } }),
+        ];
+      })
+    )("rejects quoted native retry diagnostics: %s", content => {
+      writeAWFConfig(1000);
+      writeTokenUsageLog([{ ai_credits_total: 8.747565 }]);
+      writeAgentStdio(content);
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: "8.747565",
+        maxAICredits: "1000",
+        aiCreditsRateLimitError: false,
+        maxAICreditsExceeded: false,
+      });
     });
 
     it("detects max-ai-credits exceeded from stdio log alone (no audit rate-limit signal)", () => {
@@ -155,6 +331,35 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
       expect(result.aiCredits).toBe("1002.381900");
     });
 
+    it.each([
+      ["no trailing record", ""],
+      ["an invalid pair", "CAPIError: 429 Maximum AI credits exceeded (1 / 0)."],
+      ["a quoted diagnostic", 'Review example: "CAPIError: 429 Maximum AI credits exceeded (2000 / 1000)."'],
+      ["a conversational JSON record", JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "CAPIError: 429 Maximum AI credits exceeded (2000 / 1000)." }] } })],
+      ["a below-cap pair", "CAPIError: 429 Maximum AI credits exceeded (500 / 1000)."],
+    ])("retains the last genuine stdio rejection with %s", (_description, trailingRecord) => {
+      writeAgentStdio(["CAPIError: 429 Maximum AI credits exceeded (1500 / 1000).", "CAPIError: 429 Maximum AI credits exceeded (1200 / 1000).", trailingRecord].join("\n"));
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: "1200",
+        maxAICredits: "1000",
+        aiCreditsRateLimitError: true,
+        maxAICreditsExceeded: true,
+      });
+    });
+
+    it("decodes native JSONL records once and recovers from corrupt neighbors", () => {
+      const record = JSON.stringify({ type: "error", message: "403 Forbidden: Maximum AI credits exceeded (1200 / 1000)." });
+      writeAgentStdio(`${record}\r\n{"broken":}\r\nAuthentication failed with provider at http://api-proxy:10000 (HTTP 403).`);
+      const parse = vi.spyOn(JSON, "parse");
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: "1200",
+        maxAICredits: "1000",
+        aiCreditsRateLimitError: true,
+        maxAICreditsExceeded: true,
+      });
+      expect(parse.mock.calls.filter(([text]) => text === record)).toHaveLength(1);
+    });
+
     it("sets exceeded flags but leaves credit amounts empty when no parenthetical is present", () => {
       process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
       fs.writeFileSync(path.join(tmpDir, "agent-stdio.log"), "Fatal: Maximum AI credits exceeded.", "utf8");
@@ -165,6 +370,117 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
       expect(result.maxAICredits).toBe("");
     });
 
+    it.each(nativeErrorLines.flatMap(makeLine => ["", " (1.025406 / 1)"].map(pair => [makeLine(`Maximum AI credits exceeded${pair}.`), pair])))("retains native transport rejection with optional usage pair: %s", (line, pair) => {
+      writeAgentStdio(line);
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: pair ? "1.025406" : "",
+        maxAICredits: pair ? "1" : "",
+        aiCreditsRateLimitError: true,
+        maxAICreditsExceeded: true,
+      });
+    });
+
+    it.each(
+      nativeErrorLines.flatMap(makeLine =>
+        [
+          "Maximum AI credits exceeded (0.5 / 1).",
+          "Maximum AI credits exceeded (1 / 0).",
+          `Maximum AI credits exceeded (${"9".repeat(400)} / 1).`,
+          "403 Maximum consecutive cache misses exceeded (5 / 5).",
+          'Review example: "403 Maximum AI credits exceeded (1.025406 / 1)."',
+        ].map(makeLine)
+      )
+    )("rejects invalid pairs, other guardrails and quotes in native errors: %s", line => {
+      writeAWFConfig(1);
+      writeTokenUsageLog([{ ai_credits_total: 1.025406 }]);
+      writeAgentStdio(line);
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: "1.025406",
+        maxAICredits: "1",
+        aiCreditsRateLimitError: false,
+        maxAICreditsExceeded: false,
+      });
+    });
+
+    it.each([
+      { message: "403 Maximum AI credits exceeded (1.025406 / 1)." },
+      { error: "403 Maximum AI credits exceeded (1.025406 / 1)." },
+      { type: "assistant", message: { ...piError, errorMessage: "403 Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "message_end", message: { ...piError, role: "toolResult", errorMessage: "403 Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "turn_end", message: { ...piError, stopReason: "stop", errorMessage: "403 Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "error", role: "assistant", error: "Maximum AI credits exceeded." },
+      { type: "error", role: "tool", message: "403 Maximum AI credits exceeded (1.025406 / 1)." },
+      { type: "session.error", data: { role: "tool", message: "403 Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "session.error", data: { severity: "warning", message: "403 Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "session.error", data: { message: '{"type":"assistant","message":"Maximum AI credits exceeded."}' } },
+      { type: "session.error", data: { message: '{"role":"tool","message":"Maximum AI credits exceeded."}' } },
+      { type: "session.error", data: { message: "403 Forbidden", output: "403 Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "session.error", data: { parentToolCallId: "tool-1", message: "403 Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "toolResponse", toolResult: { status: "error", value: "403 Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "message", message: { role: "assistant", content: [{ type: "error", error: "Maximum AI credits exceeded." }] } },
+    ])("rejects conversational or tool envelopes and unrelated error fields: %j", record => {
+      writeAgentStdio(JSON.stringify(record));
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(false);
+    });
+
+    it.each(nativeErrorLines.map(makeLine => makeLine("Maximum AI credits exceeded.")))("does not unwrap native errors quoted in conversation or tool output: %s", line => {
+      writeAgentStdio(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: line }] } }));
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(false);
+    });
+
+    it.each(["status=400", "status=429", "status=no-response", "status=200"])("requires HTTP 403 on Pi provider errors: %s", status => {
+      const line = nativeErrorLines.at(-2)("Maximum AI credits exceeded (1.025406 / 1).").replace("status=403", status);
+      writeAgentStdio(line);
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(false);
+    });
+
+    it.each([
+      { type: "item.completed", item: { type: "command_execution", aggregated_output: "403 Maximum AI credits exceeded (1.02 / 1)." } },
+      { type: "assistant", message: { content: [{ type: "text", text: "403 Maximum AI credits exceeded (1.02 / 1)." }] } },
+      { type: "user", message: { content: [{ type: "tool_result", content: "CAPIError: 429 Maximum AI credits exceeded (1.02 / 1)." }] } },
+      { type: "turn.failed", error: { message: "403 Forbidden" }, metadata: "403 Maximum AI credits exceeded (1.02 / 1)." },
+      { type: "turn.failed", error: { message: "403 Maximum consecutive cache misses exceeded (5 / 5)." } },
+    ])("does not classify quoted or unrelated credit evidence as budget exhaustion: %j", record => {
+      writeAWFConfig(1000);
+      writeTokenUsageLog([{ ai_credits_total: 8.747565 }]);
+      writeAgentStdio(JSON.stringify(record));
+      process.env.GH_AW_AGENT_CONCLUSION = "failure";
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: "8.747565",
+        maxAICredits: "1000",
+        aiCreditsRateLimitError: false,
+        maxAICreditsExceeded: false,
+      });
+    });
+
+    it.each([
+      { type: "error", message: "Reconnecting... 1/5 (unexpected status 403 Forbidden: Maximum AI credits exceeded (1.025406 / 1)., url: http://api-proxy:10000/responses)" },
+      { type: "turn.failed", error: { message: "unexpected status 403 Forbidden: Maximum AI credits exceeded (1.025406 / 1)." } },
+      { type: "assistant", is_api_error_message: true, error: "rate_limit", message: "API Error: 403 Maximum AI credits exceeded (1.025406 / 1)." },
+    ])("retains authentic proxy credit rejection: %j", record => {
+      writeAWFConfig(1);
+      writeAgentStdio(JSON.stringify(record));
+      expect(resolveAICreditsFailureState({ logProvenance: false })).toEqual({
+        aiCredits: "1.025406",
+        maxAICredits: "1",
+        aiCreditsRateLimitError: true,
+        maxAICreditsExceeded: true,
+      });
+    });
+
+    it.each([
+      "CAPIError: 429 Maximum AI credits exceeded (8.75 / 1000).",
+      "CAPIError: 429 Maximum AI credits exceeded (0 / 1000).",
+      "CAPIError: 429 Maximum AI credits exceeded (1 / 0).",
+      JSON.stringify({ type: "error", message: "403 Maximum AI credits exceeded (8.75 / 1000)." }),
+      'Review example: "CAPIError: 429 Maximum AI credits exceeded (1001 / 1000)."',
+      "The workflow discusses Maximum AI credits exceeded.",
+    ])("does not infer budget exhaustion from an invalid native diagnostic: %s", content => {
+      writeAgentStdio(content);
+      expect(resolveAICreditsFailureState({ logProvenance: false }).maxAICreditsExceeded).toBe(false);
+    });
+
     it("ignores env rate-limit signal when no AI credits evidence is present", () => {
       writeAuditLog([{ type: "response", status: 200 }]);
       process.env.GH_AW_AI_CREDITS_RATE_LIMIT_ERROR = "true";
@@ -173,6 +489,28 @@ describe("ai_credits_context max_ai_credits_exceeded detection", () => {
       expect(result.aiCreditsRateLimitError).toBe(false);
       expect(result.aiCredits).toBe("");
       expect(result.maxAICredits).toBe("1000");
+    });
+
+    it("reports aiCreditsRateLimitError when rate-limit signal present but under budget", () => {
+      // Reproduces the failing run scenario: gateway log detected a 429 while the agent
+      // was under budget (236 AIC used vs 1000 max).  Before the fix, the check
+      // `aiCredits >= maxAICredits` suppressed this signal, causing the conclusion handler
+      // to fall through to the generic "unexpected engine termination" path.
+      writeAuditLog([{ type: "response", ai_credits_rate_limit_error: true, ai_credits: 236, max_ai_credits: 1000 }]);
+      const result = resolveAICreditsFailureState();
+      expect(result.aiCreditsRateLimitError).toBe(true);
+      expect(result.maxAICreditsExceeded).toBe(false);
+    });
+
+    it("reports aiCreditsRateLimitError from env signal combined with env AIC evidence when under budget", () => {
+      writeAuditLog([{ type: "response", status: 200 }]);
+      process.env.GH_AW_AI_CREDITS_RATE_LIMIT_ERROR = "true";
+      process.env.GH_AW_AIC = "236.079";
+      process.env.GH_AW_MAX_AI_CREDITS = "1000";
+      const result = resolveAICreditsFailureState();
+      expect(result.aiCreditsRateLimitError).toBe(true);
+      expect(result.maxAICreditsExceeded).toBe(false);
+      expect(result.aiCredits).toBe("236.079");
     });
   });
 });
@@ -364,6 +702,123 @@ describe("ai_credits_context parseUnknownModelAICreditsAndModelFromAuditLog", ()
   });
 });
 
+describe("ai_credits_context parseMaxCacheMissesExceededFromEventLog", () => {
+  let tmpDir;
+  let parseMaxCacheMissesExceededFromEventLog;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aic-cache-misses-test-"));
+    delete process.env.GH_AW_AGENT_OUTPUT;
+    const mod = await import("./ai_credits_context.cjs");
+    const exports = mod.default || mod;
+    parseMaxCacheMissesExceededFromEventLog = exports.parseMaxCacheMissesExceededFromEventLog;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.GH_AW_AGENT_OUTPUT;
+  });
+
+  function writeEventLog(lines, filename = "event-logs.jsonl") {
+    const logDir = path.join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs");
+    fs.mkdirSync(logDir, { recursive: true });
+    const logPath = path.join(logDir, filename);
+    fs.writeFileSync(logPath, lines.map(l => JSON.stringify(l)).join("\n") + "\n", "utf8");
+    process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
+    return logPath;
+  }
+
+  it("detects max_cache_misses_exceeded in event-logs.jsonl", () => {
+    writeEventLog([{ type: "max_cache_misses_exceeded", consecutive_cache_misses: 6, max_cache_misses: 5 }]);
+    expect(parseMaxCacheMissesExceededFromEventLog()).toBe(true);
+  });
+
+  it("detects max_cache_misses_exceeded in events.jsonl fallback", () => {
+    writeEventLog([{ type: "max_cache_misses_exceeded", consecutive_cache_misses: 7, max_cache_misses: 5 }], "events.jsonl");
+    expect(parseMaxCacheMissesExceededFromEventLog()).toBe(true);
+  });
+
+  it("returns false when no matching event is present", () => {
+    writeEventLog([{ type: "response", status: 200 }]);
+    expect(parseMaxCacheMissesExceededFromEventLog()).toBe(false);
+  });
+
+  it("returns false for missing event log", () => {
+    process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
+    expect(parseMaxCacheMissesExceededFromEventLog("/nonexistent/path/event-logs.jsonl")).toBe(false);
+  });
+
+  it("does not detect other error types", () => {
+    writeEventLog([{ type: "unknown_model_ai_credits" }]);
+    expect(parseMaxCacheMissesExceededFromEventLog()).toBe(false);
+  });
+});
+
+describe("ai_credits_context parseAPIProxyGuardRejectionFromEventLog", () => {
+  let tmpDir;
+  let parseAPIProxyGuardRejectionFromEventLog;
+  let formatAPIProxyGuardRejection;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aic-proxy-guard-test-"));
+    delete process.env.GH_AW_AGENT_OUTPUT;
+    const mod = await import("./ai_credits_context.cjs");
+    const exports = mod.default || mod;
+    parseAPIProxyGuardRejectionFromEventLog = exports.parseAPIProxyGuardRejectionFromEventLog;
+    formatAPIProxyGuardRejection = exports.formatAPIProxyGuardRejection;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.GH_AW_AGENT_OUTPUT;
+  });
+
+  function writeEventLog(lines, filename = "event-logs.jsonl") {
+    const logDir = path.join(tmpDir, "sandbox", "firewall", "logs", "api-proxy-logs");
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(path.join(logDir, filename), lines.map(l => JSON.stringify(l)).join("\n") + "\n", "utf8");
+    process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
+  }
+
+  it("returns the guard name and counters for max_cache_misses_exceeded", () => {
+    writeEventLog([{ type: "max_cache_misses_exceeded", consecutive_cache_misses: 5, max_cache_misses: 5 }]);
+    expect(parseAPIProxyGuardRejectionFromEventLog()).toEqual({
+      guard: "max_cache_misses_exceeded",
+      counters: { consecutive_cache_misses: 5, max_cache_misses: 5 },
+    });
+  });
+
+  it("reads the token tracker audit log written by the proxy", () => {
+    writeEventLog([{ type: "max_cache_misses_exceeded", consecutive_cache_misses: 6, max_cache_misses: 5 }], "token-tracker-audit.jsonl");
+    expect(parseAPIProxyGuardRejectionFromEventLog()?.guard).toBe("max_cache_misses_exceeded");
+  });
+
+  it("detects the other api-proxy guardrails", () => {
+    writeEventLog([{ type: "permission_denied_limit_exceeded", permission_denied_count: 20, max_permission_denied: 20 }]);
+    expect(parseAPIProxyGuardRejectionFromEventLog()?.guard).toBe("permission_denied_limit_exceeded");
+  });
+
+  it("returns null when no guard rejection is present", () => {
+    writeEventLog([{ type: "response", status: 200 }]);
+    expect(parseAPIProxyGuardRejectionFromEventLog()).toBeNull();
+  });
+
+  it("returns null for a missing event log", () => {
+    process.env.GH_AW_AGENT_OUTPUT = path.join(tmpDir, "output.json");
+    expect(parseAPIProxyGuardRejectionFromEventLog("/nonexistent/path/event-logs.jsonl")).toBeNull();
+  });
+
+  it("formats the guard name with its counters", () => {
+    expect(formatAPIProxyGuardRejection({ guard: "max_cache_misses_exceeded", counters: { consecutive_cache_misses: 5, max_cache_misses: 5 } })).toBe("max_cache_misses_exceeded (consecutive_cache_misses=5, max_cache_misses=5)");
+    expect(formatAPIProxyGuardRejection({ guard: "model_policy_violation", counters: {} })).toBe("model_policy_violation");
+    expect(formatAPIProxyGuardRejection(null)).toBe("");
+  });
+});
+
 describe("ai_credits_context parseMaxAICreditsFromAuditLog", () => {
   let tmpDir;
   /** @type {(path?: string) => string} */
@@ -507,6 +962,21 @@ describe("ai_credits_context parseAICreditsErrorInfoFromAuditLog", () => {
 
   it("detects rate limit from message field text pattern", () => {
     writeAuditLog([{ message: "AI credits rate limit exceeded" }]);
+    expect(parseAICreditsErrorInfoFromAuditLog().rateLimitError).toBe(true);
+  });
+
+  it("ignores rate-limit text echoed in an MCP tool result", () => {
+    writeAuditLog([{ message: 'tool_result: {"title":"[aw] Workflow hit AI credits rate limit"}' }]);
+    expect(parseAICreditsErrorInfoFromAuditLog().rateLimitError).toBe(false);
+  });
+
+  it("ignores rate-limit keywords farther than 80 characters apart", () => {
+    writeAuditLog([{ message: `AI credits ${"x".repeat(79)} rate limit exceeded` }]);
+    expect(parseAICreditsErrorInfoFromAuditLog().rateLimitError).toBe(false);
+  });
+
+  it("detects nearby rate-limit keywords", () => {
+    writeAuditLog([{ message: `AI credits ${"x".repeat(78)} rate limit exceeded` }]);
     expect(parseAICreditsErrorInfoFromAuditLog().rateLimitError).toBe(true);
   });
 

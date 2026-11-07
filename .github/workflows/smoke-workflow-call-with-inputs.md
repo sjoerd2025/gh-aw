@@ -4,6 +4,7 @@ emoji: "🧪"
 name: Smoke Workflow Call with Inputs
 description: Reusable workflow with inputs - used to test that multiple callers don't clash on artifact names
 on:
+  schedule: every 2 days
   workflow_call:
     inputs:
       task-description:
@@ -11,6 +12,11 @@ on:
         required: false
         default: 'generic task'
         type: string
+      task-count:
+        description: 'Optional task count used to verify zero-valued numeric defaults'
+        required: false
+        default: 0
+        type: number
   workflow_dispatch:
     inputs:
       task-description:
@@ -18,6 +24,11 @@ on:
         required: false
         default: 'generic task'
         type: string
+      task-count:
+        description: 'Optional task count used to verify zero-valued numeric defaults'
+        required: false
+        default: 0
+        type: number
 permissions:
   contents: read
   issues: read
@@ -34,12 +45,20 @@ tools:
   bash:
     - "echo *"
     - "date"
+evals:
+  - id: task_echo
+    question: Does the output show execution of echo with Running task followed by this invocation's supplied task description?
+  - id: invocation_identification
+    question: Does the noop message include this invocation's actual task description rather than a hardcoded description from another invocation?
 safe-outputs:
   allowed-domains: [default-safe-outputs]
   noop:
 timeout-minutes: 5
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Workflow Call with Inputs
@@ -51,6 +70,7 @@ or sequentially in the same GitHub Actions workflow run.
 ## Task
 
 Task description: "${{ inputs.task-description }}"
+Task count: "${{ inputs.task-count }}"
 
 Execute `echo "Running task: ${{ inputs.task-description }}"` and then call the noop safe-output with
 a message that includes the task description so the invocation is identifiable in the logs.

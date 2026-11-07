@@ -1,6 +1,8 @@
 package workflow
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -39,26 +41,56 @@ type GHAWManifestContainer struct {
 // GHAWManifestResolutionFailure represents an action-ref pinning failure captured
 // during compilation. These failures are embedded for lock-file auditing.
 type GHAWManifestResolutionFailure struct {
-	Repo      string `json:"repo"`
-	Ref       string `json:"ref"`
-	ErrorType string `json:"error_type"`
+	Repo              string `json:"repo"`
+	Ref               string `json:"ref"`
+	ErrorType         string `json:"error_type"`
+	compilerGenerated bool
+}
+
+// GHAWManifestMemoryValidationScript represents a custom memory validation
+// script without storing its potentially sensitive source in the lock file.
+type GHAWManifestMemoryValidationScript struct {
+	Memory            string `json:"memory"`
+	SHA256            string `json:"sha256,omitempty"`
+	JSONSchemasSHA256 string `json:"json_schemas_sha256,omitempty"`
+}
+
+// GHAWManifestMCPServer represents an MCP server exposed to the agent and the
+// statically-declared tool names allowed for that server.
+type GHAWManifestMCPServer struct {
+	Name  string   `json:"name"`
+	Tools []string `json:"tools,omitempty"`
+}
+
+// GHAWManifestDetectionPolicy records the effective compiler policy independently
+// of the jobs, so deleting a detection job cannot masquerade as a disabled policy.
+type GHAWManifestDetectionPolicy struct {
+	Mode      string `json:"mode"`
+	Condition string `json:"condition,omitempty"`
 }
 
 // GHAWManifest is the single-line JSON payload embedded as a "# gh-aw-manifest: ..."
 // comment in generated lock files. It records the secrets, external actions, and
 // container images that were detected at the time the lock file was last compiled
 // so that subsequent compilations can detect newly introduced secrets when safe
-// update mode is enabled.
+// update mode is enabled. Webhook subscriptions declare discovery metadata for CAO.
 type GHAWManifest struct {
-	Version              int                             `json:"version"`
-	Secrets              []string                        `json:"secrets"`
-	Actions              []GHAWManifestAction            `json:"actions"`
-	Skills               []string                        `json:"skills,omitempty"`                  // frontmatter skill specs (owner/repo@sha or owner/repo/skill/path@sha), sorted
-	ResolutionFailures   []GHAWManifestResolutionFailure `json:"resolution_failures,omitempty"`     // unresolved action-ref pinning failures
-	Containers           []GHAWManifestContainer         `json:"containers,omitempty"`              // container images used, with digest when available
-	Redirect             string                          `json:"redirect,omitempty"`                // frontmatter redirect target for moved workflows
-	HasPullRequest       bool                            `json:"has_pull_request,omitempty"`        // whether on: includes pull_request
-	HasPullRequestTarget bool                            `json:"has_pull_request_target,omitempty"` // whether on: includes pull_request_target
+	Version                     int                                  `json:"version"`
+	Secrets                     []string                             `json:"secrets"`
+	Actions                     []GHAWManifestAction                 `json:"actions"`
+	Skills                      []string                             `json:"skills,omitempty"`                    // frontmatter skill specs (owner/repo@sha or owner/repo/skill/path@sha), sorted
+	Plugins                     []string                             `json:"plugins,omitempty"`                   // frontmatter plugin specs (owner/repository[/path]@sha), sorted
+	ResolutionFailures          []GHAWManifestResolutionFailure      `json:"resolution_failures,omitempty"`       // unresolved action-ref pinning failures
+	Containers                  []GHAWManifestContainer              `json:"containers,omitempty"`                // container images used, with digest when available
+	Redirect                    string                               `json:"redirect,omitempty"`                  // frontmatter redirect target for moved workflows
+	HasPullRequest              bool                                 `json:"has_pull_request,omitempty"`          // whether on: includes pull_request
+	HasPullRequestTarget        bool                                 `json:"has_pull_request_target,omitempty"`   // whether on: includes pull_request_target
+	MemoryValidationScripts     []GHAWManifestMemoryValidationScript `json:"memory_validation_scripts,omitempty"` // custom repo/cache memory validation scripts, hashed
+	MCPServers                  []GHAWManifestMCPServer              `json:"mcp_servers"`                         // MCP servers/tools exposed to the agent, independent of engine-specific allowlist syntax
+	ThreatDetectionSuppressions []ThreatDetectionSuppression         `json:"threat_detection_suppressions,omitempty"`
+	ThreatDetection             *GHAWManifestDetectionPolicy         `json:"threat_detection,omitempty"`
+	Admission                   bool                                 `json:"admission"`
+	WebhookSubscriptions        []WebhookSubscription                `json:"webhook_subscriptions,omitempty"`
 }
 
 // NewGHAWManifest builds a GHAWManifest from the raw secret names, action reference
@@ -72,8 +104,8 @@ type GHAWManifest struct {
 //
 // containers is the list of container image entries with full digest info (when available).
 // skillSpecs is the list of skill references from the workflow frontmatter.
-func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWManifestResolutionFailure, containers []GHAWManifestContainer, redirect string, skillSpecs []string, onField any) *GHAWManifest {
-	safeUpdateManifestLog.Printf("Building gh-aw-manifest: raw_secrets=%d, raw_actions=%d, containers=%d, skills=%d", len(secretNames), len(actionRefs), len(containers), len(skillSpecs))
+func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWManifestResolutionFailure, containers []GHAWManifestContainer, redirect string, skillSpecs []string, pluginSpecs []string, onField any) *GHAWManifest {
+	safeUpdateManifestLog.Printf("Building gh-aw-manifest: raw_secrets=%d, raw_actions=%d, containers=%d, skills=%d, plugins=%d", len(secretNames), len(actionRefs), len(containers), len(skillSpecs), len(pluginSpecs))
 
 	// Normalize secret names to full "secrets.NAME" form and deduplicate.
 	seen := make(map[string]struct {
@@ -92,18 +124,53 @@ func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWM
 	actions := parseActionRefs(actionRefs)
 	resolutionFailures := normalizeResolutionFailures(failures)
 
-	// Deduplicate container entries by image name and sort for deterministic output.
-	seenContainers := make(map[string]struct {
-	}, len(containers))
-	sortedContainers := make([]GHAWManifestContainer, 0, len(containers))
-	for _, c := range containers {
-		if c.Image != "" && !setutil.Contains(seenContainers, c.Image) {
-			seenContainers[c.Image] = struct {
-			}{}
-			sortedContainers = append(sortedContainers, c)
+	sortedContainers := normalizeManifestContainers(containers)
+
+	safeUpdateManifestLog.Printf("Manifest built: version=%d, secrets=%d, actions=%d, containers=%d, skills=%d",
+		currentGHAWManifestVersion, len(secrets), len(actions), len(sortedContainers), len(skillSpecs))
+
+	sortedSkills := normalizeManifestSpecs(skillSpecs)
+	sortedPlugins := normalizeManifestSpecs(pluginSpecs)
+
+	hasPR, hasPRTarget := detectPullRequestEvents(onField)
+
+	return &GHAWManifest{
+		Version:              currentGHAWManifestVersion,
+		Secrets:              secrets,
+		Actions:              actions,
+		Skills:               sortedSkills,
+		Plugins:              sortedPlugins,
+		ResolutionFailures:   resolutionFailures,
+		Containers:           sortedContainers,
+		Redirect:             strings.TrimSpace(redirect),
+		HasPullRequest:       hasPR,
+		HasPullRequestTarget: hasPRTarget,
+	}
+}
+
+func normalizeManifestSpecs(specs []string) []string {
+	seen := make(map[string]struct{}, len(specs))
+	var sorted []string
+	for _, spec := range specs {
+		if spec != "" && !setutil.Contains(seen, spec) {
+			seen[spec] = struct{}{}
+			sorted = append(sorted, spec)
 		}
 	}
-	slices.SortFunc(sortedContainers, func(a, b GHAWManifestContainer) int {
+	sort.Strings(sorted)
+	return sorted
+}
+
+func normalizeManifestContainers(containers []GHAWManifestContainer) []GHAWManifestContainer {
+	seen := make(map[string]struct{}, len(containers))
+	sorted := make([]GHAWManifestContainer, 0, len(containers))
+	for _, container := range containers {
+		if container.Image != "" && !setutil.Contains(seen, container.Image) {
+			seen[container.Image] = struct{}{}
+			sorted = append(sorted, container)
+		}
+	}
+	slices.SortFunc(sorted, func(a, b GHAWManifestContainer) int {
 		switch {
 		case a.Image < b.Image:
 			return -1
@@ -113,37 +180,7 @@ func NewGHAWManifest(secretNames []string, actionRefs []string, failures []GHAWM
 			return 0
 		}
 	})
-
-	safeUpdateManifestLog.Printf("Manifest built: version=%d, secrets=%d, actions=%d, containers=%d, skills=%d",
-		currentGHAWManifestVersion, len(secrets), len(actions), len(sortedContainers), len(skillSpecs))
-
-	// Deduplicate and sort skill specs for deterministic output.
-	seenSkills := make(map[string]struct{}, len(skillSpecs))
-	sortedSkills := make([]string, 0, len(skillSpecs))
-	for _, s := range skillSpecs {
-		if s != "" && !setutil.Contains(seenSkills, s) {
-			seenSkills[s] = struct{}{}
-			sortedSkills = append(sortedSkills, s)
-		}
-	}
-	sort.Strings(sortedSkills)
-	if len(sortedSkills) == 0 {
-		sortedSkills = nil // keep JSON output clean: omitempty omits nil but not empty slice
-	}
-
-	hasPR, hasPRTarget := detectPullRequestEvents(onField)
-
-	return &GHAWManifest{
-		Version:              currentGHAWManifestVersion,
-		Secrets:              secrets,
-		Actions:              actions,
-		Skills:               sortedSkills,
-		ResolutionFailures:   resolutionFailures,
-		Containers:           sortedContainers,
-		Redirect:             strings.TrimSpace(redirect),
-		HasPullRequest:       hasPR,
-		HasPullRequestTarget: hasPRTarget,
-	}
+	return sorted
 }
 
 func detectPullRequestEvents(onField any) (hasPR bool, hasPRTarget bool) {
@@ -168,6 +205,47 @@ func detectPullRequestEvents(onField any) (hasPR bool, hasPRTarget bool) {
 		_, hasPRTarget = v["pull_request_target"]
 	}
 	return hasPR, hasPRTarget
+}
+
+func collectMemoryValidationScripts(data *WorkflowData) []GHAWManifestMemoryValidationScript {
+	var scripts []GHAWManifestMemoryValidationScript
+	add := func(kind, id string, validation *MemoryValidationConfig) {
+		if validation == nil || (validation.Script == "" && len(validation.JSONSchemas) == 0) {
+			return
+		}
+		entry := GHAWManifestMemoryValidationScript{
+			Memory: kind + ":" + id,
+		}
+		if validation.Script != "" {
+			hash := sha256.Sum256([]byte(validation.Script))
+			entry.SHA256 = hex.EncodeToString(hash[:])
+		}
+		if len(validation.JSONSchemas) > 0 {
+			encoded, _ := json.Marshal(validation.JSONSchemas) //nolint:jsonmarshalignoredeerror // parsed schemas contain JSON-compatible values
+			hash := sha256.Sum256(encoded)
+			entry.JSONSchemasSHA256 = hex.EncodeToString(hash[:])
+		}
+		scripts = append(scripts, entry)
+	}
+	if data.RepoMemoryConfig != nil {
+		for _, memory := range data.RepoMemoryConfig.Memories {
+			add("repo-memory", memory.ID, memory.Validation)
+		}
+	}
+	if data.CacheMemoryConfig != nil {
+		for _, cache := range data.CacheMemoryConfig.Caches {
+			add("cache-memory", cache.ID, cache.Validation)
+		}
+	}
+	if data.DriveMemoryConfig != nil {
+		for _, drive := range data.DriveMemoryConfig.Drives {
+			add("drive-memory", drive.ID, drive.Validation)
+		}
+	}
+	slices.SortFunc(scripts, func(a, b GHAWManifestMemoryValidationScript) int {
+		return strings.Compare(a.Memory, b.Memory)
+	})
+	return scripts
 }
 
 // normalizeSecretName ensures a secret identifier is stored as a plain name
@@ -303,7 +381,7 @@ func normalizeResolutionFailures(failures []GHAWManifestResolutionFailure) []GHA
 func (m *GHAWManifest) ToJSON() (string, error) {
 	data, err := json.Marshal(m)
 	if err != nil {
-		return "", fmt.Errorf("failed to serialize gh-aw-manifest: %w", err)
+		return "", fmt.Errorf("gh-aw-manifest could not be serialized to JSON, expected fields that marshal cleanly: %w", err)
 	}
 	return string(data), nil
 }
@@ -313,15 +391,15 @@ func (m *GHAWManifest) ToJSON() (string, error) {
 // which is the normal state for lock files generated before this feature was
 // introduced.
 func ExtractGHAWManifestFromLockFile(content string) (*GHAWManifest, error) {
-	matches := ghawManifestPattern.FindStringSubmatch(content)
-	if len(matches) < 2 {
-		return nil, nil
+	match := ghawManifestPattern.FindString(content)
+	if _, payload, found := strings.Cut(match, ":"); found {
+		var m GHAWManifest
+		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+			return nil, fmt.Errorf("gh-aw-manifest JSON is not recognized, expected the JSON emitted by ToJSON in the lock file header: %w", err)
+		}
+		safeUpdateManifestLog.Printf("Extracted gh-aw-manifest: version=%d secrets=%d actions=%d",
+			m.Version, len(m.Secrets), len(m.Actions))
+		return &m, nil
 	}
-	var m GHAWManifest
-	if err := json.Unmarshal([]byte(matches[1]), &m); err != nil {
-		return nil, fmt.Errorf("failed to parse gh-aw-manifest JSON: %w", err)
-	}
-	safeUpdateManifestLog.Printf("Extracted gh-aw-manifest: version=%d secrets=%d actions=%d",
-		m.Version, len(m.Secrets), len(m.Actions))
-	return &m, nil
+	return nil, nil
 }

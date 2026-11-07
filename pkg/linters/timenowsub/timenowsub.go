@@ -8,41 +8,26 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the time-now-sub analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "timenowsub",
-	Doc:      "reports time.Now().Sub(t) calls that should be simplified to time.Since(t)",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/timenowsub",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("timenowsub", "reports time.Now().Sub(t) calls that should be simplified to time.Since(t)", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		analyzeTimeNowSub(pass, n, generatedFiles, noLintIndex)
 	})
-	return nil, nil
 }
 
 // analyzeTimeNowSub checks whether a call is a time.Now().Sub(t) that can be
@@ -54,7 +39,7 @@ func analyzeTimeNowSub(pass *analysis.Pass, n ast.Node, generatedFiles filecheck
 	}
 
 	// Match <expr>.Sub(<arg>) where <expr> is time.Now().
-	sel, ok := outer.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(outer.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Sub" {
 		return
 	}
@@ -62,7 +47,7 @@ func analyzeTimeNowSub(pass *analysis.Pass, n ast.Node, generatedFiles filecheck
 		return
 	}
 
-	nowCall, ok := sel.X.(*ast.CallExpr)
+	nowCall, ok := astutil.UnwrapParenExpr(sel.X).(*ast.CallExpr)
 	if !ok {
 		return
 	}
@@ -88,19 +73,22 @@ func analyzeTimeNowSub(pass *analysis.Pass, n ast.Node, generatedFiles filecheck
 	}
 	sinceText := qualifier + ".Since(" + argText + ")"
 
-	pass.Report(analysis.Diagnostic{
+	diag := analysis.Diagnostic{
 		Pos:     outer.Pos(),
 		End:     outer.End(),
 		Message: fmt.Sprintf("%s.Now().Sub(%s) can be simplified to %s", qualifier, argText, sinceText),
-		SuggestedFixes: []analysis.SuggestedFix{{
+	}
+	if !astutil.HasOverlappingComment(pass.Files, outer.Pos(), outer.End()) {
+		diag.SuggestedFixes = []analysis.SuggestedFix{{
 			Message: fmt.Sprintf("Replace %s.Now().Sub(%s) with %s", qualifier, argText, sinceText),
 			TextEdits: []analysis.TextEdit{{
 				Pos:     outer.Pos(),
 				End:     outer.End(),
 				NewText: []byte(sinceText),
 			}},
-		}},
-	})
+		}}
+	}
+	pass.Report(diag)
 }
 
 // timeNowQualifier reports the imported identifier used for time.Now().
@@ -108,11 +96,11 @@ func timeNowQualifier(pass *analysis.Pass, call *ast.CallExpr) (string, bool) {
 	if len(call.Args) != 0 {
 		return "", false
 	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Now" {
 		return "", false
 	}
-	ident, ok := sel.X.(*ast.Ident)
+	ident, ok := astutil.UnwrapParenExpr(sel.X).(*ast.Ident)
 	if !ok {
 		return "", false
 	}

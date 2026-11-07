@@ -12,23 +12,19 @@ import (
 var evalsConfigLog = logger.New("workflow:evals_config")
 
 // EvalDefinition represents a single binary evaluation question in a BinEval workflow.
-// Each question is evaluated independently and answered with YES or NO.
+// Questions share one Decisions request and receive YES, NO, or UNKNOWN choices.
 type EvalDefinition struct {
 	ID       string
 	Question string
-	// Model is an optional per-question model override. When set, it takes precedence over
-	// EvalsConfig.Model. Use a model alias such as "small" or a full model ID.
-	Model string
 }
 
 // EvalsConfig holds the configuration for BinEval-style evaluations declared in workflow
-// frontmatter. Evaluations run after safe-outputs and before the conclusion job.
+// frontmatter. Evaluations run after the agent, in parallel with safe-outputs.
 type EvalsConfig struct {
 	// Questions is the ordered list of binary evaluation questions.
 	Questions []EvalDefinition
-	// Model is the default LLM model to use for evaluations. Use a model alias such as
-	// "small" or a full model ID. Per-question Model fields override this value.
-	// When empty, the compiler default ("small") is used.
+	// Model is the Decisions-compatible model for the entire batch.
+	// When empty, copilot/gpt-6-luna-decisions is used, subject to GH_AW_DEFAULT_EVALS_MODEL.
 	Model string
 	// RunsOn allows overriding the runner for the evals job.
 	RunsOn string
@@ -54,7 +50,7 @@ func (ec *EvalsConfig) HasEvals() bool {
 //	  questions:
 //	    - id: builds
 //	      question: Does the generated code compile?
-//	  model: small
+//	  model: copilot/gpt-6-luna-decisions
 func (c *Compiler) parseEvalsFromFrontmatter(frontmatter map[string]any) (*EvalsConfig, error) {
 	raw, exists := frontmatter["evals"]
 	if !exists || raw == nil {
@@ -77,7 +73,7 @@ func (c *Compiler) parseEvalsFromFrontmatter(frontmatter map[string]any) (*Evals
 		if questionsRaw, ok := v["questions"]; ok {
 			questionsList, ok := questionsRaw.([]any)
 			if !ok {
-				return nil, fmt.Errorf("evals.questions: must be a list of question objects, got %T", questionsRaw)
+				return nil, fmt.Errorf("evals.questions must be a list of question objects, got %T. Example:\nevals:\n  questions:\n    - id: readme\n      question: Does the README explain setup?", questionsRaw)
 			}
 			questions, err := parseEvalDefinitions(questionsList)
 			if err != nil {
@@ -90,7 +86,7 @@ func (c *Compiler) parseEvalsFromFrontmatter(frontmatter map[string]any) (*Evals
 		if modelRaw, ok := v["model"]; ok {
 			modelStr, ok := modelRaw.(string)
 			if !ok {
-				return nil, fmt.Errorf("evals.model: must be a string, got %T", modelRaw)
+				return nil, fmt.Errorf("evals.model must be a string, got %T. Example:\nevals:\n  model: copilot/gpt-6-luna-decisions", modelRaw)
 			}
 			cfg.Model = strings.TrimSpace(modelStr)
 		}
@@ -101,20 +97,14 @@ func (c *Compiler) parseEvalsFromFrontmatter(frontmatter map[string]any) (*Evals
 		}
 
 	default:
-		return nil, errors.New("evals: must be a list of questions or an object with a questions list")
+		return nil, errors.New("evals must be a list of questions or an object with a questions list. Example:\nevals:\n  - id: readme\n    question: Does the README explain setup?")
 	}
 
 	if err := validateEvals(cfg); err != nil {
 		return nil, err
 	}
 
-	perQuestionOverrides := 0
-	for _, q := range cfg.Questions {
-		if q.Model != "" {
-			perQuestionOverrides++
-		}
-	}
-	evalsConfigLog.Printf("Parsed %d eval definitions (model: %q, per-question overrides: %d)", len(cfg.Questions), cfg.Model, perQuestionOverrides)
+	evalsConfigLog.Printf("Parsed %d eval definitions (Decisions model: %q)", len(cfg.Questions), cfg.Model)
 	return cfg, nil
 }
 
@@ -124,7 +114,7 @@ func parseEvalDefinitions(items []any) ([]EvalDefinition, error) {
 	for i, item := range items {
 		m, ok := item.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("item %d must be an object with id and question fields", i)
+			return nil, fmt.Errorf("evals item %d must be an object with 'id' and 'question' fields, got a different type. Example:\nevals:\n  - id: readme\n    question: Does the README explain setup?", i)
 		}
 		def, err := parseEvalDefinition(m, i)
 		if err != nil {
@@ -141,20 +131,20 @@ func parseEvalDefinition(m map[string]any, idx int) (EvalDefinition, error) {
 	questionRaw, hasQuestion := m["question"]
 
 	if !hasID {
-		return EvalDefinition{}, fmt.Errorf("item %d: missing required field 'id'", idx)
+		return EvalDefinition{}, fmt.Errorf("evals item %d is missing the required 'id' field. Example:\nevals:\n  - id: readme\n    question: Does the README explain setup?", idx)
 	}
 	if !hasQuestion {
-		return EvalDefinition{}, fmt.Errorf("item %d: missing required field 'question'", idx)
+		return EvalDefinition{}, fmt.Errorf("evals item %d is missing the required 'question' field. Example:\nevals:\n  - id: readme\n    question: Does the README explain setup?", idx)
 	}
 
 	id, ok := idRaw.(string)
 	if !ok || strings.TrimSpace(id) == "" {
-		return EvalDefinition{}, fmt.Errorf("item %d: 'id' must be a non-empty string", idx)
+		return EvalDefinition{}, fmt.Errorf("evals item %d has an 'id' that is not a non-empty string. Example:\nevals:\n  - id: readme\n    question: Does the README explain setup?", idx)
 	}
 
 	question, ok := questionRaw.(string)
 	if !ok || strings.TrimSpace(question) == "" {
-		return EvalDefinition{}, fmt.Errorf("item %d: 'question' must be a non-empty string", idx)
+		return EvalDefinition{}, fmt.Errorf("evals item %d has a 'question' that is not a non-empty string. Example:\nevals:\n  - id: readme\n    question: Does the README explain setup?", idx)
 	}
 
 	def := EvalDefinition{
@@ -162,13 +152,8 @@ func parseEvalDefinition(m map[string]any, idx int) (EvalDefinition, error) {
 		Question: strings.TrimSpace(question),
 	}
 
-	// Optional per-question model override.
-	if modelRaw, ok := m["model"]; ok {
-		modelStr, ok := modelRaw.(string)
-		if !ok {
-			return EvalDefinition{}, fmt.Errorf("item %d: 'model' must be a string, got %T", idx, modelRaw)
-		}
-		def.Model = strings.TrimSpace(modelStr)
+	if _, ok := m["model"]; ok {
+		return EvalDefinition{}, fmt.Errorf("evals question %q cannot override the model: all questions share one Decisions request. Set evals.model for the entire batch", id)
 	}
 
 	return def, nil
@@ -180,18 +165,21 @@ func validateEvals(cfg *EvalsConfig) error {
 		return nil
 	}
 	if len(cfg.Questions) == 0 {
-		return errors.New("evals: at least one question is required when evals is configured")
+		return errors.New("evals requires at least one question when configured. Example:\nevals:\n  - id: readme\n    question: Does the README explain setup?")
+	}
+	if len(cfg.Questions) > 400 {
+		return errors.New("evals supports at most 400 questions in one Decisions request. Reduce the question list to 400 or fewer")
 	}
 
 	seen := make(map[string]struct{}, len(cfg.Questions))
 	for i, q := range cfg.Questions {
 		if _, dup := seen[q.ID]; dup {
-			return fmt.Errorf("evals: duplicate id %q at index %d", q.ID, i)
+			return fmt.Errorf("evals has a duplicate id %q at index %d. Use a unique 'id' for each question. Example:\nevals:\n  - id: readme\n    question: Does the README explain setup?\n  - id: security\n    question: Are secrets handled safely?", q.ID, i)
 		}
 		seen[q.ID] = struct{}{}
 
 		if strings.TrimSpace(q.Question) == "" {
-			return fmt.Errorf("evals: question for id %q must be non-empty", q.ID)
+			return fmt.Errorf("evals question for id %q must be non-empty. Example:\nevals:\n  - id: %s\n    question: Does the README explain setup?", q.ID, q.ID)
 		}
 	}
 	return nil

@@ -7,9 +7,18 @@ sidebar:
 
 The [`safe-outputs:`](/gh-aw/reference/glossary/#safe-outputs) (validated GitHub operations) element of your workflow's [frontmatter](/gh-aw/reference/glossary/#frontmatter) declares that your agentic workflow should conclude with optional automated actions based on the agentic workflow's output. This enables your workflow to write content that is then automatically processed to create GitHub issues, comments, pull requests, or add labels - all without giving the agentic portion of the workflow any write permissions.
 
-Safe outputs enforce security through separation: agents run read-only and request actions via structured output, while separate permission-controlled jobs execute those requests. This provides least privilege, defense against prompt injection, auditability, and controlled limits per operation.
+Safe outputs separate action requests from execution: the agent requests actions through structured output, and separate permission-controlled jobs execute permitted requests. This separation limits the agent's direct permissions and supports validation, auditability and per-operation limits.
 
-When no `safe-outputs:` section is present (or when only [system types](#system-types-auto-enabled) are configured), `create-issue` is automatically enabled with conservative defaults (`max: 1`, labels and title-prefix set to the workflow ID). To opt out, add an explicit `safe-outputs:` section with the outputs you want.
+Configured outputs may publish content, update metadata or merge pull requests automatically. Review requirements depend on the output configuration and applicable policy gates.
+
+When no `safe-outputs:` section is present (or when only [system types](#system-types-auto-enabled) are configured), `create-issue` is automatically enabled with conservative defaults (`max: 1`, labels and title-prefix set to the workflow ID).
+
+Setting `create-issue: false` disables the `create_issue` tool and its automatic reporting instruction while leaving system outputs enabled:
+
+```yaml wrap
+safe-outputs:
+  create-issue: false
+```
 
 Example:
 
@@ -20,9 +29,80 @@ safe-outputs:
 
 The agent requests issue creation; a separate job with `issues: write` creates it.
 
+## CLI Payloads
+
+When the runtime exposes safe outputs through the `safeoutputs` CLI, tool names
+use underscores, such as `create_issue`. Run `safeoutputs --help` to list
+available tools and `safeoutputs create_issue --help` for that tool's schema.
+Calls request real actions for downstream processing; they are not previews.
+
+Pass a complete JSON object as one single-quoted shell argument:
+
+```bash
+safeoutputs create_issue '{"title":"Documentation findings","body":"First finding.\nSecond finding."}'
+```
+
+Inside JSON strings, encode newlines as `\n`, double quotes as `\"`, backslashes
+as `\\`, and apostrophes as `\u0027` to preserve the surrounding shell quote.
+For a Markdown report already saved in a file, per-field stdin avoids manually
+escaping its body:
+
+```bash
+cat /tmp/gh-aw/agent/report.md | safeoutputs create_issue --title "Documentation findings" --body .
+```
+
+The `--body .` form supplies the text to one field. The bare
+`safeoutputs create_issue .` form instead requires the entire stdin content to
+be a valid JSON object. Raw Markdown is not valid input for that bare form,
+and `{"body": .}` is not valid JSON. Use only tools and shell operations
+available in the workflow's runtime.
+
+## Output Dependencies
+
+Each recorded safe-output call returns a unique, compact URL-safe `output_id`,
+such as `so_AbCdEf012345`. This identifies the queued operation,
+not a created issue or pull request. It is distinct from `temporary_id` (`aw_…`),
+which remains the mechanism for referencing newly created resources.
+
+For handler-managed safe outputs, `depends-on` is available by default and is
+optional; omit it to run an operation independently. When provided, it accepts
+one `output_id` or a nonempty array of distinct identifiers. All prerequisites
+must complete successfully before the dependent operation runs. For example,
+after a call returns the identifier above:
+
+```json
+{
+  "item_number": 123,
+  "body": "The prerequisite update completed.",
+  "depends-on": "so_AbCdEf012345"
+}
+```
+
+The identifier acknowledges recording, not execution success. If a prerequisite
+fails, its dependents fail without executing, including transitive dependents.
+Skipped, cancelled, staged, deferred, or delegated results do not establish
+success. Missing, ambiguous, or cyclic dependencies also fail closed. Independent
+outputs retain their existing behavior and policy checks.
+
+`submit_pull_request_review` and `create_pull_request_review_comment` can be
+prerequisites. Inline comments and the review body are buffered and submitted
+together at the end of message processing, before dependent outputs run.
+Buffering alone does not confirm success: dependents wait for submission and
+run only if their prerequisite was actually published.
+Review comments released by a dependency are submitted in a subsequent batch.
+
+Dependencies apply within a single safe-output processing pass (and within the
+same Claim in queue workflows). Custom safe jobs, `call_workflow`,
+`push_repo_memory`, `upload_asset`, `noop`, and out-of-band diagnostics
+(`report_incomplete`, `report_missing_tool`, `report_missing_data`) reject
+`depends-on`. `upload_code_coverage`, `dispatch_workflow`, `dispatch_repository`,
+and custom action outputs delegate effects outside this manager, so they cannot
+establish successful prerequisites. Dependencies do not provide rollback for
+operations that have already succeeded.
+
 ## Available Safe Output Types
 
-The tables below summarize the built-in safe output handlers. `noop`, `missing-tool`, and `missing-data` are always available, and `create-issue` is auto-injected only when no non-system safe outputs are configured.
+The tables below summarize the built-in safe output handlers. `noop`, `report-missing-tool`, and `report-missing-data` are always available, and `create-issue` is auto-injected only when no non-system safe outputs are configured and it is not explicitly disabled.
 
 ### Issues & Discussions
 
@@ -43,6 +123,7 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 | [Create PR](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-creation-create-pull-request) | `create-pull-request` | Create pull requests with code changes (default max: 1, configurable) |
 | [Update PR](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-updates-update-pull-request) | `update-pull-request` | Update PR title or body (max: 1) |
 | [Close PR](/gh-aw/reference/safe-outputs-pull-requests/#close-pull-request-close-pull-request) | `close-pull-request` | Close pull requests without merging (max: 10) |
+| [Approve Workflow Run](/gh-aw/reference/safe-outputs-pull-requests/#approve-workflow-run-approve-workflow-run) | `approve-workflow-run` | Approve a pending workflow run in the "action required" state (max: 1) |
 | [Merge PR](/gh-aw/reference/safe-outputs-pull-requests/#merge-pull-request-merge-pull-request) | `merge-pull-request` | Merge pull requests after policy gates pass (max: 1, experimental) |
 | [PR Review Comments](/gh-aw/reference/safe-outputs-pull-requests/#pr-review-comments-create-pull-request-review-comment) | `create-pull-request-review-comment` | Create review comments on code lines (max: 10) |
 | [Reply to PR Review Comment](/gh-aw/reference/safe-outputs-pull-requests/#reply-to-pr-review-comment-reply-to-pull-request-review-comment) | `reply-to-pull-request-review-comment` | Reply to existing review comments (max: 10) |
@@ -56,7 +137,7 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 |--------|-----|-------------|
 | [Add Comment](#comment-creation-add-comment) | `add-comment` | Post comments on issues, PRs, or discussions (max: 1) |
 | [Hide Comment](#hide-comment-hide-comment) | `hide-comment` | Hide comments on issues, PRs, or discussions (max: 5) |
-| [Add Labels](#add-labels-add-labels) | `add-labels` | Add labels to issues or PRs (max: 3) |
+| [Add Labels](#add-labels-add-labels) | `add-labels` | Add labels to issues or PRs (max: 5 calls) |
 | [Remove Labels](#remove-labels-remove-labels) | `remove-labels` | Remove labels from issues or PRs (max: 3) |
 | [Assign Milestone](#assign-milestone-assign-milestone) | `assign-milestone` | Assign issues to milestones (max: 1) |
 | [Assign to Agent](#assign-to-agent-assign-to-agent) | `assign-to-agent` | Assign Copilot coding agent to issues or PRs (max: 1) |
@@ -65,6 +146,15 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 | [Set Issue Type](#set-issue-type-set-issue-type) | `set-issue-type` | Set or clear the type of GitHub issues (max: 5) |
 | [Set Issue Field](#set-issue-field-set-issue-field) | `set-issue-field` | Set one issue field value by name/value (max: 5) |
 
+### External Integrations
+
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Jira Create Issue](#jira-safe-outputs) | `jira-create-issue` | Create a Jira issue (max: 1) |
+| [Jira Update Issue](#jira-safe-outputs) | `jira-update-issue` | Update a Jira issue summary or description (max: 1) |
+| [Jira Add Comment](#jira-safe-outputs) | `jira-add-comment` | Add a comment to a Jira issue (max: 1) |
+| [Jira Add Label](#jira-safe-outputs) | `jira-add-label` | Add one label to a Jira issue (max: 1) |
+
 ### Projects, Releases & Assets
 
 | Output | Key | Description |
@@ -72,9 +162,20 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 | [Create Project](#project-creation-create-project) | `create-project` | Create new GitHub Projects boards (max: 1, cross-repo) |
 | [Update Project](#project-board-updates-update-project) | `update-project` | Manage GitHub Projects boards (max: 10, same-repo only) |
 | [Create Project Status Update](#project-status-updates-create-project-status-update) | `create-project-status-update` | Create project status updates |
-| [Update Release](#release-updates-update-release) | `update-release` | Update GitHub release descriptions (max: 1) |
+| [Update Release](#release-updates-update-release) | `update-release` | Update GitHub release descriptions; requires an existing GitHub Release, not just a Git tag (max: 1) |
 | [Upload Artifact](#artifact-uploads-upload-artifact) | `upload-artifact` | Upload files as run-scoped GitHub Actions artifacts (max: 1 by default) |
 | [Upload Assets](#asset-uploads-upload-asset) | `upload-asset` | Upload files to orphaned git branch (max: 10, same-repo only). **Prefer `upload-artifact` with `skip-archive` instead.** |
+
+### Azure DevOps Work Items
+
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Create Work Item](#azure-devops-work-items) | `ado-create-work-item` | Create an Azure DevOps work item (max: 1, experimental) |
+| [Update Work Item](#azure-devops-work-items) | `ado-update-work-item` | Update explicitly enabled fields on a scoped work item (max: 1, experimental) |
+| [Comment on Work Item](#azure-devops-work-items) | `ado-comment-on-work-item` | Add a comment to a scoped work item (max: 1, experimental) |
+| [Assign Work Item](#azure-devops-work-items) | `ado-assign-work-item` | Assign an allowed identity to a scoped work item (max: 1, experimental) |
+| [Link Work Items](#azure-devops-work-items) | `ado-link-work-items` | Link two scoped work items (max: 5, experimental) |
+| [Upload Work Item Attachment](#azure-devops-work-items) | `ado-upload-workitem-attachment` | Attach a staged workspace file to a work item (max: 1, experimental) |
 
 ### Security & Agent Tasks
 
@@ -82,28 +183,172 @@ The tables below summarize the built-in safe output handlers. `noop`, `missing-t
 |--------|-----|-------------|
 | [Dispatch Workflow](#workflow-dispatch-dispatch-workflow) | `dispatch-workflow` | Trigger other workflows with inputs (max: 3, same-repo only) |
 | [Call Workflow](#workflow-call-call-workflow) | `call-workflow` | Call reusable workflows via compile-time fan-out (max: 1, same-repo only) |
-| [Dispatch Repository Event](#repository-dispatch-dispatch-repository) | `dispatch-repository` | Trigger `repository_dispatch` events in external repositories, experimental (cross-repo) |
+| [Dispatch Repository Event](#repository-dispatch-dispatch-repository) | `dispatch-repository` | Trigger `repository_dispatch` events in external repositories (cross-repo) |
 | [Code Scanning Alerts](#code-scanning-alerts-create-code-scanning-alert) | `create-code-scanning-alert` | Generate SARIF security advisories (max: unlimited, same-repo only) |
 | [Autofix Code Scanning Alerts](#autofix-code-scanning-alerts-autofix-code-scanning-alert) | `autofix-code-scanning-alert` | Create automated fixes for code scanning alerts (max: 10, same-repo only) |
 | [Create Check Run](#check-run-creation-create-check-run) | `create-check-run` | Create GitHub Check Runs to surface analysis results in the PR checks UI (default max: 1, same-repo only) |
 | [Create Agent Session](/gh-aw/reference/copilot-cloud-agent/#create-agent-session) | `create-agent-session` | Create Copilot coding agent sessions (max: 1) |
 
+### Linear
+
+| Output | Key | Description |
+|--------|-----|-------------|
+| [Create Linear Issue](#linear-safe-outputs) | `linear-create-issue` | Create an issue in a configured Linear team (max: 1, experimental) |
+| [Add Linear Comment](#linear-safe-outputs) | `linear-add-comment` | Comment on a configured Linear issue (max: 1, experimental) |
+| [Update Linear Issue](#linear-safe-outputs) | `linear-update-issue` | Update enabled fields on a configured Linear issue (max: 1, experimental) |
+
+#### Linear Safe Outputs
+
+:::caution[Experimental]
+Linear Safe Outputs are experimental. Compiling a workflow that enables any Linear Safe Output emits `Using experimental feature: Linear safe outputs`.
+:::
+
+Linear Safe Outputs use Linear's public GraphQL API from the isolated `safe_outputs` job. Configure a personal Linear API key through a secret expression. The credential is not available to the agent.
+
+```yaml wrap
+safe-outputs:
+  linear-token: ${{ secrets.LINEAR_API_KEY }}
+  linear-create-issue:
+    team-id: "ENG"
+    project-id: "810f57a7e383"
+    max: 1
+  linear-add-comment:
+    target: "ENG-123"
+  linear-update-issue:
+    target: "ENG-123"
+    title: true
+    body: true
+```
+
+`team-id` accepts a Linear team model UUID, team key such as `ENG`, team name, or a GitHub Actions expression such as `${{ secrets.LINEAR_TEAM_ID }}`. UUIDs are passed directly to Linear; keys and names are resolved through the Linear API, with key matches taking precedence. Optional `project-id` fixes new issues to a trusted project and accepts either the 12-character identifier from a Linear project URL or its model UUID. When omitted, the compiler loads `LINEAR_TEAM_ID` from a repository or organization secret and `LINEAR_PROJECT_ID` from a same-named variable. Values in `safe-outputs.env` can override those defaults; explicit `team-id` and `project-id` values take precedence over environment fallbacks. Comment and update targets are fixed trusted configuration and accept either a Linear issue model UUID or shorthand identifier such as `ENG-123`. Updates replace only the enabled `title` and `body` fields. All agent-provided titles, descriptions, and comments use standard Safe Outputs sanitization.
+
+To find and configure `LINEAR_TEAM_ID`:
+
+1. In Linear, open the team that should receive the issues. Press **Cmd+K** (macOS) or **Ctrl+K** (Windows/Linux), then select **Copy model UUID**. The command uses the current page, so copy the team's UUID, not an issue or project's UUID. See [Linear's API documentation](https://linear.app/developers/graphql#queries--mutations).
+2. In the GitHub repository, open **Settings > Secrets and variables > Actions > New repository secret**. Name the secret `LINEAR_TEAM_ID` and paste the team's UUID. Alternatively, use an organization Actions secret with that name and grant the repository access.
+
+When the workflow references `${{ secrets.LINEAR_TEAM_ID }}`, a repository variable with the same name does not satisfy it. `LINEAR_TEAM_ID` identifies the destination team; it is separate from the `LINEAR_API_KEY` credential.
+
 ### System Types (Auto-Enabled)
 
 | Output | Key | Description |
 |--------|-----|-------------|
-| [No-Op](#no-op-logging-noop) | `noop` | Log completion message for transparency (max: 1, same-repo only) |
-| [Missing Tool](#missing-tool-reporting-missing-tool) | `missing-tool` | Report missing tools (max: unlimited, same-repo only) |
-| [Missing Data](#missing-data-reporting-missing-data) | `missing-data` | Report missing data required to achieve goals (max: unlimited, same-repo only) |
-| [Create Issue](#issue-creation-create-issue) | `create-issue` | Auto-injected when no `safe-outputs:` section is present or when only system types (`noop`, `missing-tool`, `missing-data`) are configured (max: 1, labels and title-prefix set to workflow ID). |
+| [No-Op](#no-op-logging-noop) | `noop` | Log completion messages for transparency (max: 2, same-repo only) |
+| [Missing Tool](#missing-tool-reporting-report-missing-tool) | `report-missing-tool` | Report missing tools (max: unlimited, same-repo only) |
+| [Missing Data](#missing-data-reporting-report-missing-data) | `report-missing-data` | Report missing data required to achieve goals (max: unlimited, same-repo only) |
+| [Create Issue](#issue-creation-create-issue) | `create-issue` | Auto-injected when no `safe-outputs:` section is present or when only system types (`noop`, `report-missing-tool`, `report-missing-data`) are configured (max: 1, labels and title-prefix set to workflow ID). |
 
 ### Custom Safe Output Jobs (`jobs:`)
 
 Create custom post-processing jobs registered as Model Context Protocol (MCP) tools. Support standard GitHub Actions properties and auto-access agent output via `$GH_AW_AGENT_OUTPUT`. See [Custom Safe Output Jobs](/gh-aw/reference/custom-safe-outputs/).
 
+Custom implementations should include a generated-by footer and workflow metadata on published content. Direct API calls do not add these automatically; without them, provenance searches and workflow-output tracking cannot identify the content. Use the [stable issue-creation API](/gh-aw/reference/custom-safe-outputs/#issue-creation-api) for GitHub issues.
+
+Do not read internal safe-output files from `post-steps`. Their paths and format are implementation details, and the compiler rejects direct reads:
+
+```yaml wrap
+post-steps:
+  - name: Read safe output
+    run: jq '.items[]' /tmp/gh-aw/safeoutputs/output.json
+```
+
+Use a built-in `safe-outputs` handler for supported operations, or move custom processing into a `safe-outputs.jobs` job. Custom jobs receive agent output through `$GH_AW_AGENT_OUTPUT`:
+
+```yaml wrap
+safe-outputs:
+  jobs:
+    process-report:
+      description: "Process the generated report"
+      runs-on: ubuntu-latest
+      output: "Report processed"
+      inputs:
+        report:
+          description: "Report content"
+          required: true
+          type: string
+      steps:
+        - name: Process agent output
+          run: jq '.items[]' "$GH_AW_AGENT_OUTPUT"
+```
+
 ### GitHub Action Wrappers (`actions:`)
 
 Mount any public GitHub Action as a once-callable MCP tool. The compiler pins the action reference to a SHA at compile time and derives the tool's input schema from the action's `action.yml`. See [GitHub Action Wrappers](/gh-aw/reference/custom-safe-outputs/#github-action-wrappers-safe-outputsactions).
+
+## Jira Safe Outputs
+
+Jira safe outputs call Jira Cloud REST API v3 from the privileged safe-output job. Jira credentials are not exposed to the agent or included in `agent_output`.
+
+```aw wrap
+---
+on:
+  workflow_dispatch:
+safe-outputs:
+  env:
+    JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+    JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+    JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+  jira-create-issue:
+    max: 1
+  jira-update-issue:
+    max: 1
+  jira-add-comment:
+    max: 1
+  jira-add-label:
+    max: 3
+---
+
+# Jira maintenance
+
+Use Jira safe outputs for Jira mutations.
+```
+
+`JIRA_BASE_URL` is the Jira API base without `/rest/api/3`. For unscoped API tokens, use the site URL, such as `https://example.atlassian.net`. For scoped API tokens, use the Atlassian gateway URL, such as `https://api.atlassian.com/ex/jira/<cloudId>`. The initial authentication mechanism uses an Atlassian account email and API token with HTTP Basic authentication.
+
+Each output accepts `max` and `staged`. In staged mode, the handler writes a Jira-specific preview without requiring credentials or sending an HTTP request.
+
+| Frontmatter key | Agent tool | Inputs |
+|---|---|---|
+| `jira-create-issue` | `jira_create_issue` | Required: `project_key`, `issue_type`, `summary`; optional: `description` |
+| `jira-update-issue` | `jira_update_issue` | Required: `issue_key`; at least one of `summary` or `description` |
+| `jira-add-comment` | `jira_add_comment` | Required: `issue_key`, `body` |
+| `jira-add-label` | `jira_add_label` | Required: `issue_key`, `label` |
+
+Descriptions and comment bodies remain plain strings at the agent boundary. The runtime converts them deterministically to Atlassian Document Format version 1, preserving paragraphs and line breaks. `jira_add_label` uses Jira's additive field-update operation and does not replace existing labels.
+
+`jira_create_issue` returns a temporary `#aw_` ID. Pass that ID as `issue_key` to update, comment on, or label the newly created Jira issue later in the same run.
+
+> [!IMPORTANT]
+> Unprefixed tools such as `create_issue`, `update_issue`, `add_comment`, and `add_labels` operate on GitHub. Jira operations always use the `jira_` prefix.
+
+This integration does not support transitions, assignment, custom fields, priorities, components, attachments, issue links, subtasks, label removal, JQL, bulk operations, arbitrary Jira REST calls, or OAuth installation flows.
+
+## Steering Issues (`steer:`)
+
+:::caution[Experimental]
+`steer` is an experimental option. `gh aw compile` emits an experimental feature warning when a workflow uses it.
+:::
+
+Set `steer: true` to create a run-scoped issue during the activation job, before the agent starts. Users can add comments containing the keyword `steer` while the run is in progress. The injected prompt identifies the exact issue and instructs the agent to read relevant user-authored comments with the GitHub MCP `issue_read` tool.
+
+When the daily AI Credits guardrail blocks agent startup, no steering issue is created. Failure reporting uses its normal existing-issue deduplication instead.
+
+The initial issue body includes the standard generated-by footer and tracking metadata for the workflow, run, tracker ID, and available engine information. Attribution is present before the agent starts and uses the configured `messages.footer` template when provided.
+
+Steering enables the GitHub MCP issues toolset for comment reads and requires top-level `issues: read` permission. The compiler reports an error instead of adding that permission automatically.
+
+```yaml
+permissions:
+  contents: read
+  issues: read
+
+safe-outputs:
+  steer: true
+```
+
+The activation and conclusion jobs require `issues: write` through the global [`github-token`](#custom-github-token-github-token) or [`github-app`](#using-a-github-app-for-authentication-github-app) safe-output credential. On success, the conclusion job closes the steering issue and links a created pull request when available. On failure, the same issue is retitled and updated with the agent failure report instead of creating a second issue. Because reuse requires a workflow-repository issue, `steer` cannot be combined with `safe-outputs.failure-issue-repo`.
+
+In [staged mode](#staged-mode), no steering issue is created because staged runs must not perform API side effects.
 
 ### Issue Creation (`create-issue:`)
 
@@ -117,6 +362,8 @@ safe-outputs:
     allowed-fields: [Priority, Iteration] # restrict issue fields this workflow may set
     assignees: [user1, copilot]      # assignees (use 'copilot' for bot)
     max: 5                           # max issues (default: 1)
+    max-issue-artifacts: 3            # max artifacts per issue (default: 10; <=0 disables)
+    max-issue-artifact-size: 1mb       # max UTF-8 size per artifact body (default: 1 MB)
     expires: 7                       # auto-close after 7 days (or false to disable)
     group: true                      # group as sub-issues under parent
     close-older-issues: true         # close previous issues from same workflow
@@ -130,7 +377,7 @@ safe-outputs:
 See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for comprehensive documentation on `target-repo`, `allowed-repos`, and cross-repository authentication.
 
 > [!TIP]
-> Use `footer: false` to omit the AI-generated footer while preserving workflow-id markers for searchability. See [Footer Control](/gh-aw/reference/footers/) for details.
+> Use `footer: false` to omit the visible AI-generated footer while preserving workflow grouping markers and machine-readable execution provenance. See [Footer Control](/gh-aw/reference/footers/) for details.
 
 #### `create_issue` tool field schema (`fields`)
 
@@ -140,7 +387,7 @@ See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for compre
 |-----------|------|----------|-------------|---------|
 | `fields` | `array<object>` | No | Optional issue field updates to apply immediately after issue creation. | `[{"name":"Priority","value":"P1"}]` |
 | `fields[].name` | `string` | Yes (when item exists) | Issue field display name. Match the repository field label (case-insensitive matching is supported). | `"Priority"` |
-| `fields[].value` | `string \| number` | Yes (when item exists) | Field value. Use a number for numeric fields; otherwise use a string (single select, iteration title, date `YYYY-MM-DD`, text). | `"Sprint 42"` |
+| `fields[].value` | `string \| number` | Yes (when item exists) | Field value. Use a number for numeric fields; otherwise use a string (single select, date `YYYY-MM-DD`, text). For multi-select fields, pass a comma-separated list of option names to select multiple options. | `"Sprint 42"` |
 
 ```json
 {
@@ -149,11 +396,62 @@ See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for compre
   "body": "Intermittent failure detected in CI.",
   "fields": [
     { "name": "Priority", "value": "High" },
-    { "name": "Iteration", "value": "Sprint 42" },
+    { "name": "Tags", "value": "Bug, Regression" },
     { "name": "Story Points", "value": 3 }
   ]
 }
 ```
+
+#### Issue Artifacts
+
+`create_issue` accepts an optional `artifacts` array. Each item requires a non-empty `name` and exactly one of `body` (inline content) or `path` (a UTF-8 text file), with an optional `type`: `generic` (default), `plan`, `link`, or `embedded_html`. Link bodies contain a URL; HTML bodies contain HTML source for GitHub's artifact preview. Names and content follow safe-output sanitization. HTML preserves supported safe-output tags, strips dangerous attributes, and converts unsupported tags to visible text. HTML URLs always use `allowed-only` filtering, even inside backticks and when the workflow allows URLs in Markdown code regions. Temporary issue references in artifact bodies are resolved, including the newly created issue's temporary ID.
+
+`safe-outputs.create-issue.max-issue-artifacts` limits attachments **per issue**, defaulting to **10**. Zero or any negative integer disables attachments. Requests exceeding the limit are rejected before issue creation, including in staged mode; requests with no artifacts remain valid. The generated tool description includes the configured limit or disabled state.
+
+`safe-outputs.create-issue.max-issue-artifact-size` accepts positive integer bytes or a human-friendly size such as `512kb`, `1mb`, or `1.5mb`, defaulting to **1mb (1048576 bytes)**. Units `B`, `K`/`KB`/`KiB`, `M`/`MB`/`MiB`, `G`/`GB`/`GiB`, and `T`/`TB`/`TiB` are case-insensitive and use multiples of 1024; spaces between the number and unit are accepted. Values must resolve to a positive whole byte count. Raw bodies and sanitized, reference-resolved content must fit the limit; oversized bodies are rejected rather than silently truncated. Each artifact is measured separately, not as a combined upload. The final body is checked again immediately before attachment.
+
+```json
+{
+  "type": "create_issue",
+  "title": "Implement parser caching",
+  "body": "Cache parsed workflows to reduce compilation time.",
+  "artifacts": [
+    { "type": "plan", "name": "Implementation plan", "body": "## Plan\n\nAdd a cache and regression coverage." }
+  ]
+}
+```
+
+Artifacts are attached using the issue's repository and credentials with `issues: write` permission. Staged mode previews artifacts without writing them. Requests with artifacts create a new issue rather than grouping content into a same-day comment; title deduplication still applies. If an attachment fails, the handler still attempts normal issue assignment and parent linking, then reports failure with the created issue's number and URL and the number of artifacts already attached; it does not delete the issue or retry the entire creation. See the [issue artifacts REST API](https://docs.github.com/en/rest/issues/artifacts?apiVersion=2026-03-10).
+
+##### Attaching Files by Path
+
+Pass an absolute `path` to attach a file without loading its content into the agent's conversation:
+
+```json
+{
+  "title": "Implement parser caching",
+  "body": "The implementation plan is attached.",
+  "artifacts": [
+    { "type": "plan", "name": "Implementation plan", "path": "/tmp/gh-aw/agent/issue-plan.md" }
+  ]
+}
+```
+
+The unprivileged safeoutputs MCP backend reads the file and replaces `path` with its complete `body` before recording the request. The privileged issue job receives content only and never opens the agent-supplied path. The source file does not require a separate artifact upload or custom-job file declaration.
+
+Paths must be literal absolute paths within the workspace or `/tmp/gh-aw/agent`; general temporary runtime files are not allowed. The shared file-upload denylist rejects any `.git` path component, system directories, and HOME credential/config locations such as `.ssh`, `.aws`, `.config`, `.npmrc`, and `.git-credentials`, even when they overlap an allowed root. Variables and globs are not expanded. Guarded reads on the Linux workflow runtime reject symlinks (including directory links), hard links, non-regular files, invalid UTF-8, empty content, and files exceeding `max-issue-artifact-size`. Unsupported platforms fail closed. A read or validation failure records no issue request. Do not specify both `body` and `path`. Passing a pathname as `body` still attaches that pathname as text.
+
+For an image, binary file, or downloadable original, use [upload-artifact](#artifact-uploads-upload-artifact) with a literal file path:
+
+```json
+{"type": "upload_artifact", "path": "/tmp/gh-aw/agent/chart.png"}
+```
+
+This creates a run-scoped GitHub Actions artifact, not an issue artifact. Use [upload-asset](#asset-uploads-upload-asset) with `path` when a persistent repository-branch URL is required, then reference the published URL in the issue body or a `link` artifact. Upload retention, path authorization, and file-size policies are separate from the issue artifact count and body-size limits.
+
+#### Blocked-By Dependencies
+
+The `create_issue` tool accepts `blocked_by` as an issue reference or an array of references: an issue number (optionally prefixed with `#`), `owner/repo#number`, a GitHub issue URL, or a temporary ID. Numeric references use the new issue's repository. Every resolved blocker repository must match `target-repo` or appear in `allowed-repos`, including configured wildcard patterns, before issue creation or dependency API access. A disallowed blocker rejects the request. Unresolved temporary IDs defer creation and are validated when retried; staged mode previews unresolved IDs but still rejects resolved disallowed repositories.
 
 #### Auto-Expiration
 
@@ -216,12 +514,17 @@ The `deduplicate-by-title` field drops duplicate issues by comparing titles befo
 
 Deduplication runs at both the MCP tool-call boundary (within-run drops with immediate `duplicate_dropped` feedback to the agent) and at apply time (within-run plus open and recently-closed repository issues). Dropped items are recorded in the safe-output summary with the matched title, edit distance, and source (`mcp-precheck`, `within-run`, or `repo-level`).
 
+The optional `deduplicate-by-labels` array drops duplicates when an existing issue has **all** listed labels. It works independently of `deduplicate-by-title`; when both are configured, both the title and all labels must match (AND). Filters apply within-run and to repository searches for open issues and issues closed within the last 30 days. Omitted, empty, or whitespace-only label filters preserve title-only behavior; without either filter, deduplication is disabled.
+
+Filter labels must be literal strings, not GitHub Actions expressions. Repository filtering uses GitHub's issue-search syntax; matching labels containing double quotes or backslashes is not verified. Prefer labels without those characters. The `labels` field only controls labels applied at creation. Include filter labels in `labels` (or supply them in the tool call) if newly created issues should match future deduplication searches; filter labels are not added automatically.
+
 ```yaml wrap
 safe-outputs:
   create-issue:
-    title-prefix: "[triage] "
-    labels: [bug]
+    title-prefix: "[docs-consistency-check] "
+    labels: [documentation, automated]
     deduplicate-by-title: 1   # tolerate one-character title differences
+    deduplicate-by-labels: [documentation, automated]
 ```
 
 #### Searching for Workflow-Created Items
@@ -276,13 +579,20 @@ safe-outputs:
 
 Posts comments on issues, PRs, or discussions. Defaults to triggering item; use `target: "*"` for any, or number for specific items. When combined with `create-issue`, `create-discussion`, or `create-pull-request`, includes "Related Items" section.
 
+For machine-readable state such as an incremental review's baseline commit, use [`safe-outputs.data`](#structured-data-data). HTML comments in the agent-provided body are stripped; structured data is published as visible fenced JSON.
+The `add_comment` tool rejects obvious placeholder bodies such as `test` and `test body` before recording the output or consuming the comment budget. Intent checks also recognize `test ` followed by the corresponding field name, such as `test title` for issue or pull request titles. Matching ignores case and repeated whitespace, but preserves substantive content such as `Test coverage improved`. Rejected calls return a validation error so the agent can submit the real comment.
+
 Use `required-labels` to only comment on issues/PRs that have **all** of the specified labels. Use `required-title-prefix` to only comment on issues/PRs whose title starts with the given prefix. These filters apply to issues and PRs only (not discussions).
+
+`max-links` accepts a positive integer and defaults to 50. It counts every `http://` or `https://` URL occurrence in agent-provided content, including repeated URLs. Generated footer and metadata links do not count toward this limit. Both tool invocation and comment posting enforce the configured limit; the final body still must satisfy length and mention limits. Raise `max-links` for trusted link-heavy reports.
 
 ```yaml wrap
 safe-outputs:
   add-comment:
     max: 3                       # max comments (default: 1)
+    max-links: 100                # max URL occurrences in agent content (default: 50)
     target: "*"                  # "triggering" (default), "*", or number
+    allows-comment-ids: ${{ needs.prepare.outputs.comment_ids }} # comment IDs the agent may update when target is "*"
     discussions: true            # request discussions:write permission (default: false)
     target-repo: "owner/repo"    # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
@@ -296,6 +606,10 @@ safe-outputs:
 
 > [!TIP]
 > Use `footer: false` to suppress the "Generated by..." attribution line in posted comments. See [Footer Control](/gh-aw/reference/footers/) for global and per-handler options.
+
+When `target: "*"` is configured, the agent may update an existing issue or pull request comment by passing `comment_id` only if that ID appears in `allows-comment-ids`. Populate `allows-comment-ids` from trusted workflow state (for example, an earlier step output) rather than agent output.
+
+Set `replace-older-comments: true` to update the newest comment from the workflow's authenticated author on the target issue or PR bearing this caller workflow's `gh-aw-workflow-call-id` marker, instead of posting a new comment on every run. If no matching comment exists, a new comment is posted. The replacement includes a fresh footer and run link; staged mode only previews the comment and never edits it. When no caller workflow ID is available, matching uses the workflow ID marker. This option cannot be combined with `hide-older-comments`.
 
 #### Normalize closing keywords
 
@@ -339,30 +653,50 @@ When enabled, the workflow completion notifier creates a new comment instead of 
 
 Collapses comments in GitHub UI with reason. Requires GraphQL node IDs (e.g., `IC_kwDOABCD123456`), not REST numeric IDs. Reasons: `spam`, `abuse`, `off_topic`, `outdated`, `resolved`, `low_quality`.
 
+`required-labels` and `required-title-prefix` are not supported for `hide-comment`. Use `target` and `allowed-reasons` to restrict comment hiding.
+
 ```yaml wrap
 safe-outputs:
   hide-comment:
     max: 5                    # max comments (default: 5)
     target-repo: "owner/repo" # cross-repository
+    discussions: true         # request discussions:write permission (default: false)
 ```
 
 ### Add Labels (`add-labels:`)
 
 Adds labels to issues or PRs. Specify `allowed` to restrict to specific labels or glob patterns, or `blocked` to deny specific label patterns regardless of the allow list.
 
+`max` limits the number of `add_labels` calls (default: 5); `max-labels` limits the labels in each call (default: 10). Calls exceeding `max-labels` are rejected without adding any labels.
+
 Use `required-labels` to only add labels to issues/PRs that already have **all** of the specified labels. Use `required-title-prefix` to only add labels to issues/PRs whose title starts with the given prefix.
+
+By default, labels that don't already exist in the target repository are rejected with an error. Set `create-if-missing: true` to automatically create any missing labels before they are applied.
+
+Use `item-schema` to narrow the label item shape shown to the agent and enforced when the MCP tool is called. The schema must remain compatible with the built-in string-or-object label schema: it can require existing fields, exclude optional fields, or restrict values, but cannot add fields or loosen built-in constraints.
 
 ```yaml wrap
 safe-outputs:
   add-labels:
     allowed: [bug, team-*, area/*] # restrict to specific labels or glob patterns
     blocked: ["~*", "*[bot]"]   # deny labels matching these glob patterns
-    max: 3                       # max labels (default: 3)
+    max: 10                      # max add_labels calls (default: 5)
+    max-labels: 5                # max labels per call (default: 10)
     target: "*"                  # "triggering" (default), "*", or number
     target-repo: "owner/repo"    # cross-repository
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     required-labels: [automated, bot]  # only operate if item has ALL of these labels
     required-title-prefix: "[bot] "    # only operate if item title starts with this prefix
+    create-if-missing: true            # auto-create labels that don't already exist (default: false)
+    item-schema:
+      type: object
+      required: [name, confidence]
+      additionalProperties: false
+      properties:
+        name: { type: string }
+        confidence: { type: string, enum: [HIGH, MEDIUM, LOW] }
+        suggest: { type: boolean }
+        rationale: { type: string }
 ```
 
 #### Blocked Label Patterns
@@ -395,11 +729,15 @@ Removes labels from issues or PRs. Specify `allowed` to restrict which labels ca
 
 Use `required-labels` to only remove labels from issues/PRs that already have **all** of the specified labels. Use `required-title-prefix` to only remove labels from issues/PRs whose title starts with the given prefix.
 
+The `remove_labels` tool accepts structured label objects for compatibility, but ignores their `rationale`, `confidence`, and `suggest` fields.
+
 ```yaml wrap
 safe-outputs:
   remove-labels:
     allowed: [automated, team-*] # restrict to specific labels or glob patterns (optional)
     blocked: ["~*"]              # deny removal of labels matching these glob patterns
+    issues: true                 # include issues: write permission (default: true)
+    pull-requests: false         # exclude pull-requests: write permission (default: true)
     max: 3                       # max operations (default: 3)
     target: "*"                  # "triggering" (default), "*", or number
     target-repo: "owner/repo"    # cross-repository
@@ -409,6 +747,8 @@ safe-outputs:
 ```
 
 **Target**: `"triggering"` (requires issue/PR event), `"*"` (any issue/PR), or number (specific issue/PR).
+
+Set `issues: false` or `pull-requests: false` to omit the corresponding write permission. Both default to `true` when omitted, and at least one must be enabled.
 
 When `allowed` is omitted or set to `null`, any labels can be removed. Use `allowed` to restrict removal to specific labels or glob patterns, providing control over which labels agents can manipulate. The `blocked` field takes precedence over `allowed`.
 
@@ -477,7 +817,7 @@ When using `target: "*"`, the agent must provide `issue_number` or `item_number`
 - `replace`: Completely replaces existing body with new content and attribution
 - `replace-island`: Updates a specific section marked with HTML comments
 
-Agent output format: `{"type": "update_issue", "issue_number": 123, "operation": "append", "body": "..."}`. The `operation` field is optional (defaults to `append`).
+Agent output format: `{"type": "update_issue", "issue_number": 123, "operation": "append", "body": "..."}`. The `operation` field is optional (defaults to `append`). Each call must include at least one update field: `status`, `title`, `body`, `labels`, `assignees`, or `milestone`; an issue number or operation alone is rejected. Set `milestone` to `null` to clear the issue's milestone; omitting `milestone` leaves it unchanged.
 For issue field updates, use [`set_issue_field`](#set-issue-field-set-issue-field).
 
 ### Pull Request Updates (`update-pull-request:`)
@@ -493,6 +833,7 @@ Links issues as sub-issues using GitHub's parent-child issue relationships. Supp
 ```yaml wrap
 safe-outputs:
   link-sub-issue:
+    target: "*"                         # use the agent's explicit parent
     parent-required-labels: [epic]        # parent must have these labels
     parent-title-prefix: "[Epic]"         # parent must match prefix
     sub-required-labels: [task]           # sub must have these labels
@@ -504,6 +845,10 @@ safe-outputs:
 ```
 
 Agent output includes `parent_issue_number` and `sub_issue_number`. Validation ensures both issues exist and meet label/prefix requirements before linking.
+
+`target` selects the parent: `"triggering"` (the default) uses the triggering issue, a fixed issue number uses that parent, and `"*"` uses the agent's `parent_issue_number`, including a temporary ID for a newly created parent. Triggering and fixed targets ignore the agent's parent selection. Scheduled and `workflow_dispatch` runs without issue context must configure `"*"` or a fixed parent; the default fails even if the agent supplies `parent_issue_number`.
+
+Both effective issues must belong to the same repository, and that repository must match `target-repo` or appear in `allowed-repos` before any issue read or link mutation. This check applies after temporary IDs resolve, including deferred retries. `target: "*"` permits agent-selected parents, not unrestricted repositories; repository wildcards are controlled separately by `target-repo` and `allowed-repos`.
 
 ### Set Issue Type (`set-issue-type:`)
 
@@ -564,83 +909,34 @@ Agent calls `set_issue_field` with `value`, and either `field_name` (preferred) 
 }
 ```
 
-#### Issue field discovery mechanism
+#### Issue field discovery
 
-When `field_name` is provided, the handler discovers available issue fields for the target repository and resolves the matching field automatically.
-
-1. Agent calls `set_issue_field` with `field_name`.
-2. Handler fetches available issue fields and resolves the field by label.
-3. If the field is unknown, the error includes available field names and guidance to use `field_node_id`.
-
-```json
-{
-  "type": "set_issue_field",
-  "field_name": "Urgency",
-  "value": "P0"
-}
-```
-
-Example actionable error:
+When `field_name` is provided, the handler fetches the repository's issue fields and resolves the matching one. If the field is unknown, the error lists available names and suggests `field_node_id`:
 
 ```text
 Issue field "Urgency" not found. Available fields: Priority, Iteration, Story Points.
 Use a listed field_name or provide field_node_id to bypass discovery.
 ```
 
-Retrying with explicit ID:
+Retry with `{"type": "set_issue_field", "field_node_id": "PVTF_lADOExampleFieldId", "value": "P0"}` to skip discovery.
 
-```json
-{
-  "type": "set_issue_field",
-  "field_node_id": "PVTF_lADOExampleFieldId",
-  "value": "P0"
-}
-```
-
-#### End-to-end triage workflow example (discovery + field updates)
+#### Triage example
 
 ```yaml wrap
----
-on:
-  issues:
-    types: [opened, reopened]
-
-permissions:
-  contents: read
-  issues: write
-
 safe-outputs:
-  create-issue:
-    title-prefix: "[triage] "
-    labels: [triage]
-    allowed-fields: [Priority, Iteration, Story Points]
   update-issue:
     target: triggering
-    status:
     body:
   set-issue-field:
     target: triggering
     allowed-fields: [Priority, Iteration]
----
 ```
 
 ```json
 [
-  {
-    "type": "update_issue",
-    "body": "Initial triage complete. Escalating for review.",
-    "operation": "append"
-  },
-  {
-    "type": "set_issue_field",
-    "field_name": "Priority",
-    "value": "High"
-  },
-  {
-    "type": "set_issue_field",
-    "field_name": "Iteration",
-    "value": "Sprint 42"
-  }
+  {"type": "update_issue", "body": "Initial triage complete.", "operation": "append"},
+  {"type": "set_issue_field", "field_name": "Priority", "value": "High"},
+  {"type": "set_issue_field", "field_name": "Iteration", "value": "Sprint 42"}
 ]
 ```
 
@@ -851,6 +1147,11 @@ Exposes outputs: `status-update-id`, `project-id`, `status`.
 
 Creates PRs with code changes. Includes configurable [Protected Files](/gh-aw/reference/safe-outputs-pull-requests/#protected-files) against supply chain attacks.
 
+Detection caution, protected-files `request-review`, or a failed required
+`REQUEST_CHANGES` review withholds configured auto-merge and requires independent
+review. A successful review request or blocking-review API response alone does
+not prove that repository policy enforces human approval.
+
 See the full reference: [Safe Outputs (Pull Requests) — create-pull-request](/gh-aw/reference/safe-outputs-pull-requests/#pull-request-creation-create-pull-request)
 
 ```yaml wrap
@@ -904,7 +1205,7 @@ safe-outputs:
     target-repo: "owner/repo"  # cross-repository: submit review on PR in another repo
     allowed-repos: ["org/repo1", "org/repo2"]  # additional allowed repositories
     allowed-events: [COMMENT, REQUEST_CHANGES]  # include REQUEST_CHANGES when using supersede mode for blocking reviews
-    supersede-older-reviews: true  # dismiss older same-workflow REQUEST_CHANGES reviews after posting a replacement review
+    supersede-older-reviews: true  # dismiss older same-workflow blockers after a clean COMMENT review with no inline findings
     footer: false     # omit AI-generated footer from review body (default: true)
 ```
 
@@ -912,7 +1213,7 @@ Use `allowed-events` to restrict which review event types the agent can submit. 
 
 **Recommendation:** prefer `allowed-events: [COMMENT]` as the default for automated review workflows. This keeps AI feedback visible without creating a persistent merge-blocking state.
 
-Set `supersede-older-reviews: true` only when your workflow intentionally uses `REQUEST_CHANGES` and you want newer runs to dismiss older blocking reviews from the same workflow. Superseding is best-effort and happens after the replacement review is posted.
+Set `supersede-older-reviews: true` only when your workflow intentionally uses `REQUEST_CHANGES` and you want a clean `COMMENT` review with no inline findings to dismiss older blocking bot reviews from the same workflow. A blocking review or one with inline findings does not trigger supersession, and newer reviews are never dismissed. Superseding is best-effort.
 
 ### Resolve PR Review Thread (`resolve-pull-request-review-thread:`)
 
@@ -1027,6 +1328,8 @@ safe-outputs:
 
 Agent output format: `{"type": "update_release", "tag": "v1.0.0", "operation": "replace", "body": "..."}`. The `tag` field is optional for release events (inferred from context). Workflow needs read access; only the generated job receives write permissions.
 
+`update-release` requires an existing **GitHub Release** for the given tag — a Git tag alone is not enough. Both published and draft releases are supported: if the tag only has a draft release, the handler finds and updates it automatically. If no release (published or draft) exists for that tag, the handler fails with a diagnostic that links directly to the release-creation page for the tag.
+
 ### Artifact Uploads (`upload-artifact:`)
 
 Uploads files as run-scoped GitHub Actions artifacts. Artifacts expire automatically after the configured retention period and put less pressure on git storage than `upload-asset`. Recommended for images, reports, and temporary output files.
@@ -1044,6 +1347,11 @@ safe-outputs:
 ```
 
 Agent calls `upload_artifact` with a `path` (file or directory) or `filters` (glob-based file selection). Artifacts are available via `gh run download` during the workflow run retention period.
+
+The repository's `artifact_retention_days` setting in `aw.json`, or the
+`GH_AW_DEFAULT_ARTIFACT_RETENTION_DAYS` Actions variable when that setting is
+absent, overrides this output's `retention-days`. See
+[Artifact Retention](/gh-aw/reference/compiler-enterprise-environment-controls/#artifact-retention).
 
 ### Asset Uploads (`upload-asset:`)
 
@@ -1069,9 +1377,61 @@ safe-outputs:
 git checkout --orphan my-custom-branch && git rm -rf . && git commit --allow-empty -m "Initialize" && git push origin my-custom-branch
 ```
 
-**Security**: File path validation (workspace/`/tmp` only), extension allowlist, size limits, SHA-256 verification, orphaned branch isolation, minimal permissions.
+**Security**: Files must be isolated regular files within the workspace or `/tmp`; symlinks (including parent-directory links), hard links, and special files are rejected. Staging and publication use the same bounded, verified file snapshot for hashing and writing, with no-follow opens and exclusive destination creation. Extension allowlists, size limits, SHA-256 verification, orphaned branch isolation, and minimal permissions also apply.
+
+**Platform support**: Asset staging and publication require Linux with `/proc/self/fd` available for descriptor-relative access. macOS and Windows fail closed with `ERR_VALIDATION` before guarded file access; absolute-path checks cannot prevent concurrent ancestor replacement, and POSIX no-follow flags do not protect against Windows junctions. Policy and size-limit failures use `ERR_VALIDATION`; upload-handler I/O failures use `ERR_SYSTEM`.
 
 **Outputs**: `published_count`, `branch_name`. **Limits**: Same-repo only, max 50MB/file, 100 assets/run.
+
+### Azure DevOps Work Items
+
+Azure DevOps work-item safe outputs use the same public tool names as [`ado-aw`](https://githubnext.github.io/ado-aw/reference/safe-outputs/). The agent remains read-only; the safe-output job performs trusted Azure DevOps REST requests.
+
+Provide the organization, project, and credential only to the safe-output job:
+
+> These safe outputs are experimental. Compiling a workflow emits an experimental feature warning for each configured Azure DevOps work-item output.
+
+```yaml wrap
+safe-outputs:
+  env:
+    AZURE_DEVOPS_ORG_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+    SYSTEM_TEAMPROJECT: ${{ vars.AZURE_DEVOPS_PROJECT }}
+    AZURE_DEVOPS_EXT_PAT: ${{ secrets.AZURE_DEVOPS_EXT_PAT }}
+  ado-create-work-item:
+    work-item-type: Task
+    area-path: MyProject\Platform
+    allowed-tags: [agent-*]
+  ado-update-work-item:
+    target: MyProject\Platform
+    title: true
+    status: true
+  ado-comment-on-work-item:
+    target: MyProject\Platform
+  ado-assign-work-item:
+    target: "*"
+    allowed: [owner@example.com]
+  ado-link-work-items:
+    target: MyProject\Platform
+    allowed-link-types: [parent, child, related]
+  ado-upload-workitem-attachment:
+    target: MyProject\Platform
+    allowed-extensions: [.txt, .log, .pdf]
+    max-file-size: 5242880
+```
+
+Authentication uses `SYSTEM_ACCESSTOKEN` when present, otherwise `AZURE_DEVOPS_EXT_PAT`. `AZURE_DEVOPS_ORG_URL` must use `https://dev.azure.com/{organization}` or `https://{organization}.visualstudio.com`; redirects and embedded credentials are rejected.
+
+`ado_create_work_item` returns a run-scoped `#aw_...` temporary ID. The other work-item tools accept that ID, and same-run IDs bypass their consuming `target` policy because creation was already scoped by trusted configuration. Numeric IDs are checked against `target`, which accepts `"*"`, a single ID, a list of IDs, or an area-path prefix.
+
+To restrict comments to a work item selected at runtime, set `target` from an expression. The value must evaluate to a positive, safe-integer work-item ID; an empty value is rejected.
+
+```aw wrap
+safe-outputs:
+  ado-comment-on-work-item:
+    target: "${{ inputs.work_item_id }}"
+```
+
+For `ado-update-work-item`, each mutable field must be explicitly enabled. Assignment always rejects the reserved `Agency` and `GitHub Copilot` identities. Attachments must be regular workspace files and are checked for traversal, symbolic links, size, extension, and Azure Pipelines command sequences before upload.
 
 ### No-Op Logging (`noop:`)
 
@@ -1089,7 +1449,11 @@ safe-outputs:
 
 **When to call `noop`**: Any time no GitHub action (issue, comment, PR, label, etc.) is needed — e.g., no issues found, no changes detected, or repository already in desired state. Do NOT call `noop` if any other safe-output action was taken.
 
-Agent output: `{"noop": {"message": "No action needed: analysis complete - no issues found"}}`. Messages appear in the workflow conclusion comment or step summary.
+Agent output: `{"noop": {"message": "No action needed: analysis complete - no issues found"}}`. Messages appear in the workflow step summary; public completion comments show the categorized outcome instead.
+
+The `[aw] No-Op Runs` tracker and no-op sections of completion status comments omit agent messages and reuse the same categorized body. For runs with only no-op outputs, `reported_no_action` means the agent succeeded and reported no action; it does not independently verify task completion or publication readiness. `incomplete` means the agent failed despite emitting a no-op. An explicit `report_incomplete` also makes reusable tracking comments `incomplete`, while its failure report remains separate from the no-op tracker. The existing failure-policy exception for task-complete registration diagnostics also applies: registration-only reports are ignored only with terminal completion evidence and real task-level outputs. Other agent conclusions remain `unconfirmed` and are not posted to the tracker. Categories use run status and the existing incomplete-report policy, not interpretation of no-op prose. Existing tracker comments are not rewritten.
+
+Up to two `noop` calls are accepted by default (`max: 2`), since an agent's first call is often a probe. Calls whose `message` is an obvious placeholder (e.g. `test`, `test message`, `probe`, `placeholder`, `dummy`, `todo`) are detected and ignored entirely — they don't count against the `noop` budget and aren't surfaced in summaries or tracking issues, so a probing call never crowds out a real completion message.
 
 **Always include explicit `noop` instructions in your workflow prompts:**
 
@@ -1098,23 +1462,23 @@ If no action is needed, you MUST call the `noop` tool with a message explaining 
 {"noop": {"message": "No action needed: [brief explanation]"}}
 ```
 
-### Missing Tool Reporting (`missing-tool:`)
+### Missing Tool Reporting (`report-missing-tool:`)
 
 Enabled by default. Automatically detects and reports tools lacking permissions or unavailable functionality.
 
 ```yaml wrap
 safe-outputs:
-  create-issue:           # missing-tool enabled automatically
-  missing-tool: false     # explicitly disable
+  create-issue:                  # report-missing-tool enabled automatically
+  report-missing-tool: false     # explicitly disable
 ```
 
-### Missing Data Reporting (`missing-data:`)
+### Missing Data Reporting (`report-missing-data:`)
 
 Enabled by default. Allows AI agents to report missing data required to achieve their goals, encouraging truthfulness over hallucination.
 
 ```yaml wrap
 safe-outputs:
-  missing-data:
+  report-missing-data:
     create-issue: true          # create GitHub issues for missing data
     title-prefix: "[data]"      # prefix for issue titles (default: "[missing data]")
     labels: [data, blocked]     # labels to attach to issues
@@ -1217,6 +1581,7 @@ safe-outputs:
 - **`target-repo`** (optional) - Target repository in `owner/repo` format for cross-repository dispatch.
 - **`allowed-repos`** (optional) - Allowlist of cross-repository dispatch targets. Required when `target-repo` points to a different repository. Supports repository slugs and wildcards such as `org/*`, or a GitHub Actions expression string (e.g. `"${{ inputs['allowed-repos'] }}"`) for dynamic allowlists.
 - **`target-ref`** (optional) - Git ref to dispatch on. In `workflow_call` relay scenarios, the compiler injects this automatically so the dispatch uses the target repository's branch or tag instead of the caller's `GITHUB_REF`.
+- **`allowed-refs`** (optional) - List of ref glob patterns that the agent is allowed to supply via `message.ref` at runtime. Supports arrays and GitHub Actions expressions resolving to a comma-separated list (e.g. `"${{ inputs['allowed-refs'] }}"`). When omitted, the repository default branch is allowed. Branch shorthand (`feature/*`) is automatically expanded to `refs/heads/feature/*`; `tags/v*` is expanded to `refs/tags/v*`; full `refs/…` patterns are used as-is.
 
 #### Validation Rules
 
@@ -1229,6 +1594,28 @@ At runtime, when exactly one workflow is configured, the agent may omit `workflo
 ```
 
 With `dispatch-workflow: [workflow-handler]`, that item is normalized to target `workflow-handler` automatically before validation.
+
+#### Per-call Ref Override
+
+When an agent needs to dispatch CI against a branch it just created, it can supply `ref` directly in the output payload:
+
+```json
+{
+  "type": "dispatch_workflow",
+  "workflow_name": "ci",
+  "ref": "feature/my-branch",
+  "inputs": { "reason": "validate new branch" }
+}
+```
+
+The repository default branch is allowed when `allowed-refs` is omitted. The ref is normalized before matching: bare branch names are expanded to `refs/heads/<name>`, `tags/…` to `refs/tags/…`, and full `refs/…` values are used as-is. Dispatches with a `message.ref` that does not match any configured pattern are rejected at runtime.
+
+Ref resolution priority:
+1. `message.ref` (highest — per-call override, restricted by configured or implicit `allowed-refs`)
+2. `target-ref` from configuration
+3. `GITHUB_HEAD_REF` (PR head branch)
+4. `GITHUB_REF` or `context.ref` (push/default branch)
+5. target repository default branch
 
 #### Defining Workflow Inputs
 
@@ -1337,9 +1724,6 @@ Use `call-workflow` for deterministic fan-out where actor attribution and zero A
 
 ### Repository Dispatch (`dispatch-repository`)
 
-> [!CAUTION]
-> This is an experimental feature. Compiling a workflow with `dispatch-repository` emits a warning: `Using experimental feature: dispatch-repository`. The API may change in future releases.
-
 Triggers [`repository_dispatch`](https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#repository_dispatch) events in external repositories. Unlike `dispatch-workflow` (same-repo only), `dispatch-repository` is designed for cross-repository orchestration.
 
 Each key under `dispatch-repository:` defines a named tool exposed to the agent:
@@ -1408,10 +1792,12 @@ Programmatically assigns GitHub Copilot coding agent to **existing** issues or p
 safe-outputs:
   assign-to-agent:
     name: "copilot"            # default agent (default: "copilot")
-    model: "claude-sonnet-5"   # default AI model (default: "auto")
+    model: "o3"                # default AI model (default: "auto")
+    reasoning-effort: "high"   # optional enum value or expression
     custom-agent: "agent-id"   # default custom agent ID (optional)
     custom-instructions: "..."  # default custom instructions (optional)
     allowed: [copilot]         # restrict to specific agents (optional)
+    required-labels: [copilot-ready] # only assign if all these labels are present
     max: 1                     # max assignments (default: 1)
     target: "triggering"       # "triggering" (default), "*", or number
     target-repo: "owner/repo"  # where the issue lives (cross-repository)
@@ -1420,6 +1806,10 @@ safe-outputs:
     base-branch: "develop"     # target branch for PR (default: target repo's default branch)
     github-token: ${{ secrets.SOME_CUSTOM_TOKEN }} # optional custom token for permissions
 ```
+
+When configured, `required-labels` checks that every listed label is still present on the target issue or pull request immediately before the agent is assigned.
+
+`reasoning-effort` accepts `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`, as well as GitHub Actions expressions. Valid values are forwarded without enforcing model-specific capabilities; invalid runtime values produce a warning and are omitted without failing assignment.
 
 See **[Copilot Cloud Agent](/gh-aw/reference/copilot-cloud-agent/#assign-to-agent)** for complete configuration options and authorization setup.
 
@@ -1467,6 +1857,8 @@ Most safe outputs support cross-repository operations:
 - **`target-repo`**: Set a fixed target repository (`owner/repo` format), or use `"*"` as a wildcard to let the agent supply any repository at runtime.
 - **`allowed-repos`**: Allow the agent to dynamically choose from an allowlist of repositories (supports glob patterns, e.g. `org/*`).
 
+Repository matching is case-sensitive for both `target-repo` and `allowed-repos` patterns; repository names must use the same case as the configured values.
+
 Using `target-repo: "*"` enables fully dynamic routing — the agent provides the `repo` field in each tool call. Note that `create-pull-request-review-comment`, `reply-to-pull-request-review-comment`, `submit-pull-request-review`, `create-agent-session`, and `manage-project-items` do not support the wildcard; use an explicit repository or `allowed-repos` for those types.
 
 See [Cross-Repository Operations](/gh-aw/reference/cross-repository/) for comprehensive documentation.
@@ -1503,6 +1895,12 @@ jobs:
 ### Failure Issue Reporting (`report-failure-as-issue:`)
 
 Controls whether workflow failures are reported as GitHub issues (default: `true`).
+
+Failure reports keep error diagnostics in fenced code blocks inside collapsed details sections. Raw engine logs and arbitrary log tails are not included because they may contain secrets; inspect the linked workflow run for full logs.
+
+Empty-output reports preserve recognized engine failure categories as concise summaries, without copying raw error payloads. Unrecognized failure formats require inspecting the workflow run logs; reports do not publish a fallback log preview.
+
+Cancelled startup failures are suppressed only when check annotations rule out a job timeout and no independent model configuration error is present. If timeout annotations cannot be read, the startup failure remains reportable. The compiler grants the conclusion job and its generated GitHub App reporting tokens `checks: read` when failure issue reporting is enabled. Custom reporting tokens also need this permission.
 
 #### Simple Boolean (Opt-Out All Failures)
 
@@ -1566,15 +1964,38 @@ safe-outputs:
 | `timed_out` | Agent execution exceeded the timeout limit |
 | `missing_safe_outputs` | Agent succeeded but produced no safe outputs |
 | `report_incomplete` | Agent reported that the task could not be completed (infrastructure or tool failures) |
+| `agent_startup_failure` | Runtime recorded `not_started`: setup failed before agent execution, so missing outputs are downstream |
+| `engine_driver_failure` | Engine driver exited with a non-zero code before recording a terminal safe output, or the final engine result reported an error even if the process exited 0 and safe outputs exist |
+| `secret_redaction_failure` | The selected failing step is secret redaction; can be included or excluded independently of generic agent failures |
+| `safeoutputs_cli_error` | Safeoutputs CLI failed and no terminal safe output was recorded |
+| `invalid_safe_outputs` | Output validation rejected the agent's outputs, leaving no terminal safe output |
+| `missing_terminal_safe_output` | Agent finished with no terminal safe output, including diagnostic-only exits |
 | `missing_tool` | Required functionality is not available |
 | `missing_data` | Required data is not accessible |
 | `inference_access_error` | AI inference endpoint authentication or access failures |
+| `model_endpoint_mismatch` | The configured model does not support the selected API endpoint |
+| `copilot_org_billing_error` | Copilot authorization failed because organization billing for Copilot CLI is unavailable |
 | `mcp_policy_error` | MCP server policy violations |
 | `ai_credits_rate_limit_error` | AI credits rate limit exceeded |
 | `max_ai_credits_exceeded` | Maximum AI credits budget exceeded |
+| `activation_failed` | Activation job failed before the agent started, without a named guardrail failure |
 | `cache_miss_misconfiguration` | Cache configuration errors |
 | `code_push_failures` | Failures pushing code to branches |
 | `assignment_errors` | Failures assigning issues or reviewers |
+
+When no terminal safe output is recorded, post-agent validation adds a `report_incomplete` signal with the detected cause. Driver exit codes and CLI audit errors distinguish runtime failures from agent behavior. Diagnostic-only outputs (`report_missing_tool` or `report_missing_data`) do not confirm task completion; silence is not treated as an intentional `noop`.
+
+The diagnostic tool names are `report_missing_tool` and `report_missing_data`, configured with `safe-outputs.report-missing-tool` and `safe-outputs.report-missing-data`. Legacy calls and recorded output types named `missing_tool` and `missing_data` remain supported. The old YAML keys `missing-tool` and `missing-data` are deprecated aliases; run `gh aw fix --write` to migrate them. The fix also corrects `missing-tools` to `report-missing-tool`, preserves configuration values and comments, and reports conflicts for manual resolution rather than overwriting either entry. Failure category names (`missing_tool`, `missing_data`) are unchanged.
+
+An observed `not_started` agent execution marker is classified as `agent_startup_failure`, not agent omission. Failure reports identify the failing startup step when available and direct investigation to setup and gateway logs. Missing, unreadable, invalid, or mismatched run evidence does not establish a startup failure; observed agent execution takes precedence over a stale marker.
+
+An unexplained nonzero driver exit is classified as `driver_crash`, not `unknown` or an inferred provider outage. Fatal-signal exits take precedence over earlier request errors; crash categories from recovered attempts do not override a recorded non-crash final exit. Reports include the exit code and its conventional meaning when known, an inferred signal when recognized, and a fixed summary classifying the final stderr tail by stage (dependency loading, initialization, or execution). Shell-redirected diagnostics recovered from attributed stdout are labeled separately. Empty output is reported as `no output captured`, separately from captured but unclassified output. Raw stderr and agent text are excluded, and published diagnostics are redacted. Explicit provider, request, and budget evidence still explains ordinary nonzero exits, including handled SDK errors. A failed **Redact secrets in logs** step is reported separately as `secret_redaction_failure`, with its own bounded redactor operation/error-code diagnostics when available, rather than a generic driver-exit message. A recorded startup failure retains priority over a later redaction failure.
+
+When the Actions jobs API confirms that the entire run has no jobs, failure reporting stays silent: no failure issue, update, or parent report is created. Such runs may be awaiting or lacking user approval and are not agent failures. API errors or missing agent metadata in a nonempty job list do not establish this condition; genuine setup failures within a started job remain reportable.
+
+Without a more specific runtime failure, the failure classification is `missing_terminal_safe_output`, not an inferred engine outage or budget exhaustion. Incompletion descriptions contain only inferred runtime status and validated error codes: driver exit status, last tool status, failed-tool counts, token and LLM-invocation exhaustion signals, and safe-output tool registration. Registration prefers a valid setup cache, falling back to the archived gateway snapshot when the cache is missing, unreadable, or invalid; neither proves continued availability. A recorded gateway zero-tools flag overrides registration evidence as unavailable; an unreadable flag makes availability unknown. CLI attempt counts and gateway request counts are reported separately because one invocation can appear in both. Persistence reports whether the output file is missing, empty, nonempty, or unreadable, with record and malformed-record counts; it does not establish validation or publication.
+
+Explicit `report_incomplete` signals also include registration, call-count, and persistence evidence, even alongside ordinary safe outputs. They are not reclassified as missing terminal output. Failure issues, follow-up comments, and run summaries can include a bounded, secret-redacted agent-declared reason labeled unverified; summaries are also written when failure-issue reporting is disabled. A reason matching a trusted collector cause is presented only as runtime-derived classification. Agent tool names, commands, arguments, results, schemas, and diagnostic/error text remain excluded, even when they contain no recognized secrets. Reasons are omitted from summaries when secret redaction fails. Missing evidence is reported as unknown or not recorded, and malformed call logs are marked as partial evidence.
 
 **Use case: Suppress transient infrastructure failures**
 
@@ -1603,6 +2024,26 @@ safe-outputs:
 
 Both approaches prevent noise while preserving actionable signals, but exclusion syntax is more concise when most categories should be reported.
 
+#### Reusable Workflows (Dynamic Configuration via Inputs)
+
+`report-failure-as-issue` (and `report-failed-jobs`, `failure-issue-repo`) accept a GitHub Actions expression instead of a literal value, so a `workflow_call`-triggered workflow can let each caller decide whether failures become issues:
+
+```yaml wrap
+on:
+  workflow_call:
+    inputs:
+      report-failure-as-issue:
+        description: When true, agent failures are reported as GitHub issues
+        required: false
+        type: boolean
+        default: true
+safe-outputs:
+  report-failure-as-issue: ${{ inputs.report-failure-as-issue }}
+  create-issue:
+```
+
+Callers that want to silence failure issues then pass `report-failure-as-issue: false` when invoking the reusable workflow, without editing its source. This avoids maintaining a separate copy of the workflow (or a post-compile patch of the generated `.lock.yml`) just to toggle failure reporting per caller.
+
 ### Failure Issue Repository (`failure-issue-repo:`)
 
 Redirects failure tracking issues to a different repository. Useful when the current repository has issues disabled (e.g. `github/docs-internal`).
@@ -1613,7 +2054,9 @@ safe-outputs:
   create-issue:
 ```
 
-The value must be in `owner/repo` format. The `GITHUB_TOKEN` used must have permission to create issues in the target repository. When not set, failure issues are created in the current repository.
+The value must be in `owner/repo` format, or a GitHub Actions expression that resolves to that format at runtime (e.g. `${{ inputs.failure-issue-repo }}` for a reusable workflow). The `GITHUB_TOKEN` used must have permission to create issues in the target repository. When not set, failure issues are created in the current repository.
+
+A literal `owner/repo` value is trusted compile-time configuration and may point at any repository. A value that comes from an expression is resolved at runtime from caller-supplied data, so it is validated before use: it must belong to the same owner as the repository running the workflow, otherwise it is ignored (with a warning) and failure issues are created in the current repository.
 
 ### Group Reports (`group-reports:`)
 
@@ -1644,18 +2087,19 @@ safe-outputs:
 - `secrets.NAME`
 - `needs.<job>.outputs.<name>`
 - `steps.<id>.outputs.<name>`
+- `steps.<id>.outputs.<name> || secrets.NAME [|| secrets.NAME ...]`
 
-The `steps.*.outputs.*` form is useful when the safe-outputs job mints a short-lived token in `pre-steps:` or `setup-steps:` and then reuses that token for `Process Safe Outputs` in the same job.
+The `steps.*.outputs.*` forms are useful when a short-lived token is minted inside the job that uses it, for example with a keyless OIDC token-minting action. Step outputs are only readable inside that job. Agent and safe-output jobs may inject token-minting steps, but conclusion accepts compiler-generated steps only. A global `safe-outputs.github-token` consumed by conclusion must therefore use a secret or supported compiler-managed GitHub App authentication, not a user-provided minting step.
+
+`pre-steps:` run before the job's checkout, git-credential and token-consuming steps, so the minted token is available everywhere it is needed. `safe-outputs.steps:` is not a valid place to mint such a token because it runs *after* the `safe_outputs` job checkout.
 
 ```yaml wrap
-pre-steps:
-  - id: fetch_token
-    run: echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
-
 safe-outputs:
-  github-token: ${{ steps.fetch_token.outputs.token }}
-  create-pull-request:
+  github-token: ${{ secrets.CUSTOM_PAT || secrets.GITHUB_TOKEN }}
+  push-to-pull-request-branch:
 ```
+
+The compiler fails compilation when a job consumes `${{ steps.<id>.outputs.* }}` but never declares a step with that id, or declares it after the first consumer, rather than emitting a lock file with an unresolvable reference.
 
 ### Using a GitHub App for Authentication (`github-app:`)
 
@@ -1677,7 +2121,17 @@ safe-outputs:
     private-key: ${{ secrets.WORKFLOW_APP_PRIVATE_KEY }}
 ```
 
-Accepts a plain string or an object with `name` and optional `url`, consistent with the top-level `environment:` syntax.
+Accepts a plain string or an object with `name`, optional `url`, and optional `deployment`, consistent with the top-level `environment:` syntax. `deployment` accepts a boolean or GitHub Actions expression, such as `${{ github.ref_name == 'main' }}`; omitting it preserves the default deployment behavior.
+
+For environments that only gate write credentials, `deployment: false` keeps environment secrets and protection rules (including branch policies, required reviewers, and wait timers) without creating deployment records:
+
+```aw wrap
+safe-outputs:
+  environment:
+    name: protected-write-secrets
+    deployment: false
+  add-comment:
+```
 
 ### Safe Outputs Dependencies (`needs:`)
 
@@ -1717,6 +2171,9 @@ Validation rules:
 The text output by AI agents is automatically sanitized to prevent injection of malicious content and ensure safe rendering on GitHub. The auto-sanitization applied is: XML escaped, HTTPS only, domain allowlist (GitHub by default), 0.5MB/65k line limits, control char stripping.
 
 HTML/XML comments (`<!-- ... -->`) are removed from sanitized body fields.
+
+#### Structured Data (`data:`)
+
 If you need a machine-readable channel that survives sanitization, configure `safe-outputs.data` in frontmatter:
 
 ```yaml wrap
@@ -1731,18 +2188,32 @@ safe-outputs:
 
 Inline object schemas are validated at compile-time (Go) and runtime (JavaScript). Expression-based schemas are resolved and validated at runtime in JavaScript.
 
-For safe outputs that support `body`, the validator preserves output `data` and appends it to the body as fenced JSON:
+For safe outputs that support `body`, the validator preserves output `data` and appends it to the body as fenced JSON. For `create-issue`, the JSON is enclosed in a collapsed `<details>` element with a "Structured data" summary. For `add-comment`, the JSON is visible under a "Structured data:" label, not hidden metadata.
+
+For example, an incremental review can declare a baseline SHA:
+
+```yaml wrap
+safe-outputs:
+  data:
+    reviewed_sha: string
+  add-comment:
+```
+
+The agent supplies the baseline in the output item's `data` field, not as an HTML comment in `body`:
 
 ```json
 {
   "type": "add_comment",
   "body": "Review complete. All criteria pass.",
   "data": {
-    "verdict": "APPROVE",
-    "criteria_passed": 5
+    "reviewed_sha": "0123456789abcdef0123456789abcdef01234567"
   }
 }
 ```
+
+On a later run, including an `issue_comment`-triggered run, read the PR's comment history and parse the fenced JSON following "Structured data:" in the latest matching review comment. Filter by the expected comment author and [workflow marker](#searching-for-workflow-created-items). Validate the recovered SHA against the target PR before using it as a baseline. The state persists in the posted comment; `data` does not automatically restore it or provide a separate cross-run store. Do not put secrets in `data`.
+
+#### Sanitization Options
 
 You can configure sanitization options:
 
@@ -1795,6 +2266,8 @@ Accepts a literal integer or a GitHub Actions expression string (e.g., `${{ inpu
 
 By default, `@mentions` in AI-generated content are escaped with backticks unless the mentioned user is a verified collaborator or inferred from the event context (issue/PR author, assignees, etc.). Use `mentions:` to control this behavior:
 
+Collaborator checks use the repository receiving each safe output. With `target-repo`, the workflow repository's collaborators are not used as a fallback when the token cannot read the target repository. The agent job preserves mention candidates without performing lookups; the trusted `safe_outputs` job filters them before publication.
+
 ```yaml wrap
 safe-outputs:
   mentions: false          # Escape all mentions
@@ -1804,21 +2277,34 @@ safe-outputs:
 ```yaml wrap
 safe-outputs:
   mentions:
-    allow-team-members: true    # Allow repo collaborators (default: true)
-    allow-context: true         # Allow event context participants (default: true)
-    allowed:                    # Individual users/bots always allowed
+    allowed-collaborators: true  # Allow repo collaborators (default: true)
+    allow-context: true          # Allow event context participants (default: true)
+    allowed:                     # Individual users/bots always allowed
       - trusted-bot
-    allowed-teams:              # Team members always allowed
-      - myorg/eng               # org/team-slug format
-      - reviewers               # team-slug only (uses current org)
-    max: 50                     # Max mentions per message (default: 50)
+    allowed-teams:               # Team members always allowed
+      - myorg/eng                # org/team-slug format
+      - reviewers                # team-slug only (uses current org)
+    max: 50                      # Max mentions per message (default: 50)
   add-comment: {}
 ```
 
+`allow-team-members` is a deprecated alias for `allowed-collaborators`. Run `gh aw fix` to migrate existing workflows.
+
 **`allowed-teams`** lets organizations allow all members of specific GitHub teams to be mentioned without listing individual usernames. Team members are fetched from the GitHub API at runtime using `GET /orgs/{org}/teams/{team_slug}/members`. Bot accounts within the team are excluded. Use `org/team-slug` for cross-org teams or just `team-slug` to resolve against the current repository's organization.
 
+Configure `safe-outputs.mentions.github-token` or `safe-outputs.mentions.github-app` with read access to team membership. Mention and team lookups run in the trusted `safe_outputs` job, after the agent artifact is transferred. The token selection is mention app, mention token, then `github.token`; it never inherits `safe-outputs.github-token`, `safe-outputs.github-app`, per-output credentials, or `GH_AW_GITHUB_TOKEN`.
+
+```yaml wrap
+safe-outputs:
+  mentions:
+    github-token: ${{ secrets.MENTIONS_READ_PAT }}
+    allowed-teams: [my-org/my-team]
+```
+
+Alternatively, configure `safe-outputs.mentions.github-app` with the standard `client-id`, `private-key`, `owner`, `repositories`, and `permissions` fields. Its token is minted in the trusted `safe_outputs` job before **Process Safe Outputs**, takes precedence over `mentions.github-token`, and requests `issues: read` when `add-comment` is enabled and `members: read` when `allowed-teams` is configured. Permission overrides may be `read` or `none`; `write` and other values are rejected. With `ignore-if-missing: true`, missing app credentials fall back to `mentions.github-token`, then `github.token`. Omitting the mention-specific app does not disable mention filtering. Downstream write credentials remain unchanged.
+
 > [!IMPORTANT]
-> `allowed-teams` requires the workflow token to have `read:org` scope. The default `GITHUB_TOKEN` does **not** include this scope. Use one of the following:
+> `allowed-teams` requires the mention-resolution token to have `read:org` scope. The default `github.token` does **not** include this scope. Use one of the following:
 > - A **classic PAT** with the `read:org` scope stored as a repository secret
 > - A **fine-grained PAT** with the "Members" repository permission (read)
 > - A **GitHub App** installation token with the "Members" permission (read)
@@ -1852,6 +2338,10 @@ safe-outputs:
   create-pull-request:
 ```
 
+### Bundle History Recovery (`allow-full-history-fetch:`)
+
+Configured independently under `create-pull-request` and `push-to-pull-request-branch`, defaulting to `false`. Missing local bundle prerequisites fail with checkout provisioning guidance instead of downloading history. Setting this literal boolean to `true` explicitly permits potentially unbounded history downloads for that handler. It does not enable object downloads for optional validation baselines. See [bundle prerequisites and history downloads](/gh-aw/reference/safe-outputs-pull-requests/#bundle-prerequisites-and-history-downloads).
+
 ### Custom Runner Image
 
 Specify a custom runner for safe output jobs (default: `ubuntu-slim`):
@@ -1865,6 +2355,24 @@ safe-outputs:
 ```
 
 `safe-outputs.runs-on` overrides `runs-on-slim:` for safe-output jobs specifically. To override the runner for all framework jobs at once, use the top-level [`runs-on-slim:`](/gh-aw/reference/self-hosted-runners/#configuring-the-framework-job-runner) field instead.
+
+Custom safe-jobs can select their own runner with `safe-outputs.jobs.<job>.runs-on`. This field supports runner labels, label arrays, and runner-group objects:
+
+```aw
+---
+safe-outputs:
+  jobs:
+    notify:
+      runs-on:
+        group: safe-job-runners
+        labels: [linux]
+      inputs:
+        message:
+          description: Notification message
+      steps:
+        - run: echo "Notify"
+---
+```
 
 ### Safe Outputs Job Concurrency (`concurrency-group:`)
 
@@ -1899,13 +2407,15 @@ safe-outputs:
 
 The `footer-install` template renders the install instructions that follow the footer attribution line. When a workflow source is available and no custom template is set, the default renders as a collapsed `<details>` disclosure with the summary `Add this agentic workflows to your repo`; the expanded block contains the `gh aw add {workflow_source}` command. Custom `footer-install` overrides bypass the disclosure wrapper, so include `<details>` markup explicitly if you want the same collapsed UX. Supported placeholders: `{workflow_source}`, `{workflow_source_url}`.
 
-**Variables**: `{workflow_name}`, `{run_url}`, `{agentic_workflow_url}`, `{triggering_number}`, `{triggering_type}`, `{workflow_source}`, `{workflow_source_url}`, `{event_type}`, `{status}`, `{operation}`, `{effective_tokens}`, `{effective_tokens_formatted}`, `{ai_credits_suffix}`, `{effective_tokens_suffix}`
+**Variables**: `{workflow_name}`, `{run_url}`, `{agentic_workflow_url}`, `{triggering_number}`, `{triggering_type}`, `{workflow_source}`, `{workflow_source_url}`, `{event_type}`, `{status}`, `{operation}`, `{ai_credits_suffix}`, `{ai_credits}`, `{ai_credits_formatted}`, `{ai_model}`, `{ai_model_short}`, `{ai_credits_unit}`, `{detection_conclusion}`, `{detection_reason}`, `{ambient_context}`, `{ambient_context_formatted}`, `{ambient_context_suffix}`, `{agent_ai_credits}`, `{agent_ai_credits_formatted}`, `{agent_ai_credits_suffix}`, `{evals_ai_credits}`, `{evals_ai_credits_formatted}`, `{evals_ai_credits_suffix}`, `{threat_detection_ai_credits}`, `{threat_detection_ai_credits_formatted}`, `{threat_detection_ai_credits_suffix}`, `{history_link}`
 
-`{ai_credits_suffix}` is the preferred pre-formatted, always-safe suffix for run cost (for example, `" · sonnet46 12.4 AIC"` or `""`) and can be inserted directly into footer templates alongside `{history_link}`. `{effective_tokens}` and `{effective_tokens_formatted}` remain available as legacy ET compatibility fields. `{effective_tokens_suffix}` is also preserved as a legacy alias for older templates. When the run's engine model is known, the suffix is prefixed with a deterministic compact model identifier — `sonnetNN` for Sonnet, `gptNN` for GPT, `opusNN` for Opus, `haikuNN` for Haiku, `gemNN` for Gemini, with a stable fallback for other models. Direct short aliases like `opus`, `sonnet`, and `haiku` are preserved. The default footer uses AI Credits formatting; use these variables to customize output as needed. See [AI Credits Specification](/gh-aw/specs/ai-credits-specification/) for AIC details and [Effective Tokens Specification](/gh-aw/specs/effective-tokens-specification/) for legacy ET computation.
+`{ai_credits_suffix}` is the preferred pre-formatted, always-safe suffix for run cost (for example, `" · sonnet46 · ~13 AIC"` or `""`) and can be inserted directly into footer templates alongside `{history_link}`. Formatted footer costs include a `~` estimate prefix and round up to whole credits without decimals; raw numeric cost variables retain their original precision. When the run's engine model is known, the suffix is prefixed with a deterministic compact model identifier — `sonnetNN` for Sonnet, `gptNN` for GPT, `opusNN` for Opus, `haikuNN` for Haiku, `gemNN` for Gemini, with a stable fallback for other models. Direct short aliases like `opus`, `sonnet`, and `haiku` are preserved. The default footer uses AI Credits formatting; use these variables to customize output as needed. Individual components are also available: `{ai_model}` is the full model name (e.g. `claude-sonnet-4.6`), `{ai_model_short}` is the compact identifier (e.g. `sonnet46`), `{ai_credits_unit}` is always `AIC`, `{detection_conclusion}` and `{detection_reason}` expose the threat detection result. See [AI Credits Specification](/gh-aw/specs/ai-credits-specification/) for AIC details.
 
 ## Staged Mode
 
 Staged mode lets you preview what safe outputs a workflow would create without actually creating anything. Every write operation is skipped; instead, a 🎭-labelled preview appears in the GitHub Actions step summary.
+
+Staged handlers can still read target data to validate filters such as `required-labels` and `required-title-prefix`. The compiler grants the read permissions these lookups require, including for GitHub App tokens, without granting write permissions for staged handlers.
 
 Enable it globally by adding `staged: true` to the `safe-outputs:` block:
 
@@ -1953,7 +2463,7 @@ The `apply_safe_outputs` job downloads the `agent_output.json` artifact from the
 > [!TIP]
 > Find the run URL by opening the failed or cancelled run in the **Actions** tab — the URL in your browser's address bar is the run URL.
 
-## Related Documentation
+## Learn More
 
 - [Staged Mode](/gh-aw/reference/staged-mode/) - Preview safe output operations without making changes
 - [Threat Detection Guide](/gh-aw/reference/threat-detection/) - Complete threat detection documentation and examples

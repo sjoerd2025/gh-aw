@@ -12,14 +12,17 @@ permissions:
   issues: read
   # Note: PR write operations handled via safe-outputs
   copilot-requests: write
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 strict: true
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [pull_requests, repos, issues]
   bash:
     - "jq *"
@@ -185,8 +188,6 @@ Add warning comment (do not close):
 ```
 
 ### Step 4: Generate Summary Report
-
-**Report Formatting**: Use h3 (###) or lower for all headers in the report. Wrap long sections (>10 items) in `<details><summary>Section Name</summary>` tags to improve readability.
 
 Output the following summary to stdout after processing:
 

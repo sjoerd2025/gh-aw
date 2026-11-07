@@ -3,9 +3,45 @@ import { describe, it, expect } from "vitest";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
-const { extractFilenamesFromPatch, checkForManifestFiles, checkAllowedFiles, checkExcludedFiles, checkFileProtection, checkForTopLevelDotFolders } = require("./manifest_file_helpers.cjs");
+const { extractFilenamesFromPatch, checkForManifestFiles, checkAllowedFiles, checkExcludedFiles, checkFileProtection, checkFileProtectionPostApply, checkForTopLevelDotFolders } = require("./manifest_file_helpers.cjs");
 
 describe("manifest_file_helpers", () => {
+  describe.each(["patch", "post-apply"])("repository protected-file exclusions (%s)", mode => {
+    const config = {
+      protected_files: ["README.md", "package.json"],
+      protected_path_prefixes: [".github/"],
+      protect_top_level_dot_folders: true,
+      protected_files_path_exclude: [".changeset/*.md", ".github/reports/**", "README.md"],
+    };
+    const check = (paths, overrides = {}) =>
+      mode === "patch" ? checkFileProtection(paths.map(path => `diff --git a/${path} b/${path}\nindex abc..def 100644\n`).join("\n"), { ...config, ...overrides }) : checkFileProtectionPostApply(paths, { ...config, ...overrides });
+
+    it("allows only matching paths, including dot-folder and protected-prefix exceptions", () => {
+      expect(check([".changeset/fix.md", ".changeset/README.md", ".github/reports/nested/report.md", "README.md"]).action).toBe("allow");
+      for (const path of [".changeset/config.json", ".changeset/nested/fix.md", ".changesets/fix.md", "nested/.changeset/README.md", "docs/README.md", ".github/workflows/ci.yml", "package.json"]) {
+        expect(check([path]).action, path).toBe("deny");
+      }
+    });
+
+    it("preserves allowlists and policies for other protected files", () => {
+      expect(check([".changeset/fix.md"], { allowed_files: ["src/**"] }).action).toBe("deny");
+      expect(check([".changeset/fix.md", ".changeset/config.json"]).action).toBe("deny");
+      expect(check([".changeset/fix.md", "package.json"], { protected_files_policy: "fallback-to-issue" }).action).toBe("fallback");
+      expect(check([".changeset/fix.md", "package.json"], { protected_files_policy: "request-review" }).action).toBe("request_review");
+    });
+
+    it("treats placeholder-like exclusions literally without exempting other protected paths", () => {
+      const overrides = {
+        protected_files: [...config.protected_files, "<!DOUBLESTAR>"],
+        protected_files_path_exclude: ["<!DOUBLESTAR>"],
+      };
+      expect(check(["<!DOUBLESTAR>"], overrides).action).toBe("allow");
+      for (const path of ["README.md", "package.json", ".github/workflows/ci.yml", ".cursor/settings.json"]) {
+        expect(check([path], overrides).action, path).toBe("deny");
+      }
+    });
+  });
+
   describe("extractFilenamesFromPatch", () => {
     it("should return empty array for empty patch", () => {
       expect(extractFilenamesFromPatch("")).toEqual([]);
@@ -267,12 +303,23 @@ index 0000000..abc
       expect(result).toHaveLength(1);
     });
 
-    it("should preserve full escaped paths from quoted headers", () => {
+    it("should decode quoted path escapes", () => {
       const patch = `diff --git "a/foo\\\\bar/config.json" "b/foo\\\\bar/config.json"
 index abc..def 100644
 `;
       const result = extractPathsFromPatch(patch);
-      expect(result).toContain("foo\\\\bar/config.json");
+      expect(result).toContain("foo\\bar/config.json");
+    });
+
+    it("should match exact exclusions for quoted non-ASCII paths", () => {
+      const patch = `diff --git "a/r\\303\\251po/pyproject.toml" "b/r\\303\\251po/pyproject.toml"
+index abc..def 100644
+diff --git "a/lib/foo/pyproject.toml" "b/lib/foo/pyproject.toml"
+index abc..def 100644
+`;
+      const result = checkForManifestFiles(patch, ["pyproject.toml"], ["répo/pyproject.toml"]);
+      expect(result.hasManifestFiles).toBe(true);
+      expect(result.manifestFilesFound).toEqual(["pyproject.toml"]);
     });
   });
 
@@ -484,6 +531,21 @@ index abc..def 100644
       expect(result.action).toBe("allow");
     });
 
+    it("should allow CHANGELOG.md while protecting adjacent top-level documentation", () => {
+      const changelogResult = checkFileProtection(makePatch("CHANGELOG.md"), {
+        protected_files: ["README.md", "CONTRIBUTING.md"],
+        protected_files_policy: "request-review",
+      });
+      expect(changelogResult.action).toBe("allow");
+
+      const readmeResult = checkFileProtection(makePatch("README.md"), {
+        protected_files: ["README.md", "CONTRIBUTING.md"],
+        protected_files_policy: "request-review",
+      });
+      expect(readmeResult.action).toBe("request_review");
+      expect(readmeResult.files).toContain("README.md");
+    });
+
     it("should deny protected file even when it matches the allowlist (orthogonal checks)", () => {
       const result = checkFileProtection(makePatch("package.json"), {
         allowed_files: ["package.json"],
@@ -493,6 +555,33 @@ index abc..def 100644
       expect(result.action).toBe("deny");
       expect(result.source).toBe("protected");
       expect(result.files).toContain("package.json");
+    });
+
+    it("should exempt only the exact path, not files with the same basename", () => {
+      const config = {
+        allowed_files: ["pyproject.toml", "lib/**", "tests/**"],
+        protected_files: ["pyproject.toml"],
+        protected_files_path_exclude: ["pyproject.toml"],
+        protected_files_policy: "blocked",
+      };
+      expect(checkFileProtection(makePatch("pyproject.toml"), config).action).toBe("allow");
+      for (const path of ["lib/x/pyproject.toml", "tests/pyproject.toml"]) {
+        const result = checkFileProtection(makePatch(path), config);
+        expect(result.action).toBe("deny");
+        expect(result.source).toBe("protected");
+      }
+      expect(checkFileProtection(makePatch("lib/x/pyproject.toml"), { ...config, protected_files: [], protected_files_path_exclude: [] }).action).toBe("allow");
+    });
+
+    it("should apply exact-path exclusions to protected prefixes and dot folders but not the allowlist", () => {
+      const config = {
+        protected_path_prefixes: [".github/"],
+        protect_top_level_dot_folders: true,
+        protected_files_path_exclude: [".github/CODEOWNERS"],
+      };
+      expect(checkFileProtection(makePatch(".github/CODEOWNERS"), config).action).toBe("allow");
+      expect(checkFileProtection(makePatch(".github/workflows/ci.yml"), config).action).toBe("deny");
+      expect(checkFileProtection(makePatch(".github/CODEOWNERS"), { ...config, allowed_files: ["src/**"] }).source).toBe("allowlist");
     });
 
     it("should allow protected file when allowlist matches and protected-files: allowed", () => {
@@ -677,6 +766,33 @@ index abc..def 100644
 
   describe("checkFileProtectionPostApply", () => {
     const { checkFileProtectionPostApply } = require("./manifest_file_helpers.cjs");
+
+    it("should exempt only the exact path, while protecting nested manifests", () => {
+      const config = {
+        allowed_files: ["pyproject.toml", "lib/**", "tests/**"],
+        protected_files: ["pyproject.toml"],
+        protected_files_path_exclude: ["pyproject.toml"],
+        protected_files_policy: "blocked",
+      };
+      expect(checkFileProtectionPostApply(["pyproject.toml"], config).action).toBe("allow");
+      for (const path of ["lib/x/pyproject.toml", "tests/pyproject.toml"]) {
+        const result = checkFileProtectionPostApply([path], config);
+        expect(result.action).toBe("deny");
+        expect(result.files).toContain(path);
+      }
+      expect(checkFileProtectionPostApply(["lib/x/pyproject.toml"], { ...config, protected_files: [], protected_files_path_exclude: [] }).action).toBe("allow");
+    });
+
+    it("should skip exact paths under protected prefixes and dot folders, without bypassing allowed-files", () => {
+      const config = {
+        protected_path_prefixes: [".github/"],
+        protect_top_level_dot_folders: true,
+        protected_files_path_exclude: [".github/CODEOWNERS"],
+      };
+      expect(checkFileProtectionPostApply([".github/CODEOWNERS"], config).action).toBe("allow");
+      expect(checkFileProtectionPostApply([".github/workflows/ci.yml"], config).action).toBe("deny");
+      expect(checkFileProtectionPostApply([".github/CODEOWNERS"], { ...config, allowed_files: ["src/**"] }).source).toBe("post-apply");
+    });
 
     it("should allow when no files modified", () => {
       const result = checkFileProtectionPostApply([], {});

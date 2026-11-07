@@ -35,9 +35,20 @@ There are two billing paths for the Copilot engine (`engine: copilot`, the defau
 
 `gh aw compile` does **not** auto-inject `copilot-requests: write` into arbitrary workflow source. The permission must be declared in the workflow frontmatter. Some authoring flows such as `gh aw add` can insert it when the author explicitly chooses Copilot org billing, but the compiler otherwise only emits an informational tip.
 
+For Claude workflows that use the GitHub Copilot provider (for example `engine: { id: claude, model-provider: github }` or a `copilot/` model), the compiler emits a warning instead of a tip when `copilot-requests: write` is missing, because the `COPILOT_GITHUB_TOKEN` fallback may be rejected when loading the Copilot model catalog. Setting `copilot-requests: none` also silences this warning.
+
+To use individual/seat billing without receiving this tip on future compilations, explicitly disable organization billing:
+
+```yaml
+permissions:
+  copilot-requests: none
+```
+
 **Individual/seat billing** — If the above conditions are not met, the workflow must be configured with a user-supplied [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token). In this case inference is attributed to (and limited by) the PAT owner's Copilot entitlements rather than being billed centrally through the organization.
 
 See [Engines](/gh-aw/reference/engines/) for a full list of engines and their authentication requirements, and [Authentication](/gh-aw/reference/auth/) for configuration details. For Copilot model pricing and AIC rates, see [GitHub Copilot models and pricing](https://docs.github.com/copilot/reference/copilot-billing/models-and-pricing).
+
+An `Authentication failed with provider ... (HTTP 403)` message from the local API proxy does not necessarily indicate a billing or credential problem. Copilot CLI can emit the same message when the proxy enforces `max-ai-credits`. gh-aw compares the proxy's token-usage total with the configured cap to identify budget exhaustion and avoid retrying against an exhausted budget. Failure reports use the budget category instead of organization billing guidance when that evidence is present.
 
 ### Anthropic (Claude)
 

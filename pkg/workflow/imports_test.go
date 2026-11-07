@@ -390,8 +390,7 @@ This is a test workflow with imported MCP server.
 }
 
 // TestCompileWorkflowWithTopLevelModel verifies that a workflow declaring a top-level
-// model: field (without engine.model) compiles successfully. This is the recommended
-// way to set a model since engine.model is deprecated.
+// model: field (without engine.model) compiles successfully.
 func TestCompileWorkflowWithTopLevelModel(t *testing.T) {
 	tempDir := testutil.TempDir(t, "test-*")
 
@@ -423,8 +422,6 @@ This workflow uses the top-level model field to express a model-size preference.
 // TestCompileWorkflowWithImportedTopLevelModel verifies that a workflow importing a shared
 // file that declares only a top-level model: field (without engine or engine.model) compiles
 // successfully and that the shared workflow's model is applied to the compiled output.
-// This is the recommended modern alternative to importing shared workflows that use the
-// deprecated engine.model field.
 func TestCompileWorkflowWithImportedTopLevelModel(t *testing.T) {
 	tempDir := testutil.TempDir(t, "test-*")
 
@@ -664,4 +661,36 @@ This workflow imports a shared file that declares a model preference.
 	if err := compiler.CompileWorkflow(workflowPath); err != nil {
 		t.Fatalf("CompileWorkflow failed when imported shared workflow has engine.model without engine.id: %v", err)
 	}
+}
+
+func TestMergeNetworkPermissionsPreservesImportedRestrictions(t *testing.T) {
+	compiler := workflow.NewCompiler()
+
+	t.Run("blocked domains", func(t *testing.T) {
+		permissions, err := compiler.MergeNetworkPermissions(
+			&workflow.NetworkPermissions{Allowed: []string{"defaults"}},
+			`{"blocked":["tracker.example.com"]}`,
+		)
+
+		if err != nil {
+			t.Fatalf("MergeNetworkPermissions returned an error: %v", err)
+		}
+		if len(permissions.Blocked) != 1 || permissions.Blocked[0] != "tracker.example.com" {
+			t.Errorf("expected imported blocked domain to be preserved, got %v", permissions.Blocked)
+		}
+	})
+
+	t.Run("empty network object", func(t *testing.T) {
+		permissions, err := compiler.MergeNetworkPermissions(
+			&workflow.NetworkPermissions{Allowed: []string{"defaults"}},
+			"{}\n{\"allowed\":[\"example.com\"]}",
+		)
+
+		if err != nil {
+			t.Fatalf("MergeNetworkPermissions returned an error: %v", err)
+		}
+		if len(permissions.Allowed) != 0 || !permissions.ExplicitlyDefined {
+			t.Errorf("expected imported empty network object to preserve deny-all semantics, got %+v", permissions)
+		}
+	})
 }

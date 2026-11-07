@@ -37,6 +37,14 @@ func New(getenv EnvGetter) *Manager {
 var defaultManager = New(os.Getenv)
 
 const (
+	DefaultAdmissionURL      = "GH_AW_DEFAULT_ADMISSION_URL"
+	DefaultAdmissionAudience = "GH_AW_DEFAULT_ADMISSION_AUDIENCE"
+	DefaultAdmissionOnOutage = "GH_AW_DEFAULT_ADMISSION_ON_OUTAGE"
+
+	// DefaultArtifactRetentionDays is the runtime Actions variable used when
+	// artifact_retention_days is not configured in aw.json.
+	DefaultArtifactRetentionDays = "GH_AW_DEFAULT_ARTIFACT_RETENTION_DAYS"
+
 	// DefaultMaxDailyAICredits is the enterprise override for the top-level
 	// max-daily-ai-credits guardrail when it is not explicitly configured in
 	// workflow frontmatter.
@@ -59,9 +67,16 @@ const (
 	// DefaultMaxTurns is the enterprise override for max-turns when it is not
 	// explicitly configured in workflow frontmatter.
 	DefaultMaxTurns = "GH_AW_DEFAULT_MAX_TURNS"
-	// DefaultTimeoutMinutes is the enterprise override for top-level timeout-minutes
-	// when it is not explicitly configured in workflow frontmatter.
+	// DefaultTimeoutMinutes is the GitHub Actions variable used for the default
+	// agentic execution step timeout when top-level timeout-minutes is not set.
 	DefaultTimeoutMinutes = "GH_AW_DEFAULT_TIMEOUT_MINUTES"
+	// DefaultAgentJobTimeoutMinutes is the GitHub Actions variable used for the
+	// default generated agent job timeout when jobs.agent.timeout-minutes is not set.
+	DefaultAgentJobTimeoutMinutes = "GH_AW_DEFAULT_AGENT_JOB_TIMEOUT_MINUTES"
+	// DefaultDetectionJobTimeoutMinutes is the GitHub Actions variable used for the
+	// default generated detection job timeout when jobs.detection.timeout-minutes
+	// is not set.
+	DefaultDetectionJobTimeoutMinutes = "GH_AW_DEFAULT_DETECTION_JOB_TIMEOUT_MINUTES"
 	// DefaultDetectionModel is the enterprise override for selecting the detection
 	// job model when threat-detection.engine.model is not set.
 	DefaultDetectionModel = "GH_AW_DEFAULT_DETECTION_MODEL"
@@ -72,6 +87,18 @@ const (
 	// DefaultUTC is the enterprise override for the project home timezone used
 	// when rendering local times in CLI output.
 	DefaultUTC = "GH_AW_DEFAULT_UTC"
+
+	// DefaultOTLPEndpoint is the GitHub Actions secret or variable used as the
+	// fallback OTLP endpoint when observability.otlp.endpoint is not configured
+	// in workflow frontmatter (or any imported workflow).
+	DefaultOTLPEndpoint = "GH_AW_DEFAULT_OTLP_ENDPOINT"
+	// DefaultOTLPHeaders is the GitHub Actions secret used as the fallback OTLP
+	// exporter headers (comma-separated key=value pairs) that accompany
+	// DefaultOTLPEndpoint.
+	DefaultOTLPHeaders = "GH_AW_DEFAULT_OTLP_HEADERS"
+	// OTLPProtocol is the standard Actions variable used to select the trusted
+	// JavaScript exporter's wire encoding unless workflow env overrides it.
+	OTLPProtocol = "OTEL_EXPORTER_OTLP_PROTOCOL"
 
 	// DefaultModelCopilot is the enterprise override for Copilot fallback model selection.
 	DefaultModelCopilot = "GH_AW_DEFAULT_MODEL_COPILOT"
@@ -94,7 +121,32 @@ const (
 	// remain runtime-compliant. Set to the string value "false" to disable the
 	// create_pull_request safe-output tool at runtime.
 	PolicyAllowCreatePullRequest = "GH_AW_POLICY_ALLOW_CREATE_PULL_REQUEST"
+	// RequireSelfHostedRunners enables compile-time validation that every generated
+	// job selects a self-hosted runner.
+	RequireSelfHostedRunners = "GH_AW_REQUIRE_SELF_HOSTED_RUNNERS"
 )
+
+// ResolveRequireSelfHostedRunners reports whether self-hosted runner enforcement is
+// enabled. An unset value disables enforcement; any other value must be true or false.
+func (m *Manager) ResolveRequireSelfHostedRunners() (bool, error) {
+	raw := strings.TrimSpace(m.getenv(RequireSelfHostedRunners))
+	if raw == "" {
+		return false, nil
+	}
+	if strings.EqualFold(raw, "true") {
+		return true, nil
+	}
+	if strings.EqualFold(raw, "false") {
+		return false, nil
+	}
+	return false, fmt.Errorf("%s must be \"true\" or \"false\", got %q", RequireSelfHostedRunners, raw)
+}
+
+// ResolveRequireSelfHostedRunners is a convenience wrapper that delegates to the
+// default process-environment Manager.
+func ResolveRequireSelfHostedRunners() (bool, error) {
+	return defaultManager.ResolveRequireSelfHostedRunners()
+}
 
 // ResolveDefaultMaxTurns returns fallback when the env var is unset/invalid,
 // otherwise returns the parsed override as a string.
@@ -124,6 +176,13 @@ func (m *Manager) ResolveDefaultTimeoutMinutes(fallback int) int {
 // default process-environment Manager.
 func ResolveDefaultTimeoutMinutes(fallback int) int {
 	return defaultManager.ResolveDefaultTimeoutMinutes(fallback)
+}
+
+// BuildTimeoutMinutesExpression builds a GitHub Actions expression that resolves
+// a default timeout from an Actions variable at runtime, falling back to the
+// compiled-in default when the variable is unset.
+func BuildTimeoutMinutesExpression(varName string, builtinDefault int) string {
+	return fmt.Sprintf("${{ fromJSON(vars.%s || '%d') }}", varName, builtinDefault)
 }
 
 // ResolveDefaultMaxTurnCacheMisses returns fallback when the env var is unset/invalid,
@@ -249,6 +308,22 @@ func BuildDefaultMaxTurnsExpression() string {
 	return fmt.Sprintf("${{ vars.%s || '' }}", DefaultMaxTurns)
 }
 
+// BuildDefaultOTLPEndpointExpression builds an expression that resolves the OTLP
+// endpoint at runtime from the GH_AW_DEFAULT_OTLP_ENDPOINT GitHub secret, falling
+// back to the variable for compatibility. The expression evaluates to an empty
+// string when both are unset, which downstream runtime code treats as
+// "observability disabled".
+func BuildDefaultOTLPEndpointExpression() string {
+	return fmt.Sprintf("${{ secrets.%s || vars.%s }}", DefaultOTLPEndpoint, DefaultOTLPEndpoint)
+}
+
+// BuildDefaultOTLPHeadersExpression builds a secrets expression that resolves the
+// OTLP exporter headers at runtime from the GH_AW_DEFAULT_OTLP_HEADERS GitHub
+// secret. The expression evaluates to an empty string when the secret is unset.
+func BuildDefaultOTLPHeadersExpression() string {
+	return fmt.Sprintf("${{ secrets.%s }}", DefaultOTLPHeaders)
+}
+
 // BuildModelOverrideExpression builds a vars expression with primary model var, enterprise
 // default model var, and built-in fallback model.
 func BuildModelOverrideExpression(primaryVar, enterpriseDefaultVar, builtinFallback string) string {
@@ -256,8 +331,8 @@ func BuildModelOverrideExpression(primaryVar, enterpriseDefaultVar, builtinFallb
 	return fmt.Sprintf("${{ vars.%s || vars.%s || '%s' }}", primaryVar, enterpriseDefaultVar, escaped)
 }
 
-// BuildModelOverrideExpressionEmptyFallback builds a vars expression with primary model var,
-// enterprise default model var, and empty string fallback.
+// BuildModelOverrideExpressionEmptyFallback leaves model selection to the runtime
+// when neither the phase nor enterprise model variable is configured.
 func BuildModelOverrideExpressionEmptyFallback(primaryVar, enterpriseDefaultVar string) string {
 	return fmt.Sprintf("${{ vars.%s || vars.%s || '' }}", primaryVar, enterpriseDefaultVar)
 }

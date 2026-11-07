@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"unicode"
 
 	"github.com/github/gh-aw/pkg/logger"
 )
@@ -39,6 +41,10 @@ func ValidateAbsolutePath(path string) (string, error) {
 	if path == "" {
 		fileutilLog.Print("ValidateAbsolutePath: rejected empty path")
 		return "", errors.New("path cannot be empty")
+	}
+	if strings.IndexFunc(path, unicode.IsControl) >= 0 {
+		fileutilLog.Printf("ValidateAbsolutePath: rejected path with control characters: %q", path)
+		return "", fmt.Errorf("path contains invalid control characters: %q", path)
 	}
 
 	// Sanitize the filepath to prevent path traversal attacks
@@ -78,7 +84,7 @@ func ValidatePathWithinBase(base, candidate string) error {
 			return fmt.Errorf("failed to resolve base path %q: %w", base, err)
 		}
 	}
-	absCand, err := resolveWithAncestorSymlinks(candidate)
+	absCand, err := resolvePathWithExistingAncestorSymlinks(candidate)
 	if err != nil {
 		return fmt.Errorf("failed to resolve candidate path %q: %w", candidate, err)
 	}
@@ -91,13 +97,13 @@ func ValidatePathWithinBase(base, candidate string) error {
 	return nil
 }
 
-// resolveWithAncestorSymlinks resolves a path to its absolute real form, following
+// resolvePathWithExistingAncestorSymlinks resolves a path to its absolute real form, following
 // symlinks for every existing component. For paths whose final component does not
 // yet exist on disk, it walks up to the longest existing ancestor, resolves that
 // through filepath.EvalSymlinks (catching any symlinked directories along the way),
 // and then re-appends the non-existing suffix. This prevents a symlinked directory
 // inside base from being used to escape the boundary when the target file is new.
-func resolveWithAncestorSymlinks(p string) (string, error) {
+func resolvePathWithExistingAncestorSymlinks(p string) (string, error) {
 	// Fast path: path exists — EvalSymlinks fully resolves it.
 	if resolved, err := filepath.EvalSymlinks(p); err == nil {
 		return resolved, nil
@@ -182,7 +188,7 @@ type syncWriteCloser interface {
 	Close() error
 }
 
-func copyFileContents(in io.Reader, out syncWriteCloser, dst string) (err error) {
+func copyToFileAndSync(in io.Reader, out syncWriteCloser, dst string) (err error) {
 	removePartial := false
 
 	defer func() {
@@ -219,7 +225,7 @@ func CopyFile(src, dst string) error {
 		fileutilLog.Printf("Failed to create destination file: %s", err)
 		return err
 	}
-	err = copyFileContents(in, out, dst)
+	err = copyToFileAndSync(in, out, dst)
 	if err != nil {
 		return err
 	}

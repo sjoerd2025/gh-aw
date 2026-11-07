@@ -1,24 +1,62 @@
-# Repository Instructions Overlay for gh-aw Agents
+---
+description: Repository overrides for workflow authoring, validation, and investigation.
+---
 
-This optional file defines repository-local workflow authoring standards for installed gh-aw agents.
+# Repository Instructions
 
-## Scope
-
-These rules apply when creating, editing, reviewing, and upgrading agentic workflow files.
-
-## Precedence
-
-Apply upstream/default gh-aw instructions first, then apply this overlay.
-If a rule conflicts, this repository overlay takes precedence.
+Apply to workflow creation, editing, review, diagnosis, debugging, and upgrades.
+These rules override conflicting upstream guidance.
 
 ## Repository Rules
 
-Add your repository-specific standards here, for example:
+- After any `.github/workflows/*.md` edit, run one-shot `gh aw compile`; never `--watch`.
+- Follow [debug-agentic-workflow.md](debug-agentic-workflow.md) for diagnosis,
+  patching, mode selection, and live gates. Logs/audits do not authorize live runs.
+- For ruleset-required workflows, keep workflow/job names stable; set
+  `inlined-imports: true` when imports exist.
+- Explain Copilot authentication accurately: `permissions: { copilot-requests: write }`
+  uses `${{ github.token }}` for inference, without a PAT or `COPILOT_GITHUB_TOKEN`.
+- Before inventing workflow/shared-component/tool/safe-output patterns, inspect
+  `https://github.com/gm3dmo/the-power` through GitHub APIs or `gh` for prior art.
 
-- **CRITICAL INVARIANT:** After **any** modification to agentic workflow markdown files (`.github/workflows/*.md`), you **must** run `gh aw compile` (or `gh aw compile --watch` while iterating) before stopping. Treat this as mandatory.
-- Required shared include(s) for new workflows
-- Standard frontmatter defaults
-- Frontmatter ordering/style conventions
-- Security or policy constraints specific to this repository
-- When documenting or recommending Copilot authentication, state that `permissions: { copilot-requests: write }` uses `${{ github.token }}` for inference and does not require a PAT or `COPILOT_GITHUB_TOKEN` secret
-- When you need prior art for workflow design, shared components, tool configuration, or safe-output patterns, use GitHub APIs or `gh` to inspect `https://github.com/gm3dmo/the-power` before inventing a new pattern
+## Session Graders
+
+Ten fast built-ins run by default in conclusion after session collection.
+Configure them with `graders.<builtin-id>.threshold`, `enabled`, or data-only
+`config`; expensive built-ins require opt-in.
+
+For custom outcomes, use `graders.<distinct-id>.script` with a synchronous
+JavaScript body over immutable `session`, `config`, and `helpers` inputs.
+Reuse `helpers.createSessionLookups(session)` for stats and event/tool lookups.
+Return a finite number, `null` for unavailable evidence, or an object with
+`value`; do not emit legacy metric arrays. The script limit is 256 KiB.
+
+For repository-owned Bash compatibility, use `graders.operational-value.run`
+with a confined `.sh` path. Read session JSONL from `$1` / `GH_AW_SESSION_FILE`
+and JSON config from `GH_AW_GRADER_CONFIG`; retain `[{id,value}, ...]` output.
+Remove file writes and live API/checkout reads; compile/lint rejects detected
+writes. This trusted shell path is not yet microVM-isolated.
+
+The compiler owns the isolated downstream `graders` job for both custom forms.
+Never override built-in implementations, customize `jobs.graders`, or inject
+user code or steps into `jobs.conclusion`.
+Collect required evidence before session publication; graders cannot fetch it.
+Use [operational-value-designer](../skills/operational-value-designer/SKILL.md)
+for executable examples and evidence/fixture design.
+
+Audit optionally retrieves registered custom results from the `graders`
+artifact; `logs --graders` and `--artifacts graders` include both it and `usage`.
+Custom results never replace conclusion's published session.
+
+## Repository-Wide Debugging and Optimization
+
+General "debug/optimize agentic workflows" requests start with failure clustering,
+not a request to choose a workflow. Supplied workflow/run/failure scope takes
+precedence. Follow [analyzing-runs.md](analyzing-runs.md) for collection, selection,
+cached evidence, audits, and uncertainty reporting. Do not dispatch workflows for evidence.
+Use single-run `audit --search` for BM25 evidence retrieval from the actual
+unified session. Repetition grouping activates automatically when useful; do not
+configure Drain3. Grouping never changes ranking and keeps structured outcomes
+separate. These optional run-local groups are distinct from
+fleet failure clusters and `audit --group` finding codes; relevance/anomaly scores
+never replace full-stream findings or establish threat absence.

@@ -1,29 +1,42 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { AGENT_LOGIN_NAMES, getAgentLogins, getAvailableAgentLogins, findAgent, getIssueDetails, getPullRequestDetails, assignAgentToIssue, generatePermissionErrorSummary } = require("./assign_agent_helpers.cjs");
+const { AGENT_LOGIN_NAMES, getAgentLogins, getAvailableAgentLogins, findAgent, getIssueDetails, getPullRequestDetails, assignAgentToIssue, generatePermissionErrorSummary, resolveReasoningEffort } = require("./assign_agent_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { resolveTarget, isStagedMode } = require("./safe_output_helpers.cjs");
+const { resolveTarget, isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
 const { generateStagedPreview } = require("./staged_preview.cjs");
 const { isTemporaryId, normalizeTemporaryId, resolveRepoIssueTarget } = require("./temporary_id.cjs");
 const { sleep } = require("./error_recovery.cjs");
 const { parseAllowedRepos, validateRepo, resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { resolvePullRequestRepo } = require("./pr_helpers.cjs");
-const { sanitizeContent } = require("./sanitize_content.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
 const { normalizeIssueIntentMetadata } = require("./issue_intents.cjs");
+const { getPromptPath, renderTemplateFromFile } = require("./messages_core.cjs");
+const { createTokenBrokerGitHubClient, isTokenBrokerEnabled } = require("./token_broker_github.cjs");
+
+/** @type {Array<[string, string]>} */
+const TOKEN_FORMATS = [
+  ["ghs_", "GitHub App installation token"],
+  ["github_pat_", "fine-grained PAT"],
+  ["ghp_", "classic PAT"],
+  ["ghu_", "GitHub App user access token"],
+  ["gho_", "OAuth access token"],
+];
 
 /**
- * Module-level state — populated by main(), read by the exported getters below.
- * Using module-level variables (rather than closure-only state) allows the handler
- * manager to read final output values after all messages have been processed.
- * @type {Array<{issue_number: number|null, pull_number: number|null, agent: string, owner: string|null, repo: string|null, pull_request_repo?: string|null, success: boolean, skipped?: boolean, error?: string}>}
+ * @param {unknown} token
+ * @returns {string}
  */
-let _allResults = [];
+function classifyTokenFormat(token) {
+  if (typeof token !== "string") return "unknown";
+  return TOKEN_FORMATS.find(([prefix]) => token.startsWith(prefix))?.[1] ?? "unknown";
+}
 
 /**
  * Create a dedicated GitHub client for assign-to-agent operations.
  *
  * Token precedence:
+ *   0. Token broker copilot-task capability, when opted in (never falls back)
  *   1. config["github-token"] — per-handler PAT configured in the workflow frontmatter
  *   2. GH_AW_ASSIGN_TO_AGENT_TOKEN — agent token injected by the compiler as a step env var
  *      (evaluates to: GH_AW_AGENT_TOKEN || GH_AW_GITHUB_TOKEN || GITHUB_TOKEN)
@@ -33,6 +46,7 @@ let _allResults = [];
  * @returns {Promise<Object>} Authenticated GitHub client
  */
 async function createAssignToAgentGitHubClient(config) {
+  if (isTokenBrokerEnabled()) return createTokenBrokerGitHubClient();
   const token = config["github-token"] || process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN;
   if (!token) {
     core.debug("No dedicated agent token configured — using step-level github client for assign-to-agent operations");
@@ -40,6 +54,154 @@ async function createAssignToAgentGitHubClient(config) {
   }
   core.info("Using dedicated github client for assign-to-agent operations");
   return global.getOctokit(token);
+}
+
+/**
+ * Build sanitized credential guidance after validation or an assignment fails.
+ * @param {Object} config
+ * @param {string} errorMessage
+ * @returns {string}
+ */
+function describeAssignmentCredentialFailure(config, errorMessage) {
+  if (isTokenBrokerEnabled()) return `${errorMessage}. Agent assignment uses the token broker copilot-task capability; check broker authorization.`;
+  const token = config["github-token"] || process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN;
+  const compiledSource = process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN_SOURCE || "";
+  const knownSources = new Set(["GH_AW_AGENT_TOKEN", "GH_AW_GITHUB_TOKEN", "GITHUB_TOKEN"]);
+  const dedicatedSource =
+    compiledSource === "configured" ? "the configured assignment credential" : knownSources.has(compiledSource) ? compiledSource : "GH_AW_ASSIGN_TO_AGENT_TOKEN (selected source unavailable; recompile the workflow for source metadata)";
+  const source = config["github-token"] ? "the configured assignment credential" : process.env.GH_AW_ASSIGN_TO_AGENT_TOKEN ? dedicatedSource : "the step-level GitHub token (selected source unavailable)";
+  const remedy = renderTemplateFromFile(getPromptPath("copilot_assignment_credential_remedy.md"), {}).trim();
+  const presence = token ? "present" : "absent (using the step-level client)";
+  const tokenFormat = classifyTokenFormat(token);
+  return `${errorMessage}. Agent assignment credential source: ${source}. Dedicated assignment credential: ${presence}. Credential format: ${tokenFormat} (validity and permissions unverified). ${remedy}`;
+}
+
+/**
+ * Validate the selected credential once before processing assignment messages.
+ * @param {Object} githubClient
+ * @param {Object} config
+ * @returns {Promise<void>}
+ */
+async function validateAssignmentCredential(githubClient, config) {
+  try {
+    await githubClient.request("GET /rate_limit");
+  } catch (error) {
+    if (isTokenBrokerEnabled()) throw error;
+    const status = Number(error && typeof error === "object" ? error.status || error.response?.status || 0 : 0);
+    const errorMessage = getErrorMessage(error);
+    if (status !== 401 && !/\b(?:bad credentials|not authenticated)\b/i.test(errorMessage)) {
+      core.debug("Assignment credential preflight did not identify an authentication failure");
+      return;
+    }
+
+    throw new Error(`Agent assignment credential validation failed: ${describeAssignmentCredentialFailure(config, "Bad credentials (HTTP 401)")}`);
+  }
+}
+
+/**
+ * @param {Array<{issue_number: number|null, pull_number: number|null, agent: string, owner: string|null, repo: string|null, pull_request_repo?: string|null, success: boolean, skipped?: boolean, error?: string}>} allResults
+ * @returns {string}
+ */
+function formatAssignedOutput(allResults) {
+  return allResults
+    .filter(r => r.success && !r.skipped)
+    .map(r => {
+      const number = r.issue_number || r.pull_number;
+      const prefix = r.issue_number ? "issue" : "pr";
+      return `${prefix}:${number}:${r.agent}`;
+    })
+    .join("\n");
+}
+
+/**
+ * @param {Array<{issue_number: number|null, pull_number: number|null, agent: string, owner: string|null, repo: string|null, pull_request_repo?: string|null, success: boolean, skipped?: boolean, error?: string}>} allResults
+ * @returns {string}
+ */
+function formatErrorsOutput(allResults) {
+  return (
+    allResults
+      // Include skipped(ignore-if-error) entries that still captured an error so
+      // downstream failure handling can surface assignment problems in issue/comment reports.
+      // Include hard failures (!success) and ignored failures (skipped=true with error).
+      .filter(r => r.error && (r.skipped || !r.success))
+      .map(r => {
+        const number = r.issue_number || r.pull_number;
+        const prefix = r.issue_number ? "issue" : "pr";
+        return `${prefix}:${number}:${r.agent}:${r.error}`;
+      })
+      .join("\n")
+  );
+}
+
+/**
+ * @param {Array<{issue_number: number|null, pull_number: number|null, agent: string, owner: string|null, repo: string|null, pull_request_repo?: string|null, success: boolean, skipped?: boolean, error?: string}>} allResults
+ * @returns {number}
+ */
+function countHardFailures(allResults) {
+  return allResults.filter(r => !r.success && !r.skipped).length;
+}
+
+/**
+ * @param {Array<{issue_number: number|null, pull_number: number|null, agent: string, owner: string|null, repo: string|null, pull_request_repo?: string|null, success: boolean, skipped?: boolean, error?: string}>} allResults
+ * @param {string} batchError
+ * @returns {Promise<void>}
+ */
+async function writeAssignSummary(allResults, batchError = "") {
+  const successResults = allResults.filter(r => r.success && !r.skipped);
+  const skippedResults = allResults.filter(r => r.skipped);
+  const failedResults = allResults.filter(r => !r.success && !r.skipped);
+
+  if (allResults.length === 0 && !batchError) return;
+
+  let summaryContent = "## Agent Assignment\n\n";
+
+  if (batchError) {
+    summaryContent += `⚠️ Assignments skipped: ${batchError}\n\n`;
+  }
+
+  if (successResults.length > 0) {
+    summaryContent += `✅ Successfully assigned ${successResults.length} agent(s):\n\n`;
+    summaryContent += successResults
+      .map(r => {
+        const itemType = r.issue_number ? `Issue #${r.issue_number}` : `Pull Request #${r.pull_number}`;
+        return `- ${itemType} → Agent: ${r.agent}${r.pull_request_repo ? ` (PR target: ${r.pull_request_repo})` : ""}`;
+      })
+      .join("\n");
+    summaryContent += "\n\n";
+  }
+
+  if (skippedResults.length > 0) {
+    summaryContent += `⏭️ Skipped ${skippedResults.length} agent assignment(s) (ignore-if-error enabled):\n\n`;
+    summaryContent += skippedResults
+      .map(r => {
+        const itemType = r.issue_number ? `Issue #${r.issue_number}` : `Pull Request #${r.pull_number}`;
+        return `- ${itemType} → Agent: ${r.agent}${r.pull_request_repo ? ` (PR target: ${r.pull_request_repo})` : ""} (assignment failed due to error)`;
+      })
+      .join("\n");
+    summaryContent += "\n\n";
+  }
+
+  if (failedResults.length > 0) {
+    summaryContent += `❌ Failed to assign ${failedResults.length} agent(s):\n\n`;
+    summaryContent += failedResults
+      .map(r => {
+        const itemType = r.issue_number ? `Issue #${r.issue_number}` : `Pull Request #${r.pull_number}`;
+        return `- ${itemType} → Agent: ${r.agent}${r.pull_request_repo ? ` (PR target: ${r.pull_request_repo})` : ""}: ${r.error}`;
+      })
+      .join("\n");
+
+    const hasPermissionError = failedResults.some(r => r.error?.includes("Resource not accessible") || r.error?.includes("Insufficient permissions"));
+    if (hasPermissionError) {
+      summaryContent += generatePermissionErrorSummary();
+    }
+    summaryContent += "\n\n";
+  }
+
+  try {
+    await core.summary.addRaw(summaryContent).write();
+  } catch (error) {
+    core.warning(`Failed to write agent assignment summary: ${getErrorMessage(error)}`);
+  }
 }
 
 /**
@@ -53,6 +215,7 @@ async function createAssignToAgentGitHubClient(config) {
  * @returns {Promise<Function>} Message processor function
  */
 async function main(config = {}) {
+  const brokerEnabled = isTokenBrokerEnabled();
   // Parse configuration (replaces env vars from the old standalone step)
   const maxCount = parseInt(String(config.max ?? "1"), 10);
   if (Number.isNaN(maxCount) || maxCount < 1) {
@@ -60,6 +223,7 @@ async function main(config = {}) {
   }
   const defaultAgent = String(config.name ?? "copilot").trim();
   const defaultModel = config.model ? String(config.model).trim() : null;
+  const reasoningEffort = config["reasoning-effort"] ?? null;
   const defaultCustomAgent = config["custom-agent"] ? String(config["custom-agent"]).trim() : null;
   const defaultCustomInstructions = config["custom-instructions"] ? String(config["custom-instructions"]).trim() : null;
   const configuredBaseBranch = config["base-branch"] ? String(config["base-branch"]).trim() : null;
@@ -74,6 +238,7 @@ async function main(config = {}) {
           .map(a => a.trim())
           .filter(Boolean)
     : null;
+  const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const allowedPullRequestRepos = parseAllowedRepos(config["allowed-pull-request-repos"]);
 
@@ -90,12 +255,13 @@ async function main(config = {}) {
   core.info(`Target configuration: ${targetConfig}`);
   core.info(`Max count: ${maxCount}`);
   core.info(`Issue intent enabled: ${issueIntentEnabled}`);
+  if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
   if (ignoreIfError) core.info("Ignore-if-error mode enabled: Will not fail if agent assignment encounters auth or availability errors");
   if (allowedAgents) core.info(`Allowed agents: ${allowedAgents.join(", ")}`);
   core.info(`Default target repo: ${defaultTargetRepo}`);
   if (allowedRepos.size > 0) core.info(`Allowed repos: ${[...allowedRepos].join(", ")}`);
 
-  // Resolve pull request repo upfront (if globally configured)
+  // Validate pull request repo configuration before processing messages.
   /** @type {any} */
   let pullRequestOwner = null;
   /** @type {any} */
@@ -113,15 +279,6 @@ async function main(config = {}) {
       pullRequestOwner = parts[0];
       pullRequestRepo = parts[1];
       core.info(`Using pull request repository: ${pullRequestOwner}/${pullRequestRepo}`);
-      try {
-        const resolved = await resolvePullRequestRepo(githubClient, pullRequestOwner, pullRequestRepo, configuredBaseBranch);
-        effectiveBaseBranch = resolved.effectiveBaseBranch;
-        if (!configuredBaseBranch && effectiveBaseBranch) {
-          core.info(`Resolved pull request repository default branch: ${effectiveBaseBranch}`);
-        }
-      } catch (error) {
-        throw new Error(`Failed to fetch pull request repository for ${pullRequestOwner}/${pullRequestRepo}: ${getErrorMessage(error)}`, { cause: error });
-      }
     } else {
       core.warning(`Invalid pull-request-repo format: ${pullRequestRepoConfig}. Expected owner/repo. PRs will be created in issue repository.`);
     }
@@ -129,11 +286,16 @@ async function main(config = {}) {
 
   // Closure-level state
   let processedCount = 0;
+  /** @type {Array<{issue_number: number|null, pull_number: number|null, agent: string, owner: string|null, repo: string|null, pull_request_repo?: string|null, success: boolean, skipped?: boolean, error?: string}>} */
+  const allResults = [];
   const agentCache = {};
   const processedAssignmentTargets = new Set();
-
-  // Reset module-level results for this handler invocation
-  _allResults = [];
+  /** @type {Promise<void>|undefined} */
+  let credentialPreflight;
+  let credentialError = "";
+  let repositoryError = "";
+  /** @type {Promise<void>|undefined} */
+  let pullRequestRepoResolution;
 
   /**
    * Message processor — called once per assign_to_agent message by the handler manager.
@@ -143,7 +305,7 @@ async function main(config = {}) {
    * @param {Map<string, {repo: string, number: number}>} temporaryIdMap - Live temp ID map
    * @returns {Promise<{success: boolean, error?: string, skipped?: boolean, deferred?: boolean}>}
    */
-  return async function handleMessage(message, resolvedTemporaryIds, temporaryIdMap) {
+  const handleMessage = async function (message, resolvedTemporaryIds, temporaryIdMap) {
     // Handle staged mode — emit preview and skip actual assignment
     if (isStaged) {
       await generateStagedPreview({
@@ -159,6 +321,8 @@ async function main(config = {}) {
           }
           parts.push(`**Agent:** ${item.agent || defaultAgent}`);
           if (defaultModel) parts.push(`**Model:** ${defaultModel}`);
+          const stagedReasoningEffort = resolveReasoningEffort(reasoningEffort);
+          if (stagedReasoningEffort) parts.push(`**Reasoning Effort:** ${stagedReasoningEffort}`);
           if (defaultCustomAgent) parts.push(`**Custom Agent:** ${defaultCustomAgent}`);
           if (defaultCustomInstructions) parts.push(`**Custom Instructions:** ${defaultCustomInstructions}`);
           return parts.join("\n") + "\n\n";
@@ -167,18 +331,34 @@ async function main(config = {}) {
       return { success: true, skipped: true };
     }
 
-    // Enforce max count — track the attempt in _allResults so it appears in the summary
-    if (processedCount >= maxCount) {
-      core.info(`⏭ Max count (${maxCount}) reached, skipping agent assignment`);
-      const agentNameForSkip = message.agent ?? defaultAgent;
-      _allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentNameForSkip, owner: null, repo: null, success: false, skipped: true });
-      return { success: false, skipped: true };
+    credentialPreflight ??= validateAssignmentCredential(githubClient, config).catch(error => {
+      credentialError = getErrorMessage(error);
+      core.warning(credentialError);
+    });
+    await credentialPreflight;
+    if (credentialError) {
+      if (brokerEnabled) return { success: false, error: credentialError };
+      return { success: true, skipped: true };
     }
 
-    // Add delay between consecutive assignments to avoid spawning too many agents at once
-    if (processedCount > 0) {
-      core.info("Waiting 10 seconds before processing next agent assignment...");
-      await sleep(10000);
+    if (pullRequestOwner && pullRequestRepo) {
+      pullRequestRepoResolution ??= (async () => {
+        try {
+          const resolved = await resolvePullRequestRepo(githubClient, pullRequestOwner, pullRequestRepo, configuredBaseBranch);
+          effectiveBaseBranch = resolved.effectiveBaseBranch;
+          if (!configuredBaseBranch && effectiveBaseBranch) {
+            core.info(`Resolved pull request repository default branch: ${effectiveBaseBranch}`);
+          }
+        } catch (error) {
+          repositoryError = `Failed to fetch pull request repository for ${pullRequestOwner}/${pullRequestRepo}: ${getErrorMessage(error)}`;
+          core.warning(repositoryError);
+        }
+      })();
+      await pullRequestRepoResolution;
+      if (repositoryError) {
+        if (brokerEnabled) return { success: false, error: repositoryError };
+        return { success: true, skipped: true };
+      }
     }
 
     const agentName = message.agent ?? defaultAgent;
@@ -188,16 +368,17 @@ async function main(config = {}) {
     const customInstructions = defaultCustomInstructions || null;
 
     // Validate that both issue_number and pull_number are not specified simultaneously
-    if (message.issue_number != null && message.pull_number != null) {
+    // (only relevant when the model-provided identifiers are actually used, i.e. target: "*")
+    if (targetConfig === "*" && message.issue_number != null && message.pull_number != null) {
       const error = "Cannot specify both issue_number and pull_number in the same assign_to_agent item";
       core.error(error);
-      _allResults.push({ issue_number: message.issue_number, pull_number: message.pull_number, agent: agentName, owner: null, repo: null, success: false, error });
+      allResults.push({ issue_number: message.issue_number, pull_number: message.pull_number, agent: agentName, owner: null, repo: null, success: false, error });
       return { success: false, error };
     }
 
     // Defer if issue_number is a temporary ID that hasn't been resolved yet
     // Strip leading '#' so both 'aw_abc1' and '#aw_abc1' (canonical validator form) are handled
-    if (message.issue_number != null) {
+    if (targetConfig === "*" && message.issue_number != null) {
       const issueNumStr = String(message.issue_number).trim();
       if (isTemporaryId(issueNumStr)) {
         const normalized = normalizeTemporaryId(issueNumStr);
@@ -212,7 +393,7 @@ async function main(config = {}) {
     const repoResult = resolveAndValidateRepo(message, defaultTargetRepo, allowedRepos, "issue/PR");
     if (!repoResult.success) {
       core.error(`E004: ${repoResult.error}`);
-      _allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: null, repo: null, success: false, error: repoResult.error });
+      allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: null, repo: null, success: false, error: repoResult.error });
       return { success: false, error: repoResult.error };
     }
     let effectiveOwner = repoResult.repoParts.owner;
@@ -220,12 +401,12 @@ async function main(config = {}) {
     let itemForTarget = message;
 
     // Resolve temporary ID in issue_number to real issue number
-    if (message.issue_number != null) {
+    if (targetConfig === "*" && message.issue_number != null) {
       const resolvedTarget = resolveRepoIssueTarget(message.issue_number, temporaryIdMap, effectiveOwner, effectiveRepo);
       if (!resolvedTarget.resolved) {
         const error = resolvedTarget.errorMessage || `Failed to resolve issue target: ${message.issue_number}`;
         core.error(error);
-        _allResults.push({ issue_number: message.issue_number, pull_number: null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
+        allResults.push({ issue_number: message.issue_number, pull_number: null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
         return { success: false, error };
       }
       effectiveOwner = resolvedTarget.resolved.owner;
@@ -235,10 +416,6 @@ async function main(config = {}) {
         core.info(`Resolved temporary issue id to ${effectiveOwner}/${effectiveRepo}#${resolvedTarget.resolved.number}`);
       }
     }
-
-    // Determine effective target configuration
-    const hasExplicitTarget = itemForTarget.issue_number != null || itemForTarget.pull_number != null;
-    const effectiveTarget = hasExplicitTarget ? "*" : targetConfig;
 
     const basePullRequestRepoSlug = pullRequestOwner && pullRequestRepo ? `${pullRequestOwner}/${pullRequestRepo}` : `${effectiveOwner}/${effectiveRepo}`;
 
@@ -257,7 +434,7 @@ async function main(config = {}) {
         if (!pullRequestRepoValidation.valid) {
           const error = pullRequestRepoValidation.error ?? "Repository validation failed";
           core.error(`E004: ${error}`);
-          _allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
+          allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
           return { success: false, error };
         }
         try {
@@ -269,7 +446,7 @@ async function main(config = {}) {
         } catch (error) {
           const errorMsg = `Failed to resolve pull request repository for ${itemPullRequestRepo}: ${getErrorMessage(error)}`;
           core.error(errorMsg);
-          _allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error: errorMsg });
+          allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error: errorMsg });
           return { success: false, error: errorMsg };
         }
       } else {
@@ -283,7 +460,7 @@ async function main(config = {}) {
 
     // Resolve the target issue or pull request number from context
     const targetResult = resolveTarget({
-      targetConfig: effectiveTarget,
+      targetConfig,
       item: itemForTarget,
       context,
       itemType: "assign_to_agent",
@@ -294,7 +471,7 @@ async function main(config = {}) {
     if (!targetResult.success) {
       if (targetResult.shouldFail) {
         core.error(targetResult.error);
-        _allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error: targetResult.error });
+        allResults.push({ issue_number: message.issue_number || null, pull_number: message.pull_number || null, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error: targetResult.error });
         return { success: false, error: targetResult.error };
       } else {
         core.info(targetResult.error);
@@ -310,7 +487,7 @@ async function main(config = {}) {
     if (Number.isNaN(number) || number <= 0) {
       const error = `Invalid ${type} number: ${number}`;
       core.error(error);
-      _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
+      allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
       return { success: false, error };
     }
 
@@ -318,7 +495,7 @@ async function main(config = {}) {
     if (!AGENT_LOGIN_NAMES[agentName]) {
       const error = `Unsupported agent: ${agentName}`;
       core.warning(`Agent "${agentName}" is not supported. Supported agents: ${Object.keys(AGENT_LOGIN_NAMES).join(", ")}`);
-      _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
+      allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
       return { success: false, error };
     }
 
@@ -326,12 +503,23 @@ async function main(config = {}) {
     if (allowedAgents && !allowedAgents.includes(agentName)) {
       const error = `Agent not allowed: ${agentName}`;
       core.error(`Agent "${agentName}" is not in the allowed list. Allowed agents: ${allowedAgents.join(", ")}`);
-      _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
+      allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, error });
       return { success: false, error };
     }
 
-    // Increment processed count before attempting the assignment
+    // Atomically reserve the max-count slot before beginning an assignment attempt.
+    if (processedCount >= maxCount) {
+      core.info(`⏭ Max count (${maxCount}) reached, skipping agent assignment`);
+      allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, success: false, skipped: true });
+      return { success: false, skipped: true };
+    }
     processedCount++;
+
+    // Add delay between consecutive assignments to avoid spawning too many agents at once
+    if (processedCount > 1) {
+      core.info("Waiting 10 seconds before processing next agent assignment...");
+      await sleep(10000);
+    }
 
     try {
       // Find agent (use cache to avoid repeated lookups)
@@ -383,9 +571,12 @@ async function main(config = {}) {
       const knownLogins = getAgentLogins(agentName);
       if (currentAssignees.some(a => a.login === agentLogin || knownLogins.includes(a.login)) && !shouldAllowReassignment) {
         core.info(`${agentName} is already assigned to ${type} #${number}`);
-        _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: true });
+        allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: true });
         return { success: true };
       }
+
+      const finalFilterResult = await checkRequiredFilter(githubClient, { owner: effectiveOwner, repo: effectiveRepo }, number, requiredLabels, "", "assign_to_agent");
+      if (finalFilterResult) return finalFilterResult;
 
       core.info(`Assigning ${agentName} coding agent to ${type} #${number}...`);
       if (model) core.info(`Using model: ${model}`);
@@ -407,21 +598,23 @@ async function main(config = {}) {
         taskContext,
         effectivePullRequestRepoSlug,
         intentMetadata,
-        issueIntentEnabled
+        issueIntentEnabled,
+        reasoningEffort
       );
       if (!success) throw new Error(`Failed to assign ${agentName} via REST`);
 
       core.info(`Successfully assigned ${agentName} coding agent to ${type} #${number}`);
-      _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: true });
+      allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: true });
       return { success: true };
     } catch (error) {
       let errorMessage = getErrorMessage(error);
+      const isPullRequestError = error && typeof error === "object" && error.isPullRequest;
 
       // When the agent specified an issue_number that turns out to be a PR, skip
       // silently without posting a comment — error comments on PRs are confusing.
-      if (/** @type {any} */ error.isPullRequest) {
+      if (isPullRequestError) {
         core.warning(`Skipping assign_to_agent for #${number}: target is a pull request, not an issue.`);
-        _allResults.push({
+        allResults.push({
           issue_number: issueNumber,
           pull_number: pullNumber,
           agent: agentName,
@@ -435,14 +628,19 @@ async function main(config = {}) {
         return { success: false, skipped: true, error: errorMessage };
       }
 
-      const isAuthError = ["Bad credentials", "Not Authenticated", "Resource not accessible", "Insufficient permissions", "requires authentication"].some(msg => errorMessage.includes(msg));
+      const status = error && typeof error === "object" && "status" in error ? error.status : undefined;
+      const isAuthError = status === 401 || ["Bad credentials", "Not Authenticated", "Resource not accessible", "Insufficient permissions", "requires authentication"].some(msg => errorMessage.includes(msg));
       const isAvailabilityError = errorMessage.includes("coding agent is not available for this repository");
+      if (isAuthError || errorMessage === `Failed to assign ${agentName} via REST`) {
+        if (status === 401 && !errorMessage.includes("Bad credentials")) errorMessage = `Bad credentials (HTTP 401): ${errorMessage}`;
+        errorMessage = describeAssignmentCredentialFailure(config, errorMessage);
+      }
 
-      if (ignoreIfError && (isAuthError || isAvailabilityError)) {
+      if (!brokerEnabled && ignoreIfError && (isAuthError || isAvailabilityError)) {
         const errorType = isAuthError ? "authentication/permission" : "agent availability";
         core.warning(`Agent assignment failed for ${agentName} on ${type} #${number} due to ${errorType} error. Skipping due to ignore-if-error=true.`);
         core.info(`Error details: ${errorMessage}`);
-        _allResults.push({
+        allResults.push({
           issue_number: issueNumber,
           pull_number: pullNumber,
           agent: agentName,
@@ -469,21 +667,46 @@ async function main(config = {}) {
 
       // Post failure comment on the issue/PR so the user sees the failure in context
       try {
-        await githubClient.rest.issues.createComment({
+        await (brokerEnabled ? github : githubClient).rest.issues.createComment({
           owner: effectiveOwner,
           repo: effectiveRepo,
           issue_number: number,
-          body: sanitizeContent(`⚠️ **Assignment failed**: Failed to assign ${agentName} coding agent to this ${type}.\n\nError: ${errorMessage}`, { maxLength: 65000 }),
+          body: renderSizedReport(
+            {
+              type: "report",
+              title: "Assignment failed",
+              children: [
+                {
+                  type: "paragraph",
+                  children: [
+                    { type: "text", value: "⚠️ ", agentTainted: false },
+                    { type: "strong", children: [{ type: "text", value: "Assignment failed", agentTainted: false }] },
+                    { type: "text", value: `: Failed to assign ${agentName} coding agent to this ${type}.`, agentTainted: false },
+                  ],
+                },
+                { type: "paragraph", children: [{ type: "text", value: `Error: ${errorMessage}`, agentTainted: false }] },
+              ],
+            },
+            65000
+          ).body,
         });
         core.info(`Posted failure comment on ${type} #${number} in ${effectiveOwner}/${effectiveRepo}`);
       } catch (commentError) {
-        core.warning(`Failed to post failure comment on ${type} #${number}: ${getErrorMessage(commentError)}`);
+        const commentDiagnostic = brokerEnabled ? "GitHub comment request failed." : getErrorMessage(commentError);
+        core.warning(`Failed to post failure comment on ${type} #${number}: ${commentDiagnostic}`);
       }
 
-      _allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: false, error: errorMessage });
+      allResults.push({ issue_number: issueNumber, pull_number: pullNumber, agent: agentName, owner: effectiveOwner, repo: effectiveRepo, pull_request_repo: effectivePullRequestRepoSlug, success: false, error: errorMessage });
       return { success: false, error: errorMessage };
     }
   };
+
+  handleMessage.getAssignToAgentAssigned = () => formatAssignedOutput(allResults);
+  handleMessage.getAssignToAgentErrors = () => credentialError || repositoryError || formatErrorsOutput(allResults);
+  handleMessage.getAssignToAgentErrorCount = () => (repositoryError || (credentialError && (brokerEnabled || !ignoreIfError)) ? 1 : countHardFailures(allResults));
+  handleMessage.writeAssignToAgentSummary = () => writeAssignSummary(allResults, credentialError || repositoryError);
+
+  return handleMessage;
 }
 
 /**
@@ -491,45 +714,26 @@ async function main(config = {}) {
  * Format: "issue:N:agent" or "pr:N:agent" per successful assignment, newline-separated.
  * @returns {string}
  */
-function getAssignToAgentAssigned() {
-  return _allResults
-    .filter(r => r.success && !r.skipped)
-    .map(r => {
-      const number = r.issue_number || r.pull_number;
-      const prefix = r.issue_number ? "issue" : "pr";
-      return `${prefix}:${number}:${r.agent}`;
-    })
-    .join("\n");
+function getAssignToAgentAssigned(handler) {
+  return typeof handler?.getAssignToAgentAssigned === "function" ? handler.getAssignToAgentAssigned() : "";
 }
 
 /**
  * Returns the "assignment_errors" output string for step outputs.
  * Format: "issue:N:agent:error" or "pr:N:agent:error" per failure/skipped-with-error,
- * newline-separated.
+ * newline-separated, or a single batch diagnostic.
  * @returns {string}
  */
-function getAssignToAgentErrors() {
-  return (
-    _allResults
-      // Include skipped(ignore-if-error) entries that still captured an error so
-      // downstream failure handling can surface assignment problems in issue/comment reports.
-      // Include hard failures (!success) and ignored failures (skipped=true with error).
-      .filter(r => r.error && (r.skipped || !r.success))
-      .map(r => {
-        const number = r.issue_number || r.pull_number;
-        const prefix = r.issue_number ? "issue" : "pr";
-        return `${prefix}:${number}:${r.agent}:${r.error}`;
-      })
-      .join("\n")
-  );
+function getAssignToAgentErrors(handler) {
+  return typeof handler?.getAssignToAgentErrors === "function" ? handler.getAssignToAgentErrors() : "";
 }
 
 /**
  * Returns the "assignment_error_count" output value.
  * @returns {number}
  */
-function getAssignToAgentErrorCount() {
-  return _allResults.filter(r => !r.success && !r.skipped).length;
+function getAssignToAgentErrorCount(handler) {
+  return typeof handler?.getAssignToAgentErrorCount === "function" ? handler.getAssignToAgentErrorCount() : 0;
 }
 
 /**
@@ -537,57 +741,9 @@ function getAssignToAgentErrorCount() {
  * Called by the handler manager after all messages have been processed.
  * @returns {Promise<void>}
  */
-async function writeAssignToAgentSummary() {
-  const successResults = _allResults.filter(r => r.success && !r.skipped);
-  const skippedResults = _allResults.filter(r => r.skipped);
-  const failedResults = _allResults.filter(r => !r.success && !r.skipped);
-
-  if (_allResults.length === 0) return;
-
-  let summaryContent = "## Agent Assignment\n\n";
-
-  if (successResults.length > 0) {
-    summaryContent += `✅ Successfully assigned ${successResults.length} agent(s):\n\n`;
-    summaryContent += successResults
-      .map(r => {
-        const itemType = r.issue_number ? `Issue #${r.issue_number}` : `Pull Request #${r.pull_number}`;
-        return `- ${itemType} → Agent: ${r.agent}${r.pull_request_repo ? ` (PR target: ${r.pull_request_repo})` : ""}`;
-      })
-      .join("\n");
-    summaryContent += "\n\n";
-  }
-
-  if (skippedResults.length > 0) {
-    summaryContent += `⏭️ Skipped ${skippedResults.length} agent assignment(s) (ignore-if-error enabled):\n\n`;
-    summaryContent += skippedResults
-      .map(r => {
-        const itemType = r.issue_number ? `Issue #${r.issue_number}` : `Pull Request #${r.pull_number}`;
-        return `- ${itemType} → Agent: ${r.agent}${r.pull_request_repo ? ` (PR target: ${r.pull_request_repo})` : ""} (assignment failed due to error)`;
-      })
-      .join("\n");
-    summaryContent += "\n\n";
-  }
-
-  if (failedResults.length > 0) {
-    summaryContent += `❌ Failed to assign ${failedResults.length} agent(s):\n\n`;
-    summaryContent += failedResults
-      .map(r => {
-        const itemType = r.issue_number ? `Issue #${r.issue_number}` : `Pull Request #${r.pull_number}`;
-        return `- ${itemType} → Agent: ${r.agent}${r.pull_request_repo ? ` (PR target: ${r.pull_request_repo})` : ""}: ${r.error}`;
-      })
-      .join("\n");
-
-    const hasPermissionError = failedResults.some(r => r.error?.includes("Resource not accessible") || r.error?.includes("Insufficient permissions"));
-    if (hasPermissionError) {
-      summaryContent += generatePermissionErrorSummary();
-    }
-    summaryContent += "\n\n";
-  }
-
-  try {
-    await core.summary.addRaw(summaryContent).write();
-  } catch (error) {
-    core.warning(`Failed to write agent assignment summary: ${getErrorMessage(error)}`);
+async function writeAssignToAgentSummary(handler) {
+  if (typeof handler?.writeAssignToAgentSummary === "function") {
+    await handler.writeAssignToAgentSummary();
   }
 }
 
