@@ -5,11 +5,13 @@
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
  */
 
-const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
+const { assembleReportBodyParts } = require("./markdown_body_helpers.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
-const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
+const { isStagedMode, checkRequiredFilter, resolveTarget } = require("./safe_output_helpers.cjs");
 const { ERR_NOT_FOUND } = require("./error_codes.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
@@ -102,6 +104,7 @@ async function markPullRequestAsReadyForReview(github, pullRequestNodeId) {
 async function main(config = {}) {
   // Extract configuration
   const maxCount = config.max || 10;
+  const targetConfig = config.target || "triggering";
   const githubClient = await createAuthenticatedGitHubClient(config);
 
   // Check if we're in staged mode
@@ -150,29 +153,20 @@ async function main(config = {}) {
     const prOwner = repoResult.repoParts.owner;
     const prRepo = repoResult.repoParts.repo;
 
-    // Determine PR number
-    let prNumber;
-    if (item.pull_request_number !== undefined) {
-      prNumber = parseInt(String(item.pull_request_number), 10);
-      if (Number.isNaN(prNumber)) {
-        core.warning(`Invalid pull_request_number: ${item.pull_request_number}`);
-        return {
-          success: false,
-          error: `Invalid pull_request_number: ${item.pull_request_number}`,
-        };
-      }
-    } else {
-      // Use context PR if available
-      const contextPR = context.payload?.pull_request?.number;
-      if (!contextPR) {
-        core.warning("No pull_request_number provided and not in pull request context");
-        return {
-          success: false,
-          error: "No pull request number available",
-        };
-      }
-      prNumber = contextPR;
+    const targetResult = resolveTarget({
+      targetConfig,
+      item,
+      context,
+      itemType: HANDLER_TYPE,
+    });
+    if (!targetResult.success) {
+      core.warning(targetResult.error);
+      return {
+        success: false,
+        error: targetResult.error,
+      };
     }
+    const prNumber = targetResult.number;
 
     const repoParts = { owner: prOwner, repo: prRepo };
     const filterResult = await checkRequiredFilter(githubClient, repoParts, prNumber, requiredLabels, requiredTitlePrefix, "mark_pull_request_as_ready_for_review");
@@ -242,11 +236,12 @@ async function main(config = {}) {
       const sanitizedReason = sanitizeContent(item.reason);
 
       // Inject CAUTION at top of body if threat detection warning was raised
-      const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
-      const cautionPrefix = detectionCaution ? detectionCaution + "\n\n" : "";
-
-      const footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber, undefined, { skipDetectionCaution: true });
-      const commentBody = `${cautionPrefix}${sanitizedReason}\n\n${footer}`;
+      const { detectionCaution, footer } = assembleReportBodyParts({ includeFooter: true, workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, triggeringDiscussionNumber });
+      const commentBody = renderSizedReport({
+        type: "report",
+        title: "Pull request ready for review",
+        children: [...detectionCaution, ...parseReportMarkdown(sanitizedReason, { agentTainted: true, minimumHeadingLevel: 2 }), ...footer],
+      }).body;
 
       await addPullRequestComment(githubClient, prOwner, prRepo, prNumber, commentBody);
 

@@ -1,12 +1,14 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/stringutil"
 )
 
 var notifyCommentLog = logger.New("workflow:notify_comment")
@@ -20,7 +22,7 @@ var notifyCommentLog = logger.New("workflow:notify_comment")
 // This job runs when:
 // 1. always() - runs even if agent fails
 // 2. Agent job was not skipped
-// 3. NO add_comment output was produced by the agent (avoids duplicate updates)
+// 3. NO add_comment output was produced, or detection produced no verdict
 // This job depends on all safe output jobs to ensure it runs last
 func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, safeOutputJobNames []string) (*Job, error) {
 	notifyCommentLog.Printf("Building conclusion job: main_job=%s, safe_output_jobs_count=%d", mainJobName, len(safeOutputJobNames))
@@ -30,36 +32,10 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		notifyCommentLog.Printf("Skipping job: no safe-outputs configured")
 		return nil, nil // No safe-outputs configured, no need for conclusion job
 	}
-	steps := c.buildConclusionSetupSteps(data)
-	steps = append(steps, c.buildConclusionNoOpStep(data, mainJobName)...)
-	steps = append(steps, c.buildConclusionDetectionRunsStep(data, mainJobName)...)
-	steps = append(steps, c.buildConclusionMissingToolStep(data, mainJobName)...)
-	steps = append(steps, c.buildConclusionReportIncompleteStep(data, mainJobName)...)
-	messagesJSON := serializeConclusionMessagesJSON(data)
-	agentFailureSteps, err := c.buildAgentFailureStep(data, mainJobName, messagesJSON)
+	data = c.dryRunConclusionData(data)
+	steps, err := c.buildConclusionJobSteps(data, mainJobName, safeOutputJobNames)
 	if err != nil {
 		return nil, err
-	}
-	steps = append(steps, agentFailureSteps...)
-	customEnvVars := c.buildConclusionScriptEnvVars(data, mainJobName, safeOutputJobNames, messagesJSON)
-	var token string
-	if data.SafeOutputs != nil && data.SafeOutputs.AddComments != nil {
-		token = data.SafeOutputs.AddComments.GitHubToken
-	}
-	// Only add the conclusion update step if status comments are explicitly enabled
-	if data.StatusComment != nil && *data.StatusComment {
-		steps = append(steps, c.buildGitHubScriptStepWithoutDownload(data, GitHubScriptStepConfig{
-			StepName:      "Update reaction comment with completion status",
-			StepID:        "conclusion",
-			MainJobName:   mainJobName,
-			CustomEnvVars: customEnvVars,
-			Script:        getNotifyCommentErrorScript(),
-			ScriptFile:    "notify_comment_error.cjs",
-			CustomToken:   token,
-		})...)
-	}
-	if c.actionMode.IsScript() {
-		steps = append(steps, c.generateScriptModeCleanupStep())
 	}
 	needs := buildConclusionJobNeeds(data, mainJobName, safeOutputJobNames)
 	// If any message template references needs.pre_activation.outputs.*, add pre_activation
@@ -74,19 +50,7 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		}
 	}
 	notifyCommentLog.Printf("Job built successfully: dependencies_count=%d", len(needs))
-	conclusionPerms := ComputePermissionsForSafeOutputs(data.SafeOutputs)
-	// When observability.otlp.github-app is configured without app-id/private-key
-	// credentials, id-token: write is needed so the conclusion job can mint the OTLP
-	// OIDC token via core.getIDToken(audience) (mirrors threat_detection_job.go).
-	if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
-		conclusionPerms.Set(PermissionIdToken, PermissionWrite)
-	}
-	// The daily-AIC usage cache save step must not run with a fully read-only GITHUB_TOKEN.
-	// If safe-outputs already granted some writable scope (for example issues: write for
-	// comment updates), reuse that existing write access instead of broadening the job.
-	if needsDailyAICCachePermission(data) && !conclusionPerms.HasAnyWriteScope() {
-		conclusionPerms.Set(PermissionActions, PermissionWrite)
-	}
+	conclusionPerms := computeConclusionJobPermissions(data)
 	return &Job{
 		Name:        "conclusion",
 		If:          RenderCondition(c.buildConclusionJobCondition(data, mainJobName, safeOutputJobNames)),
@@ -97,150 +61,447 @@ func (c *Compiler) buildConclusionJob(data *WorkflowData, mainJobName string, sa
 		Steps:       steps,
 		Needs:       needs,
 		Outputs:     buildConclusionJobOutputs(data),
+		Env:         buildConclusionMemorySaveEnv(data),
 	}, nil
+}
+
+// buildConclusionJobSteps assembles the ordered step list for the conclusion job: setup and
+// usage-artifact steps, noop/missing-tool/incomplete reporting, agent-failure and
+// failed-jobs reporting, the optional status-comment update, and the steering-issue step.
+func (c *Compiler) buildConclusionJobSteps(data *WorkflowData, mainJobName string, safeOutputJobNames []string) ([]string, error) {
+	steps := c.buildConclusionSetupSteps(data)
+	steps = append(steps, c.buildWorkQueueTerminationStep(data)...)
+	steps = append(steps, c.buildWorkQueueIssuesStep(data)...)
+	steps = append(steps, c.buildConclusionWorkQueueSummaryStep(data)...)
+	if isWorkQueueParticipant(data) {
+		// Queue outputs and failure reports are settled only in their trusted Claim pass.
+		// Native job failure is diagnostic, not authority for anonymous follow-up writes.
+		steps = append(steps, c.buildConclusionDetectionRunsStep(data, mainJobName)...)
+		return c.appendConclusionUsageSteps(steps, data)
+	}
+	steps = append(steps, c.buildConclusionNoOpStep(data, mainJobName)...)
+	steps = append(steps, c.buildConclusionDetectionRunsStep(data, mainJobName)...)
+	steps = append(steps, c.buildConclusionMissingToolStep(data, mainJobName)...)
+	steps = append(steps, c.buildConclusionReportIncompleteStep(data, mainJobName)...)
+	messagesJSON := serializeConclusionMessagesJSON(data)
+	steeringTokenSteps, steeringToken := c.buildConclusionSteeringIssueTokenSteps(data)
+	steps = append(steps, steeringTokenSteps...)
+	agentFailureSteps, err := c.buildAgentFailureStep(data, mainJobName, messagesJSON, steeringToken)
+	if err != nil {
+		return nil, err
+	}
+	steps = append(steps, agentFailureSteps...)
+	failedJobsSteps, err := c.buildConclusionReportFailedJobsStep(data, mainJobName)
+	if err != nil {
+		return nil, err
+	}
+	steps = append(steps, failedJobsSteps...)
+	// Only add the conclusion update step if status comments are explicitly enabled
+	if data.StatusComment != nil && *data.StatusComment {
+		var token string
+		var stepCondition string
+		if data.SafeOutputs != nil && data.SafeOutputs.AddComments != nil {
+			token = data.SafeOutputs.AddComments.GitHubToken
+		}
+		if slices.Contains(safeOutputJobNames, "add_comment") {
+			stepCondition = "always() && !(needs.add_comment.outputs.comment_id)"
+		}
+		steps = append(steps, c.buildGitHubScriptStepWithoutDownload(data, GitHubScriptStepConfig{
+			StepName:      "Update reaction comment with completion status",
+			StepID:        "conclusion",
+			MainJobName:   mainJobName,
+			CustomEnvVars: c.buildConclusionScriptEnvVars(data, mainJobName, safeOutputJobNames, messagesJSON),
+			Script:        getNotifyCommentErrorScript(),
+			ScriptFile:    "notify_comment_error.cjs",
+			CustomToken:   token,
+			StepCondition: stepCondition,
+		})...)
+	}
+	steps = append(steps, c.buildConclusionSteeringIssueStep(data, mainJobName, steeringToken)...)
+	return c.appendConclusionUsageSteps(steps, data)
+}
+
+func (c *Compiler) appendConclusionUsageSteps(steps []string, data *WorkflowData) ([]string, error) {
+	gradersEnv, err := graderEnvironment(data.Graders)
+	if err != nil {
+		return nil, fmt.Errorf("cannot serialize grader configuration: %w", err)
+	}
+	safeJobNames := configuredUsageSafeJobNames(data)
+	usageEnv := []string{gradersEnv}
+	if len(safeJobNames) > 0 {
+		namesJSON, err := json.Marshal(safeJobNames)
+		if err != nil {
+			return nil, fmt.Errorf("cannot serialize safe-job names: %w", err)
+		}
+		usageEnv = append(usageEnv, fmt.Sprintf("          GH_AW_SAFE_JOB_NAMES: %q\n", namesJSON), buildUsageSafeJobResultsEnv(safeJobNames, data.SafeOutputs.Jobs))
+	}
+	steps = append(steps, buildUsageArtifactCollectionStep(IsDetectionJobEnabled(data.SafeOutputs))...)
+	// Admission still runs in dry-run mode; record its decision without applying
+	// its budget to agent, detection, or evals execution.
+	steps = append(steps, buildUsageActivityGenerationStep(data.AdmissionEnabled, hasMaxDailyAICGuardrail(data), !isWorkQueueParticipant(data) && conclusionReportFailedJobsEnabled(data), c.getActionPin, usageEnv...)...)
+	if data.AdmissionEnabled {
+		steps = append(steps, c.buildConclusionAdmissionMetadataStep(data)...)
+	}
+	steps = append(steps, buildUsageArtifactUploadStep(artifactPrefixExprForDownstreamJob(data), c.getActionPin)...)
+	if c.actionMode.IsScript() {
+		steps = append(steps, c.generateScriptModeCleanupStep())
+	}
+	return steps, nil
+}
+
+func configuredUsageSafeJobNames(data *WorkflowData) []string {
+	var names []string
+	// Work-queue jobs only prepare adapters; they do not execute safe jobs.
+	if data.SafeOutputs != nil && !isWorkQueueParticipant(data) {
+		for name := range data.SafeOutputs.Jobs {
+			names = append(names, stringutil.NormalizeSafeOutputIdentifier(name))
+		}
+		slices.Sort(names)
+	}
+	return names
+}
+
+// computeConclusionJobPermissions resolves the GITHUB_TOKEN permissions for the conclusion
+// job: safe-outputs permissions plus the scopes required by configured OTLP OIDC,
+// session job-duration collection, and any issue-creating conclusion mechanism.
+func computeConclusionJobPermissions(data *WorkflowData) *Permissions {
+	conclusionPerms := ComputePermissionsForSafeOutputs(data.SafeOutputs)
+	// Session job-duration collection is always enabled, independently of failure
+	// reporting, and reads the current run attempt's Actions jobs.
+	if level, ok := conclusionPerms.Get(PermissionActions); !ok || level == PermissionNone {
+		conclusionPerms.Set(PermissionActions, PermissionRead)
+	}
+	if isWorkQueueParticipant(data) {
+		conclusionPerms = NewPermissions()
+		conclusionPerms.Set(PermissionContents, PermissionRead)
+		conclusionPerms.Set(PermissionActions, PermissionRead)
+		if workQueueRequiresAssignment(data) {
+			conclusionPerms.Set(PermissionContents, PermissionWrite)
+		}
+		if workQueueIssuesConfig(data) != nil {
+			conclusionPerms.Set(PermissionContents, PermissionWrite)
+			conclusionPerms.Set(PermissionIssues, PermissionWrite)
+		}
+		if conclusionDetectionMayCreateIssue(data) {
+			conclusionPerms.Set(PermissionIssues, PermissionWrite)
+		}
+		if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
+			conclusionPerms.Set(PermissionIdToken, PermissionWrite)
+		}
+		return conclusionPerms
+	}
+	if hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
+		conclusionPerms.Set(PermissionIdToken, PermissionWrite)
+	}
+	if isWorkQueueEnabled(data) {
+		if level, ok := conclusionPerms.Get(PermissionContents); !ok || level == PermissionNone {
+			conclusionPerms.Set(PermissionContents, PermissionRead)
+		}
+	}
+	// The agent-failure handler checks the PR state and agent job steps before
+	// reporting a failed PR merge-ref checkout; Actions access is already granted above.
+	if conclusionReportFailureAsIssueEnabled(data) {
+		if level, ok := conclusionPerms.Get(PermissionPullRequests); !ok || level == PermissionNone {
+			conclusionPerms.Set(PermissionPullRequests, PermissionRead)
+		}
+	}
+	addAgentFailureChecksPermission(data, conclusionPerms)
+	// Only request issues: write when at least one conclusion-job mechanism can actually
+	// create/update an issue and that path is not already covered by
+	// ComputePermissionsForSafeOutputs (report-failed-jobs, agent-failure reporting,
+	// noop, detection, or missing-tool issue reporting). This keeps the permission grant
+	// derived from the resolved configuration instead of being emitted unconditionally.
+	if conclusionMayCreateIssue(data) {
+		if level, ok := conclusionPerms.Get(PermissionIssues); !ok || level != PermissionWrite {
+			conclusionPerms.Set(PermissionIssues, PermissionWrite)
+		}
+		if isSteeringIssueEnabled(data) {
+			conclusionPerms.Set(PermissionIssues, PermissionWrite)
+		}
+	}
+	return conclusionPerms
+}
+
+func addAgentFailureChecksPermission(data *WorkflowData, permissions *Permissions) {
+	if !isWorkQueueParticipant(data) && conclusionReportFailureAsIssueEnabled(data) {
+		if level, ok := permissions.Get(PermissionChecks); !ok || level == PermissionNone {
+			permissions.Set(PermissionChecks, PermissionRead)
+		}
+	}
+}
+
+// conclusionReportFailedJobsEnabled returns true unless safe-outputs.report-failed-jobs is
+// explicitly set to false. Defaults to true.
+func conclusionReportFailedJobsEnabled(data *WorkflowData) bool {
+	return data.SafeOutputs == nil || data.SafeOutputs.ReportFailedJobs == nil || !strings.EqualFold(strings.TrimSpace(data.SafeOutputs.ReportFailedJobs.String()), "false")
+}
+
+// conclusionReportFailureAsIssueEnabled returns true unless safe-outputs.report-failure-as-issue
+// is explicitly set to false. Defaults to true.
+func conclusionReportFailureAsIssueEnabled(data *WorkflowData) bool {
+	if data.SafeOutputs == nil || data.SafeOutputs.ReportFailureAsIssue == nil {
+		return true
+	}
+	return !strings.EqualFold(strings.TrimSpace(data.SafeOutputs.ReportFailureAsIssue.String()), "false")
+}
+
+// conclusionMissingToolCreateIssueEnabled returns true unless
+// safe-outputs.missing-tool.create-issue is explicitly set to false.
+func conclusionMissingToolCreateIssueEnabled(data *WorkflowData) bool {
+	return data.SafeOutputs != nil && issueReportingCreateIssueEnabled(data.SafeOutputs.MissingTool)
+}
+
+func issueReportingCreateIssueEnabled(config *IssueReportingConfig) bool {
+	return config != nil && (config.CreateIssue == nil || !strings.EqualFold(strings.TrimSpace(*config.CreateIssue), "false"))
+}
+
+func conclusionDetectionMayCreateIssue(data *WorkflowData) bool {
+	return IsDetectionJobEnabled(data.SafeOutputs) && data.SafeOutputs.ThreatDetection.IsReportAsIssueEnabled()
+}
+
+// conclusionMayCreateIssue returns true if at least one conclusion-job mechanism can create or
+// update an issue: report-failed-jobs, agent-failure reporting (report-failure-as-issue), noop
+// reporting (noop.report-as-issue), detection runs, or missing-tool issue reporting. This mirrors the resolved
+// configuration so that disabling every issue-creating path removes issues: write from the
+// compiled conclusion job's permissions.
+func conclusionMayCreateIssue(data *WorkflowData) bool {
+	if conclusionReportFailedJobsEnabled(data) {
+		return true
+	}
+	if conclusionReportFailureAsIssueEnabled(data) {
+		return true
+	}
+	if data.SafeOutputs != nil && data.SafeOutputs.NoOp != nil && isNoOpReportAsIssueEnabled(data.SafeOutputs.NoOp.ReportAsIssue) {
+		return true
+	}
+	if conclusionMissingToolCreateIssueEnabled(data) {
+		return true
+	}
+	if conclusionDetectionMayCreateIssue(data) {
+		return true
+	}
+	return false
+}
+
+// buildUsageArtifactInputDownloadSteps creates the artifact download steps that feed the
+// usage artifact: the safe-outputs items manifest (used by
+// generate_usage_activity_summary.cjs), the experiment artifact when the workflow declares
+// experiments (experimentArtifactName is non-empty), and the evals artifact when the
+// workflow declares evals. Grader results need no dedicated download because the
+// conclusion job already downloads the unified agent artifact, which contains them.
+func buildUsageArtifactInputDownloadSteps(prefix string, hasEvals bool, experimentArtifactName string, pinAction func(string) string) []string {
+	safeOutputsItemsArtifactName := prefix + constants.SafeOutputItemsArtifactName.String()
+	safeOutputsDownloadAction := pinAction("actions/download-artifact")
+	steps := []string{
+		"      - name: Download Safe Outputs Items Manifest\n",
+		"        id: download-safe-outputs-manifest\n",
+		"        if: always()\n",
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", safeOutputsDownloadAction),
+		"        with:\n",
+	}
+	steps = append(steps, downloadArtifactInputLines(safeOutputsItemsArtifactName, safeOutputsDownloadAction)...)
+	steps = append(steps, "          path: /tmp/gh-aw/\n")
+	if experimentArtifactName != "" {
+		experimentDownloadAction := pinAction("actions/download-artifact")
+		steps = append(steps,
+			"      - name: Download experiment artifact\n",
+			"        id: download-experiment-artifact\n",
+			"        if: always()\n",
+			"        continue-on-error: true\n",
+			fmt.Sprintf("        uses: %s\n", experimentDownloadAction),
+			"        with:\n",
+		)
+		steps = append(steps, downloadArtifactInputLines(experimentArtifactName, experimentDownloadAction)...)
+		steps = append(steps, fmt.Sprintf("          path: %s/\n", experimentsCacheDir))
+	}
+	if !hasEvals {
+		return steps
+	}
+	evalsArtifactName := prefix + constants.EvalsArtifactName.String()
+	evalsDownloadAction := pinAction("actions/download-artifact")
+	steps = append(steps,
+		"      - name: Download evals artifact\n",
+		"        id: download-evals-artifact\n",
+		"        if: always()\n",
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", evalsDownloadAction),
+		"        with:\n",
+	)
+	steps = append(steps, downloadArtifactInputLines(evalsArtifactName, evalsDownloadAction)...)
+	return append(steps, "          path: /tmp/gh-aw/evals/\n")
 }
 
 // buildUsageArtifactUploadSteps creates steps that collect and upload a compact usage artifact.
 // The artifact includes aw_info.json, aw-info.jsonl, agent_usage.json, agent_usage.jsonl, detection_usage.jsonl,
-// evals.jsonl, and agent/detection token usage JSONL files (when present).
+// evals.jsonl, evals token usage, execution evidence and not-evaluated marker, A/B experiment state and assignments,
+// grader results, threat-detection outcome/verdict, and agent/detection token usage and
+// model-routing JSONL files
+// (when present), so the audit command can mine these results from the usage artifact alone.
 // It also downloads the safe-outputs-items artifact so that generate_usage_activity_summary.cjs
 // can include safe-output item counts in the activity summary without requiring a separate artifact download.
-func buildUsageArtifactUploadSteps(prefix string, hasEvals bool, pinAction func(string) string) []string {
-	usageArtifactName := prefix + "usage"
-	safeOutputsItemsArtifactName := prefix + constants.SafeOutputItemsArtifactName
-	steps := []string{
-		"      - name: Download safe outputs items manifest\n",
-		"        id: download-safe-outputs-manifest\n",
-		"        if: always()\n",
-		"        continue-on-error: true\n",
-		fmt.Sprintf("        uses: %s\n", pinAction("actions/download-artifact")),
+func buildUsageArtifactUploadSteps(prefix string, hasEvals bool, experimentArtifactName string, hasDetection bool, pinAction func(string) string) []string {
+	steps := buildUsageArtifactInputDownloadSteps(prefix, hasEvals, experimentArtifactName, pinAction)
+	return append(steps, buildUsageArtifactPublishSteps(prefix, hasDetection, true, false, pinAction)...)
+}
+
+func buildUsageArtifactPublishSteps(prefix string, hasDetection, hasDailyAICGuardrail, reuseJobDurations bool, pinAction func(string) string, gradersEnv ...string) []string {
+	steps := buildUsageArtifactCollectionStep(hasDetection)
+	steps = append(steps, buildUsageActivityGenerationStep(false, hasDailyAICGuardrail, reuseJobDurations, pinAction, gradersEnv...)...)
+	return append(steps, buildUsageArtifactUploadStep(prefix, pinAction)...)
+}
+
+func buildUsageArtifactUploadStep(prefix string, pinAction func(string) string) []string {
+	var steps []string
+	usageArtifactUploadAction := pinAction("actions/upload-artifact")
+	usageArtifactUploadWithLines := []string{
 		"        with:\n",
-		fmt.Sprintf("          name: %s\n", safeOutputsItemsArtifactName),
-		"          path: /tmp/gh-aw/\n",
-	}
-	if hasEvals {
-		evalsArtifactName := prefix + constants.EvalsArtifactName
-		steps = append(steps,
-			"      - name: Download evals artifact\n",
-			"        id: download-evals-artifact\n",
-			"        if: always()\n",
-			"        continue-on-error: true\n",
-			fmt.Sprintf("        uses: %s\n", pinAction("actions/download-artifact")),
-			"        with:\n",
-			fmt.Sprintf("          name: %s\n", evalsArtifactName),
-			"          path: /tmp/gh-aw/evals/\n",
-		)
-	}
-	steps = append(steps,
-		"      - name: Collect usage artifact files\n",
-		"        if: always()\n",
-		"        continue-on-error: true\n",
-		"        run: |\n",
-		"          mkdir -p /tmp/gh-aw/usage/agent /tmp/gh-aw/usage/detection\n",
-		"          echo \"Usage artifact source file status:\"\n",
-		"          for file in /tmp/gh-aw/aw_info.json /tmp/gh-aw/aw-info.jsonl /tmp/gh-aw/agent_usage.json /tmp/gh-aw/agent_usage.jsonl /tmp/gh-aw/detection_usage.jsonl /tmp/gh-aw/evals/evals.jsonl /tmp/gh-aw/github_rate_limits.jsonl /tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/threat-detection/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/threat-detection/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/threat-detection/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl; do\n",
-		"            [ -f \"$file\" ] && echo \"FOUND: $file\" || echo \"MISSING: $file\"\n",
-		"          done\n",
-		"          [ -f /tmp/gh-aw/aw_info.json ] && cp /tmp/gh-aw/aw_info.json /tmp/gh-aw/usage/aw_info.json || true\n",
-		"          [ -f /tmp/gh-aw/aw-info.jsonl ] && cp /tmp/gh-aw/aw-info.jsonl /tmp/gh-aw/usage/aw-info.jsonl || true\n",
-		"          [ -f /tmp/gh-aw/agent_usage.json ] && cp /tmp/gh-aw/agent_usage.json /tmp/gh-aw/usage/agent_usage.json || true\n",
-		"          [ -f /tmp/gh-aw/agent_usage.jsonl ] && cp /tmp/gh-aw/agent_usage.jsonl /tmp/gh-aw/usage/agent_usage.jsonl || true\n",
-		"          [ -f /tmp/gh-aw/detection_usage.jsonl ] && cp /tmp/gh-aw/detection_usage.jsonl /tmp/gh-aw/usage/detection_usage.jsonl || true\n",
-		"          [ -f /tmp/gh-aw/evals/evals.jsonl ] && cp /tmp/gh-aw/evals/evals.jsonl /tmp/gh-aw/usage/evals.jsonl || true\n",
-		"          [ -f /tmp/gh-aw/github_rate_limits.jsonl ] && cp /tmp/gh-aw/github_rate_limits.jsonl /tmp/gh-aw/usage/github_rate_limits.jsonl || true\n",
-		// Agent token usage: copy in ascending priority order (last non-empty source wins).
-		// firewall/logs/ is the authoritative proxy-logs dir and goes last so it always wins
-		// over the legacy firewall-audit-logs/ path and the AWF audit dir (firewall/audit/).
-		// Using [ -s ] (non-empty) prevents an empty stub file from zeroing out valid data.
-		"          [ -s /tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl ] && cp /tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/usage/agent/token_usage.jsonl || true\n",
-		"          [ -s /tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl ] && cp /tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/usage/agent/token_usage.jsonl || true\n",
-		"          [ -s /tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl ] && cp /tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/usage/agent/token_usage.jsonl || true\n",
-		// Detection token usage: same priority ordering as agent.
-		"          [ -s /tmp/gh-aw/threat-detection/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl ] && cp /tmp/gh-aw/threat-detection/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/usage/detection/token_usage.jsonl || true\n",
-		"          [ -s /tmp/gh-aw/threat-detection/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl ] && cp /tmp/gh-aw/threat-detection/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/usage/detection/token_usage.jsonl || true\n",
-		"          [ -s /tmp/gh-aw/threat-detection/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl ] && cp /tmp/gh-aw/threat-detection/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl /tmp/gh-aw/usage/detection/token_usage.jsonl || true\n",
-		"          [ -f /tmp/gh-aw/usage/agent/token_usage.jsonl ] || : > /tmp/gh-aw/usage/agent/token_usage.jsonl\n",
-		"          [ -f /tmp/gh-aw/usage/detection/token_usage.jsonl ] || : > /tmp/gh-aw/usage/detection/token_usage.jsonl\n",
-		"          mkdir -p /tmp/gh-aw/usage/activity\n",
-		fmt.Sprintf("          node \"%s/generate_usage_activity_summary.cjs\"\n", SetupActionDestinationShell),
-		"          find /tmp/gh-aw/usage -type f -print | sort\n",
-		"      - name: Upload usage artifact\n",
-		"        if: always()\n",
-		"        continue-on-error: true\n",
-		fmt.Sprintf("        uses: %s\n", pinAction("actions/upload-artifact")),
-		"        with:\n",
-		fmt.Sprintf("          name: %s\n", usageArtifactName),
+		fmt.Sprintf("          name: %susage\n", prefix),
 		"          path: |\n",
+		"            /tmp/gh-aw/usage/aw_session.jsonl\n",
 		"            /tmp/gh-aw/usage/aw_info.json\n",
 		"            /tmp/gh-aw/usage/aw-info.jsonl\n",
 		"            /tmp/gh-aw/usage/agent_usage.json\n",
 		"            /tmp/gh-aw/usage/agent_usage.jsonl\n",
 		"            /tmp/gh-aw/usage/detection_usage.jsonl\n",
 		"            /tmp/gh-aw/usage/evals.jsonl\n",
+		"            /tmp/gh-aw/usage/graders/grader_manifest.json\n",
+		"            /tmp/gh-aw/usage/graders/grader_results.json\n",
 		"            /tmp/gh-aw/usage/github_rate_limits.jsonl\n",
 		"            /tmp/gh-aw/usage/agent/token_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/agent/model-routing.jsonl\n",
+		"            /tmp/gh-aw/usage/agent/execution.json\n",
+		"            /tmp/gh-aw/usage/agent/harness_retry.json\n",
+		"            /tmp/gh-aw/usage/agent/durable-session.jsonl\n",
 		"            /tmp/gh-aw/usage/detection/token_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/detection/execution.json\n",
+		"            /tmp/gh-aw/usage/detection/harness_retry.json\n",
+		"            /tmp/gh-aw/usage/detection/detection_result.json\n",
+		"            /tmp/gh-aw/usage/evals/token_usage.jsonl\n",
+		"            /tmp/gh-aw/usage/evals/execution.json\n",
+		"            /tmp/gh-aw/usage/evals/evals_status.json\n",
+		"            /tmp/gh-aw/usage/experiment/state.jsonl\n",
+		"            /tmp/gh-aw/usage/experiment/state.json\n",
+		"            /tmp/gh-aw/usage/experiment/assignments.json\n",
 		"            /tmp/gh-aw/usage/activity/summary.json\n",
 		"          if-no-files-found: ignore\n",
+	}
+	retryUsageArtifactUploadWithLines := append([]string{}, usageArtifactUploadWithLines...)
+	retryUsageArtifactUploadWithLines = append(retryUsageArtifactUploadWithLines, "          overwrite: true\n")
+	steps = append(steps,
+		"      - name: Upload usage artifact\n",
+		"        id: upload-usage-artifact\n",
+		"        if: always()\n",
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", usageArtifactUploadAction),
 	)
+	steps = append(steps, usageArtifactUploadWithLines...)
+	// The initial upload can fail transiently (e.g. a runner-side DNS blip while
+	// talking to blob storage). A missing usage artifact permanently blocks the
+	// daily AI Credits guardrail for this run, so wait briefly and retry once
+	// before giving up, so a short-lived network hiccup has time to clear.
+	steps = append(steps,
+		"      - name: Wait before retrying usage artifact upload\n",
+		"        if: always() && steps.upload-usage-artifact.outcome == 'failure'\n",
+		"        run: sleep 10\n",
+		"      - name: Retry upload usage artifact\n",
+		"        id: upload-usage-artifact-retry\n",
+		"        if: always() && steps.upload-usage-artifact.outcome == 'failure'\n",
+		"        continue-on-error: true\n",
+		fmt.Sprintf("        uses: %s\n", usageArtifactUploadAction),
+	)
+	steps = append(steps, retryUsageArtifactUploadWithLines...)
 	return steps
 }
 
-// buildDailyAICUsageCacheSteps creates steps that compute AIC for the current run and persist
-// it to a per-workflow JSONL cache via actions/cache/save.  The cache is restored by the
-// activation job so that subsequent guardrail checks can skip artifact downloads for known runs.
-//
-// The sequence is: restore latest snapshot → append current run entry → save updated snapshot.
-// The restore step uses a prefix restore-key so it picks up the most recent snapshot even when
-// the exact key (which includes the current run ID) does not exist yet.
-func buildDailyAICUsageCacheSteps(data *WorkflowData, pinAction func(string) string) []string {
-	sanitized := SanitizeWorkflowIDForCacheKey(data.WorkflowID)
-	cacheKeyPrefix := fmt.Sprintf("agentic-workflow-usage-%s-", sanitized)
-	cacheKey := cacheKeyPrefix + "${{ github.run_id }}"
-	return []string{
-		"      - name: Restore daily AIC usage cache\n",
-		"        id: restore-daily-aic-cache-conclusion\n",
+func buildUsageArtifactCollectionStep(hasDetection bool) []string {
+	collectionStep := []string{
+		"      - name: Collect usage artifact files\n",
 		"        if: always()\n",
 		"        continue-on-error: true\n",
-		fmt.Sprintf("        uses: %s\n", pinAction("actions/cache/restore")),
-		"        with:\n",
-		fmt.Sprintf("          key: %s\n", cacheKey),
-		fmt.Sprintf("          restore-keys: %s\n", cacheKeyPrefix),
-		"          path: /tmp/gh-aw/agentic-workflow-usage-cache.jsonl\n",
-		"      - name: Write daily AIC usage cache entry\n",
-		"        id: write-daily-aic-cache\n",
+	}
+	var env []string
+	if hasDetection {
+		env = append(env,
+			"          GH_AW_DETECTION_JOB_RESULT: ${{ needs.detection.result }}\n",
+			"          GH_AW_DETECTION_CONCLUSION: ${{ needs.detection.outputs.detection_conclusion }}\n",
+			"          GH_AW_DETECTION_REASON: ${{ needs.detection.outputs.detection_reason }}\n",
+		)
+	}
+	if len(env) > 0 {
+		collectionStep = append(collectionStep, "        env:\n")
+		collectionStep = append(collectionStep, env...)
+	}
+	collectionStep = append(collectionStep, fmt.Sprintf("        run: bash \"%s/collect_usage_artifact_files.sh\"\n", SetupActionDestinationShell))
+	return collectionStep
+}
+
+func buildUsageSafeJobResultsEnv(safeJobNames []string, jobs map[string]*SafeJobConfig) string {
+	// Keep private dependency outputs outside the collector's environment.
+	// toJSON on each scalar preserves quotes and newlines in output values.
+	configured := make(map[string]*SafeJobConfig, len(jobs))
+	for name, config := range jobs {
+		configured[stringutil.NormalizeSafeOutputIdentifier(name)] = config
+	}
+	var results []string
+	for _, name := range safeJobNames {
+		fields := fmt.Sprintf("\"result\":${{ toJSON(needs.%s.result) }}", name)
+		var outputs []string
+		for _, field := range []string{"status", "url"} {
+			if config := configured[name]; config != nil {
+				if _, declared := config.Outputs[field]; declared {
+					outputs = append(outputs, fmt.Sprintf("%q:${{ toJSON(needs.%s.outputs.%s) }}", field, name, field))
+				}
+			}
+		}
+		fields += ",\"outputs\":{" + strings.Join(outputs, ",") + "}"
+		results = append(results, fmt.Sprintf("%q:{%s}", name, fields))
+	}
+	return fmt.Sprintf("          GH_AW_SAFE_JOB_RESULTS: %q\n", "{"+strings.Join(results, ",")+"}")
+}
+
+func buildUsageActivityGenerationStep(hasAdmission, hasDailyAICGuardrail, reuseJobDurations bool, pinAction func(string) string, gradersEnv ...string) []string {
+	steps := []string{
+		"      - name: Generate usage activity summary and unified session\n",
 		"        if: always()\n",
 		"        continue-on-error: true\n",
 		fmt.Sprintf("        uses: %s\n", pinAction("actions/github-script")),
-		"        with:\n",
-		"          github-token: ${{ github.token }}\n",
-		"          script: |\n",
-		"            const { setupGlobals } = require('" + SetupActionDestination + "/setup_globals.cjs');\n",
-		"            setupGlobals(core, github, context);\n",
-		"            const { main } = require('" + SetupActionDestination + "/write_daily_aic_usage_cache.cjs');\n",
-		"            await main();\n",
-		"      - name: Save daily AIC usage cache\n",
-		"        id: save-daily-aic-cache\n",
-		"        if: always()\n",
-		"        continue-on-error: true\n",
-		fmt.Sprintf("        uses: %s\n", pinAction("actions/cache/save")),
-		"        with:\n",
-		fmt.Sprintf("          key: %s\n", cacheKey),
-		"          path: /tmp/gh-aw/agentic-workflow-usage-cache.jsonl\n",
-		// Upload the cache file as an artifact so the activation job's artifact-based
-		// fallback can retrieve it on a different PR branch where actions/cache is
-		// branch-scoped and would otherwise always miss.
-		"      - name: Upload daily AIC usage cache artifact\n",
-		"        id: upload-daily-aic-cache\n",
-		"        if: always()\n",
-		"        continue-on-error: true\n",
-		fmt.Sprintf("        uses: %s\n", pinAction("actions/upload-artifact")),
-		"        with:\n",
-		"          name: aic-usage-cache\n",
-		"          path: /tmp/gh-aw/agentic-workflow-usage-cache.jsonl\n",
-		"          if-no-files-found: ignore\n",
-		"          retention-days: 7\n",
 	}
+	var env []string
+	if hasAdmission {
+		env = append(env,
+			"          GH_AW_ADMISSION_RESULT: ${{ needs.activation.outputs.admission-result }}\n",
+			"          GH_AW_ADMISSION_MAX_AI_CREDITS: ${{ needs.activation.outputs.admission-max-ai-credits }}\n",
+			"          GH_AW_ADMISSION_MAX_AI_CREDITS_THREAT_DETECTION: ${{ needs.activation.outputs.admission-max-ai-credits-threat-detection }}\n",
+			"          GH_AW_ADMISSION_MAX_AI_CREDITS_EVALS: ${{ needs.activation.outputs.admission-max-ai-credits-evals }}\n",
+		)
+	}
+	env = append(env, gradersEnv...)
+	if reuseJobDurations {
+		env = append(env, "          GH_AW_JOB_DURATIONS: ${{ steps.report_failed_jobs.outputs.job_durations }}\n")
+	}
+	if hasDailyAICGuardrail {
+		env = append(env,
+			"          GH_AW_DAILY_AI_CREDITS_GUARDRAIL_STATUS: ${{ needs.activation.outputs.daily_ai_credits_guardrail_status }}\n",
+			"          GH_AW_DAILY_AI_CREDITS_EXCEEDED: ${{ needs.activation.outputs.daily_ai_credits_exceeded }}\n",
+			"          GH_AW_DAILY_AI_CREDITS_TOTAL: ${{ needs.activation.outputs.daily_ai_credits_total }}\n",
+			"          GH_AW_DAILY_AI_CREDITS_ESTIMATED: ${{ needs.activation.outputs.daily_ai_credits_estimated }}\n",
+			"          GH_AW_DAILY_AI_CREDITS_THRESHOLD: ${{ needs.activation.outputs.daily_ai_credits_threshold }}\n",
+		)
+	}
+	if len(env) > 0 {
+		steps = append(steps, "        env:\n")
+		steps = append(steps, env...)
+	}
+	steps = append(steps,
+		"        with:\n",
+		"          script: |\n",
+		fmt.Sprintf("            const { setupGlobals } = require('%s/setup_globals.cjs');\n", SetupActionDestination),
+		"            setupGlobals(core, github, context, exec, io, getOctokit);\n",
+		fmt.Sprintf("            const { main } = require('%s/generate_usage_artifacts.cjs');\n", SetupActionDestination),
+		"            await main();\n",
+	)
+	return steps
 }
 
 // isGroupConcurrencyQueueEnabled reports whether compiler-generated concurrency groups

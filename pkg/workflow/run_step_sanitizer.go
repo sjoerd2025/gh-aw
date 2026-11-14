@@ -15,7 +15,7 @@
 // # What this file does
 //
 // sanitizeRunStepExpressions inspects a step map and, for every ${{ ... }}
-// expression that appears directly in the run: field (outside of heredoc blocks),
+// expression that appears directly in the run: field (outside quoted heredoc bodies),
 // it:
 //   1. Generates a deterministic GH_AW_ environment variable name for the expression.
 //   2. Adds the expression as a value under env: for that step.
@@ -37,23 +37,29 @@
 //
 // # Edge cases
 //
-// Heredoc blocks (e.g. << 'EOF' ... EOF) are intentionally excluded from
-// extraction because their content is written to a file or stdin and is not
-// executed by the shell interpreter as code.  The existing removeHeredocContent
-// helper from template_injection_utils.go is reused for this detection.
+// Shell comments and expanding heredoc bodies are sanitized because GitHub
+// evaluates expressions before Bash sees them. Expressions in quoted heredocs
+// cannot be rewritten without changing literal output, so validation rejects
+// unsafe expressions that remain there.
+// Scripts with unproven heredoc boundaries are left intact for validation to
+// reject, rather than risking destructive replacements inside quoted data.
 
 package workflow
 
 import (
+	"bytes"
 	"fmt"
 	"maps"
 	"slices"
 	"strings"
-
-	"github.com/goccy/go-yaml"
+	"unicode/utf8"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/typeutil"
+	"github.com/github/gh-aw/pkg/workflow/gradershell"
+	"github.com/goccy/go-yaml"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 var runStepSanitizerLog = logger.New("workflow:run_step_sanitizer")
@@ -71,9 +77,9 @@ type sanitizedExpression struct {
 // sanitizeRunStepExpressions extracts unsafe ${{ ... }} expressions from the
 // run: field of a step map and moves them into the step's env: block.
 //
-// Only expressions that appear in the non-heredoc portion of the run: script are
-// extracted; expressions inside heredoc blocks are left in place because they are
-// written to files rather than executed by the shell interpreter.
+// Expressions in comments and expanding heredocs are extracted. Expressions in
+// quoted heredocs are left in place because replacing them with shell variables
+// would change their literal output; validation rejects unsafe expressions that remain.
 //
 // The returned step map is a shallow copy of the input with updated run: and env:
 // fields.  The input map is not modified.
@@ -87,45 +93,103 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 	if !ok || !hasExpressionMarker(runVal) {
 		return step, nil, false
 	}
+	regions, parsed := shellHeredocRegions(runVal, false)
+	if !parsed {
+		// Without reliable boundaries, rewriting could corrupt quoted data.
+		// Leave the script intact for the fail-closed expression validators.
+		return step, nil, false
+	}
 
-	// Only scan executable script content:
-	//   - strip heredoc bodies (written to files/stdin, not executed)
-	//   - strip bash line comments (not executed)
-	scanContent := stripShellLineComments(removeHeredocContent(runVal))
+	// GitHub evaluates expressions before the shell sees comments or heredoc
+	// bodies. Scan comments and expanding heredocs as well as executable code,
+	// but leave quoted heredocs for validation to reject without rewriting them.
+	scanContent := transformShellRegions(runVal, regions, func(content string) string { return content }, true)
 	if !hasExpressionMarker(scanContent) {
 		return step, nil, false
 	}
 
-	// Find all distinct ${{ ... }} expressions in the executable portion.
-	matches := ExpressionPattern.FindAllStringSubmatch(scanContent, -1)
-	if len(matches) == 0 {
+	ordered := runStepExpressionsToExtract(scanContent)
+	if len(ordered) == 0 {
 		return step, nil, false
 	}
 
+	// Environment-variable expansion is not safe when its result is subsequently
+	// parsed as shell code (for example, by eval or bash -c). Leave these expressions
+	// intact so the compiler's raw run-expression validator rejects the step.
+	if runStepUsesShellCodeEvaluation(runVal) {
+		return step, nil, false
+	}
+
+	newEnv := mergeSanitizedRunStepEnv(step, ordered)
+
+	// Replace every occurrence of each expression in the run: script.
+	// Replacements are limited to non-quoted-heredoc regions: quoted heredocs
+	// (e.g. << 'EOF') suppress shell variable expansion, so replacing
+	// ${{ expr }} with $GH_AW_VAR inside them would write the literal variable
+	// name to the output file instead of the expression value. Expressions
+	// that appear exclusively inside quoted heredocs are never added to `ordered` (see
+	// the scanContent check above), so they are left intact regardless.
+	newRun := runVal
+	for _, s := range ordered {
+		newRun = replaceSanitizedRunStepExpression(newRun, s, step["shell"])
+	}
+
+	// Build the sanitized step as a shallow copy.
+	sanitized := make(map[string]any, len(step))
+	maps.Copy(sanitized, step)
+	sanitized["run"] = newRun
+	sanitized["env"] = newEnv
+
+	return sanitized, sanitizedRunStepDescriptions(step, ordered), true
+}
+
+func runStepUsesShellCodeEvaluation(run string) bool {
+	masked := maskShellActionsExpressions(run)
+	tree, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(bytes.NewReader(masked), "")
+	if err != nil {
+		return true
+	}
+
+	expressions := ExpressionPattern.FindAllStringSubmatchIndex(run, -1)
+	return gradershell.HasShellCodeEvaluation(tree, func(word *syntax.Word) bool {
+		if _, literal := gradershell.LiteralWord(word); !literal {
+			return true
+		}
+		start, end := int(word.Pos().Offset()), int(word.End().Offset())
+		for _, expression := range expressions {
+			if len(expression) >= 2 && start < expression[1] && expression[0] < end { //nolint:uncheckedsliceindex // The guard requires the complete match offset pair.
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func runStepExpressionsToExtract(scanContent string) []sanitizedExpression {
+	// Find all distinct ${{ ... }} expressions in the expandable portions and comments.
+	matches := ExpressionPattern.FindAllStringSubmatch(scanContent, -1)
+
 	// Build a deduplicated, ordered list of expressions to extract.
 	extractor := NewExpressionExtractor()
-	seen := make(map[string]struct {
-	})
+	seen := make(map[string]struct{})
 	var ordered []sanitizedExpression
 
 	for _, match := range matches {
-		original := match[0]
+		if len(match) < 2 {
+			continue
+		}
+		original := match[0] //nolint:uncheckedsliceindex // The submatch length is checked above.
 		if setutil.Contains(seen, original) {
 			continue
 		}
-		seen[original] = struct {
-		}{}
-		content := strings.TrimSpace(match[1])
+		seen[original] = struct{}{}
+		content := strings.TrimSpace(match[1]) //nolint:uncheckedsliceindex // The submatch length is checked above.
 		envVar := extractor.generateEnvVarName(content)
 		ordered = append(ordered, sanitizedExpression{
 			Original: original,
 			EnvVar:   envVar,
 			Content:  content,
 		})
-	}
-
-	if len(ordered) == 0 {
-		return step, nil, false
 	}
 
 	// Sort longest expressions first to avoid partial replacements when one
@@ -140,14 +204,20 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 			return 0
 		}
 	})
+	return ordered
+}
 
+func mergeSanitizedRunStepEnv(step map[string]any, ordered []sanitizedExpression) map[string]any {
 	// Merge extracted env vars into a copy of the existing env: map.
 	// Collision handling:
 	//   - If the generated key already exists with the same value → reuse as-is.
 	//   - If it exists with a different value → pick an alternate name by appending
 	//     a numeric suffix (_2, _3, …) so the original user-defined value is preserved.
-	existingEnv, _ := step["env"].(map[string]any)
-	newEnv := make(map[string]any, safeAllocationCapacity(len(existingEnv), len(ordered)))
+	existingEnv, ok := step["env"].(map[string]any)
+	if !ok {
+		existingEnv = nil
+	}
+	newEnv := make(map[string]any, typeutil.SafeAllocationCapacity(len(existingEnv), len(ordered)))
 	maps.Copy(newEnv, existingEnv)
 
 	for i := range ordered {
@@ -184,27 +254,15 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 		}
 		newEnv[s.EnvVar] = s.Original
 	}
+	return newEnv
+}
 
-	// Replace every occurrence of each expression in the run: script.
-	// Replacements are limited to non-quoted-heredoc regions: quoted heredocs
-	// (e.g. << 'EOF') suppress shell variable expansion, so replacing
-	// ${{ expr }} with $GH_AW_VAR inside them would write the literal variable
-	// name to the output file instead of the expression value.  Expressions
-	// that appear exclusively inside heredocs are never added to `ordered` (see
-	// the scanContent check above), so they are left intact regardless.
-	newRun := runVal
-	for _, s := range ordered {
-		newRun = replaceOutsideQuotedHeredocs(newRun, s.Original, "$"+s.EnvVar)
-	}
-
-	// Build the sanitized step as a shallow copy.
-	sanitized := make(map[string]any, len(step))
-	maps.Copy(sanitized, step)
-	sanitized["run"] = newRun
-	sanitized["env"] = newEnv
-
+func sanitizedRunStepDescriptions(step map[string]any, ordered []sanitizedExpression) []string {
 	// Build human-readable descriptions for caller warnings.
-	stepName, _ := step["name"].(string)
+	stepName, ok := step["name"].(string)
+	if !ok {
+		stepName = ""
+	}
 	var descriptions []string
 	for _, s := range ordered {
 		var msg string
@@ -221,8 +279,36 @@ func sanitizeRunStepExpressions(step map[string]any) (map[string]any, []string, 
 		}
 		descriptions = append(descriptions, msg)
 	}
+	return descriptions
+}
 
-	return sanitized, descriptions, true
+func replaceSanitizedRunStepExpression(run string, expression sanitizedExpression, shellValue any) string {
+	shell, shellIsString := shellValue.(string)
+	powershell := shellIsString && (strings.EqualFold(shell, "pwsh") || strings.EqualFold(shell, "powershell"))
+	regions, parsed := shellHeredocRegions(run, false)
+	if !parsed {
+		return run
+	}
+	return transformShellRegions(run, regions, func(segment string) string {
+		var result strings.Builder
+		for {
+			before, after, found := strings.Cut(segment, expression.Original)
+			if !found {
+				result.WriteString(segment)
+				break
+			}
+			result.WriteString(before)
+			reference := "$" + expression.EnvVar
+			first, _ := utf8.DecodeRuneInString(after)
+			if !powershell && strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", first) {
+				// Bash otherwise consumes the adjacent suffix as part of the name.
+				reference = "${" + expression.EnvVar + "}"
+			}
+			result.WriteString(reference)
+			segment = after
+		}
+		return result.String()
+	}, false)
 }
 
 // sanitizeCustomStepsYAML parses a raw "steps: ..." YAML string (as produced by

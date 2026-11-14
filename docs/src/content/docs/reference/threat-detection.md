@@ -12,6 +12,19 @@ GitHub Agentic Workflows includes automatic threat detection to analyze agent ou
 
 Threat detection provides an additional security layer by analyzing agent output for malicious content, scanning code changes for suspicious patterns, using workflow context to distinguish legitimate actions from threats, and running automatically after the main job completes but before safe outputs are applied.
 
+Detection sanitizes its files after firewall-log collection and custom post-steps,
+before accounting reads or renders them. A second redaction pass covers newly
+generated usage files before log rendering, result publication, and artifact
+upload. These consumers require successful detection-job redaction; a failed or
+skipped redaction blocks publication for an active detection run even when detection
+uses `continue-on-error`. When no detection is needed, the redaction passes are
+skipped and the job still reports a successful skipped conclusion without reading
+detection output files. Exact-value secret inputs are limited to the detection
+job's own steps and inherited environment, not unrelated workflow credentials.
+GitHub Actions console masking does not sanitize downloadable artifact contents.
+Copied firewall files must be valid UTF-8 text no larger than 16 MiB; unsupported
+byproducts are removed before upload, and removal failures block publication.
+
 **Security Architecture:**
 
 ```text
@@ -26,10 +39,10 @@ Threat detection provides an additional security layer by analyzing agent output
 │ Threat Detection│ (Analyzes for security issues)
 │ Job             │
 └────────┬────────┘
-         │ approved/blocked
+         │ configured output policy
          ▼
 ┌─────────────────┐
-│ Safe Output Jobs│ (Write permissions, only if safe)
+│ Safe Output Jobs│ (Scoped writes; warn/strict policy)
 │ Create Issues,  │
 │ PRs, Comments   │
 └─────────────────┘
@@ -61,8 +74,18 @@ safe-outputs:
 # Or disable entirely:
 safe-outputs:
   create-pull-request:
-  threat-detection: false  # Disable threat detection
+  threat-detection: false  # Disable threat detection entirely
 ```
+
+The `features.gh-aw-detection` flag controls the detection implementation, not
+whether threat detection runs. The external `threat-detect` implementation is
+the default; set `features.gh-aw-detection: false` to select the legacy inline
+engine implementation. Compiled workflows embed the reviewed detector release
+tag and per-architecture SHA-256 digests. Installation verifies the downloaded
+binary against those compiler-controlled pins instead of a runtime checksum file.
+If installation does not complete verification, the detection job neither runs nor
+concludes with a detector binary: analysis is skipped and the conclusion is reported
+as an `agent_failure` (a warning in warn mode, a hard failure in strict mode).
 
 > [!NOTE]
 > When a workflow explicitly sets `threat-detection: false`, that setting takes precedence over any imported fragments. Imported shared workflows that configure safe outputs without a `threat-detection` key will not re-enable threat detection in the importing workflow.
@@ -92,10 +115,110 @@ safe-outputs:
 | `enabled` | boolean | Enable or disable detection (default: `true` when safe-outputs exist) |
 | `prompt` | string | Custom instructions appended to default detection prompt |
 | `engine` | string/object/false | AI engine config (`"copilot"`, full config object, or `false` for no AI) |
+| `ca-cert` | string/false | Absolute host path to a CA certificate for the detection API proxy. Inherits `sandbox.agent.ca-cert` when unset or empty and the detection engine matches the agent engine; set to `false` to disable inheritance. Requires AWF v0.28.10 or later. |
 | `runs-on` | string/array/object | Runner for the detection job (default: inherits from workflow `runs-on`) |
+| `artifact-base-url` | string | HTTPS base URL for a mirror of the pinned detector release assets. The compiler appends the pinned release tag and asset name; the embedded digest cannot be overridden. |
 | `steps` | array | Additional GitHub Actions steps to run **before** AI analysis (pre-steps) |
 | `post-steps` | array | Additional GitHub Actions steps to run **after** AI analysis (post-steps) |
 | `max-ai-credits` | integer | AI Credits cap for the detection run, independent of the main agent budget. Defaults to `400` when unset, with runtime override via `vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS`. Accepts plain integers; `-1` disables the detection budget. |
+| `continue-on-error` | boolean | When `true` (default), detected threats and detection engine failures apply the warn-mode policy (annotate reviewable outputs, convert branch pushes, abort non-reviewable outputs) instead of blocking all safe outputs. When `false`, they fail the detection job and safe outputs are not applied. |
+| `report-as-issue` | boolean | When `true` (default), detection warnings/failures create or update the `[aw] Detection Runs` tracking issue. Set to `false` to keep threat detection and its enforcement enabled while skipping the tracking issue; results remain visible in the GitHub Actions run logs. |
+
+### Issue reporting permissions
+
+When detection is runnable and `report-as-issue` is enabled (the default), the
+`conclusion` job and its GitHub App token request `issues: write`. Reusable workflow
+callers must grant this permission throughout the caller chain. When
+`safe-outputs.github-app` is configured, the App must have **Issues: write** access;
+otherwise, token creation can fail. Reusable callers without the required scope
+can fail workflow validation before any job runs.
+
+The existing opt-out disables the tracking issue and its detection-specific
+permission grant without disabling threat detection or enforcement:
+
+```aw wrap
+safe-outputs:
+  threat-detection:
+    report-as-issue: false
+```
+
+Other enabled issue-writing outputs or conclusion reporters can still require
+`issues: write`.
+
+### Private CA certificates
+
+The detection job inherits `sandbox.agent.ca-cert` for upstream API proxy TLS verification only when the detection and agent engines match. A non-empty `safe-outputs.threat-detection.ca-cert` overrides the inherited path; set it to `false` to opt out, or leave it unset/empty to use the matching-engine inheritance behavior.
+
+Detection runs on a fresh runner, so the certificate file must also exist there before engine execution. Use detection pre-steps to write it:
+
+```yaml wrap
+safe-outputs:
+  create-issue:
+  threat-detection:
+    ca-cert: /tmp/detection-ca.pem
+    steps:
+      - name: Write CA certificate
+        env:
+          CA_PEM: ${{ secrets.INTERNAL_CA_PEM }}
+        run: printf '%s\n' "$CA_PEM" > /tmp/detection-ca.pem
+```
+
+AWF versions before v0.28.10 silently omit `apiProxy.caCert` from the configuration instead of failing compilation. The custom certificate is therefore not used, and connections that require it may fail TLS verification.
+
+### Use an artifact mirror
+
+Set `artifact-base-url` when detector binaries must be downloaded through an
+approved HTTPS mirror:
+
+```yaml wrap
+safe-outputs:
+  create-issue:
+  threat-detection:
+    artifact-base-url: https://artifacts.example.com/gh-aw-threat-detection/releases/download
+```
+
+The configured URL is the base of this required layout:
+
+```text
+<artifact-base-url>/<version>/threat-detect-linux-amd64
+<artifact-base-url>/<version>/threat-detect-linux-arm64
+```
+
+For example, the current `v0.5.2` pin resolves the amd64 asset to
+`https://artifacts.example.com/gh-aw-threat-detection/releases/download/v0.5.2/threat-detect-linux-amd64`.
+
+The mirrored bytes must exactly match the SHA-256 digests embedded by the
+compiler. The mirror changes only the source of the bytes; it cannot override
+the release tag or expected digest. The mirror must be reachable from the
+threat-detection runner. `artifact-base-url` currently has no documented
+authentication mechanism, so use a runner-accessible HTTPS endpoint that does
+not require credentials.
+
+Update the mirror contents whenever a gh-aw release changes the pinned detector
+version or digests. Populate the new `<version>` directory with both Linux assets
+before compiling workflows that use the new gh-aw release.
+
+### Maintain detector release pins
+
+Review the promoted `gh-aw-threat-detection` release, then run the updater from
+the gh-aw repository root:
+
+```bash
+make update-threat-detect-pins THREAT_DETECT_VERSION=<version>
+```
+
+For example, `<version>` is `v0.5.2` for the current pin. The updater downloads
+the release `checksums.txt` and all four Linux and Darwin assets. It rejects
+malformed, missing, duplicate, or unexpected manifest entries, verifies every
+download against the manifest, and atomically updates
+`DefaultThreatDetectVersion` with the complete `DefaultThreatDetectSHA256`
+matrix and synchronizes the reviewed-literal compiler test. It does not update
+source files if any validation fails.
+
+The make target also runs `make fmt` and `make recompile` so the generated
+workflow locks carry the new Linux digests. Review
+`pkg/constants/version_constants.go`, `pkg/constants/version_constants_test.go`,
+and the generated lock-file diff in the same pull request.
 
 ## Detection Budget
 
@@ -116,7 +239,7 @@ When unset, the compiler emits a runtime resolution that falls back to the built
 ${{ vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS || '400' }}
 ```
 
-Set the org-wide default with the [`GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS`](/gh-aw/reference/compiler-enterprise-environment-controls/) GitHub Actions variable. A value of `-1` disables AWF budget steering for detection runs.
+Set the org-wide default with the [`GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS`](/gh-aw/reference/compiler-enterprise-environment-controls/) GitHub Actions variable. It accepts a plain whole number, or `-1` to disable the configured detection budget. Set `safe-outputs.threat-detection.max-ai-credits: -1` in frontmatter to disable it for a specific workflow. Other variable values, including `K`/`M` suffixes, fall back to the built-in default of `400`. AWF's operator-controlled hard cap still applies when the configured budget is disabled.
 
 ## AI-Based Detection (Default)
 
@@ -152,7 +275,7 @@ AI detection produces a structured JSON response:
 }
 ```
 
-If any threat is detected (`true`), the workflow fails and safe outputs are blocked.
+If any threat is detected (`true`), default warn mode annotates reviewable outputs, converts branch pushes to review pull requests, and aborts non-reviewable outputs; strict mode fails the detection job and blocks safe outputs. Detector failures follow the same mode-dependent policy; see [Error Handling](#error-handling).
 
 ## Custom Prompt Instructions
 
@@ -175,6 +298,12 @@ The custom prompt is appended to the default threat detection instructions, prov
 ## Custom Engine Configuration
 
 Override the main workflow engine for threat detection:
+
+When the resolved detection engine matches the main engine, detection inherits `engine.env`, `api-target`, and model aliases. Detection-specific environment values take precedence, including empty values.
+
+When the engines differ, detection does not inherit the main engine's environment, API target, or custom model aliases. This prevents provider URLs, API keys, and custom headers from reaching an unrelated engine. Configure any required provider settings under `safe-outputs.threat-detection.engine.env`; built-in model aliases remain available.
+
+The conclusion job emits a warning when detection runs but produces no security verdict, including engine failures and unparseable results. Intentionally skipped detection does not emit this warning. The warning does not change `continue-on-error` behavior.
 
 **String Format:**
 
@@ -209,6 +338,22 @@ safe-outputs:
           # Run your own security tools
           ./security-scan.sh
 ```
+
+### Workflows Using a Custom Engine
+
+Threat detection only runs on the built-in engines. When a workflow uses a custom engine, detection runs on `copilot` by default (so it needs Copilot credentials) and the compiler emits a warning. Set `safe-outputs.threat-detection.engine` to another built-in engine, or to `false` to skip AI analysis.
+
+Custom engine definitions can ship their own default with the `detection-engine` key (`copilot`, `claude`, or `codex`), which removes the warning for every workflow using that engine:
+
+```yaml wrap
+engine:
+  id: my-engine
+  detection-engine: claude
+  behaviors:
+    # ...
+```
+
+An explicit `safe-outputs.threat-detection.engine` in a workflow always wins over `detection-engine`.
 
 ## Custom Detection Steps
 
@@ -249,9 +394,23 @@ safe-outputs:
           path: /tmp/gh-aw/threat-detection/
 ```
 
-**Available Artifacts:** Custom steps have access to `/tmp/gh-aw/threat-detection/prompt.txt` (workflow prompt), `agent_output.json` (safe output items), and `aw.patch` (git patch file).
+**Available Artifacts:** Custom steps have access to `/tmp/gh-aw/threat-detection/prompt.txt` (workflow prompt), `agent_output.json` (safe output items), and `aw.patch` (git patch file). gh-aw also stages `/tmp/gh-aw/threat-detection/aw-prompts/prompt-template.txt`, `/tmp/gh-aw/threat-detection/aw-prompts/prompt-import-tree.json`, `/tmp/gh-aw/threat-detection/aw_info.json`, and any restored `/tmp/gh-aw/threat-detection/comment-memory/*.md` files so detectors can analyze prompt structure, activation context, and persisted comment memory.
 
-**Execution Order:** Download artifacts → Execute pre-steps (`steps:`) → Run AI analysis (if enabled) → Execute post-steps (`post-steps:`) → Upload detection log.
+**Execution Order:** Download artifacts → Stage detection inputs → Execute pre-steps (`steps:`) → Run AI analysis (if enabled) → Execute post-steps (`post-steps:`) → Upload detection log.
+
+### Prompt Provenance Artifacts
+
+`prompt-import-tree.json` retains `version: 1` and adds `trust` to its root and every import node, including nested and cached imports.
+
+| `trust` | Source and capabilities |
+|---|---|
+| `author` | Locally assembled system/user prompt or repository-local author file; imports and compiler-selected non-secret expression bindings are supported |
+| `untrusted` | External content in older artifacts; current prompt assembly does not fetch remote imports |
+| Missing | Older artifact with unknown trust; do not infer author capabilities |
+
+The runtime assigns labels from provenance, not imported text. Current trees contain only local author sources, including nested and cached imports; remote targets fail before fetching or tree insertion. A node's label does not establish the safety of its interpolated values. Cached nodes retain their own label and pre-expansion `rawContent`, even when `children` is empty because expansion already occurred. Labels are inspection metadata, not permission grants or proof against prompt injection. Content retrieved later by the agent inside the AWF sandbox is not a prompt-assembly import node.
+
+`prompt-template.txt` records the assembled template before interpolation-stage processing. The main author source is part of that assembled prompt rather than a separate runtime-import child. Keep the template and import tree alongside the final prompt when analyzing provenance.
 
 ## Example: LlamaGuard Integration
 
@@ -338,24 +497,36 @@ safe-outputs:
 
 ## Error Handling
 
-**When Threats Are Detected:**
+**Threat Findings and Detector Failures:**
 
-The threat detection job fails with a clear error message and safe output jobs are skipped:
+A detected threat has reason `threat_detected`. A detector execution failure (for example a provider outage or retired model) has reason `agent_failure`; an invalid result has reason `parse_error`. The latter two mean the security assessment is incomplete, not that a threat was found or that the output is clean. For all three outcomes, enforcement depends on `safe-outputs.threat-detection.continue-on-error`:
 
-```text
-❌ Threat detected: Potential SQL injection in code changes
-Reasons:
-- Unsanitized user input in database query
-- Missing parameterized query pattern
-```
-
-**When Detection Fails:**
-
-If the detection process itself fails (e.g., network issues, tool errors), the workflow stops and safe outputs are not applied. This fail-safe approach prevents potentially malicious content from being processed.
+- **Warn mode** (`continue-on-error: true`, the default): the run continues and detection concludes `warning`. Safe outputs get the warn-mode policy from the [safe outputs specification](/gh-aw/specs/safe-outputs-specification/) instead of being applied as if detection passed:
+  - Reviewable outputs (such as `create-issue`, `add-comment`, `create-pull-request`) carry a `[!CAUTION]` block, `agentic threat detected` label string, and `<!-- gh-aw-threat-detected -->` marker for an actual threat; detector failures use a `[!WARNING]` block, `Threat detection engine error` label string, and `<!-- gh-aw-threat-engine-error -->` marker.
+  - `push-to-pull-request-branch` falls back to a review pull request with the same warning.
+  - Non-reviewable outputs (such as `merge-pull-request`, `close-issue`, `assign-to-agent`) are not applied and are reported as failures in the step summary.
+- **Strict mode** (`continue-on-error: false`): the detection job fails and safe outputs are not applied.
 
 **When Detection Returns a Warning:**
 
-A warning is a lower-severity signal than a hard threat: the safe output is allowed to proceed, but human review is required before merge. When `create-pull-request` is the safe output, the handler submits a `REQUEST_CHANGES` pull request review whose body includes the detection reason and a link to the workflow run logs. If a `request_review` protected-files gate also fires in the same run, both signals are composed into a single review body separated by a horizontal rule.
+A warning conclusion describes enforcement mode, not the severity or absence of a threat. Reviewable outputs can proceed, but require human review before follow-up automation. When `create-pull-request` is the safe output, the handler submits a `REQUEST_CHANGES` pull request review whose body includes the detection reason and a link to the workflow run logs. If a `request_review` protected-files gate also fires in the same run, both signals are composed into a single review body separated by a horizontal rule. Configure repository merge protections to enforce the intended review requirement; a warning marker or label alone is not a platform approval gate.
+
+**Opting Out of Tracking Issues:**
+
+By default, a warning or failure conclusion also creates or updates a `[aw] Detection Runs` tracking issue in the repository and posts a comment describing the run. This is useful for auditing automation health, but not every repository wants detector diagnostics (such as `parse_error` reports) surfaced alongside user-facing issues.
+
+Comments categorize the structured reason as `threat_finding` (`threat_detected`), `detector_execution_failure` (`agent_failure`), or `detector_result_invalid` (`parse_error`). Missing or unrecognized reasons are `detection_outcome_unknown`; unrecognized reason text is omitted. Execution failures and invalid results leave the security assessment incomplete, rather than proving a threat or a clean result. The category is independent of the warning/failure conclusion and does not change enforcement. Comments omit agent text and detection payloads; existing comments are not rewritten.
+
+Set `report-as-issue: false` to keep threat detection and its enforcement fully active while skipping the tracking issue entirely:
+
+```yaml wrap
+safe-outputs:
+  create-issue:
+  threat-detection:
+    report-as-issue: false
+```
+
+Detection still runs, `continue-on-error` behavior is unchanged, and results remain available in GitHub Actions diagnostics and logs.
 
 ## Supply Chain Protection (Protected Files)
 
@@ -421,10 +592,10 @@ The protection list is composed of four sources:
 |-------|----------|
 | **AI detection always fails** | Review custom prompt for overly strict instructions, check if legitimate patterns trigger detection, adjust prompt context, or temporarily disable to test |
 | **Custom steps not running** | Verify YAML indentation, ensure steps array is properly formatted, review compilation output, check if AI detection failed first |
-| **Large patches cause timeouts** | Increase `timeout-minutes`, configure `max-patch-size`, truncate content before analysis, or split changes into smaller PRs |
+| **Large patches cause timeouts** | Increase `jobs.detection.timeout-minutes` (10 minutes by default, or `vars.GH_AW_DEFAULT_DETECTION_JOB_TIMEOUT_MINUTES`), configure `max-patch-size`, truncate content before analysis, or split changes into smaller PRs |
 | **False positives** | Refine prompt with specific exclusions, adjust tool thresholds, add workflow context explaining patterns, review detection logs |
 
-## Related Documentation
+## Learn More
 
 - [Safe Outputs Reference](/gh-aw/reference/safe-outputs/) - Complete safe outputs configuration
 - [Security Guide](/gh-aw/introduction/architecture/) - Overall security best practices

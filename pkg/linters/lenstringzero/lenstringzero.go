@@ -8,44 +8,33 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"maps"
 
-	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
-
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"golang.org/x/tools/go/analysis"
 )
 
-var Analyzer = &analysis.Analyzer{
-	Name: "lenstringzero",
-	Doc: "reports len(s) == 0, len(s) != 0, and equivalent relational comparisons " +
-		"(len(s) > 0, len(s) >= 1, len(s) < 1, len(s) <= 0) on string values " +
-		"that should use == \"\" or != \"\" instead",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/lenstringzero",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("lenstringzero", "reports len(s) == 0, len(s) != 0, and equivalent relational comparisons "+
+	"(len(s) > 0, len(s) >= 1, len(s) < 1, len(s) <= 0) on string values "+
+	"that should use == \"\" or != \"\" instead", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 	lenStringAliases := collectLenStringAliases(pass)
 	nodeFilter := []ast.Node{(*ast.BinaryExpr)(nil)}
-	insp.Preorder(nodeFilter, func(n ast.Node) {
-		analyzeLenStringExpr(pass, n, generatedFiles, noLintIndex, lenStringAliases)
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
+		expr, ok := n.(*ast.BinaryExpr)
+		if !ok {
+			return
+		}
+		analyzeLenStringExpr(pass, expr, generatedFiles, noLintIndex, lenStringAliases[expr])
 	})
-	return nil, nil
 }
 
 // analyzeLenStringExpr checks whether a binary expression is a len(s) comparison
@@ -67,7 +56,7 @@ func analyzeLenStringExpr(pass *analysis.Pass, n ast.Node, generatedFiles filech
 	if nolint.HasDirectiveForLinter(pos, noLintIndex, "lenstringzero") {
 		return
 	}
-	lenArg, isDirect, normalOp, lit, matched := matchLenLiteralExpr(pass, expr, lenStringAliases)
+	lenArg, lenNode, isDirect, normalOp, lit, matched := matchLenLiteralExpr(pass, expr, lenStringAliases)
 	if !matched {
 		return
 	}
@@ -83,6 +72,8 @@ func analyzeLenStringExpr(pass *analysis.Pass, n ast.Node, generatedFiles filech
 	if !ok || basic.Kind() != types.String {
 		return
 	}
+	argText := exprTextOr(pass, lenArg, "s")
+	lenText := exprTextOr(pass, lenNode, "len(s)")
 	var fixes []analysis.SuggestedFix
 	if isDirect {
 		fixes = buildLenStringFix(pass, expr, lenArg, fixOp)
@@ -90,63 +81,64 @@ func analyzeLenStringExpr(pass *analysis.Pass, n ast.Node, generatedFiles filech
 	pass.Report(analysis.Diagnostic{
 		Pos:            expr.Pos(),
 		End:            expr.End(),
-		Message:        fmt.Sprintf(`use s %s "" to check for %s string instead of len(s) %s %d`, fixOp, cmpVerb, normalOp, lit),
+		Message:        fmt.Sprintf(`use %s %s "" to check for %s string instead of %s %s %d`, argText, fixOp, cmpVerb, lenText, normalOp, lit),
 		SuggestedFixes: fixes,
 	})
 }
 
 // matchLenLiteralExpr tries to match len(s)/alias OP literal or literal OP len(s)/alias.
-// Returns (lenArg, isDirect, normalOp, lit, matched) where:
+// Returns (lenArg, lenNode, isDirect, normalOp, lit, matched) where:
 //   - lenArg is the string expression passed to len()
+//   - lenNode is the expression being compared (the len() call or the alias identifier)
 //   - isDirect indicates a direct len() call (true) vs a stored alias (false)
 //   - normalOp is the operator normalized so that len is on the left side
 //   - lit is the integer literal value (0 or 1)
 //   - matched indicates whether a valid pattern was found
-func matchLenLiteralExpr(pass *analysis.Pass, expr *ast.BinaryExpr, aliases map[types.Object]ast.Expr) (lenArg ast.Expr, isDirect bool, normalOp token.Token, lit int, ok bool) {
+func matchLenLiteralExpr(pass *analysis.Pass, expr *ast.BinaryExpr, aliases map[types.Object]ast.Expr) (lenArg ast.Expr, lenNode ast.Expr, isDirect bool, normalOp token.Token, lit int, ok bool) {
 	op := expr.Op
 
 	// Normal order: len/alias on the left, literal on the right.
-	if isLenCall(expr.X) {
+	if isLenCall(pass, expr.X) {
 		if isIntZero(expr.Y) {
-			return lenCallArg(expr.X), true, op, 0, true
+			return lenCallArg(expr.X), expr.X, true, op, 0, true
 		}
 		if isIntOne(expr.Y) {
-			return lenCallArg(expr.X), true, op, 1, true
+			return lenCallArg(expr.X), expr.X, true, op, 1, true
 		}
 	}
 	if isIntZero(expr.Y) {
 		if arg, ok2 := lenAliasArg(pass, expr.X, aliases); ok2 {
-			return arg, false, op, 0, true
+			return arg, expr.X, false, op, 0, true
 		}
 	}
 	if isIntOne(expr.Y) {
 		if arg, ok2 := lenAliasArg(pass, expr.X, aliases); ok2 {
-			return arg, false, op, 1, true
+			return arg, expr.X, false, op, 1, true
 		}
 	}
 
 	// Yoda order: literal on the left, len/alias on the right.
 	// Flip the operator so the normalized form has len on the left.
-	if isLenCall(expr.Y) {
+	if isLenCall(pass, expr.Y) {
 		if isIntZero(expr.X) {
-			return lenCallArg(expr.Y), true, astutil.FlipComparisonOp(op), 0, true
+			return lenCallArg(expr.Y), expr.Y, true, astutil.FlipComparisonOp(op), 0, true
 		}
 		if isIntOne(expr.X) {
-			return lenCallArg(expr.Y), true, astutil.FlipComparisonOp(op), 1, true
+			return lenCallArg(expr.Y), expr.Y, true, astutil.FlipComparisonOp(op), 1, true
 		}
 	}
 	if isIntZero(expr.X) {
 		if arg, ok2 := lenAliasArg(pass, expr.Y, aliases); ok2 {
-			return arg, false, astutil.FlipComparisonOp(op), 0, true
+			return arg, expr.Y, false, astutil.FlipComparisonOp(op), 0, true
 		}
 	}
 	if isIntOne(expr.X) {
 		if arg, ok2 := lenAliasArg(pass, expr.Y, aliases); ok2 {
-			return arg, false, astutil.FlipComparisonOp(op), 1, true
+			return arg, expr.Y, false, astutil.FlipComparisonOp(op), 1, true
 		}
 	}
 
-	return nil, false, 0, 0, false
+	return nil, nil, false, 0, 0, false
 }
 
 // resolveFixOp returns the fix operator and comparison verb for a normalized
@@ -196,6 +188,9 @@ func resolveFixOp(normalOp token.Token, lit int) (fixOp token.Token, cmpVerb str
 // buildLenStringFix returns a SuggestedFix that rewrites a direct len(s) comparison
 // to a direct string comparison using fixOp (== or !=).
 func buildLenStringFix(pass *analysis.Pass, expr *ast.BinaryExpr, lenArg ast.Expr, fixOp token.Token) []analysis.SuggestedFix {
+	if astutil.HasOverlappingComment(pass.Files, expr.Pos(), expr.End()) {
+		return nil
+	}
 	text := astutil.NodeText(pass.Fset, lenArg)
 	if text == "" {
 		return nil
@@ -211,13 +206,28 @@ func buildLenStringFix(pass *analysis.Pass, expr *ast.BinaryExpr, lenArg ast.Exp
 	}}
 }
 
-func isLenCall(expr ast.Expr) bool {
+// exprTextOr renders node's source text, falling back to fallback when the
+// node cannot be printed.
+func exprTextOr(pass *analysis.Pass, node ast.Expr, fallback string) string {
+	if node == nil {
+		return fallback
+	}
+	if text := astutil.NodeText(pass.Fset, node); text != "" {
+		return text
+	}
+	return fallback
+}
+
+// isLenCall reports whether expr is a call to the builtin len function. A
+// user-defined or shadowed "len" is ignored so its result is never rewritten
+// as a string comparison.
+func isLenCall(pass *analysis.Pass, expr ast.Expr) bool {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok || len(call.Args) != 1 {
 		return false
 	}
 	ident, ok := call.Fun.(*ast.Ident)
-	return ok && ident.Name == "len"
+	return ok && ident.Name == "len" && pass.TypesInfo.ObjectOf(ident) == types.Universe.Lookup("len")
 }
 
 func lenCallArg(expr ast.Expr) ast.Expr {
@@ -238,11 +248,16 @@ func isIntOne(expr ast.Expr) bool {
 	return ok && lit.Kind == token.INT && lit.Value == "1"
 }
 
-func collectLenStringAliases(pass *analysis.Pass) map[types.Object]ast.Expr {
+func collectLenStringAliases(pass *analysis.Pass) map[*ast.BinaryExpr]map[types.Object]ast.Expr {
 	aliases := make(map[types.Object]ast.Expr)
+	atComparison := make(map[*ast.BinaryExpr]map[types.Object]ast.Expr)
 	for _, file := range pass.Files {
 		ast.Inspect(file, func(node ast.Node) bool {
 			switch n := node.(type) {
+			case *ast.BinaryExpr:
+				if len(aliases) != 0 && (n.Op == token.EQL || n.Op == token.NEQ || n.Op == token.GTR || n.Op == token.GEQ || n.Op == token.LSS || n.Op == token.LEQ) {
+					atComparison[n] = maps.Clone(aliases)
+				}
 			case *ast.AssignStmt:
 				collectLenStringAliasesFromAssignStmt(pass, n, aliases)
 			case *ast.ValueSpec:
@@ -260,7 +275,7 @@ func collectLenStringAliases(pass *analysis.Pass) map[types.Object]ast.Expr {
 			return true
 		})
 	}
-	return aliases
+	return atComparison
 }
 
 func collectLenStringAliasesFromAssignStmt(pass *analysis.Pass, stmt *ast.AssignStmt, aliases map[types.Object]ast.Expr) {
@@ -335,7 +350,7 @@ func lenAliasArg(pass *analysis.Pass, expr ast.Expr, aliases map[types.Object]as
 }
 
 func lenStringArg(pass *analysis.Pass, expr ast.Expr) (ast.Expr, bool) {
-	if !isLenCall(expr) {
+	if !isLenCall(pass, expr) {
 		return nil, false
 	}
 	arg := lenCallArg(expr)

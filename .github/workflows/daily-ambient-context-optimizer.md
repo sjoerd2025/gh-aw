@@ -22,15 +22,13 @@ network:
   allowed: [defaults, github]
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
   agentic-workflows:
   bash: true
-skills:
-  - githubnext/rig/skills/rig/SKILL.md@0ba73e37355f92adca11f9d596eb709e77f25332
 safe-outputs:
   mentions: false
   allowed-github-references: []
@@ -43,13 +41,13 @@ safe-outputs:
 timeout-minutes: 45
 steps:
   - name: Setup Python
-    uses: actions/setup-python@v7.0.0
+    uses: actions/setup-python@v7.1.0
     with:
       python-version: "3.12"
   - name: Prepare analysis workspace
     run: |
       mkdir -p /tmp/gh-aw/ambient-context
-  - name: Closed PR deduplication guard
+  - name: Exclude files from recently closed PRs
     uses: actions/github-script@v9.0.0
     with:
       github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -110,7 +108,7 @@ steps:
 
         core.info(`Deduplication guard: ${closedOptimizerPrs.length} closed optimizer PRs, ${blockedFiles.length} blocked files`);
         for (const bf of blockedFiles) core.info(`  BLOCKED: ${bf}`);
-  - name: PR close-rate metric
+  - name: Calculate PR close rate
     uses: actions/github-script@v9.0.0
     with:
       github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -161,6 +159,7 @@ steps:
         core.info(`PR close-rate (7d): ${rateStr} (${closed7d.length} closed, ${merged7d.length} merged)${autoPause ? ' — AUTO-PAUSE ACTIVE' : ''}`);
 
 imports:
+  - shared/mcp-pagination.md
   - shared/otlp.md
 features:
   gh-aw-detection: true
@@ -169,6 +168,8 @@ evals:
     question: Did the agent sample recent agentic workflow runs and inspect their ambient context?
   - id: recommendations_produced
     question: Were recommendations produced for prompt, skill, and agent changes to reduce ambient context size?
+  - id: instruction_prefix_audited
+    question: When instruction or skill sources were available, did the analysis measure their first 8000 UTF-8 bytes and identify whether essential constraints, routing, verification and stop rules fit within 7500 bytes? Return UNKNOWN when no such sources were accessible.
 ---
 
 # Daily Ambient Context Optimizer
@@ -193,7 +194,7 @@ Use the `agentic-workflows` MCP server instead of shelling out to `gh aw`:
 
 - call the `logs` MCP tool with `start_date: "-1d"` and `count: 60`
 - use the JSON artifacts under `/tmp/gh-aw/aw-mcp/logs/` as your source of run metadata
-- keep GitHub reads on `tools.github.mode: gh-proxy`
+- keep GitHub reads on the configured GitHub MCP tools
 - use `tools.cli-proxy: true` only for other proxied `gh` CLI commands when they are truly needed
 - do not run `gh aw logs` or `gh aw audit` through the CLI proxy because the `agentic-workflows` MCP server already provides dedicated `logs` and `audit` tools for those operations
 
@@ -214,11 +215,11 @@ Eligibility rules:
   - fallback: the first `user.message` event in `sandbox/agent/logs/copilot-session-state/<session-id>/events.jsonl`
   - use `prompt.txt` only as a compilation-debug cross-check, never as the ambient-context source of truth
 
-Prefer higher-cost runs first by using `aic`, then `effective_tokens`, `token_usage`, `turns`, or first-request size when available.
+Prefer higher-cost runs first by using `aic`, then `token_usage`, `turns`, or first-request size when available.
 
 ### Step 3 — Enrich a subset with audits
 
-Run the `audit` MCP tool for the **2 most expensive sampled runs** so you have richer cost context and references.
+Run the `audit` MCP tool for the **2 most expensive sampled runs** so you have richer cost context and references. Record each enriched run's `working_set` block (`measurement_state`, `rebuild_factor`, `peak_input_tokens`, `cumulative_input_tokens`) — the Working-Set Rebuild Factor (WSRF) is a direct signal of how much ambient context is being re-sent across turns and complements the first-request char/token metrics gathered in Step 1.
 
 ### Step 4 — Closed PR Deduplication Guard
 
@@ -265,6 +266,7 @@ Include at least:
 - `request_input_tokens` when a matching API proxy token-usage entry is available
 - `prompt_chars` when `prompt.txt` exists
 - `request_prompt_char_delta` (`request_chars - prompt_chars` when both exist)
+- `working_set_rebuild_factor` (WSRF, from the `audit` MCP tool's `working_set.rebuild_factor`) when the run was enriched with an audit in Step 3; omit for runs that were not audited
 
 ## Deterministic Analysis
 
@@ -295,6 +297,11 @@ The script must compute deterministic metrics for each sampled first request:
 - longest 5 sections by heading
 - top repeated non-trivial lines or paragraphs
 - count of lines mentioning tools, skills, agents, safe outputs, and workflow instructions
+- For accessible instruction/skill sources only (not the whole first request):
+  total UTF-8 bytes, bytes visible under an 8,000-byte query, omitted bytes and
+  execution-contract end byte. Reuse
+  `python3 scripts/check-instruction-prefixes.py --json <source-paths>` for
+  structure/byte counts. Record unavailable sources/checks explicitly.
 
 Aggregate metrics across the sample set:
 
@@ -317,36 +324,37 @@ Assess whether the request size is likely driven by:
 - too many inline agents or agent definitions that are not justified
 - duplicated guardrails, examples, or formatting rules
 - context that should be moved to deterministic `steps:` or smaller sub-agents
+- large output templates (issue body, discussion body, report formats) embedded inline in the prompt body rather than in `## skill:` blocks
+- Required instruction/skill rules lost after byte 8,000. Review each available
+  exact prefix: objective, constraints, task routes, verification and stop
+  conditions should be actionable by byte 7,500 including metadata. Recommend
+  short grammatical imperatives, early conditional links and later examples;
+  preserve safety, negation, exceptions and exact identifiers. A structural
+  checker cannot establish semantic completeness or response-quality parity.
+
+Keep source-prefix availability separate from actual first-request measurements;
+do not truncate captured DLLM requests or claim the CLI limit applies to them.
 
 Review `prompt.txt` only as a compiler cross-check artifact:
 
 - compare its size to the authoritative API proxy request text when both are present
 - if `prompt.txt` contains inline agents or inline linters that do **not** appear in the API proxy request text, classify that as a likely compilation bug instead of ambient-context evidence against the workflow author
 
-Also review proxy/CLI feature readiness for each sampled workflow:
+Also review tool/CLI feature readiness for each sampled workflow:
 
-- GitHub gh-proxy enabled (`tools.github.mode: gh-proxy`)
+- GitHub MCP tools configured with the required toolsets
 - CLI proxy enabled (`tools.cli-proxy: true`)
 
-When one or more are missing, include a recommendation to enable them and rewrite raw `gh aw` shell instructions into explicit `agentic-workflows` MCP-tool usage.
+When one or more are missing, include a recommendation to configure them and rewrite raw `gh aw` shell instructions into explicit `agentic-workflows` MCP-tool usage.
 
-## Rig Custom Harness Usage
+## Deep-Dive Analysis
 
-After the deterministic Python script finishes, use a Rig custom harness for **at most 2 sampled runs** (only when at least 2 sampled runs exist):
+After the deterministic Python script finishes, perform a deeper review yourself for **at most 2 sampled runs** (only when at least 2 sampled runs exist):
 
-1. Discover the installed launcher path:
-   - `find "${RUNNER_TEMP}/gh-aw" -path "*/skills/rig/rig.ts" | head -1`
-2. For each selected run, build a compact JSON input from `run-<id>.json` plus deterministic analysis metrics.
-3. Run the harness with `node <rig-launcher>`, feeding an inline Rig program that:
-   - configures `copilotEngine()`
-   - takes only compact JSON input (never raw full prompt text)
-   - returns JSON with at most 3 opportunities using `category`, `finding`, `evidence`, and `impact`
-4. Aggregate and deduplicate harness outputs, then do final prioritization yourself.
-
-Harness guardrails:
-- no raw request bodies in harness input
-- use a small model unless deterministic evidence shows quality loss
-- one harness run per sampled run (no retries without a concrete parse/runtime error)
+1. For each selected run, review `run-<id>.json` alongside the deterministic analysis metrics already computed, including `working_set_rebuild_factor` (WSRF) when present.
+2. Identify at most 3 opportunities per run, each described with `category`, `finding`, `evidence`, and `impact`.
+3. Base findings only on the compact structured metrics already gathered — never re-read raw full prompt text.
+4. Aggregate and deduplicate opportunities across the sampled runs, then do final prioritization.
 
 ## Execution Budget Guardrails
 
@@ -377,7 +385,9 @@ Prioritize recommendations that:
 2. reduce broad skill loading or oversized skill fusion
 3. simplify or remove low-value inline agents
 4. move deterministic data gathering out of the main prompt
-5. enable `gh-proxy` and `cli-proxy` when missing, then rewrite raw CLI-oriented problem wording to explicit `agentic-workflows` MCP-tool calls
+5. configure GitHub MCP tools and `cli-proxy` when missing, then rewrite raw CLI-oriented problem wording to explicit `agentic-workflows` MCP-tool calls
+6. move large inline output templates (issue body, discussion body, report formats) into `## skill:` blocks so they are loaded on demand rather than unconditionally inflating the first request
+7. when an audited run shows a high WSRF (context repeatedly rebuilt near the peak invocation size rather than growing incrementally), prioritize recommendations that stop resending large static context on every turn
 
 Do not recommend changes that would obviously weaken safety or remove necessary task context.
 
@@ -435,6 +445,7 @@ Any agent implementing workflow-file recommendations **must** complete every ite
 | Merged optimizer PRs (7d) | ... |
 | Closed optimizer PRs (7d) | ... |
 | Optimizer PR close-rate (7d) | ... |
+| WSRF (audited runs) | ... |
 
 <details>
 <summary><b>Per-Run First-Request Metrics</b></summary>
@@ -494,9 +505,9 @@ Do not use `noop` merely because the sample is small or imperfect. Create exactl
 
 If `create_issue` returns a body-size validation error, shorten the details and retry with a compact body that preserves Executive Summary, Highest-Leverage Changes, Key Metrics, and References.
 
-## Rig Harness Output Contract
+## Deep-Dive Analysis Output Shape
 
-Each Rig harness invocation must return JSON only:
+Structure each per-run finding as:
 
 ```json
 {

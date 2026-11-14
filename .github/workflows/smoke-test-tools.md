@@ -2,7 +2,8 @@
 private: true
 emoji: "🧪"
 description: Smoke test to validate common development tools are available in the agent container
-on: 
+on:
+  schedule: every 2 days
   slash_command:
     name: smoke-test-tools
     strategy: centralized
@@ -13,19 +14,21 @@ on:
     names: ["smoke"]
   status-comment: true
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
 name: Agent Container Smoke Test
-engine: copilot
+engine: pi
+model: copilot/mai-code-1.1-flash
 strict: true
 runtimes:
   node:
-    version: "20"
+    version: "24"
   python:
     version: "3.11"
   go:
-    version: "1.24"
+    version: "1.27.4"
   java:
     version: "21"
   dotnet:
@@ -38,6 +41,13 @@ network:
 tools:
   bash:
     - "*"
+evals:
+  - id: runtime_check_coverage
+    question: Does the output report an observed availability result for each of bash, sh, git, jq, yq, curl, gh, node, python3, go, java, and dotnet?
+  - id: availability_accounting
+    question: Does the reported X/12 count agree with the individual tool-check results?
+  - id: missing_tool_failure
+    question: When any required tool check fails, does the report mark overall status FAIL rather than PASS? Return UNKNOWN when all required tools are available.
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     add-comment:
@@ -52,8 +62,13 @@ timeout-minutes: 5
 imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
+  - shared/playwright-title-test.md
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Agent Container Tools

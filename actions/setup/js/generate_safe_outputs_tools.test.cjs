@@ -1,10 +1,26 @@
 // @ts-check
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import { execSync } from "child_process";
+import { normalizeSafeOutputToolArguments } from "./safe_outputs_mcp_arguments.cjs";
+import { normalizeClaimScope } from "./work_queue_claim_scope.cjs";
+import { loadTools, attachHandlers, registerPredefinedTools, registerDynamicTools } from "./safe_outputs_tools_loader.cjs";
+import { createServer, registerTool } from "./mcp_server_core.cjs";
+import { validateValueAgainstSchema } from "./schema-validation.cjs";
+import generateSafeOutputsTools from "./generate_safe_outputs_tools.cjs";
 
 const scriptPath = path.join(__dirname, "generate_safe_outputs_tools.cjs");
+const { main: generateTools } = generateSafeOutputsTools;
+const outputIdPattern = "^so_[A-Za-z0-9_-]{12}$";
+const dependencySchema = {
+  description: expect.any(String),
+  "x-synonyms": ["depends_on"],
+  oneOf: [
+    { type: "string", pattern: outputIdPattern },
+    { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", pattern: outputIdPattern } },
+  ],
+};
 
 describe("generate_safe_outputs_tools", () => {
   /** @type {string} */
@@ -43,7 +59,7 @@ describe("generate_safe_outputs_tools", () => {
       },
     },
     {
-      name: "missing_tool",
+      name: "report_missing_tool",
       description: "Reports a missing tool.",
       inputSchema: { type: "object", properties: {} },
     },
@@ -51,7 +67,7 @@ describe("generate_safe_outputs_tools", () => {
 
   beforeEach(() => {
     const testId = Math.random().toString(36).substring(7);
-    testDir = `/tmp/test-generate-tools-${testId}`;
+    testDir = path.join(__dirname, `.test-generate-tools-${testId}`);
     fs.mkdirSync(testDir, { recursive: true });
 
     toolsSourcePath = path.join(testDir, "safe_outputs_tools.json");
@@ -94,8 +110,297 @@ describe("generate_safe_outputs_tools", () => {
     const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
     expect(result).toHaveLength(2);
     expect(result.map((/** @type {{name: string}} */ t) => t.name)).toEqual(expect.arrayContaining(["create_issue", "add_comment"]));
-    // missing_tool should NOT be included since it's not in config
-    expect(result.map((/** @type {{name: string}} */ t) => t.name)).not.toContain("missing_tool");
+    // report_missing_tool should NOT be included since it's not in config
+    expect(result.map((/** @type {{name: string}} */ t) => t.name)).not.toContain("report_missing_tool");
+  });
+
+  it.skipIf(process.platform !== "linux").each([false, true])("keeps generated files owner-only, including existing files: %s", existing => {
+    const validationPath = path.join(testDir, "validation.json");
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: {} }), { mode: 0o600 });
+    for (const file of [toolsMetaPath, validationPath, outputPath]) {
+      if (existing) {
+        fs.writeFileSync(file, "old");
+        fs.chmodSync(file, 0o666);
+      }
+    }
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: "{}",
+      GH_AW_VALIDATION_JSON: "{}",
+    });
+
+    for (const file of [configPath, toolsMetaPath, validationPath, outputPath]) {
+      const stat = fs.statSync(file);
+      expect(stat.mode & 0o777).toBe(0o600);
+      expect(stat.uid).toBe(process.geteuid());
+      expect(stat.gid).toBe(process.getegid());
+    }
+    expect(JSON.parse(fs.readFileSync(outputPath, "utf8"))[0].name).toBe("create_issue");
+  });
+
+  it.skipIf(process.platform !== "linux")("rejects a symlinked tools output without modifying its target", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: {} }), { mode: 0o600 });
+    const target = path.join(testDir, "private.json");
+    fs.writeFileSync(target, "unchanged", { mode: 0o600 });
+    fs.symlinkSync(target, outputPath);
+
+    expect(() => runScript()).toThrow();
+    expect(fs.readFileSync(target, "utf8")).toBe("unchanged");
+  });
+
+  it.each([
+    ["missing_tool", "missing_data"],
+    ["missing-tool", "missing-data"],
+    ["report_missing_tool", "report_missing_data"],
+    ["report-missing-tool", "report-missing-data"],
+  ])("generates and registers canonical diagnostics from %s and %s configuration", (toolKey, dataKey) => {
+    fs.copyFileSync(path.join(__dirname, "safe_outputs_tools.json"), toolsSourcePath);
+    const config = { [toolKey]: {}, [dataKey]: {} };
+    fs.writeFileSync(configPath, JSON.stringify(config));
+    runScript();
+
+    const originalToolsPath = process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH;
+    process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH = outputPath;
+    try {
+      const server = createServer({ name: "safeoutputs", version: "test" });
+      const normalize = name => name.replace(/-/g, "_").toLowerCase();
+      const tools = attachHandlers(loadTools(server), { defaultHandler: name => args => ({ name, args }) });
+      expect(tools.map(tool => tool.name)).toEqual(["report_missing_tool", "report_missing_data"]);
+      registerPredefinedTools(server, tools, config, registerTool, normalize);
+      registerDynamicTools(server, tools, config, path.join(testDir, "output.jsonl"), registerTool, normalize);
+      expect(Object.keys(server.tools)).toEqual(["report_missing_tool", "report_missing_data"]);
+      for (const name of Object.keys(server.tools)) {
+        expect(server.tools[name].handler({})).toEqual({ name, args: {} });
+      }
+    } finally {
+      if (originalToolsPath === undefined) delete process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH;
+      else process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH = originalToolsPath;
+    }
+  });
+
+  it("normalizes configuration before tool-specific lookups", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ "ADD-COMMENT": { discussions: true } }));
+    runScript();
+
+    const [tool] = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(tool.name).toBe("add_comment");
+    expect(tool.description).toContain("Discussion comments are enabled");
+    expect(tool.description).toContain("Supports reply_to_id for discussion threading.");
+  });
+
+  it("preserves invalid explicit Claim selectors through argument normalization", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    fs.writeFileSync(
+      toolsMetaPath,
+      JSON.stringify({
+        work_queue_scoped: true,
+        dynamic_tools: [{ name: "custom_job", inputSchema: { type: "object", properties: { count: { type: "integer" } } } }],
+      })
+    );
+    runScript();
+    const tools = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const assignment = count => ({
+      version: 3,
+      dispatch_id: "dispatch",
+      request_id: "request",
+      commit_id: "commit",
+      policy_epoch: "policy",
+      pool: "pool",
+      worker_profile: "worker",
+      claims: Array.from({ length: count }, (_, index) => ({ handle: `h${index + 1}`, claim_id: `c${index + 1}`, work_id: `w${index + 1}`, work: {}, result_refs: [] })),
+    });
+    expect(tools.map(tool => tool.name)).toEqual(["create_issue", "custom_job"]);
+    for (const tool of tools) {
+      expect(tool.inputSchema.properties["depends-on"]).toEqual(dependencySchema);
+      expect(tool.inputSchema.required || []).not.toContain("depends-on");
+      expect(tool.inputSchema.properties).not.toHaveProperty("output_id");
+      expect(normalizeSafeOutputToolArguments(tool.name, { depends_on: "so_AAAAAAAAAAAA" }, undefined, tool.inputSchema)).toEqual({
+        "depends-on": "so_AAAAAAAAAAAA",
+      });
+      for (const claim_handle of ["", " ", "\t", null]) {
+        const normalized = normalizeSafeOutputToolArguments(tool.name, { claim_handle }, undefined, tool.inputSchema);
+        expect(normalized).toHaveProperty("claim_handle", claim_handle);
+        for (const count of [1, 2]) {
+          expect(() => normalizeClaimScope(normalized, assignment(count))).toThrow();
+        }
+      }
+      const selected = normalizeSafeOutputToolArguments(tool.name, { claim_handle: "h1" }, undefined, tool.inputSchema);
+      for (const count of [1, 2]) {
+        expect(normalizeClaimScope(selected, assignment(count)).claim_handle).toBe("h1");
+      }
+      const omitted = normalizeSafeOutputToolArguments(tool.name, {}, undefined, tool.inputSchema);
+      expect(normalizeClaimScope(omitted, assignment(1)).claim_handle).toBe("h1");
+      expect(() => normalizeClaimScope(omitted, assignment(2))).toThrow(/original multi-Claim/);
+    }
+    const custom = tools.find(tool => tool.name === "custom_job");
+    expect(normalizeSafeOutputToolArguments(custom.name, { count: "", claim_handle: "h1" }, undefined, custom.inputSchema)).toEqual({ claim_handle: "h1" });
+  });
+
+  it("does not inject Claim selectors into ordinary workflow tools", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    fs.writeFileSync(toolsMetaPath, JSON.stringify({ work_queue_scoped: false }));
+    runScript();
+    const [tool] = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(tool.inputSchema).toEqual({
+      ...sampleSourceTools[0].inputSchema,
+      properties: { ...sampleSourceTools[0].inputSchema.properties, "depends-on": dependencySchema },
+    });
+    expect(tool.inputSchema.properties).not.toHaveProperty("claim_handle");
+    expect(tool.inputSchema.properties).not.toHaveProperty("claim_id");
+    expect(tool.inputSchema.required).not.toContain("depends-on");
+  });
+
+  it("generates an Anthropic-compatible update_issue schema with update-field guidance", () => {
+    fs.copyFileSync(path.join(__dirname, "safe_outputs_tools.json"), toolsSourcePath);
+    fs.writeFileSync(configPath, JSON.stringify({ update_issue: { target: "*" } }));
+
+    runScript();
+
+    const [tool] = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(tool.name).toBe("update_issue");
+    expect(tool.inputSchema.type).toBe("object");
+    expect(tool.inputSchema.additionalProperties).toBe(false);
+    for (const keyword of ["anyOf", "oneOf", "allOf"]) {
+      expect(tool.inputSchema).not.toHaveProperty(keyword);
+    }
+    expect(tool.description).toContain("REQUIRED: Provide at least one of: status, title, body, labels, assignees, milestone, or artifacts.");
+    expect(tool.inputSchema.properties.milestone.type).toEqual(["number", "string", "null"]);
+    expect(tool.inputSchema.properties.milestone.description).toContain("Use null to clear.");
+  });
+
+  it.each(["map", "notes"])("mounts dedicated %s ledger tools without exposing the low-level append tool", type => {
+    fs.writeFileSync(toolsSourcePath, JSON.stringify([...sampleSourceTools, { name: "ledger_append", inputSchema: { type: "object", properties: { ledger: { type: "string" } } } }]));
+    const builtin = {
+      name: type === "map" ? "ledger_map_put" : "ledger_note_add",
+      _ledger_type: type,
+      _ledger_operation: type === "map" ? "put" : "note",
+      inputSchema: { type: "object", properties: { key: { type: "string" } } },
+    };
+    fs.writeFileSync(configPath, JSON.stringify({ ledger_append: { ledgers: [{ name: "cache", type }] } }));
+    fs.writeFileSync(toolsMetaPath, JSON.stringify({ dynamic_tools: [builtin] }));
+    runScript();
+    expect(JSON.parse(fs.readFileSync(outputPath, "utf8")).map((/** @type {{name: string}} */ tool) => tool.name)).toEqual([builtin.name]);
+
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        ledger_append: {
+          ledgers: [
+            { name: "cache", type },
+            { name: "events", type: "log" },
+          ],
+        },
+      })
+    );
+    runScript();
+    const mixed = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(mixed.map((/** @type {{name: string}} */ tool) => tool.name)).toEqual(["ledger_append", builtin.name]);
+    expect(mixed[0].inputSchema.properties.ledger.enum).toEqual(["events"]);
+    expect(mixed[0].inputSchema.required).toContain("ledger");
+  });
+
+  it.each(["", undefined])("advertises the required custom record envelope for ledger type %s", type => {
+    fs.copyFileSync(path.join(__dirname, "safe_outputs_tools.json"), toolsSourcePath);
+    const schema = { type: "object", required: ["run_id"], properties: { run_id: { type: "string" } }, additionalProperties: false };
+    fs.writeFileSync(configPath, JSON.stringify({ ledger_append: { ledgers: [{ name: "reviews", type, schema }] } }));
+    runScript();
+    const [tool] = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(tool.inputSchema.required).toEqual(["record"]);
+    expect(tool.inputSchema.properties.ledger.enum).toEqual(["reviews"]);
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(["ledger", "temp_id", "record", "depends-on"]);
+    expect(tool.inputSchema.properties["depends-on"]).toEqual(dependencySchema);
+    expect(tool.inputSchema.properties.record).toMatchObject(schema);
+    expect(validateValueAgainstSchema({ ledger: "reviews", operation: "append", value: { run_id: "42" } }, tool.inputSchema)).toBeTruthy();
+    expect(validateValueAgainstSchema({ record: { run_id: 42 } }, tool.inputSchema)).toBeTruthy();
+    expect(validateValueAgainstSchema({ record: { run_id: "42" } }, tool.inputSchema)).toBeNull();
+  });
+
+  it.each(["map", "notes"])("advertises only the custom record envelope alongside a %s ledger", type => {
+    fs.copyFileSync(path.join(__dirname, "safe_outputs_tools.json"), toolsSourcePath);
+    const schema = { type: "object", required: ["run_id"], properties: { run_id: { type: "string" } }, additionalProperties: false };
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({
+        ledger_append: {
+          ledgers: [
+            { name: "reviews", schema },
+            { name: "cache", type },
+          ],
+        },
+      })
+    );
+    runScript();
+    const [tool] = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(tool.inputSchema.required).toEqual(["ledger", "record"]);
+    expect(tool.inputSchema.properties.ledger.enum).toEqual(["reviews"]);
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(["ledger", "temp_id", "record", "depends-on"]);
+    expect(tool.inputSchema.properties["depends-on"]).toEqual(dependencySchema);
+    expect(tool.inputSchema.properties.record).toMatchObject(schema);
+    expect(validateValueAgainstSchema({ ledger: "reviews", record: { run_id: "42" } }, tool.inputSchema)).toBeNull();
+    expect(validateValueAgainstSchema({ ledger: "cache", record: { run_id: "42" } }, tool.inputSchema)).toBeTruthy();
+  });
+
+  it.each([
+    { $ref: "#/$defs/record", $defs: { record: { type: "object" } } },
+    { type: "object", properties: { run_id: { $ref: "#/$defs/runId" } }, $defs: { runId: { type: "string" } } },
+    { type: "object", allOf: [{ properties: { run_id: { $ref: "#/$defs/runId" } } }], $defs: { runId: { type: "string" } } },
+  ])("preserves the generic record schema when a custom schema contains references: %j", schema => {
+    fs.copyFileSync(path.join(__dirname, "safe_outputs_tools.json"), toolsSourcePath);
+    const sourceTools = JSON.parse(fs.readFileSync(toolsSourcePath, "utf8"));
+    const sourceRecordSchema = sourceTools.find(tool => tool.name === "ledger_append").inputSchema.properties.record;
+    fs.writeFileSync(configPath, JSON.stringify({ ledger_append: { ledgers: [{ name: "reviews", schema }] } }));
+    runScript();
+    const [tool] = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(tool.inputSchema.required).toEqual(["record"]);
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(["ledger", "temp_id", "record", "depends-on"]);
+    expect(tool.inputSchema.properties["depends-on"]).toEqual(dependencySchema);
+    expect(tool.inputSchema.properties.record).toEqual(sourceRecordSchema);
+    expect(validateValueAgainstSchema({ record: { run_id: "42" } }, tool.inputSchema)).toBeNull();
+    expect(validateValueAgainstSchema({}, tool.inputSchema)).toBeTruthy();
+  });
+
+  it("requires an explicit custom ledger when multiple record schemas are configured", () => {
+    fs.copyFileSync(path.join(__dirname, "safe_outputs_tools.json"), toolsSourcePath);
+    fs.writeFileSync(configPath, JSON.stringify({ ledger_append: { ledgers: [{ name: "reviews" }, { name: "findings" }] } }));
+    runScript();
+    const [tool] = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(tool.inputSchema.required).toEqual(["ledger", "record"]);
+    expect(tool.inputSchema.properties.ledger.enum).toEqual(["reviews", "findings"]);
+    expect(tool.inputSchema.properties.record.type).toBe("object");
+    expect(tool.inputSchema.properties).not.toHaveProperty("operation");
+  });
+
+  it("preserves operation arguments when custom and built-in ledgers share the tool", () => {
+    fs.copyFileSync(path.join(__dirname, "safe_outputs_tools.json"), toolsSourcePath);
+    fs.writeFileSync(configPath, JSON.stringify({ ledger_append: { ledgers: [{ name: "reviews" }, { name: "events", type: "log" }] } }));
+    runScript();
+    const [tool] = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(tool.inputSchema.required).toEqual(["ledger"]);
+    expect(tool.inputSchema.properties).toHaveProperty("record");
+    expect(tool.inputSchema.properties).toHaveProperty("operation");
+    expect(tool.inputSchema.properties).toHaveProperty("value");
+  });
+
+  it("preserves namespaced public names", () => {
+    fs.writeFileSync(
+      toolsSourcePath,
+      JSON.stringify([
+        ...sampleSourceTools,
+        {
+          name: "external_create_record",
+          description: "Creates a provider-neutral external record.",
+          inputSchema: { type: "object", properties: {} },
+        },
+      ])
+    );
+    fs.writeFileSync(configPath, JSON.stringify({ external_create_record: { max: 1 } }));
+    fs.writeFileSync(toolsMetaPath, JSON.stringify({ description_suffixes: {}, repo_params: {}, dynamic_tools: [] }));
+
+    runScript();
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("external_create_record");
   });
 
   it("applies description suffix from tools_meta", () => {
@@ -167,6 +472,283 @@ describe("generate_safe_outputs_tools", () => {
     expect(createIssueTool.inputSchema.required).toEqual(expect.arrayContaining(["title", "temporary_id"]));
   });
 
+  it("replaces array item schemas when specified in tools_meta", () => {
+    fs.writeFileSync(
+      toolsSourcePath,
+      JSON.stringify([
+        {
+          name: "add_labels",
+          description: "Adds labels.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              labels: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
+            },
+            required: ["labels"],
+          },
+        },
+      ])
+    );
+    fs.writeFileSync(configPath, JSON.stringify({ add_labels: {} }));
+    const itemSchema = {
+      type: "object",
+      required: ["name", "confidence"],
+      additionalProperties: false,
+      properties: {
+        name: { type: "string" },
+        confidence: { type: "string", enum: ["HIGH", "MEDIUM", "LOW"] },
+      },
+    };
+    fs.writeFileSync(
+      toolsMetaPath,
+      JSON.stringify({
+        description_suffixes: {},
+        repo_params: {},
+        dynamic_tools: [],
+        item_schemas: { add_labels: { labels: itemSchema } },
+      })
+    );
+
+    runScript();
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(result[0].inputSchema.properties.labels.items).toEqual(itemSchema);
+    expect(result[0].inputSchema.properties.labels.description).toContain("plain string label names are not permitted");
+    expect(result[0].inputSchema.properties.labels.description).toContain("Required fields: name, confidence");
+    expect(result[0].inputSchema.properties.labels.description).toContain('Example: [{"name":"bug","confidence":"HIGH"}]');
+    expect(result[0].inputSchema.properties.labels.description).not.toContain("rationale");
+    expect(result[0].description).not.toContain("INTENT ENCOURAGED:");
+  });
+
+  it("uses boolean and numeric values in configured add_labels examples", () => {
+    fs.writeFileSync(
+      toolsSourcePath,
+      JSON.stringify([
+        {
+          name: "add_labels",
+          description: "Adds labels.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              labels: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
+            },
+          },
+        },
+      ])
+    );
+    fs.writeFileSync(configPath, JSON.stringify({ add_labels: {} }));
+    const itemSchema = {
+      type: "object",
+      required: ["name", "suggest", "priority"],
+      additionalProperties: false,
+      properties: {
+        name: { type: "string" },
+        suggest: { type: "boolean" },
+        priority: { type: "number" },
+      },
+    };
+    fs.writeFileSync(
+      toolsMetaPath,
+      JSON.stringify({
+        description_suffixes: {},
+        repo_params: {},
+        dynamic_tools: [],
+        item_schemas: { add_labels: { labels: itemSchema } },
+      })
+    );
+
+    runScript();
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(result[0].inputSchema.properties.labels.description).toContain('Example: [{"name":"bug","suggest":true,"priority":0}]');
+  });
+
+  it("does not present optional add_labels fields as required", () => {
+    fs.writeFileSync(
+      toolsSourcePath,
+      JSON.stringify([
+        {
+          name: "add_labels",
+          description: "Adds labels.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              labels: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
+            },
+          },
+        },
+      ])
+    );
+    fs.writeFileSync(configPath, JSON.stringify({ add_labels: {} }));
+    const itemSchema = {
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        suggest: { type: "boolean" },
+      },
+    };
+    fs.writeFileSync(
+      toolsMetaPath,
+      JSON.stringify({
+        description_suffixes: {},
+        repo_params: {},
+        dynamic_tools: [],
+        item_schemas: { add_labels: { labels: itemSchema } },
+      })
+    );
+
+    runScript();
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const description = result[0].inputSchema.properties.labels.description;
+    expect(description).toContain("No required fields are declared by the configured item schema.");
+    expect(description).toContain("Available fields: name, suggest.");
+    expect(description).not.toContain("Required fields:");
+    expect(description).not.toContain("Example:");
+  });
+
+  it("omits add_labels examples when a required value cannot be inferred safely", () => {
+    fs.writeFileSync(
+      toolsSourcePath,
+      JSON.stringify([
+        {
+          name: "add_labels",
+          description: "Adds labels.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              labels: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
+            },
+          },
+        },
+      ])
+    );
+    fs.writeFileSync(configPath, JSON.stringify({ add_labels: {} }));
+    const itemSchema = {
+      type: "object",
+      required: ["slug"],
+      additionalProperties: false,
+      properties: {
+        slug: { type: "string", pattern: "^[A-Z]{3}$" },
+      },
+    };
+    fs.writeFileSync(
+      toolsMetaPath,
+      JSON.stringify({
+        description_suffixes: {},
+        repo_params: {},
+        dynamic_tools: [],
+        item_schemas: { add_labels: { labels: itemSchema } },
+      })
+    );
+
+    runScript();
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const description = result[0].inputSchema.properties.labels.description;
+    expect(description).toContain("Required fields: slug.");
+    expect(description).not.toContain("Example:");
+  });
+
+  it("keeps issue-intent requirements and guidance with a narrowed add_labels item schema", () => {
+    fs.writeFileSync(
+      toolsSourcePath,
+      JSON.stringify([
+        {
+          name: "add_labels",
+          description: "Adds labels.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              labels: {
+                type: "array",
+                items: {
+                  oneOf: [
+                    { type: "string" },
+                    {
+                      type: "object",
+                      required: ["name"],
+                      properties: {
+                        name: { type: "string" },
+                        rationale: { type: "string" },
+                        confidence: { type: "string" },
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      ])
+    );
+    fs.writeFileSync(configPath, JSON.stringify({ add_labels: { issue_intent: true } }));
+    const itemSchema = {
+      type: "object",
+      required: ["name", "rationale", "confidence"],
+      additionalProperties: false,
+      properties: {
+        name: { type: "string" },
+        rationale: { type: "string" },
+        confidence: { type: "string", enum: ["HIGH", "MEDIUM", "LOW"] },
+      },
+    };
+    fs.writeFileSync(
+      toolsMetaPath,
+      JSON.stringify({
+        description_suffixes: {},
+        repo_params: {},
+        dynamic_tools: [],
+        item_schemas: { add_labels: { labels: itemSchema } },
+      })
+    );
+
+    runScript();
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const addLabelsTool = result.find((/** @type {{name: string}} */ t) => t.name === "add_labels");
+    expect(addLabelsTool.inputSchema.properties.labels.items).toEqual(itemSchema);
+    expect(addLabelsTool.inputSchema.properties.labels.items.required).toEqual(expect.arrayContaining(["name", "rationale", "confidence"]));
+    expect(addLabelsTool.inputSchema.properties.labels.description).toContain("Plain string label names are not permitted");
+    expect(addLabelsTool.inputSchema.properties.labels.description).toContain("confidence (exactly one of: LOW, MEDIUM, HIGH)");
+    expect(addLabelsTool.description).toContain("INTENT REQUIRED:");
+  });
+
+  it("describes configured string-only add_labels schemas accurately", () => {
+    fs.writeFileSync(
+      toolsSourcePath,
+      JSON.stringify([
+        {
+          name: "add_labels",
+          description: "Adds labels.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              labels: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
+            },
+          },
+        },
+      ])
+    );
+    fs.writeFileSync(configPath, JSON.stringify({ add_labels: {} }));
+    fs.writeFileSync(
+      toolsMetaPath,
+      JSON.stringify({
+        description_suffixes: {},
+        repo_params: {},
+        dynamic_tools: [],
+        item_schemas: { add_labels: { labels: { type: "string" } } },
+      })
+    );
+
+    runScript();
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    expect(result[0].inputSchema.properties.labels.items).toEqual({ type: "string" });
+    expect(result[0].inputSchema.properties.labels.description).toContain("Each label must be a plain string");
+    expect(result[0].description).not.toContain("INTENT ENCOURAGED:");
+  });
+
   it("adds anyOf alternative requirements for assign_milestone", () => {
     fs.writeFileSync(
       toolsSourcePath,
@@ -232,6 +814,95 @@ describe("generate_safe_outputs_tools", () => {
     expect(result).toHaveLength(0);
   });
 
+  it("resolves env placeholders in GH_AW_TOOLS_META_JSON", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    const metaFromEnv = JSON.stringify({
+      description_suffixes: {
+        create_issue: " TARGET: ${GH_AW_INPUT_TARGET_REPO}",
+      },
+      repo_params: {},
+      dynamic_tools: [],
+    });
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: metaFromEnv,
+      GH_AW_INPUT_TARGET_REPO: "github/gh-aw",
+    });
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const createIssueTool = result.find((/** @type {{name: string, description: string}} */ t) => t.name === "create_issue");
+    expect(createIssueTool).toBeDefined();
+    expect(createIssueTool.description).toContain("TARGET: github/gh-aw");
+  });
+
+  it("resolves multiple distinct env placeholders in GH_AW_TOOLS_META_JSON", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    const metaFromEnv = JSON.stringify({
+      description_suffixes: {
+        create_issue: " TARGET: ${GH_AW_INPUT_TARGET_REPO} OWNER: ${GH_AW_GITHUB_REPOSITORY_OWNER}",
+      },
+      repo_params: {},
+      dynamic_tools: [],
+    });
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: metaFromEnv,
+      GH_AW_INPUT_TARGET_REPO: "github/gh-aw",
+      GH_AW_GITHUB_REPOSITORY_OWNER: "github",
+    });
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const createIssueTool = result.find((/** @type {{name: string, description: string}} */ t) => t.name === "create_issue");
+    expect(createIssueTool).toBeDefined();
+    expect(createIssueTool.description).toContain("TARGET: github/gh-aw");
+    expect(createIssueTool.description).toContain("OWNER: github");
+  });
+
+  it("leaves unresolved placeholders in GH_AW_TOOLS_META_JSON unchanged", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    const metaFromEnv = JSON.stringify({
+      description_suffixes: {
+        create_issue: " TARGET: ${GH_AW_INPUT_MISSING}",
+      },
+      repo_params: {},
+      dynamic_tools: [],
+    });
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: metaFromEnv,
+    });
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const createIssueTool = result.find((/** @type {{name: string, description: string}} */ t) => t.name === "create_issue");
+    expect(createIssueTool).toBeDefined();
+    expect(createIssueTool.description).toContain("TARGET: ${GH_AW_INPUT_MISSING}");
+  });
+
+  it("escapes quotes, backslashes, and newlines when resolving GH_AW_TOOLS_META_JSON placeholders", () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    const metaFromEnv = JSON.stringify({
+      description_suffixes: {
+        create_issue: " TARGET: ${GH_AW_INPUT_TARGET_REPO}",
+      },
+      repo_params: {},
+      dynamic_tools: [],
+    });
+
+    runScript({
+      GH_AW_TOOLS_META_JSON: metaFromEnv,
+      GH_AW_INPUT_TARGET_REPO: 'a"b\\c\nd',
+    });
+
+    // The written tools_meta.json must remain valid JSON despite the unsafe characters.
+    const writtenMeta = JSON.parse(fs.readFileSync(toolsMetaPath, "utf8"));
+    expect(writtenMeta.description_suffixes.create_issue).toContain('a"b\\c\nd');
+
+    const result = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+    const createIssueTool = result.find((/** @type {{name: string, description: string}} */ t) => t.name === "create_issue");
+    expect(createIssueTool).toBeDefined();
+    expect(createIssueTool.description).toContain('TARGET: a"b\\c\nd');
+  });
+
   it("ignores non-tool config keys when filtering", () => {
     // dispatch_workflow and max_bot_mentions are not tool names in source file
     fs.writeFileSync(
@@ -276,17 +947,38 @@ describe("generate_safe_outputs_tools", () => {
     expect(result1[0].inputSchema.properties.repo).toEqual(result2[0].inputSchema.properties.repo);
   });
 
+  it("reports tool deep-copy failures with the registered error code", async () => {
+    fs.writeFileSync(configPath, JSON.stringify({ create_issue: { max: 1 } }));
+    fs.writeFileSync(toolsMetaPath, JSON.stringify({ description_suffixes: {}, repo_params: {}, dynamic_tools: [] }));
+
+    const clone = globalThis.structuredClone;
+    vi.stubGlobal("structuredClone", value => {
+      if (value?.name === "create_issue") throw new Error("forced clone failure");
+      return clone(value);
+    });
+    vi.stubEnv("GH_AW_SAFE_OUTPUTS_TOOLS_SOURCE_PATH", toolsSourcePath);
+    vi.stubEnv("GH_AW_SAFE_OUTPUTS_CONFIG_PATH", configPath);
+    vi.stubEnv("GH_AW_SAFE_OUTPUTS_TOOLS_META_PATH", toolsMetaPath);
+    vi.stubEnv("GH_AW_SAFE_OUTPUTS_TOOLS_PATH", outputPath);
+    try {
+      await expect(generateTools()).rejects.toThrow("ERR_SAFE_OUTPUT_TOOL_COPY_FAILED: Failed to deep-copy tool create_issue: forced clone failure");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("exits with error when source tools file is missing", () => {
     fs.writeFileSync(configPath, JSON.stringify({ create_issue: {} }));
     fs.writeFileSync(toolsMetaPath, JSON.stringify({ description_suffixes: {}, repo_params: {}, dynamic_tools: [] }));
 
-    expect(() => runScript({ GH_AW_SAFE_OUTPUTS_TOOLS_SOURCE_PATH: "/nonexistent/path.json" })).toThrow();
+    expect(() => runScript({ GH_AW_SAFE_OUTPUTS_TOOLS_SOURCE_PATH: "/nonexistent/path.json" })).toThrow("ERR_CONFIG:");
   });
 
   it("exits with error when config file is missing", () => {
     fs.writeFileSync(toolsMetaPath, JSON.stringify({ description_suffixes: {}, repo_params: {}, dynamic_tools: [] }));
 
-    expect(() => runScript({ GH_AW_SAFE_OUTPUTS_CONFIG_PATH: "/nonexistent/config.json" })).toThrow();
+    expect(() => runScript({ GH_AW_SAFE_OUTPUTS_CONFIG_PATH: "/nonexistent/config.json" })).toThrow("ERR_CONFIG:");
   });
 
   it("works when tools_meta file is missing (graceful fallback)", () => {

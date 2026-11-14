@@ -52,6 +52,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 )
 
 var templateInjectionValidationLog = logger.New("workflow:template_injection_validation")
@@ -71,14 +72,144 @@ type runContentExpressionScan struct {
 	hasDisallowed bool
 }
 
-// mayContainInlineExpression is a cheap zero-false-negative precheck for
-// GitHub Actions inline expressions. It intentionally allows false positives,
-// for example when `${{` and a later `}}` appear in unrelated text without
-// forming a valid expression. Callers still apply InlineExpressionPattern
-// before classifying expressions.
+// Include incomplete wrappers so malformed executable expressions fail closed.
 func mayContainInlineExpression(s string) bool {
-	_, remainder, found := strings.Cut(s, "${{")
-	return found && strings.Contains(remainder, "}}")
+	return strings.Contains(s, "${{")
+}
+
+func runScriptExpressions(source string) []string {
+	spans, err := actionslanguageservice.ExtractExpressions(source)
+	var expressions []string
+	last := 0
+	for _, span := range spans {
+		expressions = append(expressions, source[span.Start:span.End])
+		last = span.End
+	}
+	if err != nil {
+		if start := strings.Index(source[last:], "${{"); start >= 0 {
+			expressions = append(expressions, source[last+start:])
+		}
+	}
+	return expressions
+}
+
+func runScriptHeredocExpressionSnippets(source string) (map[string]string, bool) {
+	regions, parsed := shellHeredocRegions(source, false)
+	if !parsed {
+		return nil, false
+	}
+	snippets := make(map[string]string)
+	for _, region := range regions {
+		if !region.quoted || region.start < 0 || region.end < region.start || region.end > len(source) {
+			continue
+		}
+		body := source[region.start:region.end]
+		for _, expression := range runScriptExpressions(body) {
+			if _, exists := snippets[expression]; !exists {
+				snippets[expression] = extractRunSnippet(body, expression)
+			}
+		}
+	}
+	return snippets, true
+}
+
+func isRunScriptEnvExpression(source string) bool {
+	expression, ok := actionslanguageservice.WrappedExpression(source)
+	if !ok {
+		return false
+	}
+	found := false
+	actionslanguageservice.Walk(expression, func(node *actionslanguageservice.Expression) bool {
+		path := runScriptAccessPath(node)
+		first, ok := runScriptAccessPathSegment(path, 0)
+		if ok && strings.EqualFold(first, "env") {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
+func unsafeRunScriptExpressionContextInScript(expression string, quotedHeredocSnippets map[string]string, boundariesProven bool) string {
+	if context := unsafeRunScriptExpressionContext(expression); context != "" {
+		return context
+	}
+	if isRunScriptEnvExpression(expression) {
+		if !boundariesProven {
+			return "unproven heredoc boundary"
+		}
+		if _, quoted := quotedHeredocSnippets[expression]; quoted {
+			return "quoted heredoc environment"
+		}
+	}
+	return ""
+}
+
+// Unknown computed selectors are wildcards for this deny policy, not trusted
+// static references. In particular, steps[vars.step].outputs.* is user data.
+func runScriptAccessPath(expression *actionslanguageservice.Expression) []string {
+	switch expression.Kind {
+	case "group":
+		return runScriptAccessPath(expression.Child(0))
+	case "context":
+		return []string{expression.Token.Text}
+	case "index":
+		path := runScriptAccessPath(expression.Child(0))
+		if path == nil {
+			return nil
+		}
+		index := expression.Child(1)
+		if index.Kind == "literal" && (index.Token.Kind == "identifier" || index.Token.Kind == "string") {
+			if value, ok := index.Token.Value.(string); ok {
+				return append(path, value)
+			}
+		}
+		return append(path, "*")
+	default:
+		return nil
+	}
+}
+
+func runScriptAccessPathSegment(path []string, index int) (string, bool) {
+	if index < 0 || index >= len(path) {
+		return "", false
+	}
+	return path[index], true //nolint:uncheckedsliceindex // index is checked against len(path) above.
+}
+
+func unsafeRunScriptExpressionContext(source string) string {
+	expression, ok := actionslanguageservice.WrappedExpression(source)
+	if !ok {
+		return "invalid expression"
+	}
+	context := ""
+	actionslanguageservice.Walk(expression, func(node *actionslanguageservice.Expression) bool {
+		if context != "" {
+			return false
+		}
+		path := runScriptAccessPath(node)
+		first, ok := runScriptAccessPathSegment(path, 0)
+		if !ok {
+			return true
+		}
+		switch {
+		case strings.EqualFold(first, "inputs"):
+			context = "workflow inputs"
+		case strings.EqualFold(first, "github"):
+			event, exists := runScriptAccessPathSegment(path, 1)
+			if exists && (strings.EqualFold(event, "event") || event == "*") {
+				context = "github.event"
+			}
+		case strings.EqualFold(first, "steps"):
+			outputs, exists := runScriptAccessPathSegment(path, 2)
+			if len(path) >= 4 && exists && (strings.EqualFold(outputs, "outputs") || outputs == "*") {
+				context = "steps.*.outputs"
+			}
+		}
+		return context == ""
+	})
+	return context
 }
 
 func findRunValue(keyPart string) (string, bool) {
@@ -91,168 +222,85 @@ func findRunValue(keyPart string) (string, bool) {
 		return "", false
 	}
 	loc := runKeyPattern.FindStringIndex(keyPart)
-	if loc == nil {
+	if len(loc) < 2 {
 		return "", false
 	}
-	return strings.TrimSpace(keyPart[loc[1]:]), true
+	return strings.TrimSpace(keyPart[loc[1]:]), true //nolint:uncheckedsliceindex // FindStringIndex returns a pair; checked above.
 }
 
-// detectHeredocDelimiter extracts the heredoc closing delimiter from a line that
-// opens a heredoc (contains "<<"). It handles the common forms used in compiler-
-// generated run blocks:
-//
-//   - Unquoted:       cat << DELIM ...    → "DELIM"
-//   - Strip-tab:      cat <<- DELIM ...   → "DELIM"
-//   - Single-quoted:  cat << 'DELIM' ...  → "DELIM"
-//   - Double-quoted:  cat << "DELIM" ...  → "DELIM"
-//
-// Returns ("", false) when no heredoc opening is found on the line, including
-// for bash here-strings (<<<) and arithmetic bitshifts (1 << 2).
-func detectHeredocDelimiter(trimmed string) (string, bool) {
-	_, after, found := strings.Cut(trimmed, "<<")
-	if !found {
-		return "", false
+func appendRunBlockLine(block *strings.Builder, line string, indent int, contentIndent *int) {
+	if *contentIndent == 0 {
+		*contentIndent = indent
 	}
-	// Reject bash here-strings (<<<): the character immediately after << is another <.
-	if after != "" && after[0] == '<' {
-		return "", false
-	}
-	// Handle <<- (strip-tab variant): the dash must immediately follow << with no
-	// intervening whitespace. Strip exactly one dash; <<-- and similar are not valid
-	// shell and are treated conservatively as non-heredoc.
-	if after != "" && after[0] == '-' {
-		after = after[1:]
-	}
-	rest := strings.TrimSpace(after)
-	if rest == "" {
-		return "", false
-	}
-	// Quoted delimiter: << 'DELIM' or << "DELIM"
-	if rest[0] == '\'' || rest[0] == '"' {
-		quoteChar := rest[0]
-		end := strings.IndexByte(rest[1:], quoteChar)
-		if end >= 0 {
-			delim := rest[1 : end+1]
-			if delim != "" {
-				return delim, true
-			}
-		}
-		return "", false
-	}
-	// Unquoted delimiter: take the first whitespace-delimited token.
-	// Require the delimiter to be a valid shell identifier (letters, digits,
-	// underscores; must start with a letter or underscore) to avoid treating
-	// arithmetic bitshifts (e.g. "1 << 2") as heredoc openings.
-	fields := strings.Fields(rest)
-	if len(fields) == 0 {
-		return "", false
-	}
-	delim := strings.TrimRight(fields[0], "|;&")
-	if !isShellIdentifier(delim) {
-		return "", false
-	}
-	return delim, true
+	block.WriteString(line[min(*contentIndent, indent):])
+	block.WriteByte('\n')
 }
 
-// isShellIdentifier reports whether s is a valid shell identifier (letters,
-// digits, and underscores; must not start with a digit). Heredoc delimiters
-// must match this pattern; non-matching tokens indicate non-heredoc uses of <<
-// such as arithmetic bitshifts.
-func isShellIdentifier(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i, c := range s {
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c == '_':
-			// always valid
-		case c >= '0' && c <= '9':
-			if i == 0 {
-				return false // identifiers must not start with a digit
-			}
-		default:
-			return false
-		}
-	}
-	return true
+func startRunBlock(indent int, inRunBlock *bool, runBlockIndent, contentIndent *int) {
+	*inRunBlock = true
+	*runBlockIndent = indent
+	*contentIndent = 0
 }
 
-// walkRunBlockLines scans raw YAML text and visits each inline run value or line inside a
-// multiline run block. It recognizes plain run: keys as well as quoted and flow-style forms
-// so Path B stays aligned with the parsed-YAML validators.
+// walkRunBlocks scans raw YAML text and visits each inline run value or complete
+// multiline run block. It recognizes plain run: keys as well as quoted and flow-style
+// forms so Path B stays aligned with the parsed-YAML validators.
 //
-// Heredoc content is skipped so that expressions embedded inside heredocs (which are written
-// to files and never executed directly by the shell) do not trigger false positives in the
-// caller's expression checks. This matches the behaviour of removeHeredocContent, which
-// validateNoGitHubExpressionsInRunScriptsFromParsed uses on the parsed path.
-func walkRunBlockLines(yamlContent string, visit func(line string) bool) bool {
+// YAML indentation is removed before expressions are scanned. Shell comments and
+// heredoc bodies are included because GitHub evaluates expressions before Bash.
+func walkRunBlocks(yamlContent string, visit func(runContent string) bool) bool {
 	inRunBlock := false
 	runBlockIndent := 0
-	inHeredoc := false
-	heredocDelimiter := ""
-
+	contentIndent := 0
+	var block strings.Builder
+	flush := func() bool {
+		content := block.String()
+		block.Reset()
+		return content != "" && visit(content)
+	}
 	for line := range strings.SplitSeq(yamlContent, "\n") {
 		trimmed := strings.TrimLeft(line, " \t")
 		if trimmed == "" {
+			if inRunBlock {
+				block.WriteByte('\n')
+			}
 			continue
 		}
 		indent := len(line) - len(trimmed)
-
 		if inRunBlock {
 			if indent <= runBlockIndent {
-				inRunBlock = false
-				inHeredoc = false
-				heredocDelimiter = ""
-				// Fall through: check whether this line starts a new run: block.
-			} else {
-				// If we are inside a heredoc, look for the closing delimiter.
-				if inHeredoc {
-					if strings.TrimSpace(line) == heredocDelimiter {
-						inHeredoc = false
-						heredocDelimiter = ""
-					}
-					continue // always skip heredoc content
-				}
-				// Check whether this line opens a heredoc.
-				if delim, ok := detectHeredocDelimiter(trimmed); ok {
-					inHeredoc = true
-					heredocDelimiter = delim
-					// The opening line itself is not heredoc body; visit it so callers
-					// can see the surrounding shell context, but do not recurse.
-					if visit(line) {
-						return true
-					}
-					continue
-				}
-				if visit(line) {
+				if flush() {
 					return true
 				}
+				inRunBlock = false
+				// Fall through: check whether this line starts a new run: block.
+			} else {
+				appendRunBlockLine(&block, line, indent, &contentIndent)
 				continue
 			}
 		}
-
 		keyPart := trimmed
 		if strings.HasPrefix(keyPart, "-") {
 			keyPart = strings.TrimSpace(keyPart[1:])
 		}
-
 		rest, ok := findRunValue(keyPart)
 		if !ok {
 			continue
 		}
-
-		if rest == "" || rest[0] == '|' || rest[0] == '>' {
-			inRunBlock = true
-			runBlockIndent = indent
+		if rest == "" {
+			startRunBlock(indent, &inRunBlock, &runBlockIndent, &contentIndent)
 			continue
 		}
-
+		if rest[0] == '|' || rest[0] == '>' { //nolint:uncheckedsliceindex // rest is non-empty above.
+			startRunBlock(indent, &inRunBlock, &runBlockIndent, &contentIndent)
+			continue
+		}
 		if visit(rest) {
 			return true
 		}
 	}
 
-	return false
+	return inRunBlock && flush()
 }
 
 // scanRunContentExpressions performs a single pass over run: blocks to detect both
@@ -264,16 +312,18 @@ func scanRunContentExpressions(yamlContent string) runContentExpressionScan {
 	}
 
 	var scan runContentExpressionScan
-	walkRunBlockLines(yamlContent, func(line string) bool {
-		if !mayContainInlineExpression(line) {
+	walkRunBlocks(yamlContent, func(runContent string) bool {
+		if !mayContainInlineExpression(runContent) {
 			return false
 		}
 
-		for _, expr := range InlineExpressionPattern.FindAllString(line, -1) {
-			if !scan.hasUnsafe && UnsafeContextPattern.MatchString(expr) {
+		quotedHeredocSnippets, boundariesProven := runScriptHeredocExpressionSnippets(runContent)
+		for _, expr := range runScriptExpressions(runContent) {
+			context := unsafeRunScriptExpressionContextInScript(expr, quotedHeredocSnippets, boundariesProven)
+			if !scan.hasUnsafe && context != "" {
 				scan.hasUnsafe = true
 			}
-			if !scan.hasDisallowed && !allowedRunScriptExpressionRegex.MatchString(expr) {
+			if !scan.hasDisallowed && (context != "" || !allowedRunScriptExpressionRegex.MatchString(expr)) {
 				scan.hasDisallowed = true
 			}
 			if scan.hasUnsafe && scan.hasDisallowed {
@@ -290,6 +340,10 @@ func scanRunContentExpressions(yamlContent string) runContentExpressionScan {
 // injection vulnerabilities. It is called when the caller already holds a parsed
 // representation of the compiled YAML, avoiding a redundant parse.
 func validateNoTemplateInjectionFromParsed(workflow map[string]any) error {
+	return validateRunScriptTemplateInjection(workflow, true)
+}
+
+func validateRunScriptTemplateInjection(workflow map[string]any, checkShellEvaluation bool) error {
 	// Extract all run blocks from the workflow
 	runBlocks := extractRunBlocks(workflow)
 	templateInjectionValidationLog.Printf("Found %d run blocks to scan", len(runBlocks))
@@ -298,27 +352,30 @@ func validateNoTemplateInjectionFromParsed(workflow map[string]any) error {
 
 	for _, runContent := range runBlocks {
 		// Check if this run block contains inline expressions
-		if !InlineExpressionPattern.MatchString(runContent) {
+		if !mayContainInlineExpression(runContent) {
 			continue
 		}
 
-		// Remove non-executable regions from the run block to avoid false positives:
-		//   - heredocs are written to files/stdin, not executed directly
-		//   - bash # comments are ignored by the shell
-		contentWithoutHeredocs := stripShellLineComments(removeHeredocContent(runContent))
-
-		// Extract all inline expressions from this run block (excluding heredocs)
-		expressions := InlineExpressionPattern.FindAllString(contentWithoutHeredocs, -1)
+		expressions := runScriptExpressions(runContent)
+		quotedHeredocSnippets, boundariesProven := runScriptHeredocExpressionSnippets(runContent)
+		shellCodeEvaluation := checkShellEvaluation && runStepUsesShellCodeEvaluation(runContent)
 
 		// Check each expression for unsafe contexts
 		for _, expr := range expressions {
-			if UnsafeContextPattern.MatchString(expr) {
+			context := unsafeRunScriptExpressionContextInScript(expr, quotedHeredocSnippets, boundariesProven)
+			if context == "" && shellCodeEvaluation {
+				context = "shell code evaluation"
+			}
+			if context != "" {
 				// Found an unsafe pattern - extract a snippet for context
-				snippet := extractRunSnippet(contentWithoutHeredocs, expr)
+				snippet := extractRunSnippet(runContent, expr)
+				if quotedSnippet, quoted := quotedHeredocSnippets[expr]; quoted {
+					snippet = quotedSnippet
+				}
 				violations = append(violations, TemplateInjectionViolation{
 					Expression: expr,
 					Snippet:    snippet,
-					Context:    detectExpressionContext(expr),
+					Context:    context,
 				})
 
 				templateInjectionValidationLog.Printf("Found template injection risk: %s in run block", expr)
@@ -339,11 +396,13 @@ func validateNoTemplateInjectionFromParsed(workflow map[string]any) error {
 // validateNoGitHubExpressionsInRunScriptsFromParsed checks a pre-parsed workflow map
 // for any GitHub Actions expression usage in run: scripts.
 //
-// This is a compiler regression guardrail: run: scripts in compiled lock files should
-// never contain ${{ ... }} directly because the compiler must rewrite expressions into
-// env: variables. It runs after validateNoTemplateInjectionFromParsed as a broader
-// catch-all for any remaining expression contexts.
+// This raw-content guardrail rejects prohibited expressions left in run: scripts,
+// including comments and quoted heredocs that the sanitizer preserves.
 func validateNoGitHubExpressionsInRunScriptsFromParsed(workflow map[string]any) error {
+	return validateRunScriptExpressions(workflow, true)
+}
+
+func validateRunScriptExpressions(workflow map[string]any, checkShellEvaluation bool) error {
 	runBlocks := extractRunBlocks(workflow)
 	templateInjectionValidationLog.Printf("Found %d run blocks to scan for raw expressions", len(runBlocks))
 
@@ -354,27 +413,90 @@ func validateNoGitHubExpressionsInRunScriptsFromParsed(workflow map[string]any) 
 			continue
 		}
 
-		// Align with template-injection validation by excluding non-executable regions:
-		// heredoc bodies and bash # comments.
-		contentWithoutHeredocs := stripShellLineComments(removeHeredocContent(runContent))
-		expressions := InlineExpressionPattern.FindAllString(contentWithoutHeredocs, -1)
+		expressions := runScriptExpressions(runContent)
+		quotedHeredocSnippets, boundariesProven := runScriptHeredocExpressionSnippets(runContent)
+		shellCodeEvaluation := checkShellEvaluation && runStepUsesShellCodeEvaluation(runContent)
 		for _, expr := range expressions {
-			if allowedRunScriptExpressionRegex.MatchString(expr) {
+			_, hasQuotedSnippet := quotedHeredocSnippets[expr]
+			quotedEnv := isRunScriptEnvExpression(expr) &&
+				(!boundariesProven || hasQuotedSnippet)
+			if _, valid := actionslanguageservice.WrappedExpression(expr); valid &&
+				allowedRunScriptExpressionRegex.MatchString(expr) && !quotedEnv && !shellCodeEvaluation {
 				continue
 			}
-			snippet := extractRunSnippet(contentWithoutHeredocs, expr)
+			snippet := extractRunSnippet(runContent, expr)
+			context := detectExpressionContext(expr)
+			if shellCodeEvaluation {
+				context = "shell code evaluation"
+			} else if quotedEnv {
+				context = "quoted heredoc environment"
+				if quotedSnippet, quoted := quotedHeredocSnippets[expr]; quoted {
+					snippet = quotedSnippet
+				}
+			} else if quotedSnippet, quoted := quotedHeredocSnippets[expr]; quoted {
+				snippet = quotedSnippet
+				context = "quoted heredoc"
+			} else if !boundariesProven && isRunScriptEnvExpression(expr) {
+				context = "unproven heredoc boundary"
+			}
 			violations = append(violations, TemplateInjectionViolation{
 				Expression: expr,
 				Snippet:    snippet,
-				Context:    detectExpressionContext(expr),
+				Context:    context,
 			})
 		}
 	}
 
 	if len(violations) > 0 {
 		templateInjectionValidationLog.Printf("Run-script expression guardrail failed: %d violation(s) found", len(violations))
-		return formatRunScriptExpressionGuardrailError(violations)
+		return formatRunScriptExpressionValidationError(violations)
 	}
 
+	return nil
+}
+
+// Validate authored/imported steps separately from compiler-owned shell scripts,
+// whose runtime script paths and traps cannot be classified as authored evaluators.
+func validateAuthoredShellCodeEvaluation(data *WorkflowData) error {
+	runBlocks := extractRunBlocks(data.RawFrontmatter)
+	runBlocks = append(runBlocks, extractRunBlocks(data.Jobs)...)
+	for _, step := range data.OnSteps {
+		runBlocks = append(runBlocks, extractRunBlocks(step)...)
+	}
+	if data.SafeOutputs != nil {
+		runBlocks = append(runBlocks, extractRunBlocks(data.SafeOutputs.Steps)...)
+		if detection := data.SafeOutputs.ThreatDetection; detection != nil {
+			runBlocks = append(runBlocks, extractRunBlocks(detection.Steps)...)
+			runBlocks = append(runBlocks, extractRunBlocks(detection.PostSteps)...)
+		}
+	}
+	if data.SecretMasking != nil {
+		for _, step := range data.SecretMasking.Steps {
+			runBlocks = append(runBlocks, extractRunBlocks(step)...)
+		}
+	}
+	for _, steps := range []string{data.CustomSteps, data.PreSteps, data.PreAgentSteps, data.PostSteps} {
+		walkRunBlocks(steps, func(run string) bool {
+			runBlocks = append(runBlocks, run)
+			return false
+		})
+	}
+
+	var violations []TemplateInjectionViolation
+	for _, run := range runBlocks {
+		if !mayContainInlineExpression(run) || !runStepUsesShellCodeEvaluation(run) {
+			continue
+		}
+		for _, expression := range runScriptExpressions(run) {
+			violations = append(violations, TemplateInjectionViolation{
+				Expression: expression,
+				Snippet:    extractRunSnippet(run, expression),
+				Context:    "shell code evaluation",
+			})
+		}
+	}
+	if len(violations) > 0 {
+		return formatTemplateInjectionError(violations)
+	}
 	return nil
 }

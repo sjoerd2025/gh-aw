@@ -8,7 +8,7 @@
  */
 
 const fs = require("fs");
-const { ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
+const { ERR_SYSTEM, ERR_VALIDATION, ERR_PARSE } = require("./error_codes.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 
 /**
@@ -19,6 +19,7 @@ const { getErrorMessage } = require("./error_helpers.cjs");
  * @property {string} [handler] - Path to handler file (.cjs, .sh, or .py)
  * @property {number} [timeout] - Timeout in seconds for tool execution (default: 60)
  * @property {string[]} [dependencies] - Runtime dependencies installed before first invocation
+ * @property {Record<string, string>} [env] - Tool-local variable names mapped to server environment references
  */
 
 /**
@@ -44,13 +45,13 @@ function loadConfig(configPath) {
   try {
     configContent = fs.readFileSync(configPath, "utf-8");
   } catch (err) {
-    throw new Error(`Failed to read file ${configPath}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to read file ${configPath}: ${getErrorMessage(err)}`, { cause: err });
   }
   let config;
   try {
     config = JSON.parse(configContent);
   } catch (err) {
-    throw new Error("Failed to parse config file " + configPath + ": " + getErrorMessage(err), { cause: err });
+    throw new Error(`${ERR_PARSE}: ` + "Failed to parse config file " + configPath + ": " + getErrorMessage(err), { cause: err });
   }
 
   // Validate required fields

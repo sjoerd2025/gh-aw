@@ -4,27 +4,31 @@
  * Claude Code CLI Harness with Retry Logic
  *
  * Wraps the Claude Code CLI command with retry logic for failures that occur after the session
- * has been partially executed.  Passes all arguments to the claude subprocess, transparently
- * forwarding stdin/stdout/stderr.
+ * has been partially executed.  Passes all arguments to the claude subprocess, forwarding
+ * stdout/stderr; the initial prompt is delivered through stdin.
  *
  * Retry policy:
  *   - If the process produced any output (hasOutput) and exits with a non-zero code, the
- *     session is considered partially executed.  The driver retries with --continue so the
- *     Claude Code CLI can continue from where it left off.
+ *     driver resumes the captured session ID after genuine assistant progress.
  *   - Overloaded API errors (HTTP 529 / "overloaded_error") and rate-limit errors (HTTP 429 /
  *     "rate_limit_error") are well-known transient failure modes and are logged explicitly, but
  *     any partial-execution failure is retried — not just those specific errors.
- *   - If the process produced no output (failed to start / auth error before any work), the
- *     driver does not retry because there is nothing to resume.
- *   - On a `--continue` retry the initial prompt is omitted: Claude Code resumes the session
- *     from its on-disk state rather than re-processing the original instructions.
+ *   - "The request body is not valid JSON" (HTTP 400) is a transport-level serialization bug,
+ *     observed immediately after a `permission_denied` tool-result on a compound Bash command.
+ *     Fresh restarts after partial work require GH_AW_CLAUDE_ALLOW_FRESH_RESTART=true;
+ *     otherwise the harness fails explicitly instead of replaying side effects.
+ *   - Connection-refused failures before the first assistant response are retried as fresh
+ *     runs because there is no session state to resume.
+ *   - Other failures that produce no output use a separate bounded startup retry budget.
+ *   - On a `--resume <id>` retry a short continuation prompt replaces the original task.
+ *     Empty-input resume only works for deferred sessions, not ordinary API failures.
  *   - Retries use exponential backoff: 5s → 10s → 20s (capped at 60s) by default.
  *   - Maximum 3 retry attempts after the initial run by default.
  *
  * Prompt handling:
  *   - The harness expects a `--prompt-file <path>` argument in the args list.
- *   - For the initial run it reads the file and appends the content as the last positional arg.
- *   - For `--continue` retries the prompt is omitted (Claude resumes from session state).
+ *   - For the initial run it reads the file and sends the content through stdin.
+ *   - For resume retries stdin contains only the continuation prompt.
  *
  * Usage: node claude_harness.cjs <command> [args...]
  * Example: node claude_harness.cjs claude --print --prompt-file /tmp/gh-aw/aw-prompts/prompt.txt
@@ -33,12 +37,36 @@
 "use strict";
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { isGitHubProviderCybersecurityPolicyRejection } = require("./github_provider_policy_rejection.cjs");
 const fs = require("fs");
-const { runProcess, formatDuration, sleep } = require("./process_runner.cjs");
+const { openDurableSession, observeDurableSession } = require("./durable_native_session.cjs");
+const { runProcess, formatDuration, resolvePostResultWatchdogIdleTimeoutMs } = require("./process_runner.cjs");
+const { applyClaudeRuntimeTimeouts } = require("./tool_timeouts.cjs");
+const {
+  CLAUDE_RESUME_PROMPT,
+  claudeFailureEvidence,
+  hasClaudeSessionProgress,
+  claudeSessionId,
+  claudePermissionDenials,
+  claudeBareCapabilities,
+  claudeRepositoryEditPolicy,
+  claudeSafeOutputsOffset,
+  removeClaudePlugin,
+} = require("./claude_runtime.cjs");
+const {
+  captureExecutionEvidenceConfiguration,
+  resolveHarnessRetryTelemetryPath,
+  runHarnessRetryLoop,
+  selectedHarnessStrategy,
+  shouldSkipForNoopSafeOutputs,
+  shouldStopForNoopSafeOutputs,
+  stripExecutionEvidenceEnv,
+} = require("./harness_retry_runner.cjs");
 const { resolveRetryConfig: resolveSharedRetryConfig } = require("./harness_retry_config.cjs");
+const { stopForPermissionDenied } = require("./harness_failure_handling.cjs");
+const { resolveHarnessPromptFileArgs } = require("./harness_prompt_input.cjs");
 const {
   AWF_API_PROXY_REFLECT_URL,
-  AWF_REFLECT_OUTPUT_PATH,
   AWF_REFLECT_TIMEOUT_MS,
   AWF_MODELS_URL_TIMEOUT_MS,
   GEMINI_MODEL_NAME_PREFIX,
@@ -47,13 +75,28 @@ const {
   fetchAWFReflect,
   fetchModelsFromUrl,
   normalizeReflectProviderName,
+  REFLECT_PROVIDER_ALIASES,
   resolveProviderEndpointFromReflect,
 } = require("./awf_reflect.cjs");
-const { emitMissingToolPermissionIssue, hasExpectedSafeOutputs, hasNoopInSafeOutputs } = require("./safeoutputs_cli.cjs");
+const { emitMissingToolPermissionIssue, emitInfrastructureIncomplete, hasExpectedSafeOutputs, hasNoopInSafeOutputs, hasTerminalSafeOutput } = require("./safeoutputs_cli.cjs");
 const { countPermissionDeniedIssues, hasNumerousPermissionDeniedIssues, extractDeniedCommands, buildMissingToolPermissionIssuePayload } = require("./permission_denied_helpers.cjs");
-const { detectNonRetryableHarnessGuard, buildSoftTimeoutGuard, emitSoftTimeoutSignal, isAuthenticationFailedError } = require("./harness_retry_guard.cjs");
+const {
+  createOutputPatternMatcher,
+  detectNonRetryableHarnessGuard,
+  detectExhaustedAWFInvocationBudget,
+  buildSoftTimeoutGuard,
+  emitSoftTimeoutSignal,
+  isAuthenticationFailedError,
+  parseAICreditsExceededProxyRejection,
+} = require("./harness_retry_guard.cjs");
+const { isCrashSignalExitCode, crashSignalNameForExitCode } = require("./harness_crash_signals.cjs");
 const { MODEL_NOT_SUPPORTED_PATTERN: INVALID_MODEL_ERROR_PATTERN } = require("./detect_agent_errors.cjs");
-const { applyModelFallback } = require("./model_fallback.cjs");
+const { applyModelFallback, normalizeClaudeModel } = require("./model_fallback.cjs");
+const { resolveEngineModel } = require("./resolve_model_alias.cjs");
+const { applyClaudeSubagentModels, isDetectionPhase } = require("./engine_subagent_models.cjs");
+const { parseMaxAICreditsExceededFromAuditLog } = require("./ai_credits_context.cjs");
+const { resolveAWFModelRoutingSelection, mapAWFRoutingEffort, recordAWFModelRoutingOutcome, getAWFModelRoutingPolicy, getAWFModelRoutingFailureCode, resolveAWFRoutingProvider } = require("./awf_model_routing.cjs");
+const CLAUDE_ROUTING_POLICY = getAWFModelRoutingPolicy("claude");
 
 // Pattern to detect Anthropic API overload errors (HTTP 529).
 // Matches "overloaded_error" from the Anthropic error type field, and the
@@ -66,6 +109,17 @@ const OVERLOADED_ERROR_PATTERN = /overloaded_error|"overloaded"/i;
 //   - embedded stream-json result fields (e.g. "api_error_status":429)
 //   - human-readable message text ("rate limit")
 const RATE_LIMIT_ERROR_PATTERN = /rate_limit_error|429 Too Many Requests|"api_error_status"\s*:\s*429|request rejected \(429\)|rate limit/i;
+
+// Pattern to detect the transport-level "invalid JSON request body" error.
+// Observed after a `permission_denied` tool-result on a compound Bash command: the
+// CLI appears to re-serialize the conversation for the next turn incorrectly,
+// producing an empty/malformed body that the Anthropic API rejects with HTTP 400
+// before any model logic runs. This is a serialization glitch, not a real
+// application-level 400 from the model, so it should be retried — but as a fresh
+// run rather than --continue, since resuming would resend the same corrupted
+// session state and reproduce the identical error.
+const INVALID_JSON_BODY_ERROR_PATTERN = /request body is not valid JSON/i;
+const CONNECTION_REFUSED_ERROR_PATTERN = /connection refused|ECONNREFUSED/i;
 
 // Pattern to detect a clean max-turns exit from Claude Code.
 // Claude Code emits a JSON result object with "subtype":"error_max_turns" when the
@@ -111,22 +165,23 @@ function resolveRetryConfig(env = process.env, logger = log) {
  * @returns {number}
  */
 function resolveStartupRetryLimit(env = process.env, logger = log) {
-  const raw = env.GH_AW_CLAUDE_STARTUP_RETRIES;
+  const envVar = env.GH_AW_HARNESS_STARTUP_RETRIES == null || env.GH_AW_HARNESS_STARTUP_RETRIES === "" ? "GH_AW_CLAUDE_STARTUP_RETRIES" : "GH_AW_HARNESS_STARTUP_RETRIES";
+  const raw = env[envVar];
   if (raw == null || raw === "") {
     return 1;
   }
   if (!/^[+-]?\d+$/.test(raw)) {
-    logger(`invalid GH_AW_CLAUDE_STARTUP_RETRIES='${raw}' (expected integer); using default startup retries=1`);
+    logger(`invalid ${envVar}='${raw}' (expected integer); using default startup retries=1`);
     return 1;
   }
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed)) {
-    logger(`invalid GH_AW_CLAUDE_STARTUP_RETRIES='${raw}' (not finite); using default startup retries=1`);
+    logger(`invalid ${envVar}='${raw}' (not finite); using default startup retries=1`);
     return 1;
   }
   const clamped = Math.min(Math.max(parsed, 0), MAX_STARTUP_RETRIES);
   if (clamped !== parsed) {
-    logger(`GH_AW_CLAUDE_STARTUP_RETRIES=${parsed} out of range; clamped to ${clamped}`);
+    logger(`${envVar}=${parsed} out of range; clamped to ${clamped}`);
   }
   return clamped;
 }
@@ -145,8 +200,17 @@ function isOverloadedError(output) {
  * @param {string} output - Collected stdout+stderr from the process
  * @returns {boolean}
  */
-function isRateLimitError(output) {
-  return RATE_LIMIT_ERROR_PATTERN.test(output);
+const isRateLimitError = createOutputPatternMatcher(RATE_LIMIT_ERROR_PATTERN);
+
+/**
+ * Remove stream-JSON user events, which contain tool results, from output used
+ * by failure classifiers.
+ *
+ * @param {string} output - Collected stdout+stderr from the process
+ * @returns {string}
+ */
+function classifiableOutput(output) {
+  return claudeFailureEvidence(output);
 }
 
 /**
@@ -161,6 +225,33 @@ function isMaxTurnsExit(output) {
   return MAX_TURNS_EXIT_PATTERN.test(output);
 }
 
+/**
+ * Determines if the collected output contains the transport-level "invalid JSON
+ * request body" error (HTTP 400 "The request body is not valid JSON"). This has
+ * been observed immediately following a `permission_denied` tool-result on a
+ * compound Bash command, where the CLI appears to re-serialize the conversation
+ * incorrectly for the next turn. It is a serialization bug, not a genuine
+ * application-level 400 from the model.
+ * @param {string} output - Collected stdout+stderr from the process
+ * @returns {boolean}
+ */
+function isInvalidJsonBodyError(output) {
+  return INVALID_JSON_BODY_ERROR_PATTERN.test(output);
+}
+
+/**
+ * Determines if the collected output contains a refused network connection.
+ * @param {string} output - Collected stdout+stderr from the process
+ * @returns {boolean}
+ */
+const isConnectionRefusedError = createOutputPatternMatcher(CONNECTION_REFUSED_ERROR_PATTERN);
+
+/**
+ * Determines whether Claude produced an assistant response before failing.
+ * System initialization and transport-error events do not represent resumable work.
+ * @param {string} output - Collected stdout+stderr from the process
+ * @returns {boolean}
+ */
 /**
  * Determines if the collected output contains a "no deferred tool marker" error.
  * This occurs when Claude Code is invoked with --continue but the session was never
@@ -179,9 +270,7 @@ function isNoDeferredMarkerError(output) {
  * @param {string} output - Collected stdout+stderr from the process
  * @returns {boolean}
  */
-function isInvalidModelError(output) {
-  return INVALID_MODEL_ERROR_PATTERN.test(output);
-}
+const isInvalidModelError = createOutputPatternMatcher(INVALID_MODEL_ERROR_PATTERN);
 
 /**
  * Determines whether the exit code corresponds to signal-style termination
@@ -209,7 +298,7 @@ function shouldRetryWithContinue({ attempt, maxRetries, exitCode, hasOutput, isN
   if (attempt >= maxRetries || !hasOutput || continueDisabledPermanently) {
     return false;
   }
-  if (isSignalTerminationExitCode(exitCode)) {
+  if (isSignalTerminationExitCode(exitCode) || isCrashSignalExitCode(exitCode)) {
     return false;
   }
   if (isNoDeferredMarker) {
@@ -220,65 +309,14 @@ function shouldRetryWithContinue({ attempt, maxRetries, exitCode, hasOutput, isN
 
 /**
  * Resolve --prompt-file arguments for the initial Claude run.
- * Strips the --prompt-file <path> pair from args and appends -- followed by
- * the file content as the last positional argument.
- *
- * The end-of-options marker (--) is essential: Claude Code 2.x treats any
- * non-flag argument that follows --mcp-config as an additional config file
- * path (variadic flag).  Without --, a long prompt appended after
- * --mcp-config <path> would be used as a file path, producing an
- * ENAMETOOLONG error when the prompt exceeds PATH_MAX (~4096 bytes).
- *
- * For --continue retries the prompt should be omitted entirely (Claude resumes
- * from its on-disk session state).  Call this function only for the initial run.
+ * Separate --prompt-file content from argv for stdin delivery. This avoids
+ * argument-size limits and Claude's variadic --mcp-config parsing.
  *
  * @param {string[]} args
- * @returns {string[]} Args with --prompt-file resolved to ["--", <content>]
+ * @returns {{args: string[], prompt: string | null}}
  */
 function resolveClaudePromptFileArgs(args) {
-  /** @type {string[]} */
-  const filteredArgs = [];
-  /** @type {string|null} */
-  let promptContent = null;
-
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] !== "--prompt-file") {
-      filteredArgs.push(args[i]);
-      continue;
-    }
-
-    if (i + 1 >= args.length) {
-      log("warning: --prompt-file provided without a path; leaving arguments unchanged");
-      filteredArgs.push(args[i]);
-      continue;
-    }
-
-    const promptFile = args[i + 1];
-    try {
-      const stat = fs.statSync(promptFile);
-      log(`resolved --prompt-file: path=${promptFile} size=${stat.size}B`);
-      promptContent = fs.readFileSync(promptFile, "utf8");
-    } catch (error) {
-      const err = /** @type {Error} */ error;
-      // An unreadable prompt file means no task instructions can be delivered to Claude.
-      // Propagate as a fatal error rather than forwarding the harness-only flag to the
-      // claude subprocess (which would fail with an "unknown option" error).
-      throw new Error(`--prompt-file '${promptFile}' is not readable: ${err.message}`, { cause: err });
-    }
-    i++; // Skip the prompt-file path argument
-  }
-
-  // Append an end-of-options marker followed by the prompt content.
-  // The '--' prevents Claude Code from treating the prompt text as an additional
-  // --mcp-config value (Claude Code 2.x accepts that flag variadically, so any
-  // non-flag positional argument that follows --mcp-config <path> would otherwise
-  // be tried as a second config file path, causing ENAMETOOLONG for long prompts).
-  if (promptContent !== null) {
-    filteredArgs.push("--");
-    filteredArgs.push(promptContent);
-  }
-
-  return filteredArgs;
+  return resolveHarnessPromptFileArgs(args, { logger: log });
 }
 
 /**
@@ -314,32 +352,151 @@ function stripContinueArgs(args) {
 }
 
 /**
+ * Resolve, validate, and record the routing decision for Claude. Claude routes on
+ * GitHub Copilot (model-provider: github) or natively on Anthropic, matching the
+ * engine's resolved GH_AW_LLM_PROVIDER.
+ * @param {any} reflectData
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{selection: any, effort: string|null, error: string|null}}
+ */
+function resolveClaudeModelRouting(reflectData, env = process.env) {
+  const routingProvider = resolveAWFRoutingProvider("claude", env.GH_AW_LLM_PROVIDER);
+  const result = routingProvider
+    ? routingProvider === "github"
+      ? resolveAWFModelRoutingSelection(reflectData, true, CLAUDE_ROUTING_POLICY.endpoints, CLAUDE_ROUTING_POLICY.allowEndpointOverride)
+      : resolveAWFModelRoutingSelection(reflectData, true, CLAUDE_ROUTING_POLICY.endpoints, CLAUDE_ROUTING_POLICY.allowEndpointOverride, routingProvider)
+    : { selection: null, error: `AWF model routing is not supported for Claude on provider ${env.GH_AW_LLM_PROVIDER}` };
+  if (result.error || !result.selection) {
+    const error = result.error || "AWF model routing selection is missing";
+    recordAWFModelRoutingOutcome(
+      {
+        status: reflectData?.routing?.status === "failed" ? "failed" : "rejected",
+        failure_code: reflectData?.routing?.failure_code || getAWFModelRoutingFailureCode(error),
+        detail: error,
+      },
+      env
+    );
+    return { selection: null, effort: null, error };
+  }
+  const mappedEffort = mapAWFRoutingEffort("claude", result.selection.effort);
+  if (mappedEffort.error) {
+    recordAWFModelRoutingOutcome({ status: "rejected", failure_code: "unsupported_effort", detail: mappedEffort.error }, env);
+    return { selection: null, effort: null, error: mappedEffort.error };
+  }
+  recordAWFModelRoutingOutcome(
+    {
+      status: "selected",
+      wire_model: result.selection.wire_model,
+      endpoint: result.selection.endpoint,
+      selected_endpoint: result.selection.selected_endpoint,
+      effort: result.selection.effort,
+      applied_effort: mappedEffort.effort,
+    },
+    env
+  );
+  return { selection: result.selection, effort: mappedEffort.effort, error: null };
+}
+
+/**
  * Build Claude child process env with provider endpoint overrides resolved from /reflect.
+ * The configured model goes through the shared "resolve configured model" step first;
+ * Claude's own handling (copilot/ prefix, `auto` rule) runs on the result.
+ * @param {import("./awf_reflect.cjs").ReflectData | null | undefined} reflectData
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {(message: string) => void} [logger]
+ * @param {{ refetchReflectData?: () => Promise<any> }} [options]
  * @returns {Promise<NodeJS.ProcessEnv>}
  */
-async function buildClaudeChildEnv() {
-  const childEnv = { ...process.env };
-  applyModelFallback(childEnv, "ANTHROPIC_MODEL", log);
-  const provider = normalizeReflectProviderName(process.env.GH_AW_LLM_PROVIDER, "anthropic");
-  try {
-    const raw = fs.readFileSync(AWF_REFLECT_OUTPUT_PATH, "utf8");
-    const reflectData = JSON.parse(raw);
-    const resolved = resolveProviderEndpointFromReflect({ provider, reflectData, logger: log });
-    if (resolved && resolved.baseUrl) {
-      childEnv.ANTHROPIC_BASE_URL = resolved.baseUrl;
-      log(`configured ANTHROPIC_BASE_URL from /reflect for provider=${provider}: ${resolved.baseUrl}`);
-    }
-  } catch (error) {
-    const err = /** @type {Error} */ error;
-    log(`warning: unable to resolve provider endpoint from /reflect: ${err.message}`);
+async function buildClaudeChildEnv(reflectData, env = process.env, logger = log, options = {}) {
+  const childEnv = { ...env };
+  applyClaudeRuntimeTimeouts(childEnv);
+  if (env.GH_AW_MODEL_ROUTING === "1") {
+    const result = resolveClaudeModelRouting(reflectData, env);
+    if (result.error || !result.selection) throw new Error(`${result.error || "AWF model routing selection is missing"}; refusing to start Claude`);
+    childEnv.ANTHROPIC_MODEL = result.selection.wire_model;
+    delete childEnv.GH_AW_MODEL_FALLBACK;
+    if (result.effort) childEnv.CLAUDE_CODE_EFFORT_LEVEL = result.effort;
+    else delete childEnv.CLAUDE_CODE_EFFORT_LEVEL;
+    const endpointOverride = result.selection.selected_endpoint && result.selection.selected_endpoint !== result.selection.endpoint ? ` selected_endpoint=${result.selection.selected_endpoint}` : "";
+    logger(`inference routing: mode=awf-routed model=${result.selection.wire_model} effort=${result.selection.effort || "(unset)"} endpoint=${result.selection.endpoint}${endpointOverride}`);
+  } else {
+    applyModelFallback(childEnv, "ANTHROPIC_MODEL", logger);
   }
-  return childEnv;
+  const provider = normalizeReflectProviderName(env.GH_AW_LLM_PROVIDER, "anthropic");
+  const copilotProvider = REFLECT_PROVIDER_ALIASES.github.has(provider);
+  if (env.GH_AW_MODEL_ROUTING !== "1" && env.GH_AW_LLM_PROVIDER_EXPLICIT === "1" && !copilotProvider) {
+    const overriddenModel = /^copilot\/(.+)$/i.exec(String(childEnv.ANTHROPIC_MODEL || "").trim());
+    if (overriddenModel) childEnv.ANTHROPIC_MODEL = overriddenModel[1];
+  }
+  if (childEnv.ANTHROPIC_MODEL && env.GH_AW_MODEL_ROUTING !== "1") {
+    const resolution = await resolveEngineModel({
+      engine: "claude",
+      role: "main",
+      configuredModel: childEnv.ANTHROPIC_MODEL,
+      provider,
+      reflectData,
+      refetchReflectData: options.refetchReflectData,
+      preserveAuto: true,
+      normalize: result => normalizeClaudeModel(result.resolvedModel, provider, childEnv, { reflectData, logger }),
+      logger,
+      env,
+    });
+    if (resolution.reflectData) reflectData = resolution.reflectData;
+    childEnv.ANTHROPIC_MODEL = resolution.engineModel;
+  }
+  const resolved = reflectData ? resolveProviderEndpointFromReflect({ provider: copilotProvider ? "github" : provider, reflectData, logger }) : null;
+  if (copilotProvider && (!resolved || !REFLECT_PROVIDER_ALIASES.github.has(normalizeReflectProviderName(resolved.endpointProvider)))) {
+    throw new Error("Claude GitHub Copilot inference requires a configured Copilot endpoint from AWF /reflect; keep the agent sandbox enabled and configure permissions.copilot-requests: write or COPILOT_GITHUB_TOKEN");
+  }
+  if (env.GH_AW_MODEL_ROUTING === "1" && !copilotProvider && (!resolved?.baseUrl || !REFLECT_PROVIDER_ALIASES.anthropic.has(normalizeReflectProviderName(resolved.endpointProvider)))) {
+    throw new Error("Claude native Anthropic model routing requires the configured Anthropic endpoint from AWF /reflect; refusing to start Claude");
+  }
+  if (resolved?.baseUrl) {
+    childEnv.ANTHROPIC_BASE_URL = resolved.baseUrl;
+    logger(`configured ANTHROPIC_BASE_URL from /reflect for provider=${provider}: ${resolved.baseUrl}`);
+  }
+  return stripExecutionEvidenceEnv(childEnv);
+}
+
+/**
+ * Remove fixed model and effort options so routing cannot be overridden by caller arguments.
+ * @param {string[]} args
+ * @returns {string[]}
+ */
+function removeClaudeRoutingOverrides(args) {
+  const result = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--model" || args[i] === "--effort") {
+      i++;
+      continue;
+    }
+    if (args[i].startsWith("--model=") || args[i].startsWith("--effort=")) continue;
+    result.push(args[i]);
+  }
+  return result;
+}
+
+/**
+ * Append --settings from GH_AW_CLAUDE_SETTINGS when the caller passed no --settings.
+ * The external threat-detect binary builds its own Claude Code arguments, so the
+ * compiler hands the Copilot modelOverrides map to Claude Code through this variable.
+ * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string[]}
+ */
+function applyClaudeSettingsEnv(args, env = process.env) {
+  const settings = (env.GH_AW_CLAUDE_SETTINGS || "").trim();
+  if (!settings) return args;
+  if (args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) return args;
+  return [...args, "--settings", settings];
 }
 
 /**
  * Main entry point: run claude with retry logic for transient API failures.
  */
 async function main() {
+  const executionEvidence = captureExecutionEvidenceConfiguration(process.env);
+  stripExecutionEvidenceEnv(process.env);
   const [, , command, ...args] = process.argv;
   const retryConfig = resolveRetryConfig(process.env, log);
   const { maxRetries, initialDelayMs, backoffMultiplier, maxDelayMs } = retryConfig;
@@ -355,241 +512,432 @@ async function main() {
   // Resolve the prompt for the initial run (reads --prompt-file content).
   // A missing or unreadable prompt file is treated as a fatal startup error.
   let initialArgs;
+  let prompt;
+  let pluginDir;
   try {
-    initialArgs = resolveClaudePromptFileArgs(args);
+    const resolved = resolveClaudePromptFileArgs(args);
+    prompt = resolved.prompt;
+    const capabilities = claudeBareCapabilities(claudeRepositoryEditPolicy(stripContinueArgs(resolved.args), process.env));
+    initialArgs = applyClaudeSettingsEnv(capabilities.args, process.env);
+    pluginDir = capabilities.pluginDir;
   } catch (err) {
     const e = /** @type {Error} */ err;
     log(`fatal: ${e.message}`);
     process.exit(1);
   }
+  // Auto model selection needs the configured provider's live inventory.
+  const reflection = await fetchAWFReflect({ logger: log });
+  let childEnv;
+  try {
+    let modelEnv = process.env;
+    if (process.env.GH_AW_MODEL_ROUTING === "1") {
+      initialArgs = removeClaudeRoutingOverrides(initialArgs);
+    } else {
+      // CLI model flags override ANTHROPIC_MODEL, so resolve that effective model once.
+      for (let i = 0; i < initialArgs.length; i++) {
+        if (initialArgs[i] === "--") break;
+        if (initialArgs[i] === "--model" && i + 1 < initialArgs.length) {
+          modelEnv = { ...process.env, ANTHROPIC_MODEL: initialArgs[++i] };
+        } else if (initialArgs[i].startsWith("--model=")) {
+          modelEnv = { ...process.env, ANTHROPIC_MODEL: initialArgs[i].slice("--model=".length) };
+        }
+      }
+    }
+    childEnv = await buildClaudeChildEnv(reflection.reflectData, modelEnv, log, {
+      refetchReflectData: async () => (await fetchAWFReflect({ logger: log })).reflectData || null,
+    });
+    for (let i = 0; i < initialArgs.length; i++) {
+      if (initialArgs[i] === "--") break;
+      if (initialArgs[i] === "--model" && i + 1 < initialArgs.length) {
+        initialArgs[++i] = childEnv.ANTHROPIC_MODEL;
+      } else if (initialArgs[i].startsWith("--model=")) {
+        initialArgs[i] = `--model=${childEnv.ANTHROPIC_MODEL}`;
+      }
+    }
+  } catch (error) {
+    removeClaudePlugin(pluginDir);
+    throw error;
+  }
+
   const freshRetryArgs = stripContinueArgs(initialArgs);
   // Args without --prompt-file, used as the base for --continue retries.
-  const continueBaseArgs = stripContinueArgs(stripPromptFileArgs(args));
+  const continueBaseArgs = freshRetryArgs;
 
-  // Detect whether the original args included --prompt-file so we know whether
-  // initialArgs carries prompt text as its last positional arg.
-  const hadPromptFile = args.includes("--prompt-file");
-
-  // Safe arg list for logging: when --prompt-file was present, the last two elements of
-  // initialArgs are the -- end-of-options marker and the resolved prompt content.
-  // Strip both and replace with a placeholder so task instructions are never written
-  // to stderr or captured in agent logs.
-  const safeInitialArgs = hadPromptFile && initialArgs.length > 0 ? [...initialArgs.slice(0, -2), "<prompt omitted>"] : initialArgs;
-  const safeFreshRetryArgs = hadPromptFile && freshRetryArgs.length > 0 ? [...freshRetryArgs.slice(0, -2), "<prompt omitted>"] : freshRetryArgs;
-
-  // Fetch AWF API proxy reflection data before running the agent to capture initial proxy state.
-  // This is best-effort: failures are logged but do not affect the agent run.
-  await fetchAWFReflect({ logger: log });
-  const childEnv = await buildClaudeChildEnv();
+  const safeInitialArgs = initialArgs;
+  const safeFreshRetryArgs = freshRetryArgs;
 
   // Pre-flight: skip the agent entirely when a noop has already been written by a prior step.
   // A noop indicates the work is complete or there is nothing to do — starting the agent
   // would be wasteful and potentially harmful.
   const safeOutputsPath = process.env.GH_AW_SAFE_OUTPUTS || "";
-  if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
-    log("pre-flight: noop message found in safe-outputs — skipping agent (work is already complete or no work needed)");
+  if (shouldSkipForNoopSafeOutputs({ safeOutputsPath, hasNoopInSafeOutputs, log, executionEvidence })) {
+    removeClaudePlugin(pluginDir);
     process.exit(0);
   }
 
-  let delay = initialDelayMs;
+  // Sub-agent models are resolved on routed runs too, but a pre-existing noop must not
+  // make startup depend on sub-agent model availability. Threat detection uses no
+  // sub-agents, so it neither reads, resolves, records nor writes agent files.
+  if (!isDetectionPhase(process.env.GH_AW_PHASE)) {
+    let subagents;
+    try {
+      subagents = await applyClaudeSubagentModels({
+        reflectData: reflection.reflectData,
+        refetchReflectData: async () => (await fetchAWFReflect({ logger: log })).reflectData || null,
+        provider: normalizeReflectProviderName(process.env.GH_AW_LLM_PROVIDER, "anthropic"),
+        pluginDir,
+        env: process.env,
+        logger: log,
+      });
+    } catch (error) {
+      log(`fatal: unexpected error while resolving Claude sub-agent models: ${getErrorMessage(error)}. Refusing to start Claude with unresolved sub-agent models.`);
+      subagents = { ok: false };
+    }
+    if (!subagents.ok) {
+      removeClaudePlugin(pluginDir);
+      process.exit(1);
+    }
+  }
+
   let lastExitCode = 1;
   let useContinueOnRetry = false;
   let continueDisabledPermanently = false;
   let startupRetriesUsed = 0;
+  // Tracks whether the *active session* (the run currently being resumed via --continue)
+  // has ever produced an assistant response. This must persist across attempts — a later
+  // --continue attempt can fail during its own startup (e.g. connection refused before it
+  // emits anything) even though earlier attempts in the same session already made progress.
+  // Reset only when a genuinely fresh run begins (see below), never on a --continue attempt.
+  let sessionHasProgress = false;
+  const durableSession = openDurableSession("claude");
+  let sessionId = durableSession?.id || undefined;
   const driverStartTime = Date.now();
-  // Soft-timeout guard: polled at the top of the retry loop and after each backoff sleep.
-  // It does not preempt a running attempt — if a single invocation runs past the soft
-  // deadline the guard fires on the next iteration. Individual attempts are expected to
-  // complete within the SOFT_TIMEOUT_BUFFER_MS window.
+  // The same deadline guards both the retry loop and each active child process.
   const softTimeoutGuard = buildSoftTimeoutGuard(driverStartTime);
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (softTimeoutGuard && Date.now() >= softTimeoutGuard.softDeadlineMs) {
-      emitSoftTimeoutSignal(softTimeoutGuard, `before attempt ${attempt + 1}`, "Claude harness", log);
-      lastExitCode = 1;
-      break;
-    }
-
-    // For --continue retries: omit the original prompt and add --continue.
-    // Claude Code resumes the session from on-disk state; re-sending the original
-    // instructions would re-execute the full task from scratch.
-    let currentArgs;
-    if (attempt > 0 && useContinueOnRetry) {
-      currentArgs = [...continueBaseArgs, "--continue"];
-    } else {
-      currentArgs = attempt === 0 ? initialArgs : freshRetryArgs;
-    }
-
-    // Use redacted args for logging when the run carries the prompt text.
-    const logArgs = attempt === 0 ? safeInitialArgs : useContinueOnRetry ? currentArgs : safeFreshRetryArgs;
-
-    if (attempt > 0) {
-      const retryMode = useContinueOnRetry ? "--continue" : "fresh run";
-      log(`retry ${attempt}/${maxRetries}: sleeping ${delay}ms before next attempt (${retryMode})`);
-      await sleep(delay);
-      delay = Math.min(delay * backoffMultiplier, maxDelayMs);
-      log(`retry ${attempt}/${maxRetries}: woke up, next delay cap will be ${Math.min(delay * backoffMultiplier, maxDelayMs)}ms`);
-      if (softTimeoutGuard && Date.now() >= softTimeoutGuard.softDeadlineMs) {
-        emitSoftTimeoutSignal(softTimeoutGuard, "after backoff sleep", "Claude harness", log);
-        lastExitCode = 1;
-        break;
+  const retryRun = await runHarnessRetryLoop({
+    telemetryPath: resolveHarnessRetryTelemetryPath(),
+    maxRetries,
+    initialDelayMs,
+    backoffMultiplier,
+    maxDelayMs,
+    driverStartTime,
+    harnessName: "Claude harness",
+    log,
+    softTimeoutGuard,
+    getRetryMode: () => (useContinueOnRetry ? `--resume ${sessionId}` : "fresh run"),
+    runAttempt: async (attempt, observeStrategy) => {
+      let nativeTerminalRateLimitError = false;
+      /** @type {number | null} */
+      let retryAfterMs = null;
+      // Resume only the captured session; never select the latest unrelated conversation.
+      // Claude Code resumes the session from on-disk state; re-sending the original
+      // instructions would re-execute the full task from scratch.
+      let currentArgs;
+      if ((attempt === 0 && durableSession?.id) || (attempt > 0 && useContinueOnRetry)) {
+        currentArgs = [...continueBaseArgs, "--resume", sessionId];
+      } else {
+        if (durableSession?.id && attempt > 0) throw new Error("Durable Claude continuation cannot restart a recorded session as a fresh conversation");
+        currentArgs = attempt === 0 ? initialArgs : freshRetryArgs;
+        // This attempt starts a brand-new session (either attempt 0, or a fresh
+        // retry that discards prior on-disk state) — no assistant progress can carry
+        // forward from any earlier attempt, so reset the tracker.
+        sessionHasProgress = false;
+        sessionId = undefined;
       }
-    }
 
-    const result = await runProcess({ command, args: currentArgs, attempt, log, logArgs, env: childEnv });
-    lastExitCode = result.exitCode;
-
-    // Success — stop retrying
-    if (result.exitCode === 0) {
-      log(`success on attempt ${attempt + 1}: totalDuration=${formatDuration(Date.now() - driverStartTime)}`);
-      lastExitCode = 0;
-      break;
-    }
-
-    const isOverloaded = isOverloadedError(result.output);
-    const isRateLimit = isRateLimitError(result.output);
-    const isAuthenticationFailed = isAuthenticationFailedError(result.output);
-    const isMaxTurns = isMaxTurnsExit(result.output);
-    const isNoDeferredMarker = isNoDeferredMarkerError(result.output);
-    const isInvalidModel = isInvalidModelError(result.output);
-    const permissionDeniedCount = countPermissionDeniedIssues(result.output);
-    const hasNumerousPermissionDenied = hasNumerousPermissionDeniedIssues(result.output);
-    log(
-      `attempt ${attempt + 1} failed:` +
-        ` exitCode=${result.exitCode}` +
-        ` isOverloadedError=${isOverloaded}` +
-        ` isRateLimitError=${isRateLimit}` +
-        ` isAuthenticationFailedError=${isAuthenticationFailed}` +
-        ` isMaxTurnsExit=${isMaxTurns}` +
-        ` isNoDeferredMarkerError=${isNoDeferredMarker}` +
-        ` isInvalidModelError=${isInvalidModel}` +
-        ` permissionDeniedCount=${permissionDeniedCount}` +
-        ` hasNumerousPermissionDenied=${hasNumerousPermissionDenied}` +
-        ` hasOutput=${result.hasOutput}` +
-        ` retriesRemaining=${maxRetries - attempt}`
-    );
-
-    // If a noop was written to safe-outputs during the failed run, the agent determined
-    // there was nothing to do (or the user indicated so before the agent ran).  Retrying
-    // would not produce different results and could waste resources.
-    if (safeOutputsPath && hasNoopInSafeOutputs(safeOutputsPath, { logger: log })) {
-      log(`attempt ${attempt + 1}: noop message found in safe-outputs — not retrying (work is already complete or no work needed)`);
-      lastExitCode = 0;
-      break;
-    }
-
-    const nonRetryableGuard = detectNonRetryableHarnessGuard(result.output);
-    if (nonRetryableGuard.aiCreditsExceeded || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.maxRunsExceeded) {
-      const reasons = [];
-      if (nonRetryableGuard.aiCreditsExceeded) reasons.push("AI credits budget exceeded");
-      if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
-      if (nonRetryableGuard.maxRunsExceeded) reasons.push("maximum LLM invocations exceeded");
-      log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
-      break;
-    }
-
-    if (attempt === 0 && isAuthenticationFailed) {
-      log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
-      break;
-    }
-
-    if (isInvalidModel) {
-      log(`attempt ${attempt + 1}: invalid/unsupported model configuration — not retrying (specify a valid engine model name in workflow frontmatter)`);
-      break;
-    }
-
-    if (hasNumerousPermissionDenied) {
-      // If the agent already produced expected safe-outputs, the permission-denied
-      // signals are from optional/exploratory commands — not from the core task work.
-      // Suppress the terminal verdict and exit 0 to avoid a false-red run.
-      if (safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
-        log(`attempt ${attempt + 1}: detected numerous permission-denied issues but safe-outputs already contain expected output — suppressing terminal verdict (false-red: core work succeeded)`);
-        lastExitCode = 0;
-        break;
-      }
-      const deniedCommands = extractDeniedCommands(result.output);
-      emitMissingToolPermissionIssue({ deniedCommands, logger: log });
-      log(`attempt ${attempt + 1}: detected numerous permission-denied issues — not retrying (classified as missing tool/permission issue)`);
-      break;
-    }
-
-    // max_turns is a deterministic terminal condition: the session ended cleanly after
-    // exhausting the allowed number of turns.  --continue cannot resume it because no
-    // deferred tool marker was written.  Retrying would immediately fail with "No deferred
-    // tool marker found", wasting time and masking the real exit reason.
-    if (isMaxTurns) {
-      log(`attempt ${attempt + 1}: max_turns exit — not retriable via --continue`);
-      break;
-    }
-
-    // "No deferred tool marker found" is a deterministic terminal condition: the session
-    // was never deferred, the marker is stale (tool already ran), or it falls outside the
-    // tail-scan window. If this happens on a --continue attempt, restart fresh and disable
-    // --continue permanently so we do not re-enter the same invalid retry path.
-    if (isNoDeferredMarker) {
-      if (attempt < maxRetries && result.hasOutput) {
-        useContinueOnRetry = false;
-        continueDisabledPermanently = true;
-        log(`attempt ${attempt + 1}: no deferred tool marker on --continue — retrying as fresh run (failure_reason=harness_retry_path_invalid, --continue disabled permanently, attempt ${attempt + 2}/${maxRetries + 1})`);
-        continue;
-      }
-      log(`attempt ${attempt + 1}: no deferred tool marker — not retriable via --continue (failure_reason=harness_retry_path_invalid)`);
-      break;
-    }
-
-    // Retry when the session was partially executed (has output).
-    // Use --continue so Claude Code can resume from its saved session state.
-    if (attempt < maxRetries && result.hasOutput) {
-      const isSignalTermination = isSignalTerminationExitCode(result.exitCode);
-      const retryWithContinue = shouldRetryWithContinue({
+      // Use redacted args for logging when the run carries the prompt text.
+      const strategy = selectedHarnessStrategy(currentArgs, "claude");
+      observeStrategy(strategy);
+      const logArgs = attempt === 0 ? safeInitialArgs : useContinueOnRetry ? currentArgs : safeFreshRetryArgs;
+      const safeOutputsByteOffset = claudeSafeOutputsOffset(safeOutputsPath);
+      const result = await runProcess({
+        command,
+        args: currentArgs,
         attempt,
-        maxRetries,
-        exitCode: result.exitCode,
-        hasOutput: result.hasOutput,
-        isNoDeferredMarker,
-        continueDisabledPermanently,
+        log,
+        logArgs,
+        env: childEnv,
+        onStdoutLine: line => {
+          observeDurableSession(durableSession, "claude", line);
+          if (isRateLimitError(classifiableOutput(line))) nativeTerminalRateLimitError = true;
+          const { isGitHubRetryAfterProvider, parseTerminalRetryAfterMs } = require("./copilot_retry_after.cjs");
+          if (isGitHubRetryAfterProvider(process.env.GH_AW_LLM_PROVIDER)) {
+            const delay = parseTerminalRetryAfterMs(line, "claude");
+            if (delay != null) retryAfterMs = Math.max(retryAfterMs ?? 0, delay);
+          }
+        },
+        onStderrLine: line => {
+          if (isRateLimitError(line)) nativeTerminalRateLimitError = true;
+        },
+        stdin: attempt > 0 && useContinueOnRetry ? CLAUDE_RESUME_PROMPT : (prompt ?? undefined),
+        postResultWatchdog: safeOutputsPath
+          ? {
+              shouldArm: () => hasTerminalSafeOutput(safeOutputsPath, { byteOffset: safeOutputsByteOffset, logger: log }),
+              inactivityTimeoutMs: resolvePostResultWatchdogIdleTimeoutMs(),
+            }
+          : undefined,
+        runtimeGuard: softTimeoutGuard
+          ? {
+              shouldTerminate: () => (Date.now() >= softTimeoutGuard.softDeadlineMs ? { terminate: true, reason: "Claude execution reached its soft deadline" } : false),
+            }
+          : undefined,
       });
-      if (isSignalTermination) {
-        continueDisabledPermanently = true;
+      sessionId = claudeSessionId(result.output) || sessionId;
+      return {
+        ...result,
+        exitCode: result.runtimeGuardFired && result.exitCode === 0 ? 1 : result.exitCode,
+        safeOutputsByteOffset,
+        strategy,
+        nativeTerminalRateLimitError,
+        retryAfterMs,
+      };
+    },
+    handleFailure: async ({ attempt, result }) => {
+      if (result.runtimeGuardFired && softTimeoutGuard) {
+        emitSoftTimeoutSignal(softTimeoutGuard, "during execution", "Claude harness", log);
+        return { action: "stop" };
       }
-      const reason = isSignalTermination
-        ? `signal-style termination exitCode=${result.exitCode} (failure_reason=cancelled_or_timed_out)`
-        : isOverloaded
-          ? "overloaded_error (transient)"
-          : isRateLimit
-            ? "rate_limit_error (transient)"
-            : "partial execution";
-      useContinueOnRetry = retryWithContinue;
-      const retryMode = retryWithContinue ? "--continue" : "fresh run (--continue disabled permanently)";
-      log(`attempt ${attempt + 1}: ${reason} — will retry with ${retryMode} (attempt ${attempt + 2}/${maxRetries + 1})`);
-      continue;
-    }
+      if (result.watchdogFired && hasTerminalSafeOutput(safeOutputsPath, { byteOffset: result.safeOutputsByteOffset, logger: log })) {
+        log("post-result watchdog stopped an idle process after terminal safe-output — treating as success");
+        return { action: "stop", exitCode: 0 };
+      }
+      const classifierOutput = claudeFailureEvidence(result.output);
+      const isCybersecurityPolicyRejection = isGitHubProviderCybersecurityPolicyRejection(result.output, process.env.GH_AW_LLM_PROVIDER, "claude");
+      const isOverloaded = isOverloadedError(classifierOutput);
+      const isRateLimit = isRateLimitError(classifierOutput);
+      const isAuthenticationFailed = isAuthenticationFailedError(classifierOutput);
+      const isMaxTurns = isMaxTurnsExit(classifierOutput);
+      const isNoDeferredMarker = isNoDeferredMarkerError(classifierOutput);
+      const isInvalidModel = isInvalidModelError(classifierOutput);
+      const isInvalidJsonBody = isInvalidJsonBodyError(classifierOutput);
+      const isConnectionRefused = isConnectionRefusedError(classifierOutput);
+      // Accumulate across attempts of the same session: once an assistant response has been
+      // observed, it stays true for the remainder of this session's --continue attempts, even
+      // if a later attempt's own output contains nothing but startup/transport errors.
+      sessionHasProgress = sessionHasProgress || hasClaudeSessionProgress(result.output);
+      const denials = claudePermissionDenials(result.output);
+      const permissionDeniedCount = denials.count;
+      const hasNumerousPermissionDenied = permissionDeniedCount >= 3;
+      const crashSignalName = crashSignalNameForExitCode(result.exitCode);
+      result.failureClasses = Object.entries({
+        content_filter: isCybersecurityPolicyRejection,
+        overloaded_error: isOverloaded,
+        rate_limit_error: isRateLimit,
+        authentication_failed: isAuthenticationFailed,
+        max_turns: isMaxTurns,
+        no_deferred_marker: isNoDeferredMarker,
+        invalid_model: isInvalidModel,
+        invalid_json_body: isInvalidJsonBody,
+        connection_refused: isConnectionRefused,
+        permission_denied: hasNumerousPermissionDenied,
+        sandbox_runtime_crash: !!crashSignalName,
+        cancelled_or_timed_out: isSignalTerminationExitCode(result.exitCode),
+      })
+        .filter(([, detected]) => detected)
+        .map(([reason]) => reason);
+      log(
+        `attempt ${attempt + 1} failed:` +
+          ` exitCode=${result.exitCode}` +
+          (crashSignalName ? ` crashSignal=${crashSignalName}` : "") +
+          ` isOverloadedError=${isOverloaded}` +
+          ` isRateLimitError=${isRateLimit}` +
+          ` isAuthenticationFailedError=${isAuthenticationFailed}` +
+          ` isMaxTurnsExit=${isMaxTurns}` +
+          ` isNoDeferredMarkerError=${isNoDeferredMarker}` +
+          ` isInvalidModelError=${isInvalidModel}` +
+          ` isInvalidJsonBodyError=${isInvalidJsonBody}` +
+          ` isConnectionRefusedError=${isConnectionRefused}` +
+          ` isCybersecurityPolicyRejection=${isCybersecurityPolicyRejection}` +
+          ` sessionHasProgress=${sessionHasProgress}` +
+          ` permissionDeniedCount=${permissionDeniedCount}` +
+          ` hasNumerousPermissionDenied=${hasNumerousPermissionDenied}` +
+          ` hasOutput=${result.hasOutput}` +
+          ` retriesRemaining=${maxRetries - attempt}`
+      );
 
-    if (attempt >= maxRetries) {
-      log(`all ${maxRetries} retries exhausted — giving up (exitCode=${lastExitCode})`);
-    } else {
-      if (startupRetriesUsed < startupRetryLimit) {
+      if (isCybersecurityPolicyRejection) {
+        log(`attempt ${attempt + 1}: GitHub provider blocked the request for cybersecurity policy — not retrying; task completion could not be confirmed`);
+        return { action: "stop" };
+      }
+
+      if (shouldStopForNoopSafeOutputs({ attempt, safeOutputsPath, hasNoopInSafeOutputs, log })) {
+        return { action: "stop", exitCode: 0 };
+      }
+
+      const nonRetryableGuard = detectNonRetryableHarnessGuard(classifierOutput);
+      if (!nonRetryableGuard.maxRunsExceeded) {
+        const budget = await detectExhaustedAWFInvocationBudget({ nativeTerminalRateLimitError: result.nativeTerminalRateLimitError === true, logger: log });
+        if (budget) {
+          nonRetryableGuard.maxRunsExceeded = true;
+          result.failureClasses.push("invocation_cap_exceeded");
+          log(`attempt ${attempt + 1}: AWF shared invocation budget exhausted (${budget.invocationCount}/${budget.maxRuns}) — confirmed by fresh reflection`);
+        }
+      }
+      if (nonRetryableGuard.apiProxyGuardRejection) {
+        const reason = `AWF API proxy guardrail rejected the request: ${nonRetryableGuard.apiProxyGuardRejection.guard}`;
+        log(`${reason} — not retrying`);
+        emitInfrastructureIncomplete(reason, { logger: log });
+        return { action: "stop" };
+      }
+      const proxyAICreditsRejection = parseAICreditsExceededProxyRejection(result.output);
+      if (proxyAICreditsRejection) {
+        log(`attempt ${attempt + 1}: AWF API proxy rejected the request with HTTP 403 max-AI-credits (${proxyAICreditsRejection.aiCredits}/${proxyAICreditsRejection.maxAICredits}) — trusted budget-abort evidence`);
+      }
+      const trustedAICreditsExceeded = nonRetryableGuard.aiCreditsExceeded && (!!proxyAICreditsRejection || parseMaxAICreditsExceededFromAuditLog());
+      if (nonRetryableGuard.aiCreditsExceeded && !trustedAICreditsExceeded) {
+        log(`attempt ${attempt + 1}: AI credits marker found in CLI output without trusted firewall audit confirmation — preserving normal failure handling`);
+      }
+      // Some CLIs surface the proxy's budget rejection as an authentication failure (e.g. Claude Code
+      // reports `error: authentication_failed` for "403 Maximum AI credits exceeded"). When the trusted
+      // proxy signature is present that veto must not mask intentional budget enforcement.
+      const shouldTreatAICreditsExceededAsSuccess = trustedAICreditsExceeded && (!isAuthenticationFailed || !!proxyAICreditsRejection);
+      if (shouldTreatAICreditsExceededAsSuccess || nonRetryableGuard.awfAPIProxyBlockingRequests || nonRetryableGuard.maxRunsExceeded) {
+        const reasons = [];
+        if (shouldTreatAICreditsExceededAsSuccess) reasons.push("AI credits budget exceeded");
+        if (nonRetryableGuard.awfAPIProxyBlockingRequests) reasons.push("AWF API proxy is blocking requests");
+        if (nonRetryableGuard.maxRunsExceeded) reasons.push("maximum LLM invocations exceeded");
+        log(`attempt ${attempt + 1}: ${reasons.join(" and ")} — not retrying (non-retryable guard condition)`);
+        if (shouldTreatAICreditsExceededAsSuccess) {
+          log(`attempt ${attempt + 1}: AI credits budget enforced — exiting 0 (budget control, not an error)`);
+          return { action: "stop", exitCode: 0 };
+        }
+        if (nonRetryableGuard.maxRunsExceeded && safeOutputsPath && hasExpectedSafeOutputs(safeOutputsPath, { logger: log })) {
+          log(`attempt ${attempt + 1}: invocation cap saturated but safe-outputs already contain expected output — suppressing terminal verdict (false-red: core work succeeded)`);
+          return { action: "stop", exitCode: 0 };
+        }
+        return { action: "stop" };
+      }
+
+      const isSignalTermination = isSignalTerminationExitCode(result.exitCode);
+      const isCrashSignal = isCrashSignalExitCode(result.exitCode);
+      if (sessionHasProgress && (isSignalTermination || isCrashSignal || isNoDeferredMarker || isInvalidJsonBody) && process.env.GH_AW_CLAUDE_ALLOW_FRESH_RESTART !== "true") {
+        const reason = "Claude cannot safely resume completed work; refusing to replay the original task. Set GH_AW_CLAUDE_ALLOW_FRESH_RESTART=true only for replay-safe workflows.";
+        emitInfrastructureIncomplete(reason, { logger: log });
+        log(reason);
+        return { action: "stop" };
+      }
+      if (attempt < maxRetries && result.hasOutput && (isSignalTermination || isCrashSignal)) {
+        continueDisabledPermanently = true;
+        useContinueOnRetry = false;
+        const reason = isCrashSignal
+          ? `fatal-signal crash exitCode=${result.exitCode} (signal=${crashSignalName}, failure_reason=sandbox_runtime_crash)`
+          : `signal-style termination exitCode=${result.exitCode} (failure_reason=cancelled_or_timed_out)`;
+        log(`attempt ${attempt + 1}: ${reason} — will retry with fresh run (--continue disabled permanently) (attempt ${attempt + 2}/${maxRetries + 1})`);
+        return { action: "retry" };
+      }
+
+      if (attempt === 0 && isAuthenticationFailed) {
+        log(`attempt ${attempt + 1}: authentication failed — not retrying (first-attempt auth failure is non-retryable)`);
+        return { action: "stop" };
+      }
+
+      if (isInvalidModel) {
+        log(`attempt ${attempt + 1}: invalid/unsupported model configuration — not retrying (specify a valid engine model name in workflow frontmatter)`);
+        return { action: "stop" };
+      }
+
+      if (hasNumerousPermissionDenied) {
+        return stopForPermissionDenied({ attempt, output: result.output, safeOutputsPath, log, deniedCommands: denials.commands });
+      }
+
+      if (isMaxTurns) {
+        log(`attempt ${attempt + 1}: max_turns exit — not retriable via --continue`);
+        return { action: "stop" };
+      }
+
+      if (isNoDeferredMarker) {
+        if (attempt < maxRetries && result.hasOutput) {
+          if (!continueDisabledPermanently && !sessionId) {
+            log("partial execution produced no session ID — not retrying to avoid resuming an unrelated conversation");
+            return { action: "stop" };
+          }
+          useContinueOnRetry = false;
+          continueDisabledPermanently = true;
+          log(`attempt ${attempt + 1}: no deferred tool marker on --continue — retrying as fresh run (failure_reason=harness_retry_path_invalid, --continue disabled permanently, attempt ${attempt + 2}/${maxRetries + 1})`);
+          return { action: "retry" };
+        }
+        log(`attempt ${attempt + 1}: no deferred tool marker — not retriable via --continue (failure_reason=harness_retry_path_invalid)`);
+        return { action: "stop" };
+      }
+
+      if (isInvalidJsonBody) {
+        if (attempt < maxRetries && result.hasOutput) {
+          useContinueOnRetry = false;
+          continueDisabledPermanently = true;
+          log(
+            `attempt ${attempt + 1}: invalid JSON request body (transport-level serialization bug, likely following a permission_denied) — retrying as fresh run (--continue disabled permanently, attempt ${attempt + 2}/${maxRetries + 1})`
+          );
+          return { action: "retry" };
+        }
+        log(`attempt ${attempt + 1}: invalid JSON request body — not retriable via --continue (failure_reason=harness_retry_path_invalid)`);
+        return { action: "stop" };
+      }
+
+      if (isConnectionRefused && !sessionHasProgress && attempt < maxRetries) {
+        useContinueOnRetry = false;
+        log(`attempt ${attempt + 1}: connection refused before first assistant response — retrying as fresh run with backoff (attempt ${attempt + 2}/${maxRetries + 1})`);
+        return { action: "retry" };
+      }
+
+      const isNoProgressOutputFailure = !sessionHasProgress && result.hasOutput && !isSignalTerminationExitCode(result.exitCode) && !isCrashSignalExitCode(result.exitCode);
+      if (isNoProgressOutputFailure && attempt < maxRetries && startupRetriesUsed < startupRetryLimit) {
         startupRetriesUsed++;
         useContinueOnRetry = false;
-        delay = initialDelayMs;
-        // attempt is 0-based; logs are 1-based, so "next attempt" is +2.
-        const nextAttemptNumber = attempt + 2;
-        const totalAttempts = maxRetries + 1;
-        log(`attempt ${attempt + 1}: no output produced — retrying startup as fresh run ` + `(startup retry ${startupRetriesUsed}/${startupRetryLimit}, next attempt ${nextAttemptNumber} of ${totalAttempts} total attempts)`);
-        continue;
+        log(`attempt ${attempt + 1}: output produced but no Claude session progress — retrying startup as fresh run ` + `(startup retry ${startupRetriesUsed}/${startupRetryLimit}, next attempt ${attempt + 2}/${maxRetries + 1})`);
+        return { action: "retry", nextDelayMs: initialDelayMs };
       }
-      log(
-        `attempt ${attempt + 1}: no output produced — not retrying (startup retry budget exhausted: ${startupRetriesUsed}/${startupRetryLimit}; possible causes: binary not found, permission denied, auth failure, or silent startup crash)`
-      );
-    }
+      if (isNoProgressOutputFailure) {
+        log(`attempt ${attempt + 1}: output produced but no Claude session progress — not retrying (startup retry budget exhausted: ${startupRetriesUsed}/${startupRetryLimit})`);
+        return { action: "stop" };
+      }
 
-    break;
-  }
+      if (attempt < maxRetries && result.hasOutput) {
+        if (!continueDisabledPermanently && !sessionId) {
+          log("partial execution produced no session ID — not retrying to avoid resuming an unrelated conversation");
+          return { action: "stop" };
+        }
+        const retryWithContinue = shouldRetryWithContinue({
+          attempt,
+          maxRetries,
+          exitCode: result.exitCode,
+          hasOutput: result.hasOutput,
+          isNoDeferredMarker,
+          continueDisabledPermanently,
+        });
+        const reason = isOverloaded ? "overloaded_error (transient)" : isRateLimit ? "rate_limit_error (transient)" : "partial execution";
+        useContinueOnRetry = retryWithContinue;
+        const retryMode = retryWithContinue ? `--resume ${sessionId}` : "fresh run (session resume disabled permanently)";
+        log(`attempt ${attempt + 1}: ${reason} — will retry with ${retryMode} (attempt ${attempt + 2}/${maxRetries + 1})`);
+        return { action: "retry" };
+      }
+
+      if (attempt >= maxRetries) {
+        log(`all ${maxRetries} retries exhausted — giving up (exitCode=${result.exitCode})`);
+      } else {
+        if (startupRetriesUsed < startupRetryLimit) {
+          startupRetriesUsed++;
+          useContinueOnRetry = false;
+          const nextAttemptNumber = attempt + 2;
+          const totalAttempts = maxRetries + 1;
+          log(`attempt ${attempt + 1}: no output produced — retrying startup as fresh run ` + `(startup retry ${startupRetriesUsed}/${startupRetryLimit}, next attempt ${nextAttemptNumber} of ${totalAttempts} total attempts)`);
+          return { action: "retry", nextDelayMs: initialDelayMs };
+        }
+        log(
+          `attempt ${attempt + 1}: no output produced — not retrying (startup retry budget exhausted: ${startupRetriesUsed}/${startupRetryLimit}; possible causes: binary not found, permission denied, auth failure, or silent startup crash)`
+        );
+      }
+
+      return { action: "stop" };
+    },
+  });
+  lastExitCode = retryRun.exitCode;
 
   // Fetch AWF API proxy reflection data and persist to disk for post-run step summary.
   await fetchAWFReflect({ logger: log });
 
   log(`done: exitCode=${lastExitCode} totalDuration=${formatDuration(Date.now() - driverStartTime)}`);
+  removeClaudePlugin(pluginDir);
   process.exit(lastExitCode);
 }
 
@@ -597,12 +945,18 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     resolveClaudePromptFileArgs,
     stripPromptFileArgs,
+    classifiableOutput,
     isRateLimitError,
     isAuthenticationFailedError,
     isMaxTurnsExit,
     isNoDeferredMarkerError,
     isInvalidModelError,
+    isInvalidJsonBodyError,
+    isConnectionRefusedError,
+    hasClaudeSessionProgress,
     isSignalTerminationExitCode,
+    isCrashSignalExitCode,
+    crashSignalNameForExitCode,
     shouldRetryWithContinue,
     countPermissionDeniedIssues,
     hasNumerousPermissionDeniedIssues,
@@ -614,6 +968,10 @@ if (typeof module !== "undefined" && module.exports) {
     resolveRetryConfig,
     resolveStartupRetryLimit,
     applyModelFallback,
+    resolveClaudeModelRouting,
+    buildClaudeChildEnv,
+    removeClaudeRoutingOverrides,
+    applyClaudeSettingsEnv,
   };
 }
 

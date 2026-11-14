@@ -57,7 +57,7 @@ func sanitizeCopilotShellCommand(cmdStr string) (string, bool) {
 // computeCopilotToolArguments computes the --allow-tool arguments for Copilot CLI based on tool configurations.
 // It handles bash/shell tools, edit tools, safe outputs, mcp-scripts, and MCP server tools.
 // Returns a sorted list of arguments ready to be passed to the Copilot CLI.
-func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOutputs *SafeOutputsConfig, mcpScripts *MCPScriptsConfig, workflowData *WorkflowData) []string {
+func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOutputs *SafeOutputsConfig, mcpScripts *MCPScriptsConfig, workflowData *WorkflowData) []string { //nolint:largefunc // Existing engine permission mapping is intentionally centralized.
 	copilotEngineToolsLog.Printf("Computing tool arguments: tools=%d", len(tools))
 	if tools == nil {
 		tools = make(map[string]any)
@@ -65,14 +65,23 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 
 	var args []string
 	hasRestrictedBashAllowlist := false
+	hasUnrestrictedBash := false
+	bashDisabled := workflowData != nil && workflowData.BashDisabled
 
-	// Check if bash has wildcard - if so, use --allow-all-tools instead
-	if bashConfig, hasBash := tools["bash"]; hasBash {
+	// Check if bash has wildcard - if so, use --allow-all-tools in CLI mode.
+	// SDK mode and restricted-network workflows must keep shell permission scoped
+	// because --allow-all-tools would also authorize hosted web tools.
+	if bashConfig, hasBash := tools["bash"]; hasBash && !bashDisabled {
 		if bashCommands, ok := bashConfig.([]any); ok {
 			// Check for :* or * wildcard - if present, allow all tools
 			for _, cmd := range bashCommands {
 				if cmdStr, ok := cmd.(string); ok {
 					if cmdStr == ":*" || cmdStr == "*" {
+						if isCopilotSDKMode(workflowData) ||
+							(workflowData != nil && hasNetworkRestrictions(workflowData.NetworkPermissions)) {
+							hasUnrestrictedBash = true
+							break
+						}
 						// Use --allow-all-tools flag instead of individual tool permissions
 						copilotEngineToolsLog.Print("Bash wildcard detected, using --allow-all-tools")
 						return []string{"--allow-all-tools"}
@@ -83,39 +92,43 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 	}
 
 	// Handle bash/shell tools (when no wildcard)
-	if bashConfig, hasBash := tools["bash"]; hasBash {
-		if bashCommands, ok := bashConfig.([]any); ok {
-			hasRestrictedBashAllowlist = true
-			// Add specific shell commands
-			for _, cmd := range bashCommands {
-				if cmdStr, ok := cmd.(string); ok {
-					// Normalize trailing " *" wildcard (e.g. "jq *" → "jq") so that
-					// all engines emit the canonical prefix form (shell(jq)) regardless
-					// of whether the command was written with or without the wildcard.
-					cmdStr, _ = normalizeBashCommand(cmdStr)
-					// For stem commands (like dotnet, npm, cargo), Copilot CLI uses
-					// subcommand matching. When the user specifies just the base command
-					// (e.g., "dotnet"), append :* so "dotnet build", "dotnet test", etc.
-					// are all permitted. Skip if the command already has a colon (explicit
-					// matching) or a space (user already specified the subcommand).
-					if !strings.Contains(cmdStr, ":") && !strings.Contains(cmdStr, " ") && constants.CopilotStemCommands[cmdStr] {
-						args = append(args, "--allow-tool", fmt.Sprintf("shell(%s:*)", cmdStr))
-					} else {
-						sanitized, wasSanitized := sanitizeCopilotShellCommand(cmdStr)
-						if wasSanitized {
-							fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
-								fmt.Sprintf("bash tool %q contains single quotes that crash Copilot CLI; "+
-									"truncated to safe prefix %q for shell() prefix-matching. "+
-									"Use %q in your workflow to silence this warning.",
-									cmdStr, sanitized, sanitized)))
+	if !bashDisabled {
+		if hasUnrestrictedBash {
+			args = append(args, "--allow-tool", "shell")
+		} else if bashConfig, hasBash := tools["bash"]; hasBash && isCopilotToolValueEnabled(tools, "bash") {
+			if bashCommands, ok := bashConfig.([]any); ok {
+				hasRestrictedBashAllowlist = len(bashCommands) > 0
+				// Add specific shell commands
+				for _, cmd := range bashCommands {
+					if cmdStr, ok := cmd.(string); ok {
+						// Normalize trailing " *" wildcard (e.g. "jq *" → "jq") so that
+						// all engines emit the canonical prefix form (shell(jq)) regardless
+						// of whether the command was written with or without the wildcard.
+						cmdStr, _ = normalizeBashCommand(cmdStr)
+						// For stem commands (like dotnet, npm, cargo), Copilot CLI uses
+						// subcommand matching. When the user specifies just the base command
+						// (e.g., "dotnet"), append :* so "dotnet build", "dotnet test", etc.
+						// are all permitted. Skip if the command already has a colon (explicit
+						// matching) or a space (user already specified the subcommand).
+						if !strings.Contains(cmdStr, ":") && !strings.Contains(cmdStr, " ") && constants.CopilotStemCommands[cmdStr] {
+							args = append(args, "--allow-tool", fmt.Sprintf("shell(%s:*)", cmdStr))
+						} else {
+							sanitized, wasSanitized := sanitizeCopilotShellCommand(cmdStr)
+							if wasSanitized {
+								fmt.Fprintln(os.Stderr, console.FormatWarningMessage(
+									fmt.Sprintf("bash tool %q contains single quotes that crash Copilot CLI; "+
+										"truncated to safe prefix %q for shell() prefix-matching. "+
+										"Use %q in your workflow to silence this warning.",
+										cmdStr, sanitized, sanitized)))
+							}
+							args = append(args, "--allow-tool", fmt.Sprintf("shell(%s)", sanitized))
 						}
-						args = append(args, "--allow-tool", fmt.Sprintf("shell(%s)", sanitized))
 					}
 				}
+			} else {
+				// Bash with no specific commands or null value - allow all shell
+				args = append(args, "--allow-tool", "shell")
 			}
-		} else {
-			// Bash with no specific commands or null value - allow all shell
-			args = append(args, "--allow-tool", "shell")
 		}
 	}
 
@@ -130,7 +143,7 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 		}
 		// When playwright is configured in CLI mode, playwright-cli must be executable.
 		// Automatically add shell(playwright-cli:*) to the restricted bash allowlist.
-		if workflowData != nil && isPlaywrightCLIMode(workflowData.Tools) {
+		if isPlaywrightCLIMode(effectiveWorkflowData.Tools) {
 			args = append(args, "--allow-tool", "shell(playwright-cli:*)")
 		}
 		// When GitHub CLI mode is enabled (tools.github.mode: gh-proxy), GitHub access
@@ -142,7 +155,7 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 
 	// Handle edit tools requirement for file write access
 	// Note: safe-outputs do not need write permission as they use MCP
-	if _, hasEdit := tools["edit"]; hasEdit {
+	if isCopilotEditToolEnabled(tools, workflowData) {
 		copilotEngineToolsLog.Print("Edit tool enabled, adding write permission")
 		args = append(args, "--allow-tool", "write")
 	}
@@ -159,8 +172,8 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 		args = append(args, "--allow-tool", constants.MCPScriptsMCPServerID.String())
 	}
 
-	// Handle web-fetch builtin tool (Copilot CLI uses web_fetch with underscore)
-	if _, hasWebFetch := tools["web-fetch"]; hasWebFetch {
+	// SDK mode supplies a custom proxy-aware fetch tool; native web tools are unavailable.
+	if isCopilotSDKMode(workflowData) && isCopilotToolValueEnabled(tools, "web-fetch") {
 		copilotEngineToolsLog.Print("Web-fetch tool enabled, adding web_fetch permission")
 		// web-fetch -> web_fetch
 		args = append(args, "--allow-tool", "web_fetch")
@@ -169,12 +182,15 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 	// Built-in tool names that should be skipped when processing MCP servers
 	// Note: GitHub is NOT included here because it needs MCP configuration in CLI mode
 	// Note: web-fetch is NOT included here because it needs explicit --allow-tool argument
+	// Note: native web-search is unavailable in offline BYOK mode
 	builtInTools := map[string]struct {
 	}{
-		"bash":       {},
-		"edit":       {},
-		"web-search": {},
-		"playwright": {},
+		"bash":         {},
+		"edit":         {},
+		"web-search":   {},
+		"playwright":   {},
+		"cache-memory": {},
+		"drive-memory": {},
 	}
 
 	// Handle MCP server tools
@@ -187,6 +203,11 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 		// GitHub is a special case - it's an MCP server but doesn't have explicit MCP config in the workflow
 		// It gets MCP configuration through the parser's processBuiltinMCPTool
 		if toolName == "github" {
+			if workflowData != nil {
+				if _, explicitlyDisabled := workflowData.ExplicitlyDisabledTools["github"]; explicitlyDisabled {
+					continue
+				}
+			}
 			if toolConfigMap, ok := toolConfig.(map[string]any); ok {
 				if allowed, hasAllowed := toolConfigMap["allowed"]; hasAllowed {
 					if allowedList, ok := allowed.([]any); ok {
@@ -224,18 +245,27 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 		if toolConfigMap, ok := toolConfig.(map[string]any); ok {
 			if hasMcp, _ := hasMCPConfig(toolConfigMap); hasMcp {
 				copilotEngineToolsLog.Printf("Adding custom MCP server permission: %s", toolName)
-				// Allow the entire MCP server
-				args = append(args, "--allow-tool", toolName)
-
-				// If it has specific allowed tools, add them individually
+				hasAllowedField := false
+				allowWholeServer := true
 				if allowed, hasAllowed := toolConfigMap["allowed"]; hasAllowed {
+					hasAllowedField = true
+					allowWholeServer = false
 					if allowedList, ok := allowed.([]any); ok {
 						for _, allowedTool := range allowedList {
 							if toolStr, ok := allowedTool.(string); ok {
+								if toolStr == "*" {
+									allowWholeServer = true
+									break
+								}
 								args = append(args, "--allow-tool", fmt.Sprintf("%s(%s)", toolName, toolStr))
 							}
 						}
 					}
+				}
+				// SDK permission checks use individual entries when an MCP allowlist
+				// exists. CLI mode retains the server-wide grant for compatibility.
+				if !isCopilotSDKMode(workflowData) || !hasAllowedField || allowWholeServer {
+					args = append(args, "--allow-tool", toolName)
 				}
 			}
 		}
@@ -247,8 +277,12 @@ func (e *CopilotEngine) computeCopilotToolArguments(tools map[string]any, safeOu
 	// all become "jq"), producing duplicate --allow-tool shell(jq) entries.
 	if len(args) > 0 {
 		var values []string
-		for i := 1; i < len(args); i += 2 {
-			values = append(values, args[i])
+		expectValue := false
+		for _, arg := range args {
+			if expectValue {
+				values = append(values, arg)
+			}
+			expectValue = !expectValue
 		}
 		sort.Strings(values)
 
@@ -281,10 +315,16 @@ func (e *CopilotEngine) generateCopilotToolArgumentsComment(tools map[string]any
 	comment.WriteString(indent + "# Copilot CLI tool arguments (sorted):\n")
 
 	// Group flag-value pairs for better readability
-	for i := 0; i < len(toolArgs); i += 2 {
-		if i+1 < len(toolArgs) {
-			fmt.Fprintf(&comment, "%s# %s %s\n", indent, toolArgs[i], toolArgs[i+1])
+	var flag string
+	expectValue := false
+	for _, arg := range toolArgs {
+		if !expectValue {
+			flag = arg
+			expectValue = true
+			continue
 		}
+		fmt.Fprintf(&comment, "%s# %s %s\n", indent, flag, arg)
+		expectValue = false
 	}
 
 	return comment.String()

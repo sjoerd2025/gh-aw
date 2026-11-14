@@ -115,52 +115,67 @@ func getAgentConfig(workflowData *WorkflowData) *AgentSandboxConfig {
 	return workflowData.SandboxConfig.Agent
 }
 
-// getAgentContainerRuntime returns the container runtime string for the AWF config,
-// or an empty string if no custom runtime is configured.
-// docker-sbx is excluded because it is not an OCI runtime; it passes
-// --container-runtime sbx as a CLI flag in BuildAWFArgs instead.
-func getAgentContainerRuntime(workflowData *WorkflowData) string {
-	agentConfig := getAgentConfig(workflowData)
-	if agentConfig == nil || agentConfig.Disabled {
-		return ""
-	}
-	// docker-sbx is not an OCI runtime and must not appear in container.containerRuntime.
-	if agentConfig.Runtime == AgentRuntimeDockerSbx {
-		return ""
-	}
-	return string(agentConfig.Runtime)
-}
-
-// isGVisorRuntime returns true when the agent container should use gVisor (runsc).
-func isGVisorRuntime(workflowData *WorkflowData) bool {
+// isCloudHypervisorRuntime returns true when the agent should run inside a Cloud
+// Hypervisor microVM (preview).
+func isCloudHypervisorRuntime(workflowData *WorkflowData) bool {
 	agentConfig := getAgentConfig(workflowData)
 	if agentConfig == nil || agentConfig.Disabled {
 		return false
 	}
-	return agentConfig.Runtime == AgentRuntimeGVisor
+	return agentConfig.Runtime == AgentRuntimeCloudHypervisor
 }
 
-// isDockerSbxRuntime returns true when the agent should run inside a Docker sbx
-// microVM (KVM-based hypervisor isolation).
-func isDockerSbxRuntime(workflowData *WorkflowData) bool {
+func isNVXRuntime(workflowData *WorkflowData) bool {
 	agentConfig := getAgentConfig(workflowData)
 	if agentConfig == nil || agentConfig.Disabled {
 		return false
 	}
-	return agentConfig.Runtime == AgentRuntimeDockerSbx
+	return agentConfig.Runtime == AgentRuntimeNVX
+}
+
+// declaresIgnoredFilesystemAllowWrite returns true when a workflow declares
+// sandbox.agent.config.filesystem.allow-write on a runtime where the compiler drops
+// it (see awfEmitsFilesystemAllowWrite). Only explicit opt-ins are reported: the
+// implicit defaults are seeded for the Cloud Hypervisor runtime alone.
+func declaresIgnoredFilesystemAllowWrite(workflowData *WorkflowData) bool {
+	if isCloudHypervisorRuntime(workflowData) {
+		return false
+	}
+	agentConfig := getAgentConfig(workflowData)
+	if agentConfig == nil || agentConfig.Disabled || agentConfig.Config == nil || agentConfig.Config.Filesystem == nil {
+		return false
+	}
+	return agentConfig.Config.Filesystem.AllowWrite != nil
 }
 
 func isAWFNetworkIsolationEnabled(workflowData *WorkflowData) bool {
+	if isNVXRuntime(workflowData) {
+		return true
+	}
+	// Inline threat detection and evals run a standalone AWF with no MCP sidecars, so
+	// there is nothing to attach to the isolated topology.
+	if workflowData != nil && (workflowData.IsDetectionRun || workflowData.IsEvalsRun) {
+		return false
+	}
+	return isAWFAgentOnNetworkIsolationTopology(workflowData)
+}
+
+// isAWFAgentOnNetworkIsolationTopology reports whether AWF places the agent on its
+// network-isolation topology, which depends only on the sandbox runtime profile.
+// Unlike isAWFNetworkIsolationEnabled it does not exempt inline threat detection
+// and evals: those runs attach no sidecars, but AWF still runs the agent on the
+// isolated topology, so addresses the agent must reach (such as the LLM gateway on
+// the api-proxy container) must follow it.
+func isAWFAgentOnNetworkIsolationTopology(workflowData *WorkflowData) bool {
 	agentConfig := getAgentConfig(workflowData)
 	if agentConfig == nil || agentConfig.Disabled {
 		return false
 	}
-	// docker-sbx always uses network isolation regardless of the sudo setting.
-	// The sudo flag is only for the install steps, not for network enforcement.
-	if agentConfig.Runtime == AgentRuntimeDockerSbx {
+	if agentConfig.Runtime == AgentRuntimeNVX {
 		return true
 	}
-	return agentConfig.NetworkIsolation
+	profile := resolveSandboxRuntimeProfile(agentConfig)
+	return profile.NetworkIsolation && !profile.SupportsHostAccess
 }
 
 // enableFirewallByDefaultForCopilot enables firewall by default for copilot and codex engines
@@ -207,6 +222,22 @@ func enableFirewallByDefaultForClaude(engineID string, networkPermissions *Netwo
 func enableFirewallByDefaultForPi(engineID string, networkPermissions *NetworkPermissions, sandboxConfig *SandboxConfig) {
 	// Only apply to pi engine
 	if engineID != string(constants.PiEngine) {
+		return
+	}
+
+	enableFirewallByDefaultForEngine(engineID, networkPermissions, sandboxConfig)
+}
+
+// enableFirewallByDefaultForGemini enables firewall by default for Gemini engine
+// when network restrictions are present but no explicit firewall configuration exists
+// and sandbox.agent is not explicitly set to false
+//
+// The firewall is enabled by default for Gemini UNLESS:
+// - allowed contains "*" (unrestricted network access)
+// - sandbox.agent is explicitly set to false
+func enableFirewallByDefaultForGemini(engineID string, networkPermissions *NetworkPermissions, sandboxConfig *SandboxConfig) {
+	// Only apply to gemini engine
+	if engineID != string(constants.GeminiEngine) {
 		return
 	}
 

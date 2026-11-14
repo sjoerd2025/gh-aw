@@ -15,26 +15,31 @@ on:
 permissions:
   contents: read
   pull-requests: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   playwright:
-    mode: cli
   bash:
     - "npm *"
     - "npx *"
     - "node *"
-    - "curl http://localhost:*"
-    - "curl http://host.docker.internal:*"
+    - "curl http://localhost:4321/gh-aw/:*"
 network:
   allowed:
     - defaults
     - playwright
     - local
     - node
+jobs:
+  agent:
+    timeout-minutes: 15
 safe-outputs:
+  timeout-minutes: 10
   add-comment:
     max: 1
 timeout-minutes: 15
@@ -44,8 +49,17 @@ steps:
     with:
       persist-credentials: false
 
+  - name: Checkout agentics workflows
+    uses: actions/checkout@v7.0.1
+    with:
+      repository: githubnext/agentics
+      ref: main
+      path: .agentics
+      persist-credentials: false
+      sparse-checkout: workflows
+
   - name: Setup Node.js
-    uses: actions/setup-node@v7.0.0
+    uses: actions/setup-node@v7.1.0
     with:
       node-version: '24'
       cache: 'npm'
@@ -53,68 +67,43 @@ steps:
 
   - name: Install dependencies
     working-directory: ./docs
+    timeout-minutes: 5
     run: npm ci
 
   - name: Build documentation
     working-directory: ./docs
+    timeout-minutes: 5
+    env:
+      AGENTICS_WORKFLOWS_DIR: ${{ github.workspace }}/.agentics/workflows
     run: npm run build
 
-  - name: Start docs server
-    working-directory: ./docs
-    run: |
-      nohup npm run dev -- --host 0.0.0.0 --port 4321 > /tmp/gh-aw/agent/preview.log 2>&1 &
-      PID=$!
-      echo "$PID" > /tmp/gh-aw/agent/server.pid
-      echo "Server PID: $PID"
-
-  - name: Wait for server readiness
-    run: |
-      MAX_WAIT=90
-      WAITED=0
-      until (echo > /dev/tcp/127.0.0.1/4321) > /dev/null 2>&1; do
-        if [ -f /tmp/gh-aw/agent/server.pid ] && ! kill -0 "$(cat /tmp/gh-aw/agent/server.pid)" 2>/dev/null; then
-          echo "Docs server process exited before opening port 4321" >&2
-          cat /tmp/gh-aw/agent/preview.log >&2
-          exit 1
-        fi
-        WAITED=$((WAITED + 3))
-        if [ $WAITED -ge $MAX_WAIT ]; then
-          echo "Docs server port 4321 did not open in ${MAX_WAIT}s" >&2
-          cat /tmp/gh-aw/agent/preview.log >&2
-          exit 1
-        fi
-        echo "Waiting for docs port... ($WAITED/${MAX_WAIT}s)"
-        sleep 3
-      done
-      WAITED=0
-      until curl -sf http://localhost:4321/gh-aw/ > /dev/null 2>&1; do
-        WAITED=$((WAITED + 3))
-        if [ $WAITED -ge $MAX_WAIT ]; then
-          echo "Dev server did not become ready in ${MAX_WAIT}s" >&2
-          cat /tmp/gh-aw/agent/preview.log >&2
-          exit 1
-        fi
-        echo "Waiting for dev server response... ($WAITED/${MAX_WAIT}s)"
-        sleep 3
-      done
-      echo "Dev server is ready"
-
+evals:
+  - id: viewport-coverage
+    question: Does the agent output record screenshot results for each required mobile, tablet, and desktop viewport?
+  - id: findings-reported
+    question: When visual differences or accessibility issues are observed, does the proposed PR comment describe those observations? Return UNKNOWN when neither is observed.
+  - id: clean-run-noop
+    question: When all inspected pages have no visual differences or accessibility issues, does the agent request noop? Return UNKNOWN when that clean-run scenario is not established.
 ---
 
 # Visual Regression Checker
 
-You are a visual quality agent. The workflow started the docs server and verified readiness. It is running on the host at `http://host.docker.internal:4321/gh-aw/`. For this pull request, use playwright-cli commands in bash to capture screenshots of key pages and report any visual differences.
+You are a visual quality agent. Setup installed `docs/node_modules` and built `docs/dist` for this run. Use these provisioned directories without installing dependencies or inspecting the process environment. Capture the built documentation inside the sandbox with the provisioned Playwright CLI.
 
 ## Steps
 
-1. **Capture screenshots** — Use `playwright-cli` to resize the viewport and take full-page screenshots of the key pages:
-   - **Mobile**: `playwright-cli browser_resize --width 375 --height 812 && playwright-cli browser_navigate --url "http://host.docker.internal:4321/gh-aw/" && playwright-cli browser_take_screenshot --filename /tmp/gh-aw/agent/screenshot-mobile.png --full-page true`
+1. **Start the sandbox-local preview** — Run `npm --prefix docs run preview -- --host 127.0.0.1 --port 4321` with the Bash tool's background/async mode. Keep its process handle for cleanup. Do not start a runner-host server, bind to `0.0.0.0`, install packages, or change proxy configuration. Poll `curl http://localhost:4321/gh-aw/ --fail --silent --show-error --connect-timeout 2 --max-time 5` for at most 30 seconds until it returns successfully; stop and report a setup failure if it does not become ready. Loopback preview traffic uses the sandbox's existing local bypass; do not inspect environment variables to discover proxy settings.
+2. **Capture screenshots** — Open `playwright-cli open http://localhost:4321/gh-aw/`, then use the pinned CLI's commands (not MCP `browser_*` tool names):
+   - **Mobile**: `playwright-cli resize 375 812`, then `playwright-cli screenshot --filename=/tmp/gh-aw/agent/screenshot-mobile.png --full-page`
    - **Tablet**: resize to 768 × 1024, navigate, screenshot
    - **Desktop**: resize to 1440 × 900, navigate, screenshot
-2. **Accessibility snapshot** — For each page, run `playwright-cli browser_snapshot` and note any violations.
-3. **Report** — Post a summary comment with:
-   - A table listing each page, viewport, and screenshot status (unchanged / changed / error)
+3. **Accessibility snapshot** — For each page, run `playwright-cli snapshot` and report observed accessibility concerns, not a claim of exhaustive compliance.
+4. **Compare only with an available baseline** — No baseline is provisioned by this workflow. Its absence must not block screenshots or accessibility inspection. Record visual comparison as **unavailable**, never **unchanged**, when no authorized baseline is available. Do not fetch a baseline from an unapproved location.
+5. **Report** — Post a summary comment with:
+   - A table listing each page, viewport, capture status (captured / error), and comparison status (unchanged / changed / unavailable)
    - Any accessibility issues found
 
 Post the summary as a pull request comment using the `add_comment` safe-output tool.
-If there are no differences and no accessibility issues, call `noop` with a brief message.
+Call `noop` only when actual baseline comparison established no differences and inspection found no accessibility issues; missing comparison evidence is not a clean result. If basic capture fails, report the concrete failure with `report_incomplete`; an unavailable baseline alone is not a capture failure.
+
+Always close the browser with `playwright-cli close`, stop the preview using its process handle, and verify it stopped before finishing.

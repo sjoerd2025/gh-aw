@@ -9,9 +9,11 @@ on:
     - cron: "weekly on monday around 15:00"  # ~3 PM UTC on Mondays (scattered)
   workflow_dispatch:
 permissions:
+  copilot-requests: write
   issues: read
 tracker-id: weekly-issue-summary
-engine: copilot
+engine: pi
+model: copilot/grok-4.6
 network:
   allowed:
     - defaults
@@ -20,7 +22,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 tools:
   cli-proxy: true
   edit:
@@ -41,6 +42,7 @@ imports:
 
   - shared/otlp.md
 ---
+
 # Weekly Issue Summary
 
 ## 📊 Trend Charts Requirement

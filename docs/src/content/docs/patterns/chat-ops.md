@@ -45,17 +45,18 @@ safe-outputs:
 
 When someone types /review in a pull request comment, perform a thorough analysis of the changes.
 
+Triggering comment (sanitized): "${{ steps.sanitized.outputs.text }}"
+
 Examine the diff for potential bugs, security vulnerabilities, performance implications, code style issues, and missing tests or documentation.
 
 Create specific review comments on relevant lines of code and add a summary comment with overall observations and recommendations.
 ```
 
-## Related Documentation
+## Learn More
 
 - [IssueOps](/gh-aw/patterns/issue-ops/) — Event-driven issue automation
 - [DispatchOps](/gh-aw/patterns/dispatch-ops/) — Manual workflow triggers
 - [LabelOps](/gh-aw/patterns/label-ops/) — Label-triggered automation
-- [MultiRepoOps — Side Repository](/gh-aw/patterns/multi-repo-ops/#using-a-side-repository) — Isolated workflow execution
 - [Command Triggers](/gh-aw/reference/command-triggers/) — Slash command configuration
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) — Secure write operations
 - [Authentication](/gh-aw/reference/auth/) — PAT and GitHub App setup

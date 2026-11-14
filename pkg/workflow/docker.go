@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 
@@ -16,9 +15,11 @@ var dockerLog = logger.New("workflow:docker")
 // When workflowData.ActionCache contains container pins, the returned slice uses
 // the pinned references (image:tag@sha256:…) instead of the bare tags, ensuring
 // deterministic and supply-chain-safe image pulls.
-func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actionMode ActionMode) []string {
+func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actionMode ActionMode) []string { //nolint:largefunc // Existing image collection remains centralized.
 	var images []string
 	imageSet := make(map[string]struct{}) // Use a set to avoid duplicates
+	var authoritativeAWFImages []string
+	authoritativeAWFImageSet := make(map[string]struct{})
 
 	// Check for GitHub tool (uses Docker image)
 	if rawGithubTool, hasGitHub := tools["github"]; hasGitHub {
@@ -38,24 +39,16 @@ func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actio
 			}
 		}
 	}
-
-	// Check for Playwright tool (uses Docker image - no version tag, only one image)
-	// Only in MCP mode; CLI mode installs @playwright/cli via npm instead.
-	if _, hasPlaywright := tools["playwright"]; hasPlaywright {
-		if !isPlaywrightCLIMode(tools) {
-			image := "mcr.microsoft.com/playwright/mcp"
-			if !setutil.Contains(imageSet, image) {
-				images = append(images, image)
-				imageSet[image] = struct {
-				}{}
-			}
+	if workflowData != nil && enclaveGitHubDelegationEnabled(workflowData) {
+		image := "ghcr.io/github/github-mcp-server:" + string(constants.DefaultGitHubMCPServerVersion)
+		if !setutil.Contains(imageSet, image) {
+			images = append(images, image)
+			imageSet[image] = struct{}{}
 		}
 	}
 
-	// Check for safe-outputs MCP server.
-	// Safe outputs run in the published gh-aw node container and must be part of
-	// the default predownload set and lock-file manifest whenever enabled.
-	if workflowData != nil && HasSafeOutputsEnabled(workflowData.SafeOutputs) {
+	// Safe outputs and ledger MCP servers share the published gh-aw node container.
+	if workflowData != nil && (HasSafeOutputsEnabled(workflowData.SafeOutputs) || workflowData.RepoMemoryConfig.ledgerEntry() != nil) {
 		image := constants.DefaultGhAwNodeImage
 		if !setutil.Contains(imageSet, image) {
 			images = append(images, image)
@@ -85,64 +78,30 @@ func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actio
 	// Collect AWF (firewall) container images when firewall is enabled
 	// AWF uses three containers: squid (proxy), agent, and api-proxy (for engines with LLM gateway support)
 	if isFirewallEnabled(workflowData) {
-		// Get the firewall version for image tags
 		firewallConfig := getFirewallConfig(workflowData)
 		awfImageTag := getAWFImageTag(firewallConfig)
+		sandboxImages := getSandboxAgentImages(workflowData)
 
-		// Add squid (proxy) container
-		squidImage := constants.DefaultFirewallRegistry + "/squid:" + awfImageTag
-		if !setutil.Contains(imageSet, squidImage) {
-			images = append(images, squidImage)
-			imageSet[squidImage] = struct {
-			}{}
-			dockerLog.Printf("Added AWF squid (proxy) container: %s", squidImage)
-		}
-
-		// Add default agent container
-		agentImage := constants.DefaultFirewallRegistry + "/agent:" + awfImageTag
-		if !setutil.Contains(imageSet, agentImage) {
-			images = append(images, agentImage)
-			imageSet[agentImage] = struct {
-			}{}
-			dockerLog.Printf("Added AWF agent container: %s", agentImage)
-		}
-
-		// Add api-proxy sidecar container (required for all engines — LLM gateway is mandatory)
-		// The api-proxy holds LLM API keys securely and proxies requests through Squid
-		// Each engine uses its own dedicated port for communication
-		if workflowData != nil && workflowData.AI != "" {
-			apiProxyImage := constants.DefaultFirewallRegistry + "/api-proxy:" + awfImageTag
-			if !setutil.Contains(imageSet, apiProxyImage) {
-				images = append(images, apiProxyImage)
-				imageSet[apiProxyImage] = struct {
-				}{}
-				dockerLog.Printf("Added AWF api-proxy sidecar container: %s", apiProxyImage)
+		// Use the same enabled-role ledger as manifest completeness validation so
+		// every AWF consumer is predownloaded under --skip-pull. A closed manifest
+		// is authoritative: its literal references bypass aw.json container_pins.
+		for _, role := range requiredAWFImageRoles(workflowData) {
+			image := defaultAWFImageForRole(role, awfImageTag)
+			if sandboxImages != nil {
+				image = sandboxImages[role]
+				if image != "" && !setutil.Contains(authoritativeAWFImageSet, image) {
+					authoritativeAWFImages = append(authoritativeAWFImages, image)
+					authoritativeAWFImageSet[image] = struct{}{}
+					dockerLog.Printf("Added authoritative AWF %s container: %s", role, image)
+				}
+				continue
 			}
-		}
-
-		// Add cli-proxy sidecar container when the cli-proxy is needed.
-		// Without this, --skip-pull causes AWF to fail because the cli-proxy image was never pulled.
-		if isCliProxyNeeded(workflowData) {
-			cliProxyImage := constants.DefaultFirewallRegistry + "/cli-proxy:" + awfImageTag
-			if !setutil.Contains(imageSet, cliProxyImage) {
-				images = append(images, cliProxyImage)
-				imageSet[cliProxyImage] = struct {
-				}{}
-				dockerLog.Printf("Added AWF cli-proxy sidecar container: %s", cliProxyImage)
+			if image == "" || setutil.Contains(imageSet, image) {
+				continue
 			}
-		}
-
-		// Add build-tools sysroot image for ARC/DinD topology.
-		// AWF uses this as an init container to populate the sysroot volume with
-		// system binaries (gcc, make, libraries) that are invisible on the DinD daemon's FS.
-		if isArcDindTopology(workflowData) {
-			buildToolsImage := constants.DefaultFirewallRegistry + "/build-tools:" + awfImageTag
-			if !setutil.Contains(imageSet, buildToolsImage) {
-				images = append(images, buildToolsImage)
-				imageSet[buildToolsImage] = struct {
-				}{}
-				dockerLog.Printf("Added AWF build-tools sysroot container for arc-dind: %s", buildToolsImage)
-			}
+			images = append(images, image)
+			imageSet[image] = struct{}{}
+			dockerLog.Printf("Added AWF %s container: %s", role, image)
 		}
 	}
 
@@ -159,8 +118,7 @@ func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actio
 				if mcpGateway.Version != "" {
 					image += ":" + mcpGateway.Version
 				} else {
-					// Use default version if not specified (consistent with mcp_servers.go)
-					image += ":" + string(constants.DefaultMCPGatewayVersion)
+					image += ":" + effectiveMCPGatewayVersion(workflowData)
 				}
 				if !setutil.Contains(imageSet, image) {
 					images = append(images, image)
@@ -192,7 +150,10 @@ func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actio
 						// Extract container image from docker args
 						// Args format: ["run", "--rm", "-i", ... , "container-image"]
 						// The container image is the last arg
-						image := mcpConf.Args[len(mcpConf.Args)-1]
+						var image string
+						for _, arg := range mcpConf.Args {
+							image = arg
+						}
 						// Skip if it's a docker flag (starts with -)
 						if !strings.HasPrefix(image, "-") && !setutil.Contains(imageSet, image) {
 							images = append(images, image)
@@ -207,12 +168,24 @@ func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actio
 
 	// Sort for stable output
 	sort.Strings(images)
-	dockerLog.Printf("Collected %d Docker images from tools", len(images))
+	sort.Strings(authoritativeAWFImages)
+	dockerLog.Printf("Collected %d Docker images from tools", len(images)+len(authoritativeAWFImages))
 
 	// Apply digest pins from the action cache when available.
 	// Each pinned ref replaces the bare tag with "tag@sha256:…" so that the pull
 	// is bound to a specific immutable manifest and not just to a mutable tag.
 	pinnedImages, imagePins := applyContainerPins(images, workflowData)
+
+	// Closed AWF manifest references are already literal digest pins and must
+	// remain unchanged. Keep them separate from normal image mapping so a non-AWF
+	// container using the same source reference can still be redirected and both
+	// runtime images are predownloaded.
+	pinnedImages = mergeDockerImages(pinnedImages, authoritativeAWFImages)
+	authoritativePins := make([]GHAWManifestContainer, 0, len(authoritativeAWFImages))
+	for _, image := range authoritativeAWFImages {
+		authoritativePins = append(authoritativePins, GHAWManifestContainer{Image: image})
+	}
+	imagePins = mergeDockerImagePins(imagePins, authoritativePins)
 
 	// Store pinned image refs and full pin info in WorkflowData so they can be
 	// included in the compiled lock file header and gh-aw-manifest for auditability.
@@ -230,26 +203,45 @@ func collectDockerImages(tools map[string]any, workflowData *WorkflowData, actio
 // Returns both the resolved image strings (for script args) and full GHAWManifestContainer
 // entries (for the manifest).
 func applyContainerPins(images []string, workflowData *WorkflowData) ([]string, []GHAWManifestContainer) {
-	result := make([]string, len(images))
-	pins := make([]GHAWManifestContainer, len(images))
+	result := make([]string, 0, len(images))
+	pins := make([]GHAWManifestContainer, 0, len(images))
 
 	var cache *ActionCache
 	if workflowData != nil {
 		cache = workflowData.ActionCache
 	}
 
-	for i, img := range images {
+	for _, img := range images {
 		// Apply container_pins mapping from aw.json before digest resolution so that
 		// redirected registries are pre-downloaded and recorded in the manifest.
 		img = applyContainerPinMappingFromData(img, workflowData)
 		if pin, ok := lookupContainerPin(img, cache); ok && pin.PinnedImage != "" {
-			result[i] = pin.PinnedImage
-			pins[i] = GHAWManifestContainer(pin)
+			result = append(result, pin.PinnedImage)
+			pins = append(pins, GHAWManifestContainer(pin))
 			dockerLog.Printf("Pinned container image: %s -> %s", img, pin.PinnedImage)
 			continue
 		}
-		result[i] = img
-		pins[i] = GHAWManifestContainer{Image: img}
+		result = append(result, img)
+		pins = append(pins, GHAWManifestContainer{Image: img})
+
+		// gh-aw-firewall images that fail to resolve a digest pin are the most
+		// security-load-bearing containers (they confine the agent sandbox), so
+		// record the miss as a resolution failure for lock-file auditing instead
+		// of silently shipping an unpinned tag (see gh-aw#51248).
+		if workflowData != nil && strings.HasPrefix(img, constants.DefaultFirewallRegistry+"/") {
+			dockerLog.Printf("No digest pin found for gh-aw-firewall image: %s", img)
+			// Split on the last colon so a registry:port prefix (unlikely for AWF
+			// images, but generically correct) isn't mistaken for the tag separator.
+			repo, tag := img, ""
+			if idx := strings.LastIndex(img, ":"); idx >= 0 {
+				repo, tag = img[:idx], img[idx+1:]
+			}
+			workflowData.ActionResolutionFailures = append(workflowData.ActionResolutionFailures, GHAWManifestResolutionFailure{
+				Repo:      repo,
+				Ref:       tag,
+				ErrorType: "container_pin_not_found",
+			})
+		}
 	}
 	return result, pins
 }
@@ -294,16 +286,34 @@ func mergeDockerImagePins(existing, newPins []GHAWManifestContainer) []GHAWManif
 	return result
 }
 
+// dockerImagePullPolicy returns the configured Docker image pull policy.
+func dockerImagePullPolicy(data *WorkflowData) string {
+	if data == nil || data.RawFrontmatter == nil {
+		return ""
+	}
+	policy, ok := data.RawFrontmatter["docker-image-pull-policy"].(string)
+	if !ok {
+		return ""
+	}
+	return policy
+}
+
 // generateDownloadDockerImagesStep generates the step to download Docker images
-func generateDownloadDockerImagesStep(yaml *strings.Builder, dockerImages []string) {
+func generateDownloadDockerImagesStep(yaml *strings.Builder, dockerImages []string, pullPolicy string) {
 	if len(dockerImages) == 0 {
 		return
 	}
 
 	yaml.WriteString("      - name: Download container images\n")
+	if pullPolicy == "always" || pullPolicy == "never" {
+		yaml.WriteString("        env:\n          GH_AW_DOCKER_IMAGE_PULL_POLICY: ")
+		yaml.WriteString(pullPolicy)
+		yaml.WriteString("\n")
+	}
 	yaml.WriteString("        run: bash \"${RUNNER_TEMP}/gh-aw/actions/download_docker_images.sh\"")
 	for _, image := range dockerImages {
-		fmt.Fprintf(yaml, " %s", image)
+		yaml.WriteString(" ")
+		yaml.WriteString(image)
 	}
 	yaml.WriteString("\n")
 }

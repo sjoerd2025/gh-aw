@@ -13,8 +13,11 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/repoutil"
 	"github.com/github/gh-aw/pkg/workflow"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 )
 
 var trialRepoLog = logger.New("cli:trial_repository")
@@ -74,8 +77,7 @@ func trialRepositoryActionsSettingsURL(repoSlug string) string {
 func ensureTrialRepository(repoSlug string, cloneRepoSlug string, forceDeleteHostRepo bool, dryRun bool, verbose bool) error {
 	trialRepoLog.Printf("Ensuring trial repository: %s (cloneRepo=%s, forceDelete=%v, dryRun=%v)", repoSlug, cloneRepoSlug, forceDeleteHostRepo, dryRun)
 
-	parts := strings.Split(repoSlug, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	if _, _, err := repoutil.SplitRepoSlug(repoSlug); err != nil {
 		return fmt.Errorf("invalid repository slug format: %s. Expected format: owner/repo. Example: github/gh-aw", repoSlug)
 	}
 
@@ -252,9 +254,9 @@ func installWorkflowInTrialMode(ctx context.Context, tempDir string, parsedSpec 
 	trialRepoLog.Printf("Installing workflow in trial mode: workflow=%s, hostRepo=%s, directMode=%v", parsedSpec.WorkflowName, hostRepoSlug, directTrialMode)
 
 	// Change to temp directory
-	originalDir, err := os.Getwd()
+	originalDir, err := gitutil.Getwd()
 	if err != nil {
-		return fmt.Errorf("failed to get current directory: %w", err)
+		return err
 	}
 	defer os.Chdir(originalDir)
 
@@ -365,7 +367,6 @@ func installWorkflowInTrialMode(ctx context.Context, tempDir string, parsedSpec 
 		Validate:             true,
 		Watch:                false,
 		WorkflowDir:          "",
-		SkipInstructions:     false,
 		NoEmit:               false,
 		Purge:                false,
 		TrialMode:            !directTrialMode && (cloneRepoSlug == ""), // Enable trial mode in compiler unless in direct mode or clone-repo mode
@@ -455,6 +456,31 @@ func writeWorkflowToTrialDir(tempDir string, workflowName string, content []byte
 	}, nil
 }
 
+func replaceTrialRepositoryExpressions(content, repository string) (string, error) {
+	matches, err := actionslanguageservice.ExtractExpressions(content)
+	if err != nil {
+		return "", fmt.Errorf("cannot scan trial repository expressions: %w", err)
+	}
+	var result strings.Builder
+	last := 0
+	for _, match := range matches {
+		result.WriteString(content[last:match.Start])
+		expression, err := actionslanguageservice.ParseSyntax(match.Content)
+		if err != nil {
+			trialRepoLog.Printf("Cannot parse trial repository expression")
+		}
+		path, ok := actionslanguageservice.Reference(expression)
+		if ok && len(path) == 2 && path[0] == "github" && path[1] == "repository" {
+			result.WriteString(repository)
+		} else {
+			result.WriteString(content[match.Start:match.End])
+		}
+		last = match.End
+	}
+	result.WriteString(content[last:])
+	return result.String(), nil
+}
+
 // modifyWorkflowForTrialMode modifies the workflow to work in trial mode
 func modifyWorkflowForTrialMode(tempDir, workflowName, logicalRepoSlug string, verbose bool) error {
 	trialRepoLog.Printf("Modifying workflow for trial mode: workflow=%s, logicalRepo=%s", workflowName, logicalRepoSlug)
@@ -481,7 +507,10 @@ func modifyWorkflowForTrialMode(tempDir, workflowName, logicalRepoSlug string, v
 
 	if logicalRepoSlug != "" {
 		// Replace github.repository references to point to simulated host repo
-		modifiedContent = strings.ReplaceAll(modifiedContent, "${{ github.repository }}", logicalRepoSlug)
+		modifiedContent, err = replaceTrialRepositoryExpressions(modifiedContent, logicalRepoSlug)
+		if err != nil {
+			return err
+		}
 
 		// Also replace checkout actions to use the simulated host repo
 		// Split content into lines to preserve indentation
@@ -658,9 +687,9 @@ func cloneRepoContentsIntoHost(cloneRepoSlug string, cloneRepoVersion string, ho
 	}
 
 	// Save the original working directory to restore it later
-	originalDir, err := os.Getwd()
+	originalDir, err := gitutil.Getwd()
 	if err != nil {
-		return fmt.Errorf("failed to get current directory: %w", err)
+		return err
 	}
 	defer os.Chdir(originalDir)
 

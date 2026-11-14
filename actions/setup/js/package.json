@@ -1,29 +1,46 @@
 {
   "devDependencies": {
-    "@actions/artifact": "^6.2.1",
+    "@actions/artifact": "^6.3.1",
     "@actions/core": "^3.0.1",
     "@actions/exec": "^3.0.0",
     "@actions/github": "^9.1.1",
     "@actions/github-script": "github:actions/github-script#v9.0.0",
     "@actions/glob": "^0.7.0",
     "@actions/io": "^3.0.2",
-    "@github/copilot-sdk": "^1.0.8",
-    "@types/node": "^26.1.1",
-    "@vitest/coverage-v8": "^4.1.8",
-    "@vitest/ui": "^4.1.10",
-    "minimatch": ">=10.2.6",
-    "prettier": "^3.9.6",
+    "@github/copilot-sdk": "^1.0.29",
+    "@types/node": "26.6.6",
+    "@vitest/coverage-v8": "^5.1.0",
+    "@vitest/ui": "^5.1.0",
+    "ajv": "^8.17.1",
+    "commonmark": "0.31.2",
+    "minimatch": ">=11.0.3",
+    "prettier": "3.9.10",
+    "smol-toml": "1.9.1",
+    "ts-json-schema-generator": "2.9.0",
     "typescript": "^7.0.2",
-    "vite": "^8.1.5",
-    "vitest": "^4.1.9"
+    "vite": "8.3.4",
+    "vitest": "^5.1.0"
   },
   "overrides": {
-    "undici": "^6.23.0"
+    "magic-string": "1.4.2",
+    "minimatch@3": "^3.1.5",
+    "undici": "^6.23.0",
+    "vite": {
+      "rolldown": "1.2.14",
+      "postcss": {
+        ".": "8.5.28",
+        "nanoid": "3.3.19"
+      }
+    }
   },
   "scripts": {
+    "schema:session": "node scripts/generate_session_schemas.cjs",
+    "schema:session:check": "node scripts/generate_session_schemas.cjs --check",
+    "session:validate": "node scripts/validate_session.cjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && vitest run --no-file-parallelism",
+    "test": "npm run typecheck && npm run schema:session:check && vitest run --no-file-parallelism",
     "test:js": "vitest run",
+    "test:work-queue-performance": "vitest run --no-file-parallelism --silent=false work_queue_git_transport.test.cjs work_queue_performance.test.cjs work_queue_control_performance.test.cjs work_queue_live_performance.test.cjs",
     "test:js-integration-live-api": "vitest run --config vitest.integration.config.mjs --no-file-parallelism",
     "test:js-integration-artifact": "vitest run --config vitest.artifact-integration.config.mjs --no-file-parallelism",
     "test:js-watch": "vitest",

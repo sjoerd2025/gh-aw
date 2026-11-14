@@ -8,11 +8,12 @@ import (
 	"testing"
 )
 
+const validationAlpineImage = "mirror.gcr.io/library/alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf"
+
 func TestValidateContainerImages(t *testing.T) {
 	tests := []struct {
 		name           string
 		workflowData   *WorkflowData
-		expectError    bool
 		skipIfNoDocker bool
 	}{
 		{
@@ -20,7 +21,6 @@ func TestValidateContainerImages(t *testing.T) {
 			workflowData: &WorkflowData{
 				Tools: nil,
 			},
-			expectError: false,
 		},
 		{
 			name: "tools without container",
@@ -32,32 +32,16 @@ func TestValidateContainerImages(t *testing.T) {
 					},
 				},
 			},
-			expectError: false,
 		},
 		{
 			name: "valid container image",
 			workflowData: &WorkflowData{
 				Tools: map[string]any{
 					"test-tool": map[string]any{
-						"container": "alpine",
-						"version":   "latest",
+						"container": validationAlpineImage,
 					},
 				},
 			},
-			expectError:    false,
-			skipIfNoDocker: true,
-		},
-		{
-			name: "invalid container image",
-			workflowData: &WorkflowData{
-				Tools: map[string]any{
-					"test-tool": map[string]any{
-						"container": "nonexistent-image-that-should-not-exist-12345",
-						"version":   "nonexistent",
-					},
-				},
-			},
-			expectError:    true,
 			skipIfNoDocker: true,
 		},
 	}
@@ -78,10 +62,7 @@ func TestValidateContainerImages(t *testing.T) {
 			compiler := NewCompiler()
 			err := compiler.validateContainerImages(tt.workflowData)
 
-			if tt.expectError && err == nil {
-				t.Error("expected error but got none")
-			}
-			if !tt.expectError && err != nil {
+			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
 		})
@@ -98,34 +79,10 @@ func TestValidateDockerImage(t *testing.T) {
 		t.Skip("docker daemon not running, skipping test")
 	}
 
-	tests := []struct {
-		name        string
-		image       string
-		expectError bool
-	}{
-		{
-			name:        "valid image - alpine",
-			image:       "alpine:latest",
-			expectError: false,
-		},
-		{
-			name:        "invalid image",
-			image:       "nonexistent-image-12345:nonexistent",
-			expectError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateDockerImage(tt.image, false, false)
-
-			if tt.expectError && err == nil {
-				t.Error("expected error but got none")
-			}
-			if !tt.expectError && err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-		})
+	// Missing-image failures use fake Docker in docker_validation_readonly_test.go
+	// so registry throttling cannot replace the expected manifest error.
+	if err := validateDockerImageWithMode(validationAlpineImage, false, false, false); err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 

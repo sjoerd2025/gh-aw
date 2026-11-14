@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestResolveEngineID(t *testing.T) {
@@ -55,23 +55,44 @@ func TestResolveEngineID(t *testing.T) {
 	}
 }
 
-func TestBuildStandardNpmEngineInstallStepsNoCooldown(t *testing.T) {
-	steps := BuildStandardNpmEngineInstallStepsNoCooldown(
-		"@github/copilot",
-		string(constants.DefaultCopilotVersion),
-		"Install GitHub Copilot CLI",
-		"copilot",
-		&WorkflowData{},
-	)
+func TestApplyEngineHarnessRetryEnv(t *testing.T) {
+	t.Run("injects harness policy env vars including watchdog timeout", func(t *testing.T) {
+		env := map[string]string{}
+		workflowData := &WorkflowData{
+			EngineConfig: &EngineConfig{
+				HarnessMaxRetries:        "6",
+				HarnessInitialDelayMs:    "10000",
+				HarnessBackoffMultiplier: "2",
+				HarnessMaxDelayMs:        "180000",
+				HarnessWatchdogTimeoutMs: "120000",
+			},
+		}
 
-	var content strings.Builder
-	for _, step := range steps {
-		content.WriteString(strings.Join(step, "\n"))
-		content.WriteString("\n")
-	}
-	if strings.Contains(content.String(), "NPM_CONFIG_MIN_RELEASE_AGE") {
-		t.Fatalf("expected npm cooldown env to be omitted when no-cooldown helper is used")
-	}
+		applyEngineHarnessRetryEnv(env, workflowData)
+
+		assert.Equal(t, "6", env["GH_AW_HARNESS_MAX_RETRIES"])
+		assert.Equal(t, "10000", env["GH_AW_HARNESS_INITIAL_DELAY_MS"])
+		assert.Equal(t, "2", env["GH_AW_HARNESS_BACKOFF_MULTIPLIER"])
+		assert.Equal(t, "180000", env["GH_AW_HARNESS_MAX_DELAY_MS"])
+		assert.Equal(t, "120000", env["GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS"])
+	})
+
+	t.Run("engine.env override still wins after harness policy env injection", func(t *testing.T) {
+		env := map[string]string{}
+		workflowData := &WorkflowData{
+			EngineConfig: &EngineConfig{
+				HarnessWatchdogTimeoutMs: "120000",
+				Env: map[string]string{
+					"GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS": "90000",
+				},
+			},
+		}
+
+		applyEngineHarnessRetryEnv(env, workflowData)
+		applyEngineAndAgentEnv(env, workflowData, nil)
+
+		assert.Equal(t, "90000", env["GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS"])
+	})
 }
 
 func TestShellEscapeArgWithFullyQuotedAgentPath(t *testing.T) {
@@ -186,6 +207,86 @@ func TestGetNpmBinPathSetup_GorootOrdering(t *testing.T) {
 	}
 }
 
+func TestGetNpmBinPathSetup_PreservesSelectedRuby(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Skipping shell-based test on non-Linux platform")
+	}
+
+	cacheRoot := filepath.Join(t.TempDir(), "toolcache")
+	selectedRubyBin := filepath.Join(t.TempDir(), "selected-ruby", "bin")
+	cachedRubyBin := filepath.Join(cacheRoot, "Ruby", "3.2.11", "x64", "bin")
+	require.NoError(t, os.MkdirAll(selectedRubyBin, 0o755))
+	require.NoError(t, os.MkdirAll(cachedRubyBin, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(selectedRubyBin, "ruby"), []byte("#!/bin/sh\necho 'ruby 3.4.8'\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cachedRubyBin, "ruby"), []byte("#!/bin/sh\necho 'ruby 3.2.11'\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cachedRubyBin, "npm-agent"), []byte("#!/bin/sh\necho 'npm agent found'\n"), 0o755))
+
+	shellCmd := fmt.Sprintf(
+		`unset GOROOT ERLANG_HOME; export RUNNER_TOOL_CACHE=%q; export PATH=%q:/usr/bin:/bin; %s; ruby --version; npm-agent`,
+		cacheRoot,
+		selectedRubyBin,
+		GetNpmBinPathSetup(),
+	)
+
+	output, err := exec.Command("bash", "-c", shellCmd).Output()
+	if err != nil {
+		t.Fatalf("Failed to execute shell command: %v", err)
+	}
+	assert.Equal(t, "ruby 3.4.8\nnpm agent found\n", string(output))
+}
+
+func TestDockerSudoIptablesPreservesSelectedRubyPath(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("Skipping shell-based test outside Linux and macOS")
+	}
+
+	root := t.TempDir()
+	cacheRoot := filepath.Join(root, "toolcache")
+	selectedRubyBin := filepath.Join(root, "selected-ruby", "bin")
+	cachedRubyBin := filepath.Join(cacheRoot, "Ruby", "3.2.11", "x64", "bin")
+	secureBin := filepath.Join(root, "secure-bin")
+	commandBin := filepath.Join(root, "command-bin")
+	for _, dir := range []string{selectedRubyBin, cachedRubyBin, secureBin, commandBin} {
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+	}
+
+	require.NoError(t, os.WriteFile(filepath.Join(selectedRubyBin, "ruby"), []byte("#!/bin/sh\necho 'ruby 3.4.8'\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cachedRubyBin, "ruby"), []byte("#!/bin/sh\necho 'ruby 3.2.11'\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cachedRubyBin, "npm-agent"), []byte("#!/bin/sh\necho 'npm agent found'\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(secureBin, "ruby"), []byte("#!/bin/sh\necho 'ruby 3.2.3'\n"), 0o755))
+
+	fakeAWF := filepath.Join(secureBin, "awf")
+	awfScript := fmt.Sprintf("#!/bin/bash\nset -e\nunset GOROOT ERLANG_HOME\n%s\nruby --version\nnpm-agent\n", GetNpmBinPathSetup())
+	require.NoError(t, os.WriteFile(fakeAWF, []byte(awfScript), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(commandBin, "sudo"), []byte(`#!/bin/sh
+case "$1" in
+  -E|--preserve-env=*) shift ;;
+esac
+export PATH="$GH_AW_TEST_SECURE_PATH"
+exec "$@"
+`), 0o755))
+
+	workflowData := &WorkflowData{
+		SandboxConfig: &SandboxConfig{
+			Agent: &AgentSandboxConfig{Runtime: AgentRuntimeDockerSudoIptables},
+		},
+	}
+	awfCommand := strings.Replace(GetAWFCommandPrefix(workflowData), "/usr/local/bin/awf", fakeAWF, 1)
+	hostPath := strings.Join([]string{selectedRubyBin, commandBin, "/usr/bin", "/bin"}, ":")
+	securePath := strings.Join([]string{secureBin, "/usr/bin", "/bin"}, ":")
+	shellCmd := fmt.Sprintf(
+		`export PATH=%q GH_AW_TEST_SECURE_PATH=%q RUNNER_TOOL_CACHE=%q; %s`,
+		hostPath,
+		securePath,
+		cacheRoot,
+		awfCommand,
+	)
+
+	output, err := exec.Command("/bin/bash", "-c", shellCmd).CombinedOutput()
+	require.NoError(t, err, "privileged AWF command failed: %s", output)
+	assert.Equal(t, "ruby 3.4.8\nnpm agent found\n", string(output))
+}
+
 // TestGetNpmBinPathSetup_NoGorootDoesNotBreakChain verifies that when GOROOT is
 // not set, the command chain continues (the || true prevents short-circuit).
 func TestGetNpmBinPathSetup_NoGorootDoesNotBreakChain(t *testing.T) {
@@ -294,6 +395,46 @@ func TestYamlStringValue(t *testing.T) {
 			expected: "${{ secrets.TOKEN }}",
 		},
 		{
+			name:     "uppercase boolean keyword is quoted",
+			input:    "True",
+			expected: `"True"`,
+		},
+		{
+			name:     "uppercase boolean synonym is quoted",
+			input:    "TRUE",
+			expected: `"TRUE"`,
+		},
+		{
+			name:     "boolean synonym is quoted",
+			input:    "yes",
+			expected: `"yes"`,
+		},
+		{
+			name:     "boolean synonym with mixed case is quoted",
+			input:    "Off",
+			expected: `"Off"`,
+		},
+		{
+			name:     "null keyword is quoted",
+			input:    "null",
+			expected: `"null"`,
+		},
+		{
+			name:     "null synonym is quoted",
+			input:    "~",
+			expected: `"~"`,
+		},
+		{
+			name:     "canonical true remains unquoted",
+			input:    "true",
+			expected: "true",
+		},
+		{
+			name:     "canonical false remains unquoted",
+			input:    "false",
+			expected: "false",
+		},
+		{
 			name:     "json object gets single-quoted",
 			input:    `{"key":"value"}`,
 			expected: `'{"key":"value"}'`,
@@ -346,6 +487,19 @@ func TestFormatStepWithCommandAndEnvYAMLSafe(t *testing.T) {
 		// GitHub Actions expressions should not be wrapped in extra quotes
 		if !strings.Contains(output, "MY_TOKEN: ${{ secrets.TOKEN }}") {
 			t.Errorf("Expected unquoted github expression in env, got:\n%s", output)
+		}
+	})
+
+	t.Run("ambiguous scalar env var is quoted", func(t *testing.T) {
+		stepLines := []string{"      - name: Test step"}
+		env := map[string]string{
+			"LITELLM_LOCAL_MODEL_COST_MAP": "True",
+		}
+		result := FormatStepWithCommandAndEnv(stepLines, "echo test", env)
+		output := strings.Join(result, "\n")
+
+		if !strings.Contains(output, `LITELLM_LOCAL_MODEL_COST_MAP: "True"`) {
+			t.Errorf("Expected quoted ambiguous scalar in env, got:\n%s", output)
 		}
 	})
 
@@ -559,6 +713,63 @@ func TestNormalizeBashCommand(t *testing.T) {
 			}
 			if gotChanged != tt.expectedChanged {
 				t.Errorf("normalizeBashCommand(%q) changed = %v, want %v", tt.input, gotChanged, tt.expectedChanged)
+			}
+		})
+	}
+}
+
+func TestApplyEngineVersionEnv(t *testing.T) {
+	tests := []struct {
+		name         string
+		workflowData *WorkflowData
+		wantVersion  string
+		wantSet      bool
+	}{
+		{
+			name:         "nil workflow data",
+			workflowData: nil,
+			wantSet:      false,
+		},
+		{
+			name:         "nil engine config",
+			workflowData: &WorkflowData{},
+			wantSet:      false,
+		},
+		{
+			name: "empty version",
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "goose"},
+			},
+			wantSet: false,
+		},
+		{
+			name: "explicit version string",
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "goose", Version: "1.0.0"},
+			},
+			wantVersion: "1.0.0",
+			wantSet:     true,
+		},
+		{
+			name: "expression version",
+			workflowData: &WorkflowData{
+				EngineConfig: &EngineConfig{ID: "goose", Version: "${{ inputs.engine-version }}"},
+			},
+			wantVersion: "${{ inputs.engine-version }}",
+			wantSet:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := map[string]string{}
+			applyEngineVersionEnv(env, tt.workflowData)
+			got, set := env["GH_AW_ENGINE_VERSION"]
+			if set != tt.wantSet {
+				t.Errorf("expected GH_AW_ENGINE_VERSION to be set=%v, got set=%v", tt.wantSet, set)
+			}
+			if tt.wantSet && got != tt.wantVersion {
+				t.Errorf("expected GH_AW_ENGINE_VERSION=%q, got %q", tt.wantVersion, got)
 			}
 		})
 	}

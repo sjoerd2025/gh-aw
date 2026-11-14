@@ -213,6 +213,53 @@ function parseRepoSlug(repoSlug) {
 }
 
 /**
+ * Check that parsed repository parts identify an exact repository, not a wildcard or pattern.
+ * Owner underscores support Enterprise Managed User logins.
+ * @param {RepoParts|null|undefined} repo - Parsed repository parts
+ * @returns {repo is RepoParts}
+ */
+function isExactRepoSlug(repo) {
+  return !!repo && /^[A-Za-z0-9_-]+$/.test(repo.owner) && /^[A-Za-z0-9_.-]+$/.test(repo.repo);
+}
+
+/**
+ * Get the repository that owns the current workflow checkout.
+ * @returns {string}
+ */
+function getWorkflowRepoSlug() {
+  const githubRepo = (process.env.GITHUB_REPOSITORY || "").trim();
+  if (githubRepo) {
+    return githubRepo;
+  }
+  if (typeof context !== "undefined" && context.repo?.owner && context.repo?.repo) {
+    return `${context.repo.owner}/${context.repo.repo}`;
+  }
+  return "";
+}
+
+/**
+ * Check whether a resolved target differs from the workflow repository.
+ * @param {string} targetRepo - Resolved target repository slug
+ * @returns {boolean}
+ */
+function isSideRepoTarget(targetRepo) {
+  const workflowRepo = getWorkflowRepoSlug();
+  return !workflowRepo || targetRepo.trim().toLowerCase() !== workflowRepo.toLowerCase();
+}
+
+/**
+ * Check whether a configured patch workspace belongs to the resolved target.
+ * An omitted checkout identity describes the workflow checkout.
+ * @param {string} targetRepo - Resolved target repository slug
+ * @param {string} checkoutRepo - Repository identity for the configured workspace, if provided
+ * @returns {boolean}
+ */
+function patchWorkspaceTargetsRepo(targetRepo, checkoutRepo) {
+  const workspaceRepo = (checkoutRepo || getWorkflowRepoSlug()).trim().toLowerCase();
+  return Boolean(workspaceRepo) && workspaceRepo === targetRepo.trim().toLowerCase();
+}
+
+/**
  * Resolve target repository configuration from handler config
  * Combines parsing of allowed-repos and resolution of default target repo
  * @param {HandlerRepoConfig | import('./types/handler-factory').HandlerConfig} config - Handler configuration object
@@ -318,11 +365,53 @@ function resolveExecutionOwnerRepo() {
   if (targetRepoSlug) {
     const parsed = parseRepoSlug(targetRepoSlug);
     if (!parsed) {
-      throw new Error(`Invalid GH_AW_TARGET_REPO_SLUG: "${targetRepoSlug}". Expected exact "owner/repo" format (one slash, non-empty on both sides).`);
+      throw new Error(`${ERR_VALIDATION}: Invalid GH_AW_TARGET_REPO_SLUG: "${targetRepoSlug}". Expected exact "owner/repo" format (one slash, non-empty on both sides).`);
     }
     return parsed;
   }
   return { owner: context.repo.owner, repo: context.repo.repo };
+}
+
+/**
+ * Resolve the configured failure-issue repository (`GH_AW_FAILURE_ISSUE_REPO`).
+ *
+ * SEC-005: when the value was written as a literal "owner/repo" in the workflow
+ * frontmatter it is trusted compile-time configuration. When it was written as a GitHub
+ * Actions expression (for example `${{ inputs.failure-issue-repo }}` in a reusable
+ * workflow) the compiler sets `GH_AW_FAILURE_ISSUE_REPO_FROM_EXPRESSION` to "true"; the
+ * resolved value is then caller-controlled at runtime and is validated with
+ * `validateTargetRepo` against an explicit allowlist limited to the current repository
+ * owner before any API use.
+ *
+ * @param {string} defaultRepoSlug - Current repository slug ("owner/repo") used as the default
+ * @param {(message: string) => void} [warn] - Optional warning sink for rejected values
+ * @returns {RepoParts|null} Parsed owner/repo when a usable override is configured, otherwise null
+ */
+function resolveFailureIssueRepo(defaultRepoSlug, warn) {
+  const configured = (process.env.GH_AW_FAILURE_ISSUE_REPO || "").trim();
+  if (!configured) {
+    return null;
+  }
+  const parsed = parseRepoSlug(configured);
+  if (!parsed) {
+    if (warn) {
+      warn(`Ignoring invalid failure-issue-repo value "${configured}"; expected "owner/repo" format`);
+    }
+    return null;
+  }
+  if (process.env.GH_AW_FAILURE_ISSUE_REPO_FROM_EXPRESSION !== "true") {
+    return parsed;
+  }
+  const defaultOwner = parseRepoSlug(defaultRepoSlug)?.owner;
+  const allowedRepos = parseAllowedRepos(defaultOwner ? `${defaultOwner}/*` : "");
+  const validation = validateTargetRepo(`${parsed.owner}/${parsed.repo}`, defaultRepoSlug, allowedRepos);
+  if (!validation.valid) {
+    if (warn) {
+      warn(`Ignoring runtime failure-issue-repo value "${parsed.owner}/${parsed.repo}": expression-provided repositories must belong to the "${defaultOwner}" owner`);
+    }
+    return null;
+  }
+  return parsed;
 }
 
 module.exports = {
@@ -332,7 +421,12 @@ module.exports = {
   validateRepo,
   validateTargetRepo,
   parseRepoSlug,
+  isExactRepoSlug,
+  getWorkflowRepoSlug,
+  isSideRepoTarget,
+  patchWorkspaceTargetsRepo,
   resolveTargetRepoConfig,
   resolveAndValidateRepo,
   resolveExecutionOwnerRepo,
+  resolveFailureIssueRepo,
 };

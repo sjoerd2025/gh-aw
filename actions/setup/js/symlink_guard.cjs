@@ -14,6 +14,14 @@
  */
 
 const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { ERR_CONFIG, ERR_VALIDATION } = require("./error_codes.cjs");
+
+/** @param {string} message */
+function assetValidationError(message) {
+  return Object.assign(new Error(`${ERR_VALIDATION}: ${message}`), { code: ERR_VALIDATION });
+}
 
 /**
  * Calls `fs.lstatSync(filePath)` and returns the Stats object unless the path
@@ -33,4 +41,258 @@ function lstatGuard(filePath) {
   return stat.isSymbolicLink() ? null : stat;
 }
 
-module.exports = { lstatGuard };
+/**
+ * Resolve only platform-owned aliases, not agent-controlled symlinks.
+ * @param {string} filename
+ */
+function normalizeGuardedPath(filename) {
+  const absolute = path.resolve(filename);
+  if (process.platform === "darwin") {
+    for (const alias of ["/tmp", "/var"]) {
+      if (absolute === alias || absolute.startsWith(`${alias}/`)) {
+        return fs.realpathSync(alias) + absolute.slice(alias.length);
+      }
+    }
+  }
+  return absolute;
+}
+
+/**
+ * Resolve a safe-output source within the workspace or /tmp without following links.
+ * @param {string} filename
+ * @returns {string}
+ */
+function resolveWorkspaceOrTmpPath(filename) {
+  const absolute = normalizeGuardedPath(filename);
+  const workspace = normalizeGuardedPath(process.env.GITHUB_WORKSPACE || process.cwd());
+  for (const root of [workspace, normalizeGuardedPath("/tmp")]) {
+    const relative = path.relative(root, absolute);
+    if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) return absolute;
+  }
+  throw new Error(`${ERR_CONFIG}: File path must be within workspace directory (${workspace}) or /tmp directory. Provided path: ${filename} (resolved to: ${absolute})`);
+}
+
+/**
+ * Shared publication denylist for file uploads and issue artifact text sources.
+ * @param {string} canonicalPath
+ * @returns {string|null}
+ */
+function validateUploadSourcePath(canonicalPath) {
+  const parts = canonicalPath.split(path.sep);
+  if (parts.some(p => p === ".git")) {
+    return `path contains sensitive repository metadata (.git): ${canonicalPath}`;
+  }
+  const systemDenied = ["/etc", "/proc", "/sys", "/dev", "/run", "/boot", "/lib", "/lib64", "/usr/lib", "/usr/local/lib"];
+  for (const denied of systemDenied) {
+    const normalDenied = normalizeGuardedPath(denied);
+    if (canonicalPath === normalDenied || canonicalPath.startsWith(normalDenied + path.sep)) {
+      return `path refers to a system directory: ${canonicalPath}`;
+    }
+  }
+  const homeDir = os.homedir();
+  if (homeDir) {
+    const sensitiveNames = [".ssh", ".aws", ".gnupg", ".docker", ".kube", ".azure", ".gcp", ".config", ".netrc", ".npmrc", ".gitconfig", ".gitcredentials", ".git-credentials"];
+    for (const name of sensitiveNames) {
+      const sensitive = path.join(normalizeGuardedPath(homeDir), name);
+      if (canonicalPath === sensitive || canonicalPath.startsWith(sensitive + path.sep)) {
+        return `path refers to a sensitive HOME location: ${canonicalPath}`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Issue artifact reads must not access general temporary runtime files.
+ * @param {string} filename
+ * @returns {string}
+ */
+function resolveIssueArtifactPath(filename) {
+  const absolute = normalizeGuardedPath(filename);
+  const workspace = normalizeGuardedPath(process.env.GITHUB_WORKSPACE || process.cwd());
+  const agentRoot = normalizeGuardedPath("/tmp/gh-aw/agent");
+  const denied = validateUploadSourcePath(absolute);
+  if (denied) throw assetValidationError(denied);
+  for (const root of [workspace, agentRoot]) {
+    const relative = path.relative(root, absolute);
+    if (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) return absolute;
+  }
+  throw assetValidationError(`File path must be within workspace directory (${workspace}) or /tmp/gh-aw/agent directory. Provided path: ${filename}`);
+}
+
+/**
+ * Pin each directory while walking, rejecting links before opening children.
+ * Linux uses descriptor-relative paths so a renamed/replaced ancestor cannot
+ * redirect the next open. Fail closed elsewhere: absolute-path revalidation
+ * cannot detect an ancestor swapped and restored during the operation, and
+ * POSIX no-follow flags do not provide Windows junction protection.
+ * @template T
+ * @param {string} directory
+ * @param {boolean} create
+ * @param {(directoryPath: string) => T} operation
+ * @param {number} [directoryMode]
+ * @returns {T}
+ */
+function withGuardedDirectory(directory, create, operation, directoryMode = 0o700) {
+  if (process.platform !== "linux") {
+    throw assetValidationError("Guarded asset access requires Linux descriptor-relative paths; macOS and Windows are unsupported");
+  }
+  if (fs.constants.O_NOFOLLOW === undefined || fs.constants.O_DIRECTORY === undefined) {
+    throw assetValidationError("Cannot safely access assets: no-follow directory opens are unavailable");
+  }
+  const absolute = normalizeGuardedPath(directory);
+  const root = path.parse(absolute).root;
+  /** @type {Array<{fd: number, filename: string, stat: import('fs').Stats}>} */
+  const directories = [];
+  let current = root;
+  try {
+    for (const component of [root, ...absolute.slice(root.length).split(path.sep).filter(Boolean)]) {
+      if (component !== root) {
+        const parent = directories[directories.length - 1];
+        current = `/proc/self/fd/${parent.fd}/${component}`;
+      }
+      let stat;
+      let created = false;
+      try {
+        stat = lstatGuard(current);
+      } catch (error) {
+        if (!create || !error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+        try {
+          fs.mkdirSync(current, { mode: directoryMode });
+          created = true;
+        } catch (mkdirError) {
+          if (!mkdirError || typeof mkdirError !== "object" || !("code" in mkdirError) || mkdirError.code !== "EEXIST") throw mkdirError;
+        }
+        stat = lstatGuard(current);
+      }
+      if (!stat) throw assetValidationError("Asset symlinks are not allowed, including parent directories");
+      if (!stat.isDirectory()) throw assetValidationError("Asset parent must be a directory");
+      const fd = fs.openSync(current, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_DIRECTORY);
+      directories.push({ fd, filename: current, stat });
+      const opened = fs.fstatSync(fd);
+      if (opened.dev !== stat.dev || opened.ino !== stat.ino) throw assetValidationError("Asset directory changed while opening");
+      if (created) fs.fchmodSync(fd, directoryMode);
+    }
+    const verify = () => {
+      for (const directory of directories) {
+        const stat = lstatGuard(directory.filename);
+        if (!stat || stat.dev !== directory.stat.dev || stat.ino !== directory.stat.ino) throw assetValidationError("Asset directory changed during access");
+      }
+    };
+    verify();
+    const final = directories[directories.length - 1];
+    const result = operation(`/proc/self/fd/${final.fd}`);
+    verify();
+    return result;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && (error.code === "ELOOP" || error.code === "ENOTDIR")) {
+      throw assetValidationError("Asset symlinks or non-directory parents are not allowed");
+    }
+    throw error;
+  } finally {
+    for (const directory of directories.reverse()) fs.closeSync(directory.fd);
+  }
+}
+
+/**
+ * Read one isolated regular-file snapshot; never reopen the source for copying.
+ * @param {string} filename
+ * @param {number} [maximumBytes]
+ * @returns {Buffer}
+ */
+function readGuardedFile(filename, maximumBytes = 10 * 1024 * 1024) {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) throw assetValidationError("Invalid asset maximum size");
+  return withGuardedDirectory(path.dirname(filename), false, directory => {
+    const source = path.join(directory, path.basename(filename));
+    const expected = lstatGuard(source);
+    if (!expected) throw assetValidationError("Asset symlinks are not allowed");
+    if (!expected.isFile() || expected.nlink !== 1) throw assetValidationError("Asset must be an isolated regular file");
+    const fd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== expected.dev || opened.ino !== expected.ino) throw assetValidationError("Asset file changed while opening");
+      const current = lstatGuard(source);
+      if (!current || current.dev !== opened.dev || current.ino !== opened.ino) throw assetValidationError("Asset file changed while opening");
+      if (opened.size > maximumBytes) throw assetValidationError(`Asset exceeds maximum allowed size ${maximumBytes / 1024} KB`);
+      const content = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < content.length) {
+        const count = fs.readSync(fd, content, offset, content.length - offset, offset);
+        if (!count) throw assetValidationError("Asset file changed while reading");
+        offset += count;
+      }
+      const after = fs.fstatSync(fd);
+      if (after.nlink !== 1 || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) throw assetValidationError("Asset file changed while reading");
+      return content;
+    } finally {
+      fs.closeSync(fd);
+    }
+  });
+}
+
+/**
+ * Exclusively create a staged/published file without following destination links.
+ * @param {string} filename
+ * @param {Buffer} content
+ * @param {{mode?: number, directoryMode?: number}} [options]
+ */
+function writeGuardedFile(filename, content, { mode = 0o600, directoryMode = 0o700 } = {}) {
+  if (!((mode === 0o600 && directoryMode === 0o700) || (mode === 0o644 && directoryMode === 0o755))) {
+    throw assetValidationError("Invalid guarded asset permissions");
+  }
+  return withGuardedDirectory(
+    path.dirname(filename),
+    true,
+    directory => {
+      const target = path.join(directory, path.basename(filename));
+      const fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      try {
+        fs.writeFileSync(fd, content);
+        fs.fchmodSync(fd, mode);
+      } finally {
+        fs.closeSync(fd);
+      }
+    },
+    directoryMode
+  );
+}
+
+/**
+ * Append to one regular file without following destination or parent links.
+ * @param {string} filename
+ * @param {Buffer} content
+ */
+function appendGuardedFile(filename, content) {
+  return withGuardedDirectory(path.dirname(filename), false, directory => {
+    const target = path.join(directory, path.basename(filename));
+    /** @type {import('fs').Stats | null} */
+    let expected = null;
+    try {
+      expected = lstatGuard(target);
+      if (!expected) throw assetValidationError("Asset symlinks are not allowed");
+    } catch (error) {
+      if (!error || typeof error !== "object" || Reflect.get(error, "code") !== "ENOENT") throw error;
+      expected = null;
+    }
+    if (expected && (!expected.isFile() || expected.nlink !== 1)) throw assetValidationError("Asset must be an isolated regular file");
+    const fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.nlink !== 1 || (expected && (opened.dev !== expected.dev || opened.ino !== expected.ino))) {
+        throw assetValidationError("Asset file changed while opening");
+      }
+      const current = lstatGuard(target);
+      if (!current || current.dev !== opened.dev || current.ino !== opened.ino) throw assetValidationError("Asset file changed while opening");
+      let offset = 0;
+      while (offset < content.length) {
+        const written = fs.writeSync(fd, content, offset, content.length - offset);
+        if (written === 0) throw assetValidationError("Could not append complete summary content");
+        offset += written;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  });
+}
+
+module.exports = { lstatGuard, normalizeGuardedPath, resolveWorkspaceOrTmpPath, resolveIssueArtifactPath, validateUploadSourcePath, withGuardedDirectory, readGuardedFile, writeGuardedFile, appendGuardedFile };

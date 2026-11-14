@@ -1,5 +1,8 @@
 // Package httprespbodyclose implements a Go analysis linter that flags
 // HTTP response Body.Close() calls that are made directly instead of deferred.
+// Cleanup through helper calls or aliases is outside this syntactic analysis:
+// passing a response to a helper does not prove that its body is closed. Only
+// directly matched Body.Close() calls affect cleanup state.
 package httprespbodyclose
 
 import (
@@ -8,8 +11,8 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
@@ -19,26 +22,12 @@ import (
 var pkgLog = logger.New("linters:httprespbodyclose")
 
 // Analyzer is the http-resp-body-close analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "httprespbodyclose",
-	Doc:      "reports HTTP response Body.Close() calls that are not deferred, which risks resource leaks on early return",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/httprespbodyclose",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("httprespbodyclose", "reports HTTP response Body.Close() calls that are not deferred, which risks resource leaks on early return", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
 
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -48,11 +37,9 @@ func run(pass *analysis.Pass) (any, error) {
 		(*ast.FuncLit)(nil),
 	}
 
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		inspectFunc(pass, n, noLintIndex, generatedFiles)
 	})
-
-	return nil, nil
 }
 
 func inspectFunc(pass *analysis.Pass, n ast.Node, noLintIndex nolint.DirectiveIndex, generatedFiles filecheck.GeneratedIndex) {
@@ -75,22 +62,76 @@ func inspectFunc(pass *analysis.Pass, n ast.Node, noLintIndex nolint.DirectiveIn
 		return
 	}
 
-	respVars := make(map[types.Object]*respVarState)
+	respVars := make(map[types.Object]map[token.Pos]*respVarState)
+	reported := make(map[token.Pos]bool)
 
-	ast.Inspect(body, func(node ast.Node) bool {
-		return inspectNode(pass, respVars, node, noLintIndex)
-	})
+	walkResponses(pass, respVars, reported, body, noLintIndex)
 
-	for _, state := range respVars {
-		if state.hasManualClose && !state.hasDeferClose {
-			if !nolint.HasDirectiveForLinter(pass.Fset.PositionFor(state.assignPos, false), noLintIndex, "httprespbodyclose") {
-				reportMissingDefer(pass, state)
+	for _, variants := range respVars {
+		for _, state := range variants {
+			if state.hasManualClose && !state.hasDeferClose && !reported[state.assignPos] {
+				if !nolint.HasDirectiveForLinter(pass.Fset.PositionFor(state.assignPos, false), noLintIndex, "httprespbodyclose") {
+					reportMissingDefer(pass, state)
+				}
 			}
 		}
 	}
 }
 
-func inspectNode(pass *analysis.Pass, respVars map[types.Object]*respVarState, node ast.Node, noLintIndex nolint.DirectiveIndex) bool {
+func cloneResponses(states map[types.Object]map[token.Pos]*respVarState) map[types.Object]map[token.Pos]*respVarState {
+	copyOf := make(map[types.Object]map[token.Pos]*respVarState, len(states))
+	for key, variants := range states {
+		copyOf[key] = make(map[token.Pos]*respVarState, len(variants))
+		for pos, st := range variants {
+			value := *st
+			copyOf[key][pos] = &value
+		}
+	}
+	return copyOf
+}
+
+func walkResponses(pass *analysis.Pass, states map[types.Object]map[token.Pos]*respVarState, reported map[token.Pos]bool, node ast.Node, noLintIndex nolint.DirectiveIndex) {
+	ast.Inspect(node, func(n ast.Node) bool {
+		if branch, ok := n.(*ast.IfStmt); ok {
+			if branch.Init != nil {
+				walkResponses(pass, states, reported, branch.Init, noLintIndex)
+			}
+			walkResponses(pass, states, reported, branch.Cond, noLintIndex)
+			thenStates := cloneResponses(states)
+			elseStates := cloneResponses(states)
+			walkResponses(pass, thenStates, reported, branch.Body, noLintIndex)
+			if branch.Else != nil {
+				walkResponses(pass, elseStates, reported, branch.Else, noLintIndex)
+			}
+			for key, variants := range thenStates {
+				for pos, then := range variants {
+					if other, ok := elseStates[key][pos]; ok {
+						then.hasManualClose = then.hasManualClose || other.hasManualClose
+						then.hasDeferClose = then.hasDeferClose && other.hasDeferClose
+						if !then.manualClosePos.IsValid() {
+							then.manualClosePos = other.manualClosePos
+						}
+					}
+				}
+				states[key] = variants
+			}
+			for key, variants := range elseStates {
+				if states[key] == nil {
+					states[key] = make(map[token.Pos]*respVarState)
+				}
+				for pos, st := range variants {
+					if _, ok := states[key][pos]; !ok {
+						states[key][pos] = st
+					}
+				}
+			}
+			return false
+		}
+		return inspectNode(pass, states, reported, n, noLintIndex)
+	})
+}
+
+func inspectNode(pass *analysis.Pass, respVars map[types.Object]map[token.Pos]*respVarState, reported map[token.Pos]bool, node ast.Node, noLintIndex nolint.DirectiveIndex) bool {
 	if node == nil {
 		return false
 	}
@@ -99,10 +140,10 @@ func inspectNode(pass *analysis.Pass, respVars map[types.Object]*respVarState, n
 	}
 
 	if assign, ok := node.(*ast.AssignStmt); ok {
-		trackHTTPAssignment(pass, respVars, assign, noLintIndex)
+		trackHTTPAssignment(pass, respVars, reported, assign, noLintIndex)
 		// Also check RHS for manual Body.Close() in assignments like: err := resp.Body.Close()
 		for _, rhs := range assign.Rhs {
-			if call, ok := rhs.(*ast.CallExpr); ok {
+			if call, ok := astutil.UnwrapParenExpr(rhs).(*ast.CallExpr); ok {
 				markBodyClose(pass, respVars, call)
 			}
 		}
@@ -110,14 +151,14 @@ func inspectNode(pass *analysis.Pass, respVars map[types.Object]*respVarState, n
 
 	if deferStmt, ok := node.(*ast.DeferStmt); ok {
 		if obj := bodyCloseReceiver(pass, deferStmt.Call); obj != nil {
-			if state, found := respVars[obj]; found {
+			for _, state := range respVars[obj] {
 				state.hasDeferClose = true
 			}
 		}
 	}
 
 	if exprStmt, ok := node.(*ast.ExprStmt); ok {
-		if call, ok := exprStmt.X.(*ast.CallExpr); ok {
+		if call, ok := astutil.UnwrapParenExpr(exprStmt.X).(*ast.CallExpr); ok {
 			markBodyClose(pass, respVars, call)
 		}
 	}
@@ -125,12 +166,12 @@ func inspectNode(pass *analysis.Pass, respVars map[types.Object]*respVarState, n
 	return true
 }
 
-func markBodyClose(pass *analysis.Pass, respVars map[types.Object]*respVarState, call *ast.CallExpr) {
+func markBodyClose(pass *analysis.Pass, respVars map[types.Object]map[token.Pos]*respVarState, call *ast.CallExpr) {
 	obj := bodyCloseReceiver(pass, call)
 	if obj == nil {
 		return
 	}
-	if state, found := respVars[obj]; found {
+	for _, state := range respVars[obj] {
 		state.hasManualClose = true
 		if !state.manualClosePos.IsValid() {
 			state.manualClosePos = call.Pos()
@@ -138,7 +179,7 @@ func markBodyClose(pass *analysis.Pass, respVars map[types.Object]*respVarState,
 	}
 }
 
-func trackHTTPAssignment(pass *analysis.Pass, respVars map[types.Object]*respVarState, assign *ast.AssignStmt, noLintIndex nolint.DirectiveIndex) {
+func trackHTTPAssignment(pass *analysis.Pass, respVars map[types.Object]map[token.Pos]*respVarState, reported map[token.Pos]bool, assign *ast.AssignStmt, noLintIndex nolint.DirectiveIndex) {
 	for i, lhs := range assign.Lhs {
 		ident, ok := lhs.(*ast.Ident)
 		if !ok || ident.Name == "_" {
@@ -150,16 +191,13 @@ func trackHTTPAssignment(pass *analysis.Pass, respVars map[types.Object]*respVar
 		}
 
 		var callPos token.Pos
-		switch {
-		case len(assign.Rhs) == 1:
-			// Multi-return function: resp, err := client.Do(req)
-			if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
-				callPos = call.Pos()
-			}
-		case i < len(assign.Rhs):
-			// Parallel assignment: resp, x := f1(), f2()
-			if call, ok := assign.Rhs[i].(*ast.CallExpr); ok {
-				callPos = call.Pos()
+		for rhsIndex, rhs := range assign.Rhs {
+			// A single RHS may return multiple values; otherwise match LHS by index.
+			if len(assign.Rhs) == 1 || rhsIndex == i {
+				if call, ok := rhs.(*ast.CallExpr); ok {
+					callPos = call.Pos()
+				}
+				break
 			}
 		}
 		if !callPos.IsValid() {
@@ -167,12 +205,15 @@ func trackHTTPAssignment(pass *analysis.Pass, respVars map[types.Object]*respVar
 		}
 
 		// Report any prior unresolved violation before overwriting state.
-		if prev, exists := respVars[obj]; exists && prev.hasManualClose && !prev.hasDeferClose {
-			if !nolint.HasDirectiveForLinter(pass.Fset.PositionFor(prev.assignPos, false), noLintIndex, "httprespbodyclose") {
-				reportMissingDefer(pass, prev)
+		for _, prev := range respVars[obj] {
+			if prev.hasManualClose && !prev.hasDeferClose && !reported[prev.assignPos] {
+				if !nolint.HasDirectiveForLinter(pass.Fset.PositionFor(prev.assignPos, false), noLintIndex, "httprespbodyclose") {
+					reportMissingDefer(pass, prev)
+				}
+				reported[prev.assignPos] = true
 			}
 		}
-		respVars[obj] = &respVarState{assignPos: callPos}
+		respVars[obj] = map[token.Pos]*respVarState{callPos: {assignPos: callPos}}
 	}
 }
 
@@ -217,16 +258,18 @@ func isHTTPResponsePtr(t types.Type) bool {
 
 // bodyCloseReceiver returns the types.Object for the *http.Response receiver
 // of a resp.Body.Close() call, or nil if the call is not of that form.
+// Redundant parentheses such as (resp.Body.Close)() or (resp.Body).Close()
+// are ignored so they are matched like the unparenthesized call.
 func bodyCloseReceiver(pass *analysis.Pass, call *ast.CallExpr) types.Object {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Close" {
 		return nil
 	}
-	bodySel, ok := sel.X.(*ast.SelectorExpr)
+	bodySel, ok := astutil.UnwrapParenExpr(sel.X).(*ast.SelectorExpr)
 	if !ok || bodySel.Sel.Name != "Body" {
 		return nil
 	}
-	ident, ok := bodySel.X.(*ast.Ident)
+	ident, ok := astutil.UnwrapParenExpr(bodySel.X).(*ast.Ident)
 	if !ok {
 		return nil
 	}

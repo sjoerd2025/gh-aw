@@ -1,11 +1,29 @@
 // @ts-check
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { syncRuntimePromptTemplates } from "./test_prompt_templates.js";
+import { expectExecutionProvenance, expectMissingRuntimeFailure, requiredExecutionEnvKeys, useExecutionProvenanceFixture } from "./test_execution_provenance.js";
+
+useExecutionProvenanceFixture();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const { runtimePromptsDir } = syncRuntimePromptTemplates(import.meta.url);
+const originalPromptsDir = process.env.GH_AW_PROMPTS_DIR;
+
+beforeAll(() => {
+  process.env.GH_AW_PROMPTS_DIR = runtimePromptsDir;
+});
+
+afterAll(() => {
+  if (originalPromptsDir === undefined) {
+    delete process.env.GH_AW_PROMPTS_DIR;
+  } else {
+    process.env.GH_AW_PROMPTS_DIR = originalPromptsDir;
+  }
+});
 
 describe("add_comment", () => {
   let mockCore;
@@ -45,6 +63,13 @@ describe("add_comment", () => {
             data: {
               id: 12345,
               html_url: "https://github.com/owner/repo/issues/42#issuecomment-12345",
+            },
+          }),
+          getComment: async params => ({
+            data: {
+              id: params.comment_id,
+              issue_url: "https://api.github.com/repos/owner/repo/issues/42",
+              html_url: `https://github.com/owner/repo/issues/42#issuecomment-${params.comment_id}`,
             },
           }),
           listComments: async () => ({ data: [] }),
@@ -101,6 +126,116 @@ describe("add_comment", () => {
     global.github = originalGlobals.github;
     global.context = originalGlobals.context;
     delete process.env.GH_AW_COMMENT_ID;
+  });
+
+  describe("publication size fitting", () => {
+    it("rejects over-limit input before sanitization could truncate its trailing protected marker", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const createComment = vi.fn(mockGithub.rest.issues.createComment);
+      mockGithub.rest.issues.createComment = createComment;
+      const handler = await eval(`(async () => { ${script}; return await main({}); })()`);
+      const result = await handler({ type: "add_comment", body: "x".repeat(524289) + "\n<!-- custom: KEEP-THIS-ENTIRE-MARKER -->" }, {});
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/E006.*524288/);
+      expect(createComment).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])("keeps text intact when the final provenance-inclusive body exactly fits with footer=%s", async footer => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const handler = await eval(`(async () => { ${script}; return await main(${JSON.stringify({ max: 2, footer })}); })()`);
+      const baseline = await handler({ type: "add_comment", body: "x" }, {});
+      const agentBody = "x".repeat(65536 - (baseline.body.length - 1));
+      const result = await handler({ type: "add_comment", body: agentBody }, {});
+      expect(result.success).toBe(true);
+      expect(result.body).toHaveLength(65536);
+      expect(result.body).toContain(agentBody);
+      expect(result.body).not.toContain("Content redacted to fit size limit.");
+      expectExecutionProvenance(result.body);
+    });
+
+    it("does not double-count replaced provenance when a large protected footer leaves only notice space", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const baselineHandler = await eval(`(async () => { ${script}; return await main({ footer: false, body_footer: "Policy" }); })()`);
+      const baseline = await baselineHandler({ type: "add_comment", body: "x" }, {});
+      const notice = "Content redacted to fit size limit.";
+      const policy = "f".repeat(65536 - (baseline.body.length - 1 - "Policy".length) - notice.length);
+      const handler = await eval(`(async () => { ${script}; return await main(${JSON.stringify({ footer: false, body_footer: policy })}); })()`);
+      const result = await handler({ type: "add_comment", body: "x".repeat(100000) }, {});
+      expect(result.success).toBe(true);
+      expect(result.body).toHaveLength(65536);
+      expect(result.body).toContain(notice);
+      expect(result.body).toContain(policy);
+      expectExecutionProvenance(result.body);
+    });
+
+    it.each([true, false])("fits large content and preserves full configured footer and provenance with footer=%s", async footer => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const policy = "POLICY-START " + "f".repeat(1000) + " POLICY-END";
+      const createComment = vi.fn(mockGithub.rest.issues.createComment);
+      mockGithub.rest.issues.createComment = createComment;
+      const handler = await eval(`(async () => { ${script}; return await main(${JSON.stringify({ footer, body_footer: policy })}); })()`);
+      const result = await handler({ type: "add_comment", body: "x".repeat(100000) }, {});
+      expect(result.success).toBe(true);
+      expect(createComment).toHaveBeenCalledOnce();
+      const body = createComment.mock.calls[0][0].body;
+      expect(body.length).toBeLessThanOrEqual(65536);
+      expect(body).toContain("Content redacted to fit size limit.");
+      expect(body).toContain(policy);
+      expectExecutionProvenance(body);
+      if (footer) expect(body).toContain("> Generated by");
+    });
+
+    it("rejects protected-footer overflow without attempting an API write", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const createComment = vi.fn(mockGithub.rest.issues.createComment);
+      mockGithub.rest.issues.createComment = createComment;
+      const handler = await eval(`(async () => { ${script}; return await main({ body_footer: "f".repeat(65536) }); })()`);
+      const result = await handler({ type: "add_comment", body: "Normal body" }, {});
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("protected markers, footers, and framework content");
+      expect(createComment).not.toHaveBeenCalled();
+    });
+
+    it("still enforces the original link budget before reducing large text", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const createComment = vi.fn(mockGithub.rest.issues.createComment);
+      mockGithub.rest.issues.createComment = createComment;
+      const handler = await eval(`(async () => { ${script}; return await main({ max_links: 1 }); })()`);
+      const result = await handler({ type: "add_comment", body: "x".repeat(100000) + " https://github.com/owner/repo/issues/1 https://github.com/owner/repo/issues/2" }, {});
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("E008");
+      expect(createComment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("link limits", () => {
+    it.each([
+      [{}, 50, true],
+      [{ footer: false }, 50, true],
+      [{}, 51, false],
+      [{ max_links: 75 }, 75, true],
+      [{ max_links: 75 }, 76, false],
+      [{ "max-links": 2 }, 3, false],
+    ])("should enforce the agent link budget for config %j and %i links", async (config, count, success) => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const createComment = vi.fn(mockGithub.rest.issues.createComment);
+      mockGithub.rest.issues.createComment = createComment;
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main(${JSON.stringify(config)}); })()`);
+      const body = "https://github.com/owner/repo/issues/42 ".repeat(count);
+      const result = await handler({ type: "add_comment", body }, {});
+      expect(result.success).toBe(success);
+      if (success) {
+        expect(createComment).toHaveBeenCalledOnce();
+        const postedBody = createComment.mock.calls[0][0].body;
+        expect(postedBody).toContain("[https://github.com/owner/repo/issues/42](https://github.com/owner/repo/issues/42) ".repeat(count).trim());
+        if (config.footer !== false) {
+          expect((postedBody.match(/https?:\/\//g) || []).length).toBeGreaterThan(count);
+        }
+      } else {
+        expect(result.error).toMatch(/E008/);
+        expect(createComment).not.toHaveBeenCalled();
+      }
+    });
   });
 
   describe("target configuration", () => {
@@ -261,7 +396,7 @@ describe("add_comment", () => {
       expect(result.error).toBeTruthy();
     });
 
-    it("should use explicit item_number even with triggering target", async () => {
+    it("should ignore explicit item_number with triggering target", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
       /** @type {any} */
@@ -288,8 +423,8 @@ describe("add_comment", () => {
       const result = await handler(message, {});
 
       expect(result.success).toBe(true);
-      expect(capturedIssueNumber).toBe(777);
-      expect(result.itemNumber).toBe(777);
+      expect(capturedIssueNumber).toBe(8535);
+      expect(result.itemNumber).toBe(8535);
     });
 
     it("should resolve from context when item_number is not provided", async () => {
@@ -367,9 +502,11 @@ describe("add_comment", () => {
       let capturedOwner = null;
       /** @type {any} */
       let capturedRepo = null;
+      let capturedBody;
       mockGithub.rest.issues.createComment = async params => {
         capturedOwner = params.owner;
         capturedRepo = params.repo;
+        capturedBody = params.body;
         return {
           data: {
             id: 12345,
@@ -392,42 +529,65 @@ describe("add_comment", () => {
       expect(result.success).toBe(true);
       expect(capturedOwner).toBe("other-org");
       expect(capturedRepo).toBe("other-repo");
+      expectExecutionProvenance(capturedBody);
     });
 
-    it("should return skipped (not failed) when target is 'triggering' but running in schedule context", async () => {
+    it("does not reuse default-repo mention aliases for a cross-repo comment", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const collaboratorLookups = [];
+      let postedBody;
+      mockGithub.rest.repos = {
+        listCollaborators: async params => {
+          collaboratorLookups.push(params);
+          return { data: [] };
+        },
+      };
+      mockGithub.rest.issues.createComment = async params => {
+        postedBody = params.body;
+        return { data: { id: 12345, html_url: "https://github.com/target-org/target-repo/issues/5#issuecomment-12345" } };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({
+        "target-repo": "*", target: "*",
+        mentions: { allowContext: false, allowed: ["target-user"] },
+        allowedMentionAliases: ["workflow-user"]
+      }); })()`);
+      const result = await handler({ type: "add_comment", repo: "target-org/target-repo", item_number: 5, body: "Hi @workflow-user and @target-user" }, {});
+
+      expect(result.success).toBe(true);
+      expect(postedBody).toContain("`@workflow-user` and @target-user");
+      expect(collaboratorLookups).toEqual([expect.objectContaining({ owner: "target-org", repo: "target-repo" })]);
+    });
+
+    it.each([
+      ["schedule", { target: "triggering" }],
+      ["repository_dispatch", {}],
+      ["workflow_dispatch", {}],
+    ])("should fail when triggering target has no issue/PR context in %s", async (eventName, config) => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      let infoCalls = [];
-      let warningCalls = [];
-      mockCore.info = msg => {
-        infoCalls.push(msg);
-      };
+      const warningCalls = [];
       mockCore.warning = msg => {
         warningCalls.push(msg);
       };
 
-      // Simulate a schedule run — no issue or PR in context
-      mockContext.eventName = "schedule";
+      mockContext.eventName = eventName;
       mockContext.payload = {};
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main(${JSON.stringify(config)}); })()`);
 
       const message = {
         type: "add_comment",
-        body: "Status comment from scheduled run",
+        body: "Status comment",
       };
 
       const result = await handler(message, {});
 
-      // Should be skipped, not failed — schedule runs have no triggering issue/PR
       expect(result.success).toBe(false);
-      expect(result.skipped).toBe(true);
-      expect(result.error).toContain("triggering");
-
-      // Should use core.info, not core.warning, since this is an expected non-failure skip
-      const skipInfo = infoCalls.find(msg => msg.includes("triggering"));
-      expect(skipInfo).toBeTruthy();
-      expect(warningCalls.filter(msg => msg.includes("triggering")).length).toBe(0);
+      expect(result.skipped).not.toBe(true);
+      expect(result.error).toContain('target "triggering"');
+      expect(result.error).toContain('target to "*"');
+      expect(warningCalls).toContain(result.error);
     });
 
     it("should reply inline to triggering PR review comment when item_number is not provided", async () => {
@@ -486,6 +646,7 @@ describe("add_comment", () => {
           comment_id: 777,
         })
       );
+      expectExecutionProvenance(capturedReplyParams.body);
     });
 
     it("should keep top-level comment behavior for pull_request_review_comment when item_number is explicitly provided", async () => {
@@ -523,7 +684,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -684,12 +845,19 @@ describe("add_comment", () => {
       delete process.env.GH_AW_COMMENT_ID;
     });
 
-    it("should update existing comment when comment-id alias is provided", async () => {
+    it("should update existing comment when comment-id alias is allowed by target wildcard config", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
       /** @type {any} */
       let capturedUpdateParams = null;
       let createCommentCalled = false;
+      mockGithub.rest.issues.getComment = async params => ({
+        data: {
+          id: params.comment_id,
+          issue_url: "https://api.github.com/repos/owner/repo/issues/8535",
+          html_url: `https://github.com/owner/repo/issues/8535#issuecomment-${params.comment_id}`,
+        },
+      });
       mockGithub.rest.issues.updateComment = async params => {
         capturedUpdateParams = params;
         return {
@@ -709,10 +877,11 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*', allows_comment_ids: ['55555'] }); })()`);
       const result = await handler({ type: "add_comment", body: "Updated output", "comment-id": 55555 }, {});
 
       expect(result.success).toBe(true);
+      expect(result.itemNumber).toBe(8535);
       expect(capturedUpdateParams).toEqual(
         expect.objectContaining({
           owner: "owner",
@@ -721,6 +890,23 @@ describe("add_comment", () => {
         })
       );
       expect(createCommentCalled).toBe(false);
+    });
+
+    it("should reject comment_id when it is not in allows-comment-ids", async () => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+      let updateCommentCalled = false;
+      mockGithub.rest.issues.updateComment = async () => {
+        updateCommentCalled = true;
+        return { data: { id: 999, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-999" } };
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*', allows_comment_ids: ['12345'] }); })()`);
+      const result = await handler({ type: "add_comment", body: "Updated output", comment_id: 55555 }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("allows-comment-ids");
+      expect(updateCommentCalled).toBe(false);
     });
 
     it("should warn and ignore unrecognized message-level target values instead of failing", async () => {
@@ -1008,7 +1194,7 @@ describe("add_comment", () => {
         throw err;
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       // Explicit item_number targeting a different discussion (via 404 fallback)
       const message = {
@@ -1070,7 +1256,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1132,7 +1318,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1255,7 +1441,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1317,7 +1503,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1678,7 +1864,7 @@ describe("add_comment", () => {
       expect(errorCalls.length).toBe(0);
     });
 
-    it("should detect 404 from error message containing '404'", async () => {
+    it("should not classify digit substrings in an error message as HTTP status", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
       let warningCalls = [];
@@ -1700,10 +1886,37 @@ describe("add_comment", () => {
 
       const result = await handler(message, {});
 
-      expect(result.success).toBe(true);
-      expect(result.warning).toBeTruthy();
-      expect(result.skipped).toBe(true);
-      expect(warningCalls.length).toBeGreaterThan(0);
+      expect(result.success).toBe(false);
+      expect(result.error).toBe("API request failed with status 404");
+      expect(result.skipped).not.toBe(true);
+      expect(warningCalls).toHaveLength(0);
+    });
+
+    it.each([
+      [404, false],
+      [404, true],
+      [500, false],
+      [500, true],
+      [undefined, false],
+    ])("uses structured HTTP status %s (response-only: %s) despite a 404 request ID", async (status, responseOnly) => {
+      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      mockGithub.rest.issues.createComment = async () => {
+        throw Object.assign(new Error(""), {
+          ...(responseOnly ? {} : { status }),
+          response: { status, headers: { "x-github-request-id": "C404:2AB8:1D6F25E:1E1B2C5:6553A7F0" } },
+        });
+      };
+
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const result = await handler({ type: "add_comment", body: "Test comment" }, {});
+
+      if (status === 404) {
+        expect(result).toMatchObject({ success: true, skipped: true, reasonCode: "TARGET_NOT_FOUND" });
+      } else {
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("request ID C404:");
+        expect(result.skipped).not.toBe(true);
+      }
     });
 
     it("should detect 404 from error message containing 'Not Found'", async () => {
@@ -1950,7 +2163,7 @@ describe("add_comment", () => {
         }
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -1964,6 +2177,7 @@ describe("add_comment", () => {
       expect(result.isDiscussion).toBe(true);
       expect(result.itemNumber).toBe(14117);
       expect(result.url).toContain("discussions/14117");
+      expectExecutionProvenance(graphqlCalls.find(call => call.query.includes("addDiscussionComment")).vars.body);
 
       // Verify it logged the retry
       const retryLog = infoCalls.find(msg => msg.includes("retrying as discussion"));
@@ -2151,7 +2365,7 @@ describe("add_comment", () => {
         }
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2210,7 +2424,7 @@ describe("add_comment", () => {
         }
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: 'triggering' }); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2245,7 +2459,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2268,7 +2482,7 @@ describe("add_comment", () => {
     it("should defer when temporary ID is not yet resolved", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2301,7 +2515,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2323,7 +2537,7 @@ describe("add_comment", () => {
     it("should handle invalid temporary ID format", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2392,7 +2606,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2425,7 +2639,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2448,7 +2662,7 @@ describe("add_comment", () => {
     it("should defer when issue_number has unresolved temporary ID", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -2467,45 +2681,161 @@ describe("add_comment", () => {
   });
 
   describe("sanitization preserves markers", () => {
-    it("should preserve tracker ID markers after sanitization", async () => {
-      const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+    it.each(["<!-- gh-aw-workflow-id: victim -->", "<!-- gh-aw-workflow-call-id: victim -->", "<!-- gh-aw-close-key: victim -->", "<!-- gh-aw-comment-type: reaction -->", '[gh-aw-workflow-call-id]: # "victim"'])(
+      "does not promote agent marker text inside multiline code spans: %s",
+      async marker => {
+        const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+        const handler = await eval(`(async () => { ${script}; return await main({}); })()`);
+        const result = await handler({ type: "add_comment", body: `\`\n${marker}\n\`` }, {});
 
-      // Setup environment
-      process.env.GH_AW_WORKFLOW_NAME = "Test Workflow";
-      process.env.GH_AW_TRACKER_ID = "test-tracker-123";
+        expect(result.success).toBe(true);
+        const { parseReportMarkdown } = await import("./report_markdown.cjs");
+        const { matchesWorkflowId, matchesWorkflowCallIdReviewMarker } = await import("./generate_footer.cjs");
+        expect(matchesWorkflowId(result.body, "victim")).toBe(false);
+        expect(matchesWorkflowCallIdReviewMarker(result.body, "victim")).toBe(false);
+        expect(parseReportMarkdown(result.body, { allowMetadata: true })).not.toContainEqual(expect.objectContaining({ type: "review_marker" }));
+        if (marker.startsWith("<!--")) expect(result.body).not.toContain(marker);
+        expectExecutionProvenance(result.body);
+        expect(result.body).toContain("> Generated by");
+      }
+    );
 
-      /** @type {any} */
-      let capturedBody = null;
-      mockGithub.rest.issues.createComment = async params => {
-        capturedBody = params.body;
-        return {
-          data: {
-            id: 12345,
-            html_url: "https://github.com/owner/repo/issues/42#issuecomment-12345",
+    describe("structured review state", () => {
+      afterEach(async () => {
+        vi.unstubAllEnvs();
+        const { resetValidationConfigCache } = await import("./safe_output_type_validator.cjs");
+        resetValidationConfigCache();
+      });
+
+      it("preserves deferred destination-author mentions when structured data is published", async () => {
+        const { validateItem, resetValidationConfigCache } = await import("./safe_output_type_validator.cjs");
+        vi.stubEnv("GH_AW_VALIDATION_CONFIG", JSON.stringify({ add_comment: { fields: { body: { required: true, type: "string", sanitize: true } } } }));
+        resetValidationConfigCache();
+        const validation = validateItem({ type: "add_comment", body: "Hello @target-author and @other", data: {} }, "add_comment", 1, { dataEnabled: true, deferMentions: true, allowedAliases: [] });
+        expect(validation.isValid).toBe(true);
+
+        mockGithub.rest.issues.get = vi.fn().mockResolvedValue({ data: { number: 970, user: { login: "target-author", type: "User" } } });
+        const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+        const handler = await eval(`(async () => { ${script}; return await main({ target: '*' }); })()`);
+        const result = await handler({ ...validation.normalizedItem, item_number: 970 }, {});
+
+        expect(result.success).toBe(true);
+        expect(result.body).toContain("Hello @target-author");
+        expect(result.body).not.toContain("`@target-author`");
+        expect(result.body).toContain("`@other`");
+        expect(result.body).toContain("Structured data:");
+      });
+
+      it.each([true, false])("should publish recoverable baseline data on issue_comment events with footer=%s", async footer => {
+        const { validateItem, resetValidationConfigCache } = await import("./safe_output_type_validator.cjs");
+        vi.stubEnv(
+          "GH_AW_VALIDATION_CONFIG",
+          JSON.stringify({
+            add_comment: {
+              defaultMax: 1,
+              dataSchema: { reviewed_sha: "string" },
+              fields: {
+                body: { required: true, type: "string", sanitize: true, maxLength: 65000 },
+              },
+            },
+          })
+        );
+        resetValidationConfigCache();
+
+        mockContext.eventName = "issue_comment";
+        mockContext.payload = { issue: { number: 8535, pull_request: {} } };
+        const data = { reviewed_sha: "0123456789abcdef0123456789abcdef01234567" };
+        const validation = validateItem(
+          {
+            type: "add_comment",
+            body: `Review complete.\n\n<!-- gh-aw-state: ${JSON.stringify(data)} -->`,
+            data,
           },
+          "add_comment",
+          1
+        );
+        expect(validation.isValid).toBe(true);
+        expect(validation.normalizedItem.data).toEqual(data);
+
+        const createComment = vi.fn(mockGithub.rest.issues.createComment);
+        mockGithub.rest.issues.createComment = createComment;
+        const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main(${JSON.stringify({ footer })}); })()`);
+        const result = await handler(validation.normalizedItem, {});
+
+        expect(result.success).toBe(true);
+        expect(createComment).toHaveBeenCalledOnce();
+        const request = createComment.mock.calls[0][0];
+        expect(request.issue_number).toBe(8535);
+        expect(request.body).toContain("Review complete.");
+        expect(request.body).not.toContain("<!-- gh-aw-state:");
+        const serializedData = request.body.match(/Structured data:\n\n```json\n([\s\S]*?)\n```/)?.[1];
+        expect(JSON.parse(serializedData || "")).toEqual(data);
+      });
+    });
+
+    describe("PR comment tracker attribution", () => {
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      it.each([
+        { footer: undefined, trackerId: "test-tracker-123" },
+        { footer: false, trackerId: "test-tracker-123" },
+        { footer: undefined, trackerId: undefined },
+        { footer: false, trackerId: undefined },
+      ])("should preserve sanitized PR content with footer=$footer and trackerId=$trackerId", async ({ footer, trackerId }) => {
+        const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+
+        vi.stubEnv("GH_AW_WORKFLOW_NAME", "Test Workflow");
+        vi.stubEnv("GH_AW_TRACKER_ID", trackerId);
+
+        /** @type {any} */
+        let capturedRequest = null;
+        mockGithub.rest.issues.createComment = async params => {
+          capturedRequest = params;
+          return {
+            data: {
+              id: 12345,
+              html_url: "https://github.com/owner/repo/pull/8535#issuecomment-12345",
+            },
+          };
         };
-      };
 
-      // Execute the handler
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+        // Execute the handler
+        const handler = await eval(`(async () => { ${addCommentScript}; return await main(${JSON.stringify({ footer })}); })()`);
 
-      const message = {
-        type: "add_comment",
-        body: "User content with <script>alert('xss')</script> attempt",
-      };
+        const message = {
+          type: "add_comment",
+          body: "User content with <b>safe HTML</b> and <script>alert('xss')</script> attempt",
+        };
 
-      const result = await handler(message, {});
+        const result = await handler(message, {});
 
-      expect(result.success).toBe(true);
-      expect(capturedBody).toBeDefined();
-      // Verify tracker ID is present (not removed by sanitization)
-      expect(capturedBody).toContain("<!-- gh-aw-tracker-id: test-tracker-123 -->");
-      // Verify script tags were sanitized (converted to safe format)
-      expect(capturedBody).not.toContain("<script>");
-      expect(capturedBody).toContain("(script)"); // Tags converted to parentheses
-
-      delete process.env.GH_AW_WORKFLOW_NAME;
-      delete process.env.GH_AW_TRACKER_ID;
+        expect(result.success).toBe(true);
+        expect(capturedRequest).toEqual(
+          expect.objectContaining({
+            owner: "owner",
+            repo: "repo",
+            issue_number: 8535,
+          })
+        );
+        const { body } = capturedRequest;
+        expect(body).toContain("User content with **safe HTML**");
+        if (trackerId) {
+          expect(body).toContain("\n\n<!-- gh-aw-tracker-id: test-tracker-123 -->");
+        } else {
+          expect(body).not.toContain("gh-aw-tracker-id");
+        }
+        if (footer === false) {
+          expect(body).not.toContain("> Generated by");
+        } else {
+          expect(body).toContain("> Generated by");
+        }
+        // Verify script tags were sanitized (converted to safe format)
+        expect(body).not.toContain("<script>");
+        expect(body).toContain("(script)"); // Tags converted to parentheses
+      });
     });
 
     it("should preserve workflow footer after sanitization", async () => {
@@ -3032,7 +3362,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -3077,7 +3407,7 @@ describe("add_comment", () => {
         };
       };
 
-      const handler = await eval(`(async () => { ${addCommentScript}; return await main({}); })()`);
+      const handler = await eval(`(async () => { ${addCommentScript}; return await main({ target: '*' }); })()`);
 
       const message = {
         type: "add_comment",
@@ -3393,6 +3723,65 @@ describe("add_comment", () => {
   });
 
   describe("footer configuration", () => {
+    it.each(requiredExecutionEnvKeys)("should not publish or update a comment when %s is missing", async key => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      mockGithub.rest.issues.createComment = vi.fn(mockGithub.rest.issues.createComment);
+      mockGithub.rest.issues.updateComment = vi.fn(mockGithub.rest.issues.updateComment);
+      mockGithub.rest.pulls.createReplyForReviewComment = vi.fn(mockGithub.rest.pulls.createReplyForReviewComment);
+      mockGithub.graphql = vi.fn(mockGithub.graphql);
+      await expectMissingRuntimeFailure(async () => {
+        const handler = await eval(`(async () => { ${script}; return await main({}); })()`);
+        return handler({ type: "add_comment", body: "Missing runtime" }, {});
+      }, key);
+
+      expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
+      expect(mockGithub.rest.issues.updateComment).not.toHaveBeenCalled();
+      expect(mockGithub.rest.pulls.createReplyForReviewComment).not.toHaveBeenCalled();
+      expect(mockGithub.graphql.mock.calls.some(call => call[0].includes("addDiscussionComment"))).toBe(false);
+    });
+
+    it.each(
+      ["create", "status update", "discussion fallback"].flatMap(mode =>
+        [
+          { name: "default footer", footer: undefined, customFooter: undefined },
+          { name: "disabled footer", footer: false, customFooter: undefined },
+          { name: "custom messages.footer", footer: undefined, customFooter: "Custom comment attribution" },
+        ].map(variant => ({ mode, ...variant }))
+      )
+    )("should publish execution provenance for $mode with $name", async ({ mode, footer, customFooter }) => {
+      vi.stubEnv("GH_AW_SAFE_OUTPUT_MESSAGES", customFooter ? JSON.stringify({ footer: customFooter }) : "");
+      vi.stubEnv("GH_AW_COMMENT_ID", mode === "status update" ? "55555" : undefined);
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      mockGithub.rest.issues.createComment = vi.fn(mockGithub.rest.issues.createComment);
+      mockGithub.rest.issues.updateComment = vi.fn(mockGithub.rest.issues.updateComment);
+      mockGithub.graphql = vi.fn(mockGithub.graphql);
+      if (mode === "discussion fallback") {
+        mockGithub.rest.issues.createComment.mockRejectedValue(Object.assign(new Error("Not Found"), { status: 404 }));
+      }
+      const config = { footer, target: mode === "discussion fallback" ? "*" : "triggering" };
+      const handler = await eval(`(async () => { ${script}; return await main(${JSON.stringify(config)}); })()`);
+      const result = await handler(
+        {
+          type: "add_comment",
+          body: "Comment provenance",
+          ...(mode === "status update" ? { target: "status" } : {}),
+          ...(mode === "discussion fallback" ? { item_number: 10 } : {}),
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      const body =
+        mode === "status update"
+          ? mockGithub.rest.issues.updateComment.mock.calls[0][0].body
+          : mode === "discussion fallback"
+            ? mockGithub.graphql.mock.calls.find(call => call[0].includes("addDiscussionComment"))[1].body
+            : mockGithub.rest.issues.createComment.mock.calls[0][0].body;
+      expectExecutionProvenance(body);
+      if (customFooter) expect(body).toContain(customFooter);
+      if (footer === false) expect(body).not.toContain("> Generated by");
+    });
+
     it("should include only XML marker (no attribution text) when footer is disabled", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
@@ -3415,6 +3804,7 @@ describe("add_comment", () => {
         expect(result.success).toBe(true);
         expect(capturedBody).not.toContain("Generated by");
         expect(capturedBody).toContain("<!-- gh-aw-agentic-workflow:");
+        expectExecutionProvenance(capturedBody);
       } finally {
         if (originalWorkflowName === undefined) {
           delete process.env.GH_AW_WORKFLOW_NAME;
@@ -3456,6 +3846,153 @@ describe("add_comment", () => {
     });
   });
 
+  describe("replace-older-comments behavior", () => {
+    it("updates the newest comment with the same caller marker and refreshes its footer", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const oldCaller = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      const oldWorkflow = process.env.GH_AW_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/MyWorkflow";
+      process.env.GH_AW_WORKFLOW_ID = "shared-workflow";
+      try {
+        mockGithub.rest.users = { getAuthenticated: vi.fn(async () => ({ data: { login: "workflow[bot]" } })) };
+        mockGithub.rest.issues.listComments = vi.fn(async ({ page }) => ({
+          data:
+            page === 1
+              ? [
+                  { id: 1, user: { login: "workflow[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/MyWorkflow -->" },
+                  ...Array.from({ length: 99 }, (_, index) => ({ id: index + 2, body: "<!-- gh-aw-workflow-call-id: owner/repo/OtherWorkflow -->" })),
+                ]
+              : page === 2
+                ? [
+                    { id: 101, user: { login: "workflow[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/MyWorkflow -->" },
+                    { id: 102, user: { login: "attacker", type: "User" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/MyWorkflow -->" },
+                  ]
+                : [],
+        }));
+        mockGithub.rest.issues.updateComment = vi.fn(async ({ comment_id }) => ({
+          data: { id: comment_id, html_url: `https://github.com/owner/repo/issues/8535#issuecomment-${comment_id}` },
+        }));
+        mockGithub.rest.issues.createComment = vi.fn();
+        const handler = await eval(`(async () => { ${script}; return await main({ replace_older_comments: true }); })()`);
+        const result = await handler({ type: "add_comment", body: "Fresh risk rating" }, {});
+        expect(result.success).toBe(true);
+        expect(result.commentId).toBe(101);
+        expect(mockGithub.rest.issues.updateComment).toHaveBeenCalledWith(
+          expect.objectContaining({
+            comment_id: 101,
+            body: expect.stringContaining("Fresh risk rating"),
+          })
+        );
+        expect(mockGithub.rest.issues.updateComment.mock.calls[0][0].body).toContain("<!-- gh-aw-workflow-call-id: owner/repo/MyWorkflow -->");
+        expect(mockGithub.rest.issues.updateComment.mock.calls[0][0].body).toContain("/actions/runs/12345");
+        expectExecutionProvenance(mockGithub.rest.issues.updateComment.mock.calls[0][0].body, { aw_workflow_id: "shared-workflow" });
+        expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
+        expect(mockGithub.rest.issues.listComments).toHaveBeenCalledTimes(2);
+      } finally {
+        if (oldCaller === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = oldCaller;
+        if (oldWorkflow === undefined) delete process.env.GH_AW_WORKFLOW_ID;
+        else process.env.GH_AW_WORKFLOW_ID = oldWorkflow;
+      }
+    });
+
+    it("creates a comment when no caller marker matches", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const oldCaller = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/MyWorkflow";
+      try {
+        mockGithub.rest.users = { getAuthenticated: vi.fn(async () => ({ data: { login: "workflow[bot]" } })) };
+        mockGithub.rest.issues.listComments = vi.fn(async () => ({
+          data: [{ id: 2, user: { login: "workflow[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/OtherWorkflow -->" }],
+        }));
+        mockGithub.rest.issues.updateComment = vi.fn();
+        mockGithub.rest.issues.createComment = vi.fn(mockGithub.rest.issues.createComment);
+        const handler = await eval(`(async () => { ${script}; return await main({ replace_older_comments: true }); })()`);
+        expect((await handler({ type: "add_comment", body: "Fresh rating" }, {})).success).toBe(true);
+        expect(mockGithub.rest.issues.createComment).toHaveBeenCalledOnce();
+        expect(mockGithub.rest.issues.updateComment).not.toHaveBeenCalled();
+        expect(mockGithub.rest.users.getAuthenticated).not.toHaveBeenCalled();
+      } finally {
+        if (oldCaller === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = oldCaller;
+      }
+    });
+
+    it("updates only bot-authored matching comments when authenticated identity cannot be resolved", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const oldCaller = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/MyWorkflow";
+      try {
+        mockGithub.rest.users = {
+          getAuthenticated: vi.fn(async () => {
+            throw new Error("403");
+          }),
+        };
+        mockGithub.rest.issues.listComments = vi.fn(async () => ({
+          data: [
+            { id: 101, user: { login: "workflow[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/MyWorkflow -->" },
+            { id: 102, user: { login: "attacker", type: "User" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/MyWorkflow -->" },
+          ],
+        }));
+        mockGithub.rest.issues.updateComment = vi.fn(async ({ comment_id }) => ({
+          data: { id: comment_id, html_url: `https://github.com/owner/repo/issues/8535#issuecomment-${comment_id}` },
+        }));
+        mockGithub.rest.issues.createComment = vi.fn();
+        const handler = await eval(`(async () => { ${script}; return await main({ max: 2, replace_older_comments: true }); })()`);
+        const firstResult = await handler({ type: "add_comment", body: "First update" }, {});
+        const secondResult = await handler({ type: "add_comment", body: "Second update" }, {});
+
+        expect(firstResult.commentId).toBe(101);
+        expect(secondResult.commentId).toBe(101);
+        expect(mockGithub.rest.users.getAuthenticated).toHaveBeenCalledOnce();
+        expect(mockGithub.rest.issues.updateComment).toHaveBeenCalledTimes(2);
+        expect(mockGithub.rest.issues.updateComment).toHaveBeenNthCalledWith(1, expect.objectContaining({ comment_id: 101 }));
+        expect(mockGithub.rest.issues.updateComment).toHaveBeenNthCalledWith(2, expect.objectContaining({ comment_id: 101 }));
+        expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
+      } finally {
+        if (oldCaller === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = oldCaller;
+      }
+    });
+
+    it("updates instead of replying inline to a triggering PR review comment", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      const oldCaller = process.env.GH_AW_CALLER_WORKFLOW_ID;
+      process.env.GH_AW_CALLER_WORKFLOW_ID = "owner/repo/MyWorkflow";
+      mockContext.eventName = "pull_request_review_comment";
+      mockContext.payload.comment = { id: 789 };
+      try {
+        mockGithub.rest.users = { getAuthenticated: vi.fn(async () => ({ data: { login: "workflow[bot]" } })) };
+        mockGithub.rest.issues.listComments = vi.fn(async () => ({
+          data: [{ id: 123, user: { login: "workflow[bot]", type: "Bot" }, body: "<!-- gh-aw-workflow-call-id: owner/repo/MyWorkflow -->" }],
+        }));
+        mockGithub.rest.issues.updateComment = vi.fn(async () => ({ data: { id: 123, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-123" } }));
+        mockGithub.rest.pulls.createReplyForReviewComment = vi.fn();
+        const handler = await eval(`(async () => { ${script}; return await main({ replace_older_comments: true }); })()`);
+        expect((await handler({ type: "add_comment", body: "New review digest" }, {})).commentId).toBe(123);
+        expect(mockGithub.rest.pulls.createReplyForReviewComment).not.toHaveBeenCalled();
+      } finally {
+        if (oldCaller === undefined) delete process.env.GH_AW_CALLER_WORKFLOW_ID;
+        else process.env.GH_AW_CALLER_WORKFLOW_ID = oldCaller;
+      }
+    });
+
+    it("does not look up or edit comments in staged mode", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      mockGithub.rest.issues.listComments = vi.fn();
+      mockGithub.rest.issues.updateComment = vi.fn();
+      const handler = await eval(`(async () => { ${script}; return await main({ replace_older_comments: true, staged: true }); })()`);
+      expect((await handler({ type: "add_comment", body: "Preview" }, {})).staged).toBe(true);
+      expect(mockGithub.rest.issues.listComments).not.toHaveBeenCalled();
+      expect(mockGithub.rest.issues.updateComment).not.toHaveBeenCalled();
+    });
+
+    it("rejects simultaneous hiding and replacement", async () => {
+      const script = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
+      await expect(eval(`(async () => { ${script}; return await main({ hide_older_comments: true, replace_older_comments: true }); })()`)).rejects.toThrow("replace-older-comments cannot be combined with hide-older-comments");
+    });
+  });
+
   describe("hide-older-comments behavior", () => {
     it("should normalize workflow ID match lists", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
@@ -3464,7 +4001,7 @@ describe("add_comment", () => {
       expect(exports.normalizeWorkflowIdList(["  wf-a  ", "wf-a", "", "  ", "wf-b "])).toEqual(["wf-a", "wf-b"]);
     });
 
-    it("should skip hiding when no workflow ID is set", async () => {
+    it("should reject publication before hiding when no workflow ID is set", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
 
       const originalWorkflowId = process.env.GH_AW_WORKFLOW_ID;
@@ -3476,16 +4013,15 @@ describe("add_comment", () => {
           listCommentsCalled = true;
           return { data: [] };
         };
-        mockGithub.rest.issues.createComment = async () => ({
+        mockGithub.rest.issues.createComment = vi.fn(async () => ({
           data: { id: 1, html_url: "https://github.com/owner/repo/issues/8535#issuecomment-1" },
-        });
+        }));
 
         const handler = await eval(`(async () => { ${addCommentScript}; return await main({ hide_older_comments: true }); })()`);
 
         const message = { type: "add_comment", body: "Comment without workflow ID" };
-        const result = await handler(message, {});
-
-        expect(result.success).toBe(true);
+        await expect(handler(message, {})).rejects.toThrow("GH_AW_WORKFLOW_ID");
+        expect(mockGithub.rest.issues.createComment).not.toHaveBeenCalled();
         expect(listCommentsCalled).toBe(false);
       } finally {
         if (originalWorkflowId === undefined) {
@@ -3630,10 +4166,10 @@ describe("add_comment", () => {
       }
     });
 
-    it("should hide match-list comments when workflow ID is not set", async () => {
+    it("should hide match-list comments independently of the publishing workflow ID", async () => {
       const addCommentScript = fs.readFileSync(path.join(__dirname, "add_comment.cjs"), "utf8");
       const originalWorkflowId = process.env.GH_AW_WORKFLOW_ID;
-      delete process.env.GH_AW_WORKFLOW_ID;
+      process.env.GH_AW_WORKFLOW_ID = "publishing-workflow";
 
       try {
         let hiddenNodeIds = [];

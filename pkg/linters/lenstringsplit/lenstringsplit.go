@@ -12,39 +12,33 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
+	"github.com/github/gh-aw/pkg/linters/internal/coverage"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the len-strings-split analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "lenstringsplit",
-	Doc:      "reports len(strings.Split(s, sep)) expressions with a provably non-empty separator that allocate a []string just to count substrings; use strings.Count(s, sep)+1 instead",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/lenstringsplit",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
+var Analyzer = analyzerutil.New("lenstringsplit", "reports len(strings.Split(s, sep)) expressions with a provably non-empty separator that allocate a []string just to count substrings; use strings.Count(s, sep)+1 instead", run)
+
+// hotThreshold gates findings on coverage data; see coverage package docs.
+var hotThreshold *int
+
+func init() {
+	hotThreshold = coverage.RegisterHotThresholdFlag(Analyzer)
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
 
 	nodeFilter := []ast.Node{(*ast.CallExpr)(nil)}
 
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		outer, ok := n.(*ast.CallExpr)
 		if !ok {
 			return
@@ -57,7 +51,7 @@ func run(pass *analysis.Pass) (any, error) {
 		if len(outer.Args) != 1 {
 			return
 		}
-		inner, ok := outer.Args[0].(*ast.CallExpr)
+		inner, ok := astutil.UnwrapParenExpr(outer.Args[0]).(*ast.CallExpr) //nolint:uncheckedsliceindex // len(outer.Args) is checked above
 		if !ok {
 			return
 		}
@@ -75,6 +69,9 @@ func run(pass *analysis.Pass) (any, error) {
 		if nolint.HasDirectiveForLinter(pos, noLintIndex, "lenstringsplit") {
 			return
 		}
+		if !coverage.ShouldApply(pass, outer.Pos(), *hotThreshold) {
+			return
+		}
 
 		pass.Report(analysis.Diagnostic{
 			Pos:            outer.Pos(),
@@ -83,13 +80,11 @@ func run(pass *analysis.Pass) (any, error) {
 			SuggestedFixes: buildCountFix(pass, outer, inner),
 		})
 	})
-
-	return nil, nil
 }
 
 // isBuiltinLen reports whether call is an invocation of the builtin len function.
 func isBuiltinLen(pass *analysis.Pass, call *ast.CallExpr) bool {
-	ident, ok := call.Fun.(*ast.Ident)
+	ident, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.Ident)
 	if !ok || ident.Name != "len" {
 		return false
 	}
@@ -100,7 +95,7 @@ func isBuiltinLen(pass *analysis.Pass, call *ast.CallExpr) bool {
 // isStringsSplit reports whether call is strings.Split from the standard
 // library "strings" package.
 func isStringsSplit(pass *analysis.Pass, call *ast.CallExpr) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Split" {
 		return false
 	}
@@ -111,7 +106,7 @@ func hasProvablyNonEmptySeparator(pass *analysis.Pass, call *ast.CallExpr) bool 
 	if len(call.Args) != 2 {
 		return false
 	}
-	tv, ok := pass.TypesInfo.Types[call.Args[1]]
+	tv, ok := pass.TypesInfo.Types[call.Args[1]] //nolint:uncheckedsliceindex // len(call.Args) is checked above
 	if !ok || tv.Value == nil || tv.Value.Kind() != constant.String {
 		return false
 	}
@@ -122,9 +117,12 @@ func buildCountFix(pass *analysis.Pass, outer, inner *ast.CallExpr) []analysis.S
 	if len(inner.Args) != 2 {
 		return nil
 	}
+	if astutil.HasOverlappingComment(pass.Files, outer.Pos(), outer.End()) {
+		return nil
+	}
 
-	sText := astutil.NodeText(pass.Fset, inner.Args[0])
-	sepText := astutil.NodeText(pass.Fset, inner.Args[1])
+	sText := astutil.NodeText(pass.Fset, inner.Args[0])   //nolint:uncheckedsliceindex // len(inner.Args) is checked above
+	sepText := astutil.NodeText(pass.Fset, inner.Args[1]) //nolint:uncheckedsliceindex // len(inner.Args) is checked above
 	pkgText := splitPkgText(pass, inner)
 	if sText == "" || sepText == "" || pkgText == "" {
 		return nil
@@ -141,7 +139,7 @@ func buildCountFix(pass *analysis.Pass, outer, inner *ast.CallExpr) []analysis.S
 }
 
 func splitPkgText(pass *analysis.Pass, call *ast.CallExpr) string {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok {
 		return ""
 	}

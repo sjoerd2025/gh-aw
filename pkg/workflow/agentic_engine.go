@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
@@ -112,8 +114,14 @@ type EngineCapabilities struct {
 	// ToolsAllowlist reports whether the engine supports MCP tool allow-listing.
 	ToolsAllowlist bool
 
+	// MCP reports whether the engine supports MCP servers directly.
+	MCP bool
+
 	// MaxTurns reports whether the engine supports the max-turns feature.
 	MaxTurns bool
+
+	// ContextWindow reports whether the engine supports the context-window feature.
+	ContextWindow bool
 
 	// WebSearch reports whether the engine has built-in support for the web-search tool.
 	WebSearch bool
@@ -133,12 +141,68 @@ type EngineCapabilities struct {
 	// which suppresses automatic loading of context and custom instructions. When false,
 	// specifying bare: true emits a warning and has no effect.
 	BareMode bool
+
+	// BashCommandAllowlist reports whether the engine enforces a bash command allowlist
+	// derived from tools.bash: [cmd1, cmd2, ...]. When true, the engine maps the
+	// allowlist to its own CLI syntax (e.g. --allowed-tools Bash(cmd), run_shell_command(cmd)).
+	// When false, a restricted tools.bash allowlist is silently ignored at runtime,
+	// so the compiler emits an error to prevent the allowlist illusion.
+	BashCommandAllowlist bool
+
+	// BashDisable reports whether the engine can fully refuse all bash/shell tool calls
+	// when tools.bash is completely disabled (tools.bash: false, or tools.bash: []).
+	// This is a coarser capability than BashCommandAllowlist: an engine may be unable to
+	// enforce a partial per-command allowlist yet still be able to turn shell execution
+	// off entirely (e.g. Codex's `features.shell_tool=false` config flag). When true, the
+	// compiler allows a fully-disabled tools.bash even if BashCommandAllowlist is false.
+	BashDisable bool
+
+	// Plugins reports whether the engine can install Agent Plugins.
+	Plugins bool
+
+	// DynamicWorkflows reports whether the engine supports loading saved dynamic workflows.
+	DynamicWorkflows bool
+}
+
+// PluginInstallationProvider generates installation steps for Agent Plugins.
+type PluginInstallationProvider interface {
+	GetPluginInstallationSteps(workflowData *WorkflowData) []GitHubActionStep
+}
+
+// PostConfigPluginInstallationProvider installs plugin state after runtime configuration is written.
+type PostConfigPluginInstallationProvider interface {
+	GetPostConfigPluginInstallationSteps(workflowData *WorkflowData) []GitHubActionStep
 }
 
 // CapabilityProvider detects what capabilities an engine supports.
 // Engines can optionally implement this to indicate feature support.
 type CapabilityProvider interface {
 	GetCapabilities() EngineCapabilities
+}
+
+// HostedWebCapabilities describes hosted-web support that can depend on the
+// workflow's selected inference provider.
+type HostedWebCapabilities struct {
+	Supported         bool
+	SupportsMaxUses   bool
+	UnsupportedReason string
+}
+
+// HostedWebCapabilityProvider reports whether an engine supports hosted web
+// search for the current workflow.
+type HostedWebCapabilityProvider interface {
+	GetHostedWebCapabilities(workflowData *WorkflowData) HostedWebCapabilities
+}
+
+func dynamicWorkflowsEnabled(engine CapabilityProvider, config *EngineConfig) bool {
+	return engine != nil && engine.GetCapabilities().DynamicWorkflows && config.DynamicWorkflowsEnabled()
+}
+
+// MCPProxyEngine provides the identity and MCP capability information needed to
+// configure CLI proxy tools.
+type MCPProxyEngine interface {
+	Engine
+	CapabilityProvider
 }
 
 // WorkflowExecutor handles workflow compilation and execution
@@ -182,6 +246,12 @@ type WorkflowExecutor interface {
 	GetPreBundleSteps(workflowData *WorkflowData) []GitHubActionStep
 }
 
+// DurableExecutionProvider declares persisted files and a continuation invocation.
+// Native durable runtimes also provide any additional dependency installation.
+type DurableExecutionProvider interface {
+	GetDurableExecutionPlan(workflowData *WorkflowData, logFile string) (*DurableExecutionPlan, error)
+}
+
 // MCPConfigProvider handles MCP (Model Context Protocol) configuration
 // Engines that support MCP servers should implement this
 type MCPConfigProvider interface {
@@ -207,6 +277,14 @@ type LogParser interface {
 	// the AWF sandbox container) so it can write to GITHUB_OUTPUT. Returns empty string if the
 	// engine does not provide a post-execution error detection step.
 	GetErrorDetectionScriptId() string
+
+	// GetInternalLogsDir returns the host-runner path of a directory containing the engine's own
+	// internal tracing/diagnostic log files (as opposed to the captured stdout/stderr agent log),
+	// or empty string if the engine does not write such logs. When non-empty, the error detection
+	// script (see GetErrorDetectionScriptId) tails the most recently modified log file under this
+	// directory into the step log when the execution step failed, surfacing diagnosable output for
+	// crashes that print nothing to stdout/stderr.
+	GetInternalLogsDir() string
 }
 
 // SecurityProvider handles security-related configuration
@@ -217,8 +295,8 @@ type SecurityProvider interface {
 	GetDefaultDetectionModel() string
 
 	// GetRequiredSecretNames returns the list of secret names that this engine needs for execution
-	// This includes engine-specific auth tokens and the MCP gateway API key when MCP servers are present
-	// Returns: slice of secret names (e.g., ["COPILOT_GITHUB_TOKEN", "MCP_GATEWAY_API_KEY"])
+	// This includes engine-specific auth tokens and the MCP gateway agent ID when MCP servers are present
+	// Returns: slice of secret names (e.g., ["COPILOT_GITHUB_TOKEN", "MCP_GATEWAY_AGENT_ID"])
 	GetRequiredSecretNames(workflowData *WorkflowData) []string
 
 	// GetSupportedEnvVarKeys returns the list of engine.env variable names that this engine
@@ -234,7 +312,7 @@ type SecurityProvider interface {
 // The default implementation in BaseEngine returns "" (no native env var).
 type ModelEnvVarProvider interface {
 	// GetModelEnvVarName returns the name of the native environment variable the CLI
-	// uses for model selection (e.g., "COPILOT_MODEL", "ANTHROPIC_MODEL", "ANTIGRAVITY_MODEL").
+	// uses for model selection (e.g., "COPILOT_MODEL", "ANTHROPIC_MODEL", "GEMINI_MODEL").
 	// Returns an empty string if the engine does not support a native model env var.
 	GetModelEnvVarName() string
 }
@@ -293,6 +371,21 @@ type HarnessRunner interface {
 // HarnessProvider is kept as a backward-compatible alias.
 type HarnessProvider = HarnessRunner
 
+// MCPConfigAdapterProvider is an optional interface implemented by engines that provide
+// a JavaScript config-adapter script to convert the MCP gateway's raw output
+// configuration into the engine-specific format (e.g. Goose's .goose/mcp.json).
+// The script is written to the setup actions directory and executed by
+// start_mcp_gateway.cjs in place of a built-in per-engine converter.
+type MCPConfigAdapterProvider interface {
+	// GetMCPConfigAdapterWriteStep returns a GitHub Actions step that writes the
+	// config-adapter script to disk, or nil if the engine has no config-adapter script.
+	GetMCPConfigAdapterWriteStep() GitHubActionStep
+	// GetMCPConfigAdapterFilename returns the filename (not path) of the
+	// config-adapter script located in the setup actions directory, or an empty
+	// string if the engine has no config-adapter script.
+	GetMCPConfigAdapterFilename() string
+}
+
 // engineRequiresNodeHarness reports whether the engine's execution command wraps
 // the CLI with a harness script launched via node (see nodeRuntimeResolutionCommand
 // in copilot_engine_execution.go). Used by call sites that must ensure node is on
@@ -316,6 +409,7 @@ type CodingAgentEngine interface {
 	Engine
 	CapabilityProvider
 	WorkflowExecutor
+	DurableExecutionProvider
 	MCPConfigProvider
 	LogParser
 	SecurityProvider
@@ -356,6 +450,10 @@ func (e *BaseEngine) GetGHSkillAgentName() string {
 
 func (e *BaseEngine) GetCapabilities() EngineCapabilities {
 	return e.capabilities
+}
+
+func (e *BaseEngine) GetDurableExecutionPlan(_ *WorkflowData, _ string) (*DurableExecutionPlan, error) {
+	return nil, fmt.Errorf("engine %q does not support durable execution; remove engine.durable or select an engine with durable behavior", e.id)
 }
 
 func (e *BaseEngine) getDedicatedLLMGatewayPort() int {
@@ -453,6 +551,13 @@ func (e *BaseEngine) GetErrorDetectionScriptId() string {
 	return ""
 }
 
+// GetInternalLogsDir returns empty string by default (no engine-internal log directory).
+// Engines that write their own tracing/diagnostic logs to files (separate from the captured
+// stdout/stderr) can override this to have those logs tailed into the step log on failure.
+func (e *BaseEngine) GetInternalLogsDir() string {
+	return ""
+}
+
 // RenderMCPConfig provides a default no-op implementation for MCP configuration
 // Engines can override this to provide custom MCP server configuration
 func (e *BaseEngine) RenderMCPConfig(yaml *strings.Builder, tools map[string]any, mcpTools []string, workflowData *WorkflowData) error {
@@ -508,19 +613,28 @@ func NewEngineRegistry() *EngineRegistry {
 		NewCodexEngine(),
 		NewCopilotEngine(),
 		NewGeminiEngine(),
-		NewAntigravityEngine(),
+		NewAgyEngine(),
 		NewPiEngine(),
-	}
-	for _, id := range []string{"opencode"} {
-		engine, err := newBuiltinBehaviorDefinedEngine(id)
-		if err != nil {
-			panic(fmt.Sprintf("BUG: failed to load built-in behavior engine %q: %v", id, err))
-		}
-		builtins = append(builtins, engine)
 	}
 	for _, engine := range builtins {
 		if err := registry.Register(engine); err != nil {
+			// Build-time invariant: Register only rejects a negative
+			// dedicatedLLMGatewayPort, and every built-in engine above is constructed
+			// with a compile-time constant port, so this is a programming error caught
+			// by CI (TestBuiltinEnginesRegisterWithoutError), never user input.
 			panic(fmt.Sprintf("BUG: failed to register built-in engine: %v", err))
+		}
+	}
+	for _, definition := range loadBuiltinEngineDefinitions() {
+		if definition.Behaviors == nil {
+			continue
+		}
+		engine, err := NewBehaviorDefinedEngine(definition)
+		if err != nil {
+			panic(fmt.Sprintf("BUG: invalid built-in engine definition %q: %v", definition.ID, err))
+		}
+		if err := registry.Register(engine); err != nil {
+			panic(fmt.Sprintf("BUG: failed to register built-in engine %q: %v", definition.ID, err))
 		}
 	}
 
@@ -550,10 +664,15 @@ func GetGlobalEngineRegistry() *EngineRegistry {
 func (r *EngineRegistry) Register(engine CodingAgentEngine) error {
 	type portProvider interface{ getDedicatedLLMGatewayPort() int }
 	if p, ok := engine.(portProvider); ok && p.getDedicatedLLMGatewayPort() < 0 {
-		return fmt.Errorf("engine '%s': dedicatedLLMGatewayPort must be >= 0, got %d", engine.GetID(), p.getDedicatedLLMGatewayPort())
+		return fmt.Errorf("engine '%s': dedicatedLLMGatewayPort must be >= 0, got %d; expected a non-negative port number or 0 to disable the dedicated gateway", engine.GetID(), p.getDedicatedLLMGatewayPort())
 	}
 	agenticEngineLog.Printf("Registering engine: id=%s, name=%s", engine.GetID(), engine.GetDisplayName())
 	r.engines[engine.GetID()] = engine
+	// Invalidate the pre-computed manifest caches so engines registered after
+	// construction (e.g. behavior-defined engines imported from shared workflows)
+	// contribute their manifest files and folders.
+	r.cachedManifestFolders = nil
+	r.cachedManifestFiles = nil
 	return nil
 }
 
@@ -567,6 +686,20 @@ func (r *EngineRegistry) GetEngine(id string) (CodingAgentEngine, error) {
 	}
 	agenticEngineLog.Printf("Found engine: id=%s, name=%s", id, engine.GetDisplayName())
 	return engine, nil
+}
+
+// EnginesWithCapability returns a sorted list of engine IDs for which the given capability
+// predicate returns true. It is used to build accurate, registry-driven lists of supported
+// engines in error messages and documentation so those lists stay correct as engines evolve.
+func (r *EngineRegistry) EnginesWithCapability(predicate func(EngineCapabilities) bool) []string {
+	var ids []string
+	for id, engine := range r.engines {
+		if predicate(engine.GetCapabilities()) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // GetSupportedEngines returns a list of all supported engine IDs
@@ -631,20 +764,6 @@ func (r *EngineRegistry) computeAllAgentManifestFolders() []string {
 	return result
 }
 
-// GetAllAgentManifestFiles returns the union of all engines' GetAgentManifestFiles().
-// The returned list is sorted and deduplicated, making the engine implementations the
-// single source of truth for which root-level instruction files the save/restore scripts protect.
-//
-// When created via NewEngineRegistry the result is pre-computed at construction time
-// so subsequent calls are allocation-free.  Registries created directly (e.g. in tests)
-// fall back to computing on demand.
-func (r *EngineRegistry) GetAllAgentManifestFiles() []string {
-	if r.cachedManifestFiles != nil {
-		return r.cachedManifestFiles
-	}
-	return r.computeAllAgentManifestFiles()
-}
-
 // computeAllAgentManifestFiles computes the manifest files list from the registered engines.
 // Called once during NewEngineRegistry to populate cachedManifestFiles.
 func (r *EngineRegistry) computeAllAgentManifestFiles() []string {
@@ -672,13 +791,17 @@ func (r *EngineRegistry) computeAllAgentManifestFiles() []string {
 // This is useful for backward compatibility with strings like "codex-experimental"
 func (r *EngineRegistry) GetEngineByPrefix(prefix string) (CodingAgentEngine, error) {
 	agenticEngineLog.Printf("Looking up engine by prefix: %s", prefix)
+	if engine, ok := r.engines[prefix]; ok {
+		return engine, nil
+	}
+
 	type engineCandidate struct {
 		id     string
 		engine CodingAgentEngine
 	}
 	var candidates []engineCandidate
 	for id, engine := range r.engines {
-		if strings.HasPrefix(prefix, id) {
+		if strings.HasPrefix(prefix, id+"-") || strings.HasPrefix(prefix, id+"_") {
 			candidates = append(candidates, engineCandidate{id, engine})
 		}
 	}
@@ -696,6 +819,42 @@ func (r *EngineRegistry) GetEngineByPrefix(prefix string) (CodingAgentEngine, er
 			return 0
 		}
 	})
-	agenticEngineLog.Printf("Found %d engine candidate(s) for prefix %s, using: %s", len(candidates), prefix, candidates[0].id)
-	return candidates[0].engine, nil
+	candidate := candidates[0] //nolint:uncheckedsliceindex // The empty case returns above.
+	agenticEngineLog.Printf("Found %d engine candidate(s) for prefix %s, using: %s", len(candidates), prefix, candidate.id)
+	return candidate.engine, nil
+}
+
+// resolveStepTimeoutValue returns the timeout value string to emit on an
+// agentic_execution step.  It never resolves job-level overrides: the agent job
+// timeout is bounded independently by resolveAgentJobTimeoutValue.
+func resolveStepTimeoutValue(workflowData *WorkflowData) string {
+	defaultValue := strconv.Itoa(int(constants.DefaultAgenticWorkflowTimeout / time.Minute))
+	if workflowData == nil {
+		return defaultValue
+	}
+	// The detection step is the only step of the detection job, so it shares that
+	// job's budget instead of the top-level agentic step timeout.
+	if workflowData.IsDetectionRun {
+		return resolveDetectionJobTimeoutValue(workflowData)
+	}
+	if workflowData.ParsedFrontmatter != nil && workflowData.ParsedFrontmatter.TimeoutMinutes != nil {
+		if v := workflowData.ParsedFrontmatter.TimeoutMinutes.String(); v != "" {
+			return v
+		}
+	}
+	if raw := strings.TrimSpace(workflowData.TimeoutMinutes); raw != "" {
+		if after, ok := strings.CutPrefix(raw, "timeout-minutes:"); ok {
+			raw = strings.TrimSpace(after)
+		}
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return raw
+		}
+		if isExpression(raw) {
+			return raw
+		}
+		if raw != "" {
+			agenticEngineLog.Printf("resolveStepTimeoutValue: ignoring non-integer, non-expression timeout-minutes %q; using default %s", raw, defaultValue)
+		}
+	}
+	return defaultValue
 }

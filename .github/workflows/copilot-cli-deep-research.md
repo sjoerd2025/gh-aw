@@ -29,12 +29,11 @@ emoji: 🔬
 engine:
   id: copilot
   copilot-sdk: true
+  durable:
+    retention-days: 7
 max-tool-denials: 3
 strict: true
 timeout-minutes: 20
-sandbox:
-  agent:
-    sudo: false
 tools:
   bash:
   - "*"

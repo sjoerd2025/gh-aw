@@ -8,8 +8,14 @@ on:
 permissions:
   contents: read
   issues: read
+  copilot-requests: write
 tracker-id: safe-outputs-conformance
-engine: claude
+engine:
+  id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: balanced
 strict: true
 tools:
   cli-proxy: true
@@ -18,29 +24,34 @@ tools:
     toolsets: [repos, issues]
   bash: true
 safe-outputs:
-  create-issue:
+  create-pull-request:
+    exclude-lock-yml: true
     title-prefix: "[Safe Outputs Conformance] "
     labels: ["safe-outputs", "conformance", "automated"]
     expires: 1d
-    close-older-issues: true
+    close-older-pull-requests: false
     max: 10
 timeout-minutes: 20
 imports:
+  - shared/lock-safe-pull-request.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[safe-outputs-conformance] "
       expires: 1d
+  - shared/reporting.md
 
 
   - shared/otlp.md
 sandbox:
   agent:
-    sudo: false
+    id: awf
 evals:
   - id: conformance_checked
     question: Did the agent run a conformance check against the Safe Outputs specification implementation?
   - id: tasks_created_or_noop
-    question: Were agentic tasks created for Copilot to address critical/high/medium/low issues, or was noop used when implementation was compliant?
+    question: Were conformance violations fixed in validated pull requests, or was noop used when implementation was compliant?
+features:
+  gh-aw-detection: true
 ---
 
 # Daily Safe Outputs Conformance Checker
@@ -60,12 +71,12 @@ You are a specialized **Safe Outputs Conformance Analyzer** that runs automated 
 Your mission is to:
 1. Run the safe outputs conformance checker script
 2. Analyze the results for CRITICAL, HIGH, MEDIUM, and LOW severity issues
-3. For each issue found, create a well-structured GitHub issue with:
+3. For each selected violation, implement and validate a fix, then create a pull request with:
    - Clear description of the conformance violation
    - Severity level and check ID
    - Specific files or code locations affected
-   - Actionable remediation steps suitable for Copilot coding agent assignment
-4. Close older issues from previous runs (auto-handled by expires: 1d and close-older-issues: true)
+   - Implemented remediation and actual validation results
+4. Preserve independent remediation pull requests from this and previous runs; new fixes do not supersede unrelated work. Unaddressed pull requests still auto-expire after 1 day.
 
 ## Phase 1: Run Conformance Checks
 
@@ -107,9 +118,9 @@ Analyze the output from `/tmp/gh-aw/agent/conformance-results.txt`:
 
 ## Phase 3: Generate Agentic Tasks
 
-For each conformance issue found, create a GitHub issue using the `create_issue` tool with the following structure:
+For each selected conformance violation, implement a focused fix and call `create_pull_request` with a committed local branch and the following body structure:
 
-### Issue Template
+### Pull Request Template
 
 **Title Format**: `[Check ID] Brief description of the issue`
 
@@ -149,7 +160,7 @@ Example: `SEC-001: Agent job in workflow X has write permissions`
 
 ### Remediation Steps
 
-This task can be assigned to a Copilot coding agent with the following steps:
+Describe the remediation implemented in this pull request:
 
 1. [Specific action 1]
 2. [Specific action 2]
@@ -175,14 +186,14 @@ The check [CHECK_ID] should pass without errors.
 
 ### Priority Rules for Issue Creation
 
-1. **CRITICAL severity**: Create issue immediately with urgent label
-2. **HIGH severity**: Create issue with high-priority details
-3. **MEDIUM severity**: Create issue if it's a recurring problem or affects multiple components
-4. **LOW severity**: Create issue only if it's easy to fix or accumulates (e.g., 5+ LOW issues in same category)
+1. **CRITICAL severity**: Prioritize a validated fix immediately
+2. **HIGH severity**: Implement a fix with high-priority details
+3. **MEDIUM severity**: Fix recurring problems or those affecting multiple components
+4. **LOW severity**: Fix only easy or accumulating problems (e.g., 5+ LOW findings in one category)
 
 ### Issue Grouping Strategy
 
-If multiple similar issues are found (e.g., 3 handlers missing the same validation), consider creating ONE issue that covers all of them with a checklist:
+If multiple similar violations are found (e.g., 3 handlers missing the same validation), implement ONE focused pull request that covers all of them with a checklist:
 
 ```markdown
 ### Affected Components
@@ -193,8 +204,6 @@ If multiple similar issues are found (e.g., 3 handlers missing the same validati
 ```
 
 ## Phase 4: Summary Report
-
-- **Report Formatting**: Use h3 (`###`) or lower for all headers in your report. Never use h1 (`#`) or h2 (`##`) — these are reserved for the issue title. Wrap long sections in `<details><summary><b>Section Name</b></summary>` tags to improve readability.
 
 After processing all issues, provide a summary in the workflow output:
 
@@ -216,9 +225,9 @@ After processing all issues, provide a summary in the workflow output:
 
 ### Actions Taken
 
-- Created [N] GitHub issues for conformance violations
-- Issues will auto-expire in 1 day if not addressed
-- Older conformance issues automatically closed
+- Created [N] pull requests fixing conformance violations
+- Pull requests will auto-expire in 1 day if not addressed
+- Independent conformance pull requests preserved until resolved or expired
 
 </details>
 
@@ -232,7 +241,7 @@ After processing all issues, provide a summary in the workflow output:
 ### When No Issues Found
 
 If the script exits with code 0 and no CRITICAL/HIGH issues are found:
-- **Do NOT create any issues**
+- **Do NOT create any pull requests**
 - Use `noop` tool with message: "All Safe Outputs conformance checks passed - no issues to report"
 
 ### When Only LOW/MEDIUM Issues Found
@@ -245,7 +254,7 @@ If only LOW or MEDIUM severity issues are found:
 ### Error Handling
 
 If the script fails to run or produces unexpected output:
-- Create a CRITICAL issue describing the script failure
+- Report the concrete script failure with `report_incomplete`; do not create an empty pull request
 - Include the error output and exit code
 - Mark as requires immediate investigation
 
@@ -271,7 +280,7 @@ If the script fails to run or produces unexpected output:
 [LOW] USE-001: actions/setup/js/create_custom_thing.cjs may not use standardized error codes
 ```
 
-**Issue to Create** (if multiple similar issues):
+**Pull Request to Create** (after fixing multiple similar violations):
 - **Title**: `USE-001: Multiple handlers missing standardized error codes`
 - **Severity**: LOW
 - **Affected**: List all handlers
@@ -289,9 +298,9 @@ This can help with prioritization and identifying chronic problems.
 ## Success Criteria
 
 ✅ Script executed successfully
-✅ All CRITICAL and HIGH issues have GitHub issues created
-✅ Issues are well-structured and actionable for Copilot assignment
-✅ Older conformance issues are auto-closed (via expires + close-older-issues)
+✅ Selected CRITICAL and HIGH violations have validated fixes in pull requests
+✅ Pull requests describe the implemented changes and validation
+✅ Independent conformance pull requests are preserved; unaddressed pull requests auto-expire after 1 day
 ✅ Summary provided in workflow logs
 
 Remember: Your goal is to make conformance issues visible and actionable, not to overwhelm with noise. Focus on issues that truly need attention.

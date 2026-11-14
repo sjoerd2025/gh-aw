@@ -114,13 +114,6 @@ jobs:
     pre-steps:
       - name: Safe outputs pre-step
         run: echo "safe-outputs-pre"
-  conclusion:
-    setup-steps:
-      - name: Conclusion setup-step
-        run: echo "conclusion-setup"
-    pre-steps:
-      - name: Conclusion pre-step
-        run: echo "conclusion-pre"
 ---
 
 # Builtin setup-steps ordering
@@ -169,12 +162,64 @@ jobs:
 	if conclusionSection == "" {
 		t.Fatal("Expected conclusion job section")
 	}
-	assertStepOrderInSection(t, conclusionSection,
-		"- name: Conclusion setup-step",
-		"id: setup",
-		"- name: Conclusion pre-step",
-		"- name: Generate GitHub App token",
-	)
+	if strings.Contains(conclusionSection, "Conclusion setup-step") || strings.Contains(conclusionSection, "Conclusion pre-step") {
+		t.Fatal("conclusion must contain compiler-generated steps only")
+	}
+}
+
+func TestBuiltinJobSetupCheckoutAddsContentsReadPermission(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "builtin-setup-steps-checkout-permission")
+
+	workflowContent := `---
+on:
+  issues:
+    types: [opened]
+engine: claude
+strict: false
+safe-outputs:
+  add-comment:
+jobs:
+  safe_outputs:
+    permissions:
+      id-token: write
+    setup-steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/get-app-credentials
+---
+
+# Builtin checkout permissions
+`
+
+	workflowFile := filepath.Join(tmpDir, "builtin-checkout-permissions.md")
+	if err := os.WriteFile(workflowFile, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowFile); err != nil {
+		t.Fatalf("CompileWorkflow() returned error: %v", err)
+	}
+
+	lockContent, err := os.ReadFile(filepath.Join(tmpDir, "builtin-checkout-permissions.lock.yml"))
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockYAML := string(lockContent)
+
+	for _, jobName := range []string{"safe_outputs"} {
+		jobSection := extractJobSection(lockYAML, jobName)
+		if jobSection == "" {
+			t.Fatalf("Expected %s job section", jobName)
+		}
+		if !strings.Contains(jobSection, "contents: read") {
+			t.Errorf("Expected %s setup checkout to add contents: read, got:\n%s", jobName, jobSection)
+		}
+		if !strings.Contains(jobSection, "id-token: write") {
+			t.Errorf("Expected %s to preserve id-token: write, got:\n%s", jobName, jobSection)
+		}
+	}
 }
 
 func TestBuiltinJobsPreStepsRunBeforeTokenMinting(t *testing.T) {
@@ -205,10 +250,6 @@ jobs:
     pre-steps:
       - name: Safe outputs pre-step
         run: echo "safe-outputs-pre"
-  conclusion:
-    pre-steps:
-      - name: Conclusion pre-step
-        run: echo "conclusion-pre"
 ---
 
 # Builtin pre-steps ordering with app token minting
@@ -254,10 +295,9 @@ jobs:
 	if conclusionSection == "" {
 		t.Fatal("Expected conclusion job section")
 	}
-	assertStepOrderInSection(t, conclusionSection,
-		"- name: Conclusion pre-step",
-		"- name: Generate GitHub App token",
-	)
+	if strings.Contains(conclusionSection, "Conclusion pre-step") {
+		t.Fatal("conclusion must contain compiler-generated steps only")
+	}
 }
 
 func TestImportedBuiltinJobSetupStepsMergeBeforeTokenMinting(t *testing.T) {

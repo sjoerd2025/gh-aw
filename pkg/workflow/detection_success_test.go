@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/stringutil"
 
 	"github.com/github/gh-aw/pkg/testutil"
@@ -25,6 +26,8 @@ permissions:
 engine: claude
 safe-outputs:
   create-issue:
+features:
+  gh-aw-detection: false
 ---
 
 # Test
@@ -65,6 +68,9 @@ Create an issue.
 	if !strings.Contains(yaml, "detection_reason:") {
 		t.Error("Detection job missing detection_reason output")
 	}
+	if !strings.Contains(detectionSection, "detection_threat_kinds: ${{ steps.detection_conclusion.outputs.threat_kinds }}") {
+		t.Error("Detection job missing schema-defined threat categories output")
+	}
 	if !strings.Contains(yaml, "aic:") {
 		t.Error("Detection job missing aic output")
 	}
@@ -83,7 +89,7 @@ Create an issue.
 	}
 
 	// Check that the script uses require to load the parse_threat_detection_results.cjs file
-	if !strings.Contains(detectionSection, "require('${{ runner.temp }}/gh-aw/actions/parse_threat_detection_results.cjs')") {
+	if !strings.Contains(detectionSection, "require(path.join(actionsDir, 'parse_threat_detection_results.cjs'))") {
 		t.Error("Detection conclusion step doesn't use require to load parse_threat_detection_results.cjs")
 	}
 	if !strings.Contains(detectionSection, "id: parse_detection_token_usage") {
@@ -92,7 +98,7 @@ Create an issue.
 	if !strings.Contains(detectionSection, "GH_AW_TOKEN_USAGE_SUMMARY_TITLE: Threat Detection Token Usage") {
 		t.Error("Detection token usage step missing threat detection summary title")
 	}
-	if !strings.Contains(detectionSection, "require('${{ runner.temp }}/gh-aw/actions/parse_token_usage.cjs')") {
+	if !strings.Contains(detectionSection, "require(path.join(actionsDir, 'parse_token_usage.cjs'))") {
 		t.Error("Detection token usage step doesn't use require to load parse_token_usage.cjs")
 	}
 
@@ -165,6 +171,11 @@ Create outputs.
 	if !strings.Contains(yaml, "GH_AW_THREAT_DETECTION_AIC: ${{ needs.detection.outputs.aic }}") {
 		t.Error("Safe output jobs should receive threat-detection AI Credits separately")
 	}
+	for _, job := range []string{"safe_outputs", "conclusion"} {
+		if !strings.Contains(extractJobSection(yaml, job), "GH_AW_DETECTION_THREAT_KINDS: ${{ needs.detection.outputs.detection_threat_kinds }}") {
+			t.Errorf("%s job should receive detector-defined threat types", job)
+		}
+	}
 }
 
 // TestDetectionRunsStepInConclusionJob verifies that when threat detection is enabled,
@@ -231,6 +242,64 @@ Create an issue.
 	// Verify the step uses handle_detection_runs.cjs
 	if !strings.Contains(conclusionSection, "handle_detection_runs.cjs") {
 		t.Error("Detection runs step should use handle_detection_runs.cjs")
+	}
+}
+
+func TestDetectionRunsStepOmittedWhenReportAsIssueDisabled(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+	workflowPath := filepath.Join(tmpDir, "test-workflow.md")
+
+	frontmatter := `---
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: claude
+safe-outputs:
+  create-issue:
+  threat-detection:
+    report-as-issue: false
+---
+
+# Test
+
+Create an issue.
+`
+
+	if err := os.WriteFile(workflowPath, []byte(frontmatter), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("Failed to compile: %v", err)
+	}
+
+	// Read the compiled YAML
+	lockPath := stringutil.MarkdownToLockFile(workflowPath)
+	yamlBytes, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("Failed to read compiled YAML: %v", err)
+	}
+	yaml := string(yamlBytes)
+
+	// Verify conclusion job exists (other conclusion steps still run)
+	conclusionSection := extractJobSection(yaml, "conclusion")
+	if conclusionSection == "" {
+		t.Fatal("Conclusion job not found in compiled YAML")
+	}
+
+	// The detection runs tracking issue step must be omitted entirely.
+	if strings.Contains(conclusionSection, "Log detection run") {
+		t.Error("Conclusion job should not contain 'Log detection run' step when report-as-issue is disabled")
+	}
+	if strings.Contains(conclusionSection, "handle_detection_runs.cjs") {
+		t.Error("Conclusion job should not reference handle_detection_runs.cjs when report-as-issue is disabled")
+	}
+
+	// Detection job itself must still be present since threat detection remains enabled.
+	detectionSection := extractJobSection(yaml, string(constants.DetectionJobName))
+	if detectionSection == "" {
+		t.Error("Detection job should still be compiled when only report-as-issue is disabled")
 	}
 }
 
@@ -472,8 +541,10 @@ Create an issue.
 			if parseStepIdx < 0 {
 				t.Fatal("Parse-and-conclude step (id: detection_conclusion) not found in detection job")
 			}
-			// continue-on-error appears AFTER the id: line, within the next 150 chars
-			stepContext := detectionSection[parseStepIdx:min(len(detectionSection), parseStepIdx+150)]
+			stepContext := detectionSection[parseStepIdx:]
+			if end := strings.Index(stepContext, "\n      - name:"); end >= 0 {
+				stepContext = stepContext[:end]
+			}
 
 			hasContinueOnErr := strings.Contains(stepContext, "continue-on-error: true")
 			if tt.wantContinueOnErr && !hasContinueOnErr {

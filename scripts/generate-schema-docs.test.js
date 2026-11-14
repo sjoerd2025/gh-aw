@@ -63,9 +63,9 @@ let allPassed = true;
 console.log("\nRunning tests...\n");
 
 // Test 1: Engine $ref resolution
-allPassed &= assertContains(output, 'engine: "claude"', "Engine $ref resolved - should show string option");
+allPassed &= assertContains(output, 'engine: "example-value"', "Engine $ref resolved - should show string option");
 
-allPassed &= assertContains(output, 'id: "claude"', "Engine $ref resolved - should show object variant with id field");
+allPassed &= assertContains(output, 'id: "example-value"', "Engine $ref resolved - should show object variant with id field");
 
 allPassed &= assertContains(output, "max-turns:", "Engine $ref resolved - should show max-turns field");
 
@@ -99,8 +99,13 @@ allPassed &= assertContains(output, "```yaml wrap", "YAML code block should have
 
 allPassed &= assertNotContains(output, "```yaml\n---\n# Workflow name", "YAML code block should NOT be plain ```yaml without wrap");
 
+allPassed &= assertContains(output, 'cache-memory: [{"id":"default","key":"memory-default"},{"id":"session","key":"memory-session"}]', "Array variant examples should remain non-empty");
+allPassed &= assertContains(output, "Array items: A GitHub MCP server toolset name", "Toolset array items should resolve their schema description");
+allPassed &= assertNotContains(output, "A Linear MCP toolset name", "Removed native Linear toolsets should not be documented");
+
 // Test 8: Verify that all $refs in schema can be resolved
-const allRefs = ["#/$defs/engine_config", "#/$defs/stdio_mcp_tool", "#/$defs/http_mcp_tool", "#/properties/permissions", "#/properties/defaults", "#/properties/concurrency"];
+// Defaults is nested within safe-output configuration, not a root schema property.
+const allRefs = ["#/$defs/engine_config", "#/$defs/stdio_mcp_tool", "#/$defs/http_mcp_tool", "#/properties/permissions", "#/properties/concurrency"];
 
 for (const ref of allRefs) {
   const path = ref.substring(2).split("/");
@@ -147,6 +152,19 @@ allPassed &= assertContains(output, "event_type:", "dispatch-repository example 
 allPassed &= assertContains(output, "workflow:", "dispatch-repository example should include required 'workflow' field");
 
 allPassed &= assertContains(output, "allowed_repositories:", "dispatch-repository example should include 'allowed_repositories' field");
+
+// Test 11: Verify dynamic-key schema properties are expanded
+allPassed &= assertContains(output, "run-install-scripts:", "Runtime example should include run-install-scripts");
+allPassed &= assertContains(output, "report-failed-jobs:", "Safe outputs example should include report-failed-jobs");
+
+// Test 12: Model routing descriptions explain values and link to the guide
+const unwrappedOutput = output.replace(/\n\s*#\s*/g, " ");
+allPassed &= assertContains(unwrappedOutput, "https://github.github.com/gh-aw/reference/model-routing/", "Model routing should link to its guide");
+allPassed &= assertContains(unwrappedOutput, "cost-speed prefers the fastest model and effort that meet it", "Model routing goal should explain cost-speed");
+allPassed &= assertContains(unwrappedOutput, "auto lets the classifier recommend one of these profiles per task", "Model routing mode should explain auto");
+allPassed &= assertContains(unwrappedOutput, "economy, balanced, and robust set increasing quality bars", "Model routing mode should explain the quality profiles");
+allPassed &= assertContains(unwrappedOutput, "This is not a request policy; put patterns such as gpt-* in models.allowed or models.blocked", "Model routing shortlist should explain selection and request policy");
+allPassed &= assertContains(unwrappedOutput, "GitHub Actions expressions are allowed only when neither models.allowed nor models.blocked is set", "Model routing shortlist should explain expression restrictions");
 
 // Summary
 console.log("\n" + "=".repeat(50));

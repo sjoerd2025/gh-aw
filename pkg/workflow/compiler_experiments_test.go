@@ -3,9 +3,16 @@
 package workflow
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/parser"
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,6 +46,7 @@ func TestBuildExperimentSpecJSONWithConfigs(t *testing.T) {
 	experiments := map[string][]string{
 		"style": {"concise", "detailed"},
 	}
+
 	configs := map[string]*ExperimentConfig{
 		"style": {
 			Variants:    []string{"concise", "detailed"},
@@ -56,6 +64,26 @@ func TestBuildExperimentSpecJSONWithConfigs(t *testing.T) {
 	assert.Contains(t, got, `"start_date"`, "should include start_date key")
 	assert.Contains(t, got, `"end_date"`, "should include end_date key")
 	assert.Contains(t, got, "concise", "should include variant value")
+}
+
+func TestBuildExperimentSpecJSONWithContinualConfig(t *testing.T) {
+	experiments := map[string][]string{"optimization": {"control", "candidate"}}
+	configs := map[string]*ExperimentConfig{
+		"optimization": {
+			Variants: experiments["optimization"],
+			Continual: &ContinualExperimentConfig{
+				Seed: "stable-seed",
+				Ramp: []int{10, 25, 50},
+			},
+		},
+	}
+	got := buildExperimentSpecJSON(experiments, configs, []string{"optimization"})
+	assert.JSONEq(t, `{"optimization":{"variants":["control","candidate"],"continual":{"seed":"stable-seed","ramp":[10,25,50]}}}`, got)
+}
+
+func TestValidateContinualRamp(t *testing.T) {
+	require.NoError(t, validateContinualRamp("optimization", &ContinualExperimentConfig{Ramp: []int{5, 20, 50}}))
+	require.Error(t, validateContinualRamp("optimization", &ContinualExperimentConfig{Ramp: []int{20, 10}}))
 }
 
 func TestBuildExperimentSpecJSONEscaping(t *testing.T) {
@@ -131,6 +159,8 @@ func TestGenerateExperimentSteps_CacheStorage(t *testing.T) {
 func TestGenerateExperimentSteps_SpecJSON(t *testing.T) {
 	c := &Compiler{}
 	data := &WorkflowData{
+		FrontmatterHash: "frontmatter-hash",
+		BodyHash:        "body-hash",
 		Experiments: map[string][]string{
 			"style": {"concise", "detailed"},
 		},
@@ -138,6 +168,14 @@ func TestGenerateExperimentSteps_SpecJSON(t *testing.T) {
 	steps := c.generateExperimentSteps(data)
 	joined := strings.Join(steps, "")
 	assert.Contains(t, joined, `{"style":["concise","detailed"]}`, "spec JSON should be embedded in the step")
+	assert.Contains(t, joined, "GH_AW_HARNESS_VERSION: frontmatter-hash:body-hash", "assignment should use the compiled workflow hashes")
+}
+
+func TestExperimentHarnessVersionUsesAvailableCompiledHashes(t *testing.T) {
+	assert.Equal(t, "frontmatter-hash:body-hash", experimentHarnessVersion(&WorkflowData{FrontmatterHash: "frontmatter-hash", BodyHash: "body-hash"}))
+	assert.Equal(t, "frontmatter-hash", experimentHarnessVersion(&WorkflowData{FrontmatterHash: "frontmatter-hash"}))
+	assert.Equal(t, "body-hash", experimentHarnessVersion(&WorkflowData{BodyHash: "body-hash"}))
+	assert.Equal(t, "unknown", experimentHarnessVersion(&WorkflowData{}))
 }
 
 func TestGenerateExperimentSteps_SingleQuoteEscaping(t *testing.T) {
@@ -178,6 +216,308 @@ func TestExperimentExpressionMappings(t *testing.T) {
 	assert.Equal(t, "steps.pick-experiment.outputs.style", m2.Content, "content should be the step output expression")
 }
 
+func TestRewriteExperimentsReferenceForDownstreamJobs(t *testing.T) {
+	experiments := map[string][]string{"model": {"sonnet", "opus"}}
+	assert.Equal(t, "${{ needs.activation.outputs.model }}", RewriteExperimentsReferenceForDownstreamJobs("${{ experiments.model }}", experiments))
+	assert.Equal(t, "no reference here", RewriteExperimentsReferenceForDownstreamJobs("no reference here", experiments))
+	// Undeclared experiment names are left untouched.
+	assert.Equal(t, "${{ experiments.unknown }}", RewriteExperimentsReferenceForDownstreamJobs("${{ experiments.unknown }}", experiments))
+}
+
+func TestRewriteActivationOutputsToLocalStepOutputs(t *testing.T) {
+	experiments := map[string][]string{"model": {"sonnet", "opus"}}
+	assert.Equal(t, "${{ steps.pick-experiment.outputs.model }}", RewriteActivationOutputsToLocalStepOutputs("${{ needs.activation.outputs.model }}", experiments))
+	assert.Equal(t, "no reference here", RewriteActivationOutputsToLocalStepOutputs("no reference here", experiments))
+	// Undeclared experiment names are left untouched.
+	assert.Equal(t, "${{ needs.activation.outputs.unknown }}", RewriteActivationOutputsToLocalStepOutputs("${{ needs.activation.outputs.unknown }}", experiments))
+}
+
+func TestWriteSubagentModelDeclarationsExperimentExpressions(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		model        string
+		wantModel    string
+		wantPatterns []string
+	}{
+		{"experiment", "${{ experiments.subagent_model }}", "${{ steps.pick-experiment.outputs.subagent_model }}", []string{"github-copilot/gpt-5-mini", "github-copilot/gpt-5.4"}},
+		{"fallback metadata rewrite only", "${{ experiments.subagent_model || 'small' }}", "${{ steps.pick-experiment.outputs.subagent_model || 'small' }}", nil},
+		{"literal in expression", "${{ format('experiments.subagent_model-{0}', experiments.subagent_model) }}", "${{ format('experiments.subagent_model-{0}', steps.pick-experiment.outputs.subagent_model) }}", nil},
+		{"downstream output", "${{ needs.activation.outputs.subagent_model }}", "${{ steps.pick-experiment.outputs.subagent_model }}", []string{"github-copilot/gpt-5-mini", "github-copilot/gpt-5.4"}},
+		{"other context", "${{ inputs.model }}", "${{ inputs.model }}", nil},
+		{"undeclared experiment", "${{ experiments.unknown }}", "${{ experiments.unknown }}", nil},
+		{"static model", "gpt-5.4", "gpt-5.4", []string{"github-copilot/gpt-5.4"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := &WorkflowData{
+				Experiments:    map[string][]string{"subagent_model": {"small", "large"}},
+				ModelMappings:  map[string][]string{"small": {"copilot/gpt-5-mini"}, "large": {"copilot/gpt-5.4"}},
+				SubAgentModels: []parser.SubAgentModel{{Name: "reader", Model: test.model}},
+			}
+			var generated strings.Builder
+			writeSubagentModelDeclarations(&generated, data, "copilot")
+			var env map[string]string
+			require.NoError(t, yaml.Unmarshal([]byte(generated.String()), &env))
+			var declarations []struct {
+				Name     string   `json:"name"`
+				Model    string   `json:"model"`
+				Patterns []string `json:"patterns"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(env["GH_AW_INFO_SUB_AGENT_MODELS"]), &declarations))
+			require.Len(t, declarations, 1)
+			assert.Equal(t, "reader", declarations[0].Name)
+			assert.Equal(t, test.wantModel, declarations[0].Model)
+			assert.Equal(t, test.wantPatterns, declarations[0].Patterns)
+			assert.Equal(t, test.model, data.SubAgentModels[0].Model, "metadata generation must not mutate the runtime declaration")
+		})
+	}
+}
+
+func TestCompileCopilotWithExperimentalSubagentModels(t *testing.T) {
+	for _, model := range []string{
+		"${{ experiments.subagent_model }}",
+		"${{ experiments.subagent_model || 'small' }}",
+		"${{ format('{0}', experiments.subagent_model) }}",
+		"${{ experiments.unknown }}",
+	} {
+		for _, imported := range []bool{false, true} {
+			name := "inline"
+			if imported {
+				name = "imported"
+			}
+			t.Run(model+"/"+name, func(t *testing.T) {
+				agent := "## agent: `reader`\n---\ndescription: Summarize a file\nmodel: " + model + "\n---\nRead the file.\n"
+				source := filepath.Join(t.TempDir(), "workflow.md")
+				content := "---\non: workflow_dispatch\nstrict: false\npermissions:\n  contents: read\nengine: copilot\nexperiments:\n  subagent_model: [small, large]\n"
+				if imported {
+					require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(source), "shared.md"), []byte("# Shared\n\n"+agent), 0600))
+					content += "imports:\n  - shared.md\n"
+				}
+				content += "---\n# Work\nSummarize README.md using reader.\n\n"
+				if !imported {
+					content += agent
+				}
+				require.NoError(t, os.WriteFile(source, []byte(content), 0600))
+				compiler := NewCompiler()
+				data, err := compiler.ParseWorkflowFile(source)
+				require.NoError(t, err)
+				require.Equal(t, []parser.SubAgentModel{{Name: "reader", Model: model}}, data.SubAgentModels)
+				generated, err := compiler.CompileToYAML(data, source)
+				if model != "${{ experiments.subagent_model }}" {
+					require.Error(t, err)
+					assert.Empty(t, generated, "unsupported runtime models must not produce a lock file")
+					if model == "${{ experiments.unknown }}" {
+						assert.Contains(t, err.Error(), "undeclared experiment")
+					} else {
+						assert.Contains(t, err.Error(), "compound experiment expression")
+						assert.Contains(t, err.Error(), "put the complete model or alias in each experiment variant")
+					}
+					return
+				}
+				require.NoError(t, err)
+				assert.NotRegexp(t, `\$\{\{[^}\n]*\bexperiments\.subagent_model`, generated, "compiled prompt and metadata expressions must use an Actions context")
+				assert.Contains(t, generated, "steps.pick-experiment.outputs.subagent_model", "sub-agent metadata must use the activation-local experiment output")
+				assert.Contains(t, generated, "GH_AW_INFO_SUB_AGENT_MODELS")
+				pickIndex := strings.Index(generated, "id: pick-experiment")
+				infoIndex := strings.Index(generated, "id: generate_aw_info")
+				require.NotEqual(t, -1, pickIndex)
+				require.NotEqual(t, -1, infoIndex)
+				assert.Less(t, pickIndex, infoIndex, "experiment selection must precede sub-agent model metadata")
+			})
+		}
+	}
+}
+
+// TestSubagentMetadataMatchesSelectedExperimentVariant verifies that the recorded sub-agent
+// model metadata and the value interpolate_prompt.cjs writes into the inline sub-agent file
+// both come from the same pick-experiment assignment, so after Actions evaluates the step
+// output they agree with each other and with the selected variant.
+func TestSubagentMetadataMatchesSelectedExperimentVariant(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "workflow.md")
+	content := "---\non: workflow_dispatch\nstrict: false\npermissions:\n  contents: read\nengine: copilot\nexperiments:\n  subagent_model: [small, large]\n---\n# Work\nSummarize README.md using file-summarizer.\n\n" +
+		"## agent: `file-summarizer`\n---\nmodel: ${{ experiments.subagent_model }}\ndescription: Summarizes a file\n---\nSummarize the file.\n"
+	require.NoError(t, os.WriteFile(source, []byte(content), 0600))
+	compiler := NewCompiler()
+	data, err := compiler.ParseWorkflowFile(source)
+	require.NoError(t, err)
+	generated, err := compiler.CompileToYAML(data, source)
+	require.NoError(t, err)
+
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				ID   string            `yaml:"id"`
+				Name string            `yaml:"name"`
+				Env  map[string]string `yaml:"env"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(generated), &workflow))
+	activation, ok := workflow.Jobs["activation"]
+	require.True(t, ok, "activation job must exist")
+
+	var metadataEnv, agentFileEnv string
+	pickIndex, metadataIndex, agentFileIndex := -1, -1, -1
+	for i, step := range activation.Steps {
+		switch {
+		case step.ID == "pick-experiment":
+			pickIndex = i
+		case step.ID == "generate_aw_info":
+			metadataIndex = i
+			metadataEnv = step.Env["GH_AW_INFO_SUB_AGENT_MODELS"]
+		case step.Name == "Interpolate variables and render templates":
+			agentFileIndex = i
+			agentFileEnv = step.Env["GH_AW_EXPERIMENTS_SUBAGENT_MODEL"]
+		}
+	}
+	require.NotEqual(t, -1, pickIndex, "pick-experiment step must exist")
+	require.NotEqual(t, -1, metadataIndex, "generate_aw_info step must exist")
+	require.NotEqual(t, -1, agentFileIndex, "interpolation step that writes inline sub-agents must exist")
+	assert.Less(t, pickIndex, metadataIndex, "experiment selection must precede sub-agent metadata")
+	assert.Less(t, pickIndex, agentFileIndex, "experiment selection must precede the sub-agent file write")
+
+	const selectedVariant = "${{ steps.pick-experiment.outputs.subagent_model }}"
+	assert.Equal(t, selectedVariant, agentFileEnv, "the sub-agent file must be written from the selected assignment")
+
+	for _, variant := range []string{"small", "large"} {
+		t.Run(variant, func(t *testing.T) {
+			// Simulate Actions evaluating the pick-experiment output for this assignment.
+			var declarations []struct {
+				Name  string `json:"name"`
+				Model string `json:"model"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(metadataEnv, selectedVariant, variant)), &declarations))
+			require.Len(t, declarations, 1)
+			assert.Equal(t, "file-summarizer", declarations[0].Name)
+			assert.Equal(t, variant, declarations[0].Model, "recorded sub-agent model must be the selected variant")
+			assert.Equal(t, strings.ReplaceAll(agentFileEnv, selectedVariant, variant), declarations[0].Model, "recorded model must match the model written to the sub-agent file")
+			assert.NotContains(t, declarations[0].Model, "experiments.", "a literal experiment expression must not be recorded as a model ID")
+			assert.NotContains(t, declarations[0].Model, "${{", "an unevaluated expression must not be recorded as a model ID")
+		})
+	}
+}
+
+func TestInlinedSubagentExperimentCompilerToRuntime(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is required for compiler-to-runtime coverage")
+	}
+	runtime, err := filepath.Abs("../../actions/setup/js/interpolate_prompt.cjs")
+	require.NoError(t, err)
+	workspace := t.TempDir()
+	workflows := filepath.Join(workspace, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflows, 0700))
+	const importPath = ".github/workflows/reader.md"
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, importPath), []byte(
+		"## agent: `reader`\n---\nmodel: ${{ experiments.subagent_model }}\n---\nSummarize the file.\n"), 0600))
+	compiler := NewCompiler()
+	compiler.markdownPath = filepath.Join(workflows, "workflow.md")
+
+	for _, ordered := range []bool{true, false} {
+		data := &WorkflowData{InlinedImports: true, ImportPaths: []string{importPath}}
+		if ordered {
+			data.PromptImports = []parser.PromptImportEntry{{ImportPath: importPath}}
+		}
+		chunks, mappings, err := compiler.processPromptImportEntries(data)
+		require.NoError(t, err)
+		prompt := strings.Join(chunks, "\n")
+		require.Contains(t, prompt, "model: __GH_AW_EXPERIMENTS_SUBAGENT_MODEL__")
+		require.Len(t, mappings, 1)
+		assert.Equal(t, "GH_AW_EXPERIMENTS_SUBAGENT_MODEL", mappings[0].EnvVar)
+		assert.Equal(t, "steps.pick-experiment.outputs.subagent_model", mappings[0].Content)
+		manifest := &GHAWManifest{
+			MarkdownMetadata: compiler.collectMarkdownMetadata(&WorkflowData{CompiledPromptMarkdown: []string{prompt}}),
+		}
+		require.NoError(t, populateManifestMetadata(manifest))
+		require.Len(t, manifest.AgentMetadata, 1)
+		metadataDir := filepath.Join(workspace, "runtime")
+		require.NoError(t, os.MkdirAll(metadataDir, 0700))
+		awInfo, err := json.Marshal(manifest)
+		require.NoError(t, err)
+		require.NotContains(t, string(awInfo), `"markdown_metadata"`)
+		require.NoError(t, os.WriteFile(filepath.Join(metadataDir, "aw_info.json"), awInfo, 0600))
+
+		for _, variant := range []string{"small", "large", "gpt-5.4?effort=low"} {
+			t.Run(fmt.Sprintf("ordered=%t/%s", ordered, variant), func(t *testing.T) {
+				promptPath := filepath.Join(t.TempDir(), "prompt.txt")
+				require.NoError(t, os.WriteFile(promptPath, []byte(prompt), 0600))
+				cmd := exec.Command(node, "-e", `
+const fs = require("fs");
+global.core = { info() {}, warning() {}, debug() {}, setFailed(message) { throw new Error(message); } };
+const write = fs.writeFileSync;
+const agents = [];
+fs.writeFileSync = (file, content, ...args) => {
+  if (String(file).endsWith(".agent.md")) agents.push(String(content));
+  else write(file, content, ...args);
+};
+require(process.argv[1]).main().then(() => {
+  if (agents.length !== 1) throw new Error("Expected one agent file write");
+  process.stdout.write(agents[0]);
+}).catch(error => { console.error(error); process.exitCode = 1; });
+`, runtime)
+				cmd.Dir = workspace
+				cmd.Env = append(os.Environ(), "GH_AW_PROMPT="+promptPath, "GITHUB_WORKSPACE="+workspace, "GH_AW_TMP_DIR="+metadataDir, "GH_AW_ENGINE_ID=copilot", "GH_AW_EXPERIMENTS_SUBAGENT_MODEL="+variant)
+				output, err := cmd.CombinedOutput()
+				require.NoError(t, err, "%s", output)
+				lines := strings.SplitN(string(output), "\n", 4)
+				require.Len(t, lines, 4)
+				require.Equal(t, "---", lines[0])
+				require.Equal(t, "---", lines[2])
+				var agentMetadata map[string]any
+				require.NoError(t, json.Unmarshal([]byte(lines[1]), &agentMetadata))
+				assert.Equal(t, variant, agentMetadata["model"])
+				assert.NotContains(t, string(output), "__GH_AW_")
+				assert.NotContains(t, string(output), "${{")
+			})
+		}
+	}
+}
+
+// TestRewriteExperimentPrefixCollision guards against one declared experiment name being a
+// prefix of another (e.g. "model" and "model_variant"); the word-boundary-anchored regex
+// rewrite must not partially corrupt the longer name's reference while rewriting the shorter
+// one.
+func TestRewriteExperimentPrefixCollision(t *testing.T) {
+	experiments := map[string][]string{
+		"model":         {"a", "b"},
+		"model_variant": {"x", "y"},
+	}
+	got := RewriteExperimentsReferenceForDownstreamJobs("${{ experiments.model }} ${{ experiments.model_variant }}", experiments)
+	assert.Equal(t, "${{ needs.activation.outputs.model }} ${{ needs.activation.outputs.model_variant }}", got)
+
+	back := RewriteActivationOutputsToLocalStepOutputs(got, experiments)
+	assert.Equal(t, "${{ steps.pick-experiment.outputs.model }} ${{ steps.pick-experiment.outputs.model_variant }}", back)
+}
+
+// TestRewriteExperimentsReferenceOnlyRewritesExpressionTokens guards against the rewrite
+// mutating text that merely looks like an experiment reference: plain text outside an
+// expression, string literals inside an expression, and property chains where
+// `experiments.<name>` is not a standalone reference.
+func TestRewriteExperimentsReferenceOnlyRewritesExpressionTokens(t *testing.T) {
+	experiments := map[string][]string{"model": {"sonnet", "opus"}}
+
+	// Plain text outside ${{ }} is not an expression.
+	assert.Equal(t, "experiments.model", RewriteExperimentsReferenceForDownstreamJobs("experiments.model", experiments))
+
+	// String literals inside an expression are data, not references.
+	literal := "${{ format('experiments.model-{0}', inputs.suffix) }}"
+	assert.Equal(t, literal, RewriteExperimentsReferenceForDownstreamJobs(literal, experiments))
+
+	// A literal containing an escaped quote must not desynchronize literal detection.
+	escaped := "${{ format('it''s experiments.model', experiments.model) }}"
+	assert.Equal(t, "${{ format('it''s experiments.model', needs.activation.outputs.model) }}",
+		RewriteExperimentsReferenceForDownstreamJobs(escaped, experiments))
+
+	// Property chains are not experiment placeholders.
+	nested := "${{ fromJSON(inputs.config).experiments.model }}"
+	assert.Equal(t, nested, RewriteExperimentsReferenceForDownstreamJobs(nested, experiments))
+	suffixed := "${{ experiments.model.foo }}"
+	assert.Equal(t, suffixed, RewriteExperimentsReferenceForDownstreamJobs(suffixed, experiments))
+
+	// Composite expressions still rewrite the standalone reference.
+	assert.Equal(t, "${{ needs.activation.outputs.model || 'sonnet' }}",
+		RewriteExperimentsReferenceForDownstreamJobs("${{ experiments.model || 'sonnet' }}", experiments))
+}
+
 // ── buildExperimentArtifactDownloadSteps ──────────────────────────────────
 
 func TestBuildExperimentArtifactDownloadStep_Empty(t *testing.T) {
@@ -216,6 +556,8 @@ func TestBuildExperimentArtifactDownloadStep_NoPrefix(t *testing.T) {
 	joined := strings.Join(steps, "")
 	// Artifact name should include the sanitized workflow ID as prefix.
 	assert.Contains(t, joined, "          name: smokecopilot-experiment\n", "artifact name should include sanitized workflow ID")
+	assert.NotContains(t, joined, "          pattern: smokecopilot-experiment\n", "single-artifact downloads should avoid ambiguous pattern matching")
+	assert.NotContains(t, joined, "          merge-multiple: true\n", "single-artifact downloads should not merge multiple matches")
 }
 
 // ── extractExperimentConfigsFromFrontmatter ───────────────────────────────
@@ -256,7 +598,7 @@ func TestExtractExperimentConfigsFromFrontmatter(t *testing.T) {
 					"prompt_style": map[string]any{
 						"variants":    []any{"concise", "verbose"},
 						"description": "Test prompt styles",
-						"metric":      "effective_tokens",
+						"metric":      "aic",
 						"weight":      []any{60.0, 40.0},
 						"issue":       float64(1234),
 						"start_date":  "2026-05-01",
@@ -270,7 +612,7 @@ func TestExtractExperimentConfigsFromFrontmatter(t *testing.T) {
 				require.NotNil(t, cfg, "prompt_style config should exist")
 				assert.Equal(t, []string{"concise", "verbose"}, cfg.Variants, "variants should match")
 				assert.Equal(t, "Test prompt styles", cfg.Description, "description should match")
-				assert.Equal(t, "effective_tokens", cfg.Metric, "metric should match")
+				assert.Equal(t, "aic", cfg.Metric, "metric should match")
 				assert.Equal(t, []int{60, 40}, cfg.Weight, "weight should match")
 				assert.Equal(t, 1234, cfg.Issue, "issue should match")
 				assert.Equal(t, "2026-05-01", cfg.StartDate, "start_date should match")
@@ -433,7 +775,7 @@ func TestExtractExperimentsStorageFromFrontmatter(t *testing.T) {
 	tests := []struct {
 		name        string
 		frontmatter map[string]any
-		want        string
+		want        ExperimentStorageMode
 	}{
 		{
 			name:        "no experiments key returns repo default",
@@ -533,11 +875,37 @@ func TestParseExperimentMetricEvalReference(t *testing.T) {
 	}
 }
 
+func TestParseExperimentMetricGraderReference(t *testing.T) {
+	tests := []struct {
+		name      string
+		metric    string
+		wantID    string
+		wantMatch bool
+	}{
+		{name: "empty metric", metric: "", wantID: "", wantMatch: false},
+		{name: "normal metric", metric: "aic", wantID: "", wantMatch: false},
+		{name: "grader colon format", metric: "grader:loops", wantID: "loops", wantMatch: true},
+		{name: "grader dotted format", metric: "graders.loops", wantID: "loops", wantMatch: true},
+		{name: "grader dotted with suffix", metric: "graders.loops.value", wantID: "loops", wantMatch: true},
+		{name: "grader empty id", metric: "grader:", wantID: "", wantMatch: true},
+		{name: "graders empty id", metric: "graders.", wantID: "", wantMatch: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotID, gotMatch := ParseExperimentMetricGraderReference(tt.metric)
+			assert.Equal(t, tt.wantID, gotID)
+			assert.Equal(t, tt.wantMatch, gotMatch)
+		})
+	}
+}
+
 func TestValidateExperimentMetricReferences(t *testing.T) {
 	tests := []struct {
 		name    string
 		configs map[string]*ExperimentConfig
 		evals   *EvalsConfig
+		graders *GradersConfig
 		wantErr string
 	}{
 		{
@@ -546,6 +914,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 				"prompt_style": {Metric: "aic"},
 			},
 			evals:   nil,
+			graders: nil,
 			wantErr: "",
 		},
 		{
@@ -556,6 +925,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "builds", Question: "Does it build?"}},
 			},
+			graders: nil,
 			wantErr: "",
 		},
 		{
@@ -566,6 +936,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "builds", Question: "Does it build?"}},
 			},
+			graders: nil,
 			wantErr: "",
 		},
 		{
@@ -576,6 +947,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "tests", Question: "Do tests pass?"}},
 			},
+			graders: nil,
 			wantErr: `references unknown eval "builds"`,
 		},
 		{
@@ -584,6 +956,7 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 				"prompt_style": {Metric: "eval:builds"},
 			},
 			evals:   nil,
+			graders: nil,
 			wantErr: `references eval "builds" but no evals are declared`,
 		},
 		{
@@ -594,7 +967,8 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "builds", Question: "Does it build?"}},
 			},
-			wantErr: "must include a non-empty eval id",
+			graders: nil,
+			wantErr: "expected eval reference format eval:<question_id>",
 		},
 		{
 			name: "eval colon metric trims whitespace from id",
@@ -604,13 +978,124 @@ func TestValidateExperimentMetricReferences(t *testing.T) {
 			evals: &EvalsConfig{
 				Questions: []EvalDefinition{{ID: "builds", Question: "Does it build?"}},
 			},
+			graders: nil,
+			wantErr: "",
+		},
+		{
+			name: "grader metric references existing grader",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader:loops"},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"loops": {ID: "loops"},
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "grader dotted metric references existing grader",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "graders.loops.value"},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"loops": {ID: "loops"},
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "grader reference rejected when grader id is unknown",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader:loops"},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"retries": {ID: "retries"},
+				},
+			},
+			wantErr: `references unknown grader "loops"`,
+		},
+		{
+			name: "grader reference rejected when graders are not declared",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader:loops"},
+			},
+			evals:   nil,
+			graders: nil,
+			wantErr: `references grader "loops" but no graders are declared`,
+		},
+		{
+			name: "grader reference requires non empty id",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader:"},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"loops": {ID: "loops"},
+				},
+			},
+			wantErr: "expected grader reference format grader:<grader_id>",
+		},
+		{
+			name: "grader colon metric trims whitespace from id",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {Metric: "grader: loops "},
+			},
+			evals: nil,
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{
+					"loops": {ID: "loops"},
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "grader guardrail references existing grader",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {
+					GuardrailMetrics: []GuardrailMetric{{Name: "grader:loops", Threshold: "<=1"}},
+				},
+			},
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{"loops": {ID: "loops"}},
+			},
+			wantErr: "",
+		},
+		{
+			name: "grader guardrail rejects unknown grader",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {
+					GuardrailMetrics: []GuardrailMetric{{Name: "grader:loops", Threshold: "<=1"}},
+				},
+			},
+			graders: &GradersConfig{
+				Graders: map[string]*GraderDefinition{"retries": {ID: "retries"}},
+			},
+			wantErr: `guardrail_metrics: references unknown grader "loops"`,
+		},
+		{
+			name: "eval guardrail references existing eval",
+			configs: map[string]*ExperimentConfig{
+				"prompt_style": {
+					GuardrailMetrics: []GuardrailMetric{{Name: "eval:quality", Threshold: ">=0.9"}},
+				},
+			},
+			evals: &EvalsConfig{
+				Questions: []EvalDefinition{{ID: "quality", Question: "Is quality acceptable?"}},
+			},
 			wantErr: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateExperimentMetricReferences(tt.configs, tt.evals)
+			err := validateExperimentMetricReferences(tt.configs, tt.evals, tt.graders)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 				return

@@ -20,26 +20,30 @@ import (
 var addWorkflowCompilationLog = logger.New("cli:add_workflow_compilation")
 
 // compileWorkflow compiles a workflow file without refreshing stop time.
-// This is a convenience wrapper around compileWorkflowWithRefresh.
+// This is a convenience wrapper around compileWorkflowWithActionRef.
 func compileWorkflow(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string) error {
-	return compileWorkflowWithRefresh(ctx, filePath, verbose, quiet, engineOverride, false, false)
+	return compileWorkflowWithActionRef(ctx, filePath, verbose, quiet, engineOverride, "")
 }
 
-// compileWorkflowWithRefresh compiles a workflow file with optional stop time refresh.
-// This function handles the compilation process and ensures .gitattributes is updated.
-func compileWorkflowWithRefresh(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string, refreshStopTime bool, approve bool) error {
+func compileWorkflowWithActionRef(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride, actionRef string) error {
+	return compileWorkflowWithRefreshAndActionRef(ctx, filePath, verbose, quiet, engineOverride, actionRef, false, false)
+}
+
+func compileWorkflowWithRefreshAndActionRef(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride, actionRef string, refreshStopTime bool, approve bool) error {
 	addWorkflowCompilationLog.Printf("Compiling workflow: file=%s, refresh_stop_time=%v, engine=%s, approve=%v", filePath, refreshStopTime, engineOverride, approve)
 
 	// Create compiler with auto-detected version and action mode
 	compiler := workflow.NewCompiler(
 		workflow.WithVerbose(verbose),
 		workflow.WithEngineOverride(engineOverride),
+		workflow.WithLint(true),
 	)
+	applyAddActionRef(compiler, actionRef)
 
 	compiler.SetRefreshStopTime(refreshStopTime)
 	compiler.SetApprove(approve)
 	compiler.SetQuiet(quiet)
-	if err := CompileWorkflowWithValidation(ctx, compiler, filePath, CompileValidationOptions{Verbose: verbose}); err != nil {
+	if err := CompileWorkflowWithValidation(ctx, compiler, filePath, CompileValidationOptions{Verbose: verbose, NoEmit: compiler.IsNoEmit()}); err != nil {
 		addWorkflowCompilationLog.Printf("Compilation failed: %v", err)
 		return err
 	}
@@ -48,6 +52,7 @@ func compileWorkflowWithRefresh(ctx context.Context, filePath string, verbose bo
 
 	// Ensure .gitattributes marks .lock.yml files as generated
 	if _, err := ensureGitAttributes(); err != nil {
+		addWorkflowCompilationLog.Printf("Failed to update .gitattributes: %v", err)
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update .gitattributes: %v", err)))
 		}
@@ -59,16 +64,18 @@ func compileWorkflowWithRefresh(ctx context.Context, filePath string, verbose bo
 	return nil
 }
 
-// compileWorkflowWithTracking compiles a workflow and tracks generated files.
-// This is a convenience wrapper around compileWorkflowWithTrackingAndRefresh.
-func compileWorkflowWithTracking(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string, tracker *FileTracker) error {
-	return compileWorkflowWithTrackingAndRefresh(ctx, filePath, verbose, quiet, engineOverride, tracker, false)
+type trackedWorkflowCompileOptions struct {
+	verbose, quiet  bool
+	engineOverride  string
+	actionRef       string
+	tracker         *FileTracker
+	refreshStopTime bool
+	noGitattributes bool
 }
 
-// compileWorkflowWithTrackingAndRefresh compiles a workflow, tracks generated files, and optionally refreshes stop time.
-// This function ensures that the file tracker records all files created or modified during compilation.
-func compileWorkflowWithTrackingAndRefresh(ctx context.Context, filePath string, verbose bool, quiet bool, engineOverride string, tracker *FileTracker, refreshStopTime bool) error {
-	addWorkflowCompilationLog.Printf("Compiling workflow with tracking: file=%s, refresh_stop_time=%v", filePath, refreshStopTime)
+// compileWorkflowWithTrackingAndOptions compiles a workflow, tracks generated files, and optionally refreshes stop time.
+func compileWorkflowWithTrackingAndOptions(ctx context.Context, filePath string, opts trackedWorkflowCompileOptions) error {
+	addWorkflowCompilationLog.Printf("Compiling workflow with tracking: file=%s, refresh_stop_time=%v", filePath, opts.refreshStopTime)
 
 	// Generate the expected lock file path
 	lockFile := stringutil.MarkdownToLockFile(filePath)
@@ -90,35 +97,39 @@ func compileWorkflowWithTrackingAndRefresh(ctx context.Context, filePath string,
 
 	// Track the lock file before compilation
 	if lockFileExists {
-		tracker.TrackModified(lockFile)
+		opts.tracker.TrackModified(lockFile)
 	} else {
-		tracker.TrackCreated(lockFile)
+		opts.tracker.TrackCreated(lockFile)
 	}
 
 	// Create compiler with auto-detected version and action mode
 	compiler := workflow.NewCompiler(
-		workflow.WithVerbose(verbose),
-		workflow.WithEngineOverride(engineOverride),
+		workflow.WithVerbose(opts.verbose),
+		workflow.WithEngineOverride(opts.engineOverride),
+		workflow.WithLint(true),
 	)
-	compiler.SetFileTracker(tracker)
-	compiler.SetRefreshStopTime(refreshStopTime)
-	compiler.SetQuiet(quiet)
-	if err := CompileWorkflowWithValidation(ctx, compiler, filePath, CompileValidationOptions{Verbose: verbose}); err != nil {
+	applyAddActionRef(compiler, opts.actionRef)
+	compiler.SetFileTracker(opts.tracker)
+	compiler.SetRefreshStopTime(opts.refreshStopTime)
+	compiler.SetQuiet(opts.quiet)
+	if err := CompileWorkflowWithValidation(ctx, compiler, filePath, CompileValidationOptions{Verbose: opts.verbose, NoEmit: compiler.IsNoEmit()}); err != nil {
 		return err
 	}
 
 	// Ensure .gitattributes marks .lock.yml files as generated; only track it if it was actually
 	// modified. Errors here are non-fatal — gitattributes update failure does not prevent the
 	// compiled workflow from being usable.
-	if updated, err := ensureGitAttributes(); err != nil {
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update .gitattributes: %v", err)))
-		}
-	} else if updated && gitRootErr == nil {
-		if gitAttributesExisted {
-			tracker.TrackModified(gitAttributesPath)
-		} else {
-			tracker.TrackCreated(gitAttributesPath)
+	if !opts.noGitattributes {
+		if updated, err := ensureGitAttributes(); err != nil {
+			if opts.verbose {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to update .gitattributes: %v", err)))
+			}
+		} else if updated && gitRootErr == nil {
+			if gitAttributesExisted {
+				opts.tracker.TrackModified(gitAttributesPath)
+			} else {
+				opts.tracker.TrackCreated(gitAttributesPath)
+			}
 		}
 	}
 
@@ -129,34 +140,22 @@ func compileWorkflowWithTrackingAndRefresh(ctx context.Context, filePath string,
 type compileDepsOptions struct {
 	verbose, quiet  bool
 	engineOverride  string
+	actionRef       string
 	force           bool
 	propagateErrors bool
 	tracker         *FileTracker
+	noGitattributes bool
 }
 
-// compileDispatchWorkflowDependencies compiles any dispatch-workflow .md dependencies of
-// workflowFile that are present locally but lack a corresponding .lock.yml. This must be
-// called before compiling the main workflow, because the dispatch-workflow validator
-// requires every referenced .md workflow to have an up-to-date .lock.yml.
-func compileDispatchWorkflowDependencies(ctx context.Context, workflowFile string, verbose, quiet bool, engineOverride string, force bool, tracker *FileTracker) {
-	compileSafeOutputsWorkflowDependencies(ctx, workflowFile, "dispatch-workflow dependency", dispatchWorkflowNamesForCompilation, compileDepsOptions{
-		verbose: verbose, quiet: quiet, engineOverride: engineOverride, force: force, propagateErrors: false, tracker: tracker,
-	})
+func compileDispatchWorkflowDependenciesWithOptions(ctx context.Context, workflowFile string, opts compileDepsOptions) {
+	opts.propagateErrors = false
+	if err := compileSafeOutputsWorkflowDependencies(ctx, workflowFile, "dispatch-workflow dependency", dispatchWorkflowNamesForCompilation, opts); err != nil {
+		addWorkflowCompilationLog.Printf("Failed to compile dispatch workflow dependencies: %v", err)
+	}
 }
 
-// compileCallWorkflowDependencies compiles any call-workflow .md worker dependencies of
-// workflowFile that are present locally but lack a corresponding .lock.yml. This must be
-// called before compiling the main workflow, because the call-workflow validator requires
-// every referenced .md worker to have an up-to-date .lock.yml.
-//
-// Unlike dispatch-workflow dependencies, call-workflow compilation failures are propagated:
-// the dynamic tool-generation path maps every worker .md to a .lock.yml reference, so a
-// worker whose lock cannot be produced would leave the orchestrator referencing a file that
-// does not exist.
-func compileCallWorkflowDependencies(ctx context.Context, workflowFile string, verbose, quiet bool, engineOverride string, force bool, tracker *FileTracker) error {
-	return compileSafeOutputsWorkflowDependencies(ctx, workflowFile, "call-workflow worker", callWorkflowNamesForCompilation, compileDepsOptions{
-		verbose: verbose, quiet: quiet, engineOverride: engineOverride, force: force, propagateErrors: true, tracker: tracker,
-	})
+func compileCallWorkflowDependenciesWithOptions(ctx context.Context, workflowFile string, opts compileDepsOptions) error {
+	return compileSafeOutputsWorkflowDependencies(ctx, workflowFile, "call-workflow worker", callWorkflowNamesForCompilation, opts)
 }
 
 // compileSafeOutputsWorkflowDependencies is the shared implementation for compiling
@@ -172,8 +171,12 @@ func compileSafeOutputsWorkflowDependencies(ctx context.Context, workflowFile, l
 	if len(workflowNames) == 0 {
 		return nil
 	}
+	if opts.tracker == nil {
+		opts.tracker = NewFileTracker()
+	}
 
 	workflowsDir := filepath.Dir(workflowFile)
+	addWorkflowCompilationLog.Printf("Resolved %d %s name(s) for %s", len(workflowNames), label, workflowFile)
 
 	for _, name := range workflowNames {
 		mdPath := filepath.Join(workflowsDir, name+".md")
@@ -181,10 +184,12 @@ func compileSafeOutputsWorkflowDependencies(ctx context.Context, workflowFile, l
 
 		// Skip if the .md is not present locally.
 		if _, mdErr := os.Stat(mdPath); mdErr != nil {
+			addWorkflowCompilationLog.Printf("Skipping %s %s: markdown file not found locally", label, mdPath)
 			continue
 		}
 		// Skip recompilation when a lock already exists, unless --force was specified.
 		if !opts.force && fileutil.FileExists(lockPath) {
+			addWorkflowCompilationLog.Printf("Skipping %s %s: lock file already exists (force=%v)", label, mdPath, opts.force)
 			continue
 		}
 
@@ -193,12 +198,10 @@ func compileSafeOutputsWorkflowDependencies(ctx context.Context, workflowFile, l
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Compiling %s: %s", label, mdPath)))
 		}
 
-		var compileErr error
-		if opts.tracker != nil {
-			compileErr = compileWorkflowWithTracking(ctx, mdPath, opts.verbose, opts.quiet, opts.engineOverride, opts.tracker)
-		} else {
-			compileErr = compileWorkflow(ctx, mdPath, opts.verbose, opts.quiet, opts.engineOverride)
-		}
+		compileErr := compileWorkflowWithTrackingAndOptions(ctx, mdPath, trackedWorkflowCompileOptions{
+			verbose: opts.verbose, quiet: opts.quiet, engineOverride: opts.engineOverride, actionRef: opts.actionRef,
+			tracker: opts.tracker, noGitattributes: opts.noGitattributes,
+		})
 		if compileErr != nil {
 			if opts.propagateErrors {
 				return fmt.Errorf("failed to compile %s %s: %w", label, mdPath, compileErr)
@@ -210,6 +213,14 @@ func compileSafeOutputsWorkflowDependencies(ctx context.Context, workflowFile, l
 		}
 	}
 	return nil
+}
+
+func applyAddActionRef(compiler *workflow.Compiler, actionRef string) {
+	if actionRef == "" {
+		return
+	}
+	compiler.SetActionMode(workflow.ActionModeRelease)
+	compiler.SetActionTag(actionRef)
 }
 
 func callWorkflowNamesForCompilation(workflowFile string) []string {

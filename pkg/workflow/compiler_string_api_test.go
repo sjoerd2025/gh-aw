@@ -3,8 +3,10 @@
 package workflow
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/workflow/compilerenv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -90,6 +92,46 @@ tools:
 
 	var sharedErr *SharedWorkflowError
 	assert.ErrorAs(t, err, &sharedErr, "expected SharedWorkflowError")
+}
+
+func TestParseWorkflowString_CommentOnlyFrontmatter_IsSharedWorkflow(t *testing.T) {
+	markdown := `---
+# Shared workflow guidance
+# comment-only frontmatter
+---
+
+# Shared tools component
+`
+
+	compiler := NewCompiler(
+		WithNoEmit(true),
+		WithSkipValidation(true),
+	)
+
+	_, err := compiler.ParseWorkflowString(markdown, "shared/comment-only.md")
+	require.Error(t, err)
+
+	var sharedErr *SharedWorkflowError
+	assert.ErrorAs(t, err, &sharedErr, "expected SharedWorkflowError")
+}
+
+func TestParseWorkflowString_WhitespaceOnlyFrontmatter_IsMissing(t *testing.T) {
+	markdown := `---
+   
+	
+---
+
+# Shared tools component
+`
+
+	compiler := NewCompiler(
+		WithNoEmit(true),
+		WithSkipValidation(true),
+	)
+
+	_, err := compiler.ParseWorkflowString(markdown, "shared/whitespace-only.md")
+	require.Error(t, err)
+	require.ErrorContains(t, err, "no frontmatter found")
 }
 
 func TestParseWorkflowString_RedirectOnlyDetection(t *testing.T) {
@@ -247,6 +289,172 @@ Greet the user warmly.
 	assert.Contains(t, yaml, "name:")
 	assert.Contains(t, yaml, "on:")
 	assert.Contains(t, yaml, "jobs:")
+}
+
+func TestCompileToYAML_RequiresSelfHostedRunners(t *testing.T) {
+	t.Setenv(compilerenv.RequireSelfHostedRunners, "true")
+	markdown := `---
+name: compile-runner-policy-test
+on:
+  workflow_dispatch:
+engine: copilot
+runs-on: self-hosted
+---
+
+# Mission
+
+Greet the user warmly.
+`
+
+	compiler := NewCompiler(
+		WithNoEmit(true),
+		WithSkipValidation(true),
+	)
+	workflowData, err := compiler.ParseWorkflowString(markdown, "workflow.md")
+	require.NoError(t, err)
+
+	_, err = compiler.CompileToYAML(workflowData, "workflow.md")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ubuntu-slim")
+	assert.Contains(t, err.Error(), "self-hosted runner")
+
+	markdown = strings.Replace(markdown, "runs-on: self-hosted\n", "runs-on: self-hosted\nruns-on-slim: self-hosted\n", 1)
+	compiler = NewCompiler(
+		WithNoEmit(true),
+		WithSkipValidation(true),
+	)
+	workflowData, err = compiler.ParseWorkflowString(markdown, "workflow.md")
+	require.NoError(t, err)
+
+	compiledYAML, err := compiler.CompileToYAML(workflowData, "workflow.md")
+	require.NoError(t, err)
+	assert.Contains(t, compiledYAML, "runs-on: self-hosted")
+}
+
+func TestCompileToYAML_RequiresSelfHostedRunnersFromRepoConfig(t *testing.T) {
+	t.Setenv(compilerenv.RequireSelfHostedRunners, "")
+	gitRoot := t.TempDir()
+	writeAWJSON(t, gitRoot, `{"require_self_hosted_runners": true}`)
+
+	markdown := `---
+name: compile-runner-repo-config-test
+on:
+  workflow_dispatch:
+engine: copilot
+runs-on: self-hosted
+---
+
+# Mission
+
+Greet the user warmly.
+`
+
+	compiler := NewCompiler(
+		WithNoEmit(true),
+		WithSkipValidation(true),
+	)
+	compiler.gitRoot = gitRoot
+	workflowData, err := compiler.ParseWorkflowString(markdown, "workflow.md")
+	require.NoError(t, err)
+
+	_, err = compiler.CompileToYAML(workflowData, "workflow.md")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ubuntu-slim")
+	assert.Contains(t, err.Error(), "self-hosted runner enforcement")
+}
+
+func TestCompileToYAML_AllowsMissingRepoConfig(t *testing.T) {
+	t.Setenv(compilerenv.RequireSelfHostedRunners, "")
+	gitRoot := t.TempDir()
+
+	markdown := `---
+name: compile-runner-missing-repo-config-test
+on:
+  workflow_dispatch:
+engine: copilot
+runs-on: self-hosted
+---
+
+# Mission
+
+Greet the user warmly.
+`
+
+	compiler := NewCompiler(
+		WithNoEmit(true),
+		WithSkipValidation(true),
+	)
+	compiler.gitRoot = gitRoot
+	workflowData, err := compiler.ParseWorkflowString(markdown, "workflow.md")
+	require.NoError(t, err)
+
+	compiledYAML, err := compiler.CompileToYAML(workflowData, "workflow.md")
+	require.NoError(t, err)
+	assert.Contains(t, compiledYAML, "compile-runner-missing-repo-config-test")
+}
+
+func TestCompileToYAML_RequiresValidRepoConfig(t *testing.T) {
+	t.Setenv(compilerenv.RequireSelfHostedRunners, "")
+	gitRoot := t.TempDir()
+	writeAWJSON(t, gitRoot, `{"require_self_hosted_runners":}`)
+
+	markdown := `---
+name: compile-runner-invalid-repo-config-test
+on:
+  workflow_dispatch:
+engine: copilot
+runs-on: self-hosted
+---
+
+# Mission
+
+Greet the user warmly.
+`
+
+	compiler := NewCompiler(
+		WithNoEmit(true),
+		WithSkipValidation(true),
+	)
+	compiler.gitRoot = gitRoot
+	workflowData, err := compiler.ParseWorkflowString(markdown, "workflow.md")
+	require.NoError(t, err)
+
+	_, err = compiler.CompileToYAML(workflowData, "workflow.md")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to load aw.json")
+}
+
+func TestCompileToYAML_GHESCompatPinsStringAPI(t *testing.T) {
+	markdown := `---
+name: ghes-string-api
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+engine: copilot
+strict: false
+steps:
+  - name: Upload test artifact
+    uses: actions/upload-artifact@v7
+    with:
+      name: test
+      path: test.txt
+---
+
+# GHES string API pins
+`
+
+	compiler := NewCompiler()
+	compiler.SetGHESCompat(true)
+	wd, err := compiler.ParseWorkflowString(markdown, "workflow.md")
+	require.NoError(t, err)
+
+	yaml, err := compiler.CompileToYAML(wd, "workflow.md")
+	require.NoError(t, err)
+	assert.Contains(t, yaml, "actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2")
+	assert.Contains(t, yaml, "actions/download-artifact@a9bc5e6ef2cb54c177f32aa5726adaa15e7e2d59 # v3.1.0")
+	assert.NotContains(t, yaml, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7")
+	assert.NotContains(t, yaml, "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8")
 }
 
 func TestCompileToYAML_OutputContainsWorkflowName(t *testing.T) {

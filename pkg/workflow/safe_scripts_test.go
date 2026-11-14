@@ -135,6 +135,7 @@ func TestBuildCustomSafeOutputScriptsJSONEmpty(t *testing.T) {
 
 // TestGenerateCustomScriptToolDefinition verifies MCP tool definition for scripts
 func TestGenerateCustomScriptToolDefinition(t *testing.T) {
+	maxLength := 40000
 	scriptConfig := &SafeScriptConfig{
 		Description: "Post a message to Slack",
 		Inputs: map[string]*InputDefinition{
@@ -147,6 +148,7 @@ func TestGenerateCustomScriptToolDefinition(t *testing.T) {
 				Description: "Message text",
 				Required:    true,
 				Type:        "string",
+				MaxLength:   &maxLength,
 			},
 		},
 		Script: "return async (m) => ({ success: true });",
@@ -165,12 +167,22 @@ func TestGenerateCustomScriptToolDefinition(t *testing.T) {
 	properties, ok := inputSchema["properties"].(map[string]any)
 	require.True(t, ok, "Should have properties")
 	assert.Len(t, properties, 2, "Should have 2 properties")
+	assert.Equal(t, maxLength, properties["message"].(map[string]any)["maxLength"])
 
 	required, ok := inputSchema["required"].([]string)
 	require.True(t, ok, "Should have required field")
 	assert.Len(t, required, 2, "Should have 2 required fields")
 	assert.Contains(t, required, "channel", "Should require channel")
 	assert.Contains(t, required, "message", "Should require message")
+}
+
+func TestGenerateSafeOutputScriptQuotesHyphenatedInputs(t *testing.T) {
+	content := generateSafeOutputScriptContent("notion-add-comment", &SafeScriptConfig{
+		Script: "return item;",
+		Inputs: map[string]*InputDefinition{"page-id": {Type: "string"}, "text": {Type: "string"}},
+	})
+	require.Contains(t, content, `const { "page-id": page_id, text } = config;`)
+	require.NotContains(t, content, "const { page-id:")
 }
 
 // TestScriptToolsInFilteredJSON verifies scripts appear in the filtered tools JSON
@@ -266,7 +278,7 @@ func TestBuildCustomScriptFilesStep(t *testing.T) {
 
 	fullYAML := strings.Join(steps, "")
 
-	assert.Contains(t, fullYAML, "Configure Safe Outputs Custom Scripts", "Should have configure step name")
+	assert.Contains(t, fullYAML, "Configure Safe Output Scripts", "Should have configure step name")
 	assert.Contains(t, fullYAML, "safe_output_script_my_handler.cjs", "Should reference the output filename")
 	// Verify heredoc delimiter follows the randomized GH_AW_SAFE_OUTPUT_SCRIPT_MY_HANDLER_<hex>_EOF format
 	delimRE := regexp.MustCompile(`GH_AW_SAFE_OUTPUT_SCRIPT_MY_HANDLER_[0-9a-f]{16}_EOF`)

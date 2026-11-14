@@ -2,7 +2,7 @@
 
 package workflow
 
-func validateDockerImage(image string, verbose bool, requireDocker bool) error {
+func validateDockerImageWithMode(image string, verbose bool, requireDocker bool, readOnly bool) error {
 	return nil
 }
 

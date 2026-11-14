@@ -153,6 +153,62 @@ func TestValidateRunsOn(t *testing.T) {
 			errorInMsg:  "safe-outputs.threat-detection.runs-on",
 			description: "threat-detection runs-on labels containing macos runner should be rejected",
 		},
+		{
+			name: "macos string in safe-outputs.threat-detection.runs-on",
+			frontmatter: map[string]any{
+				"safe-outputs": map[string]any{
+					"threat-detection": map[string]any{
+						"runs-on": "macos-latest",
+					},
+				},
+			},
+			wantErr:     true,
+			errorInMsg:  "safe-outputs.threat-detection.runs-on",
+			description: "threat-detection runs-on string macos runner should be rejected",
+		},
+		{
+			name: "macos in safe-outputs.threat-detection.runs-on array",
+			frontmatter: map[string]any{
+				"safe-outputs": map[string]any{
+					"threat-detection": map[string]any{
+						"runs-on": []any{"self-hosted", "macOS", "arm64"},
+					},
+				},
+			},
+			wantErr:     true,
+			errorInMsg:  "safe-outputs.threat-detection.runs-on",
+			description: "threat-detection runs-on array containing macos runner should be rejected",
+		},
+		{
+			name: "linux runner in safe-outputs.threat-detection.runs-on",
+			frontmatter: map[string]any{
+				"safe-outputs": map[string]any{
+					"threat-detection": map[string]any{
+						"runs-on": "ubuntu-latest",
+					},
+				},
+			},
+			wantErr:     false,
+			description: "threat-detection runs-on with a Linux runner should be accepted",
+		},
+		{
+			name: "macos in custom safe-job runs-on labels",
+			frontmatter: map[string]any{
+				"safe-outputs": map[string]any{
+					"jobs": map[string]any{
+						"notify": map[string]any{
+							"runs-on": map[string]any{
+								"group":  "runner-group",
+								"labels": []any{"linux", "macos-latest"},
+							},
+						},
+					},
+				},
+			},
+			wantErr:     true,
+			errorInMsg:  "safe-outputs.jobs.notify.runs-on",
+			description: "custom safe-job runs-on labels containing macos should be rejected",
+		},
 	}
 
 	for _, tt := range tests {
@@ -222,6 +278,54 @@ func TestExtractRunnerLabels(t *testing.T) {
 	}
 }
 
+func TestValidateSelfHostedRunners(t *testing.T) {
+	tests := []struct {
+		name       string
+		jobs       map[string]any
+		wantErr    bool
+		errContain string
+	}{
+		{
+			name: "self-hosted label",
+			jobs: map[string]any{"agent": map[string]any{"runs-on": []any{"self-hosted", "linux"}}},
+		},
+		{
+			name: "runner group",
+			jobs: map[string]any{"safe_outputs": map[string]any{"runs-on": map[string]any{"group": "arc-pool", "labels": []any{"linux"}}}},
+		},
+		{
+			name:       "GitHub-hosted runner",
+			jobs:       map[string]any{"agent": map[string]any{"runs-on": "ubuntu-latest"}},
+			wantErr:    true,
+			errContain: `job "agent"`,
+		},
+		{
+			name:       "custom label without self-hosted proof",
+			jobs:       map[string]any{"agent": map[string]any{"runs-on": "my-runner"}},
+			wantErr:    true,
+			errContain: "self-hosted runner",
+		},
+		{
+			name:       "omitted runner",
+			jobs:       map[string]any{"safe_outputs": map[string]any{"steps": []any{}}},
+			wantErr:    true,
+			errContain: `job "safe_outputs" has no runs-on value`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSelfHostedRunners(map[string]any{"jobs": tt.jobs})
+			if tt.wantErr {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tt.errContain)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
 func TestValidateRunsOnValue(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -251,7 +355,7 @@ func TestValidateRunsOnValue(t *testing.T) {
 			name:       "array with non-string entry is invalid",
 			value:      []any{"linux", 42},
 			wantErr:    true,
-			errContain: "array entry type int",
+			errContain: "array entry has type int",
 		},
 		{
 			name: "object with invalid key is invalid",
@@ -259,13 +363,19 @@ func TestValidateRunsOnValue(t *testing.T) {
 				"runner": "ubuntu-latest",
 			},
 			wantErr:    true,
-			errContain: `invalid runs-on object key "runner"`,
+			errContain: "runs-on object key 'runner' is not supported",
+		},
+		{
+			name:       "empty object is invalid",
+			value:      map[string]any{},
+			wantErr:    true,
+			errContain: "runs-on object is empty",
 		},
 		{
 			name:       "unsupported type is invalid",
 			value:      123,
 			wantErr:    true,
-			errContain: "invalid runs-on type int",
+			errContain: "runs-on has type int",
 		},
 	}
 

@@ -16,6 +16,7 @@
 //   - validateMaxToolDenialsSupport() - Validates max-tool-denials support for Copilot SDK mode
 //   - validateWebSearchSupport() - Validates web-search feature support (warning)
 //   - validateBareModeSupport() - Validates bare mode feature support (warning)
+//   - validateBashCommandAllowlistSupport() - Errors when restricted bash allowlist is unsupported
 //   - validateWorkflowRunBranches() - Validates workflow_run has branch restrictions
 //
 // # Validation Patterns
@@ -105,7 +106,7 @@ func (c *Compiler) validateAgentFile(workflowData *WorkflowData, markdownPath st
 	}
 
 	if c.verbose {
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr(
 			"✓ Agent file exists: "+agentPath))
 	}
 
@@ -139,6 +140,32 @@ func (c *Compiler) validateMaxTurnsSupport(frontmatter map[string]any, engine Co
 	return validateCapabilitySupport("max-turns", hasMaxTurns, engine.GetCapabilities().MaxTurns, engine.GetID())
 }
 
+// emitContextWindowSupportWarning warns when the resolved engine configuration,
+// including imported engine settings, sets context-window for an unsupported engine.
+func (c *Compiler) emitContextWindowSupportWarning(workflowData *WorkflowData) {
+	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.ContextWindow == 0 {
+		return
+	}
+	engine, err := c.getAgenticEngine(workflowData.AI)
+	if err != nil {
+		return
+	}
+	c.validateContextWindowSupport(workflowData.EngineConfig, engine)
+}
+
+// validateContextWindowSupport warns when context-window is used with an engine that cannot consume it.
+func (c *Compiler) validateContextWindowSupport(engineConfig *EngineConfig, engine CodingAgentEngine) {
+	if engineConfig == nil || engineConfig.ContextWindow == 0 || engine.GetCapabilities().ContextWindow {
+		return
+	}
+
+	agentValidationLog.Printf("Engine %s does not support context-window, emitting warning", engine.GetID())
+	fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf(
+		"Engine '%s' does not support context-window (engine.context-window). The setting will be ignored.",
+		engine.GetID())))
+	c.IncrementWarningCount()
+}
+
 // validateMaxContinuationsSupport validates that max-continuations is only used with engines that support this feature
 func (c *Compiler) validateMaxContinuationsSupport(frontmatter map[string]any, engine CodingAgentEngine) error {
 	// Check if max-continuations is specified in the engine config
@@ -164,6 +191,9 @@ func (c *Compiler) validateMaxToolDenialsSupport(frontmatter map[string]any, eng
 	agentValidationLog.Printf("Validating max-tool-denials support: engine=%s, maxToolDenials=%s, copilotSDK=%v",
 		engine.GetID(), engineConfig.MaxToolDenials, engineConfig.CopilotSDK)
 
+	if engine.GetID() == string(constants.PiEngine) && (engineConfig.Driver == "" || engineConfig.Driver == "pi_agent_core_driver.cjs" || engineConfig.Driver == "pi_rpc_driver.cjs") {
+		return nil
+	}
 	if engine.GetID() != string(constants.CopilotEngine) {
 		return fmt.Errorf("max-tool-denials not supported: engine '%s' does not support max-tool-denials (supported only with engine 'copilot' and engine.copilot-sdk: true)", engine.GetID())
 	}
@@ -175,10 +205,38 @@ func (c *Compiler) validateMaxToolDenialsSupport(frontmatter map[string]any, eng
 	return nil
 }
 
+// validateMaxToolCallsSupport limits aggregate tool-call enforcement to the built-in
+// Copilot SDK driver, whose pre-tool hook intercepts primary and subagent dispatches.
+func (c *Compiler) validateMaxToolCallsSupport(frontmatter map[string]any, engine CodingAgentEngine) error {
+	_, engineConfig, _ := c.ExtractEngineConfig(frontmatter)
+	return validateMaxToolCallsConfig(engineConfig, engine)
+}
+
+func validateMaxToolCallsConfig(engineConfig *EngineConfig, engine CodingAgentEngine) error {
+	if engineConfig == nil || engineConfig.MaxToolCalls == "" {
+		return nil
+	}
+	if engine.GetID() == string(constants.PiEngine) {
+		if engineConfig.Driver != "" && engineConfig.Driver != "pi_agent_core_driver.cjs" && engineConfig.Driver != "pi_rpc_driver.cjs" {
+			return errors.New("max-tool-calls requires the built-in Pi CLI, SDK, or RPC driver; custom Pi drivers cannot enforce the aggregate budget")
+		}
+		return nil
+	}
+	if engine.GetID() != string(constants.CopilotEngine) || !engineConfig.CopilotSDK {
+		return errors.New("max-tool-calls requires engine 'copilot' with engine.copilot-sdk: true; other engines do not currently expose an enforceable tool-dispatch hook")
+	}
+	if engineConfig.Driver != "" || engineConfig.HarnessScript != "" {
+		return errors.New("max-tool-calls requires the built-in Copilot SDK driver and harness; custom engine.driver or engine.harness overrides cannot enforce the aggregate budget")
+	}
+	return nil
+}
+
 // validateUniversalLLMConsumerModel validates that universal consumer engines
-// (OpenCode) declare a provider-qualified engine.model.
+// (behavior-defined engines using the universal-llm-consumer secret strategy)
+// declare a provider-qualified engine.model.
 func (c *Compiler) validateUniversalLLMConsumerModel(frontmatter map[string]any, engine CodingAgentEngine) error {
-	if engine.GetID() != "opencode" {
+	behaviorEngine, ok := engine.(*BehaviorDefinedEngine)
+	if !ok || !behaviorEngine.usesUniversalLLMConsumer() {
 		return nil
 	}
 
@@ -194,31 +252,56 @@ func (c *Compiler) validateUniversalLLMConsumerModel(frontmatter map[string]any,
 	return nil
 }
 
-// validatePiEngineRequirements validates Pi's required tool configuration.
-func (c *Compiler) validatePiEngineRequirements(tools *ToolsConfig, engine CodingAgentEngine) error {
-	if engine.GetID() != "pi" {
+// validateCopilotWebToolsSupport uses the resolved engine configuration so imported
+// SDK settings are honored. Native web tools are unavailable in offline BYOK mode.
+func (c *Compiler) validateCopilotWebToolsSupport(engine CodingAgentEngine, data *WorkflowData) error {
+	claudeOnCopilot := engine.GetID() == string(constants.ClaudeEngine) && claudeUsesCopilotInference(data)
+	if engine.GetID() != string(constants.CopilotEngine) && !claudeOnCopilot {
 		return nil
 	}
 
-	if tools == nil || tools.GitHub == nil ||
-		(tools.GitHub.Mode != GitHubMCPModeGHProxy && tools.GitHub.Mode != GitHubMCPModeCLI) {
-		return errors.New("engine 'pi' requires tools.github.mode: gh-proxy")
+	engineConfig := data.EngineConfig
+	collector := NewErrorCollector(c.failFast)
+	for _, tool := range []string{"web-fetch", "web-search"} {
+		if !isCopilotToolValueEnabled(data.Tools, tool) || (!claudeOnCopilot && tool == "web-fetch" && engineConfig != nil && engineConfig.CopilotSDK) {
+			continue
+		}
+		message := fmt.Sprintf("Copilot's native '%s' tool is unavailable because offline BYOK mode disables web tools (COPILOT_OFFLINE=true)", tool)
+		suggestion := fmt.Sprintf("Remove tools.%s and configure an MCP server instead, or use a supported engine, for example:\n\nengine: codex", tool)
+		if claudeOnCopilot {
+			message = fmt.Sprintf("Claude's native '%s' tool is unavailable on GitHub Copilot inference because offline BYOK mode disables web tools (COPILOT_OFFLINE=true)", tool)
+			server := "fetch"
+			if tool == "web-search" {
+				server = "search"
+			}
+			suggestion = fmt.Sprintf("Remove tools.%s and configure an MCP %s server instead, or use engine.model-provider: anthropic", tool, server)
+		} else if tool == "web-fetch" {
+			suggestion += "\n\nFor Copilot's proxy-aware custom fetch tool, enable SDK mode:\n\nengine:\n  id: copilot\n  copilot-sdk: true"
+		}
+		err := NewValidationError(
+			"tools."+tool,
+			tool,
+			message,
+			suggestion,
+		)
+		if returnErr := collector.Add(err); returnErr != nil {
+			return returnErr
+		}
 	}
-
-	if !tools.CLIProxy {
-		return errors.New("engine 'pi' requires tools.cli-proxy: true")
-	}
-
-	return nil
+	return collector.FormattedError("Copilot web tools")
 }
 
 // validateWebSearchSupport validates that web-search tool is only used with engines that support this feature
-func (c *Compiler) validateWebSearchSupport(tools map[string]any, engine CodingAgentEngine) {
+func (c *Compiler) validateWebSearchSupport(frontmatter map[string]any, tools map[string]any, engine CodingAgentEngine) {
 	// Check if web-search tool is requested
 	_, hasWebSearch := tools["web-search"]
 
 	if !hasWebSearch {
 		// No web-search specified, no validation needed
+		return
+	}
+	if engine.GetID() == string(constants.CopilotEngine) {
+		// Copilot's unavailable native tools are rejected after engine imports resolve.
 		return
 	}
 
@@ -227,8 +310,9 @@ func (c *Compiler) validateWebSearchSupport(tools map[string]any, engine CodingA
 	// web-search is specified, check if the engine supports it
 	if !engine.GetCapabilities().WebSearch {
 		agentValidationLog.Printf("Engine %s does not natively support web-search tool, emitting warning", engine.GetID())
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Engine '%s' does not support the web-search tool. See https://github.github.com/gh-aw/guides/web-search/ for alternatives.", engine.GetID())))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Engine '%s' does not support the web-search tool. See https://github.github.com/gh-aw/guides/web-search/ for alternatives.", engine.GetID())))
 		c.IncrementWarningCount()
+		return
 	}
 }
 
@@ -246,9 +330,104 @@ func (c *Compiler) validateBareModeSupport(frontmatter map[string]any, engine Co
 
 	if !engine.GetCapabilities().BareMode {
 		agentValidationLog.Printf("Engine %s does not support bare mode, emitting warning", engine.GetID())
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Engine '%s' does not support bare mode (engine.bare: true). Bare mode is only supported for the 'copilot' and 'claude' engines. The setting will be ignored.", engine.GetID())))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Engine '%s' does not support bare mode (engine.bare: true). Bare mode is only supported for the 'copilot' and 'claude' engines. The setting will be ignored.", engine.GetID())))
 		c.IncrementWarningCount()
 	}
+}
+
+// validateBashCommandAllowlistSupport errors when an explicit bash restriction is used
+// with an engine that cannot enforce it. An explicit restriction is any of:
+//   - bash: false  (disabling bash — silently ignored at runtime)
+//   - bash: []     (empty allowlist — silently ignored at runtime)
+//   - bash: [cmd1, cmd2, ...]  (non-wildcard list — silently ignored at runtime)
+//
+// Engines that do not map these configurations to their own CLI syntax silently ignore them,
+// creating the dangerous illusion of restriction where none exists.
+func (c *Compiler) validateBashCommandAllowlistSupport(tools map[string]any, engine CodingAgentEngine) error {
+	capabilities := engine.GetCapabilities()
+	if capabilities.BashCommandAllowlist {
+		return nil
+	}
+	if !HasBashExplicitRestriction(tools) {
+		return nil
+	}
+	if capabilities.BashDisable && hasBashFullyDisabled(tools) {
+		// The engine cannot enforce a per-command allowlist, but tools.bash here requests a
+		// complete refusal of all bash commands (bash: false, or bash: []), which the engine
+		// can honor directly (e.g. Codex's features.shell_tool=false), so this is safe to allow.
+		agentValidationLog.Printf("Engine %s fully disables bash instead of enforcing an allowlist", engine.GetID())
+		return nil
+	}
+	if hasBashFullyDisabled(tools) {
+		return fmt.Errorf("engine '%s' cannot disable bash: tools.bash: false and tools.bash: [] cannot be enforced. "+
+			"Remove the tools.bash restriction or switch to an engine that supports disabling bash (copilot, claude, gemini, or codex)", engine.GetID())
+	}
+	agentValidationLog.Printf("Engine %s does not support bash command allowlist, emitting error", engine.GetID())
+	disableAdvice := ""
+	if capabilities.BashDisable {
+		disableAdvice = "'bash: false' to fully disable bash, "
+	}
+	return fmt.Errorf("engine '%s' does not support bash command allow-listing: tools.bash with specific commands is silently ignored at runtime for this engine. "+
+		"Use 'bash: [\"*\"]' to allow all commands, %sor remove the tools.bash entry. "+
+		"To restrict bash commands to a specific allowlist, switch to an engine that supports this feature (copilot, claude, or gemini)",
+		engine.GetID(), disableAdvice)
+}
+
+// HasBashExplicitRestriction reports true when the tools map contains a bash configuration
+// that represents an explicit restriction: bash: false, bash: [], or a non-wildcard command list.
+// Only absent/nil bash, bash: true, and wildcard lists (["*"], [":*"]) return false.
+// This function is used for compile-time validation and by the `gh aw fix` codemods.
+// See hasBashRestrictedAllowlist for the variant used in MCP CLI command injection.
+func HasBashExplicitRestriction(tools map[string]any) bool {
+	if tools == nil {
+		return false
+	}
+	bashConfig, hasBash := tools["bash"]
+	if !hasBash || bashConfig == nil {
+		return false
+	}
+	if asBool, ok := bashConfig.(bool); ok {
+		// bash: false disables bash (explicit restriction); bash: true allows all (unrestricted)
+		return !asBool
+	}
+	bashCommands, ok := bashConfig.([]any)
+	if !ok {
+		return false
+	}
+	// empty list explicitly allows no commands — that is a restriction
+	if len(bashCommands) == 0 {
+		return true
+	}
+	for _, cmd := range bashCommands {
+		if cmdStr, ok := cmd.(string); ok && (cmdStr == "*" || cmdStr == ":*") {
+			return false
+		}
+	}
+	return true
+}
+
+// hasBashFullyDisabled reports true when the tools map's bash configuration represents a
+// complete refusal of all bash commands: bash: false, or bash: [] (empty allowlist). Unlike
+// hasBashExplicitRestriction, this excludes non-empty, non-wildcard command lists, which require
+// per-command allowlist support (EngineCapabilities.BashCommandAllowlist) to enforce safely.
+// It is used to decide whether EngineCapabilities.BashDisable is sufficient to allow an explicit
+// bash restriction that would otherwise be rejected by validateBashCommandAllowlistSupport.
+func hasBashFullyDisabled(tools map[string]any) bool {
+	if tools == nil {
+		return false
+	}
+	bashConfig, hasBash := tools["bash"]
+	if !hasBash || bashConfig == nil {
+		return false
+	}
+	if asBool, ok := bashConfig.(bool); ok {
+		return !asBool
+	}
+	bashCommands, ok := bashConfig.([]any)
+	if !ok {
+		return false
+	}
+	return len(bashCommands) == 0
 }
 
 // validateWorkflowRunBranches validates workflow_run trigger requirements.
@@ -267,7 +446,7 @@ func (c *Compiler) validateWorkflowRunBranches(workflowData *WorkflowData, markd
 	}
 	if _, hasBranches := workflowRunMap["branches"]; hasBranches {
 		if c.verbose {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("✓ workflow_run trigger has branch restrictions"))
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr("✓ workflow_run trigger has branch restrictions"))
 		}
 		return nil
 	}

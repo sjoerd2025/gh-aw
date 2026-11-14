@@ -4,10 +4,59 @@ package workflow
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestMCPDebugLoggingOnDemand(t *testing.T) {
+	for _, engine := range []string{"copilot", "claude", "codex"} {
+		t.Run(engine, func(t *testing.T) {
+			workflowPath := filepath.Join(t.TempDir(), "debug.md")
+			content := `---
+on: workflow_dispatch
+strict: false
+engine: ` + engine + `
+tools:
+  agentic-workflows: true
+mcp-scripts:
+  hello:
+    description: Say hello
+    script: return "hello";
+safe-outputs:
+  noop:
+---
+Test on-demand MCP debug logging.
+`
+			if err := os.WriteFile(workflowPath, []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			compiler := NewCompiler()
+			compiler.SetSkipValidation(true)
+			data, err := compiler.ParseWorkflowFile(workflowPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, _, _, err := compiler.generateYAML(data, workflowPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected := "DEBUG: ${{ env.DEBUG || runner.debug == '1' && '*' || '' }}"
+			if strings.Count(output, expected) != 2 {
+				t.Error("Expected gateway and MCP scripts to honor explicit DEBUG and GitHub Actions debug mode")
+			}
+			for _, forced := range []string{`export DEBUG="*"`, `DEBUG: '*'`, `"DEBUG": "*"`} {
+				if strings.Contains(output, forced) {
+					t.Errorf("Unexpected forced debug logging: %s", forced)
+				}
+			}
+			if strings.Count(output, `"DEBUG": "\${DEBUG}"`) != 2 {
+				t.Error("Expected safe outputs and agentic-workflows servers to inherit DEBUG")
+			}
+		})
+	}
+}
 
 // TestMCPServersCompilation verifies that mcp-servers configuration is properly compiled into workflows
 // TestMCPEnvVarsAlphabeticallySorted verifies that env vars in MCP configs are sorted alphabetically
@@ -66,7 +115,7 @@ This workflow tests that MCP server env vars are sorted alphabetically.
 
 	// Find the test-server env section in the generated YAML
 	// Look for "test-server" first, then find the env section after it
-	testServerIndex := strings.Index(yamlContent, `"test-server"`)
+	testServerIndex := strings.LastIndex(yamlContent, `"test-server"`)
 	if testServerIndex == -1 {
 		t.Fatalf("Could not find test-server section in generated YAML")
 	}
@@ -333,7 +382,6 @@ Test workflow.
 			tmpFile.Close()
 
 			compiler := NewCompiler()
-			compiler.SetSkipValidation(true)
 
 			workflowData, err := compiler.ParseWorkflowFile(tmpFile.Name())
 			if err != nil {
@@ -346,7 +394,7 @@ Test workflow.
 			}
 
 			// Find the server-specific block in the YAML
-			serverIndex := strings.Index(yamlContent, tt.serverName)
+			serverIndex := strings.LastIndex(yamlContent, tt.serverName)
 			if serverIndex == -1 {
 				t.Fatalf("Could not find server %s in generated YAML", tt.serverName)
 			}
@@ -508,8 +556,8 @@ This workflow tests that agentic-workflows uses the correct container in dev mod
 				}
 
 				// Verify DEBUG and GITHUB_TOKEN are present
-				if !strings.Contains(string(lockContent), `"DEBUG": "*"`) {
-					t.Error("Expected DEBUG set to literal '*' in dev mode env vars")
+				if !strings.Contains(string(lockContent), `"DEBUG": "\${DEBUG}"`) {
+					t.Error("Expected DEBUG forwarded from the environment in dev mode")
 				}
 				if !strings.Contains(string(lockContent), `"GITHUB_TOKEN"`) {
 					t.Error("Expected GITHUB_TOKEN in dev mode env vars")
@@ -597,7 +645,7 @@ mcp-servers:
 				t.Fatalf("Failed to generate YAML: %v", err)
 			}
 
-			serverIdx := strings.Index(yamlContent, `"my-server"`)
+			serverIdx := strings.LastIndex(yamlContent, `"my-server"`)
 			if serverIdx == -1 {
 				t.Fatal("Could not find my-server block in generated YAML")
 			}
@@ -682,7 +730,7 @@ Do nothing.
 	}
 
 	// Locate the my-server block.
-	serverIdx := strings.Index(yamlContent, `"my-server"`)
+	serverIdx := strings.LastIndex(yamlContent, `"my-server"`)
 	if serverIdx == -1 {
 		t.Fatal("Could not find my-server block in generated YAML")
 	}
@@ -758,7 +806,7 @@ Do nothing.
 		t.Fatalf("Failed to generate YAML: %v", err)
 	}
 
-	serverIdx := strings.Index(yamlContent, `"datadog"`)
+	serverIdx := strings.LastIndex(yamlContent, `"datadog"`)
 	if serverIdx == -1 {
 		t.Fatal("Could not find datadog block in generated YAML")
 	}
@@ -919,7 +967,7 @@ Do nothing.
 				t.Fatalf("Failed to generate YAML: %v", err)
 			}
 
-			serverIdx := strings.Index(yamlContent, tt.serverName)
+			serverIdx := strings.LastIndex(yamlContent, tt.serverName)
 			if serverIdx == -1 {
 				t.Fatalf("Could not find server %s in generated YAML", tt.serverName)
 			}
@@ -936,5 +984,76 @@ Do nothing.
 				}
 			}
 		})
+	}
+}
+
+// TestMCPServerRequiredFalseCompilation verifies that a server marked with
+// required: false is accepted by validation and rendered into the gateway
+// configuration so its startup failure can be degraded to a warning.
+func TestMCPServerRequiredFalseCompilation(t *testing.T) {
+	workflowContent := `---
+on:
+  workflow_dispatch:
+strict: false
+permissions:
+  contents: read
+engine: copilot
+mcp-servers:
+  optional-http:
+    type: http
+    url: "https://example.com/mcp"
+    required: false
+  critical-http:
+    type: http
+    url: "https://example.com/other-mcp"
+---
+
+# Test MCP Required Flag
+
+This workflow tests that non-critical MCP servers are marked as such.
+`
+
+	tmpFile, err := os.CreateTemp("", "test-mcp-required-*.md")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(workflowContent); err != nil {
+		t.Fatalf("Failed to write to temp file: %v", err)
+	}
+	tmpFile.Close()
+
+	compiler := NewCompiler()
+	compiler.SetSkipValidation(true)
+
+	workflowData, err := compiler.ParseWorkflowFile(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("Failed to parse workflow file: %v", err)
+	}
+
+	yamlContent, _, _, err := compiler.generateYAML(workflowData, tmpFile.Name())
+	if err != nil {
+		t.Fatalf("Failed to generate YAML: %v", err)
+	}
+
+	optionalIndex := strings.Index(yamlContent, `"optional-http"`)
+	if optionalIndex == -1 {
+		t.Fatalf("Could not find optional-http server in generated YAML")
+	}
+	if !strings.Contains(yamlContent, `"critical-http"`) {
+		t.Fatalf("Could not find critical-http server in generated YAML")
+	}
+
+	// The required flag must be emitted only for the non-critical server.
+	requiredIndex := strings.Index(yamlContent, `"required": false`)
+	if requiredIndex == -1 {
+		t.Fatalf("Expected \"required\": false to be rendered for optional-http")
+	}
+	if strings.Count(yamlContent, `"required": false`) != 1 {
+		t.Errorf("Expected exactly one \"required\": false entry, got %d", strings.Count(yamlContent, `"required": false`))
+	}
+	if requiredIndex < optionalIndex {
+		t.Errorf("Expected \"required\": false to be rendered inside the optional-http server block")
 	}
 }

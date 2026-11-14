@@ -36,13 +36,122 @@ All commands are run from the root of the project, from a terminal:
 | `npm run astro ...`       | Run CLI commands like `astro add`, `astro check` |
 | `npm run astro -- --help` | Get help using the Astro CLI                     |
 
+### Install through the 1ES feed
+
+If access to npmjs is blocked, run this from `docs/`:
+
+```sh
+npm ci \
+  --registry=https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/ \
+  --replace-registry-host=npmjs
+```
+
+Astro and Starlight are pinned to feed-supported releases. Keep the checked-in
+lockfile and registry configuration unchanged when installing. Metadata
+availability does not guarantee that the feed can serve a package's tarball.
+After updating dependencies, run `make check-npm-1es` from the repository root
+to verify that the locked versions can be downloaded.
+
+## Interactive talk
+
+The [interactive talk](https://github.github.com/gh-aw/cracktro/) is served from
+`public/cracktro/` and ships with the normal docs build and Pages deployment.
+It is a standalone forty-five-slide deck, separate from the homepage slideshow, linked
+from the site footer. Use arrows, Space, or Page Up/Page Down to navigate,
+Home/End to jump, F for fullscreen, N for speaker notes, and M to toggle sound.
+The navigation dots jump directly to a slide (on narrow screens they become
+previous/next arrow buttons); `#1` through `#45` are shareable
+slide links. Clicking the left third goes back; clicking elsewhere advances.
+On touch screens, swipe left or right.
+Slides are grouped into sections: slides within a section push left, and
+moving to the next section slides up (reversed when going back).
+Link previews (Open Graph, Slack, X) use `public/cracktro/og-image.png`, a
+1200x630 render of the title slide; regenerate it if the title slide changes.
+
+Examples, review activity, repository counts, and cost figures are synthetic,
+except the model routing slide's results, which are measured on this
+repository's own workflows, the Issues as intent slide's counts of
+issues labelled `community` and the merged pull requests that closed them
+(November 2026 snapshot), the Mine · Refine · Apply slide's dated feed and
+counts of Linter Miner analyzer pull requests, LintMonster issues and the
+merged pull requests that closed them (May to November 2026), the Go Fan slide's counts of daily
+library review issues and the merged pull requests that closed them
+(February to November 2026, with shortened titles), the Continuous Security slide's
+counts and dates, measured from that red-team workflow's repository memory and
+the firewall fix it led to (its attack diagram is a simplified illustration),
+the Semantic
+clustering slide's functions, files and counts from one Semantic Function
+Refactoring report (7 May 2026) and the merged pull request that closed it, and the three data slides after the finale: "First
+commit to GA", which shows this repository's measured public history from its
+first commit to general availability at GitHub Universe, and "How PRs land",
+which shows measured time-to-merge and lines-changed distributions of its
+merged pull requests, and "How workflows evolve", which shows a statistical
+study of the commits that changed its own workflow Markdown. All say so in their speaker notes.
+Use role icons rather than employee profiles. The only exceptions are the
+local avatars of `pelikhan`, `lpcox`, `dsyme`, `mnkiefer`, and `ievangelist` in `public/cracktro/assets/avatars/`.
+Keep private repository
+references, source commit identifiers, and internal attributions out of the
+public assets. Speaker notes and source comments are public too.
+The workflow illustration, avatars, and fonts are local.
+Mona Sans reuses `public/fonts/`; Monaspace Neon and its SIL Open Font License
+are in `public/cracktro/fonts/`.
+
+## Homepage slideshow
+
+On desktop, select the presentation icon in the homepage header to present the
+landing page as an eleven-slide deck. The security trifecta and its six
+defence layers, and the cost dashboard and budget guardrails, have separate
+slides. The slideshow runtime, drawing tools, and
+snippet expansion JavaScript are loaded on demand on the first click, not
+when browsing the page. Slides fill the window edge to edge and retain their
+interactive examples. Use the previous/next buttons, arrow keys or Page Up/Page
+Down to navigate, Home/End to jump to the first/last slide, and Escape or the
+close button to return to the page. Keyboard controls inside demos keep their
+normal behavior. The presentation icon is hidden below the desktop menu breakpoint
+(50rem), and resizing to mobile exits the slideshow.
+Supported browsers slide the full frame left or right with CSS View Transitions;
+headings, text, list items, and demo blocks fade and rise into place in reading
+order. Each entrance sequence finishes within one second, including the frame
+transition, and replays when revisiting a slide. Decorative backgrounds stay
+stationary. Reduced-motion preferences disable both animations.
+The rounded, compact toolbar floats at the bottom center without reserving
+footer space. It rests at 65% opacity and becomes opaque on hover, keyboard
+focus, or while its drawing palette is open.
+Add `data-slideshow-hide` to any element to omit secondary content from the
+presentation without hiding it on the normal page. On a whole slide section,
+the attribute skips that slide and updates the navigation count. Guided-form
+notes, lengthy workflow descriptions, the extra workflow catalog, and the
+custom-engine footnote already use this annotation.
+When a demo tab is focused, Left/Right select tabs; Up/Down and Page Up/Page Down
+still navigate slides, and Tab/Shift+Tab leave the tablist.
+
+The pencil button opens drawing tools inspired by
+[Microsoft Streamer](https://github.com/microsoft/streamer): colored rectangles
+(hold Shift for squares), arrows, and emoji stamps. Click to stamp an emoji or
+drag to resize and rotate it. Select the pointer tool to interact with demos.
+Undo (also Ctrl/Cmd+Z) and clear apply to the current slide. Drawings stay with
+their slide while presenting and are cleared when exiting. Escape leaves
+drawing mode and clears all annotations without leaving the slide; a second
+Escape exits the presentation.
+Drawing instructions appear in the question-mark tooltip on hover or keyboard focus.
+
+Click a code snippet, prompt, or example output to expand it to a full-window
+view with larger type. Enter/Space also expand a focused snippet. The view
+zooms and fades smoothly (unless reduced motion is enabled); Escape or its
+close button returns focus to the snippet without changing slides.
+Code in the expanded view is editable as plain text for live demonstrations.
+Edits affect only the expanded copy and are discarded when it closes; opening
+the snippet again restores its original contents.
+
 ## ⚠️ Known Dev-Mode Limitations
 
-### Sitemap not available in dev mode
+### Sitemap behavior in dev and production
 
-The sitemap (`/gh-aw/sitemap-index.xml`) is **only generated during a production build** (`npm run build`). It is not available when running the local development server (`npm run dev`).
+The robots file references `/gh-aw/sitemap.xml`, which is the stable sitemap entrypoint for the docs site.
 
-If a CI pipeline or automated tool checks for the sitemap URL during a local preview, it will receive a 404 response. To verify the sitemap, run `npm run build` followed by `npm run preview`.
+During a production build (`npm run build`), Astro generates `/gh-aw/sitemap-index.xml`, and the static `/gh-aw/sitemap.xml` entrypoint points crawlers at that generated sitemap index. The generated sitemap index is not available when running the local development server (`npm run dev`).
+
+If a CI pipeline or automated tool checks the generated sitemap index URL during a local preview, it will receive a 404 response. To verify the production sitemap flow, run `npm run build` followed by `npm run preview`.
 
 ### Robots/AI discovery paths on GitHub Pages project sites
 

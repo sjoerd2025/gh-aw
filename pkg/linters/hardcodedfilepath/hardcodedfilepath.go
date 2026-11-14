@@ -20,9 +20,9 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
@@ -32,13 +32,7 @@ import (
 var pkgLog = logger.New("linters:hardcodedfilepath")
 
 // Analyzer is the hardcoded-file-path analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "hardcodedfilepath",
-	Doc:      "reports hard-coded file path string literals that should be replaced with named constants",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/hardcodedfilepath",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("hardcodedfilepath", "reports hard-coded file path string literals that should be replaced with named constants", run)
 
 // constRef holds a reference to a named path constant.
 type constRef struct {
@@ -159,7 +153,7 @@ func isLogOrPrintCall(pass *analysis.Pass, call *ast.CallExpr) bool {
 
 // collectKnownPathConsts builds a map from path string value to constRef by
 // scanning:
-//  1. All exported constants declared at package scope in pass.Pkg.
+//  1. All constants declared at package scope in pass.Pkg.
 //  2. All exported constants in directly imported packages whose import path
 //     contains "constants" (e.g. "github.com/example/pkg/constants").
 //
@@ -167,8 +161,8 @@ func isLogOrPrintCall(pass *analysis.Pass, call *ast.CallExpr) bool {
 func collectKnownPathConsts(pass *analysis.Pass) map[string]constRef {
 	out := make(map[string]constRef)
 
-	addConst := func(c *types.Const, alias, name string) {
-		if !c.Exported() {
+	addConst := func(c *types.Const, alias, name string, exportedOnly bool) {
+		if exportedOnly && !c.Exported() {
 			return
 		}
 		basic, ok := c.Type().Underlying().(*types.Basic)
@@ -186,7 +180,7 @@ func collectKnownPathConsts(pass *analysis.Pass) map[string]constRef {
 		}
 	}
 
-	// 1. Current package's own exported constants.
+	// 1. Current package's own constants.
 	scope := pass.Pkg.Scope()
 	for _, name := range scope.Names() {
 		obj := scope.Lookup(name)
@@ -194,7 +188,7 @@ func collectKnownPathConsts(pass *analysis.Pass) map[string]constRef {
 		if !ok {
 			continue
 		}
-		addConst(c, "", name)
+		addConst(c, "", name, false)
 	}
 
 	// 2. Imported "constants" packages.
@@ -209,7 +203,7 @@ func collectKnownPathConsts(pass *analysis.Pass) map[string]constRef {
 			if !ok {
 				continue
 			}
-			addConst(c, alias, name)
+			addConst(c, alias, name, true)
 		}
 	}
 
@@ -241,11 +235,8 @@ func run(pass *analysis.Pass) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}

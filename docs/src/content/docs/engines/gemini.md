@@ -1,50 +1,56 @@
 ---
-title: Run Google Gemini in GitHub Actions with gh-aw
-description: Configure gh-aw to run Google Gemini in GitHub Actions with Markdown workflows, GitHub triggers, and safe outputs.
+title: Using Gemini CLI with GitHub Agentic Workflows
+description: Authenticate Gemini CLI and run your first GitHub Agentic Workflow.
 ---
 
-Google Gemini is Google's model family for coding and repository analysis. gh-aw runs Gemini inside GitHub Actions from a Markdown workflow and adds GitHub event triggers, sandboxing controls, and safe outputs so automated repository work can stay constrained and reviewable.
+Run Gemini CLI workflows with a Gemini API key or Google Workload Identity Federation (WIF).
 
-## Setup
+## Connect your account
 
-Set `engine: gemini` and provide `GEMINI_API_KEY`, or configure keyless authentication with Google Workload Identity Federation. See [Gemini authentication](/gh-aw/reference/auth/#gemini_api_key) for the available setup paths.
+> [!NOTE]
+> Gemini is deprecated but remains supported. Experimental [Agy](/gh-aw/engines/agy/) supports a narrower API-key-only setup; keep Gemini for WIF or command-level shell restrictions.
+
+Set `engine: gemini` and add a [`GEMINI_API_KEY`](/gh-aw/reference/auth/#gemini_api_key) repository secret, or configure [Google WIF](/gh-aw/reference/auth/#google-workload-identity-federation-wif).
+
+The example grants Copilot access for safe-output threat detection, which uses Copilot rather than Gemini. Supply Copilot authentication or [configure a different detection engine](/gh-aw/reference/threat-detection/).
+
+## Run a daily report
+
+After [setting up gh-aw](/gh-aw/setup/quick-start/), save this workflow:
 
 ```aw wrap title=".github/workflows/daily-status.md"
 ---
 on:
+  workflow_dispatch:
   schedule: daily
-
 permissions:
   contents: read
   issues: read
   pull-requests: read
-
+  copilot-requests: write
 engine: gemini
-
+tools:
+  github:
+    toolsets: [issues, pull_requests]
 safe-outputs:
   create-issue:
     title-prefix: "[status] "
-    labels: [report]
-    close-older-issues: true
 ---
 
-# Daily Repository Status
+# Daily repository status
 
-Analyze the repository and create a concise daily status report covering:
-- Open issues and their priority
-- Recent PR activity
-- Upcoming work items
+Summarize open issues and recent pull request activity in one concise issue.
 ```
 
-## When to choose gh-aw vs. running Gemini directly in Actions
+Compile with `gh aw compile daily-status`, then commit and push both the Markdown and generated lock file. Run it from the repository's Actions tab or wait for its schedule.
 
-Choose gh-aw when the workflow should be authored in Markdown, share one structure across engines, and restrict GitHub writes to validated safe outputs. Run Gemini directly in Actions when the job needs a custom script pipeline and all security and review controls are managed manually.
+## Capabilities and limitations
 
-## Related pages
+Gemini supports command-level shell restrictions, but not native web search; use an [MCP search server](/gh-aw/reference/web-search/). See the [Gemini reference](/gh-aw/reference/engines/gemini/) for configuration and limitations.
 
-- [Quick start](/gh-aw/setup/quick-start/)
-- [Engine reference](/gh-aw/reference/engines/)
-- [AI issue triage](/gh-aw/guides/ai-issue-triage/)
-- [Automated AI pull request review](/gh-aw/guides/automated-pr-review/)
-- [AI-generated release notes and reports](/gh-aw/guides/ai-release-notes/)
-- [Keeping documentation up to date automatically](/gh-aw/guides/docs-automation/)
+## Next steps
+
+- [Gemini CLI technical reference](/gh-aw/reference/engines/gemini/)
+- [Create a workflow](/gh-aw/setup/creating-workflows/)
+- [Workflow examples](/gh-aw/gallery/)
+- [Compare engines](/gh-aw/reference/engines/#engine-feature-comparison)

@@ -828,12 +828,13 @@ describe("submit_pr_review multi-buffer (registry mode)", () => {
     expect(ctx2.pullRequestNumber).toBe(2);
   });
 
-  it("second call targeting the same PR is rejected with an error", async () => {
+  it.each([false, true])("second call targeting the same PR is rejected even after draining: %s", async drained => {
     const registry = createPrReviewBufferRegistry();
     const { main } = require("./submit_pr_review.cjs");
     const handler = await main({ max: 5, target: "*", _prReviewBufferRegistry: registry });
 
     const result1 = await handler({ body: "First call", event: "COMMENT", pull_request_number: 7 }, {});
+    if (drained) registry.drainEntries();
     const result2 = await handler({ body: "Second call", event: "APPROVE", pull_request_number: 7 }, {});
 
     expect(result1.success).toBe(true);
@@ -847,16 +848,30 @@ describe("submit_pr_review multi-buffer (registry mode)", () => {
     expect(entries[0].prNumber).toBe(7);
   });
 
-  it("returns success:false when target cannot be resolved in registry mode", async () => {
-    // workflow_dispatch with target:triggering => can't resolve PR
+  it("returns a skipped result when triggering target is outside PR context in registry mode", async () => {
+    // workflow_dispatch with target:triggering => soft skip because no PR context exists
     const registry = createPrReviewBufferRegistry();
     const { main } = require("./submit_pr_review.cjs");
     const handler = await main({ max: 1, target: "triggering", _prReviewBufferRegistry: registry });
 
     const result = await handler({ body: "Review", event: "COMMENT" }, {});
 
+    expect(result).toMatchObject({ success: false, skipped: true });
+    expect(result.error).toContain("not running in pull request context");
+    // Registry should be empty — nothing was buffered
+    expect(registry.getAllEntries()).toHaveLength(0);
+  });
+
+  it("returns a failure when target resolution has a hard error in registry mode", async () => {
+    const registry = createPrReviewBufferRegistry();
+    const { main } = require("./submit_pr_review.cjs");
+    const handler = await main({ max: 1, target: "*", _prReviewBufferRegistry: registry });
+
+    const result = await handler({ body: "Review", event: "COMMENT" }, {});
+
     expect(result.success).toBe(false);
-    expect(result.error).toBeTruthy();
+    expect(result.skipped).toBeUndefined();
+    expect(result.error).toContain('Target is "*"');
     // Registry should be empty — nothing was buffered
     expect(registry.getAllEntries()).toHaveLength(0);
   });

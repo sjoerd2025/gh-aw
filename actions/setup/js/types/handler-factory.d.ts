@@ -6,14 +6,24 @@
  * Contains handler-specific configuration from GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG
  */
 interface HandlerConfig {
+  /** Maximum issue artifacts per issue (default: 10); non-positive values disable artifacts. */
+  max_issue_artifacts?: number;
+  /** Compiled maximum UTF-8 bytes per issue artifact body (default: 1048576). */
+  max_issue_artifact_size?: number;
   /** Maximum number of items this handler should process */
   max?: number;
   /** Strict allowlist of glob patterns for files eligible for push/create. Checked independently of protected-files; both checks must pass. */
   allowed_files?: string[];
+  /** Required scoped destination branch patterns for merge_pull_request. */
+  allowed_base_branches?: string[];
   /** List of glob patterns for files to exclude from the patch using git :(exclude) pathspecs. Matching files are stripped by git at generation time and will not appear in the commit or be subject to allowed-files or protected-files checks. */
   excluded_files?: string[];
+  /** Exclude compiled .lock.yml files under .github/workflows from branch writes. */
+  exclude_lock_yml?: boolean;
   /** List of filenames (basenames) whose presence in a patch triggers protected-file handling */
   protected_files?: string[];
+  /** Repository-root path globs exempt from protected-file handling (not from allowed_files) */
+  protected_files_path_exclude?: string[];
   /** List of path prefixes that trigger protected-file handling when any changed file matches */
   protected_path_prefixes?: string[];
   /** When true (default), protect any top-level directory whose name starts with "." */
@@ -26,6 +36,8 @@ interface HandlerConfig {
   fallback_as_pull_request?: boolean;
   /** When false, skip GraphQL signed commits and push the local git history directly. */
   signed_commits?: boolean;
+  /** Explicit opt-in to potentially unbounded bundle prerequisite downloads. Defaults to false. */
+  allow_full_history_fetch?: boolean;
   /** Additional handler-specific configuration properties */
   [key: string]: any;
 }
@@ -48,6 +60,26 @@ interface ResolvedTemporaryIds {
 interface HandlerSuccessResult {
   /** Indicates the operation was successful */
   success: true;
+  /** Canonical resource URI returned by the backing API (absolute, not necessarily HTTP). Persisted with status:"success" only for applied results; never inferred from request inputs. */
+  url?: string;
+  /** True when the handler intentionally skipped/no-oped without applying a mutation */
+  skipped?: boolean;
+  /** True when processing is deferred; no successful resource outcome is persisted yet */
+  deferred?: boolean;
+  /** True when processing was cancelled; no successful resource outcome is persisted */
+  cancelled?: boolean;
+  /** True for a preview that did not apply an operation */
+  staged?: boolean;
+  /** True while buffering an operation whose manifest entry must wait for finalization */
+  deferred_manifest?: boolean;
+  /** Machine-readable summary-safe reason code */
+  reasonCode?: string;
+  /** Human-readable summary-safe reason */
+  reason?: string;
+  /** Summary-safe target metadata */
+  target?: { repo?: string; number?: number; url?: string };
+  /** Additional summary-safe diagnostic fields */
+  safeDetails?: Record<string, any>;
   /** Additional result properties (number, url, temporaryId, etc.) */
   [key: string]: any;
 }
@@ -59,9 +91,34 @@ interface HandlerErrorResult {
   /** Indicates the operation failed */
   success: false;
   /** Error message describing what went wrong */
-  error: string;
+  error?: string;
+  /** True when the handler intentionally skipped/no-oped without applying a mutation */
+  skipped?: boolean;
+  /** True when the handler deferred processing for a later retry */
+  deferred?: boolean;
+  /** True when processing was cancelled by policy or upstream failure */
+  cancelled?: boolean;
+  /** Machine-readable summary-safe reason code */
+  reasonCode?: string;
+  /** Human-readable summary-safe reason */
+  reason?: string;
+  /** Summary-safe target metadata */
+  target?: { repo?: string; number?: number; url?: string };
+  /** Additional summary-safe diagnostic fields */
+  safeDetails?: Record<string, any>;
   /** Additional result properties (skipped, etc.) */
   [key: string]: any;
+}
+
+interface HandlerIndeterminateResult extends HandlerErrorResult {
+  /** Processing failed to confirm the outcome; the operation may already have applied. */
+  success: false;
+  /** The mutation outcome is unknown. Verify live state before retrying. */
+  operation_outcome: "indeterminate";
+}
+
+interface MergePullRequestIndeterminateResult extends HandlerIndeterminateResult {
+  merged: null;
 }
 
 /**
@@ -89,4 +146,4 @@ type MessageHandlerFunction = (message: any, resolvedTemporaryIds: ResolvedTempo
  */
 type HandlerFactoryFunction = (config?: HandlerConfig) => Promise<MessageHandlerFunction>;
 
-export { HandlerConfig, ResolvedTemporaryIds, HandlerSuccessResult, HandlerErrorResult, HandlerResult, MessageHandlerFunction, HandlerFactoryFunction };
+export { HandlerConfig, ResolvedTemporaryIds, HandlerSuccessResult, HandlerErrorResult, HandlerIndeterminateResult, MergePullRequestIndeterminateResult, HandlerResult, MessageHandlerFunction, HandlerFactoryFunction };

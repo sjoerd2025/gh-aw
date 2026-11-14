@@ -8,23 +8,27 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
+  - shared/pr-safe-output-defaults.md
   - uses: shared/pr-review-base.md
     with:
       min-integrity: approved
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [pull_requests, repos, issues]
 safe-outputs:
   create-pull-request:
+    expires: false
     title-prefix: "[refiner] "
     labels: [automation, refine-improvements]
     reviewers: [copilot]
-    draft: false
   add-comment:
     max: 1
   messages:
@@ -37,9 +41,6 @@ concurrency:
   cancel-in-progress: true
 
 
-sandbox:
-  agent:
-    sudo: false
 evals:
   - id: pr_analyzed
     question: Did the agent analyze the pull request for code style alignment, security issues, and test improvements?

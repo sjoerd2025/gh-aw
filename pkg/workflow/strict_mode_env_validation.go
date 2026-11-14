@@ -6,6 +6,7 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -13,7 +14,36 @@ import (
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 )
+
+// Keep credential classification separate from named-secret extraction, which
+// also drives bindings for secrets but not github.token.
+func credentialExpressionsFromMap(values map[string]string) ([]string, error) {
+	result := make(map[string]struct{})
+	for _, key := range sliceutil.SortedKeys(values) {
+		value := values[key]
+		spans, err := actionslanguageservice.ExtractExpressions(value)
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", key, err)
+		}
+		for _, span := range spans {
+			expression, err := actionslanguageservice.ParseSyntax(span.Content)
+			if err != nil || expression == nil {
+				if err == nil {
+					err = errors.New("an expression was expected")
+				}
+				return nil, fmt.Errorf("%q: %w", key, err)
+			}
+			// Whole-context secrets serialization has its own validation pass.
+			if expressionUsesCredentialReference(expression, true) {
+				result[value[span.Start:span.End]] = struct{}{}
+			}
+		}
+	}
+	return sliceutil.SortedKeys(result), nil
+}
 
 // validateEnvSecrets detects secrets in the top-level env section and the engine.env section,
 // raising an error in strict mode or a warning in non-strict mode. Secrets in env will be
@@ -27,19 +57,47 @@ import (
 //
 // No other engine.env var is allowed to have secrets.
 func (c *Compiler) validateEnvSecrets(frontmatter map[string]any) error {
+	return c.validateEnvSecretsWithModels(frontmatter, BuiltinModelAliases())
+}
+
+func (c *Compiler) validateEarlyEnvSecrets(frontmatter map[string]any) error {
+	if frontmatterDeclaresImports(frontmatter) {
+		// Validate the full top-level env after imported values have been merged.
+		return nil
+	}
+	_, config, _ := c.ExtractEngineConfig(frontmatter)
+	if config != nil && len(config.FallbackModels) > 0 {
+		strictModeValidationLog.Printf("Fallback models configured (%d); deferring engine.env secret validation until imports are merged", len(config.FallbackModels))
+		// Provider aliases are not available until imports have been merged.
+		return c.validateEnvSecretsSection(frontmatter, "env", nil)
+	}
+	return c.validateEnvSecrets(frontmatter)
+}
+
+func (c *Compiler) validateEnvSecretsWithModels(frontmatter map[string]any, models map[string][]string) error {
 	// Check top-level env section (no allowed overrides here)
 	if err := c.validateEnvSecretsSection(frontmatter, "env", nil); err != nil {
 		return err
 	}
+	return c.validateEngineEnvSecretsWithModels(frontmatter, models)
+}
 
+func (c *Compiler) validateEngineEnvSecretsWithModels(frontmatter map[string]any, models map[string][]string) error {
 	// Check engine.env section when engine is in object format
 	if engineValue, exists := frontmatter["engine"]; exists {
 		if engineObj, ok := engineValue.(map[string]any); ok {
 			// Determine which env var keys may carry secrets: those that the engine itself
 			// requires (e.g. COPILOT_GITHUB_TOKEN for the copilot engine).
 			// The second return value is *EngineConfig (not an error); we only need the engine ID.
-			engineSetting, _, _ := c.ExtractEngineConfig(frontmatter)
+			engineSetting, engineConfig, model := c.ExtractEngineConfig(frontmatter)
 			allowedEnvVarKeys := c.getEngineBaseEnvVarKeys(engineSetting)
+			if engineConfig != nil && len(engineConfig.FallbackModels) > 0 {
+				data := &WorkflowData{EngineConfig: engineConfig, Model: model, ModelMappings: models}
+				strictModeValidationLog.Printf("Adding fallback provider secret keys to engine.env allowlist for engine=%s", engineSetting)
+				for _, name := range fallbackProviderSecretNames(data) {
+					allowedEnvVarKeys[name] = struct{}{}
+				}
+			}
 
 			if err := c.validateEnvSecretsSection(engineObj, "engine.env", allowedEnvVarKeys); err != nil {
 				return err
@@ -48,6 +106,28 @@ func (c *Compiler) validateEnvSecrets(frontmatter map[string]any) error {
 	}
 
 	return nil
+}
+
+func (c *Compiler) validateResolvedEngineEnvSecrets(ctx *workflowBuildContext) error {
+	return c.withEffectiveStrictMode(ctx.frontmatter.Frontmatter, func() error {
+		cfg := ctx.workflowData.EngineConfig
+		if frontmatterDeclaresImports(ctx.frontmatter.Frontmatter) || (cfg != nil && len(cfg.FallbackModels) > 0) {
+			// Top-level env was already checked before imports were merged.
+			if err := c.validateEngineEnvSecretsWithModels(ctx.frontmatter.Frontmatter, ctx.workflowData.ModelMappings); err != nil {
+				return err
+			}
+		}
+		if cfg != nil {
+			credentialRefs, err := credentialExpressionsFromMap(cfg.Env)
+			if err != nil {
+				return fmt.Errorf("invalid expression in 'engine.env' section: %w", err)
+			}
+			if c.strictMode && len(credentialRefs) > 0 && !awfSupportsExcludeEnv(getFirewallConfig(ctx.workflowData)) {
+				return fmt.Errorf("strict mode: secret configuration in 'engine.env' requires AWF %s or newer to keep secrets out of the agent container. Set sandbox.agent.version to %s or newer", constants.AWFExcludeEnvMinVersion, constants.AWFExcludeEnvMinVersion)
+			}
+		}
+		return nil
+	})
 }
 
 // getEngineBaseEnvVarKeys returns the set of env var key names that the named engine
@@ -116,20 +196,16 @@ func (c *Compiler) validateEnvSecretsSection(config map[string]any, sectionName 
 		}
 	}
 
-	// Extract secrets from env values
-	secrets := ExtractSecretsFromMap(envStrings)
-	if len(secrets) == 0 {
+	secretRefs, err := credentialExpressionsFromMap(envStrings)
+	if err != nil {
+		return fmt.Errorf("invalid expression in '%s' section: %w", sectionName, err)
+	}
+	if len(secretRefs) == 0 {
 		strictModeValidationLog.Printf("No secrets found in %s section", sectionName)
 		return nil
 	}
 
-	// Build list of secret references found
-	var secretRefs []string
-	for _, secretExpr := range secrets {
-		secretRefs = append(secretRefs, secretExpr)
-	}
-
-	strictModeValidationLog.Printf("Found %d secret(s) in %s section: %v", len(secrets), sectionName, secretRefs)
+	strictModeValidationLog.Printf("Found %d credential expression(s) in %s section: %v", len(secretRefs), sectionName, secretRefs)
 
 	// In strict mode, this is an error
 	if c.strictMode {
@@ -142,18 +218,20 @@ func (c *Compiler) validateEnvSecretsSection(config map[string]any, sectionName 
 		return fmt.Errorf("strict mode: secrets detected in '%s' section will be leaked to the agent container. Found: %s. Use engine-specific secret configuration instead. See: https://github.github.com/gh-aw/reference/engines/", sectionName, strings.Join(secretRefs, ", "))
 	}
 
-	// In non-strict mode, emit a warning
+	c.warnEnvSecrets(sectionName, secretRefs)
+	return nil
+}
+
+func (c *Compiler) warnEnvSecrets(sectionName string, secretRefs []string) {
 	var warningMsg string
 	if sectionName == "engine.env" {
 		// engine.env secrets are excluded from the agent sandbox via awf --exclude-env
 		// (requires AWF v0.25.3+). On older AWF versions this protection is not applied and
 		// the values will reach the agent container.
-		warningMsg = fmt.Sprintf("Warning: secrets detected in 'engine.env' section will be excluded from the agent sandbox via awf --exclude-env (requires AWF %s+); on older AWF versions the agent process will see these values. Found: %s. Consider using engine-specific secret configuration instead.", constants.AWFExcludeEnvMinVersion, strings.Join(secretRefs, ", "))
+		warningMsg = fmt.Sprintf("secrets detected in 'engine.env' section will be excluded from the agent sandbox via awf --exclude-env (requires AWF %s+); on older AWF versions the agent process will see these values. Found: %s. Consider using engine-specific secret configuration instead.", constants.AWFExcludeEnvMinVersion, strings.Join(secretRefs, ", "))
 	} else {
-		warningMsg = fmt.Sprintf("Warning: secrets detected in '%s' section will be leaked to the agent container. Found: %s. Consider using engine-specific secret configuration instead.", sectionName, strings.Join(secretRefs, ", "))
+		warningMsg = fmt.Sprintf("secrets detected in '%s' section will be leaked to the agent container. Found: %s. Consider using engine-specific secret configuration instead.", sectionName, strings.Join(secretRefs, ", "))
 	}
 	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warningMsg))
 	c.IncrementWarningCount()
-
-	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -21,6 +22,12 @@ var errRunStateCommitNotFound = errors.New("run-specific state commit not found"
 func ensureEvalsResultsFromBranch(ctx context.Context, run WorkflowRun, runDir, owner, repo, hostname string, verbose bool) bool {
 	if runHasEvals(runDir, verbose) {
 		return true
+	}
+	// A not-evaluated run publishes no answers to the evals branch; do not look up
+	// branch history that could only belong to other runs.
+	if marker := findEvalsNotEvaluatedStatusFile(runDir); marker != "" {
+		logsOrchestratorLog.Printf("Skipping evals branch fallback for run %d: evals were not evaluated (%s)", run.DatabaseID, marker)
+		return false
 	}
 
 	repoOverride, host := resolveRepoOverrideForRun(run, owner, repo, hostname)
@@ -41,7 +48,7 @@ func ensureEvalsResultsFromBranch(ctx context.Context, run WorkflowRun, runDir, 
 		}
 		return false
 	}
-	decoded, err := readRemoteRepoBranchFileContext(ctx, repoOverride, refName, constants.EvalsResultFilename, host)
+	decoded, err := readRemoteRepoBranchFileContext(ctx, repoOverride, refName, constants.EvalsResultFilename.String(), host)
 	if err != nil {
 		if !isRemoteFileNotFound(err) {
 			logsOrchestratorLog.Printf("Failed to fetch evals branch file for run %d: branch=%s ref=%s repo=%s err=%v", run.DatabaseID, branchName, refName, repoOverride, err)
@@ -54,7 +61,7 @@ func ensureEvalsResultsFromBranch(ctx context.Context, run WorkflowRun, runDir, 
 		return false
 	}
 
-	dest := filepath.Join(runDir, constants.EvalsResultFilename)
+	dest := filepath.Join(runDir, constants.EvalsResultFilename.String())
 	if writeErr := os.WriteFile(dest, decoded, constants.FilePermPublic); writeErr != nil {
 		logsOrchestratorLog.Printf("Failed to write evals branch file for run %d: %v", run.DatabaseID, writeErr)
 		return false
@@ -91,9 +98,6 @@ func resolveRepoOverrideForRun(run WorkflowRun, owner, repo, hostname string) (s
 	}
 	if runOwner == "" || runRepo == "" {
 		return "", runHost
-	}
-	if runHost == "" {
-		runHost = "github.com"
 	}
 	return fmt.Sprintf("%s/%s", runOwner, runRepo), runHost
 }
@@ -132,16 +136,15 @@ func resolveRunStateBranchRef(ctx context.Context, repoOverride, branchName stri
 	const perPage = 100
 	const maxPages = 10
 	for page := 1; page <= maxPages; page++ {
-		endpoint := fmt.Sprintf("repos/%s/commits?sha=%s&per_page=%d&page=%d", repoOverride, url.QueryEscape(branchName), perPage, page)
-		args := []string{"api", "--method", "GET"}
-		if hostname != "" && hostname != "github.com" {
-			args = append(args, "--hostname", hostname)
+		endpoint := fmt.Sprintf("commits?sha=%s&per_page=%d&page=%d", url.QueryEscape(branchName), perPage, page)
+		args, err := repositoryAPIArgs(repoOverride, hostname, endpoint, "--method", "GET")
+		if err != nil {
+			return "", fmt.Errorf("invalid state branch endpoint: %w", err)
 		}
-		args = append(args, endpoint)
 		cmd := workflow.ExecGHContext(ctx, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			if isRemoteFileNotFoundOutput(string(out)) {
+			if errorutil.IsNotFoundOutput(string(out)) {
 				return "", os.ErrNotExist
 			}
 			return "", fmt.Errorf("failed to list commits for state branch %s: %w", branchName, err)

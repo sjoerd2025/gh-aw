@@ -3,9 +3,13 @@
 package workflow
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -156,7 +160,7 @@ func TestGenerateDefaultCheckoutStep(t *testing.T) {
 		})
 		lines := cm.GenerateDefaultCheckoutStep(false, "", getPin)
 		combined := strings.Join(lines, "")
-		assert.Contains(t, combined, "ref: develop", "should include ref override")
+		assert.Contains(t, combined, "ref: \"develop\"", "should include ref override")
 	})
 
 	t.Run("trial mode overrides user config", func(t *testing.T) {
@@ -334,7 +338,7 @@ func TestGenerateAdditionalCheckoutSteps(t *testing.T) {
 		combined := strings.Join(lines, "")
 		assert.Contains(t, combined, "repository: owner/libs", "should include repo")
 		assert.Contains(t, combined, "path: ./libs/owner-libs", "should include path")
-		assert.Contains(t, combined, "ref: main", "should include ref")
+		assert.Contains(t, combined, "ref: \"main\"", "should include ref")
 		assert.Contains(t, combined, "persist-credentials: false", "must always have persist-credentials: false")
 	})
 
@@ -418,6 +422,19 @@ func TestParseCheckoutConfigs(t *testing.T) {
 		assert.Equal(t, "${{ secrets.MY_TOKEN }}", configs[0].GitHubToken, "github-token should be set")
 		require.NotNil(t, configs[0].FetchDepth, "fetch-depth should be set")
 		assert.Equal(t, 0, *configs[0].FetchDepth, "fetch-depth should be 0")
+	})
+
+	t.Run("pull-request false disables generated PR checkout", func(t *testing.T) {
+		configs, err := ParseCheckoutConfigs(map[string]any{"pull-request": false})
+		require.NoError(t, err)
+		require.Len(t, configs, 1)
+		require.NotNil(t, configs[0].PullRequest)
+		assert.False(t, *configs[0].PullRequest)
+	})
+
+	t.Run("pull-request must be a boolean", func(t *testing.T) {
+		_, err := ParseCheckoutConfigs(map[string]any{"pull-request": "false"})
+		require.ErrorContains(t, err, "checkout.pull-request must be a boolean")
 	})
 
 	t.Run("negative fetch-depth returns error", func(t *testing.T) {
@@ -730,18 +747,17 @@ func TestBuildCheckoutsPromptContent(t *testing.T) {
 		content := buildCheckoutsPromptContent([]*CheckoutConfig{
 			{},
 		})
-		assert.Contains(t, content, "$GITHUB_WORKSPACE", "should show full workspace path for root checkout")
+		assert.Contains(t, content, "${{ github.workspace }}", "should resolve the full workspace path for root checkout at runtime")
 		assert.Contains(t, content, "(cwd)", "root checkout should be marked as cwd")
 		assert.Contains(t, content, "${{ github.repository }}", "should reference github.repository expression for default checkout")
 	})
 
-	t.Run("checkout with explicit repo shows full path", func(t *testing.T) {
+	t.Run("nested checkout of host repo shows runtime-resolved absolute path", func(t *testing.T) {
 		content := buildCheckoutsPromptContent([]*CheckoutConfig{
-			{Repository: "owner/target", Path: "./target"},
+			{Repository: "myorg/myrepo", Path: "myrepo"},
 		})
-		assert.Contains(t, content, "repo `owner/target` → `$GITHUB_WORKSPACE/target`", "should present checkout as repo-to-directory mapping")
-		assert.Contains(t, content, "$GITHUB_WORKSPACE/target", "should show full workspace path")
-		assert.Contains(t, content, "owner/target", "should show the configured repo")
+		assert.Contains(t, content, "repo `myorg/myrepo` → `${{ github.workspace }}/myrepo`", "should present the nested self-repository checkout with a runtime-resolved absolute path")
+		assert.Contains(t, content, "myorg/myrepo", "should show the configured repo")
 		assert.NotContains(t, content, "github.repository", "should not include github.repository expression for explicit repo")
 		assert.NotContains(t, content, "(cwd)", "non-root checkout should not be marked as cwd")
 	})
@@ -767,11 +783,11 @@ func TestBuildCheckoutsPromptContent(t *testing.T) {
 			{Repository: "owner/target", Path: "./target", Current: true},
 			{Repository: "owner/libs", Path: "./libs"},
 		})
-		assert.Contains(t, content, "$GITHUB_WORKSPACE", "should include workspace root for root checkout")
+		assert.Contains(t, content, "${{ github.workspace }}", "should include workspace root for root checkout")
 		assert.Contains(t, content, "(cwd)", "root checkout should be marked as cwd")
-		assert.Contains(t, content, "$GITHUB_WORKSPACE/target", "should include full path for target checkout")
+		assert.Contains(t, content, "${{ github.workspace }}/target", "should include full path for target checkout")
 		assert.Contains(t, content, "owner/target", "should include target repo")
-		assert.Contains(t, content, "$GITHUB_WORKSPACE/libs", "should include full path for libs checkout")
+		assert.Contains(t, content, "${{ github.workspace }}/libs", "should include full path for libs checkout")
 		assert.Contains(t, content, "owner/libs", "should include libs repo")
 		assert.Contains(t, content, "**current**", "current checkout should be marked")
 	})
@@ -819,6 +835,8 @@ func TestBuildCheckoutsPromptContent(t *testing.T) {
 		content := buildCheckoutsPromptContent([]*CheckoutConfig{
 			{Repository: "owner/repo"},
 		})
+		assert.Contains(t, content, "separate shallow, credential-free checkout", "should distinguish the workspace root from configured checkouts")
+		assert.Contains(t, content, "confirm your working directory matches that path", "should require checking the working directory first")
 		assert.Contains(t, content, "has NOT been checked out", "should mention branches that are not checked out")
 		assert.Contains(t, content, "fetch:", "should mention the fetch option for resolution")
 	})
@@ -1005,13 +1023,29 @@ func TestGenerateFetchStep(t *testing.T) {
 		assert.NotContains(t, got, "-C ", "root checkout should not use -C flag")
 	})
 
-	t.Run("multiple refspecs in single command", func(t *testing.T) {
+	t.Run("multiple refspecs are checked and fetched independently", func(t *testing.T) {
 		entry := &resolvedCheckout{
 			fetchRefs: []string{"*", "refs/pulls/open/*"},
 		}
 		got := generateFetchStepLines(entry, 0)
 		assert.Contains(t, got, "+refs/heads/*:refs/remotes/origin/*", "should include branches refspec")
 		assert.Contains(t, got, "+refs/pull/*/head:refs/remotes/origin/pull/*/head", "should include PR refspec")
+		assert.Contains(t, got, `for refspec in "${refspecs[@]}"; do`)
+		assert.Contains(t, got, `ls-remote --exit-code origin "$source_ref"`)
+		assert.Contains(t, got, `case "$remote_ref" in ($source_ref)`, "balanced patterns must parse inside command substitution on Bash 3.2")
+		assert.Contains(t, got, `fetch origin --depth=1 "$refspec"`)
+		assert.Contains(t, got, `if [ "$status" -ne 2 ]; then exit "$status"; fi`)
+	})
+
+	t.Run("expression refspecs are passed as environment data", func(t *testing.T) {
+		got := generateFetchStepLines(&resolvedCheckout{
+			fetchRefs: []string{"main", "${{ github.head_ref }}"},
+		}, 0)
+		assert.Contains(t, got, `GH_AW_FETCH_REFSPEC_1: "+refs/heads/${{ github.head_ref }}:refs/remotes/origin/${{ github.head_ref }}"`)
+		assert.Contains(t, got, `"$GH_AW_FETCH_REFSPEC_1"`)
+		_, run, ok := strings.Cut(got, "        run: |\n")
+		require.True(t, ok)
+		assert.NotContains(t, run, "${{ github.head_ref }}")
 	})
 
 	t.Run("default depth adds --depth=1 to prevent full-history fetch", func(t *testing.T) {
@@ -1052,6 +1086,121 @@ func TestGenerateFetchStep(t *testing.T) {
 		got := generateFetchStepLines(entry, 0)
 		assert.Contains(t, got, "--depth=10", "fetch-depth: 10 should pass --depth=10 to git fetch")
 	})
+}
+
+func TestGenerateFetchStepSyntax(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		refs []string
+	}{
+		{name: "single glob", refs: []string{"*"}},
+		{name: "single branch", refs: []string{"main"}},
+		{name: "mixed refs", refs: []string{"main", "feature/*", "refs/pulls/open/*"}},
+		{name: "expression", refs: []string{"${{ github.head_ref }}"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var steps []struct {
+				Run string `yaml:"run"`
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(generateFetchStepLines(&resolvedCheckout{fetchRefs: tc.refs}, 0)), &steps))
+			require.Len(t, steps, 1)
+			for _, check := range []struct {
+				name string
+				args []string
+			}{
+				{name: "bash", args: []string{"-n"}},
+				{name: "shellcheck", args: []string{"-s", "bash", "-"}},
+			} {
+				t.Run(check.name, func(t *testing.T) {
+					if _, err := exec.LookPath(check.name); err != nil {
+						t.Skipf("%s is not installed", check.name)
+					}
+					cmd := exec.Command(check.name, check.args...)
+					cmd.Stdin = strings.NewReader(steps[0].Run)
+					output, err := cmd.CombinedOutput()
+					require.NoError(t, err, "generated fetch step must pass %s:\n%s", check.name, output)
+				})
+			}
+		})
+	}
+}
+
+func TestGenerateFetchStepExecution(t *testing.T) {
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, "git %v: %s", args, output)
+		return strings.TrimSpace(string(output))
+	}
+	origin := t.TempDir()
+	git(origin, "init", "--initial-branch=main")
+	git(origin, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "initial")
+	git(origin, "branch", "feature/present")
+	git(origin, "branch", "prefix/refs/heads/missing")
+	git(origin, "branch", "prefix/refs/heads/missing-glob/present")
+	git(origin, "update-ref", "refs/other/refs/pull/2/head", "HEAD")
+	git(origin, "update-ref", "refs/pull/1/head", "HEAD")
+	commit := git(origin, "rev-parse", "HEAD")
+
+	for _, tc := range []struct {
+		name       string
+		refs       []string
+		want       []string
+		expression string
+		failure    bool
+	}{
+		{name: "absent branch", refs: []string{"missing"}},
+		{name: "absent glob", refs: []string{"missing/*"}},
+		{name: "mixed explicit branches", refs: []string{"missing", "main", "feature/present", "also-missing"}, want: []string{"main", "feature/present"}},
+		{name: "mixed globs", refs: []string{"missing/*", "feature/*"}, want: []string{"feature/present"}},
+		{name: "suffix collision glob", refs: []string{"missing-glob/*", "main"}, want: []string{"main"}},
+		{name: "all branches", refs: []string{"*"}, want: []string{"main", "feature/present", "prefix/refs/heads/missing", "prefix/refs/heads/missing-glob/present"}},
+		{name: "pull refs", refs: []string{"missing/*", "refs/pulls/open/*"}, want: []string{"pull/1/head"}},
+		{name: "unavailable remote", refs: []string{"missing", "main"}, failure: true},
+		{name: "expression command substitution", refs: []string{"${{ github.head_ref }}", "main"}, expression: "feature/$(touch${IFS}PWNED)", want: []string{"feature/$(touch${IFS}PWNED)", "main"}},
+		{name: "expression backticks and quotes", refs: []string{"${{ github.head_ref }}"}, expression: "feature/`touch${IFS}PWNED`\"'", want: []string{"feature/`touch${IFS}PWNED`\"'"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.expression != "" {
+				git(origin, "branch", tc.expression)
+			}
+			dir := t.TempDir()
+			git(dir, "init")
+			remote := origin
+			if tc.failure {
+				remote = filepath.Join(dir, "nonexistent")
+			}
+			git(dir, "remote", "add", "origin", "file://"+remote)
+			var steps []struct {
+				Run string            `yaml:"run"`
+				Env map[string]string `yaml:"env"`
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(generateFetchStepLines(&resolvedCheckout{fetchRefs: tc.refs}, 0)), &steps))
+			require.Len(t, steps, 1)
+			cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", steps[0].Run)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(), "GH_AW_FETCH_TOKEN=")
+			for key, value := range steps[0].Env {
+				if key != "GH_AW_FETCH_TOKEN" {
+					cmd.Env = append(cmd.Env, key+"="+strings.ReplaceAll(value, "${{ github.head_ref }}", tc.expression))
+				}
+			}
+			output, err := cmd.CombinedOutput()
+			if tc.failure {
+				require.Error(t, err, "%s", output)
+				return
+			}
+			require.NoError(t, err, "%s", output)
+			assert.NoFileExists(t, filepath.Join(dir, "PWNED"))
+			for _, ref := range tc.want {
+				assert.Equal(t, commit, git(dir, "rev-parse", "refs/remotes/origin/"+ref))
+			}
+			fetched := git(dir, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/")
+			assert.Len(t, strings.Fields(fetched), len(tc.want))
+		})
+	}
 }
 
 // TestCheckoutManagerFetchMerging verifies that fetch refs are merged correctly.
@@ -1692,106 +1841,5 @@ func TestGenerateCheckoutManifestStep(t *testing.T) {
 		steps := cm.GenerateCheckoutManifestStep(getActionPin)
 		require.Len(t, steps, 1)
 		assert.Contains(t, steps[0], "GH_AW_CHECKOUT_TOKEN_0: ${{ steps.checkout-app-token-1.outputs.token }}")
-	})
-}
-
-// TestGenerateConfigureGitCredentialsSteps verifies that the "Configure Git credentials"
-// step never inlines GitHub Actions expressions directly into the shell run: block.
-// Regression test for: compiler inlines workflow_dispatch input into generated step,
-// tripping the template-injection scanner for target-repo workflows.
-func TestGenerateConfigureGitCredentialsSteps(t *testing.T) {
-	alwaysTrue := BuildBooleanLiteral(true)
-	token := "${{ steps.safe-outputs-app-token.outputs.token }}"
-
-	t.Run("single root repo emits simple script call (no multi-repo env vars)", func(t *testing.T) {
-		cm := NewCheckoutManager(nil)
-		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
-		combined := strings.Join(steps, "")
-
-		assert.Contains(t, combined, "name: Configure Git credentials")
-		assert.Contains(t, combined, "GITHUB_REPOSITORY: ${{ github.repository }}")
-		assert.Contains(t, combined, "GIT_TOKEN: "+token)
-		assert.Contains(t, combined, `run: bash "${RUNNER_TEMP}/gh-aw/actions/configure_git_credentials.sh"`)
-		assert.NotContains(t, combined, "GH_AW_SUBREPO_", "single-repo case must not emit subrepo env vars")
-	})
-
-	t.Run("multi-repo with literal repo name places it in env var", func(t *testing.T) {
-		cm := NewCheckoutManager([]*CheckoutConfig{
-			{Repository: "org/other-repo", Path: "./target-repo"},
-		})
-		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
-		combined := strings.Join(steps, "")
-
-		assert.Contains(t, combined, `GH_AW_SUBREPO_0: "org/other-repo"`, "literal repo must be in env var (quoted)")
-		assert.Contains(t, combined, "${GH_AW_SUBREPO_0}.git", "shell command must reference the env var")
-		assert.NotContains(t, combined, "org/other-repo.git", "literal repo must not be inlined in shell command")
-		assert.Contains(t, combined, "GITHUB_REPOSITORY:", "root repo env var must be present")
-		assert.Contains(t, combined, "GIT_TOKEN: "+token, "token env var must be present")
-	})
-
-	t.Run("multi-repo with expression-based repo does not inline expression in shell command (regression)", func(t *testing.T) {
-		// Regression: v0.80.6 inlined the expression directly into the git remote set-url
-		// command, which the template-injection scanner correctly rejected.
-		cm := NewCheckoutManager([]*CheckoutConfig{
-			{Repository: "github/${{ github.event.inputs.target_repo }}", Path: "./target-repo"},
-		})
-		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
-		combined := strings.Join(steps, "")
-
-		// Expression must be in the env: block, not inlined in the shell command.
-		assert.Contains(t, combined, "GH_AW_SUBREPO_0: github/${{ github.event.inputs.target_repo }}",
-			"expression-based repo must be assigned to an env var")
-		assert.Contains(t, combined, "${GH_AW_SUBREPO_0}.git",
-			"shell command must reference env var, not the raw expression")
-		assert.NotContains(t, combined, "github/${{ github.event.inputs.target_repo }}.git",
-			"expression must not be inlined in the git remote set-url command (template injection risk)")
-		// The bash comment must use the path, not the expression-based repo name.
-		assert.Contains(t, combined, "# Re-authenticate git for ./target-repo",
-			"comment must reference checkout path, never the raw expression")
-		assert.NotContains(t, combined, "# Re-authenticate git for github/${{",
-			"expression must not appear in bash comment (template injection risk)")
-		assert.Contains(t, combined, "GITHUB_REPOSITORY:", "root repo env var must be present")
-		assert.Contains(t, combined, "GIT_TOKEN: "+token, "token env var must be present")
-		// No raw Actions expression may appear in the run: block.
-		runIdx := strings.Index(combined, "run: |")
-		if runIdx >= 0 {
-			assert.NotContains(t, combined[runIdx:], "${{",
-				"run: block must not contain any raw GitHub Actions expression")
-		}
-	})
-
-	t.Run("multi-repo with expression-based path routes path through env var", func(t *testing.T) {
-		cm := NewCheckoutManager([]*CheckoutConfig{
-			{Repository: "org/other-repo", Path: "${{ github.event.inputs.target_path }}"},
-		})
-		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
-		combined := strings.Join(steps, "")
-
-		assert.Contains(t, combined, "GH_AW_SUBREPO_PATH_0: ${{ github.event.inputs.target_path }}",
-			"expression-based path must be assigned to an env var")
-		assert.Contains(t, combined, "${GH_AW_SUBREPO_PATH_0}",
-			"git -C argument must reference the path env var, not the raw expression")
-		assert.NotContains(t, combined, `git -C "${{ github.event.inputs.target_path }}"`,
-			"expression path must not be inlined in git -C argument (template injection risk)")
-		// No raw Actions expression may appear in the run: block.
-		runIdx := strings.Index(combined, "run: |")
-		if runIdx >= 0 {
-			assert.NotContains(t, combined[runIdx:], "${{",
-				"run: block must not contain any raw GitHub Actions expression")
-		}
-	})
-
-	t.Run("multiple sub-repos each get a unique env var", func(t *testing.T) {
-		cm := NewCheckoutManager([]*CheckoutConfig{
-			{Repository: "org/repo-a", Path: "./repo-a"},
-			{Repository: "org/repo-b", Path: "./repo-b"},
-		})
-		steps := cm.GenerateConfigureGitCredentialsSteps(token, alwaysTrue)
-		combined := strings.Join(steps, "")
-
-		assert.Contains(t, combined, `GH_AW_SUBREPO_0: "org/repo-a"`)
-		assert.Contains(t, combined, `GH_AW_SUBREPO_1: "org/repo-b"`)
-		assert.Contains(t, combined, `${GH_AW_SUBREPO_0}.git`)
-		assert.Contains(t, combined, `${GH_AW_SUBREPO_1}.git`)
 	})
 }

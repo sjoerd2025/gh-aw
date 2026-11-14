@@ -74,10 +74,24 @@ type InlineSkill struct {
 
 var inlineSkillSeparatorRegex = regexp.MustCompile("(?m)^##[ \t]+skill:[ \t]+`([a-z][a-z0-9_-]*)`[ \t]*$")
 
+// inlineSkillBoundaryRegex is applied to a substring that starts at an implicit
+// H2 boundary. Keep it start-anchored without multiline mode or capture groups
+// so it only recognizes a skill marker exactly at that boundary.
+var inlineSkillBoundaryRegex = regexp.MustCompile("^##[ \t]+skill:[ \t]+`[a-z][a-z0-9_-]*`[ \t]*(?:\n|$)")
+
+// inlineSkillEndRegex matches the optional explicit end marker for an inline
+// skill block: "## end skill: `name`". It mirrors the start marker's name
+// rules. When present, it closes the skill block exactly at that heading
+// instead of at the next H2 heading or EOF.
+var inlineSkillEndRegex = regexp.MustCompile("(?m)^##[ \t]+end[ \t]+skill:[ \t]+`([a-z][a-z0-9_-]*)`[ \t]*$")
+
 func ExtractInlineSkills(markdown string) (mainMarkdown string, skills []InlineSkill, err error) {
 	inlineSkillLog.Printf("Extracting inline skills from markdown (length: %d)", len(markdown))
 	allStarts := inlineSkillSeparatorRegex.FindAllStringSubmatchIndex(markdown, -1)
 	if len(allStarts) == 0 {
+		if err := validateNoInlineSectionEndMarkers(markdown, inlineSkillEndRegex); err != nil {
+			return "", nil, fmt.Errorf("inline skill end marker should reference a valid skill name: %w", err)
+		}
 		inlineSkillLog.Print("No inline skill markers found")
 		return markdown, nil, nil
 	}
@@ -87,10 +101,13 @@ func ExtractInlineSkills(markdown string) (mainMarkdown string, skills []InlineS
 		return "", nil, err
 	}
 
-	mainMarkdown, skills = extractInlineSections(markdown, allStarts, func(name, content string) InlineSkill {
+	mainMarkdown, skills, err = extractInlineSections(markdown, allStarts, inlineSkillEndRegex, subAgentBoundaryRegex, func(name, content string) InlineSkill {
 		inlineSkillLog.Printf("Extracted inline skill %q (content length: %d)", name, len(content))
 		return InlineSkill{Name: name, Content: content}
 	})
+	if err != nil {
+		return "", nil, fmt.Errorf("inline skill end marker should reference a valid skill name: %w", err)
+	}
 	inlineSkillLog.Printf("Extraction complete: %d skill(s), main markdown length: %d", len(skills), len(mainMarkdown))
 	return mainMarkdown, skills, nil
 }
@@ -98,6 +115,11 @@ func ExtractInlineSkills(markdown string) (mainMarkdown string, skills []InlineS
 func validateUniqueInlineSkillNames(markdown string, allStarts [][]int) error {
 	return validateUniqueInlineSectionNames(markdown, allStarts, func(name string) error {
 		inlineSkillLog.Printf("Duplicate inline skill name: %q", name)
-		return fmt.Errorf("duplicate inline skill name %q", name)
+		return NewValidationError(
+			"skills",
+			name,
+			"duplicate name already defined",
+			fmt.Sprintf("Rename one of the duplicate skills or remove the extra `%s` definition.", name),
+		)
 	})
 }

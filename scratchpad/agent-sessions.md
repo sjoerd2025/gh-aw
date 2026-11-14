@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document outlines the plan to migrate from the old terminology "agent session" to the new terminology "agent session" throughout the GitHub Agentic Workflows codebase.
+This document outlines the plan to migrate from the old terminology "agent task" to the new terminology "agent session" throughout the GitHub Agentic Workflows codebase.
 
 **Status**: Planning Phase  
 **Target**: Complete terminology update to "agent session"  
@@ -397,7 +397,7 @@ This is a **breaking change** for users with existing workflows using `create-ag
 1. **Changeset**: Create changeset with `BREAKING CHANGE` prefix
 2. **Release Notes**: Clearly document the migration path
 3. **Migration Guide**: Link to codemod usage in docs
-4. **Deprecation Warning**: Emit clear warning when old key is used
+4. **Deprecation Warning**: Emit an explicit warning when the old key is used
 
 ### Testing Priority
 

@@ -55,10 +55,7 @@ function globPatternToRegex(pattern, options) {
 
   if (pathMode) {
     // Path mode: handle ** and * differently
-    regexPattern = regexPattern
-      .replace(/\*\*/g, "<!DOUBLESTAR>") // Temporarily replace **
-      .replace(/\*/g, "[^/]*") // Single * matches non-slash chars
-      .replace(/<!DOUBLESTAR>/g, ".*"); // ** matches everything including /
+    regexPattern = regexPattern.replace(/\*\*|\*/g, wildcard => (wildcard === "**" ? ".*" : "[^/]*"));
   } else {
     // Simple mode: * matches any character
     regexPattern = regexPattern.replace(/\*/g, ".*");
@@ -71,6 +68,7 @@ function globPatternToRegex(pattern, options) {
     regexPattern = `[^/]+/${regexPattern}`;
   }
 
+  // eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- regexPattern is intentionally built as a regex: * and ** are replaced with regex patterns after escaping all other metacharacters
   return new RegExp(`^${regexPattern}$`, caseSensitive ? "" : "i");
 }
 

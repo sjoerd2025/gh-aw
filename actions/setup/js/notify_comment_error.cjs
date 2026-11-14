@@ -3,16 +3,22 @@
 
 // This script updates an existing comment created by the activation job
 // to notify about the workflow completion status (success or failure).
-// It also processes noop messages and adds them to the activation comment.
+// It also adds the categorized, privacy-safe noop body to the activation comment.
 
 const { loadAgentOutput } = require("./load_agent_output.cjs");
-const { getRunSuccessMessage, getRunFailureMessage, getDetectionFailureMessage, getDetectionWarningMessage } = require("./messages_run_status.cjs");
+const { getRunSuccessMessage, getRunFailureMessage, getDetectionFailureBlocks, getDetectionWarningBlocks } = require("./messages_run_status.cjs");
 const { getMessages } = require("./messages_core.cjs");
 const { getErrorMessage, isLockedError } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { resolveTopLevelDiscussionCommentId } = require("./github_api_helpers.cjs");
+const { assembleReportBodyParts } = require("./markdown_body_helpers.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
+const { normalizeReportAllowedURL } = require("./report_ast.cjs");
+const { buildNoopConclusionSummary } = require("./conclusion_summary.cjs");
+const { generateHistoryUrl } = require("./generate_history_link.cjs");
 
 /**
  * Collect generated asset URLs from safe output jobs
@@ -115,8 +121,13 @@ async function main() {
   const agentConclusion = process.env.GH_AW_AGENT_CONCLUSION || "failure";
   const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION;
   const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
-  const assignToAgentErrorCount = parseInt(process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0", 10);
+  const assignToAgentErrorCount = Number(process.env.GH_AW_ASSIGNMENT_ERROR_COUNT || "0");
+  if (!Number.isFinite(assignToAgentErrorCount) || !Number.isSafeInteger(assignToAgentErrorCount) || assignToAgentErrorCount < 0) {
+    throw new Error(`${ERR_VALIDATION}: GH_AW_ASSIGNMENT_ERROR_COUNT must be a non-negative integer`);
+  }
   const safeOutputsResult = process.env.GH_AW_SAFE_OUTPUTS_RESULT;
+  const noopCommentBody = process.env.GH_AW_NOOP_COMMENT_BODY || "";
+  const activationCommentLinks = (process.env.GH_AW_ACTIVATION_COMMENT_LINKS || "").trim();
 
   const messagesConfig = getMessages();
   const appendOnlyComments = messagesConfig?.appendOnlyComments === true;
@@ -157,16 +168,7 @@ async function main() {
   // If it's disabled, and there's no comment to update but we have noop messages, write to step summary.
   if (!appendOnlyComments && !commentId && noopMessages.length > 0) {
     core.info("No comment ID found, writing noop messages to step summary");
-
-    let summaryContent = "## No-Op Messages\n\n";
-    summaryContent += "The following messages were logged for transparency:\n\n";
-
-    if (noopMessages.length === 1) {
-      summaryContent += noopMessages[0];
-    } else {
-      summaryContent += noopMessages.map((msg, idx) => `${idx + 1}. ${msg}`).join("\n");
-    }
-
+    const summaryContent = buildNoopConclusionSummary(noopMessages, { runUrl });
     await core.summary.addRaw(summaryContent).write();
     core.info(`Successfully wrote ${noopMessages.length} noop message(s) to step summary`);
     return;
@@ -191,72 +193,113 @@ async function main() {
 
   // Determine the message based on agent conclusion using custom messages if configured
   let message;
-  let detectionWarningMessage = "";
+  let detectionBlocks = [];
 
   // Check if detection job failed (if detection job exists)
   if (detectionConclusion && detectionConclusion === "failure") {
     // Detection job failed in error mode - report this prominently
-    message = getDetectionFailureMessage({
-      workflowName,
+    message = "";
+    detectionBlocks = getDetectionFailureBlocks({
+      workflowName: sanitizeContent(workflowName),
       runUrl,
+      reason: detectionReason,
     });
   } else if (detectionConclusion && detectionConclusion === "warning") {
     // Detection job produced a warning (continue-on-error mode)
     // Show success message but append caution section with progressive disclosure
     if (agentConclusion === "success" && assignToAgentErrorCount === 0 && safeOutputsResult !== "failure") {
       message = getRunSuccessMessage({
-        workflowName,
-        runUrl,
+        workflowName: "{workflow_name}",
+        runUrl: "{run_url}",
       });
     } else {
       message = getRunFailureMessage({
-        workflowName,
-        runUrl,
+        workflowName: "{workflow_name}",
+        runUrl: "{run_url}",
         status: getRunFailureStatusText(agentConclusion, assignToAgentErrorCount, safeOutputsResult),
       });
     }
     // Build the caution section for detection warning
-    detectionWarningMessage = getDetectionWarningMessage({
-      workflowName,
+    detectionBlocks = getDetectionWarningBlocks({
+      workflowName: sanitizeContent(workflowName),
       runUrl,
       reason: detectionReason,
     });
   } else if (agentConclusion === "success" && assignToAgentErrorCount === 0 && safeOutputsResult !== "failure") {
     message = getRunSuccessMessage({
-      workflowName,
-      runUrl,
+      workflowName: "{workflow_name}",
+      runUrl: "{run_url}",
     });
   } else {
     message = getRunFailureMessage({
-      workflowName,
-      runUrl,
+      workflowName: "{workflow_name}",
+      runUrl: "{run_url}",
       status: getRunFailureStatusText(agentConclusion, assignToAgentErrorCount, safeOutputsResult),
     });
   }
 
-  // Append detection warning caution section if present
-  if (detectionWarningMessage) {
-    message += "\n\n" + detectionWarningMessage;
+  const templateContext = Object.fromEntries(Array.from(message.matchAll(/\{(\w+)\}/g), match => [match[1], match[0]]));
+  Object.assign(templateContext, { workflow_name: sanitizeContent(workflowName), run_url: runUrl });
+  const children = parseReportMarkdown(sanitizeContent(message), { context: templateContext, agentTainted: false, minimumHeadingLevel: 2 });
+
+  // Import template and existing Markdown separately so an unclosed fence cannot
+  // consume the following status sections or generated metadata.
+  children.push(...detectionBlocks);
+
+  // Preserve links (e.g. "Pull request created: #X") that safe outputs appended to the
+  // activation comment; otherwise this final status update would overwrite them.
+  if (activationCommentLinks) {
+    children.push(...parseReportMarkdown(sanitizeContent(activationCommentLinks), { agentTainted: false, minimumHeadingLevel: 2 }));
   }
 
-  // Add noop messages to the comment if any
-  if (noopMessages.length > 0) {
-    message += "\n\n";
-    if (noopMessages.length === 1) {
-      message += noopMessages[0];
-    } else {
-      message += noopMessages.map((msg, idx) => `${idx + 1}. ${msg}`).join("\n");
-    }
+  // Never fall back to raw agent prose in a public comment if rendering failed.
+  if (noopCommentBody) {
+    children.push(...parseReportMarkdown(sanitizeContent(noopCommentBody), { agentTainted: true, minimumHeadingLevel: 2 }));
+  } else if (noopMessages.length > 0) {
+    core.warning("No categorized no-op comment body is available; omitting agent messages from the public comment");
   }
 
   // Collect generated asset URLs from safe output jobs
   const generatedAssets = collectGeneratedAssets();
   if (generatedAssets.length > 0) {
-    message += "\n\n";
     generatedAssets.forEach(url => {
-      message += `${url}\n`;
+      /** @type {import("./report_ast.cjs").ReportInline} */
+      let asset = { type: "text", value: sanitizeContent(url), agentTainted: false };
+      try {
+        asset = { type: "link", url: normalizeReportAllowedURL(url), children: [asset] };
+      } catch {
+        // Keep a sanitized visible value when an asset is not an allowed URL.
+      }
+      children.push({ type: "paragraph", children: [asset] });
     });
   }
+
+  // Build the generated footer (attribution + XML marker). Appended after sanitization
+  // so that the XML traceability marker is not stripped by sanitizeContent.
+  const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE ?? "";
+  const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "";
+  const triggeringIssueNumber = context.payload?.issue?.number;
+  const triggeringPRNumber = context.payload?.pull_request?.number;
+  const triggeringDiscussionNumber = context.payload?.discussion?.number;
+  const historyUrl = generateHistoryUrl({
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    itemType: "comment",
+    workflowId: process.env.GH_AW_WORKFLOW_ID || "",
+    serverUrl: context.serverUrl,
+  });
+  const markdownParts = assembleReportBodyParts({
+    includeFooter: true,
+    workflowName,
+    runUrl,
+    workflowSource,
+    workflowSourceURL,
+    triggeringIssueNumber,
+    triggeringPRNumber,
+    triggeringDiscussionNumber,
+    historyUrl: historyUrl || undefined,
+  });
+  const sanitizedMessage = renderSizedReport({ type: "report", title: "Workflow status", children: [...children, ...markdownParts.footer] }).body;
 
   // Add "needs-review" label when detection produced a warning
   if (detectionConclusion === "warning") {
@@ -309,7 +352,6 @@ async function main() {
               }
             }`;
 
-        const sanitizedMessage = sanitizeContent(message);
         const variables = replyToId ? { dId: discussionId, body: sanitizedMessage, replyToId } : { dId: discussionId, body: sanitizedMessage };
         const result = await github.graphql(mutation, variables);
         const created = result?.addDiscussionComment?.comment;
@@ -326,7 +368,6 @@ async function main() {
         return;
       }
 
-      const sanitizedMessage = sanitizeContent(message);
       const response = await github.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
         owner: repoOwner,
         repo: repoName,
@@ -363,8 +404,6 @@ async function main() {
 
   // Check if this is a discussion comment (GraphQL node ID format)
   const isDiscussionComment = commentId.startsWith("DC_");
-
-  const sanitizedMessage = sanitizeContent(message);
 
   try {
     if (isDiscussionComment) {

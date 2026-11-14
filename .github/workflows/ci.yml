@@ -15,12 +15,17 @@ on:
       - '.github/workflows/ci.yml'
       - '.github/workflows/*.md'
       - '.github/workflows/*.lock.yml'
+      - '.github/skills/agentic-workflows/**'
+      - '.github/aw/debug-agentic-workflow.md'
+      - 'debug.md'
       - '.github/aw/actions-lock.json'
       - '.github/aw/releases.json'
       - '.github/aw/releases.schema.json'
       - '.github/aw/compat.json'
       - '.github/aw/compat.schema.json'
       - 'install-gh-aw.sh'
+      - 'specs/github-mcp-access-control-compliance/**'
+      - 'scratchpad/github-mcp-access-control-specification.md'
   schedule:
   - cron: 0 * * * *
   workflow_dispatch: {}
@@ -32,7 +37,7 @@ jobs:
       contents: read
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 2
     - name: Detect recent changes
@@ -41,6 +46,35 @@ jobs:
       run: "if [ \"${{ github.event_name }}\" != \"schedule\" ]; then\n  echo \"has_changes=true\" >> \"$GITHUB_OUTPUT\"\n  echo \"✅ Non-scheduled run: integration tests enabled\" >> \"$GITHUB_STEP_SUMMARY\"\n  exit 0\nfi\n\nCHANGES_IN_LAST_HOUR=$(git log --since='1 hour ago' --pretty=format:'%H' | wc -l | tr -d ' ')\nif [ \"$CHANGES_IN_LAST_HOUR\" -gt 0 ]; then\n  echo \"has_changes=true\" >> \"$GITHUB_OUTPUT\"\n  echo \"✅ Detected $CHANGES_IN_LAST_HOUR commit(s) in the last hour\" >> \"$GITHUB_STEP_SUMMARY\"\nelse\n  echo \"has_changes=false\" >> \"$GITHUB_OUTPUT\"\n  echo \"ℹ️ No commits in the last hour; skipping integration jobs\" >> \"$GITHUB_STEP_SUMMARY\"\nfi"
     outputs:
       has_changes: ${{ steps.detect.outputs.has_changes }}
+  validate-latest-releases:
+    name: Validate latest release alignment
+    if: ${{ !github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+    - name: Compare latest releases
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      with:
+        script: |
+          const { data: release } = await github.rest.repos.getLatestRelease({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          });
+          const { data: actionsRelease } = await github.rest.repos.getLatestRelease({
+            owner: 'github',
+            repo: 'gh-aw-actions',
+          });
+          if (release.tag_name !== actionsRelease.tag_name ||
+              release.draft || release.prerelease || actionsRelease.draft || actionsRelease.prerelease) {
+            core.setFailed(
+              `Latest releases must match: gh-aw="${release.tag_name}", gh-aw-actions="${actionsRelease.tag_name}". ` +
+              'Manually publish the matching stable release as latest in github/gh-aw-actions before promoting gh-aw.'
+            );
+            return;
+          }
+          core.info(`Latest releases match: ${release.tag_name}`);
   validate-container-pins:
     name: Validate workflow container pins
     runs-on: ubuntu-latest
@@ -49,9 +83,11 @@ jobs:
       contents: read
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
+    - name: Run agentic-workflows guidance tests
+      run: make test-guidance
     - name: Check container images against actions pins
       shell: bash
       run: |
@@ -99,6 +135,11 @@ jobs:
             pinned_image="$(jq -r '.pinned_image' <<<"$container")"
             expected_digest="$(jq -r --arg image "$image" '.containers[$image].digest // empty' "$pins_file")"
 
+            # Skip containers that are intentionally unpinned (no digest in manifest)
+            if [ "$digest" = "null" ] || [ -z "$digest" ]; then
+              continue
+            fi
+
             checked_images=$((checked_images + 1))
             if [ -z "$expected_digest" ]; then
               echo "missing container entry in actions pins for $image (file: $lock_file)"
@@ -134,6 +175,122 @@ jobs:
         fi
 
         echo "validated $checked_images container pins across $checked_files workflow lock files"
+  validate-mcp-access-control-spec-pin:
+    name: Validate GitHub MCP access-control spec pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Compare pinned specification commit
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        pinned="20236db49103c7e5551a61ed0b8f430eb9d509a7"
+        current="$(git log -n1 --format=%H -- scratchpad/github-mcp-access-control-specification.md)"
+        if [ -z "$current" ]; then
+          echo "No commit found for scratchpad/github-mcp-access-control-specification.md"
+          exit 1
+        fi
+        if [ "$current" != "$pinned" ]; then
+          echo "Spec pin drift: README pin=$pinned current=$current"
+          exit 1
+        fi
+  test-race:
+    name: Race detector
+    if: ${{ github.event_name == 'schedule' && needs.changes.outputs.has_changes == 'true' }}
+    needs:
+    - changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Set up Python 3.12 for mini-SWE-agent lock tests
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: "3.12"
+
+    - name: Run race detector
+      env:
+        GH_AW_REQUIRE_MINI_PY312: "1"
+      run: make test-race
+  shellcheck-setup-sh:
+    name: ShellCheck actions/setup/sh
+    if: ${{ needs.changes.outputs.has_changes == 'true' }}
+    needs:
+    - changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    concurrency:
+      group: ci-${{ github.ref }}-shellcheck-setup-sh
+      cancel-in-progress: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
+      with:
+        go-version-file: go.mod
+        cache: true
+
+    - name: Install shellcheck
+      run: make install-shellcheck
+
+    - name: Run shellcheck on actions/setup/sh
+      run: make shellcheck-setup-sh
+  sh-playwright-browsers:
+    name: "Playwright Browsers sh Integration Test: ${{ matrix.browser }}"
+    if: ${{ needs.changes.outputs.has_changes == 'true' }}
+    needs:
+    - changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    concurrency:
+      group: ci-${{ github.ref }}-sh-playwright-browsers-${{ matrix.browser }}
+      cancel-in-progress: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Set up Node.js
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1   # v6
+      with:
+        node-version: "24"
+
+    - name: Run install_playwright_browsers.sh integration tests
+      env:
+        PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/gh-aw/playwright-browsers
+      run: bash actions/setup/sh/install_playwright_browsers_integration_test.sh "${{ matrix.browser }}"
   integration:
     name: "Integration: ${{ matrix.test-group.name }}"
     if: ${{ needs.changes.outputs.has_changes == 'true' }}
@@ -142,6 +299,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
+      actions: read
       contents: read
       code-quality: write
       pull-requests: read
@@ -167,6 +325,14 @@ jobs:
         - name: "CLI Audit Logs & Firewall"
           packages: "./pkg/cli"
           pattern: "TestLogs|TestFirewall|TestNoStopTime|TestLocalWorkflow|^TestAudit|^TestInspect"
+          skip_pattern: "TestLogsMultiTarget|TestLogsCachedJSONLLiveCaching"
+        - name: "CLI Logs Live Cache"
+          packages: "./pkg/cli"
+          pattern: "^TestLogsCachedJSONLLiveCaching$"
+          github_token: true
+        - name: "CLI Logs Multi-Target Count"    # Dedicated job: --count must be a shared max across targets, not per-target, and siblings must be cancelled promptly once it is reached
+          packages: "./pkg/cli"
+          pattern: "TestLogsMultiTarget"
         - name: "CLI Progress Flag"    # Isolate slow test (~65s for TestProgressFlagSignature)
           packages: "./pkg/cli"
           pattern: "TestProgressFlagSignature"
@@ -213,6 +379,7 @@ jobs:
         - name: "Workflow Actions & Containers"
           packages: "./pkg/workflow"
           pattern: "^TestAction[^P]|Container"
+          github_token: true
         - name: "CMD Tests"    # All cmd/gh-aw integration tests
           packages: "./cmd/gh-aw"
           pattern: ""
@@ -233,11 +400,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -325,8 +492,20 @@ jobs:
     - name: Build gh-aw binary for integration tests
       run: make build
 
+    - name: Install actions-lock for compiler parity integration test
+      if: ${{ matrix.test-group.name == 'Workflow Actions & Containers' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh extension install github/gh-actions-lock --pin v0.2.0
+
+    - name: Test model-routing golden capture tooling
+      if: ${{ matrix.test-group.name == 'CLI Audit Logs & Firewall' }}
+      run: python3 scripts/test_model_routing_golden.py
+
     - name: Run integration tests - ${{ matrix.test-group.name }}
       id: run-tests
+      env:
+        GH_TOKEN: ${{ matrix.test-group.github_token && github.token || '' }}
       run: |
         set -o pipefail
         # Sanitize the test group name for use in filename
@@ -340,6 +519,9 @@ jobs:
           else
             go test -v -parallel=8 -timeout=10m -tags 'integration' -coverprofile="coverage-integration-${SAFE_NAME}.out" -json ${{ matrix.test-group.packages }} | tee "test-result-integration-${SAFE_NAME}.json"
           fi
+        elif [ -n "${{ matrix.test-group.skip_pattern || '' }}" ]; then
+          # Pattern group with an explicit skip_pattern: exclude tests matched by another dedicated group.
+          go test -v -parallel=8 -timeout=10m -tags 'integration' -coverprofile="coverage-integration-${SAFE_NAME}.out" -run '${{ matrix.test-group.pattern }}' -skip '${{ matrix.test-group.skip_pattern }}' -json ${{ matrix.test-group.packages }} | tee "test-result-integration-${SAFE_NAME}.json"
         else
           go test -v -parallel=8 -timeout=10m -tags 'integration' -coverprofile="coverage-integration-${SAFE_NAME}.out" -run '${{ matrix.test-group.pattern }}' -json ${{ matrix.test-group.packages }} | tee "test-result-integration-${SAFE_NAME}.json"
         fi
@@ -367,7 +549,7 @@ jobs:
 
     - name: Upload integration test results
       if: always()    # Upload even if tests fail so canary_go can track coverage
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
       with:
         name: test-result-integration-${{ matrix.test-group.name }}
         path: test-result-integration-*.json
@@ -375,7 +557,7 @@ jobs:
 
     - name: Upload integration coverage artifacts
       if: always() && hashFiles(format('coverage-integration-{0}.out', steps.run-tests.outputs.safe_name)) != ''
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
       with:
         name: ci-integration-coverage-${{ steps.run-tests.outputs.safe_name }}
         path: |
@@ -391,7 +573,7 @@ jobs:
 
     - name: Upload integration coverage to code coverage API
       if: always() && vars.CODE_QUALITY_COVERAGE_ENABLED == 'true' && hashFiles(format('coverage-integration-{0}.xml', steps.run-tests.outputs.safe_name)) != ''
-      uses: actions/upload-code-coverage@abb5995db9e0199b0e2bb9dbd136fce4cb1ec4d3   # v1
+      uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52   # v1
       with:
         file: coverage-integration-${{ steps.run-tests.outputs.safe_name }}.xml
         language: Go
@@ -411,11 +593,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -459,20 +641,28 @@ jobs:
       run: make build
 
     - name: Upload gh-aw binary artifact
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
       with:
         name: gh-aw-linux-amd64
         path: gh-aw
         retention-days: 1
 
-    - name: Test update command (dry-run)
+    - name: Test upstream update command
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
         echo "Testing update command to ensure it runs successfully..."
-        # Run update with verbose flag to check for and apply workflow updates from source repositories
-        # The command may modify workflow files if upstream updates are available
-        ./gh-aw update --verbose
+        # Exercise a real upstream update without unrelated installed packages or
+        # repository-local imports. Merge behavior is covered by the update tests.
+        GH_AW_BINARY="$PWD/gh-aw"
+        TEST_WORKSPACE="$(mktemp -d "$RUNNER_TEMP/gh-aw-update.XXXXXX")"
+        trap 'rm -rf "$TEST_WORKSPACE"' EXIT
+        mkdir -p "$TEST_WORKSPACE/.github/workflows"
+        cp .github/workflows/daily-team-status.md "$TEST_WORKSPACE/.github/workflows/"
+        cd "$TEST_WORKSPACE"
+        git init -q
+        "$GH_AW_BINARY" update --verbose --no-merge --force
+        test -s .github/workflows/daily-team-status.lock.yml
         echo "✅ Update command executed successfully" >> $GITHUB_STEP_SUMMARY
 
   compile-cli-workflows:
@@ -490,10 +680,10 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Download gh-aw binary artifact
-      uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16   # v4
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
       with:
         name: gh-aw-linux-amd64
         path: .
@@ -519,10 +709,10 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Download gh-aw binary artifact
-      uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16   # v4
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
       with:
         name: gh-aw-linux-amd64
         path: .
@@ -546,11 +736,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Node.js
       id: setup-node
-      uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f   # v6
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1   # v6
       with:
         node-version: "24"
         cache: npm
@@ -599,11 +789,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -677,7 +867,7 @@ jobs:
         echo "- v0.x exposure: ${V0_PERCENT}%" >> $GITHUB_STEP_SUMMARY
 
     - name: Upload audit results
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
       with:
         name: dependency-audit
         path: |
@@ -699,11 +889,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -759,11 +949,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -959,10 +1149,10 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Download gh-aw binary artifact
-      uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16   # v4
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333   # v8.0.2
       with:
         name: gh-aw-linux-amd64
         path: .
@@ -1023,11 +1213,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -1190,11 +1380,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -1236,11 +1426,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -1278,7 +1468,7 @@ jobs:
 
     - name: Upload test results
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
       with:
         name: test-result-integration-unauthenticated
         path: test-result-integration-unauthenticated.json
@@ -1292,7 +1482,7 @@ jobs:
 
     - name: Upload unauthenticated coverage to code coverage API
       if: always() && vars.CODE_QUALITY_COVERAGE_ENABLED == 'true' && hashFiles('coverage-integration-unauthenticated.xml') != ''
-      uses: actions/upload-code-coverage@abb5995db9e0199b0e2bb9dbd136fce4cb1ec4d3   # v1
+      uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52   # v1
       with:
         file: coverage-integration-unauthenticated.xml
         language: Go
@@ -1315,11 +1505,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -1353,7 +1543,7 @@ jobs:
 
     - name: Upload test results
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
       with:
         name: test-result-integration-add-dispatch-workflow
         path: test-result-integration-add-dispatch-workflow.json
@@ -1367,7 +1557,7 @@ jobs:
 
     - name: Upload dispatch-workflow coverage to code coverage API
       if: always() && vars.CODE_QUALITY_COVERAGE_ENABLED == 'true' && hashFiles('coverage-integration-add-dispatch-workflow.xml') != ''
-      uses: actions/upload-code-coverage@abb5995db9e0199b0e2bb9dbd136fce4cb1ec4d3   # v1
+      uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52   # v1
       with:
         file: coverage-integration-add-dispatch-workflow.xml
         language: Go
@@ -1390,7 +1580,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Extract versions from constants.go
       id: versions
@@ -1494,7 +1684,7 @@ jobs:
       DIFC_PROXY_IMAGE: ghcr.io/github/gh-aw-mcpg:v0.2.8
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Log in to GitHub Container Registry
         # SECURITY: token moved to env mapping to prevent shell interpretation
@@ -1630,7 +1820,7 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Start local proxy
       run: |
@@ -1725,11 +1915,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -1873,11 +2063,11 @@ jobs:
       cancel-in-progress: true
     steps:
     - name: Checkout code
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd   # v6.0.2
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
 
     - name: Set up Go
       id: setup-go
-      uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c   # v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e   # v6
       with:
         go-version-file: go.mod
         cache: true
@@ -1909,7 +2099,7 @@ jobs:
 
     - name: Upload redirect test coverage to code coverage API
       if: always() && vars.CODE_QUALITY_COVERAGE_ENABLED == 'true' && hashFiles(format('coverage-redirect-{0}.xml', matrix.os)) != ''
-      uses: actions/upload-code-coverage@abb5995db9e0199b0e2bb9dbd136fce4cb1ec4d3   # v1
+      uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52   # v1
       with:
         file: coverage-redirect-${{ matrix.os }}.xml
         language: Go

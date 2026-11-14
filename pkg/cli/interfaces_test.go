@@ -15,6 +15,13 @@ import (
 )
 
 // TestCommandProviderInterface verifies that *cobra.Command satisfies the CommandProvider interface
+//
+// NOTE: this test intentionally does NOT call t.Parallel(). Cobra's bash completion
+// generator (prepareCustomAnnotationsForFlags in bash_completions.go) mutates a
+// shared map that is not safe for concurrent use across different *cobra.Command
+// trees. Running this alongside other completion-generating tests (e.g.
+// TestInstallShellCompletion_TypeAssertion) in parallel can trigger a
+// "fatal error: concurrent map writes" crash in the Go runtime.
 func TestCommandProviderInterface(t *testing.T) {
 	cmd := &cobra.Command{
 		Use:   "test",
@@ -101,6 +108,10 @@ func TestInitRepository_WithRootCmd(t *testing.T) {
 }
 
 // TestInstallShellCompletion_TypeAssertion verifies type assertion behavior
+//
+// NOTE: this test intentionally does NOT call t.Parallel() (see the comment on
+// TestCommandProviderInterface) since it also generates shell completions via
+// cobra, which is unsafe to do concurrently with other completion-generating tests.
 func TestInstallShellCompletion_TypeAssertion(t *testing.T) {
 	t.Run("with cobra.Command", func(t *testing.T) {
 		rootCmd := &cobra.Command{
@@ -123,7 +134,7 @@ func TestInstallShellCompletion_TypeAssertion(t *testing.T) {
 		// Should fail type assertion
 		err := InstallShellCompletion(false, nil)
 		require.Error(t, err, "Should fail with nil rootCmd")
-		require.ErrorContains(t, err, "must be a *cobra.Command",
+		require.ErrorContains(t, err, "should be a *cobra.Command",
 			"Should fail with type assertion error message")
 	})
 }

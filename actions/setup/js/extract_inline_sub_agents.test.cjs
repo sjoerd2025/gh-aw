@@ -4,7 +4,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
 
 // Provide a minimal core mock so the module loads correctly.
 global.core = {
@@ -14,10 +13,37 @@ global.core = {
   setFailed: () => {},
 };
 
-const { extractInlineSubAgents, writeInlineSubAgents, preserveSubAgentFrontmatter } = require("./extract_inline_sub_agents.cjs");
+const { extractInlineSubAgents, writeInlineSubAgents, preserveSubAgentFrontmatter, resolveSubAgentExperimentReferences, closeUnterminatedSubAgentMarkers, loadCopilotSDKCustomAgents, ensureClaudeSubAgentName } =
+  require("../../../scripts/markdown_metadata_test_adapter.cjs").withCompilerFixtures(require("./extract_inline_sub_agents.cjs"));
+const { typistAgentsDir, typistAgentToolUse, typistAgentToolResult, typistInit } = require("./fixtures/claude_codex_subagent_runs.cjs");
 
 // Helper: returns a ## agent: `name` start marker line.
 const agentMarker = name => `## agent: \`${name}\``;
+
+describe("loadCopilotSDKCustomAgents", () => {
+  it("loads runtime files, preserving YAML descriptions and workflow precedence", () => {
+    const base = fs.mkdtempSync(path.join(process.cwd(), ".sdk-agents-test-"));
+    try {
+      const workspace = path.join(base, "workspace");
+      const workflow = path.join(base, "workflow");
+      fs.mkdirSync(path.join(workspace, ".github/agents"), { recursive: true });
+      fs.mkdirSync(path.join(workflow, ".github/agents"), { recursive: true });
+      fs.writeFileSync(path.join(workspace, ".github/agents/helper.agent.md"), "---\nname: helper\n---\nRepository version.");
+      fs.writeFileSync(path.join(workflow, ".github/agents/helper.agent.md"), "---\nname: helper\ndescription: |\n  First line\n  Second line\ntools: []\nmodel: small\n---\nWorkflow version.");
+      fs.writeFileSync(path.join(workspace, ".github/agents/plain.agent.md"), "Prompt without frontmatter.");
+      fs.writeFileSync(path.join(workspace, ".github/agents/ignored.md"), "Ignored file.");
+      fs.writeFileSync(path.join(workspace, ".github/agents/broken.agent.md"), "---\ntools: {invalid: true}\n---\nInvalid tools.");
+      const warnings = [];
+      expect(loadCopilotSDKCustomAgents(workspace, workflow, message => warnings.push(message))).toEqual([
+        { name: "helper", displayName: "helper", description: "First line\nSecond line\n", tools: [], model: "small", prompt: "Workflow version." },
+        { name: "plain", displayName: "plain", prompt: "Prompt without frontmatter." },
+      ]);
+      expect(warnings).toEqual([expect.stringContaining("agent tools must be a list")]);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // extractInlineSubAgents — unit tests
@@ -75,6 +101,16 @@ describe("extractInlineSubAgents", () => {
     expect(agents[0].content).not.toContain("outside the agent block");
   });
 
+  it("preserves an implicit boundary before an inline skill", () => {
+    const content = ["Main.", "", agentMarker("planner"), "Planner.", "", "## skill: `reporting`", "Reporting."].join("\n");
+
+    const { mainContent, agents } = extractInlineSubAgents(content);
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0]).toEqual({ name: "planner", content: "Planner." });
+    expect(mainContent).toBe("Main.\n\n## skill: `reporting`\nReporting.");
+  });
+
   it("next agent marker (H2) ends the previous agent block", () => {
     const content = ["Main.", "", agentMarker("planner"), "Planner.", "", agentMarker("executor"), "Executor."].join("\n");
 
@@ -123,6 +159,93 @@ describe("extractInlineSubAgents", () => {
       expect(agents).toHaveLength(0);
     }
   });
+
+  // ── Explicit end marker ("## end agent: `name`") ───────────────────────────
+
+  const agentEndMarker = name => `## end agent: \`${name}\``;
+
+  it("explicit end marker resumes main content after it", () => {
+    const content = ["Before.", "", agentMarker("planner"), "---", "engine: copilot", "---", "You are a planner.", agentEndMarker("planner"), "", "After."].join("\n");
+    const { mainContent, agents } = extractInlineSubAgents(content);
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].name).toBe("planner");
+    expect(agents[0].content).toBe("---\nengine: copilot\n---\nYou are a planner.");
+    expect(mainContent).toBe("Before.\n\nAfter.");
+  });
+
+  it("explicit end marker allows nested H2 headings inside the agent", () => {
+    const content = ["Main.", "", agentMarker("guide"), "## Section A", "Content A.", "## Section B", "Content B.", agentEndMarker("guide"), "", "Tail."].join("\n");
+    const { mainContent, agents } = extractInlineSubAgents(content);
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0].content).toBe("## Section A\nContent A.\n## Section B\nContent B.");
+    expect(mainContent).toBe("Main.\n\nTail.");
+  });
+
+  it("supports mixing explicit and implicit end boundaries across agents", () => {
+    const content = ["Main.", "", agentMarker("bounded"), "Bounded.", agentEndMarker("bounded"), "", "Interlude.", "", agentMarker("unbounded"), "Unbounded."].join("\n");
+    const { mainContent, agents } = extractInlineSubAgents(content);
+
+    expect(agents).toHaveLength(2);
+    expect(agents[0]).toEqual({ name: "bounded", content: "Bounded." });
+    expect(agents[1]).toEqual({ name: "unbounded", content: "Unbounded." });
+    expect(mainContent).toBe("Main.\n\nInterlude.");
+  });
+
+  it("throws on an orphan end marker whose name has no matching start", () => {
+    const content = ["Main.", "", agentMarker("planner"), "Content.", agentEndMarker("plannerr")].join("\n");
+    expect(() => extractInlineSubAgents(content)).toThrow(/plannerr.*line 5/);
+  });
+
+  it("throws on a standalone end marker with no agent starts", () => {
+    const content = ["Main.", "", agentEndMarker("planner")].join("\n");
+    expect(() => extractInlineSubAgents(content)).toThrow(/planner.*line 3/);
+  });
+
+  it("throws when the end marker names a different agent than the one it could close", () => {
+    const content = ["Main.", "", agentMarker("first"), "First content.", agentEndMarker("second")].join("\n");
+    expect(() => extractInlineSubAgents(content)).toThrow(/second/);
+  });
+
+  it("falls back to implicit H2 boundary when end marker is malformed", () => {
+    const malformed = ["## end agent:", "## end agent: planner", "### end agent: `planner`"];
+    for (const line of malformed) {
+      const content = "Main.\n\n" + agentMarker("planner") + "\nContent.\n" + line + "\nTail.";
+      const { mainContent, agents } = extractInlineSubAgents(content);
+      expect(agents).toHaveLength(1);
+      expect(agents[0].name).toBe("planner");
+      // Legacy implicit H2 closing discards content after the boundary from
+      // the reassembled main prompt unless the boundary is another inline block.
+      expect(mainContent).not.toContain("Tail.");
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// closeUnterminatedSubAgentMarkers — unit tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("closeUnterminatedSubAgentMarkers", () => {
+  const agentEndMarker = name => `## end agent: \`${name}\``;
+
+  it("adds an explicit end marker at EOF for an unterminated sub-agent", () => {
+    const content = ["Main.", "", agentMarker("helper"), "Agent content."].join("\n");
+
+    expect(closeUnterminatedSubAgentMarkers(content)).toBe(["Main.", "", agentMarker("helper"), "Agent content.", "", agentEndMarker("helper"), ""].join("\n"));
+  });
+
+  it("adds an explicit end marker before the next H2 boundary", () => {
+    const content = ["Main.", "", agentMarker("helper"), "Agent content.", "## skill: `reporting`", "Skill content."].join("\n");
+
+    expect(closeUnterminatedSubAgentMarkers(content)).toBe(["Main.", "", agentMarker("helper"), "Agent content.", "", agentEndMarker("helper"), "## skill: `reporting`", "Skill content."].join("\n"));
+  });
+
+  it("leaves an explicitly terminated sub-agent unchanged", () => {
+    const content = ["Main.", "", agentMarker("helper"), "Agent content.", agentEndMarker("helper"), "", "Tail."].join("\n");
+
+    expect(closeUnterminatedSubAgentMarkers(content)).toBe(content);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,7 +256,7 @@ describe("writeInlineSubAgents", () => {
   let tmpDir;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "inline-agents-test-"));
+    tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".inline-agents-test-"));
   });
 
   afterEach(() => {
@@ -272,5 +395,130 @@ describe("preserveSubAgentFrontmatter", () => {
     const content = "---\ndescription: Summarizes files\n---\nYou are a summarizer.";
     const result = preserveSubAgentFrontmatter(content);
     expect(result).toBe(content);
+  });
+});
+
+describe("resolveSubAgentExperimentReferences", () => {
+  const env = { GH_AW_EXPERIMENTS_SUBAGENT_MODEL: "large", GH_AW_EXPERIMENTS_MY_MODEL: "gpt-5.4-mini" };
+
+  it("resolves direct and placeholder references in frontmatter only", () => {
+    const content = "---\nname: reader\nmodel: ${{experiments.subagent_model}}\ntools: [read]\n---\nKeep ${{ experiments.subagent_model }} and __GH_AW_EXPERIMENTS_SUBAGENT_MODEL__ in the body.";
+    expect(resolveSubAgentExperimentReferences("reader", content, env)).toBe('---\n{"model":"large","name":"reader","tools":["read"]}\n---\nKeep ${{ experiments.subagent_model }} and __GH_AW_EXPERIMENTS_SUBAGENT_MODEL__ in the body.');
+    expect(resolveSubAgentExperimentReferences("reader", "---\nmodel: __GH_AW_EXPERIMENTS_SUBAGENT_MODEL__\n---\nBody", env)).toBe('---\n{"model":"large"}\n---\nBody');
+  });
+
+  it("maps hyphenated experiment names to the normalized env var", () => {
+    expect(resolveSubAgentExperimentReferences("reader", "---\nmodel: ${{ experiments.my-model }}\n---\nBody", env)).toBe('---\n{"model":"gpt-5.4-mini"}\n---\nBody');
+  });
+
+  it.each(["gpt-5.4?effort=low", "gpt-5.4?effort=low&context=128000"])("preserves parameterized model selector %s", value => {
+    expect(resolveSubAgentExperimentReferences("reader", "---\nmodel: ${{ experiments.subagent_model }}\n---\nBody", { GH_AW_EXPERIMENTS_SUBAGENT_MODEL: value })).toBe(`---\n${JSON.stringify({ model: value })}\n---\nBody`);
+  });
+
+  it.each(["__GH_AW_EXPR_0498E4C3__", "${{ secrets.MODEL }}", "__GH_AW_INPUTS_MODEL__"])("rejects unresolved model token %s without evaluating other expressions", model => {
+    expect(() => resolveSubAgentExperimentReferences("reader", `---\nmodel: ${model}\n---\nBody`, { ...env, GH_AW_EXPR_0498E4C3: "large", GH_AW_INPUTS_MODEL: "large" })).toThrow(
+      'inline sub-agent "reader" field "model" contains an unresolved expression or placeholder'
+    );
+  });
+
+  it("returns content without frontmatter or references unchanged", () => {
+    expect(resolveSubAgentExperimentReferences("reader", "No frontmatter ${{ experiments.subagent_model }}", env)).toBe("No frontmatter ${{ experiments.subagent_model }}");
+    const plain = "---\nmodel: small\n---\nBody";
+    expect(resolveSubAgentExperimentReferences("reader", plain, env)).toBe(plain);
+  });
+
+  it("fails with the sub-agent and field name when no assignment is available", () => {
+    expect(() => resolveSubAgentExperimentReferences("file-summarizer", "---\nmodel: ${{ experiments.subagent_model }}\n---\nBody", {})).toThrow(
+      'inline sub-agent "file-summarizer" field "model" references ${{ experiments.subagent_model }}, but no experiment assignment is available (GH_AW_EXPERIMENTS_SUBAGENT_MODEL is not set)'
+    );
+  });
+
+  it.each(["small\nmodel: other", "a b", "${{ secrets.TOKEN }}", "-dash"])("rejects selected variant %j that is not a plain scalar", value => {
+    expect(() => resolveSubAgentExperimentReferences("reader", "---\nmodel: ${{ experiments.subagent_model }}\n---\nBody", { GH_AW_EXPERIMENTS_SUBAGENT_MODEL: value })).toThrow("is not a plain model or alias value");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Claude staged copies must be native-loadable (github/gh-aw#70667)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Claude staged sub-agent identity", () => {
+  let tmpDir;
+  const parseFrontmatter = content => {
+    const { extractFrontmatterAndBody } = require("./frontmatter_hash_pure.cjs");
+    const { readDocumentMetadata } = require("../../../scripts/markdown_metadata_test_adapter.cjs");
+    return readDocumentMetadata(extractFrontmatterAndBody(content).frontmatterText).value || {};
+  };
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".inline-agents-claude-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // Typist run 39415087125 staged this file without `name`; Claude Code 2.1.296 did not
+  // register it (init agents) and rejected the named delegation.
+  it("claude_missing_name_fixture_is_registered", () => {
+    const fixturePath = path.join(typistAgentsDir, "duplicate-type-finder.md");
+    const recorded = fs.readFileSync(fixturePath, "utf8");
+    expect(parseFrontmatter(recorded).name).toBeUndefined();
+    expect(typistInit.agents).not.toContain(typistAgentToolUse.input.subagent_type);
+    expect(typistAgentToolResult.content).toContain(`Agent type '${typistAgentToolUse.input.subagent_type}' not found`);
+
+    const workflow = `# Typist\n\nAnalyze types.\n\n${agentMarker("duplicate-type-finder")}\n${recorded}`;
+    writeInlineSubAgents(workflow, tmpDir, tmpDir, "claude");
+
+    const written = fs.readFileSync(path.join(tmpDir, ".claude", "agents", "duplicate-type-finder.md"), "utf8");
+    const frontmatter = parseFrontmatter(written);
+    expect(frontmatter.name).toBe(typistAgentToolUse.input.subagent_type);
+    expect(frontmatter.description).toBe(frontmatter.name);
+    expect(frontmatter.model).toBe("small");
+    expect(written.slice(written.indexOf("\n---") + 4)).toBe(recorded.slice(recorded.indexOf("\n---") + 4));
+    expect(fs.readFileSync(fixturePath, "utf8")).toBe(recorded);
+  });
+
+  it("keeps an authored name, derives its description and leaves other engines' copies unchanged", () => {
+    expect(ensureClaudeSubAgentName("persona-evaluator", "---\nname: persona-evaluator\nmodel: inherit\n---\nBody\n")).toBe('---\n{"model":"inherit","name":"persona-evaluator","description":"persona-evaluator"}\n---\nBody\n');
+    expect(ensureClaudeSubAgentName("helper", "Body only\n")).toBe('---\n{"name":"helper","description":"helper"}\n---\nBody only\n');
+    expect(ensureClaudeSubAgentName("helper", "---\n---\nBody\n")).toBe('---\n{"name":"helper","description":"helper"}\n---\nBody\n');
+
+    const workflow = `Main.\n\n${agentMarker("helper")}\n---\nmodel: small\n---\nHelp.`;
+    writeInlineSubAgents(workflow, tmpDir, tmpDir, "codex");
+    writeInlineSubAgents(workflow, tmpDir, tmpDir, "copilot");
+    expect(fs.readFileSync(path.join(tmpDir, ".codex", "agents", "helper.md"), "utf8")).toBe("---\nmodel: small\n---\nHelp.\n");
+    expect(fs.readFileSync(path.join(tmpDir, ".github", "agents", "helper.agent.md"), "utf8")).toBe("---\nmodel: small\n---\nHelp.\n");
+  });
+
+  it("detects a quoted authored name key and keeps it", () => {
+    const workflow = `Main.\n\n${agentMarker("reviewer")}\n---\n"name": reviewer\nmodel: small\n---\nReview.`;
+    writeInlineSubAgents(workflow, tmpDir, tmpDir, "claude");
+
+    const written = fs.readFileSync(path.join(tmpDir, ".claude", "agents", "reviewer.md"), "utf8");
+    expect(written).toBe('---\n{"model":"small","name":"reviewer","description":"reviewer"}\n---\nReview.\n');
+    expect(parseFrontmatter(written)).toEqual({ name: "reviewer", model: "small", description: "reviewer" });
+  });
+
+  it("inserts the name inside flow-mapping frontmatter without mixing mapping styles", () => {
+    const workflow = `Main.\n\n${agentMarker("marker-worker")}\n---\n{description: Returns a marker, model: small}\n---\nMarker.\n\n${agentMarker("empty-flow")}\n---\n{ }\n---\nEmpty.`;
+    writeInlineSubAgents(workflow, tmpDir, tmpDir, "claude");
+
+    const written = fs.readFileSync(path.join(tmpDir, ".claude", "agents", "marker-worker.md"), "utf8");
+    expect(written).toBe('---\n{"name":"marker-worker","model":"small","description":"marker-worker"}\n---\nMarker.\n');
+    expect(parseFrontmatter(written)).toEqual({ name: "marker-worker", description: "marker-worker", model: "small" });
+    const empty = fs.readFileSync(path.join(tmpDir, ".claude", "agents", "empty-flow.md"), "utf8");
+    expect(parseFrontmatter(empty)).toEqual({ name: "empty-flow", description: "empty-flow" });
+  });
+
+  it("injects the name for any engine id that stages into .claude/agents", () => {
+    // interpolate_prompt.cjs passes GH_AW_ENGINE_ID, which the compiler emits as the canonical
+    // "claude"; differently cased or padded ids still stage and register the same way.
+    const workflow = `Main.\n\n${agentMarker("helper")}\n---\nmodel: small\n---\nHelp.`;
+    for (const engineId of ["Claude", " CLAUDE "]) {
+      const dir = fs.mkdtempSync(path.join(tmpDir, "engine-"));
+      writeInlineSubAgents(workflow, dir, dir, engineId);
+      expect(fs.readFileSync(path.join(dir, ".claude", "agents", "helper.md"), "utf8")).toBe('---\n{"name":"helper","model":"small","description":"helper"}\n---\nHelp.\n');
+    }
   });
 });

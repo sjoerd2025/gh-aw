@@ -9,32 +9,27 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:errortypeassertion")
+
 // Analyzer is the error-type-assertion analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "errortypeassertion",
-	Doc:      "reports type assertions from error to concrete types; use errors.As for wrapped errors",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/errortypeassertion",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("errortypeassertion", "reports type assertions from error to concrete types; use errors.As for wrapped errors", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	insp, err := astutil.Inspector(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -88,6 +83,7 @@ func checkTypeAssertExpr(pass *analysis.Pass, noLintIndex nolint.DirectiveIndex,
 		return
 	}
 
+	pkgLog.Printf("flagging error type assertion to %s at %s", assertedTo, pos)
 	pass.ReportRangef(
 		typeAssert,
 		"type assertion on error to %s bypasses wrapped errors; use errors.As instead",
@@ -129,6 +125,7 @@ func checkTypeSwitchStmt(pass *analysis.Pass, noLintIndex nolint.DirectiveIndex,
 				continue
 			}
 
+			pkgLog.Printf("flagging error type switch case %s at %s", assertedTo, pos)
 			pass.ReportRangef(
 				typeExpr,
 				"type assertion on error to %s bypasses wrapped errors; use errors.As instead",

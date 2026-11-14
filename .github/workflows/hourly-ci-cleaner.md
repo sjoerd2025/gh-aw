@@ -9,6 +9,8 @@ permissions:
   actions: read
   issues: read
   pull-requests: read
+env:
+  GOTOOLCHAIN: auto
 tracker-id: hourly-ci-cleaner
 # Token Budget Guardrails:
 # - Prompt optimization: Added efficiency guidelines and early termination
@@ -34,14 +36,6 @@ tools:
 sandbox:
   agent:
     id: awf
-    sudo: false
-    mounts:
-      - "/usr/bin/make:/usr/bin/make:ro"
-      - "/usr/bin/go:/usr/bin/go:ro"
-      - "/usr/local/bin/node:/usr/local/bin/node:ro"
-      - "/usr/local/bin/npm:/usr/local/bin/npm:ro"
-      - "/usr/local/lib/node_modules:/usr/local/lib/node_modules:ro"
-      - "/opt/hostedtoolcache/go:/opt/hostedtoolcache/go:ro"
 if: needs.check_ci_status.outputs.ci_needs_fix == 'true'
 jobs:
   check_ci_status:
@@ -100,7 +94,7 @@ steps:
       go-version-file: go.mod
       cache: true
   - name: Setup Node.js
-    uses: actions/setup-node@v7.0.0
+    uses: actions/setup-node@v7.1.0
     with:
       node-version: "24"
       cache: npm
@@ -112,16 +106,18 @@ steps:
     run: make deps-dev
 safe-outputs:
   create-pull-request:
-    expires: 2d
+    draft: true
     title-prefix: "[ca] "
     protected-files: fallback-to-issue
   missing-tool:
 timeout-minutes: 45
 imports:
+  - shared/pr-safe-output-defaults.md
   - ../agents/ci-cleaner.agent.md
 
 
   - shared/otlp.md
+  - shared/reporting.md
 evals:
   - id: ci_state_checked
     question: Did the agent check whether CI was failing on the main branch?

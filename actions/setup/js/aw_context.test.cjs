@@ -3,8 +3,37 @@ import fs from "fs";
 
 // resolveItemContext does not depend on global context — it only operates on
 // the plain payload object, so we can test it directly without any mocking.
-const { resolveItemContext } = await import("./aw_context.cjs");
+const { resolveItemContext, resolveParentHopId, buildAwContext } = await import("./aw_context.cjs");
 const { EXPERIMENT_ASSIGNMENTS_PATH } = await import("./experiment_helpers.cjs");
+
+describe("buildAwContext PR revision evidence", () => {
+  afterEach(() => {
+    delete global.context;
+  });
+
+  it.each([
+    ["pull_request", { pull_request: { head: { sha: "event-head" } } }, "event-head"],
+    ["pull_request_target", { pull_request: { head: { sha: "label-event-head" } } }, "label-event-head"],
+    ["pull_request_review", { pull_request: { head: { sha: "newer-head" } }, review: { commit_id: "reviewed-commit" } }, "reviewed-commit"],
+    ["pull_request_review_comment", { pull_request: { head: { sha: "newer-head" } }, comment: { commit_id: "commented-commit" } }, "commented-commit"],
+    ["pull_request_review", { pull_request: { head: { sha: "newer-head" } }, review: {} }, ""],
+    ["pull_request_review_comment", { pull_request: { head: { sha: "newer-head" } }, comment: {} }, ""],
+    ["issue_comment", { issue: { number: 123, pull_request: {} } }, ""],
+  ])("propagates only event-recorded revision evidence for %s", (eventName, payload, expectedSha) => {
+    global.context = { repo: { owner: "owner", repo: "repo" }, eventName, payload };
+    expect(buildAwContext().pr_head_sha).toBe(expectedSha);
+  });
+
+  it("propagates the triggering edit time rather than dispatch time", () => {
+    global.context = {
+      repo: { owner: "owner", repo: "repo" },
+      eventName: "issue_comment",
+      payload: { comment: { created_at: "2026-10-26T10:00:00Z", updated_at: "2026-10-27T12:00:00Z" } },
+    };
+    expect(buildAwContext().comment_updated_at).toBe("2026-10-27T12:00:00Z");
+    expect(buildAwContext().pr_head_sha).toBe("");
+  });
+});
 
 describe("resolveItemContext", () => {
   it("returns issue type and number for issues events", () => {
@@ -93,6 +122,85 @@ describe("resolveItemContext", () => {
   it("returns empty item_number when number is null", () => {
     const payload = { issue: { number: null } };
     expect(resolveItemContext(payload)).toEqual({ item_type: "issue", item_number: "", comment_id: "", comment_node_id: "" });
+  });
+});
+
+describe("resolveParentHopId", () => {
+  it.each([
+    [{ hop_id: "caller", parent_hop_id: "root" }, "child", "caller"],
+    [{ hop_id: "current", parent_hop_id: "caller" }, "current", "caller"],
+    [{ hop_id: "current", parent_hop_id: "" }, "current", ""],
+    [{ hop_id: "current", parent_hop_id: "current" }, "current", ""],
+    [{ workflow_call_id: "legacy-caller", parent_hop_id: "root" }, "child", "legacy-caller"],
+    [{ hop_id: " ", workflow_call_id: " legacy-caller " }, "child", "legacy-caller"],
+    [{ parent_hop_id: " caller " }, "child", "caller"],
+    [undefined, "root", ""],
+  ])("resolves the immediate parent for %j", (inbound, current, expected) => {
+    expect(resolveParentHopId(inbound, current)).toBe(expected);
+  });
+});
+
+describe("buildAwContext episode lineage", () => {
+  beforeEach(() => {
+    vi.spyOn(fs, "readFileSync").mockImplementation(() => {
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    });
+    vi.stubEnv("GITHUB_RUN_ATTEMPT", "1");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  function buildHop(runId, workflow, inbound) {
+    vi.stubEnv("GITHUB_RUN_ID", String(runId));
+    vi.stubEnv("GITHUB_WORKFLOW_REF", `org/repo/.github/workflows/${workflow}.yml@refs/heads/main`);
+    vi.stubGlobal("context", {
+      runId,
+      repo: { owner: "org", repo: "repo" },
+      actor: "octocat",
+      eventName: inbound ? "workflow_dispatch" : "issues",
+      payload: inbound ? { inputs: { aw_context: JSON.stringify(inbound) } } : {},
+    });
+    return buildAwContext();
+  }
+
+  it("preserves the episode and root while advancing the immediate parent across three hops", () => {
+    const root = buildHop(100, "root");
+    const child = buildHop(200, "child", root);
+    const grandchild = buildHop(300, "grandchild", child);
+    expect(root.parent_hop_id).toBe("");
+    expect(root.parent_run_id).toBe("");
+    expect(child.parent_hop_id).toBe(root.hop_id);
+    expect(child.parent_run_id).toBe("100");
+    expect(grandchild.parent_hop_id).toBe(child.hop_id);
+    expect(grandchild.parent_run_id).toBe("200");
+    for (const hop of [child, grandchild]) {
+      expect(hop.episode_id).toBe(root.episode_id);
+      expect(hop.root_run_id).toBe("100");
+      expect(hop.root_repo).toBe(root.root_repo);
+      expect(hop.root_workflow_id).toBe(root.root_workflow_id);
+      expect(hop.origin_event).toBe("issues");
+      expect(hop.workflow_call_id).toBe(hop.hop_id);
+    }
+  });
+
+  it("distinguishes reusable workflow hops that share a GitHub run", () => {
+    const root = buildHop(100, "root");
+    const child = buildHop(100, "child", root);
+    const grandchild = buildHop(100, "grandchild", child);
+    expect(new Set([root.hop_id, child.hop_id, grandchild.hop_id]).size).toBe(3);
+    expect(child.parent_hop_id).toBe(root.hop_id);
+    expect(grandchild.parent_hop_id).toBe(child.hop_id);
+    expect(grandchild.episode_id).toBe(root.episode_id);
+  });
+
+  it("retains the recorded parent when context already represents the current hop", () => {
+    const root = buildHop(100, "root");
+    const child = buildHop(200, "child", root);
+    expect(buildHop(200, "child", child).parent_hop_id).toBe(root.hop_id);
   });
 });
 

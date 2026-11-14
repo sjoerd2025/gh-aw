@@ -7,12 +7,61 @@
  * `git push`.
  */
 
-const { ERR_API } = require("./error_codes.cjs");
+const { ERR_API, ERR_SYSTEM, ERR_VALIDATION } = require("./error_codes.cjs");
 const { loadTemporaryIdMapFromResolved, replaceTemporaryIdReferencesInPatch, TEMPORARY_ID_CANDIDATE_REFERENCE_PATTERN } = require("./temporary_id.cjs");
 const { checkFileProtectionPostApply } = require("./manifest_file_helpers.cjs");
 const { backfillCommitObjects } = require("./git_helpers.cjs");
 const { overridePersistedExtraheader, restorePersistedExtraheader } = require("./git_auth_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { redactSecrets, redactBuiltInPatterns } = require("./redact_secrets.cjs");
+const { withGitClaimEffects } = require("./work_queue_git_effects.cjs");
+const { createClaimEffectBatch, withClaimEffectBatch, discardClaimEffectBatch } = require("./work_queue_claim_scope.cjs");
+const ERROR_CODE_PREFIX_RE = /^(?:ERR_[A-Z_]+|E\d{3}):\s*/;
+
+/**
+ * Capture Git output instead of writing it directly to process streams, where
+ * Actions secret masking is bypassed.
+ * @param {string[]} args
+ * @param {Record<string, any>} [options]
+ */
+function getGitExecOutput(args, options = {}) {
+  return exec.getExecOutput("git", args, { ...options, silent: true });
+}
+
+/**
+ * @param {string[]} args
+ * @param {Record<string, any>} [options]
+ */
+function execGitCommand(args, options = {}) {
+  return exec.exec("git", args, { ...options, silent: true });
+}
+
+/**
+ * Strip the single leading `ERR_*: ` or `E001: ` sentinel from a message.
+ * Each sentinel error in this file carries exactly one such prefix, so one
+ * removal is sufficient; the wrapper can then add its own prefix without
+ * emitting a duplicate code.
+ */
+function stripLeadingErrorCode(msg) {
+  return msg.replace(ERROR_CODE_PREFIX_RE, "");
+}
+
+/**
+ * @param {string} output
+ * @returns {string}
+ */
+function getWorkflowPermissionHint(output) {
+  if (!/refusing to allow\b[^\r\n]*\bworkflow\b[^\r\n]*\.github\/workflows\/[^\r\n]*\.ya?ml\b[^\r\n]*\bwithout\b[^\r\n]*\b(?:permission|scope)\b/i.test(output)) {
+    return "";
+  }
+  return (
+    "\nGitHub refused to update workflow YAML because the push credentials lack workflow-write permission. " +
+    "If these changes are generated workflow locks, set `exclude-lock-yml: true` on the relevant `safe-outputs` entry " +
+    "(for example, `safe-outputs.create-pull-request` or `safe-outputs.push-to-pull-request-branch`) and recompile the workflow. " +
+    "Other workflow YAML changes still require credentials permitted to update workflows. " +
+    "Regenerate and commit excluded locks with authorized credentials before merging."
+  );
+}
 const OID_PATTERN = /^[0-9a-f]{40}$/i;
 
 /**
@@ -159,7 +208,7 @@ function unquoteCPath(s) {
 async function readBlobAsBase64(blobHash, cwd) {
   /** @type {Buffer[]} */
   const chunks = [];
-  await exec.exec("git", ["cat-file", "blob", blobHash], {
+  await execGitCommand(["cat-file", "blob", blobHash], {
     cwd,
     silent: true,
     listeners: {
@@ -223,7 +272,7 @@ function maybeReplaceTemporaryIdsInBase64Content(base64Content, temporaryIdMap, 
  */
 async function lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken) {
   const remote = pushRemoteUrl || "origin";
-  const doLsRemote = () => exec.getExecOutput("git", ["ls-remote", remote, `refs/heads/${branch}`], { cwd, env: { ...process.env, ...(gitAuthEnv || {}) } });
+  const doLsRemote = () => getGitExecOutput(["ls-remote", remote, `refs/heads/${branch}`], { cwd, env: { ...process.env, ...(gitAuthEnv || {}) } });
   let result;
   if (pushRemoteUrl && pushToken) {
     const githubServerUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
@@ -255,21 +304,43 @@ async function lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken
  * @param {any} [opts.gitAuthEnv]
  * @param {string} [opts.pushRemoteUrl]
  * @param {string} [opts.pushToken]
+ * @param {() => void} [opts.assertTransportUnchanged]
+ * @param {boolean} [opts.requireExistingBranch]
  * @returns {Promise<string>}
  */
-async function pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken }) {
-  const pushArgs = pushRemoteUrl ? ["push", pushRemoteUrl, branch] : ["push", "origin", branch];
+async function pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken, assertTransportUnchanged, requireExistingBranch }) {
   const pushOnce = async () => {
-    await exec.exec("git", pushArgs, {
+    const pushArgs = ["push"];
+    if (requireExistingBranch) {
+      const expectedHead = await lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken);
+      if (!expectedHead) throw new Error(`${ERR_API}: Branch ${branch} no longer exists; refusing to recreate it`);
+      const ancestor = await getGitExecOutput(["merge-base", "--is-ancestor", expectedHead, "HEAD"], { cwd, ignoreReturnCode: true });
+      if (ancestor.exitCode !== 0) throw new Error(`${ERR_API}: non-fast-forward update to ${branch} refused`);
+      pushArgs.push(`--force-with-lease=refs/heads/${branch}:${expectedHead}`);
+    }
+    pushArgs.push(pushRemoteUrl || "origin", branch);
+    await require("./work_queue_git_effects.cjs").assertGitPushAuthorized({ remote: pushRemoteUrl || "origin", branch, cwd, gitAuthEnv });
+    assertTransportUnchanged?.();
+    const result = await getGitExecOutput(pushArgs, {
       cwd,
       env: { ...process.env, ...(gitAuthEnv || {}) },
+      ignoreReturnCode: true,
     });
+    if (result.exitCode !== 0) {
+      const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+      const secrets = [pushToken, process.env.GH_TOKEN, process.env.GITHUB_TOKEN, process.env.GITHUB_APP_TOKEN].filter(secret => typeof secret === "string");
+      const detail = redactBuiltInPatterns(redactSecrets(output, secrets).content)
+        .content.replace(/(https?:\/\/)[^/\s@]+@/gi, "$1[REDACTED]@")
+        .replace(/(authorization:\s*(?:bearer|basic)\s+)\S+/gi, "$1[REDACTED]");
+      throw new Error(`${ERR_SYSTEM}: git push failed (exit code ${result.exitCode}): ${detail}${getWorkflowPermissionHint(detail)}`);
+    }
     return resolveLocalHeadSha(cwd);
   };
   if (!pushRemoteUrl || !pushToken) {
     return pushOnce();
   }
 
+  await require("./work_queue_git_effects.cjs").assertGitPushAuthorized({ remote: pushRemoteUrl, branch, cwd, gitAuthEnv });
   const githubServerUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
   let previousExtraheaders = [];
   let overrideApplied = false;
@@ -300,7 +371,7 @@ function validateSynthesizedFileChanges(additions, deletions, validationConfig) 
 
   const maxFilesRaw = Number.parseInt(String(validationConfig.max_patch_files ?? ""), 10);
   if (Number.isFinite(maxFilesRaw) && maxFilesRaw > 0 && uniquePaths.length > maxFilesRaw) {
-    throw new PushSignedCommitsPolicyViolation(`E003: Signed-commit payload exceeds max-patch-files (${maxFilesRaw}). ` + `Synthesized payload touches ${uniquePaths.length} file(s): ${uniquePaths.join(", ")}`);
+    throw new PushSignedCommitsPolicyViolation(`${ERR_VALIDATION}: E003: Signed-commit payload exceeds max-patch-files (${maxFilesRaw}). ` + `Synthesized payload touches ${uniquePaths.length} file(s): ${uniquePaths.join(", ")}`);
   }
 
   const maxSizeKbRaw = Number.parseInt(String(validationConfig.max_patch_size ?? ""), 10);
@@ -308,7 +379,7 @@ function validateSynthesizedFileChanges(additions, deletions, validationConfig) 
     const additionsBytes = additions.reduce((total, entry) => total + Buffer.from(entry.contents, "base64").length, 0);
     const additionsKb = Math.ceil(additionsBytes / 1024);
     if (additionsKb > maxSizeKbRaw) {
-      throw new PushSignedCommitsPolicyViolation(`E003: Signed-commit payload exceeds max-patch-size (${maxSizeKbRaw} KB). ` + `Synthesized payload additions total ${additionsKb} KB`);
+      throw new PushSignedCommitsPolicyViolation(`${ERR_VALIDATION}: E003: Signed-commit payload exceeds max-patch-size (${maxSizeKbRaw} KB). ` + `Synthesized payload additions total ${additionsKb} KB`);
     }
   }
 
@@ -316,8 +387,10 @@ function validateSynthesizedFileChanges(additions, deletions, validationConfig) 
     ...validationConfig,
     protected_files_policy: validationConfig.protected_files_policy ?? "request_review",
   });
-  if (protection.action !== "allow") {
-    throw new PushSignedCommitsPolicyViolation(`Signed-commit payload violates file-protection policy (${protection.action}): ${protection.files.join(", ")}`);
+  // Only "deny" is fatal here: "fallback" and "request_review" are non-fatal outcomes that the
+  // caller (create_pull_request.cjs) already decided to tolerate and handles after the push.
+  if (protection.action === "deny") {
+    throw new PushSignedCommitsPolicyViolation(`${ERR_VALIDATION}: Signed-commit payload violates file-protection policy (${protection.action}): ${protection.files.join(", ")}`);
   }
 }
 
@@ -328,7 +401,7 @@ function validateSynthesizedFileChanges(additions, deletions, validationConfig) 
  * @returns {Promise<string>}
  */
 async function resolveLocalHeadSha(cwd) {
-  const { stdout } = await exec.getExecOutput("git", ["rev-parse", "HEAD"], { cwd });
+  const { stdout } = await getGitExecOutput(["rev-parse", "HEAD"], { cwd });
   return stdout.trim();
 }
 
@@ -349,12 +422,35 @@ async function resolveLocalHeadSha(cwd) {
  * @param {string} [opts.pushToken] - Optional token used when pushing to pushRemoteUrl
  * @param {boolean} [opts.signedCommits=true] - When false, skip GraphQL signed commits and use git push directly
  * @param {boolean} [opts.allowGitPushFallback=true] - When false, refuse any fallback path that would use direct git push
+ * @param {boolean} [opts.requireBaseRefMatch=false] - Refuse a signed commit against a remote head other than baseRef
+ * @param {boolean} [opts.requireExistingBranch=false] - Never recreate a deleted target branch
  * @param {Record<string, any>} [opts.resolvedTemporaryIds] - Resolved temporary IDs map
  * @param {string} [opts.currentRepo] - Repository slug used for same-repo temporary ID resolution
  * @param {Record<string, any>} [opts.validationConfig] - Optional safe-output policy config applied to synthesized GraphQL fileChanges
+ * @param {(context: {cwd: string, branch: string, output: string}) => (boolean|Promise<boolean>)} [opts.resolveRebaseConflict]
+ * @param {() => void} [opts.assertTransportUnchanged] - Check captured safe-output inputs immediately before remote writes
  * @returns {Promise<string | undefined>} SHA of the commit that landed on the target branch
  */
-async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, cwd, gitAuthEnv, pushRemoteUrl, pushToken, signedCommits = true, allowGitPushFallback = true, resolvedTemporaryIds, currentRepo, validationConfig }) {
+async function pushSignedCommits({
+  githubClient,
+  owner,
+  repo,
+  branch,
+  baseRef,
+  cwd,
+  gitAuthEnv,
+  pushRemoteUrl,
+  pushToken,
+  signedCommits = true,
+  allowGitPushFallback = true,
+  requireBaseRefMatch = false,
+  requireExistingBranch = false,
+  resolvedTemporaryIds,
+  currentRepo,
+  validationConfig,
+  resolveRebaseConflict,
+  assertTransportUnchanged,
+}) {
   const effectiveCurrentRepo = currentRepo || `${owner}/${repo}`;
   const temporaryIdMap = loadTemporaryIdMapFromResolved(resolvedTemporaryIds, {
     defaultRepo: effectiveCurrentRepo,
@@ -366,8 +462,9 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
 
   // The default parameter value converts undefined to true; this check tests only the explicit false value.
   if (signedCommits === false) {
+    if (requireBaseRefMatch) throw new Error(`${ERR_VALIDATION}: signed commits are required for an atomic ledger transition`);
     core.info(`pushSignedCommits: signed-commits disabled (using direct git push) for branch ${branch}`);
-    const headSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken });
+    const headSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken, assertTransportUnchanged, requireExistingBranch });
     core.info(`pushSignedCommits: git push and HEAD resolution completed, HEAD=${headSha}`);
     return headSha;
   }
@@ -378,17 +475,17 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
   // so skip it entirely and fall directly through to git push.
   if (!baseRef) {
     if (allowGitPushFallback === false) {
-      throw new Error(`pushSignedCommits: cannot push branch '${branch}' without a baseRef when git push fallback is disabled. ` + `Seed the branch with a signed commit first, then retry.`);
+      throw new Error(`${ERR_VALIDATION}: pushSignedCommits: cannot push branch '${branch}' without a baseRef when git push fallback is disabled. ` + `Seed the branch with a signed commit first, then retry.`);
     }
     core.info(`pushSignedCommits: empty baseRef detected (orphan branch first push), using git push directly for branch ${branch}`);
     try {
-      const headSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken });
+      const headSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken, assertTransportUnchanged, requireExistingBranch });
       core.info(`pushSignedCommits: git push completed for orphan branch, HEAD=${headSha}`);
       return headSha;
     } catch (pushErr) {
       const pushErrMsg = getErrorMessage(pushErr);
       throw new Error(
-        `pushSignedCommits: failed to push orphan branch '${branch}' (first commit). ` +
+        `${ERR_SYSTEM}: pushSignedCommits: failed to push orphan branch '${branch}' (first commit). ` +
           `If the repository requires signed commits, the branch must be seeded manually with a signed commit before this workflow can push to it. ` +
           `Run the following commands locally (requires a GPG key configured with Git):\n\n` +
           `  git switch --orphan ${branch}\n` +
@@ -403,7 +500,7 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
   /** @type {string | undefined} */
   let baseRefOid;
   try {
-    const { stdout: baseRefOut } = await exec.getExecOutput("git", ["rev-parse", `${baseRef}^{commit}`], { cwd });
+    const { stdout: baseRefOut } = await getGitExecOutput(["rev-parse", `${baseRef}^{commit}`], { cwd });
     const trimmedBaseRefOid = baseRefOut.trim();
     if (OID_PATTERN.test(trimmedBaseRefOid)) {
       baseRefOid = trimmedBaseRefOid;
@@ -422,7 +519,7 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
   // Using --parents emits each line as "<sha> <parent1> [<parent2> ...]", which lets us detect merge commits
   // (more than one parent) in a single subprocess call without iterating each SHA individually.
   const revListBase = baseRefOid ?? baseRef;
-  const { stdout: revListOut } = await exec.getExecOutput("git", ["rev-list", "--parents", "--topo-order", "--reverse", `${revListBase}..HEAD`], { cwd });
+  const { stdout: revListOut } = await getGitExecOutput(["rev-list", "--parents", "--topo-order", "--reverse", `${revListBase}..HEAD`], { cwd });
   const revListEntriesRaw = revListOut
     .trim()
     .split("\n")
@@ -454,10 +551,11 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
   let graphqlParentIsAncestorOfHead = true;
   if (firstGraphqlParentOid) {
     try {
-      const ancestryCheck = await exec.getExecOutput("git", ["merge-base", "--is-ancestor", firstGraphqlParentOid, "HEAD"], { cwd, ignoreReturnCode: true });
+      // Partial clones may fetch a missing remote head during this probe.
+      const ancestryCheck = await getGitExecOutput(["merge-base", "--is-ancestor", firstGraphqlParentOid, "HEAD"], { cwd, env: { ...process.env, ...(gitAuthEnv || {}) }, ignoreReturnCode: true });
       graphqlParentIsAncestorOfHead = ancestryCheck.exitCode === 0;
     } catch {
-      // If ancestry probing fails, keep the default (true) and avoid rewrite.
+      // Ancestry probe failed — ignored, keep the default (true) and avoid rewrite.
     }
   }
   if (firstReplayParentOid && firstGraphqlParentOid && firstReplayParentOid !== firstGraphqlParentOid && !graphqlParentIsAncestorOfHead) {
@@ -470,23 +568,48 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
     // those on-demand promisor fetches can authenticate in private repos even
     // after checkout credentials have been scrubbed from .git/config.
     const runRebase = async () => {
-      const result = await exec.getExecOutput("git", ["rebase", "--onto", firstGraphqlParentOid, firstReplayParentOid, "HEAD"], { cwd, env: { ...process.env, ...(gitAuthEnv || {}) }, ignoreReturnCode: true });
+      // An explicit "HEAD" branch argument detaches the rebase and leaves the
+      // named branch stale, so a later git push fallback would push the old tip.
+      const result = await getGitExecOutput(["rebase", "--onto", firstGraphqlParentOid, firstReplayParentOid], { cwd, env: { ...process.env, ...(gitAuthEnv || {}) }, ignoreReturnCode: true });
       return result;
     };
     let rebaseResult = await runRebase();
     if (rebaseResult.exitCode !== 0) {
       const combinedOutput = `${rebaseResult.stdout || ""}\n${rebaseResult.stderr || ""}`;
-      // Always abort the in-progress rebase before attempting any recovery.
-      try {
-        await exec.exec("git", ["rebase", "--abort"], { cwd });
-      } catch {
-        // Ignore cleanup failures.
+      let rebaseResolved = false;
+      if (!isPartialCloneObjectFailure(combinedOutput) && typeof resolveRebaseConflict === "function") {
+        try {
+          rebaseResolved = await resolveRebaseConflict({ cwd, branch, output: combinedOutput });
+        } catch (resolveError) {
+          core.warning(`pushSignedCommits: custom rebase conflict resolver failed: ${getErrorMessage(resolveError)}`);
+        }
       }
 
-      // Recovery: if the failure was caused by missing objects in a shallow/
-      // partial clone, backfill the exact commit objects this rebase needs and
-      // retry once.
-      if (isPartialCloneObjectFailure(combinedOutput)) {
+      if (rebaseResolved) {
+        rebaseResult = await getGitExecOutput(["rebase", "--continue"], {
+          cwd,
+          env: { ...process.env, ...(gitAuthEnv || {}), GIT_EDITOR: "true" },
+          ignoreReturnCode: true,
+        });
+        if (rebaseResult.exitCode !== 0) {
+          try {
+            await execGitCommand(["rebase", "--abort"], { cwd });
+          } catch {
+            // Ignore cleanup failures.
+          }
+          const continueOutput = `${rebaseResult.stdout || ""}\n${rebaseResult.stderr || ""}`;
+          throw new Error(`${ERR_SYSTEM}: pushSignedCommits: resolved a rebase conflict for branch '${branch}' but could not continue the rebase. ` + `Root cause: ${continueOutput.trim()}`);
+        }
+      } else if (isPartialCloneObjectFailure(combinedOutput)) {
+        // Always abort the in-progress rebase before attempting recovery.
+        try {
+          await execGitCommand(["rebase", "--abort"], { cwd });
+        } catch {
+          // Ignore cleanup failures.
+        }
+        // Recovery: if the failure was caused by missing objects in a shallow/
+        // partial clone, backfill the exact commit objects this rebase needs and
+        // retry once.
         // Backfill the full object content (trees + blobs) of EXACTLY the
         // commits this rebase touches: the new GraphQL parent, the old replay
         // parent, and the current branch tip. Fetching these anchor commits
@@ -495,10 +618,10 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
         // which would download a large monorepo's entire history.
         let headOid;
         try {
-          const { stdout: headOut } = await exec.getExecOutput("git", ["rev-parse", "HEAD"], { cwd });
+          const { stdout: headOut } = await getGitExecOutput(["rev-parse", "HEAD"], { cwd });
           headOid = headOut.trim();
         } catch {
-          // If HEAD cannot be resolved, fall back to the known range anchors.
+          // HEAD cannot be resolved — ignored, fall back to the known range anchors.
         }
         const fetchTargets = [firstGraphqlParentOid, firstReplayParentOid, headOid].filter(sha => typeof sha === "string" && sha.length > 0);
         core.warning(`pushSignedCommits: rebase failed due to missing objects in a shallow/partial clone; ` + `backfilling object content for ${fetchTargets.length} anchor commit(s) directly from origin by SHA and retrying once`);
@@ -513,28 +636,35 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
           rebaseResult = await runRebase();
           if (rebaseResult.exitCode !== 0) {
             try {
-              await exec.exec("git", ["rebase", "--abort"], { cwd });
+              await execGitCommand(["rebase", "--abort"], { cwd });
             } catch {
               // Ignore cleanup failures.
             }
             const retryOutput = `${rebaseResult.stdout || ""}\n${rebaseResult.stderr || ""}`;
             throw new Error(
-              `pushSignedCommits: failed to rebase commit range onto current GraphQL parent (${firstGraphqlParentOid}) even after backfilling the required commit objects. ` +
+              `${ERR_SYSTEM}: pushSignedCommits: failed to rebase commit range onto current GraphQL parent (${firstGraphqlParentOid}) even after backfilling the required commit objects. ` +
                 `Resolve conflicts by rebasing/cherry-picking locally and retry. Root cause: ${retryOutput.trim()}`
             );
           }
         } else {
           throw new Error(
-            `pushSignedCommits: failed to rebase commit range onto current GraphQL parent (${firstGraphqlParentOid}); ` +
+            `${ERR_SYSTEM}: pushSignedCommits: failed to rebase commit range onto current GraphQL parent (${firstGraphqlParentOid}); ` +
               `the required commit objects could not be backfilled from a shallow/partial clone. ` +
               `Resolve conflicts by rebasing/cherry-picking locally and retry. Root cause: ${combinedOutput.trim()}`
           );
         }
       } else {
-        throw new Error(`pushSignedCommits: failed to rebase commit range onto current GraphQL parent (${firstGraphqlParentOid}). ` + `Resolve conflicts by rebasing/cherry-picking locally and retry. Root cause: ${combinedOutput.trim()}`);
+        try {
+          await execGitCommand(["rebase", "--abort"], { cwd });
+        } catch {
+          // Ignore cleanup failures.
+        }
+        throw new Error(
+          `${ERR_SYSTEM}: pushSignedCommits: failed to rebase commit range onto current GraphQL parent (${firstGraphqlParentOid}). ` + `Resolve conflicts by rebasing/cherry-picking locally and retry. Root cause: ${combinedOutput.trim()}`
+        );
       }
     }
-    const { stdout: rebasedRevListOut } = await exec.getExecOutput("git", ["rev-list", "--parents", "--topo-order", "--reverse", `${firstGraphqlParentOid}..HEAD`], { cwd });
+    const { stdout: rebasedRevListOut } = await getGitExecOutput(["rev-list", "--parents", "--topo-order", "--reverse", `${firstGraphqlParentOid}..HEAD`], { cwd });
     revListEntries = rebasedRevListOut
       .trim()
       .split("\n")
@@ -561,7 +691,7 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
       if (fields.length > 2) {
         const sha = fields[0];
         core.warning(`pushSignedCommits: merge commit ${sha} detected, refusing unsigned push fallback`);
-        throw new PushSignedCommitsUnsupportedShape("merge commit detected");
+        throw new PushSignedCommitsUnsupportedShape(`${ERR_VALIDATION}: merge commit detected`);
       }
     }
 
@@ -588,7 +718,7 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
       // Use git diff-tree --raw to obtain file mode information per changed file.
       // Format: :<srcMode> <dstMode> <srcHash> <dstHash> <status>[score]\t<path>[<\t><newPath>]
       // Fields: [0]=srcMode, [1]=dstMode, [2]=srcHash, [3]=dstHash, [4]=status
-      const { stdout: rawDiffOut } = await exec.getExecOutput("git", ["diff-tree", "-r", "--raw", sha], { cwd });
+      const { stdout: rawDiffOut } = await getGitExecOutput(["diff-tree", "-r", "--raw", sha], { cwd });
 
       for (const line of rawDiffOut.trim().split("\n").filter(Boolean)) {
         // Raw format lines start with ':'; skip the commit SHA header line and any other non-raw lines
@@ -614,7 +744,7 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
           // mode 160000 = gitlink (submodule); GitHub GraphQL createCommitOnBranch does not support submodules
           if (srcMode === "160000") {
             core.warning(`pushSignedCommits: submodule change detected in ${filePath}, refusing unsigned push fallback`);
-            throw new PushSignedCommitsUnsupportedShape("submodule change detected");
+            throw new PushSignedCommitsUnsupportedShape(`${ERR_VALIDATION}: submodule change detected`);
           }
           deletions.push({ path: filePath });
         } else if (status && status.startsWith("R")) {
@@ -627,11 +757,11 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
           deletions.push({ path: filePath });
           if (srcMode === "160000" || dstMode === "160000") {
             core.warning(`pushSignedCommits: submodule change detected in ${filePath} -> ${renamedPath}, refusing unsigned push fallback`);
-            throw new PushSignedCommitsUnsupportedShape("submodule change detected");
+            throw new PushSignedCommitsUnsupportedShape(`${ERR_VALIDATION}: submodule change detected`);
           }
           if (dstMode === "120000") {
             core.warning(`pushSignedCommits: symlink ${renamedPath} cannot be pushed as a signed commit, refusing unsigned push fallback`);
-            throw new PushSignedCommitsUnsupportedShape("symlink file mode requires git push fallback");
+            throw new PushSignedCommitsUnsupportedShape(`${ERR_VALIDATION}: symlink file mode requires git push fallback`);
           }
           if (dstMode === "100755") {
             core.warning(`pushSignedCommits: executable bit on ${renamedPath} will be lost in signed commit (GitHub GraphQL does not support mode 100755)`);
@@ -647,11 +777,11 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
           }
           if (dstMode === "160000") {
             core.warning(`pushSignedCommits: submodule change detected in ${copiedPath}, refusing unsigned push fallback`);
-            throw new PushSignedCommitsUnsupportedShape("submodule change detected");
+            throw new PushSignedCommitsUnsupportedShape(`${ERR_VALIDATION}: submodule change detected`);
           }
           if (dstMode === "120000") {
             core.warning(`pushSignedCommits: symlink ${copiedPath} cannot be pushed as a signed commit, refusing unsigned push fallback`);
-            throw new PushSignedCommitsUnsupportedShape("symlink file mode requires git push fallback");
+            throw new PushSignedCommitsUnsupportedShape(`${ERR_VALIDATION}: symlink file mode requires git push fallback`);
           }
           if (dstMode === "100755") {
             core.warning(`pushSignedCommits: executable bit on ${copiedPath} will be lost in signed commit (GitHub GraphQL does not support mode 100755)`);
@@ -662,11 +792,11 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
           // Added or Modified
           if (dstMode === "160000") {
             core.warning(`pushSignedCommits: submodule change detected in ${filePath}, refusing unsigned push fallback`);
-            throw new PushSignedCommitsUnsupportedShape("submodule change detected");
+            throw new PushSignedCommitsUnsupportedShape(`${ERR_VALIDATION}: submodule change detected`);
           }
           if (dstMode === "120000") {
             core.warning(`pushSignedCommits: symlink ${filePath} cannot be pushed as a signed commit, refusing unsigned push fallback`);
-            throw new PushSignedCommitsUnsupportedShape("symlink file mode requires git push fallback");
+            throw new PushSignedCommitsUnsupportedShape(`${ERR_VALIDATION}: symlink file mode requires git push fallback`);
           }
           if (dstMode === "100755") {
             core.warning(`pushSignedCommits: executable bit on ${filePath} will be lost in signed commit (GitHub GraphQL does not support mode 100755)`);
@@ -676,6 +806,10 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
         }
       }
 
+      if (additions.length + deletions.length > 4096) {
+        throw new PushSignedCommitsPolicyViolation(`${ERR_VALIDATION}: signed-commit payload exceeds the 4096 native file-change bound`);
+      }
+      validateSynthesizedFileChanges(additions, deletions, validationConfig);
       additionsMap.set(sha, additions);
       deletionsMap.set(sha, deletions);
     }
@@ -685,7 +819,17 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
     let lastOid;
     for (let i = 0; i < shas.length; i++) {
       const sha = shas[i];
+      const additions = additionsMap.get(sha) || [];
+      const deletions = deletionsMap.get(sha) || [];
+      const paths = [...additions, ...deletions].map(file => file.path);
       core.info(`pushSignedCommits: processing commit ${i + 1}/${shas.length} sha=${sha}`);
+
+      // Full commit message (subject + body)
+      const { stdout: msgOut } = await getGitExecOutput(["log", "-1", "--format=%B", sha], { cwd });
+      const message = msgOut.trim();
+      const headline = message.split("\n")[0];
+      const body = message.split("\n").slice(1).join("\n").trim();
+      core.info(`pushSignedCommits: commit message headline: "${headline}"`);
 
       // Determine the expected HEAD OID for this commit.
       // After the first signed commit, reuse the OID returned by the previous GraphQL
@@ -699,31 +843,80 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
         const oidResult = await lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken);
         expectedHeadOid = oidResult || "";
         if (!expectedHeadOid) {
+          if (requireExistingBranch) throw new Error(`${ERR_API}: Branch ${branch} no longer exists; refusing to recreate it`);
           // Branch does not exist on the remote yet.
           // createCommitOnBranch requires the branch to already exist – it does NOT auto-create branches.
-          // Resolve the parent OID, create the branch on the remote via the REST API,
-          // then proceed with the signed-commit mutation as normal.
+          // Create the first commit before publishing the ref, so branch-push CI
+          // never sees a new branch pointing at the base commit.
           core.info(`pushSignedCommits: branch ${branch} not yet on the remote, resolving parent OID for first commit`);
           if (baseRefOid !== undefined) {
             expectedHeadOid = baseRefOid;
             core.info(`pushSignedCommits: using baseRef OID for initial branch creation: ${expectedHeadOid}`);
           } else {
-            const { stdout: parentOut } = await exec.getExecOutput("git", ["rev-parse", `${sha}^`], { cwd });
+            const { stdout: parentOut } = await getGitExecOutput(["rev-parse", `${sha}^`], { cwd });
             expectedHeadOid = parentOut.trim();
           }
           if (!expectedHeadOid) {
             throw new Error(`${ERR_API}: Could not resolve OID for new branch ${branch}`);
           }
-          core.info(`pushSignedCommits: creating remote branch ${branch} at parent OID ${expectedHeadOid}`);
+          assertTransportUnchanged?.();
+          const parent = await githubClient.rest.git.getCommit({ owner, repo, commit_sha: expectedHeadOid });
+          const objectBatch = createClaimEffectBatch();
+          const createInitialObject = callback => withClaimEffectBatch(objectBatch, callback);
+          let createdCommit;
           try {
-            await githubClient.rest.git.createRef({
-              owner,
-              repo,
-              ref: `refs/heads/${branch}`,
-              sha: expectedHeadOid,
+            createdCommit = await createInitialObject(async () => {
+              /** @type {Array<{path: string, mode: "100644", type: "blob", sha: string | null}>} */
+              const tree = [];
+              for (const addition of additions) {
+                assertTransportUnchanged?.();
+                const blob = await withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths: [addition.path] }, () =>
+                  githubClient.rest.git.createBlob({ owner, repo, content: addition.contents, encoding: "base64" })
+                );
+                tree.push({ path: addition.path, mode: "100644", type: "blob", sha: blob.data.sha });
+              }
+              for (const deletion of deletions) tree.push({ path: deletion.path, mode: "100644", type: "blob", sha: null });
+              assertTransportUnchanged?.();
+              const treeOid = tree.length
+                ? (await withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths }, () => githubClient.rest.git.createTree({ owner, repo, base_tree: parent.data.tree.sha, tree }))).data.sha
+                : parent.data.tree.sha;
+              assertTransportUnchanged?.();
+              return withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths }, () => githubClient.rest.git.createCommit({ owner, repo, message, tree: treeOid, parents: [expectedHeadOid] }));
             });
+          } catch (error) {
+            discardClaimEffectBatch(objectBatch);
+            throw error;
+          }
+          const firstOid = createdCommit?.data?.sha;
+          if (typeof firstOid !== "string" || firstOid.length === 0) {
+            discardClaimEffectBatch(objectBatch);
+            throw new Error(`${ERR_API}: REST createCommit did not return a valid commit OID`);
+          }
+          if (createdCommit?.data?.verification?.verified !== true) {
+            discardClaimEffectBatch(objectBatch);
+            throw new PushSignedCommitsPolicyViolation(`${ERR_VALIDATION}: GitHub did not verify the initial commit signature; refusing to publish branch '${branch}'`);
+          }
+          core.info(`pushSignedCommits: creating remote branch ${branch} at first signed commit ${firstOid}`);
+          try {
+            assertTransportUnchanged?.();
+            await withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths }, () =>
+              githubClient.rest.git.createRef({
+                owner,
+                repo,
+                ref: `refs/heads/${branch}`,
+                sha: firstOid,
+              })
+            );
             core.info(`pushSignedCommits: remote branch ${branch} created successfully`);
+            lastOid = firstOid;
+            continue;
           } catch (createRefError) {
+            try {
+              assertTransportUnchanged?.();
+            } catch (error) {
+              discardClaimEffectBatch(objectBatch);
+              throw error;
+            }
             /** @type {any} */
             const err = createRefError;
             const status = err && typeof err === "object" ? err.status : undefined;
@@ -732,30 +925,36 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
             // GitHub returns 422 "Reference refs/heads/<branch> already exists". Treat that as success and continue.
             if (status === 422 && /reference.*already exists/i.test(message)) {
               core.info(`pushSignedCommits: remote branch ${branch} was created concurrently (422 Reference already exists); continuing with signed commits`);
-              const refreshedOid = await lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken);
+              let refreshedOid;
+              try {
+                refreshedOid = await lsRemoteHeadOid(branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken);
+              } catch (error) {
+                discardClaimEffectBatch(objectBatch);
+                throw error;
+              }
               if (!refreshedOid) {
+                discardClaimEffectBatch(objectBatch);
                 throw new Error(`${ERR_API}: Could not resolve remote branch OID for ${branch} after concurrent creation`);
               }
               expectedHeadOid = refreshedOid;
+              if (refreshedOid === firstOid) {
+                lastOid = firstOid;
+                continue;
+              }
+              discardClaimEffectBatch(objectBatch);
             } else {
+              discardClaimEffectBatch(objectBatch);
               throw createRefError;
             }
           }
         } else {
           core.info(`pushSignedCommits: using remote HEAD OID from ls-remote: ${expectedHeadOid}`);
         }
+        if (requireBaseRefMatch && expectedHeadOid !== baseRefOid) {
+          throw new Error(`${ERR_API}: ledger branch moved after transition validation`);
+        }
       }
 
-      // Full commit message (subject + body)
-      const { stdout: msgOut } = await exec.getExecOutput("git", ["log", "-1", "--format=%B", sha], { cwd });
-      const message = msgOut.trim();
-      const headline = message.split("\n")[0];
-      const body = message.split("\n").slice(1).join("\n").trim();
-      core.info(`pushSignedCommits: commit message headline: "${headline}"`);
-
-      const additions = additionsMap.get(sha) || [];
-      const deletions = deletionsMap.get(sha) || [];
-      validateSynthesizedFileChanges(additions, deletions, validationConfig);
       core.info(`pushSignedCommits: file changes: ${additions.length} addition(s), ${deletions.length} deletion(s)`);
 
       /** @type {any} */
@@ -767,11 +966,14 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
       };
 
       core.info(`pushSignedCommits: calling createCommitOnBranch mutation (expectedHeadOid=${expectedHeadOid})`);
-      const result = await githubClient.graphql(
-        `mutation($input: CreateCommitOnBranchInput!) {
-          createCommitOnBranch(input: $input) { commit { oid } }
-        }`,
-        { input }
+      assertTransportUnchanged?.();
+      const result = await withGitClaimEffects({ github: githubClient, repository: `${owner}/${repo}`, branch, paths }, () =>
+        githubClient.graphql(
+          `mutation($input: CreateCommitOnBranchInput!) {
+              createCommitOnBranch(input: $input) { commit { oid } }
+            }`,
+          { input }
+        )
       );
       const newOid = result && result.createCommitOnBranch && result.createCommitOnBranch.commit ? result.createCommitOnBranch.commit.oid : undefined;
       if (typeof newOid !== "string" || newOid.length === 0) {
@@ -783,9 +985,10 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
     core.info(`pushSignedCommits: all ${shas.length} commit(s) pushed as signed commits`);
     return lastOid ?? shas[shas.length - 1];
   } catch (err) {
+    assertTransportUnchanged?.();
     if (err instanceof PushSignedCommitsUnsupportedShape) {
       throw new Error(
-        `pushSignedCommits: refusing unsigned push for branch '${branch}': ${getErrorMessage(err)}. ` +
+        `${ERR_VALIDATION}: pushSignedCommits: refusing unsigned push for branch '${branch}': ${stripLeadingErrorCode(getErrorMessage(err))}. ` +
           `GitHub's createCommitOnBranch GraphQL mutation cannot represent merge commits, symlinks (mode 120000), ` +
           `submodule entries (mode 160000), or executable bits (mode 100755). ` +
           `Rewrite the commits to use only regular files (mode 100644) with no merge commits, ` +
@@ -794,13 +997,14 @@ async function pushSignedCommits({ githubClient, owner, repo, branch, baseRef, c
       );
     }
     if (err instanceof PushSignedCommitsPolicyViolation) {
-      throw new Error(`pushSignedCommits: refusing unsigned push for branch '${branch}': ${getErrorMessage(err)}`, { cause: err });
+      throw new Error(`${ERR_VALIDATION}: pushSignedCommits: refusing unsigned push for branch '${branch}': ${stripLeadingErrorCode(getErrorMessage(err))}`, { cause: err });
     }
     if (allowGitPushFallback === false) {
-      throw new Error(`pushSignedCommits: signed commit push failed for branch '${branch}' and git push fallback is disabled: ${getErrorMessage(err)}`, { cause: err });
+      const detail = getErrorMessage(err);
+      throw new Error(`${ERR_API}: pushSignedCommits: signed commit push failed for branch '${branch}' and git push fallback is disabled: ${detail}${getWorkflowPermissionHint(detail)}`, { cause: err });
     }
     core.warning(`pushSignedCommits: GraphQL signed push failed, falling back to git push: ${getErrorMessage(err)}`);
-    const fallbackSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken });
+    const fallbackSha = await pushBranchAndResolveHead({ branch, cwd, gitAuthEnv, pushRemoteUrl, pushToken, assertTransportUnchanged, requireExistingBranch });
     core.info(`pushSignedCommits: git push fallback completed, using pushed SHA ${fallbackSha}`);
     return fallbackSha;
   }

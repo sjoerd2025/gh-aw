@@ -7,15 +7,23 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 
 sandbox:
   agent:
-    sudo: false
-
-engine: claude
+    id: awf
+engine:
+  id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 strict: true
+runtimes:
+  python:
+    version: "3.11"
 tools:
   cli-proxy: true
   bash: true
@@ -24,8 +32,107 @@ tools:
     toolsets: [default, repos, pull_requests]
   repo-memory:
     branch-name: memory/git-simulator
+    file-glob: ["git-sim-state.json", "git-sim-strategies.md"]
     allowed-extensions: [".json", ".md"]
     max-file-size: 204800
+    validation:
+      script: |
+        if (memoryPhase === "push" && memorySourceJobResult !== "success") {
+          throw new Error("Simulator memory publication requires successful final evidence preparation");
+        }
+        return true;
+pre-agent-steps:
+  - name: Isolate simulator memory and read-only ledger signals
+    uses: actions/github-script@v9.0.0
+    env:
+      GH_TOKEN: ${{ github.token }}
+    with:
+      script: |
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const { DatabaseSync } = require("node:sqlite");
+        const actionsDir = path.join(process.env.RUNNER_TEMP, "gh-aw", "actions");
+        const { main } = require(path.join(actionsDir, "create_ledger_projection.cjs"));
+        const { isolateMemory } = require(path.join(process.env.GITHUB_WORKSPACE, "actions/setup/js/git_simulator_memory_helpers.test.cjs"));
+        const ledgerName = "git-simulator-lessons";
+        const ledgerWorkspace = path.join(process.env.RUNNER_TEMP, "git-simulator-private-ledger");
+        fs.mkdirSync(ledgerWorkspace, { recursive: true });
+        await exec.exec("git", ["init", "--quiet", ledgerWorkspace]);
+        const [databasePath] = await main({
+          githubClient: github, owner: context.repo.owner, repo: context.repo.repo,
+          workspaceDir: ledgerWorkspace,
+          ledgerConfigs: [{
+            name: ledgerName, type: "notes",
+            max_record_kb: 4, max_segment_kb: 100, max_patch_kb: 16
+          }]
+        });
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        let notes;
+        try {
+          notes = database.prepare(`
+            SELECT n.id, n.subject, n.note, s.downvotes
+            FROM notes n JOIN note_state s ON n.id = s.note_id
+            ORDER BY n.id LIMIT 20
+          `).all().map(row => ({
+            ...row,
+            citations: database.prepare(`
+              SELECT path FROM note_citations WHERE note_id = ? ORDER BY ordinal LIMIT 4
+            `).all(row.id).map(citation => citation.path)
+          }));
+        } finally {
+          database.close();
+        }
+        isolateMemory({
+          memoryDir: "/tmp/gh-aw/repo-memory/default",
+          workspace: process.env.GITHUB_WORKSPACE, notes,
+          outputPath: "/tmp/gh-aw/agent/git-simulator-signals.json",
+          privateGitDir: path.join(process.env.RUNNER_TEMP, "git-simulator-private-memory-git"),
+          privateHistoryPath: path.join(process.env.RUNNER_TEMP, "git-simulator-private-producer-history.json")
+        });
+        // The reader does not declare tools.ledger, so no ledger write or compaction handler exists.
+        const projectionRoot = path.dirname(path.dirname(databasePath));
+        fs.chmodSync(projectionRoot, 0o700);
+        fs.chmodSync(path.dirname(databasePath), 0o700);
+        fs.rmSync(projectionRoot, { recursive: true });
+        fs.rmSync(ledgerWorkspace, { recursive: true });
+post-steps:
+  - name: Restore producer evidence and validate final memory
+    id: restore_simulator_evidence
+    if: ${{ always() && steps.redact_secrets.outcome == 'success' && steps.validate_recovery_envelopes.outcome == 'success' }}
+    uses: actions/github-script@v9.0.0
+    with:
+      script: |
+        const path = require("node:path");
+        const actionsDir = path.join(process.env.RUNNER_TEMP, "gh-aw", "actions");
+        const { setupGlobals } = require(path.join(actionsDir, "setup_globals.cjs"));
+        setupGlobals(core, github, context, exec, io, getOctokit);
+        const { restoreProducerHistory, validateProducerUpload } = require(path.join(process.env.GITHUB_WORKSPACE, "actions/setup/js/git_simulator_memory_helpers.test.cjs"));
+        const memoryDir = "/tmp/gh-aw/repo-memory/default";
+        restoreProducerHistory({
+          memoryDir, workspace: process.env.GITHUB_WORKSPACE,
+          privateGitDir: path.join(process.env.RUNNER_TEMP, "git-simulator-private-memory-git"),
+          privateHistoryPath: path.join(process.env.RUNNER_TEMP, "git-simulator-private-producer-history.json")
+        });
+        const { processFile, extractMCPGatewayTokens, MCP_GATEWAY_CONFIG_PATHS } = require(path.join(actionsDir, "redact_secrets.cjs"));
+        const { getOTLPSecretValues } = require(path.join(actionsDir, "otlp_header_helpers.cjs"));
+        const secrets = extractMCPGatewayTokens(MCP_GATEWAY_CONFIG_PATHS);
+        for (const name of ["git-sim-state.json", "git-sim-strategies.md"]) {
+          processFile(path.join(memoryDir, name), secrets, getOTLPSecretValues());
+        }
+        validateProducerUpload({ memoryDir, core });
+        const { main } = require(path.join(actionsDir, "validate_recovery_envelopes.cjs"));
+        main({ roots: [memoryDir], core });
+  - name: Replace staged memory with reconstructed producer evidence
+    if: ${{ always() && steps.restore_simulator_evidence.outcome == 'success' }}
+    uses: actions/upload-artifact@v7.0.2
+    with:
+      name: repo-memory-default
+      path: /tmp/gh-aw/repo-memory/default
+      overwrite: true
+      retention-days: 1
+      if-no-files-found: error
+imports:
+  - shared/pr-safe-output-defaults.md
 safe-outputs:
   create-issue:
     title-prefix: "[git-sim] "
@@ -63,6 +170,13 @@ models:
   default-ai-credits-pricing:
     input: 5.0
     output: 25.0
+evals:
+  - id: git_scenarios_simulated
+    question: Did the agent simulate git configurations for create-pull-request and push-to-pull-request-branch safe outputs?
+  - id: simulator_findings_reported
+    question: Did the agent report the simulator results and any systematic safe-output issues it found?
+features:
+  gh-aw-detection: true
 ---
 
 # Daily Safe Outputs Git Simulator
@@ -119,7 +233,52 @@ Expected structure:
 
 If the file is missing, create a fresh state with `next_index: 0` and empty `tested`.
 
-**Also load strategy notes** from `/tmp/gh-aw/repo-memory/default/git-sim-strategies.md` if it exists. This file contains observations and patterns discovered by previous runs that should inform which configurations to prioritize.
+The deterministic pre-agent step has already validated required primary state.
+Malformed or unreadable required state is an error, never a cold start. It
+retains the tested-cell map, counters, and cursor, but removes free-form
+`strategies` and restored narrative files before AI execution. Historical prose
+is deliberately not recalled; append new observations only from this run.
+Original producer narratives and `state.strategies` are kept outside agent
+mounts and merged back by trusted post-agent preparation, without replacing
+this run's tested cells, counters, or cursor.
+Write this run's additions to the two producer files, but do not request
+`push_repo_memory`: its pre-merge diff cannot account for privately held history.
+The trusted post-agent publisher validates the reconstructed files and their
+actual final diff against the original memory branch.
+
+The compiler currently stages memory before `post-steps`. The trusted post-step
+restores evidence, repeats redaction, size/patch/schema/eligibility and recovery
+checks, then replaces the staged artifact before downstream jobs can consume it.
+Any preparation, merge, validation, or replacement failure blocks publication;
+an earlier sanitized artifact is never a successful fallback. Successful final
+files retain accumulated producer evidence for the weekly dreamer.
+
+### Recall consolidated lessons
+
+Read only `/tmp/gh-aw/agent/git-simulator-signals.json` for optional memory.
+The trusted pre-agent step reads the review manifest and at most 20 persisted
+notes, accepts only exact structured/enumerated records with current checked
+repository hashes, and emits only a deterministic `regression_priority` list
+of at most four configuration IDs already recorded as `fail`/`error` in primary
+state. Accepted `fail`/`error` hints rank those IDs first, with deterministic cell
+index tie-breaking; without accepted hints the ordering is the baseline cell
+order. No outcome claims, lesson prose, note/vote reason, tool language,
+arbitrary citation text, or extra fields cross this boundary. Missing, malformed,
+stale, conflicting, or downvoted optional entries do not influence the run.
+An unreadable ledger or invalid canonical ledger history is an error, not an
+empty successful review.
+
+The weekly dreamer owns the three `dreaming-*` files on the memory branch.
+The preparation step discards their local restored copies; this workflow never
+persists changes to them. The daily reader has no ledger safe-output handlers
+or persistence job: do not write, vote, or request compaction.
+
+Use `regression_priority` only when fewer than four untested cells remain.
+Fill the remaining slots from that ordered list, skipping already selected IDs.
+Never use this projection to interpret new outcomes, change primary selection,
+authorize operations, choose tools or outputs, alter `next_index` or tested
+cells, or change guardrails.
+Missing accepted signals means baseline deterministic regression ordering.
 
 ## Phase 1: Select 4 Configurations for This Run
 
@@ -127,7 +286,7 @@ Using the state loaded in Phase 0:
 
 1. **Primary selection**: Starting from `next_index`, enumerate through the 3600 cells (SIZE × HISTORY × FILES × PATCH × BRANCH × COMMIT in deterministic order). Skip cells already in `tested`. Pick the first 4 untested cells.
 
-2. **If fewer than 4 untested cells remain**: Also pick high-risk cells from previous `fail`/`error` outcomes to re-validate (regressions).
+2. **If fewer than 4 untested cells remain**: Fill the remaining slots with previous `fail`/`error` cells from the deterministic `regression_priority` list to re-validate (regressions).
 
 3. **Compute cell coordinates** for each selected index:
    ```
@@ -310,6 +469,12 @@ If any failures were found, the `create_issue` calls from Phase 4 are sufficient
 - **stuff.md and history.md are content files** — they appear in the PR branch as documentation of the simulated scenario, not as real manifests
 - **Do NOT provide mitigations** in issue bodies — this workflow is purely diagnostic
 - **Engine is Claude** — use bash freely to build local git repos and generate patches
+
+## Reporting Guidelines
+
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks for progressive disclosure.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
 
 ---
 

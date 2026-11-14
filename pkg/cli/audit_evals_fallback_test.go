@@ -12,6 +12,7 @@ import (
 )
 
 func TestNewAuditRunConfigMarksExplicitEvalsArtifactRequest(t *testing.T) {
+	t.Parallel()
 	cfg, err := newAuditRunConfig(123, AuditOptions{
 		ArtifactSets: []string{"evals"},
 		EvalsOnly:    false,
@@ -21,18 +22,21 @@ func TestNewAuditRunConfigMarksExplicitEvalsArtifactRequest(t *testing.T) {
 }
 
 func TestRenderCachedAuditIfAvailableBypassesCacheWhenExplicitEvalsArtifactRequested(t *testing.T) {
+	t.Parallel()
 	runOutputDir := t.TempDir()
 	summary := &RunSummary{
 		CLIVersion:  GetVersion(),
 		RunID:       123,
 		ProcessedAt: time.Now(),
-		Run: WorkflowRun{
-			DatabaseID: 123,
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID: 123,
+			},
 		},
 	}
 	require.NoError(t, saveRunSummary(runOutputDir, summary, false))
 
-	done, err := renderCachedAuditIfAvailable(context.Background(), auditRunConfig{
+	done, _, err := renderCachedAuditIfAvailable(context.Background(), auditRunConfig{
 		runID:                  123,
 		outputDir:              runOutputDir,
 		verbose:                false,

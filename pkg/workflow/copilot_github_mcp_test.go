@@ -225,9 +225,9 @@ func TestGetGitHubGuardPoliciesToolCallLimits(t *testing.T) {
 					"tool-call-limits": map[string]int{
 						"issue_read": 1,
 					},
-					"blocked-users":   guardExprSentinel + "${{ steps.parse-guard-vars.outputs.blocked_users }}",
-					"trusted-users":   guardExprSentinel + "${{ steps.parse-guard-vars.outputs.trusted_users }}",
-					"approval-labels": guardExprSentinel + "${{ steps.parse-guard-vars.outputs.approval_labels }}",
+					"blocked-users":   guardExprSentinel + "${GH_AW_GUARD_BLOCKED_USERS}",
+					"trusted-users":   guardExprSentinel + "${GH_AW_GUARD_TRUSTED_USERS}",
+					"approval-labels": guardExprSentinel + "${GH_AW_GUARD_APPROVAL_LABELS}",
 				},
 			},
 		},
@@ -243,14 +243,14 @@ func TestGetGitHubGuardPoliciesToolCallLimits(t *testing.T) {
 			},
 			expected: map[string]any{
 				"allow-only": map[string]any{
-					"repos":         "github/gh-aw",
+					"repos":         []string{"github/gh-aw"},
 					"min-integrity": "approved",
 					"tool-call-limits": map[string]int{
 						"issue_read": 2,
 					},
-					"blocked-users":   guardExprSentinel + "${{ steps.parse-guard-vars.outputs.blocked_users }}",
-					"trusted-users":   guardExprSentinel + "${{ steps.parse-guard-vars.outputs.trusted_users }}",
-					"approval-labels": guardExprSentinel + "${{ steps.parse-guard-vars.outputs.approval_labels }}",
+					"blocked-users":   guardExprSentinel + "${GH_AW_GUARD_BLOCKED_USERS}",
+					"trusted-users":   guardExprSentinel + "${GH_AW_GUARD_TRUSTED_USERS}",
+					"approval-labels": guardExprSentinel + "${GH_AW_GUARD_APPROVAL_LABELS}",
 				},
 			},
 		},
@@ -261,6 +261,21 @@ func TestGetGitHubGuardPoliciesToolCallLimits(t *testing.T) {
 			assert.Equal(t, tt.expected, getGitHubGuardPolicies(tt.githubTool))
 		})
 	}
+}
+
+func TestRenderGitHubGuardPoliciesDefersRuntimeExpressions(t *testing.T) {
+	var output strings.Builder
+	renderGuardPoliciesJSON(&output, getGitHubGuardPolicies(map[string]any{
+		"allowed": []any{
+			map[string]any{"name": "issue_read", "max-calls": 1},
+		},
+	}), "")
+
+	result := output.String()
+	for _, field := range []string{"blocked-users", "trusted-users", "approval-labels"} {
+		assert.Contains(t, result, `"`+field+`": ${GH_AW_GUARD_`+strings.ToUpper(strings.ReplaceAll(field, "-", "_"))+`}`)
+	}
+	assert.NotContains(t, result, guardExprSentinel)
 }
 
 func TestParseGitHubToolAllowedObjectEntries(t *testing.T) {

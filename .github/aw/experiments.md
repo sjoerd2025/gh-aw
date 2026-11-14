@@ -83,7 +83,7 @@ experiments:
 - `weight:` — non-negative integers, same length as `variants`. Enables weighted-random selection. `[2, 1, 1]` = 50/25/25. All zeros → always returns control (first variant). Omit for round-robin.
 - `start_date:` / `end_date:` — ISO-8601 `YYYY-MM-DD`. Outside this window, control variant is returned and counters do not increment.
 - `description:`, `metric:`, `issue:`, `hypothesis:` — governance metadata (no runtime effect).
-- `guardrail_metrics:` — array; if any guardrail fails for any variant, experiment is auto-abandoned. Each entry:
+- `guardrail_metrics:` — array; once minimum samples and supported observations are available for every mandatory guardrail, any failure produces a deterministic core decision of `REJECT`. Each entry:
   - `name` (required) — metric identifier.
   - `threshold` (required) — comparison string (`">=0.95"`, `"==0"`) or bare number paired with `direction`.
   - `direction` (optional, `"min"`/`"max"`) — lower-better vs higher-better. With bare numeric `threshold`: `min` → metric ≤ threshold; `max` → metric ≥ threshold.
@@ -136,8 +136,9 @@ Use `${{ experiments.tone }}` tone when writing the issue body.
 1. **One dimension** per experiment.
 2. **Falsifiable hypothesis**.
 3. **Primary metric** measurable from workflow run data (artifacts, outputs, duration, tokens). Prefer `eval:<id>` / `evals.<id>` when success is best measured as a YES/NO question.
-4. **Guardrail metrics** — things that must not degrade. Use `direction: min` + bare number for lower-is-better rates, or `">=0.95"` for higher-is-better.
-5. **Sample size estimate** per variant.
+4. **Pair the experiment with an eval.** Add at least one `evals:` question that checks whether the assigned variant's intended effect actually shows up in the output (e.g., "does the report follow the STE writing rules?"), and reference it from `metric` or `secondary_metrics` as `eval:<id>`. Purely quantitative metrics (token count, duration, engagement score) don't verify *why* an effect happened — the paired eval does.
+5. **Guardrail metrics** — things that must not degrade. Use `direction: min` + bare number for lower-is-better rates, or `">=0.95"` for higher-is-better.
+6. **Sample size estimate** per variant.
 
 Prefer high-frequency workflows for faster significance.
 
@@ -151,7 +152,7 @@ Prefer high-frequency workflows for faster significance.
 experiments:
   prompt_style: [concise, detailed]
   reasoning_depth: [shallow, deep]
-  output_format: [bullets, prose, table]
+  output_format: [bullets, prose, table, ste]
   tone: [formal, casual]
 ```
 
@@ -162,6 +163,8 @@ Use `{{#if experiments.prompt_style == "concise" }}` blocks to swap prompt instr
 **Typical metrics**: output quality, AI credits, success rate, output length.
 
 When `metric` references `eval:<id>` or `evals.<id>`, declare that eval question under `evals:`. `gh aw experiments analyze` will then show both the metric question text and observed eval YES/NO/UNKNOWN results.
+
+`ste` (Simplified Technical English) is a text-style variant worth testing alongside `bullets`/`prose`/`table`. It constrains the prompt to a small set of writing rules — short sentences (≤20 words), one instruction or fact per sentence, active voice, present tense, familiar vocabulary, and spelled-out acronyms on first use — to test whether simplified phrasing improves readability, engagement, or token efficiency versus richer prose/table formats.
 
 ### Engine & Model
 
@@ -285,6 +288,34 @@ experiments:
 4. **Run** — check activation job step summary for variant assignment.
 5. **Analyse** — once min sample size reached, compare distributions; for eval-backed metrics, use `gh aw experiments analyze <workflow>` to inspect the resolved question and current eval outcomes.
 6. **Conclude** — rewrite baseline to winning variant, remove `experiments:`, recompile.
+
+## Continual Experiment Ramps
+
+`continual:` is experimental. It provides deterministic control/candidate
+assignment with a runtime-managed traffic ramp. The first variant is the control
+and the second is the candidate. Existing experiments without this block keep
+their current behavior.
+
+```yaml
+experiments:
+  optimize_tool_use:
+    variants: [control, candidate]
+    metric: eval:quality
+    min_samples: 20
+    continual:
+      seed: tool-use-v1
+      ramp: [10, 25, 50]
+```
+
+Assignment occurs in the activation job before agent execution. It hashes the seed,
+experiment name, repository, workflow, and run ID. The activation job advances the
+ramp after each `min_samples` candidate assignments and stores the current stage on
+the experiment branch, leaving the workflow source immutable. Each decision logs
+the stage, assignment counts, active weights, and selected variant.
+
+The ramp only changes candidate traffic; it does not evaluate outcomes or promote a
+winner. Use the existing experiment analysis commands and metrics to decide whether
+to stop the experiment or make a variant permanent.
 
 ---
 

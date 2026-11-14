@@ -5,24 +5,24 @@ sidebar:
   order: 750
 ---
 
-The `gh aw compile --dependabot` command scans workflows for runtime tools (`npx`, `pip install`, `go install`), generates dependency manifests (`package.json`, `requirements.txt`, `go.mod`), and configures Dependabot to monitor for updates
+The `gh aw compile --dependabot` command scans workflows for runtime tools (`npx`, `pip install`, `go install`) and agentic engine packages, generates dependency manifests (`package.json`, `requirements.txt`, `go.mod`), and configures Dependabot to monitor for updates and security alerts.
+
+Engine entries use the effective installed version: `engine.version` when set, otherwise the compiler default. Copilot CLI releases are tracked through `@github/copilot`; Copilot SDK packages use their independently pinned SDK version. Declarative engines can declare npm, pip, or Go installation metadata. Non-package engines and dynamic GitHub Actions version expressions are not represented as engine package dependencies.
 
 ## Usage
 
 Run `gh aw compile --dependabot` to compile all workflows and generate manifests in `.github/workflows/`.
 
-> [!IMPORTANT]
-> Must compile **all workflows** - cannot be used with specific files or `--dir` flag.
-
 **Prerequisites**: Node.js/npm required for `package-lock.json` generation. Pip and Go manifests generate without additional tools.
 
 ## Compiler-managed `gh-aw-actions` ignore rule
 
-`gh aw compile` always reconciles the compiler-managed ignore rule for `github/gh-aw-actions` when your repository already has a `github-actions` update block in `.github/dependabot.yml` (this is not limited to `--dependabot` runs).
+`gh aw compile` always reconciles the compiler-managed ignore rule for `github/gh-aw-actions/*` when your repository already has a `github-actions` update block in `.github/dependabot.yml` (this is not limited to `--dependabot` runs).
 
 - No-op if `.github/dependabot.yml` does not exist
 - No-op if there is no `package-ecosystem: github-actions` update block
 - Preserves user-defined `ignore` entries
+- The wildcard reflects the repository that provides the reusable actions: `github/gh-aw-actions/*` by default, or `<owner>/<repo>/*` when `gh aw compile --actions-repo <owner>/<repo>` overrides the actions repository
 
 ```yaml
 updates:
@@ -31,7 +31,7 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      - dependency-name: "github/gh-aw-actions" # Managed by gh aw compile. Version-locked to the gh-aw compiler; do not bump.
+      - dependency-name: "github/gh-aw-actions/*" # Managed by gh aw compile. Version-locked to the gh-aw compiler; do not bump.
       - dependency-name: "actions/checkout" # user-defined, preserved
 ```
 
@@ -51,6 +51,8 @@ All ecosystems update `.github/dependabot.yml` with weekly update schedules. Exi
 > **Never merge Dependabot PRs that only modify manifest files.** These changes are overwritten on next compilation.
 
 **Correct workflow**: Update source `.md` files, then recompile to regenerate manifests.
+
+For engine alerts, update `engine.version` in affected workflows, or upgrade gh-aw to obtain newer engine defaults, then run `gh aw compile --dependabot`. SDK defaults are updated through gh-aw, not `engine.version`.
 
 ```bash
 # Find affected workflows
@@ -115,7 +117,7 @@ Updated dependency: [name@version]
 | **Dependency not detected** | Avoid shell variables (`${TOOL}`); use literal package names |
 | **Dependabot not opening PRs** | Verify `.github/dependabot.yml` is valid YAML and manifest files exist |
 
-## Related Documentation
+## Learn More
 
 - [CLI Commands](/gh-aw/setup/cli/#compile) - Complete compile command reference
 - [Compilation Process](/gh-aw/reference/compilation-process/) - How compilation works

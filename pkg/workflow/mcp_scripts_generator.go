@@ -50,42 +50,6 @@ func GenerateMCPScriptsToolsConfig(mcpScripts *MCPScriptsConfig) string {
 	for _, toolName := range toolNames {
 		toolConfig := mcpScripts.Tools[toolName]
 
-		// Build input schema
-		inputSchema := map[string]any{
-			"type":       "object",
-			"properties": make(map[string]any),
-		}
-
-		props, ok := inputSchema["properties"].(map[string]any)
-		if !ok {
-			props = make(map[string]any)
-			inputSchema["properties"] = props
-		}
-		var required []string
-
-		// Sort input names for stable output
-		inputNames := sliceutil.SortedKeys(toolConfig.Inputs)
-
-		for _, paramName := range inputNames {
-			param := toolConfig.Inputs[paramName]
-			propDef := map[string]any{
-				"type":        param.Type,
-				"description": param.Description,
-			}
-			if param.Default != nil {
-				propDef["default"] = param.Default
-			}
-			props[paramName] = propDef
-			if param.Required {
-				required = append(required, paramName)
-			}
-		}
-
-		sort.Strings(required)
-		if len(required) > 0 {
-			inputSchema["required"] = required
-		}
-
 		// Determine handler path based on script type
 		var handler string
 		if toolConfig.Script != "" {
@@ -98,22 +62,6 @@ func GenerateMCPScriptsToolsConfig(mcpScripts *MCPScriptsConfig) string {
 			handler = toolName + ".go"
 		}
 
-		// Build env list of required environment variables (not actual secrets)
-		// This documents which env vars the tool needs, but doesn't store secret values
-		// The actual values are passed as environment variables and accessed via process.env
-		var envRefs map[string]string
-		if len(toolConfig.Env) > 0 {
-			envRefs = make(map[string]string)
-			// Sort env var names for stable output
-			envVarNames := sliceutil.SortedKeys(toolConfig.Env)
-
-			for _, envVarName := range envVarNames {
-				// Store just the environment variable name without $ prefix or secret value
-				// Handlers access the actual value via process.env[envVarName] at runtime
-				envRefs[envVarName] = envVarName
-			}
-		}
-
 		var dependencies []string
 		if len(toolConfig.Dependencies) > 0 {
 			dependencies = append([]string(nil), toolConfig.Dependencies...)
@@ -123,10 +71,10 @@ func GenerateMCPScriptsToolsConfig(mcpScripts *MCPScriptsConfig) string {
 		config.Tools = append(config.Tools, MCPScriptsToolJSON{
 			Name:         toolName,
 			Description:  toolConfig.Description,
-			InputSchema:  inputSchema,
+			InputSchema:  generateMCPScriptInputSchema(toolConfig.Inputs),
 			Handler:      handler,
 			Dependencies: dependencies,
-			Env:          envRefs,
+			Env:          generateMCPScriptEnvRefs(toolName, toolConfig.Env),
 			Timeout:      toolConfig.Timeout,
 		})
 	}
@@ -138,6 +86,53 @@ func GenerateMCPScriptsToolsConfig(mcpScripts *MCPScriptsConfig) string {
 	}
 	mcpScriptsGeneratorLog.Printf("Generated tools.json config: size=%d bytes", len(jsonBytes))
 	return string(jsonBytes)
+}
+
+func generateMCPScriptInputSchema(inputs map[string]*MCPScriptParam) map[string]any {
+	props := make(map[string]any)
+	schema := map[string]any{
+		"type":       "object",
+		"properties": props,
+	}
+	var required []string
+	for _, name := range sliceutil.SortedKeys(inputs) {
+		param := inputs[name]
+		prop := map[string]any{
+			"type":        param.Type,
+			"description": param.Description,
+		}
+		if param.Default != nil {
+			prop["default"] = param.Default
+		}
+		if param.Items != nil {
+			prop["items"] = param.Items
+		}
+		props[name] = prop
+		if param.Required {
+			required = append(required, name)
+		}
+	}
+	sort.Strings(required)
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema
+}
+
+// Hex encoding preserves distinct tool/name pairs without sanitization collisions.
+func mcpScriptEnvBindingName(toolName, envName string) string {
+	return fmt.Sprintf("GH_AW_MCP_SCRIPTS_ENV_%x_%x", toolName, envName)
+}
+
+func generateMCPScriptEnvRefs(toolName string, env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	refs := make(map[string]string)
+	for _, name := range sliceutil.SortedKeys(env) {
+		refs[name] = mcpScriptEnvBindingName(toolName, name)
+	}
+	return refs
 }
 
 // GenerateMCPScriptsMCPServerScript generates the entry point script for the mcp-scripts MCP server
@@ -159,11 +154,12 @@ const configPath = path.join(__dirname, "tools.json");
 
 // Get port and API key from environment variables
 const port = parseInt(process.env.GH_AW_MCP_SCRIPTS_PORT || "3000", 10);
-const apiKey = process.env.GH_AW_MCP_SCRIPTS_API_KEY || "";
+const apiKey = process.env.GH_AW_MCP_SCRIPTS_API_KEY;
 
 // Start the HTTP server
 startHttpServer(configPath, {
   port: port,
+  apiKey: apiKey,
   stateless: true,
   logDir: "${RUNNER_TEMP}/gh-aw/mcp-scripts/logs"
 }).catch(error => {
@@ -198,7 +194,7 @@ func GenerateMCPScriptJavaScriptToolScript(toolConfig *MCPScriptToolConfig) stri
 	inputNamesForDoc := sliceutil.SortedKeys(toolConfig.Inputs)
 	for _, paramName := range inputNamesForDoc {
 		param := toolConfig.Inputs[paramName]
-		fmt.Fprintf(&sb, " * @param {%s} inputs.%s - %s\n", param.Type, paramName, param.Description)
+		sb.WriteString(" * @param {" + string(param.Type) + "} inputs." + paramName + " - " + param.Description + "\n")
 	}
 	sb.WriteString(" * @returns {Promise<any>} Tool result\n")
 	sb.WriteString(" */\n")
@@ -217,7 +213,7 @@ func GenerateMCPScriptJavaScriptToolScript(toolConfig *MCPScriptToolConfig) stri
 			}
 		}
 		sort.Strings(paramNames)
-		fmt.Fprintf(&sb, "  const { %s } = inputs || {};\n\n", strings.Join(paramNames, ", "))
+		sb.WriteString("  const { " + strings.Join(paramNames, ", ") + " } = inputs || {};\n\n")
 	}
 
 	// Indent the user's script code
@@ -284,8 +280,7 @@ func GenerateMCPScriptPythonToolScript(toolConfig *MCPScriptToolConfig) string {
 			if param.Default != nil {
 				defaultValue = fmt.Sprintf(", default=%v", param.Default)
 			}
-			fmt.Fprintf(&sb, "# %s = inputs.get('%s'%s)  # %s\n",
-				stringutil.SanitizePythonVariableName(paramName), paramName, defaultValue, param.Description)
+			sb.WriteString("# " + stringutil.SanitizePythonVariableName(paramName) + " = inputs.get('" + paramName + "'" + defaultValue + ")  # " + param.Description + "\n")
 		}
 		sb.WriteString("\n")
 	}
@@ -334,7 +329,7 @@ func GenerateMCPScriptGoToolScript(toolConfig *MCPScriptToolConfig) string {
 		inputNames := sliceutil.SortedKeys(toolConfig.Inputs)
 		for _, paramName := range inputNames {
 			param := toolConfig.Inputs[paramName]
-			fmt.Fprintf(&sb, "\t// %s := inputs[\"%s\"]  // %s\n", stringutil.SanitizePythonVariableName(paramName), paramName, param.Description)
+			sb.WriteString("\t// " + stringutil.SanitizePythonVariableName(paramName) + " := inputs[\"" + paramName + "\"]  // " + param.Description + "\n")
 		}
 		sb.WriteString("\n")
 	}

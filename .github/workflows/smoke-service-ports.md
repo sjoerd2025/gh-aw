@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test to validate --allow-host-service-ports with Redis service container
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-service-ports
     strategy: centralized
@@ -10,18 +11,24 @@ on:
   workflow_dispatch:
   status-comment: true
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
 name: Smoke Service Ports
-engine: copilot
+engine:
+  id: pi
+  fallback-models:
+    - copilot/gpt-5.6-luna
+    - copilot/claude-haiku-5.5
+model: copilot/gpt-5.3-codex
 strict: true
 sandbox:
   agent:
-    legacy-security: enable
+    runtime: docker-sudo-iptables
 services:
   redis:
-    image: redis:7
+    image: redis:7@sha256:44960b3100c48159a66d28c18b0588c193492e25f7551d60e51dd464fc3eca5b
     ports:
       - 6379:6379
     options: >-
@@ -36,6 +43,13 @@ network:
 tools:
   bash:
     - "*"
+evals:
+  - id: redis_ping
+    question: Does the output show a PONG response from the Redis service at host.docker.internal port 6379?
+  - id: redis_roundtrip
+    question: Does the output show that GET smoke_test returned the exact service-ports-ok value written by SET?
+  - id: redis_info
+    question: Does the output show Redis server information retrieved from the host service rather than merely claiming connectivity?
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     add-comment:
@@ -50,13 +64,17 @@ timeout-minutes: 5
 imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: agent-stdio
 features:
   gh-aw-detection: false
 ---
 
 # Smoke Test: Service Ports (Redis)
 
-**Purpose:** Validate that the `--allow-host-service-ports` feature works end-to-end. This workflow opts into `legacy-security: enable` so the compiler can configure AWF to allow traffic to the Redis service port.
+**Purpose:** Validate that the `--allow-host-service-ports` feature works end-to-end. This workflow uses `runtime: docker-sudo-iptables` so the compiler can configure AWF to allow traffic to the Redis service port.
 
 **IMPORTANT:** Inside AWF's sandbox, you must connect to services via `host.docker.internal` (not `localhost`). The service containers run on the host, and AWF routes traffic through the host gateway. Since the workflow maps port 6379:6379, port 6379 should work. Keep all outputs concise.
 

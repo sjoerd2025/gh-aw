@@ -18,6 +18,8 @@ safe-outputs:
 
 This separation provides an audit trail, limits blast radius if an agent misbehaves, supports compliance approval gates, and defends against prompt injection. Safe outputs add one extra job but provide critical safety guarantees.
 
+The compiler adds `actions: read` to support its generated workflow freshness check. By contrast, `copilot-requests: write` is an authored top-level permission that workflow authors opt into for organization-billed Copilot inference; it is not added as a compiler default.
+
 ## Permission Scopes
 
 Key read permission scopes include:
@@ -26,19 +28,20 @@ Key read permission scopes include:
 - `issues` (issue management)
 - `pull-requests` (PR management)
 - `discussions` (discussions and comments)
-- `actions` (workflow control)
+- `actions` (workflow control; gh-aw uses `actions: read` for its generated workflow freshness check)
 - `checks` (checks and statuses)
 - `deployments` (deployment management)
 - `packages` (package management)
 - `pages` (GitHub Pages management)
 - `statuses` (commit status management)
+- `attestations` (artifact attestations)
 
 See [GitHub's permissions reference](https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs) for the complete list.
 
 **Shorthand Options:**
 
 - **`read-all`**: Read access to all scopes (useful for inspection workflows)
-- **`{}`**: No permissions (for computation-only workflows)
+- **`{}`** or **`none`**: No permissions (for computation-only workflows)
 
 ### GitHub App-Only Permissions
 
@@ -48,7 +51,7 @@ Certain permission scopes require [additional authentication](/gh-aw/reference/g
 
 **Repository-level** (repository configuration and access):
 `administration`, `environments`, `git-signing`, `workflows`, `repository-hooks`,
-`single-file`, `codespaces`, `repository-custom-properties`
+`single-file`, `codespaces`, `repository-custom-properties`, `secret-scanning-alerts`
 
 **Organization-level** (organization membership and settings):
 `organization-projects`, `members`, `organization-administration`, `team-discussions`,
@@ -79,6 +82,10 @@ permissions:
 
 This permission does not require safe-outputs.
 
+The compiler emits an informational reminder to validate OIDC audiences and
+cloud-provider trust policies. The reminder does not count as a warning or
+block warnings-as-errors validation, including `gh aw compile --dry-run`.
+
 ### Special Permission: `copilot-requests: write`
 
 The `copilot-requests: write` permission enables Copilot inference using the built-in GitHub Actions token. This is the recommended way to authenticate Copilot for workflows running in organizations with a Copilot subscription.
@@ -93,7 +100,7 @@ When `copilot-requests: write` is set, gh-aw uses the GitHub Actions token for a
 
 The only valid value is `write`. See [Authentication → `copilot-requests: write` permission](/gh-aw/reference/auth/#copilot-requests-write-permission) for setup details and prerequisites.
 
-## Related Documentation
+## Learn More
 
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Secure write operations with content sanitization
 - [Security Guide](/gh-aw/introduction/architecture/) - Security best practices and permission strategies

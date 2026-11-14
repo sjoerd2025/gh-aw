@@ -1,7 +1,21 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { spawn } from "child_process";
+
+const originalRunnerTemp = process.env.RUNNER_TEMP;
+const localRunnerTemp = originalRunnerTemp ? null : fs.mkdtempSync(path.join(os.tmpdir(), "gh-aw-runner-temp-"));
+if (localRunnerTemp) {
+  process.env.RUNNER_TEMP = localRunnerTemp;
+}
+
+afterAll(() => {
+  if (localRunnerTemp) {
+    fs.rmSync(localRunnerTemp, { recursive: true, force: true });
+    delete process.env.RUNNER_TEMP;
+  }
+});
 
 // Check if ${RUNNER_TEMP}/gh-aw/safeoutputs is writable (only available in agent container)
 function canWriteToDefaultPath() {
@@ -22,16 +36,17 @@ function canWriteToDefaultPath() {
 const canWriteDefault = canWriteToDefaultPath();
 
 // Skip tests that require /opt access when running locally without permissions
-(describe.skipIf(!canWriteDefault).sequential("safe_outputs_mcp_server.cjs defaults handling", () => {
+(describe.skipIf(!canWriteDefault)("safe_outputs_mcp_server.cjs defaults handling", () => {
   let originalEnv, tempConfigFile, tempOutputDir;
   (beforeEach(() => {
     ((originalEnv = { ...process.env }),
-      (tempOutputDir = path.join("/tmp", `test_safe_outputs_defaults_${Date.now()}`)),
+      (process.env.DEBUG = "safeoutputs"),
+      (tempOutputDir = path.join(process.env.RUNNER_TEMP, `test_safe_outputs_defaults_${Date.now()}`)),
       fs.mkdirSync(tempOutputDir, { recursive: !0 }),
       (tempConfigFile = path.join(tempOutputDir, "config.json")),
       fs.existsSync(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`) || fs.mkdirSync(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`, { recursive: !0 }));
     const defaultConfigPath = path.join(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`, "config.json");
-    fs.writeFileSync(defaultConfigPath, JSON.stringify({ create_issue: !0, missing_tool: !0 }));
+    fs.writeFileSync(defaultConfigPath, JSON.stringify({ create_issue: !0, report_missing_tool: !0 }));
     const toolsJsonPath = path.join(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`, "tools.json"),
       toolsJsonContent = fs.readFileSync(path.join(__dirname, "safe_outputs_tools.json"), "utf8");
     fs.writeFileSync(toolsJsonPath, toolsJsonContent);
@@ -49,7 +64,7 @@ const canWriteDefault = canWriteToDefaultPath();
         delete process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH,
         fs.existsSync(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`) || fs.mkdirSync(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`, { recursive: !0 }));
       const defaultConfigPath = path.join(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`, "config.json");
-      fs.writeFileSync(defaultConfigPath, JSON.stringify({ create_issue: !0, missing_tool: !0 }));
+      fs.writeFileSync(defaultConfigPath, JSON.stringify({ create_issue: !0, report_missing_tool: !0 }));
       const serverPath = path.join(__dirname, "safe_outputs_mcp_server.cjs");
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -140,14 +155,14 @@ const canWriteDefault = canWriteToDefaultPath();
       });
     }),
     it("should create output directory even when GH_AW_SAFE_OUTPUTS is set", async () => {
-      const testOutputDir = path.join("/tmp", `test_safe_outputs_${Date.now()}_envset`),
+      const testOutputDir = path.join(process.env.RUNNER_TEMP, `test_safe_outputs_${Date.now()}_envset`),
         testOutputFile = path.join(testOutputDir, "outputs.jsonl");
       ((process.env.GH_AW_SAFE_OUTPUTS = testOutputFile),
         delete process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH,
         fs.existsSync(testOutputDir) && fs.rmSync(testOutputDir, { recursive: !0, force: !0 }),
-        fs.existsSync("/tmp/gh-aw/safeoutputs") || fs.mkdirSync("/tmp/gh-aw/safeoutputs", { recursive: !0 }));
-      const defaultConfigPath = path.join("/tmp/gh-aw/safeoutputs", "config.json");
-      fs.writeFileSync(defaultConfigPath, JSON.stringify({ create_issue: !0, missing_tool: !0 }));
+        fs.existsSync(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`) || fs.mkdirSync(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`, { recursive: !0 }));
+      const defaultConfigPath = path.join(`${process.env.RUNNER_TEMP}/gh-aw/safeoutputs`, "config.json");
+      fs.writeFileSync(defaultConfigPath, JSON.stringify({ create_issue: !0, report_missing_tool: !0 }));
       const serverPath = path.join(__dirname, "safe_outputs_mcp_server.cjs");
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -169,7 +184,7 @@ const canWriteDefault = canWriteToDefaultPath();
       });
     }));
 }),
-  describe.sequential("safe_outputs_mcp_server.cjs branch parameter handling", () => {
+  describe("safe_outputs_mcp_server.cjs branch parameter handling", () => {
     const toolsJsonPath = path.join(__dirname, "safe_outputs_tools.json");
     (it("should have optional branch parameter for create_pull_request", async () => {
       const tempConfigPath = path.join("/tmp", `test-config-${Date.now()}-${Math.random().toString(36).substring(7)}.json`);
@@ -276,7 +291,7 @@ const canWriteDefault = canWriteToDefaultPath();
         });
       }));
   }),
-  describe.sequential("safe_outputs_mcp_server.cjs tool call response format", () => {
+  describe("safe_outputs_mcp_server.cjs tool call response format", () => {
     const toolsJsonPath = path.join(__dirname, "safe_outputs_tools.json");
     // Provide a target repo so the create_issue handler's resolveAndValidateRepo
     // succeeds without depending on the ambient CI env (GITHUB_REPOSITORY).

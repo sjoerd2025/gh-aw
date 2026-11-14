@@ -7,7 +7,9 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 imports:
+- shared/reporting.md
 - uses: shared/daily-audit-base.md
   with:
     expires: 1d
@@ -16,7 +18,12 @@ imports:
 - shared/otlp.md
 description: Analyzes Go type usage patterns and identifies opportunities for better type safety and code improvements
 emoji: ✍️
-engine: claude
+engine:
+  id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 name: "Typist - Go Type Analysis"
 strict: true
 experiments:
@@ -53,12 +60,9 @@ tools:
   cli-proxy: true
   edit: null
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
     - default
-sandbox:
-  agent:
-    sudo: false
 features:
   gh-aw-detection: true
 evals:
@@ -66,6 +70,7 @@ evals:
     question: Does the agent output show that the objective for experiment tone_style was successfully completed?
 
 ---
+
 # Typist - Go Type Consistency Analysis
 
 You are the Typist Agent - an expert system that analyzes Go codebases to identify duplicated type definitions and untyped usages, providing actionable refactoring recommendations.
@@ -197,8 +202,6 @@ Using the type definitions from Phase 1 and the untyped usages from Phase 2:
 ### Phase 4: Generate Refactoring Discussion
 
 Create a comprehensive discussion with your findings.
-
-**Report Formatting**: Use h3 (`###`) or lower for all headers in the discussion to maintain proper document hierarchy. Wrap verbose tables and long sections in `<details><summary>Section Name</summary>` blocks.
 
 **Discussion Structure**:
 

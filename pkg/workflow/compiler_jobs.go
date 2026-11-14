@@ -30,6 +30,34 @@ func (c *Compiler) isActivationJobNeeded() bool {
 	return true
 }
 
+// ensureDriveMemoryJobPermissions grants the preview drive and OIDC permissions only
+// to jobs containing compiler-generated drive-memory steps.
+func (c *Compiler) ensureDriveMemoryJobPermissions(data *WorkflowData) {
+	if data == nil || data.DriveMemoryConfig == nil || len(data.DriveMemoryConfig.Drives) == 0 {
+		return
+	}
+	for _, job := range c.jobManager.GetAllJobs() {
+		hasCheckout := false
+		hasCommit := false
+		for _, step := range job.Steps {
+			hasCheckout = hasCheckout || strings.Contains(step, "actions/gh-drives-preview/checkout@")
+			hasCommit = hasCommit || strings.Contains(step, "actions/gh-drives-preview/commit@")
+		}
+		if !hasCheckout {
+			continue
+		}
+		perms := NewPermissionsParser(job.Permissions).ToPermissions()
+		perms.Set(PermissionContents, PermissionRead)
+		perms.Set(PermissionIdToken, PermissionWrite)
+		if hasCommit {
+			perms.Set(PermissionDrives, PermissionWrite)
+		} else {
+			perms.Set(PermissionDrives, PermissionRead)
+		}
+		job.Permissions = perms.RenderToYAML()
+	}
+}
+
 // referencesCustomJobOutputs checks if a condition string references custom jobs.
 // Returns true if the condition contains "needs.<customJobName>." patterns, which includes
 // both outputs (needs.job.outputs.*) and results (needs.job.result).
@@ -38,6 +66,7 @@ func (c *Compiler) referencesCustomJobOutputs(condition string, customJobs map[s
 	if condition == "" || customJobs == nil {
 		return false
 	}
+
 	for jobName := range customJobs {
 		// Check for patterns like "needs.ast_grep.outputs" or "needs.ast_grep.result"
 		if strings.Contains(condition, fmt.Sprintf("needs.%s.", jobName)) {
@@ -82,24 +111,31 @@ func jobDependsOnActivation(jobConfig map[string]any) bool {
 	return false
 }
 
-// jobDependsOnAgent checks if a job config has agent as a dependency.
-// Jobs that depend on agent should run AFTER the agent job, not before it.
-// The jobConfig parameter is expected to be a map representing the job's YAML configuration,
-// where "needs" can be either a string (single dependency) or []any (multiple dependencies).
-// Returns false if "needs" is missing, malformed, or doesn't contain the agent job.
-func jobDependsOnAgent(jobConfig map[string]any) bool {
-	if needs, hasNeeds := jobConfig["needs"]; hasNeeds {
-		if needsList, ok := needs.([]any); ok {
-			for _, need := range needsList {
-				if needStr, ok := need.(string); ok && needStr == string(constants.AgentJobName) {
-					return true
-				}
+// getJobsDependingOnAgent includes the agent and every job that transitively needs it.
+func getJobsDependingOnAgent(jobs map[string]any) map[string]struct{} {
+	dependents := make(map[string][]string)
+	for name, config := range jobs {
+		if job, ok := config.(map[string]any); ok {
+			for _, need := range parseNeedsField(job["needs"]) {
+				dependents[need] = append(dependents[need], name)
 			}
-		} else if needStr, ok := needs.(string); ok && needStr == string(constants.AgentJobName) {
-			return true
 		}
 	}
-	return false
+
+	queue := []string{string(constants.AgentJobName)}
+	blocked := map[string]struct{}{string(constants.AgentJobName): {}}
+	for len(queue) > 0 {
+		current := queue[0] //nolint:uncheckedsliceindex // The loop requires a nonempty queue.
+		queue = queue[1:]
+		for _, name := range dependents[current] {
+			if setutil.Contains(blocked, name) {
+				continue
+			}
+			blocked[name] = struct{}{}
+			queue = append(queue, name)
+		}
+	}
+	return blocked
 }
 
 // getCustomJobsDependingOnPreActivation returns custom job names that explicitly depend on pre_activation
@@ -149,11 +185,16 @@ func (c *Compiler) getReferencedCustomJobs(content string, customJobs map[string
 // Only jobs with NO explicit needs are returned - jobs that explicitly depend on activation/pre_activation/etc.
 // are excluded because they either already run before activation or cannot run before it.
 func (c *Compiler) getCustomJobsReferencedInPromptWithNoActivationDep(data *WorkflowData) []string {
-	if data == nil || data.Jobs == nil || data.MarkdownContent == "" {
+	if data == nil || data.Jobs == nil {
 		return nil
 	}
 
-	referencedJobs := c.getReferencedCustomJobs(data.MarkdownContent, data.Jobs)
+	promptContent := data.MarkdownContent
+	if runtimeImportMarkdown := c.collectRuntimeImportMarkdownForCompilerAnalysis(data); runtimeImportMarkdown != "" {
+		promptContent += "\n" + runtimeImportMarkdown
+	}
+
+	referencedJobs := c.getReferencedCustomJobs(promptContent, data.Jobs)
 	var result []string
 	for _, jobName := range referencedJobs {
 		jobConfig, ok := data.Jobs[jobName].(map[string]any)
@@ -172,84 +213,128 @@ func (c *Compiler) getCustomJobsReferencedInPromptWithNoActivationDep(data *Work
 	return result
 }
 
+// getEngineEnvReferencedCustomJobsWithNoExplicitNeeds returns custom job names referenced
+// by activation-rendered engine.env values via needs.<job>.outputs.* that have no explicit
+// needs declaration.
+// These jobs must run before activation so their outputs are available in activation steps
+// (e.g. secret validation uses engine.env overrides at activation time).
+//
+// Only jobs with NO explicit needs are returned, matching the same filter applied to
+// markdown-body-referenced jobs. Jobs with explicit needs either already run before activation
+// (pre_activation dependency, picked up by getCustomJobsDependingOnPreActivation) or explicitly
+// depend on activation/agent and therefore cannot be activation prerequisites.
+func (c *Compiler) getEngineEnvReferencedCustomJobsWithNoExplicitNeeds(data *WorkflowData) []string {
+	if data == nil || data.EngineConfig == nil || len(data.EngineConfig.Env) == 0 || data.Jobs == nil {
+		return nil
+	}
+
+	activationRenderedEnvValues := c.getActivationRenderedEngineEnvValues(data)
+	if len(activationRenderedEnvValues) == 0 {
+		return nil
+	}
+
+	var engineEnvBuilder strings.Builder
+	for _, envValue := range activationRenderedEnvValues {
+		engineEnvBuilder.WriteByte('\n')
+		engineEnvBuilder.WriteString(envValue)
+	}
+	referencedJobs := c.getReferencedCustomJobs(engineEnvBuilder.String(), data.Jobs)
+	var result []string
+	for _, jobName := range referencedJobs {
+		jobConfig, ok := data.Jobs[jobName].(map[string]any)
+		if !ok {
+			continue
+		}
+		// Only include jobs with no explicit needs - those get activation auto-added normally.
+		// Jobs with explicit needs either already run before activation (pre_activation dependency)
+		// or explicitly depend on activation/agent and must run after.
+		if _, hasNeeds := jobConfig["needs"]; hasNeeds {
+			continue
+		}
+		result = append(result, jobName)
+		compilerJobsLog.Printf("Found custom job '%s' referenced in engine.env with no explicit needs: will run before activation", jobName)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// getActivationRenderedEngineEnvValues returns the subset of engine.env values that are
+// rendered in activation steps: required secret validation env vars and COPILOT_GITHUB_TOKEN
+// (used by OAuth token checks).
+func (c *Compiler) getActivationRenderedEngineEnvValues(data *WorkflowData) []string {
+	if data == nil || data.EngineConfig == nil || len(data.EngineConfig.Env) == 0 {
+		return nil
+	}
+
+	envKeys := map[string]struct{}{
+		constants.CopilotGitHubToken: {},
+	}
+	engineID := strings.ToLower(resolveActivationEngineID(data))
+	if engine, err := c.engineRegistry.GetEngine(engineID); err == nil {
+		for _, secretName := range engine.GetRequiredSecretNames(data) {
+			envKeys[secretName] = struct{}{}
+		}
+	}
+
+	keyList := make([]string, 0, len(envKeys))
+	for key := range envKeys {
+		keyList = append(keyList, key)
+	}
+	sort.Strings(keyList)
+
+	values := make([]string, 0, len(keyList))
+	for _, key := range keyList {
+		if value, ok := data.EngineConfig.Env[key]; ok {
+			values = append(values, value)
+		}
+	}
+
+	return values
+}
+
 // buildJobs creates all jobs for the workflow and adds them to the job manager.
 // This function orchestrates the building of all job types by delegating to focused helper functions.
 func (c *Compiler) buildJobs(data *WorkflowData, markdownPath string) error {
 	compilerJobsLog.Printf("Building jobs for workflow: %s", markdownPath)
 
-	// Use the already-parsed frontmatter from WorkflowData (populated by ParseWorkflowFile /
-	// ParseWorkflowString) instead of re-reading and re-parsing the file on every compilation.
-	// Note: RawFrontmatter has already been through preprocessScheduleFields, so shorthand
-	// triggers (e.g. "on: daily") are already expanded into their structured form.
-	// The consumers (needsRoleCheck, hasWorkflowRunTrigger) only inspect event keys in the
-	// "on" field, which is exactly what we need here.
+	// Use the already-parsed frontmatter from WorkflowData; consumers below only
+	// inspect the processed "on" field for activation decisions.
 	frontmatter := data.RawFrontmatter
-
-	// Extract lock filename for timestamp check
 	lockFilename := filepath.Base(stringutil.MarkdownToLockFile(markdownPath))
 
-	// Resolve custom safe-output actions early so that tool schemas (derived from action.yml)
-	// are available when buildMainJobWrapper → generateMCPSetup → generateToolsMetaJSON →
-	// generateDynamicTools runs. Without this early resolution the dynamic_tools entry for
-	// each action tool would have an empty schema because Inputs/ActionDescription are nil.
-	if data.SafeOutputs != nil && len(data.SafeOutputs.Actions) > 0 {
-		c.resolveAllActions(data, markdownPath)
+	if err := c.addGatewayProvenanceJob(data); err != nil {
+		return err
+	}
+	if err := c.addGatewayAdmissionJob(data); err != nil {
+		return err
 	}
 
-	// Build pre-activation and activation jobs
-	_, activationJobCreated, err := c.buildPreActivationAndActivationJobs(data, frontmatter, lockFilename)
+	if err := c.resolveSafeOutputActionSchemas(data, markdownPath); err != nil {
+		return fmt.Errorf("failed to resolve safe-output action schemas: %w", err)
+	}
+
+	activationJobCreated, err := c.buildActivationAndMainJobs(data, frontmatter, lockFilename)
 	if err != nil {
 		return err
 	}
 
-	// Build main workflow job
-	if err := c.buildMainJobWrapper(data, activationJobCreated); err != nil {
+	if err := c.buildSafeOutputsAndEvalsJobs(data, markdownPath); err != nil {
 		return err
 	}
 
-	// Build safe outputs jobs if configured
-	if err := c.buildSafeOutputsJobs(data, string(constants.AgentJobName), markdownPath); err != nil {
-		return fmt.Errorf("failed to build safe outputs jobs: %w", err)
-	}
-
-	// Build BinEval evals job if evals are declared in frontmatter.
-	if evalsJob, err := c.buildEvalsJob(data); err != nil {
-		return fmt.Errorf("failed to build evals job: %w", err)
-	} else if evalsJob != nil {
-		if err := c.jobManager.AddJob(evalsJob); err != nil {
-			return fmt.Errorf("failed to add evals job: %w", err)
-		}
-	}
-
-	// Apply jobs.<builtin-job>.pre-steps customizations to already-created built-in jobs
-	// before processing non-built-in custom jobs.
 	if err := c.applyBuiltinJobPreSteps(data); err != nil {
-		return fmt.Errorf("failed to apply built-in job pre-steps: %w", err)
+		return fmt.Errorf("built-in job pre-steps could not be applied: %w. Check that pre-steps is an array of valid step objects", err)
 	}
 
-	// Build additional custom jobs from frontmatter jobs section
-	if len(data.Jobs) > 0 {
-		compilerJobsLog.Printf("Building %d custom jobs from frontmatter", len(data.Jobs))
-	}
-	if err := c.buildCustomJobs(data, activationJobCreated); err != nil {
-		return fmt.Errorf("failed to build custom jobs: %w", err)
+	if err := c.buildFrontmatterCustomJobs(data, activationJobCreated); err != nil {
+		return err
 	}
 
-	// Build memory management jobs (repo-memory and cache-memory)
 	if err := c.buildMemoryManagementJobs(data); err != nil {
 		return err
 	}
 
-	// Apply additive jobs.<built-in>.needs augmentations once all jobs are created,
-	// so referenced custom/imported jobs can be validated against the final job set.
-	if err := c.applyBuiltinJobNeedsAugmentations(data); err != nil {
-		return fmt.Errorf("failed to apply built-in job needs augmentations: %w", err)
-	}
-
-	// Final pass: ensure conclusion job depends on ALL remaining workflow jobs.
-	// This guarantees conclusion always runs last, even for custom user-defined jobs
-	// (e.g. post-issue, super_linter) that were not explicitly added to its needs.
-	if err := c.ensureConclusionIsLastJob(); err != nil {
+	if err := c.finalizeBuiltJobs(data); err != nil {
 		return err
 	}
 
@@ -257,9 +342,154 @@ func (c *Compiler) buildJobs(data *WorkflowData, markdownPath string) error {
 	return nil
 }
 
+func (c *Compiler) resolveSafeOutputActionSchemas(data *WorkflowData, markdownPath string) error {
+	// Resolve custom safe-output actions early so that tool schemas (derived from action.yml)
+	// are available when buildMainJobWrapper → generateMCPSetup → generateToolsMetaJSON →
+	// generateDynamicTools runs. Without this early resolution the dynamic_tools entry for
+	// each action tool would have an empty schema because Inputs/ActionDescription are nil.
+	if data.SafeOutputs != nil && len(data.SafeOutputs.Actions) > 0 {
+		return c.resolveAllActions(data, markdownPath)
+	}
+	return nil
+}
+
+// buildActivationAndMainJobs builds the activation chain and the primary agent job.
+func (c *Compiler) buildActivationAndMainJobs(data *WorkflowData, frontmatter map[string]any, lockFilename string) (bool, error) {
+	_, activationJobCreated, err := c.buildPreActivationAndActivationJobs(data, frontmatter, lockFilename)
+	if err != nil {
+		return false, err
+	}
+
+	if err := c.buildMainJobWrapper(data, activationJobCreated); err != nil {
+		return false, err
+	}
+
+	return activationJobCreated, nil
+}
+
+// buildSafeOutputsAndEvalsJobs builds optional post-agent evaluation/output jobs.
+func (c *Compiler) buildSafeOutputsAndEvalsJobs(data *WorkflowData, markdownPath string) error {
+	if err := c.buildSafeOutputsJobs(data, string(constants.AgentJobName), markdownPath); err != nil {
+		return fmt.Errorf("safe outputs jobs could not be built: %w. Check the safe-outputs configuration for valid job types", err)
+	}
+
+	if err := c.buildEvalsJobWrapper(data); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// buildEvalsJobWrapper builds and adds the BinEval evals job if evals are declared in frontmatter.
+func (c *Compiler) buildEvalsJobWrapper(data *WorkflowData) error {
+	evalsJob, err := c.buildEvalsJob(data)
+	if err != nil {
+		return fmt.Errorf("evals job could not be built: %w. Check that the evals frontmatter section is a valid object", err)
+	}
+	if evalsJob == nil {
+		return nil
+	}
+	if err := c.jobManager.AddJob(evalsJob); err != nil {
+		return fmt.Errorf("evals job could not be added: %w. Check that no other job in the workflow reuses its name", err)
+	}
+	return nil
+}
+
+// buildFrontmatterCustomJobs builds additional jobs declared in the workflow frontmatter.
+func (c *Compiler) buildFrontmatterCustomJobs(data *WorkflowData, activationJobCreated bool) error {
+	if len(data.Jobs) > 0 {
+		compilerJobsLog.Printf("Building %d custom jobs from frontmatter", len(data.Jobs))
+	}
+	if err := c.buildCustomJobs(data, activationJobCreated); err != nil {
+		return fmt.Errorf("custom jobs could not be built: %w. Check the jobs section in frontmatter for valid job definitions", err)
+	}
+	return nil
+}
+
+// finalizeBuiltJobs applies final dependency, permission, and token-reference passes.
+func (c *Compiler) finalizeBuiltJobs(data *WorkflowData) error {
+	if err := c.applyBuiltinJobAugmentations(data); err != nil {
+		return fmt.Errorf("built-in job needs augmentations could not be applied: %w. Check that jobs referenced in needs actually exist in the workflow", err)
+	}
+
+	if err := c.ensureConclusionIsLastJob(); err != nil {
+		return err
+	}
+
+	c.ensureOTLPOIDCJobPermissions(data)
+	c.ensureConnectorOIDCJobPermissions(data)
+	c.ensureDriveMemoryJobPermissions(data)
+	c.ensureDurableArtifactJobPermissions(data)
+	c.annotateGeneratedJobs(data)
+	if err := c.finalizeConclusionJobInventory(); err != nil {
+		return err
+	}
+
+	if err := c.validateSafeOutputStepTokenReferences(data); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Compiler) ensureDurableArtifactJobPermissions(data *WorkflowData) {
+	if data.EngineConfig == nil || data.EngineConfig.Durable == nil {
+		return
+	}
+	for _, job := range c.jobManager.GetAllJobs() {
+		for _, step := range job.Steps {
+			if strings.Contains(step, "id: durable_checkpoint") {
+				perms := NewPermissionsParser(job.Permissions).ToPermissions()
+				perms.Set(PermissionActions, PermissionRead)
+				job.Permissions = perms.RenderToYAML()
+				break
+			}
+		}
+	}
+}
+
+// ensureOTLPOIDCJobPermissions grants id-token: write to every job that contains the
+// OTLP OIDC token mint step. core.getIDToken() fails when the job-level permissions
+// block omits id-token: write, even if the workflow-level block grants it.
+func (c *Compiler) ensureOTLPOIDCJobPermissions(data *WorkflowData) {
+	if data == nil || !hasOTLPGitHubOIDCAuth(data.ParsedFrontmatter, data.RawFrontmatter) {
+		return
+	}
+	for _, job := range c.jobManager.GetAllJobs() {
+		if !jobStepsMintOTLPOIDCToken(job) {
+			continue
+		}
+		perms := NewPermissionsParser(job.Permissions).ToPermissions()
+		if level, exists := perms.Get(PermissionIdToken); exists && level == PermissionWrite {
+			continue
+		}
+		perms.Set(PermissionIdToken, PermissionWrite)
+		job.Permissions = perms.RenderToYAML()
+		compilerJobsLog.Printf("Granted id-token: write to job %s for OTLP OIDC token mint", job.Name)
+	}
+}
+
+// jobStepsMintOTLPOIDCToken reports whether any step in the job is the OTLP OIDC mint step.
+func jobStepsMintOTLPOIDCToken(job *Job) bool {
+	if job == nil {
+		return false
+	}
+	for _, step := range job.Steps {
+		if strings.Contains(step, "id: "+otlpOIDCMintStepID+"\n") {
+			return true
+		}
+	}
+	return false
+}
+
 // buildPreActivationAndActivationJobs builds the pre-activation and activation jobs if needed.
 // Returns whether each job was created.
 func (c *Compiler) buildPreActivationAndActivationJobs(data *WorkflowData, frontmatter map[string]any, lockFilename string) (preActivationJobCreated bool, activationJobCreated bool, err error) {
+	data.Cooldown, err = extractCooldown(frontmatter)
+	if err != nil {
+		return
+	}
+
 	// Determine if permission checks or stop-time checks are needed
 	needsPermissionCheck := c.needsRoleCheck(data, frontmatter)
 	hasStopTime := data.StopTime != ""
@@ -270,26 +500,21 @@ func (c *Compiler) buildPreActivationAndActivationJobs(data *WorkflowData, front
 	hasSkipAuthorAssociations := len(data.SkipAuthorAssociations) > 0
 	hasCommandTrigger := len(data.Command) > 0
 	hasRateLimit := data.RateLimit != nil
+	hasCooldown := data.Cooldown > 0
 	hasOnSteps := len(data.OnSteps) > 0
 	hasOnNeeds := len(data.OnNeeds) > 0
 	hasLabelNames := len(data.LabelNames) > 0
-	compilerJobsLog.Printf("Job configuration: needsPermissionCheck=%v, hasStopTime=%v, hasSkipIfMatch=%v, hasSkipIfNoMatch=%v, hasSkipRoles=%v, hasSkipBots=%v, hasSkipAuthorAssociations=%v, hasCommand=%v, hasRateLimit=%v, hasOnSteps=%v, hasOnNeeds=%v, hasLabelNames=%v", needsPermissionCheck, hasStopTime, hasSkipIfMatch, hasSkipIfNoMatch, hasSkipRoles, hasSkipBots, hasSkipAuthorAssociations, hasCommandTrigger, hasRateLimit, hasOnSteps, hasOnNeeds, hasLabelNames)
+	compilerJobsLog.Printf("Job configuration: needsPermissionCheck=%v, hasStopTime=%v, hasSkipIfMatch=%v, hasSkipIfNoMatch=%v, hasSkipRoles=%v, hasSkipBots=%v, hasSkipAuthorAssociations=%v, hasCommand=%v, hasRateLimit=%v, hasCooldown=%v, hasOnSteps=%v, hasOnNeeds=%v, hasLabelNames=%v", needsPermissionCheck, hasStopTime, hasSkipIfMatch, hasSkipIfNoMatch, hasSkipRoles, hasSkipBots, hasSkipAuthorAssociations, hasCommandTrigger, hasRateLimit, hasCooldown, hasOnSteps, hasOnNeeds, hasLabelNames)
 
 	// Build pre-activation job if needed. The job combines:
 	//   - membership checks, stop-time validation, skip-if-match/no-match checks
 	//   - skip-roles/bots checks, rate limit check, command position check
 	//   - on.steps injection, label-names filter
-	if needsPermissionCheck || hasStopTime || hasSkipIfMatch || hasSkipIfNoMatch || hasSkipRoles || hasSkipBots || hasSkipAuthorAssociations || hasCommandTrigger || hasRateLimit || hasOnSteps || hasOnNeeds || hasLabelNames {
-		compilerJobsLog.Print("Building pre-activation job")
-		preActivationJob, err := c.buildPreActivationJob(data, needsPermissionCheck)
+	if needsPermissionCheck || hasStopTime || hasSkipIfMatch || hasSkipIfNoMatch || hasSkipRoles || hasSkipBots || hasSkipAuthorAssociations || hasCommandTrigger || hasRateLimit || hasCooldown || hasOnSteps || hasOnNeeds || hasLabelNames {
+		preActivationJobCreated, err = c.addPreActivationJob(data, needsPermissionCheck)
 		if err != nil {
-			return false, false, fmt.Errorf("failed to build %s job: %w", constants.PreActivationJobName, err)
+			return false, false, err
 		}
-		if err := c.jobManager.AddJob(preActivationJob); err != nil {
-			return false, false, fmt.Errorf("failed to add %s job: %w", constants.PreActivationJobName, err)
-		}
-		compilerJobsLog.Printf("Successfully added pre-activation job: %s", constants.PreActivationJobName)
-		preActivationJobCreated = true
 	}
 
 	// Determine if we need to add workflow_run repository safety check
@@ -302,12 +527,8 @@ func (c *Compiler) buildPreActivationAndActivationJobs(data *WorkflowData, front
 	// Build activation job if needed (preamble job that handles runtime conditions)
 	if c.isActivationJobNeeded() {
 		compilerJobsLog.Print("Building activation job")
-		activationJob, err := c.buildActivationJob(data, preActivationJobCreated, workflowRunRepoSafety, lockFilename)
-		if err != nil {
-			return preActivationJobCreated, false, fmt.Errorf("failed to build activation job: %w", err)
-		}
-		if err := c.jobManager.AddJob(activationJob); err != nil {
-			return preActivationJobCreated, false, fmt.Errorf("failed to add activation job: %w", err)
+		if err := c.buildActivationAndAdmissionJobs(data, preActivationJobCreated, workflowRunRepoSafety, lockFilename); err != nil {
+			return preActivationJobCreated, false, err
 		}
 		compilerJobsLog.Print("Successfully added activation job")
 		activationJobCreated = true
@@ -316,15 +537,28 @@ func (c *Compiler) buildPreActivationAndActivationJobs(data *WorkflowData, front
 	return preActivationJobCreated, activationJobCreated, nil
 }
 
+func (c *Compiler) addPreActivationJob(data *WorkflowData, needsPermissionCheck bool) (bool, error) {
+	compilerJobsLog.Print("Building pre-activation job")
+	preActivationJob, err := c.buildPreActivationJob(data, needsPermissionCheck)
+	if err != nil {
+		return false, fmt.Errorf("%s job could not be built: %w. Check the activation-related frontmatter fields (roles, if, stop-time, etc.)", constants.PreActivationJobName, err)
+	}
+	if err := c.jobManager.AddJob(preActivationJob); err != nil {
+		return false, fmt.Errorf("%s job could not be added: %w. Check that no other job in the workflow reuses its name", constants.PreActivationJobName, err)
+	}
+	compilerJobsLog.Printf("Successfully added pre-activation job: %s", constants.PreActivationJobName)
+	return true, nil
+}
+
 // buildMainJobWrapper builds the main workflow job and adds it to the job manager.
 func (c *Compiler) buildMainJobWrapper(data *WorkflowData, activationJobCreated bool) error {
 	compilerJobsLog.Print("Building main job")
 	mainJob, err := c.buildMainJob(data, activationJobCreated)
 	if err != nil {
-		return fmt.Errorf("failed to build main job: %w", err)
+		return fmt.Errorf("main job could not be built: %w. Check the engine and steps configuration in frontmatter", err)
 	}
 	if err := c.jobManager.AddJob(mainJob); err != nil {
-		return fmt.Errorf("failed to add main job: %w", err)
+		return fmt.Errorf("main job could not be added: %w. Check that no other job in the workflow reuses its name", err)
 	}
 	compilerJobsLog.Printf("Successfully added main job: %s", string(constants.AgentJobName))
 	return nil
@@ -340,10 +574,18 @@ func (c *Compiler) buildMemoryManagementJobs(data *WorkflowData) error {
 	if err != nil {
 		return err
 	}
+	pushLedgerJobName, err := c.buildPushLedgerChangesJobWrapper(data, threatDetectionEnabledForSafeJobs)
+	if err != nil {
+		return err
+	}
 
 	// Build update_cache_memory job if cache-memory is configured and threat detection is enabled
 	updateCacheMemoryJobName, err := c.buildUpdateCacheMemoryJobWrapper(data, threatDetectionEnabledForSafeJobs)
 	if err != nil {
+		return err
+	}
+
+	if _, err := c.buildUpdateDriveMemoryJobWrapper(data, threatDetectionEnabledForSafeJobs); err != nil {
 		return err
 	}
 
@@ -360,11 +602,25 @@ func (c *Compiler) buildMemoryManagementJobs(data *WorkflowData) error {
 	}
 
 	// Update conclusion job dependencies
-	if err := c.updateConclusionJobDependencies(pushRepoMemoryJobName, updateCacheMemoryJobName, pushExperimentsJobName, pushEvalsJobName); err != nil {
+	if err := c.updateConclusionJobDependencies(pushRepoMemoryJobName, pushLedgerJobName, updateCacheMemoryJobName, pushExperimentsJobName, pushEvalsJobName); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (c *Compiler) buildPushLedgerChangesJobWrapper(data *WorkflowData, threatDetectionEnabled bool) (string, error) {
+	if data.LedgerConfig == nil || !data.LedgerConfig.Enabled() {
+		return "", nil
+	}
+	job, err := c.buildPushLedgerChangesJob(data, threatDetectionEnabled)
+	if err != nil {
+		return "", fmt.Errorf("push_ledger_changes job could not be built: %w", err)
+	}
+	if err := c.jobManager.AddJob(job); err != nil {
+		return "", fmt.Errorf("push_ledger_changes job could not be added: %w", err)
+	}
+	return job.Name, nil
 }
 
 // buildPushRepoMemoryJobWrapper builds the push_repo_memory job if repo-memory is configured.
@@ -377,7 +633,7 @@ func (c *Compiler) buildPushRepoMemoryJobWrapper(data *WorkflowData, threatDetec
 	compilerJobsLog.Print("Building push_repo_memory job")
 	pushRepoMemoryJob, err := c.buildPushRepoMemoryJob(data, threatDetectionEnabled)
 	if err != nil {
-		return "", fmt.Errorf("failed to build push_repo_memory job: %w", err)
+		return "", fmt.Errorf("push_repo_memory job could not be built: %w. Check the repo-memory configuration in frontmatter", err)
 	}
 
 	if pushRepoMemoryJob == nil {
@@ -389,7 +645,7 @@ func (c *Compiler) buildPushRepoMemoryJobWrapper(data *WorkflowData, threatDetec
 	// and its condition checks needs.detection.result == 'success'
 
 	if err := c.jobManager.AddJob(pushRepoMemoryJob); err != nil {
-		return "", fmt.Errorf("failed to add push_repo_memory job: %w", err)
+		return "", fmt.Errorf("push_repo_memory job could not be added: %w. Check that no other job in the workflow reuses its name", err)
 	}
 
 	compilerJobsLog.Printf("Successfully added push_repo_memory job: %s", pushRepoMemoryJob.Name)
@@ -410,7 +666,7 @@ func (c *Compiler) buildUpdateCacheMemoryJobWrapper(data *WorkflowData, threatDe
 	compilerJobsLog.Print("Building update_cache_memory job")
 	updateCacheMemoryJob, err := c.buildUpdateCacheMemoryJob(data, threatDetectionEnabled)
 	if err != nil {
-		return "", fmt.Errorf("failed to build update_cache_memory job: %w", err)
+		return "", fmt.Errorf("update_cache_memory job could not be built: %w. Check the cache-memory configuration in frontmatter", err)
 	}
 
 	if updateCacheMemoryJob == nil {
@@ -418,11 +674,28 @@ func (c *Compiler) buildUpdateCacheMemoryJobWrapper(data *WorkflowData, threatDe
 	}
 
 	if err := c.jobManager.AddJob(updateCacheMemoryJob); err != nil {
-		return "", fmt.Errorf("failed to add update_cache_memory job: %w", err)
+		return "", fmt.Errorf("update_cache_memory job could not be added: %w. Check that no other job in the workflow reuses its name", err)
 	}
 
 	compilerJobsLog.Printf("Successfully added update_cache_memory job: %s", updateCacheMemoryJob.Name)
 	return updateCacheMemoryJob.Name, nil
+}
+
+func (c *Compiler) buildUpdateDriveMemoryJobWrapper(data *WorkflowData, threatDetectionEnabled bool) (string, error) {
+	if data.DriveMemoryConfig == nil || len(data.DriveMemoryConfig.Drives) == 0 || !threatDetectionEnabled {
+		return "", nil
+	}
+	job, err := c.buildUpdateDriveMemoryJob(data, threatDetectionEnabled)
+	if err != nil {
+		return "", fmt.Errorf("failed to build update_drive_memory job: %w", err)
+	}
+	if job == nil {
+		return "", nil
+	}
+	if err := c.jobManager.AddJob(job); err != nil {
+		return "", fmt.Errorf("failed to add update_drive_memory job: %w", err)
+	}
+	return job.Name, nil
 }
 
 // buildPushExperimentsStateJobWrapper builds the push_experiments_state job when experiments
@@ -435,14 +708,14 @@ func (c *Compiler) buildPushExperimentsStateJobWrapper(data *WorkflowData) (stri
 	compilerJobsLog.Print("Building push_experiments_state job")
 	job, err := c.buildPushExperimentsStateJob(data)
 	if err != nil {
-		return "", fmt.Errorf("failed to build push_experiments_state job: %w", err)
+		return "", fmt.Errorf("push_experiments_state job could not be built: %w. Check the experiments configuration in frontmatter", err)
 	}
 	if job == nil {
 		return "", nil
 	}
 
 	if err := c.jobManager.AddJob(job); err != nil {
-		return "", fmt.Errorf("failed to add push_experiments_state job: %w", err)
+		return "", fmt.Errorf("push_experiments_state job could not be added: %w. Check that no other job in the workflow reuses its name", err)
 	}
 
 	compilerJobsLog.Printf("Successfully added push_experiments_state job: %s", job.Name)
@@ -459,14 +732,14 @@ func (c *Compiler) buildPushEvalsStateJobWrapper(data *WorkflowData) (string, er
 	compilerJobsLog.Print("Building push_evals_state job")
 	job, err := c.buildPushEvalsStateJob(data)
 	if err != nil {
-		return "", fmt.Errorf("failed to build push_evals_state job: %w", err)
+		return "", fmt.Errorf("push_evals_state job could not be built: %w. Check the evals configuration in frontmatter", err)
 	}
 	if job == nil {
 		return "", nil
 	}
 
 	if err := c.jobManager.AddJob(job); err != nil {
-		return "", fmt.Errorf("failed to add push_evals_state job: %w", err)
+		return "", fmt.Errorf("push_evals_state job could not be added: %w. Check that no other job in the workflow reuses its name", err)
 	}
 
 	compilerJobsLog.Printf("Successfully added push_evals_state job: %s", job.Name)
@@ -474,7 +747,7 @@ func (c *Compiler) buildPushEvalsStateJobWrapper(data *WorkflowData) (string, er
 }
 
 // updateConclusionJobDependencies updates the conclusion job to depend on memory management jobs if they exist.
-func (c *Compiler) updateConclusionJobDependencies(pushRepoMemoryJobName, updateCacheMemoryJobName, pushExperimentsJobName, pushEvalsJobName string) error {
+func (c *Compiler) updateConclusionJobDependencies(pushRepoMemoryJobName, pushLedgerJobName, updateCacheMemoryJobName, pushExperimentsJobName, pushEvalsJobName string) error {
 	conclusionJob, exists := c.jobManager.GetJob("conclusion")
 	if !exists {
 		return nil
@@ -483,6 +756,9 @@ func (c *Compiler) updateConclusionJobDependencies(pushRepoMemoryJobName, update
 	if pushRepoMemoryJobName != "" {
 		conclusionJob.Needs = append(conclusionJob.Needs, pushRepoMemoryJobName)
 		compilerJobsLog.Printf("Added push_repo_memory dependency to conclusion job")
+	}
+	if pushLedgerJobName != "" {
+		conclusionJob.Needs = append(conclusionJob.Needs, pushLedgerJobName)
 	}
 
 	if updateCacheMemoryJobName != "" {
@@ -504,12 +780,13 @@ func (c *Compiler) updateConclusionJobDependencies(pushRepoMemoryJobName, update
 }
 
 // ensureConclusionIsLastJob ensures the conclusion job depends on ALL other workflow jobs,
-// making it truly the last job to execute. This is a final-pass check that catches any
-// custom or auto-generated jobs that were not explicitly added to conclusion's needs
-// during the incremental build process (e.g. user-defined post-agent jobs).
+// except its isolated admission callback, making the callback the final dependent job.
+// This is a final-pass check that catches any custom or auto-generated jobs that were not
+// explicitly added to conclusion's needs during the incremental build process.
 //
 // Jobs intentionally excluded:
 //   - "conclusion" itself
+//   - the isolated conclusion-admission callback, which runs after conclusion
 //   - "pre_activation" / "pre-activation" – runs at the very start, before activation
 func (c *Compiler) ensureConclusionIsLastJob() error {
 	conclusionJob, exists := c.jobManager.GetJob("conclusion")
@@ -528,9 +805,11 @@ func (c *Compiler) ensureConclusionIsLastJob() error {
 	// Jobs that must never appear in conclusion's needs
 	exclude := map[string]struct {
 	}{
-		"conclusion":                           {},
-		string(constants.PreActivationJobName): {},
-		"pre-activation":                       {},
+		"conclusion": {},
+		string(constants.ConclusionAdmissionJobName): {},
+		string(constants.GradersJobName):             {},
+		string(constants.PreActivationJobName):       {},
+		"pre-activation":                             {},
 	}
 
 	// Iterate over all jobs in alphabetical order for deterministic output
@@ -564,12 +843,23 @@ func (c *Compiler) extractJobsFromFrontmatter(frontmatter map[string]any) map[st
 // The checkout step is only skipped when:
 //   - Custom steps already contain a checkout action
 //   - checkout: false is set in the workflow frontmatter
+//   - permissions.contents: none is set (target-only checkout: the workflow does
+//     not need its own repository content, but other configured checkout entries
+//     such as a target-repo checkout are still generated)
 //
 // Otherwise, checkout is always added to ensure the agent has access to the repository.
 func (c *Compiler) shouldAddCheckoutStep(data *WorkflowData) bool {
 	// If checkout was explicitly disabled via checkout: false, skip it
 	if data.CheckoutDisabled {
 		workflowLog.Print("Skipping checkout step: checkout disabled via checkout: false")
+		return false
+	}
+
+	// If permissions.contents: none is set, skip only the default (workflow-repository)
+	// checkout step; other configured checkouts (e.g. a target-only sidecar checkout)
+	// are still generated separately.
+	if data.CheckoutSkipDefault {
+		workflowLog.Print("Skipping default checkout step: permissions.contents is none (target-only checkout)")
 		return false
 	}
 

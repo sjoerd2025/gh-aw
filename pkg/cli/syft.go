@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 )
 
@@ -35,7 +38,7 @@ type SyftScanResult struct {
 // runSyftOnLockFiles extracts container image references from lock-file manifests
 // and runs syft to generate SBOM data for each unique image.
 // SBOM files are persisted to disk and paths are returned in the results.
-func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
+func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error { //nolint:largefunc
 	if len(lockFiles) == 0 {
 		return nil
 	}
@@ -43,9 +46,7 @@ func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 	images := collectContainerImagesFromLockFiles(lockFiles)
 	if len(images) == 0 {
 		syftLog.Print("No container images found in lock files")
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("No container images found in lock files to scan with syft"))
-		}
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Running syft SBOM scanner (0 container images found in lock files)"))
 		return nil
 	}
 
@@ -55,14 +56,22 @@ func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Running syft SBOM scanner on %d container images", len(images))))
 	}
 
-	// Create output directory for SBOM files
-	sbomDir := filepath.Join(os.TempDir(), "gh-aw-syft-sboms")
-	if err := os.MkdirAll(sbomDir, constants.DirPermPublic); err != nil {
+	// Keep successful SBOMs for inspection without sharing predictable output paths.
+	sbomDir, err := os.MkdirTemp("", "gh-aw-syft-sboms-")
+	if err != nil {
 		return fmt.Errorf("failed to create SBOM directory: %w", err)
 	}
+	syftLog.Printf("SBOM directory: %s", sbomDir)
 
 	var scanErrors []string
 	var results []SyftScanResult
+	defer func() {
+		if len(results) == 0 {
+			if err := os.RemoveAll(sbomDir); err != nil {
+				syftLog.Printf("Error removing empty SBOM directory: %v", err)
+			}
+		}
+	}()
 
 	ctx := context.Background()
 	for _, img := range images {
@@ -100,23 +109,42 @@ func runSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 	return nil
 }
 
-func runSyftOnImage(ctx context.Context, imageRef, sbomDir string, verbose bool) (*SyftScanResult, error) {
+func runSyftOnImage(ctx context.Context, imageRef, sbomDir string, verbose bool) (*SyftScanResult, error) { //nolint:largefunc
 	syftLog.Printf("Scanning %s with syft", imageRef)
 
-	// #nosec G204 -- imageRef comes from compiled lock-file manifests and is passed
-	// as a direct process argument (no shell interpolation).
+	// Validate the image reference before it reaches docker: lock-file manifests can carry
+	// attacker-influenced content, and an image reference starting with "-" (or containing
+	// control characters) would otherwise be interpreted as a docker/syft option.
+	validatedImageRef, err := validateDockerImageRef(imageRef)
+	if err != nil {
+		return nil, err
+	}
+
+	dockerPath, err := fileutil.ResolveExecutablePath("docker")
+	if err != nil {
+		return nil, fmt.Errorf("docker command not found: %w", err)
+	}
+
+	syftImageRef, err := validateDockerImageRef(SyftImage)
+	if err != nil {
+		return nil, fmt.Errorf("invalid syft scanner image reference %q: %w", SyftImage, err)
+	}
+
+	// #nosec G204 -- dockerPath is resolved from the fixed executable name "docker" and
+	// validatedImageRef is allow-list validated above. exec.CommandContext passes args
+	// directly to the OS without shell interpretation, preventing command injection.
 	cmd := exec.CommandContext(
 		ctx,
-		"docker",
+		dockerPath,
 		"run",
 		"--rm",
-		SyftImage,
-		imageRef,
+		syftImageRef,
+		validatedImageRef,
 		"-o", "syft-json",
 	)
 
 	if verbose {
-		dockerCmd := fmt.Sprintf("docker run --rm %s %s -o syft-json", SyftImage, imageRef)
+		dockerCmd := shellJoinArgs([]string{"docker", "run", "--rm", syftImageRef, validatedImageRef, "-o", "syft-json"})
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Run syft directly: "+dockerCmd))
 	}
 
@@ -138,13 +166,12 @@ func runSyftOnImage(ctx context.Context, imageRef, sbomDir string, verbose bool)
 		return nil, fmt.Errorf("failed to parse syft JSON output for %s: %w", imageRef, err)
 	}
 
-	// Generate a safe filename from the image reference
-	replacer := strings.NewReplacer("/", "_", ":", "_", "@", "_")
-	safeImageName := replacer.Replace(imageRef)
-	sbomPath := filepath.Join(sbomDir, fmt.Sprintf("sbom-%s.json", safeImageName))
+	// Hash the full reference so distinct images cannot collide through sanitization.
+	imageHash := sha256.Sum256([]byte(imageRef))
+	sbomPath := filepath.Join(sbomDir, fmt.Sprintf("sbom-%x.json", imageHash))
 
 	// Persist the SBOM to disk
-	if err := os.WriteFile(sbomPath, stdout.Bytes(), constants.FilePermPublic); err != nil {
+	if err := writeSyftSBOM(sbomPath, stdout.Bytes()); err != nil {
 		return nil, fmt.Errorf("failed to write SBOM file for %s: %w", imageRef, err)
 	}
 
@@ -155,4 +182,19 @@ func runSyftOnImage(ctx context.Context, imageRef, sbomDir string, verbose bool)
 		PackageCount: len(output.Artifacts),
 		SBOMPath:     sbomPath,
 	}, nil
+}
+
+func writeSyftSBOM(path string, content []byte) (err error) {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, constants.FilePermSensitive)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err = errors.Join(err, file.Close())
+		if err != nil {
+			err = errors.Join(err, os.Remove(path))
+		}
+	}()
+	_, err = file.Write(content)
+	return err
 }

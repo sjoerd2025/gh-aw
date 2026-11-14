@@ -15,6 +15,7 @@ import (
 
 // TestArgumentSyntaxConsistency verifies that command argument syntax is consistent with validators
 func TestArgumentSyntaxConsistency(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		command        *cobra.Command
@@ -29,6 +30,13 @@ func TestArgumentSyntaxConsistency(t *testing.T) {
 			expectedUse:    "audit <run-id-or-url> [run-id-or-url]...",
 			argsValidator:  "MinimumNArgs(1)",
 			shouldValidate: func(cmd *cobra.Command) error { return cmd.Args(cmd, []string{"123456"}) },
+		},
+		{
+			name:           "json-schema command requires schema",
+			command:        cli.NewJSONSchemaCommand(),
+			expectedUse:    "json-schema <schema>",
+			argsValidator:  "ExactArgs(1)",
+			shouldValidate: func(cmd *cobra.Command) error { return cmd.Args(cmd, []string{"audit"}) },
 		},
 		{
 			name:           "trial command requires workflow-spec",
@@ -98,7 +106,7 @@ func TestArgumentSyntaxConsistency(t *testing.T) {
 		{
 			name:           "logs command has optional workflow",
 			command:        cli.NewLogsCommand(),
-			expectedUse:    "logs [workflow]",
+			expectedUse:    "logs [workflow]...",
 			argsValidator:  "no validator (all optional)",
 			shouldValidate: func(cmd *cobra.Command) error { return nil },
 		},
@@ -112,7 +120,7 @@ func TestArgumentSyntaxConsistency(t *testing.T) {
 		{
 			name:           "update command has optional workflow",
 			command:        cli.NewUpdateCommand(validateEngine),
-			expectedUse:    "update [workflow]...",
+			expectedUse:    "update [workflow-or-package]...",
 			argsValidator:  "no validator (all optional)",
 			shouldValidate: func(cmd *cobra.Command) error { return nil },
 		},
@@ -127,6 +135,7 @@ func TestArgumentSyntaxConsistency(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Setup step - ensure command is valid
 			require.NotNil(t, tt.command, "Test case %q requires valid command", tt.name)
 
@@ -156,6 +165,7 @@ func TestArgumentSyntaxConsistency(t *testing.T) {
 
 // TestMCPSubcommandArgumentSyntax verifies MCP subcommands have consistent syntax
 func TestMCPSubcommandArgumentSyntax(t *testing.T) {
+	t.Parallel()
 	mcpCmd := cli.NewMCPCommand()
 
 	tests := []struct {
@@ -187,6 +197,7 @@ func TestMCPSubcommandArgumentSyntax(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Find the subcommand - setup step
 			foundCmd := findSubcommand(mcpCmd, tt.subcommand)
 			require.NotNil(t, foundCmd,
@@ -207,6 +218,7 @@ func TestMCPSubcommandArgumentSyntax(t *testing.T) {
 
 // TestPRSubcommandArgumentSyntax verifies PR subcommands have consistent syntax
 func TestPRSubcommandArgumentSyntax(t *testing.T) {
+	t.Parallel()
 	prCmd := cli.NewPRCommand()
 
 	tests := []struct {
@@ -223,6 +235,7 @@ func TestPRSubcommandArgumentSyntax(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Find the subcommand - setup step
 			foundCmd := findSubcommand(prCmd, tt.subcommand)
 			require.NotNil(t, foundCmd,
@@ -304,6 +317,7 @@ func isValidUseSyntax(use string) bool {
 
 // TestArgumentNamingConventions verifies that argument names follow conventions
 func TestArgumentNamingConventions(t *testing.T) {
+	t.Parallel()
 	// Collect all commands
 	commands := []*cobra.Command{
 		newCmd,

@@ -37,26 +37,26 @@ func resolveUniversalLLMBackendFromModel(model string) (UniversalLLMBackend, err
 	universalLLMConsumerLog.Printf("Resolving LLM backend from model: %q", model)
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return "", errors.New("for universal consumer engines (OpenCode), engine.model is required and must use provider/model format (supported providers: copilot, anthropic, openai, codex)")
+		return "", errors.New("for universal consumer engines, engine.model is required and must use provider/model format (supported providers: copilot, anthropic, openai, codex). Example: engine.model: copilot/gpt-5")
 	}
 
-	parts := strings.SplitN(model, "/", 2)
-	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
-		return "", errors.New("for universal consumer engines (OpenCode), engine.model must use provider/model format (for example: copilot/gpt-5, anthropic/claude-sonnet-4, openai/gpt-4.1)")
+	provider, modelID, ok := strings.Cut(model, "/")
+	if !ok || strings.TrimSpace(provider) == "" || strings.TrimSpace(modelID) == "" {
+		return "", errors.New("for universal consumer engines, engine.model must use provider/model format (for example: copilot/gpt-5, anthropic/claude-sonnet-4, openai/gpt-4.1)")
 	}
 
-	switch strings.ToLower(strings.TrimSpace(parts[0])) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "copilot":
-		universalLLMConsumerLog.Printf("Resolved backend: copilot (model=%s)", parts[1])
+		universalLLMConsumerLog.Printf("Resolved backend: copilot (model=%s)", modelID)
 		return UniversalLLMBackendCopilot, nil
 	case "anthropic":
-		universalLLMConsumerLog.Printf("Resolved backend: anthropic (model=%s)", parts[1])
+		universalLLMConsumerLog.Printf("Resolved backend: anthropic (model=%s)", modelID)
 		return UniversalLLMBackendAnthropic, nil
 	case "openai", "codex":
-		universalLLMConsumerLog.Printf("Resolved backend: codex/openai (model=%s)", parts[1])
+		universalLLMConsumerLog.Printf("Resolved backend: codex/openai (model=%s)", modelID)
 		return UniversalLLMBackendCodex, nil
 	default:
-		return "", fmt.Errorf("unsupported provider %q in engine.model; supported providers: copilot, anthropic, openai, codex", parts[0])
+		return "", fmt.Errorf("unsupported provider %q in engine.model; supported providers: copilot, anthropic, openai, codex. Example: engine.model: copilot/gpt-5", provider)
 	}
 }
 
@@ -92,7 +92,6 @@ func getUniversalLLMBackendProfile(backend UniversalLLMBackend, useCopilotReques
 			coreSecretNames: coreSecrets,
 			env: map[string]string{
 				"COPILOT_GITHUB_TOKEN": copilotToken,
-				"OPENAI_API_KEY":       copilotToken,
 			},
 			baseURLEnvName:  "GITHUB_COPILOT_BASE_URL",
 			extraURLEnvName: "OPENAI_BASE_URL",
@@ -115,7 +114,10 @@ func (e *UniversalLLMConsumerEngine) resolveBackend(workflowData *WorkflowData) 
 }
 
 func (e *UniversalLLMConsumerEngine) GetUniversalRequiredSecretNames(workflowData *WorkflowData) []string {
-	backend := e.resolveBackend(workflowData)
+	return e.getUniversalRequiredSecretNamesForBackend(workflowData, e.resolveBackend(workflowData))
+}
+
+func (e *UniversalLLMConsumerEngine) getUniversalRequiredSecretNamesForBackend(workflowData *WorkflowData, backend UniversalLLMBackend) []string {
 	universalLLMConsumerLog.Printf("Collecting required secret names for backend: %s", backend)
 	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
 	secrets := append([]string{}, profile.coreSecretNames...)
@@ -160,23 +162,36 @@ func extractToolsConfig(workflowData *WorkflowData) (*ToolsConfig, map[string]an
 func (e *UniversalLLMConsumerEngine) GetUniversalSecretValidationStep(workflowData *WorkflowData, engineName, docsURL string) GitHubActionStep {
 	backend := e.resolveBackend(workflowData)
 	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
-	if len(profile.coreSecretNames) == 0 {
-		return GitHubActionStep{}
-	}
-	return BuildDefaultSecretValidationStep(workflowData, profile.coreSecretNames, engineName, docsURL)
+	return BuildEngineSecretValidationStep(workflowData, EngineSecretValidationConfig{
+		SecretNames: profile.coreSecretNames,
+		EngineName:  engineName,
+		DocsURL:     docsURL,
+	})
 }
 
 func (e *UniversalLLMConsumerEngine) ApplyUniversalProviderEnv(env map[string]string, workflowData *WorkflowData, firewallEnabled bool) {
-	backend := e.resolveBackend(workflowData)
+	e.applyUniversalProviderEnvForBackend(env, workflowData, firewallEnabled, e.resolveBackend(workflowData))
+}
+
+func (e *UniversalLLMConsumerEngine) applyUniversalProviderEnvForBackend(env map[string]string, workflowData *WorkflowData, firewallEnabled bool, backend UniversalLLMBackend) {
 	universalLLMConsumerLog.Printf("Applying provider env for backend=%s, firewallEnabled=%t", backend, firewallEnabled)
 	profile := getUniversalLLMBackendProfile(backend, hasCopilotRequestsWritePermission(workflowData))
 	maps.Copy(env, profile.env)
+	switch backend {
+	case UniversalLLMBackendAnthropic:
+		env["GH_AW_LLM_PROVIDER"] = string(LLMProviderAnthropic)
+	case UniversalLLMBackendCodex:
+		env["GH_AW_LLM_PROVIDER"] = string(LLMProviderOpenAI)
+	default:
+		env["GH_AW_LLM_PROVIDER"] = string(LLMProviderGitHub)
+	}
 	if firewallEnabled {
 		universalLLMConsumerLog.Printf("Setting %s to gateway port %d", profile.baseURLEnvName, profile.gatewayPort)
-		env[profile.baseURLEnvName] = fmt.Sprintf("http://host.docker.internal:%d", profile.gatewayPort)
+		baseURL := llmGatewayBaseURL(profile.gatewayPort, workflowData)
+		env[profile.baseURLEnvName] = baseURL
 		if profile.extraURLEnvName != "" {
 			universalLLMConsumerLog.Printf("Setting extra URL env %s to gateway port %d", profile.extraURLEnvName, profile.gatewayPort)
-			env[profile.extraURLEnvName] = fmt.Sprintf("http://host.docker.internal:%d", profile.gatewayPort)
+			env[profile.extraURLEnvName] = baseURL
 		}
 	}
 }
@@ -189,9 +204,8 @@ func (e *UniversalLLMConsumerEngine) ApplyUniversalProviderEnv(env map[string]st
 func resolveBackendWithAliases(model string, extraAliases map[string]UniversalLLMBackend) (UniversalLLMBackend, error) {
 	if len(extraAliases) > 0 {
 		model = strings.TrimSpace(model)
-		parts := strings.SplitN(model, "/", 2)
-		if len(parts) == 2 {
-			provider := strings.ToLower(strings.TrimSpace(parts[0]))
+		if provider, _, ok := strings.Cut(model, "/"); ok {
+			provider = strings.ToLower(strings.TrimSpace(provider))
 			if backend, ok := extraAliases[provider]; ok {
 				universalLLMConsumerLog.Printf("Resolved backend via alias %q → %s", provider, backend)
 				return backend, nil
@@ -210,7 +224,7 @@ type UniversalCLIEngineExecutionConfig struct {
 	// EngineConstant is the engine name used for firewall allowed-domain resolution.
 	EngineConstant constants.EngineName
 	// DefaultCommandName is the CLI binary name used when engine.command is not set
-	// (e.g. "opencode").
+	// (e.g. a behavior-defined CLI engine).
 	DefaultCommandName string
 	// ExtraCLIArgs are additional flags passed to the CLI run subcommand before the
 	// prompt argument.
@@ -218,14 +232,14 @@ type UniversalCLIEngineExecutionConfig struct {
 	// MCPConfigFile is the workspace-relative path of the permissions/MCP config file.
 	// It is used to populate GH_AW_MCP_CONFIG when MCP servers are configured.
 	MCPConfigFile string
-	// StepName is the GitHub Actions step name (e.g. "Execute OpenCode CLI").
+	// StepName is the GitHub Actions step name (e.g. "Execute My CLI").
 	StepName string
 	// ConfigStep is the pre-built config-writing step that precedes the execution step.
 	// Typically writes a JSON file that grants all permissions so the agent never hangs
 	// on an interactive prompt in CI.
 	ConfigStep GitHubActionStep
 	// ModelEnvVarName is the native environment variable used by the CLI for model
-	// selection (e.g. "OPENCODE_MODEL"). When empty, model selection
+	// selection (e.g. "MY_CLI_MODEL"). When empty, model selection
 	// via env var is skipped.
 	ModelEnvVarName string
 	// WriteTimestamp controls whether the non-firewall fallback command writes the
@@ -234,10 +248,12 @@ type UniversalCLIEngineExecutionConfig struct {
 }
 
 // BuildCLIEngineExecutionSteps generates the GitHub Actions execution steps for a
-// universal CLI engine (e.g. OpenCode). It handles firewall-aware command
+// universal CLI engine. It handles firewall-aware command
 // construction, common AWF environment variable injection, and step formatting.
 // Engines call this from their GetExecutionSteps implementation, supplying engine-
 // specific parameters via cfg.
+//
+//nolint:largefunc // Keeps universal engine setup in generated execution order.
 func (e *UniversalLLMConsumerEngine) BuildCLIEngineExecutionSteps(
 	workflowData *WorkflowData,
 	logFile string,
@@ -325,6 +341,7 @@ func (e *UniversalLLMConsumerEngine) BuildCLIEngineExecutionSteps(
 		// which causes workflow_dispatch to fail with "failed to parse workflow".
 		"NO_PROXY": constants.AWFNoProxyHosts,
 	}
+	applyPlaywrightBrowserEnv(env, workflowData)
 	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
 	e.ApplyUniversalProviderEnv(env, workflowData, firewallEnabled)
 
@@ -333,6 +350,8 @@ func (e *UniversalLLMConsumerEngine) BuildCLIEngineExecutionSteps(
 	}
 
 	applySafeOutputEnvToMap(env, workflowData)
+	applyDefaultMaxAICreditsEnvToMap(env, workflowData)
+	applyAWFRuntimeAgentTimeoutEnvToMap(env, workflowData)
 
 	// Propagate W3C trace context so engine spans nest under the gh-aw.agent.setup span.
 	applyTraceContextEnvToMap(env)
@@ -367,7 +386,7 @@ func (e *UniversalLLMConsumerEngine) BuildCLIEngineExecutionSteps(
 	}
 	allowedSecrets := e.GetUniversalRequiredSecretNames(workflowData)
 	filteredEnv := FilterEnvForSecrets(env, allowedSecrets)
-	stepLines = FormatStepWithCommandAndEnv(stepLines, command, filteredEnv)
+	stepLines = FormatStepWithCommandAndEnv(stepLines, wrapAgentExecutionCommand(command), filteredEnv)
 
 	steps = append(steps, GitHubActionStep(stepLines))
 	return steps

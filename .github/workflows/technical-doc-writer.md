@@ -26,20 +26,20 @@ network:
     - github
 
 imports:
+  - shared/pr-safe-output-defaults.md
   - ../skills/documentation/SKILL.md
   - ../agents/technical-doc-writer.agent.md
   - shared/ai-coding-dictionary.md
 
   - shared/otlp.md
+  - shared/reporting.md
 safe-outputs:
   add-comment:
     max: 1
   create-pull-request:
-    expires: 2d
     title-prefix: "[docs] "
     labels: [documentation]
     reviewers: copilot
-    draft: false
   upload-artifact:
     retention-days: 30
   messages:
@@ -50,7 +50,7 @@ safe-outputs:
 
 steps:
   - name: Setup Node.js
-    uses: actions/setup-node@v7.0.0
+    uses: actions/setup-node@v7.1.0
     with:
       node-version: '24'
       cache: 'npm'

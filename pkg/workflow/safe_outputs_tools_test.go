@@ -85,12 +85,25 @@ func TestEnhanceToolDescription(t *testing.T) {
 			},
 		},
 		{
+			name:            "add_labels with default limits",
+			toolName:        "add_labels",
+			baseDescription: "Add labels to an issue.",
+			safeOutputs: &SafeOutputsConfig{
+				AddLabels: &AddLabelsConfig{},
+			},
+			wantContains: []string{
+				"Maximum 5 add_labels call(s)",
+				"Maximum 10 label(s) per call",
+			},
+		},
+		{
 			name:            "add_labels with allowed labels",
 			toolName:        "add_labels",
 			baseDescription: "Add labels to an issue.",
 			safeOutputs: &SafeOutputsConfig{
 				AddLabels: &AddLabelsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("5")},
+					MaxLabels:            strPtr("25"),
 					SafeOutputAllowBlockConfig: SafeOutputAllowBlockConfig{
 						Allowed: []string{"bug", "enhancement", "question"},
 					},
@@ -98,7 +111,8 @@ func TestEnhanceToolDescription(t *testing.T) {
 			},
 			wantContains: []string{
 				"CONSTRAINTS:",
-				"Maximum 5 label(s)",
+				"Maximum 5 add_labels call(s)",
+				"Maximum 25 label(s) per call",
 				`Only these labels are allowed: ["bug" "enhancement" "question"]`,
 			},
 		},
@@ -116,7 +130,8 @@ func TestEnhanceToolDescription(t *testing.T) {
 			},
 			wantContains: []string{
 				"CONSTRAINTS:",
-				"Maximum 3 label(s)",
+				"Maximum 3 add_labels call(s)",
+				"Maximum 10 label(s) per call",
 				`Only these labels are allowed: ["bug" "feature request" "good first issue" "help wanted"]`,
 			},
 		},
@@ -312,8 +327,8 @@ func TestEnhanceToolDescription(t *testing.T) {
 			baseDescription: "Update a discussion.",
 			safeOutputs: &SafeOutputsConfig{
 				UpdateDiscussions: &UpdateDiscussionsConfig{
-					AllowedLabels: []string{"Label1", "Label2"},
-					Labels:        testBoolPtr(true),
+					SafeOutputAllowedLabelsConfig: SafeOutputAllowedLabelsConfig{AllowedLabels: []string{"Label1", "Label2"}},
+					Labels:                        boolPtr(true),
 				},
 			},
 			wantContains:    []string{"CONSTRAINTS:", `Only these labels are allowed: ["Label1" "Label2"]`},
@@ -325,8 +340,8 @@ func TestEnhanceToolDescription(t *testing.T) {
 			baseDescription: "Update a discussion.",
 			safeOutputs: &SafeOutputsConfig{
 				UpdateDiscussions: &UpdateDiscussionsConfig{
-					Title: testBoolPtr(true),
-					Body:  testBoolPtr(true),
+					Title: boolPtr(true),
+					Body:  boolPtr(true),
 				},
 			},
 			wantContains:    []string{"CONSTRAINTS:", "Title updates are allowed.", "Body updates are allowed."},
@@ -341,10 +356,10 @@ func TestEnhanceToolDescription(t *testing.T) {
 					UpdateEntityConfig: UpdateEntityConfig{
 						BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("3")},
 					},
-					Title:         testBoolPtr(true),
-					Body:          testBoolPtr(true),
-					Labels:        testBoolPtr(true),
-					AllowedLabels: []string{"bug"},
+					Title:                         boolPtr(true),
+					Body:                          boolPtr(true),
+					Labels:                        boolPtr(true),
+					SafeOutputAllowedLabelsConfig: SafeOutputAllowedLabelsConfig{AllowedLabels: []string{"bug"}},
 				},
 			},
 			wantContains: []string{
@@ -361,7 +376,7 @@ func TestEnhanceToolDescription(t *testing.T) {
 			baseDescription: "Update a discussion.",
 			safeOutputs: &SafeOutputsConfig{
 				UpdateDiscussions: &UpdateDiscussionsConfig{
-					Labels: testBoolPtr(true),
+					Labels: boolPtr(true),
 				},
 			},
 			wantContains:    []string{"CONSTRAINTS:", "Label updates are allowed."},
@@ -409,6 +424,43 @@ func TestSafeOutputsToolsJSONInSync(t *testing.T) {
 		"pkg/workflow/js/safe_outputs_tools.json and actions/setup/js/safe_outputs_tools.json must define identical tool objects in the same order; update both files together")
 }
 
+func TestPushToPullRequestBranchMessageGuidance(t *testing.T) {
+	var tools []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(safeOutputsToolsJSONContent), &tools))
+	for _, tool := range tools {
+		if tool["name"] != "push_to_pull_request_branch" {
+			continue
+		}
+		schema := tool["inputSchema"].(map[string]any)
+		require.Contains(t, schema["required"], "message")
+		properties := schema["properties"].(map[string]any)
+		message := properties["message"].(map[string]any)
+		require.NotContains(t, message, "default")
+		return
+	}
+	t.Fatal("push_to_pull_request_branch tool not found")
+}
+
+func TestLedgerAppendToolGuidance(t *testing.T) {
+	var tools []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(safeOutputsToolsJSONContent), &tools))
+	for _, tool := range tools {
+		if tool["name"] != "ledger_append" {
+			continue
+		}
+		description := tool["description"].(string)
+		require.Contains(t, description, "Supported built-in types: counter, log, set, table.")
+		properties := tool["inputSchema"].(map[string]any)["properties"].(map[string]any)
+		ledgerDescription := properties["ledger"].(map[string]any)["description"].(string)
+		require.Contains(t, ledgerDescription, "custom, counter, log, set, or table")
+		for _, text := range []string{description, ledgerDescription} {
+			require.Contains(t, text, "For map ledgers, use ledger_map_put or ledger_map_delete instead.")
+		}
+		return
+	}
+	t.Fatal("ledger_append tool not found")
+}
+
 func TestLargeContentFieldsHaveExpectedMaxLength(t *testing.T) {
 	var tools []map[string]any
 	require.NoError(t, json.Unmarshal([]byte(safeOutputsToolsJSONContent), &tools), "failed to parse compiler copy of safe_outputs_tools.json")
@@ -454,6 +506,13 @@ func TestLargeContentFieldsHaveExpectedMaxLength(t *testing.T) {
 		{tool: "report_incomplete", field: "details"},
 		{tool: "mark_pull_request_as_ready_for_review", field: "reason"},
 	}
+	expectedMaxLengths := map[string]float64{
+		"create_issue.body":                         524288,
+		"add_comment.body":                          524288,
+		"create_pull_request_review_comment.body":   524288,
+		"submit_pull_request_review.body":           524288,
+		"reply_to_pull_request_review_comment.body": 524288,
+	}
 
 	for _, tc := range fieldCases {
 		t.Run(tc.tool+"."+tc.field, func(t *testing.T) {
@@ -471,7 +530,11 @@ func TestLargeContentFieldsHaveExpectedMaxLength(t *testing.T) {
 
 			maxLength, ok := fieldValue["maxLength"].(float64)
 			require.True(t, ok, "expected maxLength for %s.%s", tc.tool, tc.field)
-			assert.InDelta(t, float64(65536), maxLength, 0, "expected maxLength=65536 for %s.%s", tc.tool, tc.field)
+			expectedMaxLength, ok := expectedMaxLengths[tc.tool+"."+tc.field]
+			if !ok {
+				expectedMaxLength = 65536
+			}
+			assert.InDelta(t, expectedMaxLength, maxLength, 0, "expected maxLength=%v for %s.%s", expectedMaxLength, tc.tool, tc.field)
 		})
 	}
 }

@@ -3,7 +3,11 @@
 package workflow
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCacheMemorySyntaxVariations(t *testing.T) {
@@ -66,6 +70,15 @@ func TestCacheMemorySyntaxVariations(t *testing.T) {
 				map[string]any{
 					"id":  "session",
 					"key": "memory-session",
+					"validation": map[string]any{
+						"json-schemas": []any{
+							map[string]any{
+								"file":   "state.json",
+								"format": "json",
+								"schema": map[string]any{"type": "object"},
+							},
+						},
+					},
 				},
 			},
 			shouldWork:  true,
@@ -182,4 +195,81 @@ func TestCacheMemorySyntaxVariations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCacheMemoryValidationConfigAndGeneratedSteps(t *testing.T) {
+	compiler := NewCompiler()
+	config, err := compiler.extractCacheMemoryConfigFromMap(map[string]any{
+		"cache-memory": []any{
+			map[string]any{
+				"id":  "default",
+				"key": "memory-default",
+				"validation": map[string]any{
+					"script":          "if (!fs.existsSync(path.join(memoryRoot, 'index.json'))) throw new Error('missing index');",
+					"timeout-minutes": 1,
+				},
+			},
+			map[string]any{
+				"id":  "session",
+				"key": "memory-session",
+				"validation": map[string]any{
+					"json-schemas": []any{
+						map[string]any{
+							"file":   "state.json",
+							"format": "json",
+							"schema": map[string]any{"type": "object"},
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.Len(t, config.Caches, 2)
+	require.NotNil(t, config.Caches[0].Validation)
+	assert.Equal(t, 1, config.Caches[0].Validation.TimeoutMinutes)
+	require.NotNil(t, config.Caches[1].Validation)
+	assert.Empty(t, config.Caches[1].Validation.Script)
+
+	data := &WorkflowData{
+		CacheMemoryConfig: config,
+		SafeOutputs:       &SafeOutputsConfig{ThreatDetection: &ThreatDetectionConfig{}},
+	}
+
+	var validation strings.Builder
+	generateCacheMemoryValidation(&validation, data)
+	validationYAML := validation.String()
+	assert.Contains(t, validationYAML, "Validate cache-memory file types and domain content")
+	assert.Contains(t, validationYAML, "VALIDATION_SCRIPT_B64:")
+	assert.Contains(t, validationYAML, "MEMORY_JSON_SCHEMAS_REQUIRED: 'true'")
+	assert.Contains(t, validationYAML, "validate_memory_step.cjs")
+	assert.Contains(t, validationYAML, "id: "+cacheMemoryValidationStepID("default"))
+	assert.Contains(t, validationYAML, "id: "+cacheMemoryValidationStepID("session"))
+
+	var upload strings.Builder
+	generateCacheMemoryArtifactUpload(&upload, data, getActionPin)
+	uploadYAML := upload.String()
+	assert.Contains(t, uploadYAML, "steps."+cacheMemoryValidationStepID("default")+".outcome == 'success'")
+	assert.Contains(t, uploadYAML, "steps."+cacheMemoryValidationStepID("session")+".outcome == 'success'")
+
+	job, err := compiler.buildUpdateCacheMemoryJob(data, true)
+	require.NoError(t, err)
+	require.NotNil(t, job)
+	updateYAML := strings.Join(job.Steps, "\n")
+	assert.Contains(t, updateYAML, "Validate cache-memory before save (default)")
+	assert.Contains(t, updateYAML, "VALIDATION_TIMEOUT_SECONDS: 60")
+	assert.Contains(t, updateYAML, "MEMORY_JSON_SCHEMAS_REQUIRED: 'true'")
+	assert.Contains(t, updateYAML, "validate_memory_step.cjs")
+	assert.Contains(t, updateYAML, "steps."+cacheMemoryValidationStepID("default")+".outcome == 'success'")
+	assert.Contains(t, updateYAML, "steps."+cacheMemoryValidationStepID("session")+".outcome == 'success'")
+}
+
+func TestCacheMemoryValidationStepIDsDoNotCollide(t *testing.T) {
+	hyphenID := cacheMemoryValidationStepID("my-cache")
+	underscoreID := cacheMemoryValidationStepID("my_cache")
+
+	assert.NotEqual(t, hyphenID, underscoreID)
+	assert.Equal(t, "validate_cache_memory_6d792d6361636865", hyphenID)
+	assert.Equal(t, "validate_cache_memory_6d795f6361636865", underscoreID)
 }

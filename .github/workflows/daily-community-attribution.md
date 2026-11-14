@@ -8,7 +8,9 @@ on:
     - cron: daily
   workflow_dispatch:
 
-max-daily-ai-credits: 10000
+max-daily-ai-credits:
+  value: 10000
+  backend: repo-memory
 permissions:
   contents: read
   pull-requests: read
@@ -17,6 +19,7 @@ permissions:
 model: claude-haiku-4.5
 engine:
   id: copilot
+  copilot-sdk: true
 timeout-minutes: 20
 
 network:
@@ -25,11 +28,11 @@ network:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [issues]
   repo-memory:
     wiki: true
@@ -73,6 +76,7 @@ experiments:
   prompt_style: [concise, verbose]
 
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/community-attribution.md
   - shared/otlp.md
   - shared/issue-dedup.md
@@ -366,6 +370,8 @@ evals:
 
 # Daily Community Attribution Updater
 
+Use only commands listed under `tools.bash`, one standalone command per call. Do not combine commands with shell operators unless the complete command is explicitly allowlisted. If a required operation is blocked, stop and report it instead of probing command variants.
+
 Maintain an up-to-date **🌍 Community Contributions** section in `README.md`
 and an all-time **Community Contributors** wiki page by attributing all
 resolved community-labeled issues using the five-tier attribution strategy.
@@ -611,4 +617,6 @@ If you encounter a genuine error that prevents completion (e.g., data fetch fail
 
 ### Output Format
 
-Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks to reduce scrolling.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.

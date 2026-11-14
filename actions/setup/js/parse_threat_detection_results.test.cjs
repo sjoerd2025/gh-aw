@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // Create mock functions
 const mockExistsSync = vi.fn(() => false);
@@ -34,7 +34,7 @@ const mockCore = {
 };
 global.core = mockCore;
 
-const { parseDetectionLog, extractFromStreamJson, extractResultFromText, extractStructuredOutput, parseStructuredResultFile } = require("./parse_threat_detection_results.cjs");
+const { parseDetectionLog, extractFromStreamJson, extractResultFromText, extractStructuredOutput, parseStructuredResultFile, reportAPIProxyGuardRejection } = require("./parse_threat_detection_results.cjs");
 
 describe("extractResultFromText", () => {
   it("should extract a simple JSON object", () => {
@@ -329,6 +329,66 @@ describe("parseDetectionLog", () => {
 
       expect(error).toBeUndefined();
       expect(verdict.prompt_injection).toBe(false);
+    });
+
+    it("should parse a verdict wrapped in Markdown bold emphasis (**)", () => {
+      const content = '**THREAT_DETECTION_RESULT:{"prompt_injection":false,"secret_leak":false,"malicious_patch":false,"reasons":[]}**';
+      const { verdict, error } = parseDetectionLog(content);
+
+      expect(error).toBeUndefined();
+      expect(verdict).toEqual({
+        prompt_injection: false,
+        secret_leak: false,
+        malicious_patch: false,
+        reasons: [],
+      });
+    });
+
+    it("should parse a verdict wrapped in Markdown underscore emphasis (__)", () => {
+      const content = '__THREAT_DETECTION_RESULT:{"prompt_injection":true,"secret_leak":false,"malicious_patch":false,"reasons":["found injection"]}__';
+      const { verdict, error } = parseDetectionLog(content);
+
+      expect(error).toBeUndefined();
+      expect(verdict.prompt_injection).toBe(true);
+      expect(verdict.reasons).toEqual(["found injection"]);
+    });
+
+    it("should handle leading whitespace before a Markdown-wrapped verdict", () => {
+      const content = '  **THREAT_DETECTION_RESULT:{"prompt_injection":false,"secret_leak":false,"malicious_patch":false,"reasons":[]}**  ';
+      const { verdict, error } = parseDetectionLog(content);
+
+      expect(error).toBeUndefined();
+      expect(verdict.prompt_injection).toBe(false);
+    });
+
+    it("should parse a Markdown-emphasis-wrapped verdict from a stream-json 'result' line", () => {
+      const line = JSON.stringify({
+        type: "result",
+        subtype: "success",
+        result: '**THREAT_DETECTION_RESULT:{"prompt_injection":false,"secret_leak":false,"malicious_patch":false,"reasons":[]}**',
+        stop_reason: "end_turn",
+      });
+      const { verdict, error } = parseDetectionLog(line);
+
+      expect(error).toBeUndefined();
+      expect(verdict).toEqual({
+        prompt_injection: false,
+        secret_leak: false,
+        malicious_patch: false,
+        reasons: [],
+      });
+    });
+
+    it("should not treat a result-format example embedded in prose as the authoritative verdict", () => {
+      const content =
+        'The output format should look like this: some text THREAT_DETECTION_RESULT:{"prompt_injection":false,...} is an example.\nActual verdict below.\nTHREAT_DETECTION_RESULT:{"prompt_injection":true,"secret_leak":false,"malicious_patch":false,"reasons":["real threat"]}';
+      const { verdict, error } = parseDetectionLog(content);
+
+      // The prose example does not start the line with the prefix (with or without
+      // emphasis), so only the real verdict line should be matched.
+      expect(error).toBeUndefined();
+      expect(verdict.prompt_injection).toBe(true);
+      expect(verdict.reasons).toEqual(["real threat"]);
     });
 
     it("should reject non-boolean values with a type error", () => {
@@ -830,7 +890,10 @@ describe("main", () => {
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Detection log file not found"));
     });
 
-    it("should warn when detection execution failed in warn mode", async () => {
+    // Fixture: conclude inputs of run 39191157830 (detection engine returned
+    // model_not_supported, so no detection_result.json was written).
+    it("should conclude warning (not failure) when detection execution failed in warn mode (agent_failure, run 39191157830)", async () => {
+      process.env.GH_AW_DETECTION_CONTINUE_ON_ERROR = "true";
       process.env.DETECTION_AGENTIC_EXECUTION_OUTCOME = "failure";
       mockExistsSync.mockReturnValue(false);
 
@@ -839,9 +902,40 @@ describe("main", () => {
       expect(mockCore.setOutput).toHaveBeenCalledWith("conclusion", "warning");
       expect(mockCore.setOutput).toHaveBeenCalledWith("success", "false");
       expect(mockCore.setOutput).toHaveBeenCalledWith("reason", "agent_failure");
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("conclusion", "failure");
       expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_DETECTION_CONCLUSION", "warning");
       expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_DETECTION_REASON", "agent_failure");
       expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("should conclude warning on parse errors when detection execution failed in warn mode (parse_error)", async () => {
+      process.env.DETECTION_AGENTIC_EXECUTION_OUTCOME = "failure";
+      mockCore.info.mockImplementationOnce(() => {
+        throw new Error("unexpected parse failure");
+      });
+
+      await mod.main();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("conclusion", "warning");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("success", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("reason", "parse_error");
+      expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_DETECTION_CONCLUSION", "warning");
+      expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_DETECTION_REASON", "parse_error");
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("should still fail closed when detection execution failed in strict mode (agent_failure)", async () => {
+      process.env.GH_AW_DETECTION_CONTINUE_ON_ERROR = "false";
+      process.env.DETECTION_AGENTIC_EXECUTION_OUTCOME = "failure";
+      mockExistsSync.mockReturnValue(false);
+
+      await mod.main();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("conclusion", "failure");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("success", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("reason", "agent_failure");
+      expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_DETECTION_CONCLUSION", "failure");
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Detection log file not found"));
     });
 
     // Note: The following tests are skipped because mocking fs for CJS modules
@@ -906,6 +1000,18 @@ describe("main", () => {
         expect(mockCore.setOutput).toHaveBeenCalledWith("conclusion", "failure");
         expect(mockCore.setOutput).toHaveBeenCalledWith("success", "false");
         expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Security threats detected: prompt injection"));
+        expect(mockCore.setOutput).toHaveBeenCalledWith("threat_kinds", "prompt_injection");
+        expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_DETECTION_THREAT_KINDS", "prompt_injection");
+      });
+
+      it.each(["true", "false"])("exports only boolean categories in continue-on-error=%s mode", async continueOnError => {
+        process.env.GH_AW_DETECTION_CONTINUE_ON_ERROR = continueOnError;
+        mockExistsSync.mockReturnValue(true);
+        mockReadFileSync.mockReturnValue('{"prompt_injection":true,"secret_leak":false,"malicious_patch":true,"reasons":["PRIVATE_TEXT"]}');
+        await mod.main();
+        expect(mockCore.setOutput).toHaveBeenCalledWith("threat_kinds", "prompt_injection,malicious_patch");
+        expect(mockCore.exportVariable).toHaveBeenCalledWith("GH_AW_DETECTION_THREAT_KINDS", "prompt_injection,malicious_patch");
+        expect(mockCore.setOutput.mock.calls.flat().join(" ")).not.toContain("PRIVATE_TEXT");
       });
 
       it("should fail when readFileSync throws", async () => {
@@ -921,5 +1027,51 @@ describe("main", () => {
         expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to read detection log"));
       });
     });
+  });
+});
+
+describe("reportAPIProxyGuardRejection", () => {
+  // Uses real files on disk: vi.mock("fs") does not intercept require("fs") in this
+  // CJS+vitest setup (see the skipped block above), so the proxy log path is passed explicitly.
+  const realFs = require("node:fs");
+  const realOs = require("node:os");
+  const realPath = require("node:path");
+  let tmpDir;
+
+  beforeEach(() => {
+    mockCore.warning.mockClear();
+    tmpDir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), "detection-proxy-guard-"));
+  });
+
+  afterEach(() => {
+    realFs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /**
+   * @param {object[]} entries
+   * @returns {string} path to the written proxy event log
+   */
+  function writeProxyEventLog(entries) {
+    const logPath = realPath.join(tmpDir, "event-logs.jsonl");
+    realFs.writeFileSync(logPath, entries.map(entry => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+    return logPath;
+  }
+
+  it("warns with the guard name and counters when the proxy rejected requests", () => {
+    const logPath = writeProxyEventLog([{ type: "max_cache_misses_exceeded", consecutive_cache_misses: 5, max_cache_misses: 5 }]);
+    expect(reportAPIProxyGuardRejection(logPath)).toBe(true);
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("max_cache_misses_exceeded (consecutive_cache_misses=5, max_cache_misses=5)"));
+    expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("not an authentication failure"));
+  });
+
+  it("stays silent when no guard rejection is recorded", () => {
+    const logPath = writeProxyEventLog([{ type: "response", status: 200 }]);
+    expect(reportAPIProxyGuardRejection(logPath)).toBe(false);
+    expect(mockCore.warning).not.toHaveBeenCalled();
+  });
+
+  it("stays silent when the proxy logs are unavailable", () => {
+    expect(reportAPIProxyGuardRejection(realPath.join(tmpDir, "missing.jsonl"))).toBe(false);
+    expect(mockCore.warning).not.toHaveBeenCalled();
   });
 });

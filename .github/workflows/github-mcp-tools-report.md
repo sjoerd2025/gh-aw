@@ -7,16 +7,19 @@ on:
 permissions:
   contents: read
   actions: read
+  copilot-requests: write
   discussions: read
   issues: read
   pull-requests: read
   security-events: read
 
-sandbox:
-  agent:
-    sudo: false
 
-engine: claude
+engine:
+  id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 tools:
   cli-proxy: true
   github:
@@ -26,20 +29,20 @@ tools:
   edit:
 safe-outputs:
   create-pull-request:
-    expires: 2d
     title-prefix: "[mcp-tools] "
     labels: [documentation, automation]
     reviewers: copilot
-    draft: false
     protected-files: fallback-to-issue
 timeout-minutes: 15
 imports:
+  - shared/pr-safe-output-defaults.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[mcp-tools-report] "
 
   - shared/otlp.md
 ---
+
 # GitHub MCP Remote Server Tools Report Generator
 
 You are the GitHub MCP Remote Server Tools Report Generator - an agent that documents the available functions in the GitHub MCP remote server.
@@ -388,7 +391,7 @@ A successful report:
 - ✅ Saves current tools list to cache for next run
 - ✅ **Creates/updates `.github/aw/github-mcp-server.md`** with comprehensive documentation
 - ✅ **Identifies and documents recommended default toolsets** with rationale
-- ✅ **Updates default toolsets** in documentation files (github-agentic-workflows.md)
+- ✅ **Updates default toolsets** in documentation files (syntax-tools-imports.md)
 - ✅ Organizes tools by their appropriate toolset categories
 - ✅ Provides clear descriptions and usage information
 - ✅ Is formatted as a well-structured markdown document
@@ -438,7 +441,7 @@ Your output MUST:
    - Include best practices for toolset selection
    - Format the documentation according to the repository's documentation standards
 10. **Update default toolsets documentation** in:
-   - `.github/aw/github-agentic-workflows.md` (search for "Default toolsets")
+   - `.github/aw/syntax-tools-imports.md` (search for "Default toolsets")
    - Use the recommended default toolsets identified in step 9
    - Ensure consistency across all documentation files
 11. Create a GitHub discussion with the complete tools report
@@ -518,7 +521,7 @@ Begin your tool discovery now. Follow these steps:
      - Explanation of when to enable other toolsets
    - Best practices for toolset selection
 11. **Update documentation references**: Update the default toolsets list in:
-   - `.github/aw/github-agentic-workflows.md` (search for "Default toolsets")
+   - `.github/aw/syntax-tools-imports.md` (search for "Default toolsets")
 12. **Document**: Categorize tools appropriately and create comprehensive documentation
 13. **Save for next run**: Save the current tools list to `/tmp/gh-aw/cache-memory/github-mcp-tools.json`
 14. **Generate report**: Create the final markdown report including change tracking, source links, and inconsistency detection

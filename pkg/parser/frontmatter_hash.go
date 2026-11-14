@@ -11,17 +11,16 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/jsonutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/typeutil"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 )
 
 var frontmatterHashLog = logger.New("parser:frontmatter_hash")
-
-// templateExpressionRegex matches ${{ ... }} expressions (pre-compiled for performance)
-var templateExpressionRegex = regexp.MustCompile(`\$\{\{(.*?)\}\}`)
 
 // parseBoolFromFrontmatter extracts a boolean value from a frontmatter map.
 // Returns false if the key is absent, the map is nil, or the value is not a bool.
@@ -33,8 +32,8 @@ func parseBoolFromFrontmatter(m map[string]any, key string) bool {
 // This abstraction allows for different file reading strategies (disk, GitHub API, in-memory, etc.)
 type FileReader func(filePath string) ([]byte, error)
 
-// DefaultFileReader reads files from disk using os.ReadFile
-var DefaultFileReader FileReader = os.ReadFile
+// DefaultFileReader uses the parser's reader, including confined cache reads.
+var DefaultFileReader FileReader = ReadFile
 
 const maxFrontmatterHashInputBytes = 1 << 20
 
@@ -130,6 +129,7 @@ func ComputeFrontmatterHashFromParsedContent(frontmatterText, markdownBody strin
 		fullBody = normalizeFrontmatterText(markdownBody)
 	} else {
 		relevantExpressions = extractRelevantTemplateExpressions(markdownBody)
+		relevantExpressions = mergeSortedUniqueStrings(relevantExpressions, collectRuntimeImportTemplateExpressions(frontmatterText, markdownBody, baseDir, fileReader))
 	}
 
 	return computeFrontmatterHashTextBasedWithReader(frontmatterText, fullBody, baseDir, cache, relevantExpressions, fileReader)
@@ -150,7 +150,7 @@ func ComputeFrontmatterHashFromFileWithParsedFrontmatter(filePath string, parsed
 	// Read file content using the provided file reader
 	content, err := fileReader(filePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read file: %w", err)
+		return "", fmt.Errorf("could not read file %q; ensure the path exists and is readable, then retry: %w", filePath, err)
 	}
 
 	return computeFrontmatterHashFromContent(string(content), parsedFrontmatter, filePath, cache, fileReader)
@@ -165,7 +165,7 @@ func ComputeFrontmatterHashFromFileWithReader(filePath string, cache *ImportCach
 	// Read file content using the provided file reader
 	content, err := fileReader(filePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read file: %w", err)
+		return "", fmt.Errorf("could not read file %q; ensure the path exists and is readable, then retry: %w", filePath, err)
 	}
 
 	// Parse frontmatter once from content; treat inlined-imports as false if parsing fails
@@ -185,7 +185,7 @@ func computeFrontmatterHashFromContent(content string, parsedFrontmatter map[str
 	// Extract frontmatter and markdown as text (no YAML parsing)
 	frontmatterText, markdown, err := extractFrontmatterAndBodyText(content)
 	if err != nil {
-		return "", fmt.Errorf("failed to extract frontmatter: %w", err)
+		return "", fmt.Errorf("could not extract frontmatter from %q; ensure the workflow frontmatter has a closing delimiter, then retry: %w", filePath, err)
 	}
 
 	// Get base directory for resolving imports
@@ -205,34 +205,25 @@ func computeFrontmatterHashFromContent(content string, parsedFrontmatter map[str
 		fullBody = normalizeFrontmatterText(markdown)
 	} else {
 		relevantExpressions = extractRelevantTemplateExpressions(markdown)
+		relevantExpressions = mergeSortedUniqueStrings(relevantExpressions, collectRuntimeImportTemplateExpressions(frontmatterText, markdown, baseDir, fileReader))
 	}
 
 	// Compute hash using text-based approach with custom file reader
 	return computeFrontmatterHashTextBasedWithReader(frontmatterText, fullBody, baseDir, cache, relevantExpressions, fileReader)
 }
 
-// extractRelevantTemplateExpressions extracts template expressions from markdown
-// that reference env. or vars. contexts
+// extractRelevantTemplateExpressions retains the cross-language hash contract's
+// textual env./vars. filter. Hashing scans boundaries; it does not validate syntax.
 func extractRelevantTemplateExpressions(markdown string) []string {
 	frontmatterHashLog.Printf("Extracting relevant template expressions from markdown: size=%d bytes", len(markdown))
 	var expressions []string
 	seen := make(map[string]struct {
 	})
 
-	// Regex to match ${{ ... }} expressions
-	matches := templateExpressionRegex.FindAllStringSubmatch(markdown, -1)
-
-	for _, match := range matches {
-		if len(match) < 2 {
-			continue
-		}
-
-		content := strings.TrimSpace(match[1])
-
-		// Check if expression references env. or vars.
-		if strings.Contains(content, "env.") || strings.Contains(content, "vars.") {
+	for _, match := range extractHashTemplateExpressions(markdown) {
+		if strings.Contains(match.Content, "env.") || strings.Contains(match.Content, "vars.") {
 			// Store the full expression including ${{ }}
-			expr := match[0]
+			expr := markdown[match.Start:match.End]
 			// Deduplicate expressions
 			if !setutil.Contains(seen, expr) {
 				expressions = append(expressions, expr)
@@ -248,6 +239,53 @@ func extractRelevantTemplateExpressions(markdown string) []string {
 	return expressions
 }
 
+func extractAllTemplateExpressions(markdown string) []string {
+	var expressions []string
+	seen := make(map[string]struct {
+	})
+	for _, match := range extractHashTemplateExpressions(markdown) {
+		if strings.TrimSpace(match.Content) == "" {
+			continue
+		}
+		expr := markdown[match.Start:match.End]
+		if !setutil.Contains(seen, expr) {
+			expressions = append(expressions, expr)
+			seen[expr] = struct {
+			}{}
+		}
+	}
+	sort.Strings(expressions)
+	return expressions
+}
+
+func extractHashTemplateExpressions(markdown string) []actionslanguageservice.Interpolation {
+	matches, err := actionslanguageservice.ExtractExpressions(markdown)
+	if err != nil {
+		frontmatterHashLog.Printf("Cannot scan template expressions for hashing: %v", err)
+		// Preserve complete expressions before and after malformed openings. Syntax
+		// validation, rather than freshness hashing, rejects malformed input.
+	}
+	return matches
+}
+
+func mergeSortedUniqueStrings(groups ...[]string) []string {
+	seen := make(map[string]struct {
+	})
+	var merged []string
+	for _, group := range groups {
+		for _, item := range group {
+			if item == "" || setutil.Contains(seen, item) {
+				continue
+			}
+			merged = append(merged, item)
+			seen[item] = struct {
+			}{}
+		}
+	}
+	sort.Strings(merged)
+	return merged
+}
+
 // extractFrontmatterAndBodyText extracts frontmatter as raw text without parsing YAML
 // Returns: frontmatterText, markdownBody, error
 func extractFrontmatterAndBodyText(content string) (string, string, error) {
@@ -255,18 +293,18 @@ func extractFrontmatterAndBodyText(content string) (string, string, error) {
 	// same frontmatter text (and therefore the same hash) as equivalent LF files.
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 
-	lines := strings.Split(content, "\n")
-
 	// Check if content starts with frontmatter delimiter
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+	firstLine, _, _ := strings.Cut(content, "\n")
+	if strings.TrimSpace(firstLine) != "---" {
 		// No frontmatter
 		return "", content, nil
 	}
 
 	// Find end of frontmatter
+	lines := strings.Split(content, "\n")
 	endIndex := -1
-	for i := 1; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) == "---" {
+	for i, line := range lines {
+		if i > 0 && strings.TrimSpace(line) == "---" {
 			endIndex = i
 			break
 		}
@@ -419,10 +457,8 @@ func indentationOf(line string) int {
 
 // processImportsTextBased processes imports from frontmatter using text-based parsing
 // Returns: importedFiles (list of import paths), importedFrontmatterTexts (list of frontmatter texts)
-func processImportsTextBased(frontmatterText, baseDir string, visited map[string]struct {
-}, fileReader FileReader) ([]string, []string, error) {
-	var importedFiles []string
-	var importedFrontmatterTexts []string
+func processImportsTextBased(frontmatterText, baseDir, rootDir string, visited map[string]struct{}, fileReader FileReader) ([]string, []string, error) {
+	var importedFiles, importedFrontmatterTexts []string
 
 	// Extract imports from frontmatter text
 	imports := extractImportsFromText(frontmatterText)
@@ -437,8 +473,10 @@ func processImportsTextBased(frontmatterText, baseDir string, visited map[string
 	sort.Strings(imports)
 
 	for _, importPath := range imports {
-		// Resolve import path relative to base directory
-		fullPath := filepath.Join(baseDir, importPath)
+		fullPath, err := resolveHashImportPath(importPath, baseDir, rootDir)
+		if err != nil {
+			return nil, nil, err
+		}
 
 		// Skip if already visited (cycle detection)
 		if setutil.Contains(visited, fullPath) {
@@ -468,10 +506,9 @@ func processImportsTextBased(frontmatterText, baseDir string, visited map[string
 
 		// Recursively process imports in the imported file
 		importBaseDir := filepath.Dir(fullPath)
-		nestedFiles, nestedTexts, err := processImportsTextBased(importFrontmatterText, importBaseDir, visited, fileReader)
+		nestedFiles, nestedTexts, err := processImportsTextBased(importFrontmatterText, importBaseDir, rootDir, visited, fileReader)
 		if err != nil {
-			// Continue processing other imports even if one fails
-			continue
+			return nil, nil, err
 		}
 
 		// Add nested imports
@@ -483,9 +520,19 @@ func processImportsTextBased(frontmatterText, baseDir string, visited map[string
 	return importedFiles, importedFrontmatterTexts, nil
 }
 
+func resolveHashImportPath(importPath, baseDir, rootDir string) (string, error) {
+	importPath, _ = splitPathAndSection(importPath)
+	resolveBase := rootDir
+	if isFileRelativeImportPath(importPath) {
+		resolveBase = baseDir
+	}
+	resolveBase, securityBase, normalizedPath := computeIncludeResolveAndSecurityBases(importPath, resolveBase)
+	return resolveLocalIncludePath(normalizedPath, resolveBase, securityBase)
+}
+
 // collectImportedBodies processes imports from frontmatter and returns the body texts of all
 // transitively imported files. Used to include imported file bodies in the body hash.
-func collectImportedBodies(frontmatterText, baseDir string, visited map[string]struct {
+func collectImportedBodies(frontmatterText, baseDir, rootDir string, visited map[string]struct {
 }, fileReader FileReader) ([]string, error) {
 	var importedBodyTexts []string
 
@@ -497,7 +544,10 @@ func collectImportedBodies(frontmatterText, baseDir string, visited map[string]s
 	sort.Strings(imports)
 
 	for _, importPath := range imports {
-		fullPath := filepath.Join(baseDir, importPath)
+		fullPath, err := resolveHashImportPath(importPath, baseDir, rootDir)
+		if err != nil {
+			return nil, err
+		}
 
 		if setutil.Contains(visited, fullPath) {
 			continue
@@ -518,14 +568,226 @@ func collectImportedBodies(frontmatterText, baseDir string, visited map[string]s
 		importedBodyTexts = append(importedBodyTexts, importBody)
 
 		importBaseDir := filepath.Dir(fullPath)
-		nestedBodies, err := collectImportedBodies(importFrontmatterText, importBaseDir, visited, fileReader)
+		nestedBodies, err := collectImportedBodies(importFrontmatterText, importBaseDir, rootDir, visited, fileReader)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		importedBodyTexts = append(importedBodyTexts, nestedBodies...)
 	}
 
 	return importedBodyTexts, nil
+}
+
+type runtimeImportReference struct {
+	path      string
+	startLine int
+	endLine   int
+}
+
+var (
+	runtimeImportReferenceRe = regexp.MustCompile(`\{\{#(?:runtime-import|import)\??(?:[ \t]+|[ \t]*:[ \t]*)([^{}]+?)\}\}`)
+	runtimeImportLineRangeRe = regexp.MustCompile(`^(.+?):(\d+)-(\d+)$`)
+)
+
+func collectRuntimeImportTemplateExpressions(frontmatterText, markdownBody, baseDir string, fileReader FileReader) []string {
+	seen := map[string]struct{}{}
+	expressions := extractRuntimeImportTemplateExpressionsFromMarkdown(markdownBody, baseDir, seen, fileReader)
+
+	importedBodies, err := collectImportedBodies(frontmatterText, baseDir, baseDir, map[string]struct{}{}, fileReader)
+	if err != nil {
+		return expressions
+	}
+	for _, body := range importedBodies {
+		expressions = mergeSortedUniqueStrings(expressions, extractAllTemplateExpressions(body))
+		expressions = mergeSortedUniqueStrings(expressions, extractRuntimeImportTemplateExpressionsFromMarkdown(body, baseDir, seen, fileReader))
+	}
+
+	return expressions
+}
+
+func extractRuntimeImportTemplateExpressionsFromMarkdown(markdownBody, baseDir string, seen map[string]struct{}, fileReader FileReader) []string {
+	refs := extractRuntimeImportReferences(markdownBody)
+	if len(refs) == 0 {
+		return nil
+	}
+
+	var expressions []string
+	for _, ref := range refs {
+		body, ok := readRuntimeImportBodyForHash(ref, baseDir, seen, fileReader)
+		if !ok {
+			continue
+		}
+		expressions = mergeSortedUniqueStrings(expressions, extractAllTemplateExpressions(body))
+		expressions = mergeSortedUniqueStrings(expressions, extractRuntimeImportTemplateExpressionsFromMarkdown(body, baseDir, seen, fileReader))
+	}
+	return expressions
+}
+
+func extractRuntimeImportReferences(markdownBody string) []runtimeImportReference {
+	if markdownBody == "" {
+		return nil
+	}
+	var refs []runtimeImportReference
+	seen := make(map[string]struct {
+	})
+	matches := runtimeImportReferenceRe.FindAllStringSubmatch(markdownBody, -1)
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		target := strings.TrimSpace(match[1]) //nolint:uncheckedsliceindex // Capture group length is checked above.
+		if target == "" {
+			continue
+		}
+		ref := runtimeImportReference{path: target}
+		if rangeMatch := runtimeImportLineRangeRe.FindStringSubmatch(target); len(rangeMatch) == 4 {
+			ref.path = strings.TrimSpace(rangeMatch[1])     //nolint:uncheckedsliceindex // Capture group length is checked above.
+			fmt.Sscanf(rangeMatch[2], "%d", &ref.startLine) //nolint:uncheckedsliceindex // Capture group length is checked above.
+			fmt.Sscanf(rangeMatch[3], "%d", &ref.endLine)   //nolint:uncheckedsliceindex // Capture group length is checked above.
+		}
+		if strings.HasPrefix(ref.path, "http://") || strings.HasPrefix(ref.path, "https://") {
+			continue
+		}
+		key := fmt.Sprintf("%s:%d-%d", filepath.ToSlash(ref.path), ref.startLine, ref.endLine)
+		if setutil.Contains(seen, key) {
+			continue
+		}
+		refs = append(refs, ref)
+		seen[key] = struct {
+		}{}
+	}
+	return refs
+}
+
+func readRuntimeImportBodyForHash(ref runtimeImportReference, baseDir string, seen map[string]struct{}, fileReader FileReader) (string, bool) {
+	for _, candidate := range runtimeImportHashCandidatePaths(ref.path, baseDir) {
+		key := fmt.Sprintf("%s:%d-%d", candidate, ref.startLine, ref.endLine)
+		if setutil.Contains(seen, key) {
+			return "", false
+		}
+		if runtimeImportHashLocalPathExists(candidate) && !runtimeImportHashRealPathAllowed(candidate, baseDir) {
+			continue
+		}
+		rawContent, err := fileReader(candidate)
+		if err != nil {
+			continue
+		}
+		seen[key] = struct {
+		}{}
+		content := string(rawContent)
+		if ref.startLine > 0 || ref.endLine > 0 {
+			content = applyRuntimeImportLineRangeForHash(content, ref.startLine, ref.endLine)
+		}
+		body, extractErr := ExtractMarkdownContent(content)
+		if extractErr == nil {
+			content = body
+		}
+		return content, true
+	}
+	return "", false
+}
+
+func runtimeImportHashLocalPathExists(candidate string) bool {
+	_, err := os.Stat(candidate)
+	return err == nil
+}
+
+func runtimeImportHashRealPathAllowed(candidate, baseDir string) bool {
+	workspaceRoot := runtimeImportHashWorkspaceRoot(baseDir)
+	for _, base := range []string{
+		filepath.Join(workspaceRoot, strings.TrimSuffix(constants.GithubDir, "/")),
+		filepath.Join(workspaceRoot, ".agents"),
+	} {
+		if realPathWithinBaseForHash(candidate, base) {
+			return true
+		}
+	}
+	return false
+}
+
+func realPathWithinBaseForHash(pathToCheck, baseDir string) bool {
+	absoluteBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return false
+	}
+	absolutePath, err := filepath.Abs(pathToCheck)
+	if err != nil {
+		return false
+	}
+	realBase, err := filepath.EvalSymlinks(absoluteBase)
+	if err != nil {
+		return false
+	}
+	realPath, err := filepath.EvalSymlinks(absolutePath)
+	if err != nil {
+		return false
+	}
+	relativePath, err := filepath.Rel(realBase, realPath)
+	return err == nil && relativePath != ".." && !strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) && !filepath.IsAbs(relativePath)
+}
+
+func applyRuntimeImportLineRangeForHash(content string, startLine, endLine int) string {
+	lines := strings.Split(content, "\n")
+	start := startLine
+	if start <= 0 {
+		start = 1
+	}
+	end := endLine
+	if end <= 0 || end > len(lines) {
+		end = len(lines)
+	}
+	if start > end || start > len(lines) {
+		return ""
+	}
+	return strings.Join(lines[start-1:end], "\n")
+}
+
+func runtimeImportHashCandidatePaths(importPath, baseDir string) []string {
+	normalized := filepath.ToSlash(strings.TrimSpace(importPath))
+	if strings.HasPrefix(normalized, "/") {
+		normalized = strings.TrimLeft(normalized, "/")
+		if !strings.HasPrefix(normalized, constants.GithubDir) && !strings.HasPrefix(normalized, ".agents/") {
+			return nil
+		}
+	}
+	normalized = strings.TrimPrefix(normalized, "./")
+	if normalized == "" || strings.HasPrefix(normalized, "../") || strings.Contains(normalized, "/../") {
+		return nil
+	}
+
+	workspaceRoot := runtimeImportHashWorkspaceRoot(baseDir)
+	if strings.HasPrefix(normalized, ".agents/") {
+		return []string{filepath.Join(workspaceRoot, filepath.FromSlash(normalized))}
+	}
+	if strings.HasPrefix(normalized, constants.GithubDir) {
+		return []string{filepath.Join(workspaceRoot, filepath.FromSlash(normalized))}
+	}
+
+	candidates := []string{
+		filepath.Join(workspaceRoot, strings.TrimSuffix(constants.GithubDir, "/"), filepath.FromSlash(normalized)),
+		filepath.Join(workspaceRoot, strings.TrimSuffix(constants.GithubDir, "/"), "workflows", filepath.FromSlash(normalized)),
+		filepath.Join(baseDir, filepath.FromSlash(normalized)),
+	}
+	deduped := candidates[:0]
+	seen := make(map[string]struct {
+	})
+	for _, candidate := range candidates {
+		clean := filepath.Clean(candidate)
+		if !setutil.Contains(seen, clean) {
+			deduped = append(deduped, clean)
+			seen[clean] = struct {
+			}{}
+		}
+	}
+	return deduped
+}
+
+func runtimeImportHashWorkspaceRoot(baseDir string) string {
+	githubFolder := findGitHubFolder(filepath.Clean(baseDir))
+	if strings.HasSuffix(githubFolder, ".github") {
+		return filepath.Dir(githubFolder)
+	}
+	return baseDir
 }
 
 // ComputeBodyHashFromParsedContent computes a SHA-256 hash of the markdown body (after frontmatter)
@@ -540,18 +802,15 @@ func ComputeBodyHashFromParsedContent(markdownBody, frontmatterText, baseDir str
 
 	visited := make(map[string]struct {
 	})
-	importedBodies, err := collectImportedBodies(frontmatterText, baseDir, visited, fileReader)
+	importedBodies, err := collectImportedBodies(frontmatterText, baseDir, baseDir, visited, fileReader)
 	if err != nil {
-		return "", fmt.Errorf("failed to process imports for body hash: %w", err)
+		return "", fmt.Errorf("could not process imports for body hash; ensure imported workflow files exist and are readable, then retry: %w", err)
 	}
 
 	allParts := []string{normalizedBody}
 
 	if len(importedBodies) > 0 {
-		normalizedBodies := make([]string, len(importedBodies))
-		for i, b := range importedBodies {
-			normalizedBodies[i] = normalizeFrontmatterText(b)
-		}
+		normalizedBodies := sliceutil.Map(importedBodies, normalizeFrontmatterText)
 		sort.Strings(normalizedBodies)
 		allParts = append(allParts, normalizedBodies...)
 	}
@@ -569,12 +828,12 @@ func ComputeBodyHashFromParsedContent(markdownBody, frontmatterText, baseDir str
 func ComputeBodyHashFromFile(filePath string) (string, error) {
 	content, err := DefaultFileReader(filePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read file: %w", err)
+		return "", fmt.Errorf("could not read file %q; ensure the path exists and is readable, then retry: %w", filePath, err)
 	}
 
 	frontmatterText, markdownBody, err := extractFrontmatterAndBodyText(string(content))
 	if err != nil {
-		return "", fmt.Errorf("failed to extract frontmatter: %w", err)
+		return "", fmt.Errorf("could not extract frontmatter from %q; ensure the workflow frontmatter has a closing delimiter, then retry: %w", filePath, err)
 	}
 
 	baseDir := filepath.Dir(filePath)
@@ -590,19 +849,16 @@ func computeFrontmatterHashTextBasedWithReader(frontmatterText, markdown, baseDi
 	// Process imports using text-based parsing with custom file reader
 	visited := make(map[string]struct {
 	})
-	importedFiles, importedFrontmatterTexts, err := processImportsTextBased(frontmatterText, baseDir, visited, fileReader)
+	importedFiles, importedFrontmatterTexts, err := processImportsTextBased(frontmatterText, baseDir, baseDir, visited, fileReader)
 	if err != nil {
-		return "", fmt.Errorf("failed to process imports: %w", err)
+		return "", fmt.Errorf("could not process imports; ensure imported workflow files exist and are readable, then retry: %w", err)
 	}
 
 	// Build canonical representation from text
 	canonical := make(map[string]any)
 
 	normalizedFrontmatterText := normalizeFrontmatterText(frontmatterText)
-	normalizedImportedTexts := make([]string, len(importedFrontmatterTexts))
-	for i, text := range importedFrontmatterTexts {
-		normalizedImportedTexts[i] = normalizeFrontmatterText(text)
-	}
+	normalizedImportedTexts := sliceutil.Map(importedFrontmatterTexts, normalizeFrontmatterText)
 
 	if err := validateFrontmatterHashInputSize(normalizedFrontmatterText, normalizedImportedTexts); err != nil {
 		return "", err

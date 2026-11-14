@@ -1,4 +1,5 @@
 // @ts-check
+// @safe-outputs-exempt SEC-005: cross-repo allowlist is enforced by createUpdateHandlerFactory (update_handler_factory.cjs) via resolveAndValidateRepo before buildUpdateData/executeUpdate run; this file only receives the already-validated targetRepo slug for temporary-ID resolution.
 /// <reference types="@actions/github-script" />
 
 /**
@@ -10,17 +11,18 @@ const HANDLER_TYPE = "update_issue";
 
 const { resolveTarget, checkRequiredFilter } = require("./safe_output_helpers.cjs");
 const { createUpdateHandlerFactory, createStandardResolveNumber, createStandardFormatResult } = require("./update_handler_factory.cjs");
-const { updateBody } = require("./update_pr_description_helpers.cjs");
+const { buildUpdatedBody } = require("./update_pr_description_helpers.cjs");
 const { buildCommonEntityUpdateData } = require("./update_entity_helpers.cjs");
-const { loadTemporaryProjectMap, replaceTemporaryProjectReferences } = require("./temporary_id.cjs");
+const { loadTemporaryIdMapFromResolved, loadTemporaryProjectMap, replaceTemporaryIdReferences, replaceTemporaryProjectReferences } = require("./temporary_id.cjs");
+const { parseIntTemplatable } = require("./templatable.cjs");
 const { tryEnforceArrayLimit } = require("./limit_enforcement_helpers.cjs");
-const { ERR_VALIDATION } = require("./error_codes.cjs");
-const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
-const { generateHistoryUrl } = require("./generate_history_link.cjs");
+const { ERR_VALIDATION, ERR_API } = require("./error_codes.cjs");
 const { fetchIssueState, mergeIssueState } = require("./safe_output_execution_metadata.cjs");
 const { MAX_LABELS, MAX_ASSIGNEES } = require("./constants.cjs");
 const { fetchAllRepoLabels } = require("./github_api_helpers.cjs");
 const { buildIssueIntentLabelUpdates, getIssueIntentLabelNames, normalizeIssueIntentLabelSpecs } = require("./issue_intents.cjs");
+const { normalizeIssueArtifacts, sanitizeIssueArtifacts, prepareIssueArtifactUpsert, upsertIssueArtifacts } = require("./issue_artifacts.cjs");
+const { getErrorMessage } = require("./error_helpers.cjs");
 
 /**
  * Execute the issue update API call
@@ -36,13 +38,14 @@ async function executeIssueUpdate(github, context, issueNumber, updateData) {
   const operation = updateData._operation || "append";
   let rawBody = updateData._rawBody;
   const includeFooter = updateData._includeFooter !== false; // Default to true
+  const bodyFooter = updateData._bodyFooter;
   const titlePrefix = updateData._titlePrefix || "";
   const labelsWereProvided = updateData.labels !== undefined;
   const labelSpecs = labelsWereProvided ? normalizeIssueIntentLabelSpecs(updateData.labels) : undefined;
   const useIssueIntentLabels = Boolean(labelSpecs);
 
   // Remove internal fields
-  const { _operation, _rawBody, _includeFooter, _titlePrefix, _workflowRepo, ...apiData } = updateData;
+  const { _operation, _rawBody, _includeFooter, _bodyFooter, _titlePrefix, _workflowRepo, _maxIssueArtifactSize, artifacts, ...apiData } = updateData;
   if (labelSpecs) {
     apiData.labels = getIssueIntentLabelNames(labelSpecs);
   }
@@ -54,7 +57,7 @@ async function executeIssueUpdate(github, context, issueNumber, updateData) {
   let currentIssue = null;
 
   // Fetch current issue if needed (title prefix validation or body update)
-  if (titlePrefix || rawBody !== undefined || useIssueIntentLabels) {
+  if (titlePrefix || rawBody !== undefined || useIssueIntentLabels || artifacts?.length) {
     const response = await github.rest.issues.get({
       owner: context.repo.owner,
       repo: context.repo.repo,
@@ -82,38 +85,27 @@ async function executeIssueUpdate(github, context, issueNumber, updateData) {
 
       const currentBody = currentIssue.body || "";
 
-      // Get workflow run URL for AI attribution.
-      // Use the original workflow repo (_workflowRepo) rather than context.repo, because
-      // context may be effectiveContext with repo overridden to a cross-repo target.
-      const workflowName = process.env.GH_AW_WORKFLOW_NAME || "GitHub Agentic Workflow";
-      const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
-      const callerWorkflowId = process.env.GH_AW_CALLER_WORKFLOW_ID || "";
-      const workflowRepo = _workflowRepo || context.repo;
-      const runUrl = buildWorkflowRunUrl(context, workflowRepo);
-
-      const historyUrl =
-        generateHistoryUrl({
-          owner: context.repo.owner,
-          repo: context.repo.repo,
-          itemType: "issue",
-          workflowCallId: callerWorkflowId,
-          workflowId,
-          serverUrl: context.serverUrl,
-        }) || undefined;
-
-      // Use helper to update body (handles all operations including replace)
-      apiData.body = updateBody({
+      apiData.body = buildUpdatedBody({
+        context,
         currentBody,
         newContent: rawBody,
         operation,
-        workflowName,
-        runUrl,
-        workflowId,
-        includeFooter, // Pass footer flag to helper
-        historyUrl,
+        includeFooter,
+        bodyFooter,
+        workflowRepo: _workflowRepo,
+        itemType: "issue",
       });
 
       core.info(`Will update body (length: ${apiData.body.length})`);
+    }
+  }
+
+  let artifactUpsertPlan;
+  if (artifacts?.length) {
+    try {
+      artifactUpsertPlan = await prepareIssueArtifactUpsert(github, context.repo.owner, context.repo.repo, issueNumber, artifacts, _maxIssueArtifactSize);
+    } catch (error) {
+      return { ...currentIssue, _artifactPreflightError: getErrorMessage(error) };
     }
   }
 
@@ -131,6 +123,7 @@ async function executeIssueUpdate(github, context, issueNumber, updateData) {
 
   /** @type {any} */
   let issue = currentIssue;
+  let issueUpdated = false;
   if (Object.keys(apiData).length > 0) {
     const response = await github.rest.issues.update({
       owner: context.repo.owner,
@@ -139,12 +132,13 @@ async function executeIssueUpdate(github, context, issueNumber, updateData) {
       ...apiData,
     });
     issue = response.data;
+    issueUpdated = true;
   }
 
   if (useIssueIntentLabels && labelIntentUpdates) {
     const issueNodeId = issue?.node_id || currentIssue?.node_id;
     if (!issueNodeId) {
-      throw new Error(`Failed to resolve GraphQL node ID for issue #${issueNumber}`);
+      throw new Error(`${ERR_API}: Failed to resolve GraphQL node ID for issue #${issueNumber}`);
     }
 
     core.info("Using GraphQL intent path for label update with GraphQL-Features header");
@@ -170,8 +164,23 @@ async function executeIssueUpdate(github, context, issueNumber, updateData) {
       ...(issue || currentIssue || {}),
       labels: result?.updateIssue?.issue?.labels?.nodes || [],
     };
+    issueUpdated = true;
   }
 
+  if (artifacts?.length) {
+    try {
+      const attached = await upsertIssueArtifacts(github, context.repo.owner, context.repo.repo, issueNumber, artifacts, _maxIssueArtifactSize, artifactUpsertPlan);
+      issue = { ...issue, artifacts: attached };
+    } catch (error) {
+      issue = {
+        ...issue,
+        artifacts: Array.isArray(error?.attached) ? error.attached : [],
+        _artifactError: getErrorMessage(error),
+        _issueUpdated: issueUpdated,
+      };
+      core.error(issue._artifactError);
+    }
+  }
   return issue;
 }
 
@@ -187,16 +196,49 @@ const resolveIssueNumber = createStandardResolveNumber({
 });
 
 /**
+ * Prepare sanitized artifacts, resolving temporary issue references before the final size check.
+ * @param {Object} item - The update message
+ * @param {Object} config - Configuration object
+ * @param {Object} [resolvedTemporaryIds] - Resolved temporary issue IDs
+ * @param {string} [targetRepo] - Effective target repository slug
+ * @returns {import("./types/safe-outputs").IssueArtifact[]}
+ */
+function prepareIssueArtifacts(item, config, resolvedTemporaryIds, targetRepo) {
+  const maxArtifacts = config.max_issue_artifacts;
+  const maxSizeBytes = config.max_issue_artifact_size;
+  const artifacts = normalizeIssueArtifacts(item.artifacts, maxArtifacts, maxSizeBytes, HANDLER_TYPE);
+  const sanitizedArtifacts = sanitizeIssueArtifacts(artifacts, {
+    allowedAliases: Array.isArray(config.allowedMentionAliases) ? config.allowedMentionAliases : [],
+    maxMentions: parseIntTemplatable(config.mentions?.max, 50),
+  });
+  const temporaryIdMap = loadTemporaryIdMapFromResolved(resolvedTemporaryIds, { defaultRepo: targetRepo });
+  const replacedArtifacts = sanitizedArtifacts.map(artifact => ({
+    ...artifact,
+    body: replaceTemporaryIdReferences(artifact.body, temporaryIdMap, targetRepo),
+  }));
+  return normalizeIssueArtifacts(replacedArtifacts, maxArtifacts, maxSizeBytes, HANDLER_TYPE);
+}
+
+/**
  * Build update data from message
  * @param {Object} item - The message item
  * @param {Object} config - Configuration object
+ * @param {Object} [resolvedTemporaryIds] - Resolved temporary issue IDs
+ * @param {string} [targetRepo] - Effective target repository slug
  * @returns {{success: true, data: Object} | {success: false, error: string}} Update data result
  */
-function buildIssueUpdateData(item, config) {
+function buildIssueUpdateData(item, config, resolvedTemporaryIds, targetRepo) {
+  let artifacts;
+  try {
+    artifacts = prepareIssueArtifacts(item, config, resolvedTemporaryIds, targetRepo);
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
   // hasCommonUpdates is not needed here: the issue handler always continues to check
   // entity-specific fields (state, labels, assignees, milestone, title prefix).
   const { updateData } = buildCommonEntityUpdateData(item, config, {
     defaultOperation: "append",
+    configDefaultOperation: config.default_operation,
     onBodyDisallowed: () => {
       core.warning("Body update not allowed by safe-outputs configuration");
     },
@@ -217,6 +259,10 @@ function buildIssueUpdateData(item, config) {
   }
   if (item.milestone !== undefined) {
     updateData.milestone = item.milestone;
+  }
+  if (artifacts.length > 0) {
+    updateData.artifacts = artifacts;
+    updateData._maxIssueArtifactSize = config.max_issue_artifact_size;
   }
 
   // Enforce max limits on labels and assignees before API calls
@@ -262,7 +308,21 @@ const main = createUpdateHandlerFactory({
   resolveItemNumber: resolveIssueNumber,
   buildUpdateData: buildIssueUpdateData,
   executeUpdate: executeIssueUpdate,
-  formatSuccessResult: formatIssueSuccessResult,
+  formatSuccessResult: (issueNumber, issue) => ({
+    ...formatIssueSuccessResult(issueNumber, issue),
+    ...(issue.artifacts?.length ? { artifacts: issue.artifacts } : {}),
+    ...(issue._artifactError
+      ? {
+          success: false,
+          partial: true,
+          retryable: false,
+          issueUpdated: issue._issueUpdated,
+          artifacts: issue.artifacts,
+          error: issue._artifactError,
+        }
+      : {}),
+    ...(issue._artifactPreflightError ? { success: false, error: issue._artifactPreflightError } : {}),
+  }),
   captureExecutionMetadata: {
     captureBefore: async (githubClient, effectiveContext, issueNumber) => fetchIssueState(githubClient, effectiveContext.repo, issueNumber),
     captureAfter: async (updatedIssue, beforeState) => mergeIssueState(beforeState, updatedIssue),

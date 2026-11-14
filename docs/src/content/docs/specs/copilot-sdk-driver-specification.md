@@ -7,7 +7,7 @@ sidebar:
 
 # Copilot SDK Driver Specification
 
-**Version**: 1.0.2  
+**Version**: 1.0.3<br />
 **Status**: Draft Specification  
 **Latest Version**: [copilot-sdk-driver-specification](/gh-aw/specs/copilot-sdk-driver-specification/)  
 **Editor**: GitHub Agentic Workflows Team
@@ -117,6 +117,21 @@ A conforming implementation MUST execute the following sequence:
 
 A complete implementation (Level 3) SHOULD serialize non-ephemeral session events to a JSON Lines stream compatible with downstream timeline rendering.
 
+The built-in driver retains native event envelopes and payloads, including user
+messages, reasoning, errors, tool outcomes, and unknown non-ephemeral extensions.
+It also captures the ephemeral `assistant.usage`, `assistant.message_delta`,
+`assistant.reasoning_delta`, `model.call_failure`, and workflow lifecycle observations needed to
+recover accounting and interrupted conversations. Other ephemeral events are
+not persisted. Canonical conversion happens in the Copilot session adapter;
+missing timestamps, tool outcomes, and metrics are not synthesized by the driver.
+Default summaries continue to omit user prompts.
+
+Bootstrap and collection retain independently parseable native observations
+from malformed JSONL and record an explicit collection warning. A usable partial
+native trace is not replayed together with fallback stdio. When fallback is
+needed, exact identified copies are deduplicated within their observed session;
+conflicting payloads and independent retry or child observations remain available.
+
 ### 3.4 Harness Connection Token Flow
 
 When SDK mode is enabled (`COPILOT_SDK_URI` is set), the harness MUST generate a per-run `COPILOT_CONNECTION_TOKEN` and MUST pass the same token value to both:
@@ -127,6 +142,19 @@ When SDK mode is enabled (`COPILOT_SDK_URI` is set), the harness MUST generate a
 The SDK driver MUST treat `COPILOT_CONNECTION_TOKEN` as a required input and MUST fail fast with non-zero exit when it is missing.
 
 The harness MUST NOT propagate platform authentication secrets such as `GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, or `GH_TOKEN` into the SDK driver subprocess environment. Driver processes run in a secret-isolated environment and MUST NOT rely on or attempt to read platform authentication tokens.
+
+### 3.5 Workflow Skill Registration
+
+The built-in driver explicitly supplies the staged workflow skill root
+`/tmp/gh-aw/.github/skills` through the SDK's `skillDirectories` configuration
+when that directory exists, enabling skills without ambient configuration
+discovery. This includes inline skills and installed frontmatter skills.
+Repository and home-directory skill roots are not added automatically.
+Missing staging directories produce an empty explicit list; a staged root that
+is a file or symbolic link fails session creation. This is a hard failure with
+`exitCode: 1` and a `session.error` event, not a warning or silent skip.
+Skill registration does not grant additional shell permissions or change the
+tool-denial limit.
 
 ---
 
@@ -383,6 +411,34 @@ The session result object SHOULD include:
 - Output-presence indicator
 - Duration in milliseconds
 
+For failed sessions, the built-in driver returns exit code `80` when its SDK
+permission callback recorded a workflow tool denial. This status is distinct
+from model-verification failure (`79`). The harness uses the exit status, not
+human-readable markers or JSON-shaped assistant output, to stop workflow-denial
+retries, classify `permission_denied`, and emit `report_missing_tool`.
+Repeated generic `permission denied`, `EACCES`, or `EPERM` text is diagnostic
+only and does not trigger these decisions in either Copilot SDK or CLI mode;
+without exit status `80`, normal retry rules apply. Permission-denial logs are
+not authenticated control signals. Expected safe-outputs already produced
+still suppress the terminal permission-denial verdict.
+
+The built-in driver treats a main-session content-filter rejection as failure,
+even when `sendAndWait` resolves normally. A rejection MUST be evidenced by either:
+
+1. Copilot's synthesized `assistant.message` containing both `rte: true` and the
+   exact runtime content-filter text; or
+2. a top-level `session.error` whose `errorType` is `"query"` or `"sdk_driver"`
+   and whose `message` begins exactly with `422 This content was flagged for
+   possible cybersecurity risk.`.
+
+A `session.error` nested under an agent or tool context, an error with another
+`errorType`, a quoted occurrence, or unrelated text MUST NOT establish
+main-session rejection. The rejection is retained as `assistant.refusal` in the
+canonical session, not counted as task output, and cannot qualify for idle-timeout
+success recovery. The harness stops retries, and an absent terminal safe output
+is classified as `request_rejection`, not an intentional noop or task success.
+Nested-agent refusals do not independently establish main-session rejection.
+
 ### 7.3 Cleanup
 
 The implementation MUST perform best-effort cleanup of event streams, session handles, and client handles regardless of success or failure.
@@ -425,6 +481,17 @@ Implementations MUST provide automated tests for all Level 1 and Level 2 require
 - **T-CSD-201**: Lifecycle logs include connection, session, prompt, completion, and failure markers.
 - **T-CSD-202**: Permission denial logs include compact request summary.
 
+#### 8.1.4 Content-Filter Evidence Tests
+
+- **T-CSD-301**: A top-level `session.error` with `errorType: "query"` and a message beginning exactly with `422 This content was flagged for possible cybersecurity risk.` establishes main-session content-filter rejection.
+- **T-CSD-302**: The same top-level evidence with `errorType: "sdk_driver"` establishes rejection.
+- **T-CSD-303**: Nested agent/tool errors, quoted messages, unrelated error types, non-matching prefixes, and null messages do not establish rejection.
+
+#### 8.1.5 Content-Filter Retry and Outcome Tests
+
+- **T-CSD-304**: A recognized main-session content-filter rejection stops retries after the first attempt, even when output or noop output exists.
+- **T-CSD-305**: The recognized rejection preserves failure classification and maps an absent terminal safe output to `request_rejection`, rather than success.
+
 ### 8.2 Compliance Checklist
 
 | Requirement                                   | Test ID              | Level | Status      |
@@ -440,6 +507,8 @@ Implementations MUST provide automated tests for all Level 1 and Level 2 require
 | Scoped MCP/shell enforcement                  | T-CSD-108..109       | 2     | Required    |
 | Unknown-kind rejection                        | T-CSD-110            | 2     | Required    |
 | Permission denial diagnostics                 | T-CSD-111, T-CSD-202 | 2     | Required    |
+| Main-session content-filter evidence          | T-CSD-301..303       | 1     | Required    |
+| Content-filter retry and outcome behavior     | T-CSD-304..305       | 1     | Required    |
 | Lifecycle logging coverage                    | T-CSD-201            | 3     | Recommended |
 
 ---
@@ -477,7 +546,9 @@ A conforming implementation SHOULD:
 - Treat connection tokens as secrets and avoid logging raw token values.
 - Apply least-privilege permission rules and avoid broad allow-all configurations unless operationally justified.
 - Preserve auditable denial logs for policy and incident review.
-- Restrict event persistence to non-ephemeral events (as defined above) and avoid writing sensitive transient state to durable storage.
+- Restrict event persistence to non-ephemeral events and the explicit accounting,
+  conversation-delta, and workflow lifecycle exceptions in Section 3.3; avoid
+  writing other sensitive transient state to durable storage.
 - Not attempt to read, fall back to, or check for platform authentication tokens (`GITHUB_TOKEN`, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`). These tokens are not present in the driver subprocess environment by design. Attempting to use them would fail silently or cause unexpected behavior.
 
 ---
@@ -501,7 +572,7 @@ A conforming implementation SHOULD:
 <a id="sync-notes"></a>
 ## Sync Notes
 
-The canonical gh-aw harness implementation for this specification is centered in:
+The canonical gh-aw implementation for this specification is centered in:
 
 - `actions/setup/js/copilot_sdk_driver.cjs`
 - `actions/setup/js/copilot_sdk_session.cjs`
@@ -518,6 +589,12 @@ This specification MUST be revalidated whenever any of the following occurs:
 
 <a id="change-log"></a>
 ## Change Log
+
+### Version 1.0.3 (Draft Specification) — 2026-11-13
+
+- Clarified Section 7.2 to recognize top-level Copilot `session.error` events with `errorType` `"query"` or `"sdk_driver"` and the exact cybersecurity-risk 422 message prefix as main-session content-filter rejection evidence.
+- Preserved exclusions for nested, quoted, unrelated, and non-matching errors.
+- Added compliance coverage for rejection evidence, one-attempt retry behavior, and failure preservation.
 
 ### Version 1.0.2 (Draft Specification)
 

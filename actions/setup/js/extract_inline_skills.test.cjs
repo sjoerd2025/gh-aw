@@ -14,7 +14,7 @@ global.core = {
   setFailed: () => {},
 };
 
-const { extractInlineSkills, writeInlineSkills, filterInlineSkillFrontmatter } = require("./extract_inline_skills.cjs");
+const { extractInlineSkills, writeInlineSkills, filterInlineSkillFrontmatter, closeUnterminatedSkillMarkers } = require("./extract_inline_skills.cjs");
 
 // Helper: returns a ## skill: `name` start marker line.
 const skillMarker = name => `## skill: \`${name}\``;
@@ -75,6 +75,16 @@ describe("extractInlineSkills", () => {
     expect(skills[0].content).not.toContain("outside the skill block");
   });
 
+  it("preserves an implicit boundary before an inline sub-agent", () => {
+    const content = ["Main.", "", skillMarker("planner"), "Planner.", "", "## agent: `executor`", "Executor."].join("\n");
+
+    const { mainContent, skills } = extractInlineSkills(content);
+
+    expect(skills).toHaveLength(1);
+    expect(skills[0]).toEqual({ name: "planner", content: "Planner." });
+    expect(mainContent).toBe("Main.\n\n## agent: `executor`\nExecutor.");
+  });
+
   it("next skill marker (H2) ends the previous skill block", () => {
     const content = ["Main.", "", skillMarker("planner"), "Planner.", "", skillMarker("executor"), "Executor."].join("\n");
 
@@ -91,6 +101,15 @@ describe("extractInlineSkills", () => {
     expect(mainContent).toBe("");
     expect(skills).toHaveLength(1);
     expect(skills[0].name).toBe("only");
+  });
+
+  it("uses implicit EOF boundary without explicit end marker", () => {
+    const content = ["Main.", "", skillMarker("reporting"), "EOF-terminated content."].join("\n");
+    const { mainContent, skills } = extractInlineSkills(content);
+    expect(mainContent).toBe("Main.");
+    expect(skills).toHaveLength(1);
+    expect(skills[0].name).toBe("reporting");
+    expect(skills[0].content).toBe("EOF-terminated content.");
   });
 
   it("skill content is trimmed", () => {
@@ -122,6 +141,93 @@ describe("extractInlineSkills", () => {
       expect(mainContent).toBe(content);
       expect(skills).toHaveLength(0);
     }
+  });
+
+  // ── Explicit end marker ("## end skill: `name`") ──────────────────────────
+
+  const skillEndMarker = name => `## end skill: \`${name}\``;
+
+  it("explicit end marker resumes main content after it", () => {
+    const content = ["Before.", "", skillMarker("reporting"), "---", "description: x", "---", "Body.", skillEndMarker("reporting"), "", "After."].join("\n");
+    const { mainContent, skills } = extractInlineSkills(content);
+
+    expect(skills).toHaveLength(1);
+    expect(skills[0].name).toBe("reporting");
+    expect(skills[0].content).toBe("---\ndescription: x\n---\nBody.");
+    expect(mainContent).toBe("Before.\n\nAfter.");
+  });
+
+  it("explicit end marker allows nested H2 headings inside the skill", () => {
+    const content = ["Main.", "", skillMarker("guide"), "## Section A", "Content A.", "## Section B", "Content B.", skillEndMarker("guide"), "", "Tail."].join("\n");
+    const { mainContent, skills } = extractInlineSkills(content);
+
+    expect(skills).toHaveLength(1);
+    expect(skills[0].content).toBe("## Section A\nContent A.\n## Section B\nContent B.");
+    expect(mainContent).toBe("Main.\n\nTail.");
+  });
+
+  it("supports mixing explicit and implicit end boundaries across skills", () => {
+    const content = ["Main.", "", skillMarker("bounded"), "Bounded.", skillEndMarker("bounded"), "", "Interlude.", "", skillMarker("unbounded"), "Unbounded."].join("\n");
+    const { mainContent, skills } = extractInlineSkills(content);
+
+    expect(skills).toHaveLength(2);
+    expect(skills[0]).toEqual({ name: "bounded", content: "Bounded." });
+    expect(skills[1]).toEqual({ name: "unbounded", content: "Unbounded." });
+    expect(mainContent).toBe("Main.\n\nInterlude.");
+  });
+
+  it("throws on an orphan end marker whose name has no matching start", () => {
+    const content = ["Main.", "", skillMarker("reporting"), "Content.", skillEndMarker("repporting")].join("\n");
+    expect(() => extractInlineSkills(content)).toThrow(/repporting.*line 5/);
+  });
+
+  it("throws on a standalone end marker with no skill starts", () => {
+    const content = ["Main.", "", skillEndMarker("reporting")].join("\n");
+    expect(() => extractInlineSkills(content)).toThrow(/reporting.*line 3/);
+  });
+
+  it("throws when the end marker names a different skill than the one it could close", () => {
+    const content = ["Main.", "", skillMarker("first"), "First content.", skillEndMarker("second")].join("\n");
+    expect(() => extractInlineSkills(content)).toThrow(/second/);
+  });
+
+  it("falls back to implicit H2 boundary when end marker is malformed", () => {
+    const malformed = ["## end skill:", "## end skill: reporting", "### end skill: `reporting`"];
+    for (const line of malformed) {
+      const content = "Main.\n\n" + skillMarker("reporting") + "\nContent.\n" + line + "\nTail.";
+      const { mainContent, skills } = extractInlineSkills(content);
+      expect(skills).toHaveLength(1);
+      expect(skills[0].name).toBe("reporting");
+      // Legacy implicit H2 closing discards content after the boundary from
+      // the reassembled main prompt unless the boundary is another inline block.
+      expect(mainContent).not.toContain("Tail.");
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// closeUnterminatedSkillMarkers — unit tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("closeUnterminatedSkillMarkers", () => {
+  const skillEndMarker = name => `## end skill: \`${name}\``;
+
+  it("adds an explicit end marker at EOF for an unterminated skill", () => {
+    const content = ["Main.", "", skillMarker("reporting"), "Skill content."].join("\n");
+
+    expect(closeUnterminatedSkillMarkers(content)).toBe(["Main.", "", skillMarker("reporting"), "Skill content.", "", skillEndMarker("reporting"), ""].join("\n"));
+  });
+
+  it("adds an explicit end marker before the next H2 boundary", () => {
+    const content = ["Main.", "", skillMarker("reporting"), "Skill content.", "## agent: `helper`", "Agent content."].join("\n");
+
+    expect(closeUnterminatedSkillMarkers(content)).toBe(["Main.", "", skillMarker("reporting"), "Skill content.", "", skillEndMarker("reporting"), "## agent: `helper`", "Agent content."].join("\n"));
+  });
+
+  it("leaves an explicitly terminated skill unchanged", () => {
+    const content = ["Main.", "", skillMarker("reporting"), "Skill content.", skillEndMarker("reporting"), "", "Tail."].join("\n");
+
+    expect(closeUnterminatedSkillMarkers(content)).toBe(content);
   });
 });
 
@@ -161,7 +267,15 @@ describe("writeInlineSkills", () => {
     expect(fs.existsSync(skillPath)).toBe(true);
     const written = fs.readFileSync(skillPath, "utf8");
     expect(written).toContain("You are a helper.");
-    expect(written).toContain("description: A helper skill");
+    expect(written).not.toContain("description");
+  });
+
+  it("writes Codex skills as discoverable SKILL.md files", () => {
+    const content = "# Workflow\n\nMain prompt.\n\n" + skillMarker("helper") + "\n---\ndescription: A helper skill\n---\nYou are a helper.";
+    const result = writeInlineSkills(content, tmpDir, tmpDir, "codex");
+    expect(result).toBe("# Workflow\n\nMain prompt.");
+    expect(fs.existsSync(path.join(tmpDir, ".codex", "skills", "helper", "SKILL.md"))).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, ".codex", "skills", "helper.md"))).toBe(false);
   });
 
   it("writes multiple skill files", () => {
@@ -205,19 +319,19 @@ describe("writeInlineSkills", () => {
     writeInlineSkills(content, tmpDir);
 
     const written = fs.readFileSync(path.join(tmpDir, ".github", "skills", "a/SKILL.md"), "utf8");
-    expect(written).toContain("description: A helper");
+    expect(written).not.toContain("description");
     expect(written).not.toContain("engine:");
     expect(written).not.toContain("tools:");
     expect(written).toContain("Skill prompt.");
   });
 
-  it("writes only description when mixed with unsupported fields", () => {
+  it("writes only the body when frontmatter contains descriptions and configuration", () => {
     const content = ["Main.", "", skillMarker("a"), "---", "description: A helpful skill", "engine: openai", "---", "Prompt."].join("\n");
 
     writeInlineSkills(content, tmpDir);
 
     const written = fs.readFileSync(path.join(tmpDir, ".github", "skills", "a/SKILL.md"), "utf8");
-    expect(written).toContain("description: A helpful skill");
+    expect(written).toBe("Prompt.\n");
     expect(written).not.toContain("engine:");
   });
 });
@@ -232,17 +346,17 @@ describe("filterInlineSkillFrontmatter", () => {
     expect(filterInlineSkillFrontmatter(content, "skill")).toBe(content);
   });
 
-  it("keeps description field", () => {
+  it("drops description field", () => {
     const content = "---\ndescription: A planner\n---\nPrompt.";
     const result = filterInlineSkillFrontmatter(content, "skill");
-    expect(result).toContain("description: A planner");
+    expect(result).not.toContain("description");
     expect(result).toContain("Prompt.");
   });
 
-  it("strips unsupported fields and keeps supported ones", () => {
+  it("strips all frontmatter fields", () => {
     const content = "---\nengine: copilot\ndescription: Helper\n---\nPrompt.";
     const result = filterInlineSkillFrontmatter(content, "skill");
-    expect(result).toContain("description: Helper");
+    expect(result).toBe("Prompt.");
     expect(result).not.toContain("engine:");
   });
 
@@ -253,9 +367,9 @@ describe("filterInlineSkillFrontmatter", () => {
     expect(result).toContain("Prompt.");
   });
 
-  it("returns content unchanged when no closing delimiter found", () => {
+  it("rejects an unterminated frontmatter delimiter", () => {
     const content = "---\nengine: copilot\nPrompt without closing delimiter.";
-    expect(filterInlineSkillFrontmatter(content, "skill")).toBe(content);
+    expect(() => filterInlineSkillFrontmatter(content, "skill")).toThrow(/unterminated/);
   });
 
   it("drops frontmatter when only unsupported fields are present", () => {
@@ -267,6 +381,6 @@ describe("filterInlineSkillFrontmatter", () => {
   it("handles content with only description field", () => {
     const content = "---\ndescription: Summarizes files\n---\nYou are a summarizer.";
     const result = filterInlineSkillFrontmatter(content, "agent");
-    expect(result).toBe("---\ndescription: Summarizes files\n---\nYou are a summarizer.");
+    expect(result).toBe("You are a summarizer.");
   });
 });

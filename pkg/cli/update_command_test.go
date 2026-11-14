@@ -4,10 +4,13 @@ package cli
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -82,6 +85,82 @@ This is the base content.`
 	}
 }
 
+// TestMergeWorkflowContent_PreservesUnchangedObjectFormImports is a regression test
+// for: gh aw update replacing a valid, unchanged upstream object-form import
+// (uses/with) with `imports: []` when only the prompt body changed upstream.
+func TestMergeWorkflowContent_PreservesUnchangedObjectFormImports(t *testing.T) {
+	base := `---
+on: push
+engine: claude
+imports:
+  - uses: shared/control.md
+    with:
+      role: orchestrator
+---
+
+# Dependabot Workflow
+
+Base prompt body.`
+
+	// Local has no modifications relative to base.
+	current := `---
+on: push
+engine: claude
+imports:
+  - uses: shared/control.md
+    with:
+      role: orchestrator
+source: test/repo/dependabot.md@v1.0.0
+---
+
+# Dependabot Workflow
+
+Base prompt body.`
+
+	// Upstream only changes the prompt body; the object-form import is unchanged.
+	new := `---
+on: push
+engine: claude
+imports:
+  - uses: shared/control.md
+    with:
+      role: orchestrator
+source: test/repo/dependabot.md@v1.1.0
+---
+
+# Dependabot Workflow
+
+Updated prompt body.`
+
+	oldSourceSpec := "test/repo/dependabot.md@v1.0.0"
+	newRef := "v1.1.0"
+
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, "", false)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if hasConflicts {
+		t.Errorf("Expected no conflicts, merged content:\n%s", merged)
+	}
+
+	if strings.Contains(merged, "imports: []") {
+		t.Fatalf("Expected the unchanged upstream import to be preserved, but imports were emptied:\n%s", merged)
+	}
+
+	if !strings.Contains(merged, "uses: shared/control.md") && !strings.Contains(merged, "shared/control.md") {
+		t.Errorf("Expected the shared/control.md import to be preserved, got:\n%s", merged)
+	}
+
+	if !strings.Contains(merged, "role: orchestrator") {
+		t.Errorf("Expected the import 'with' fields to be preserved, got:\n%s", merged)
+	}
+
+	if !strings.Contains(merged, "Updated prompt body.") {
+		t.Errorf("Expected upstream prompt body change to be applied, got:\n%s", merged)
+	}
+}
+
 func TestNewUpdateCommand_CoolDownFlagUsage(t *testing.T) {
 	cmd := NewUpdateCommand(func(string) error { return nil })
 	require.NotNil(t, cmd)
@@ -89,6 +168,17 @@ func TestNewUpdateCommand_CoolDownFlagUsage(t *testing.T) {
 	coolDownFlag := cmd.Flags().Lookup("cool-down")
 	require.NotNil(t, coolDownFlag, "update command should register --cool-down")
 	assert.Equal(t, coolDownFlagUsage, coolDownFlag.Usage, "cool-down usage should stay consistent across commands")
+}
+
+func TestNewUpdateCommand_SupportsPackageTargets(t *testing.T) {
+	t.Parallel()
+	cmd := NewUpdateCommand(func(string) error { return nil })
+	require.NotNil(t, cmd)
+
+	assert.Equal(t, "update [workflow-or-package]...", cmd.Use)
+	assert.Contains(t, cmd.Long, "installed GitHub package URLs")
+	assert.NotContains(t, cmd.Example, "update owner/package")
+	assert.Contains(t, cmd.Example, "update https://github.com/owner/package")
 }
 
 func TestNewUpdateCommand_MentionsEnterpriseSourceResolution(t *testing.T) {
@@ -123,6 +213,7 @@ This is the original content.`
 	current := `---
 on: push
 engine: claude
+source: test/repo/workflow.md@v1.0.0
 ---
 
 # Original Workflow
@@ -153,6 +244,10 @@ This is the upstream modified content.`
 	// Check for conflict markers
 	if !strings.Contains(merged, "<<<<<<<") || !strings.Contains(merged, ">>>>>>>") {
 		t.Error("Expected conflict markers in merged content")
+	}
+
+	if !strings.Contains(merged, "source: test/repo/workflow.md@v1.1.0") {
+		t.Errorf("Expected source field to be restored in conflict output, got:\n%s", merged)
 	}
 
 	// The merged content should contain both versions
@@ -331,6 +426,161 @@ on: push
 	}
 }
 
+func TestMergeWorkflowContent_NormalizesRewrittenImports(t *testing.T) {
+	base := `---
+imports:
+  - owner/repo/workflows/my-aw.md@v0.5.3
+---
+
+# Workflow
+`
+	current := `---
+imports:
+- owner/repo/workflows/my-aw.md@v0.5.3
+source: owner/repo@v0.5.3
+---
+
+# Workflow
+
+Local paragraph.
+`
+	newContent := `---
+imports:
+  - owner/repo/workflows/my-aw.md@v0.5.4
+---
+
+# Workflow
+`
+
+	merged, hasConflicts, err := MergeWorkflowContent(
+		base,
+		current,
+		newContent,
+		"owner/repo/workflows/my-aw.md@v0.5.3",
+		"v0.5.4",
+		"",
+		false,
+	)
+	require.NoError(t, err)
+	require.False(t, hasConflicts, "format-only differences from prior import rewriting must not conflict:\n%s", merged)
+	assert.Contains(t, merged, "owner/repo/workflows/my-aw.md@v0.5.4")
+	assert.Contains(t, merged, "Local paragraph.")
+	assert.NotContains(t, merged, "<<<<<<<")
+}
+
+func TestMergeWorkflowContent_LegacyImportFormattingPreservesInlineCommentConflict(t *testing.T) {
+	base := `---
+name: Example
+imports:
+  - owner/repo/shared/local.md@v1
+---
+
+# Original
+`
+	current := `---
+name: Example # my local note
+imports:
+- owner/repo/shared/local.md@v1
+source: owner/repo/workflows/example.md@v1
+---
+
+# Original
+`
+	upstream := `---
+name: Example v2
+imports:
+  - owner/repo/shared/local.md@v2
+---
+
+# Original
+`
+
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, upstream,
+		"owner/repo/workflows/example.md@v1", "v2", "", false)
+	require.NoError(t, err)
+	require.True(t, hasConflicts, "overlapping local inline comment and upstream edit must conflict:\n%s", merged)
+	assert.Contains(t, merged, "# my local note")
+}
+
+func TestMergeWorkflowContent_LegacyImportFormattingAllowsUpstreamCommentsAndImportRemoval(t *testing.T) {
+	base := `---
+# Setup note
+name: Example
+imports:
+  - owner/repo/shared/local.md@v1
+---
+
+# Original
+`
+	current := `---
+name: Example
+imports:
+- owner/repo/shared/local.md@v1
+source: owner/repo/workflows/example.md@v1
+---
+
+# Original
+
+Local paragraph.
+`
+	upstream := `---
+# Setup note
+name: Example
+# Upstream note
+---
+
+# Original
+`
+
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, upstream,
+		"owner/repo/workflows/example.md@v1", "v2", "", false)
+	require.NoError(t, err)
+	require.False(t, hasConflicts, "formatting-only local import difference must not block upstream comments or import removal:\n%s", merged)
+	assert.Contains(t, merged, "# Upstream note")
+	assert.Contains(t, merged, "# Original")
+	assert.Contains(t, merged, "Local paragraph.")
+	assert.NotContains(t, merged, "imports:")
+}
+
+func TestMergeWorkflowContent_PreservesCommentsWithLocalImport(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "shared"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "shared/local.md"), []byte("# Local\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	base := "---\n# Setup note\nname: Example\n# imports:\n#   - shared/optional.md\n---\n\n# Original\n"
+	current := "---\n# Setup note\nname: Example\n# imports:\n#   - shared/optional.md\nimports:\n  - shared/local.md\nsource: owner/repo/workflows/example.md@v1\n---\n\n# Original\n"
+	upstream := strings.Replace(base, "# Original", "# Updated", 1)
+
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, upstream,
+		"owner/repo/workflows/example.md@v1", "v2", filepath.Join(dir, "example.md"), false)
+	require.NoError(t, err)
+	require.False(t, hasConflicts, "local import and upstream body change must not conflict:\n%s", merged)
+	assert.Contains(t, merged, "# Setup note\nname: Example\n# imports:\n#   - shared/optional.md\nimports:\n  - shared/local.md")
+	assert.Contains(t, merged, "# Updated")
+}
+
+func TestMergeWorkflowContent_NormalizesWindowsLineEndings(t *testing.T) {
+	base := "---\non: push\n---\n\n# Workflow\n\nUpstream base.\n"
+	current := strings.ReplaceAll(base, "\n", "\r\n")
+	newContent := strings.Replace(base, "Upstream base.", "Updated upstream.", 1)
+
+	merged, hasConflicts, err := MergeWorkflowContent(
+		base,
+		current,
+		newContent,
+		"owner/repo/workflows/workflow.md@v1.0.0",
+		"v1.1.0",
+		"",
+		false,
+	)
+	require.NoError(t, err)
+	require.False(t, hasConflicts, "CRLF differences must not conflict with upstream changes:\n%s", merged)
+	assert.Contains(t, merged, "Updated upstream.")
+}
+
 // TestUpdateSourceFieldInContent tests the source field update function
 func TestUpdateSourceFieldInContent(t *testing.T) {
 	content := `---
@@ -357,6 +607,139 @@ source: old/repo/workflow.md@v1.0.0
 	if !strings.Contains(updated, "# Test Workflow") {
 		t.Error("Expected markdown content to be preserved")
 	}
+}
+
+// TestMergeWorkflowContent_SourceInMiddle tests that source field position in current
+// (in the middle of frontmatter, before other fields) does not cause merge conflicts.
+// This replicates the ci-doctor.md scenario where source was committed before features/evals.
+func TestMergeWorkflowContent_SourceInMiddle(t *testing.T) {
+	// Upstream base: no source field, has features and evals at end of frontmatter
+	base := `---
+on: push
+engine: claude
+features:
+  gh-aw-detection: true
+evals:
+  - id: ci_failure_investigated
+    question: Did the agent investigate failed CI workflows?
+---
+
+# CI Doctor
+
+Test content.`
+
+	// Local current: source field is in the MIDDLE (before features/evals), as it was
+	// committed in a file where source was placed before other trailing fields.
+	current := `---
+on: push
+engine: claude
+source: test/repo/ci-doctor.md@v1.0.0
+features:
+  gh-aw-detection: true
+evals:
+  - id: ci_failure_investigated
+    question: Did the agent investigate failed CI workflows?
+---
+
+# CI Doctor
+
+Test content.`
+
+	// Upstream new: no source field, same structure but updated description
+	new := `---
+on: push
+engine: claude
+features:
+  gh-aw-detection: true
+evals:
+  - id: ci_failure_investigated
+    question: Did the agent investigate failed CI workflows?
+---
+
+# CI Doctor
+
+Test content updated upstream.`
+
+	oldSourceSpec := "test/repo/ci-doctor.md@v1.0.0"
+	newRef := "v1.1.0"
+
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, new, oldSourceSpec, newRef, "", false)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if hasConflicts {
+		t.Errorf("Expected no conflicts when source field is in a different position but content is otherwise unchanged, merged content:\n%s", merged)
+	}
+
+	// Source field should be updated to the new version
+	if !strings.Contains(merged, "source: test/repo/ci-doctor.md@v1.1.0") {
+		t.Errorf("Expected source field to be updated to v1.1.0, got:\n%s", merged)
+	}
+
+	// Upstream markdown change should be present
+	if !strings.Contains(merged, "Test content updated upstream.") {
+		t.Errorf("Expected upstream markdown change to be present, got:\n%s", merged)
+	}
+}
+
+// TestMergeWorkflowContent_SourceRefDoesNotConflictWithLocalFrontmatterExpansion
+// covers a managed source ref update next to a large local frontmatter extension.
+func TestMergeWorkflowContent_SourceRefDoesNotConflictWithLocalFrontmatterExpansion(t *testing.T) {
+	base := `---
+tools:
+  cache-memory: true
+  web-fetch:
+
+timeout-minutes: 10
+---
+
+# Workflow
+`
+
+	current := `---
+tools:
+  cache-memory: true
+  web-fetch:
+  web-search:
+  github:
+    mode: gh-proxy
+
+timeout-minutes: 20
+
+steps:
+  - name: Local pre-analysis
+    with:
+      source: local-input
+    env:
+      source: local-env
+    run: echo ready
+
+features:
+  gh-aw-detection: true
+evals:
+  - id: investigated
+    question: Was the failure investigated?
+source: test/repo/ci-doctor.md@v1.0.0
+---
+
+# Workflow
+`
+
+	newContent := base
+	oldSourceSpec := "test/repo/ci-doctor.md@v1.0.0"
+	newRef := "v1.1.0"
+
+	merged, hasConflicts, err := MergeWorkflowContent(base, current, newContent, oldSourceSpec, newRef, "", false)
+	require.NoError(t, err)
+	require.False(t, hasConflicts, "managed source ref changes must not conflict with local frontmatter additions:\n%s", merged)
+	assert.Contains(t, merged, "web-search:")
+	assert.Contains(t, merged, "timeout-minutes: 20")
+	assert.Contains(t, merged, "source: local-input")
+	assert.Contains(t, merged, "source: local-env")
+	assert.Contains(t, merged, "source: test/repo/ci-doctor.md@v1.1.0")
+	assert.NotContains(t, merged, "source: test/repo/ci-doctor.md@v1.0.0")
+	assert.NotContains(t, merged, "<<<<<<<")
 }
 
 // TestMergeWorkflowContent_Integration tests the merge with temporary files
@@ -578,9 +961,22 @@ func TestShowUpdateSummary(t *testing.T) {
 			// This test just verifies the function doesn't panic and can be called
 			// We don't check the exact output format since it uses console helpers
 			// and the exact formatting may change
-			showUpdateSummary(tt.successfulUpdates, tt.failedUpdates)
+			showUpdateSummary(tt.successfulUpdates, tt.failedUpdates, false)
 		})
 	}
+}
+
+func TestGroupUpdateFailuresCollapsesSAMLRateLimitErrors(t *testing.T) {
+	t.Parallel()
+	failures := []updateFailure{
+		{Name: "workflow-b", Error: "SAML enforcement: API rate limit exceeded"},
+		{Name: "workflow-a", Error: "forbidden by SAML enforcement; rate limit exceeded"},
+	}
+
+	groups := groupUpdateFailures(failures)
+	require.Len(t, groups, 1)
+	assert.Equal(t, "workflow-a, workflow-b", groups[0].Workflows)
+	assert.Equal(t, "SAML-restricted authenticated access; anonymous GitHub API fallback is rate-limited", groups[0].Reason)
 }
 
 // TestHasLocalModifications tests the local modifications detection
@@ -705,6 +1101,39 @@ source: test/repo/workflow.md@v1.0.0
 			expectModified: false,
 			description:    "Both files minimal but identical",
 		},
+		{
+			name: "source field in different position - not a modification",
+			sourceContent: `---
+on: push
+engine: claude
+features:
+  gh-aw-detection: true
+evals:
+  - id: check_one
+    question: Did the agent do the thing?
+---
+
+# Test Workflow
+
+Test content.`,
+			localContent: `---
+on: push
+engine: claude
+source: test/repo/workflow.md@v1.0.0
+features:
+  gh-aw-detection: true
+evals:
+  - id: check_one
+    question: Did the agent do the thing?
+---
+
+# Test Workflow
+
+Test content.`,
+			sourceSpec:     "test/repo/workflow.md@v1.0.0",
+			expectModified: false,
+			description:    "Source field in a different position (before features/evals instead of at end) should not be treated as local modification",
+		},
 	}
 
 	for _, tt := range tests {
@@ -746,7 +1175,7 @@ This is a test workflow.
 
 	// Test with refreshStopTime=false (should preserve existing stop time if lock exists)
 	t.Run("compileWorkflowWithRefresh false", func(t *testing.T) {
-		err := compileWorkflowWithRefresh(context.Background(), workflowFile, false, false, "", false, false)
+		err := compileWorkflowWithRefreshAndActionRef(context.Background(), workflowFile, false, false, "", "", false, false)
 		if err != nil {
 			t.Logf("Compilation failed (expected in test environment): %v", err)
 			// In a test environment without full setup, compilation may fail,
@@ -756,7 +1185,7 @@ This is a test workflow.
 
 	// Test with refreshStopTime=true (should regenerate stop time)
 	t.Run("compileWorkflowWithRefresh true", func(t *testing.T) {
-		err := compileWorkflowWithRefresh(context.Background(), workflowFile, false, false, "", true, false)
+		err := compileWorkflowWithRefreshAndActionRef(context.Background(), workflowFile, false, false, "", "", true, false)
 		if err != nil {
 			t.Logf("Compilation failed (expected in test environment): %v", err)
 			// In a test environment without full setup, compilation may fail,
@@ -783,6 +1212,307 @@ func TestUpdateWorkflow_NoMergeMode(t *testing.T) {
 		merge := !noMerge
 		assert.False(t, merge, "merge should be false when --no-merge is set")
 	})
+}
+
+// TestUpdateWorkflow_RestoresContentOnCompileFailure verifies that when an
+// upstream update produces content that fails to compile (for example, a new
+// dispatch-workflow target that doesn't exist locally), the local workflow
+// file is restored to its previous, working content instead of being left in
+// a broken state on disk.
+func TestUpdateWorkflow_RestoresContentOnCompileFailure(t *testing.T) {
+	originalResolveLatestRef := resolveLatestRefFn
+	originalDownloadWorkflow := downloadWorkflowContentFn
+	t.Cleanup(func() {
+		resolveLatestRefFn = originalResolveLatestRef
+		downloadWorkflowContentFn = originalDownloadWorkflow
+	})
+
+	tmpDir := testutil.TempDir(t, "test-*")
+	require.NoError(t, initTestGitRepo(tmpDir), "failed to initialize git repo")
+
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755), "failed to create workflows dir")
+
+	oldDir, err := os.Getwd()
+	require.NoError(t, err, "failed to get current directory")
+	t.Cleanup(func() {
+		require.NoError(t, os.Chdir(oldDir), "failed to restore directory")
+	})
+	require.NoError(t, os.Chdir(tmpDir), "failed to change to temp directory")
+
+	const currentRef = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const latestRef = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	originalContent := `---
+on: issues
+engine: copilot
+permissions:
+  contents: read
+source: owner/repo/workflows/test-workflow.md@` + currentRef + `
+---
+
+# Test Workflow
+
+Original content.
+`
+
+	// Simulate an upstream update that introduces a dispatch-workflow target
+	// that doesn't exist locally — this must fail to compile.
+	brokenNewContent := `---
+on: issues
+engine: copilot
+permissions:
+  contents: read
+safe-outputs:
+  dispatch-workflow:
+    workflows:
+      - missing-workflow
+    max: 1
+source: owner/repo/workflows/test-workflow.md@` + latestRef + `
+---
+
+# Test Workflow
+
+Updated content referencing a workflow that doesn't exist locally.
+`
+
+	workflowFile := filepath.Join(workflowsDir, "test-workflow.md")
+	require.NoError(t, os.WriteFile(workflowFile, []byte(originalContent), 0644), "failed to write initial workflow")
+
+	resolveLatestRefFn = func(_ context.Context, _ string, ref string, _ bool, _ bool, _ time.Duration) (latestRefResolution, error) {
+		if ref == currentRef {
+			return latestRefResolution{Ref: latestRef}, nil
+		}
+		return latestRefResolution{Ref: ref}, nil
+	}
+	downloadWorkflowContentFn = func(_ context.Context, _, _, ref string, _ bool) ([]byte, error) {
+		if ref == latestRef {
+			return []byte(brokenNewContent), nil
+		}
+		return []byte(originalContent), nil
+	}
+
+	wf := &workflowWithSource{
+		Name:       "test-workflow",
+		Path:       workflowFile,
+		SourceSpec: "owner/repo/workflows/test-workflow.md@" + currentRef,
+	}
+
+	opts := UpdateWorkflowsOptions{
+		WorkflowsDir: workflowsDir,
+	}
+
+	err = updateWorkflow(context.Background(), wf, opts)
+	require.Error(t, err, "update should fail because the new content doesn't compile")
+	assert.Contains(t, err.Error(), "failed to compile updated workflow")
+
+	restoredContent, readErr := os.ReadFile(workflowFile)
+	require.NoError(t, readErr, "failed to read workflow file after failed update")
+	assert.Equal(t, originalContent, string(restoredContent), "workflow file should be restored to its original content after a compile failure")
+}
+
+func TestUpdateWorkflows_MergeConflictsFail(t *testing.T) {
+	originalResolve, originalDownload := resolveLatestRefFn, downloadWorkflowContentFn
+	t.Cleanup(func() {
+		resolveLatestRefFn, downloadWorkflowContentFn = originalResolve, originalDownload
+	})
+	resolveLatestRefFn = func(context.Context, string, string, bool, bool, time.Duration) (latestRefResolution, error) {
+		return latestRefResolution{Ref: "v2.0.0"}, nil
+	}
+	const base = "---\non: workflow_dispatch\ntools:\n  bash: [\"echo base\"]\n---\n\n# Workflow\n"
+	downloadWorkflowContentFn = func(_ context.Context, _, _, ref string, _ bool) ([]byte, error) {
+		if ref == "v2.0.0" {
+			return []byte(strings.Replace(base, "echo base", "echo upstream", 1)), nil
+		}
+		return []byte(base), nil
+	}
+
+	for _, noCompile := range []bool{false, true} {
+		name := "preserves workflow when compiling"
+		if noCompile {
+			name = "reports partial failure without compilation"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "conflict.md")
+			local := strings.Replace(base, "echo base", "echo local", 1)
+			local = strings.Replace(local, "on: workflow_dispatch", "on: workflow_dispatch\nsource: owner/repo/workflows/conflict.md@v1.0.0", 1)
+			require.NoError(t, os.WriteFile(path, []byte(local), 0o600))
+			lockPath := filepath.Join(dir, "conflict.lock.yml")
+			require.NoError(t, os.WriteFile(lockPath, []byte("existing lock"), 0o600))
+
+			// A successful update must not hide another workflow's merge failure.
+			if noCompile {
+				healthy := strings.Replace(base, "on: workflow_dispatch", "on: workflow_dispatch\nsource: owner/repo/workflows/healthy.md@v1.0.0", 1)
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "healthy.md"), []byte(healthy), 0o600))
+			}
+			err := UpdateWorkflows(context.Background(), UpdateWorkflowsOptions{
+				WorkflowsDir: dir,
+				NoCompile:    noCompile,
+			})
+			require.ErrorContains(t, err, "1 workflow(s) failed to update")
+			updated, err := os.ReadFile(path)
+			require.NoError(t, err)
+			if noCompile {
+				assert.Contains(t, string(updated), "<<<<<<< current (local changes)")
+				healthy, err := os.ReadFile(filepath.Join(dir, "healthy.md"))
+				require.NoError(t, err)
+				assert.Contains(t, string(healthy), "echo upstream")
+			} else {
+				assert.Equal(t, local, string(updated))
+			}
+			lock, err := os.ReadFile(lockPath)
+			require.NoError(t, err)
+			assert.Equal(t, "existing lock", string(lock))
+		})
+	}
+}
+
+func TestRunUpdateWorkflows_MergeConflictStopsLaterPhases(t *testing.T) {
+	originalResolve, originalDownload := resolveLatestRefFn, downloadWorkflowContentFn
+	t.Cleanup(func() {
+		resolveLatestRefFn, downloadWorkflowContentFn = originalResolve, originalDownload
+	})
+	resolveLatestRefFn = func(context.Context, string, string, bool, bool, time.Duration) (latestRefResolution, error) {
+		return latestRefResolution{Ref: "v2.0.0"}, nil
+	}
+	const base = "---\non: workflow_dispatch\nsteps:\n  - uses: actions/checkout@v1\ntools:\n  bash: [\"echo base\"]\n---\n\n# Workflow\n"
+	downloadWorkflowContentFn = func(_ context.Context, _, _, ref string, _ bool) ([]byte, error) {
+		if ref == "v2.0.0" {
+			return []byte(strings.Replace(base, "echo base", "echo upstream", 1)), nil
+		}
+		return []byte(base), nil
+	}
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, "conflict.md")
+	local := strings.Replace(base, "echo base", "echo local", 1)
+	local = strings.Replace(local, "on: workflow_dispatch", "on: workflow_dispatch\nsource: owner/repo/workflows/conflict.md@v1.0.0", 1)
+	require.NoError(t, os.WriteFile(path, []byte(local), 0o600))
+	lockPath := filepath.Join(dir, "conflict.lock.yml")
+	require.NoError(t, os.WriteFile(lockPath, []byte("existing lock"), 0o600))
+	requests := 0
+	_, ctx := newUpdateGitHubTestClient(t, func(req *http.Request) (*http.Response, error) {
+		requests++
+		if strings.Contains(req.URL.Path, "/releases") {
+			return updateGitHubTestResponse(req, http.StatusOK, `[{"tag_name":"v6.0.0"}]`, nil), nil
+		}
+		return updateGitHubTestResponse(req, http.StatusOK, strings.Repeat("a", 40), nil), nil
+	})
+
+	err := RunUpdateWorkflows(ctx, UpdateWorkflowsOptions{WorkflowsDir: dir})
+	require.ErrorContains(t, err, "1 workflow(s) failed to update")
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, local, string(content), "action updates must not rewrite a preserved source")
+	lock, err := os.ReadFile(lockPath)
+	require.NoError(t, err)
+	assert.Equal(t, "existing lock", string(lock))
+	assert.Zero(t, requests, "dependency update phases must stop after source update failures")
+}
+
+func TestUpdateWorkflows_PartialFailureContract(t *testing.T) {
+	originalResolve, originalDownload := resolveLatestRefFn, downloadWorkflowContentFn
+	t.Cleanup(func() {
+		resolveLatestRefFn, downloadWorkflowContentFn = originalResolve, originalDownload
+	})
+	downloadWorkflowContentFn = func(context.Context, string, string, string, bool) ([]byte, error) {
+		return []byte("---\non: workflow_dispatch\n---\n\n# Updated\n"), nil
+	}
+	for _, tt := range []struct {
+		name        string
+		failures    []string
+		withSuccess bool
+		wantError   bool
+	}{
+		{name: "partial ordinary failure", failures: []string{"upstream unavailable"}, withSuccess: true, wantError: true},
+		{name: "partial rate limit", failures: []string{"API rate limit exceeded"}, withSuccess: true},
+		{name: "only rate limits", failures: []string{"API rate limit exceeded"}},
+		{name: "mixed failure types", failures: []string{"API rate limit exceeded", "upstream unavailable"}, withSuccess: true, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Chdir(dir)
+			for i := range tt.failures {
+				name := fmt.Sprintf("failure%d", i)
+				content := "---\nsource: owner/" + name + "/workflows/test.md@v1.0.0\n---\n\n# Original\n"
+				require.NoError(t, os.WriteFile(filepath.Join(dir, name+".md"), []byte(content), 0o600))
+			}
+			if tt.withSuccess {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "healthy.md"), []byte("---\nsource: owner/healthy/workflows/test.md@v1.0.0\n---\n\n# Original\n"), 0o600))
+			}
+			resolveLatestRefFn = func(_ context.Context, repo, _ string, _, _ bool, _ time.Duration) (latestRefResolution, error) {
+				for i, message := range tt.failures {
+					if repo == fmt.Sprintf("owner/failure%d", i) {
+						return latestRefResolution{}, fmt.Errorf("%s", message)
+					}
+				}
+				return latestRefResolution{Ref: "v2.0.0"}, nil
+			}
+
+			err := UpdateWorkflows(context.Background(), UpdateWorkflowsOptions{WorkflowsDir: dir, NoCompile: true, NoMerge: true})
+			if tt.wantError {
+				require.ErrorContains(t, err, "workflow(s) failed to update")
+			} else {
+				require.NoError(t, err)
+			}
+			if tt.withSuccess {
+				content, readErr := os.ReadFile(filepath.Join(dir, "healthy.md"))
+				require.NoError(t, readErr)
+				assert.Contains(t, string(content), "@v2.0.0")
+			}
+		})
+	}
+}
+
+func TestUpdateWorkflow_BackupReadFailureStopsUpdate(t *testing.T) {
+	originalResolveLatestRef := resolveLatestRefFn
+	originalDownloadWorkflow := downloadWorkflowContentFn
+	t.Cleanup(func() {
+		resolveLatestRefFn = originalResolveLatestRef
+		downloadWorkflowContentFn = originalDownloadWorkflow
+	})
+
+	tmpDir := testutil.TempDir(t, "test-*")
+	workflowsDir := filepath.Join(tmpDir, ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0755), "failed to create workflows dir")
+
+	const currentRef = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const latestRef = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	updatedContent := []byte(`---
+on: issues
+engine: copilot
+permissions:
+  contents: read
+source: owner/repo/workflows/test-workflow.md@` + latestRef + `
+---
+
+# Updated Workflow
+`)
+
+	resolveLatestRefFn = func(_ context.Context, _ string, ref string, _ bool, _ bool, _ time.Duration) (latestRefResolution, error) {
+		if ref == currentRef {
+			return latestRefResolution{Ref: latestRef}, nil
+		}
+		return latestRefResolution{Ref: ref}, nil
+	}
+	downloadWorkflowContentFn = func(_ context.Context, _, _, _ string, _ bool) ([]byte, error) {
+		return updatedContent, nil
+	}
+
+	workflowFile := filepath.Join(workflowsDir, "missing-workflow.md")
+	wf := &workflowWithSource{
+		Name:       "missing-workflow",
+		Path:       workflowFile,
+		SourceSpec: "owner/repo/workflows/test-workflow.md@" + currentRef,
+	}
+
+	err := updateWorkflow(context.Background(), wf, UpdateWorkflowsOptions{
+		WorkflowsDir: workflowsDir,
+		NoMerge:      true,
+	})
+	require.ErrorContains(t, err, "failed to read current workflow before update")
+	assert.NoFileExists(t, workflowFile, "workflow must not be written without a recoverable backup")
 }
 
 // TestMarshalActionsLockSorted tests that the actions lock marshaling produces sorted output

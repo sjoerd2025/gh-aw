@@ -30,7 +30,7 @@ func extractMCPToolUsageData(logDir string, verbose bool) (*MCPToolUsageData, er
 			gatewayLogsLog.Print("No gateway log file found, skipping MCP tool usage extraction")
 			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to parse gateway logs: %w", err)
+		return nil, fmt.Errorf("could not parse gateway logs; ensure the gateway log files are valid JSONL and not corrupted, then retry: %w", err)
 	}
 
 	if gatewayMetrics == nil || len(gatewayMetrics.Servers) == 0 {
@@ -76,11 +76,8 @@ func extractMCPToolUsageData(logDir string, verbose bool) (*MCPToolUsageData, er
 		// Build tool call records from rpc-messages.jsonl
 		toolCalls, err := buildToolCallsFromRPCMessages(gatewayLogPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read rpc-messages.jsonl: %w", err)
+			return nil, fmt.Errorf("could not read rpc-messages.jsonl; ensure the file exists and contains valid JSONL records, then retry: %w", err)
 		}
-		// Correlate tool calls with effective-token deltas from token-usage.jsonl
-		tokenUsageFile := findTokenUsageFile(logDir)
-		toolCalls = correlateToolCallsWithTokenDelta(toolCalls, tokenUsageFile)
 		mcpData.ToolCalls = toolCalls
 		gatewayLogsLog.Printf("Loaded %d tool calls from rpc-messages.jsonl", len(toolCalls))
 	} else {
@@ -88,9 +85,6 @@ func extractMCPToolUsageData(logDir string, verbose bool) (*MCPToolUsageData, er
 		if err := extractToolCallsFromGatewayLog(gatewayLogPath, mcpData); err != nil {
 			return nil, err
 		}
-		// Correlate tool calls with effective-token deltas from token-usage.jsonl
-		tokenUsageFile := findTokenUsageFile(logDir)
-		mcpData.ToolCalls = correlateToolCallsWithTokenDelta(mcpData.ToolCalls, tokenUsageFile)
 		gatewayLogsLog.Printf("Loaded %d tool calls from gateway.jsonl", len(mcpData.ToolCalls))
 	}
 
@@ -105,7 +99,7 @@ func extractMCPToolUsageData(logDir string, verbose bool) (*MCPToolUsageData, er
 func extractToolCallsFromGatewayLog(gatewayLogPath string, mcpData *MCPToolUsageData) error {
 	file, err := os.Open(gatewayLogPath)
 	if err != nil {
-		return fmt.Errorf("failed to open gateway.jsonl: %w", err)
+		return fmt.Errorf("could not open gateway.jsonl; ensure required prerequisites are configured, then retry: %w", err)
 	}
 	defer file.Close()
 
@@ -123,8 +117,8 @@ func extractToolCallsFromGatewayLog(gatewayLogPath string, mcpData *MCPToolUsage
 			continue // Skip malformed lines
 		}
 
-		// Only process tool call events
-		if entry.Event == "tool_call" || entry.Event == "rpc_call" || entry.Event == "request" {
+		// Only process actual tool invocations, not protocol requests such as tools/list.
+		if entry.Event == "tool_call" || entry.Method == "tools/call" {
 			toolName := entry.ToolName
 			if toolName == "" {
 				toolName = entry.Method
@@ -178,12 +172,14 @@ func buildMCPSummaryStats(gatewayMetrics *GatewayMetrics, mcpData *MCPToolUsageD
 	for serverName, serverMetrics := range gatewayMetrics.Servers {
 		// Server-level stats
 		serverStats := MCPServerStats{
-			ServerName:      serverName,
+			MCPServerStatsBase: MCPServerStatsBase{
+				ServerName:    serverName,
+				ToolCallCount: serverMetrics.ToolCallCount,
+				ErrorCount:    serverMetrics.ErrorCount,
+			},
 			RequestCount:    serverMetrics.RequestCount,
-			ToolCallCount:   serverMetrics.ToolCallCount,
 			TotalInputSize:  0,
 			TotalOutputSize: 0,
-			ErrorCount:      serverMetrics.ErrorCount,
 		}
 
 		if serverMetrics.RequestCount > 0 {
@@ -200,7 +196,6 @@ func buildMCPSummaryStats(gatewayMetrics *GatewayMetrics, mcpData *MCPToolUsageD
 				TotalInputSize:  toolMetrics.TotalInputSize,
 				TotalOutputSize: toolMetrics.TotalOutputSize,
 				MaxInputSize:    0, // Will be calculated below
-				MaxOutputSize:   0, // Will be calculated below
 				ErrorCount:      toolMetrics.ErrorCount,
 			}
 
@@ -222,6 +217,7 @@ func buildMCPSummaryStats(gatewayMetrics *GatewayMetrics, mcpData *MCPToolUsageD
 					}
 				}
 			}
+			summary.syncBaseFromFields()
 
 			mcpData.Summary = append(mcpData.Summary, summary)
 
@@ -262,10 +258,4 @@ func buildMCPSummaryStats(gatewayMetrics *GatewayMetrics, mcpData *MCPToolUsageD
 			return 0
 		}
 	})
-}
-
-// TODO: Implement token-usage correlation for MCP tool calls.
-func correlateToolCallsWithTokenDelta(toolCalls []MCPToolCall, tokenUsageFile string) []MCPToolCall {
-	_ = tokenUsageFile
-	return toolCalls
 }

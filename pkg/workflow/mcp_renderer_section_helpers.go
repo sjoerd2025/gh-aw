@@ -46,6 +46,25 @@ func writeJSONStringMapEntriesRaw(yaml *strings.Builder, values map[string]strin
 	}
 }
 
+func marshalMCPHeredocString(value string) string {
+	// Former expanding-heredoc escapes are syntax, not payload bytes. JSON owns
+	// escaping first; then protect every shell metacharacter in the heredoc.
+	value = normalizeMCPHeredocEscapes(value)
+	encoded := mustMarshalJSONString(value)
+	return strings.NewReplacer(`\`, `\\`, "$", `\$`, "`", "\\`").Replace(encoded)
+}
+
+func normalizeMCPHeredocEscapes(value string) string {
+	return strings.NewReplacer(`\$`, `$`, "\\`", "`").Replace(value)
+}
+
+func writeMCPHeredocStringMapEntries(yaml *strings.Builder, values map[string]string, indent string) {
+	keys := sliceutil.SortedKeys(values)
+	for i, key := range keys {
+		fmt.Fprintf(yaml, "%s%s: %s%s\n", indent, marshalMCPHeredocString(key), marshalMCPHeredocString(normalizeMCPShellReferences(values[key])), renderMCPComma(i == len(keys)-1)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	}
+}
+
 // writeJSONStringMapSectionWithEntries writes a JSON object section, delegating
 // per-entry serialisation to writeEntries.  writeEntries receives the builder,
 // the values map, and the child indent string (indent+"  ").
@@ -170,4 +189,22 @@ func renderGitHubMCPGuardPolicies(yaml *strings.Builder, guardPolicies map[strin
 	if len(guardPolicies) > 0 {
 		renderGuardPoliciesJSON(yaml, guardPolicies, indent)
 	}
+}
+
+// appendRequiredFalseField writes a "required": false field as the final field of the
+// current JSON object. renderGitHubMCPGuardPolicies (and other section helpers) always
+// render their field as the last field with no trailing comma, so when a field must
+// follow it, the preceding trailing newline must be replaced with ",\n" in place rather
+// than writing a bare "," on its own line: a line with no leading indentation would
+// dedent out of the enclosing "run: |" block scalar and corrupt the surrounding YAML.
+func appendRequiredFalseField(yaml *strings.Builder, precededByField bool, indent string) {
+	if precededByField {
+		content := yaml.String()
+		if trimmed, ok := strings.CutSuffix(content, "\n"); ok {
+			yaml.Reset()
+			yaml.WriteString(trimmed)
+			yaml.WriteString(",\n")
+		}
+	}
+	fmt.Fprintf(yaml, "%s\"required\": false\n", indent)
 }

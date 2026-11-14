@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { useExecutionProvenanceFixture } from "./test_execution_provenance.js";
+
+useExecutionProvenanceFixture();
 
 // Mock the global objects that GitHub Actions provides
 const mockCore = {
@@ -504,6 +507,35 @@ describe("update_issue.cjs - allow_body configuration", () => {
     vi.resetModules();
   });
 
+  it.each(["append", "prepend", "replace", "replace-island"])("uses configured default operation %s when the agent omits it", async operation => {
+    const { buildIssueUpdateData } = await import("./update_issue.cjs");
+    const result = buildIssueUpdateData({ body: "New body content" }, { default_operation: operation });
+
+    expect(result.success).toBe(true);
+    expect(result.data._operation).toBe(operation);
+  });
+
+  it("allows an explicit agent operation to override the configured default", async () => {
+    const { buildIssueUpdateData } = await import("./update_issue.cjs");
+    const result = buildIssueUpdateData({ body: "New body content", operation: "prepend" }, { default_operation: "replace-island" });
+
+    expect(result.success).toBe(true);
+    expect(result.data._operation).toBe("prepend");
+  });
+
+  it("does not apply the configured operation when body updates are disabled or absent", async () => {
+    const { buildIssueUpdateData } = await import("./update_issue.cjs");
+    for (const [item, config] of [
+      [{ body: "New body content" }, { allow_body: false }],
+      [{ title: "Updated title" }, {}],
+    ]) {
+      const result = buildIssueUpdateData(item, { ...config, default_operation: "replace-island" });
+      expect(result.success).toBe(true);
+      expect(result.data._operation).toBeUndefined();
+      expect(result.data._rawBody).toBeUndefined();
+    }
+  });
+
   it("should allow body updates when allow_body is true", async () => {
     const { buildIssueUpdateData } = await import("./update_issue.cjs");
 
@@ -761,6 +793,26 @@ describe("update_issue.cjs - cross-repo and operation integration", () => {
     process.env.GH_AW_WORKFLOW_ID = "test-workflow";
   });
 
+  it.each([{ milestone: null }, { milestone: 1 }, { title: "Updated title" }])("sends explicit milestone clears and assignments without changing omitted milestones: %j", async update => {
+    mockGithub.rest.issues.get.mockResolvedValue({
+      data: { number: 42, title: "Test Issue", milestone: { number: 1 }, html_url: "https://github.com/testowner/testrepo/issues/42" },
+    });
+    mockGithub.rest.issues.update.mockResolvedValue({
+      data: { number: 42, title: "Test Issue", html_url: "https://github.com/testowner/testrepo/issues/42" },
+    });
+    const { main } = await import("./update_issue.cjs");
+    const handler = await main({ target: "*" });
+    const result = await handler({ type: "update_issue", issue_number: 42, ...update }, {});
+
+    expect(result.success).toBe(true);
+    expect(mockGithub.rest.issues.update).toHaveBeenCalledExactlyOnceWith({
+      owner: "testowner",
+      repo: "testrepo",
+      issue_number: 42,
+      ...update,
+    });
+  });
+
   it("should route API calls to the cross-repo target when repo field is provided", async () => {
     let capturedOwner, capturedRepo;
 
@@ -905,7 +957,7 @@ describe("update_issue.cjs - cross-repo and operation integration", () => {
     expect(capturedBody.indexOf("Prepended content")).toBeLessThan(capturedBody.indexOf("Existing body"));
   });
 
-  it("should apply 'replace-island' operation: only the island section is updated", async () => {
+  it.each(["agent", "workflow"])("should apply 'replace-island' from %s: only the island section is updated", async source => {
     const existingBody = "Header\n<!-- gh-aw-island-start:test-workflow -->\nOld island\n<!-- gh-aw-island-end:test-workflow -->\nFooter";
     let capturedBody;
 
@@ -918,15 +970,29 @@ describe("update_issue.cjs - cross-repo and operation integration", () => {
     });
 
     const { main } = await import("./update_issue.cjs");
-    const handler = await main({ target: "*" });
-    await handler({ issue_number: 100, operation: "replace-island", body: "New island content" }, {});
+    const handler = await main({ target: "*", ...(source === "workflow" ? { default_operation: "replace-island" } : {}) });
+    const item = { issue_number: 100, body: "New island content", ...(source === "agent" ? { operation: "replace-island" } : {}) };
+    const result = await handler(item, {});
 
+    expect(result.success).toBe(true);
     expect(capturedBody).toContain("Header");
     expect(capturedBody).toContain("Footer");
     expect(capturedBody).toContain("New island content");
     expect(capturedBody).not.toContain("Old island");
     expect(capturedBody).toContain("<!-- gh-aw-island-start:test-workflow -->");
     expect(capturedBody).toContain("<!-- gh-aw-island-end:test-workflow -->");
+
+    mockGithub.rest.issues.get.mockResolvedValue({
+      data: { number: 100, title: "Test", body: capturedBody, html_url: "https://github.com/testowner/testrepo/issues/100" },
+    });
+    const nextResult = await handler({ ...item, body: "Next report" }, {});
+
+    expect(nextResult.success).toBe(true);
+    expect(capturedBody).toContain("Header");
+    expect(capturedBody).toContain("Footer");
+    expect(capturedBody).toContain("Next report");
+    expect(capturedBody).not.toContain("New island content");
+    expect(capturedBody.match(/<!-- gh-aw-island-start:test-workflow -->/g)).toHaveLength(1);
   });
 
   it("should update labels via issue intents GraphQL without requiring a runtime feature", async () => {

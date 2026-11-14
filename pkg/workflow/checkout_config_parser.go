@@ -4,6 +4,8 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"path"
+	"slices"
 	"strings"
 )
 
@@ -26,7 +28,7 @@ func ParseCheckoutConfigs(raw any) ([]*CheckoutConfig, error) {
 	if singleMap, ok := raw.(map[string]any); ok {
 		cfg, err := checkoutConfigFromMap(singleMap)
 		if err != nil {
-			return nil, fmt.Errorf("invalid checkout configuration: %w", err)
+			return nil, fmt.Errorf("invalid checkout configuration, expected an object with checkout fields such as repository, ref, or path: %w", err)
 		}
 		configs = []*CheckoutConfig{cfg}
 	} else if arr, ok := raw.([]any); ok {
@@ -44,7 +46,7 @@ func ParseCheckoutConfigs(raw any) ([]*CheckoutConfig, error) {
 			configs = append(configs, cfg)
 		}
 	} else {
-		return nil, fmt.Errorf("checkout must be an object or an array of objects, got %T", raw)
+		return nil, fmt.Errorf("checkout must be an object or an array of objects, got %T. Expected a single checkout object or a list of checkout objects. Example:\ncheckout:\n  repository: owner/repo", raw)
 	}
 
 	// Validate that at most one logical checkout target has current: true.
@@ -77,35 +79,125 @@ func ParseCheckoutConfigs(raw any) ([]*CheckoutConfig, error) {
 }
 
 // checkoutConfigFromMap converts a raw map to a CheckoutConfig.
-func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
+func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) { //nolint:largefunc // Existing checkout parsing remains centralized.
 	cfg := &CheckoutConfig{}
+
+	if v, ok := m["multi"]; ok {
+		value, ok := v.(bool)
+		if !ok {
+			return nil, errors.New("checkout.multi must be a literal boolean; use true or false")
+		}
+		cfg.Multi = value
+	}
+
+	if v, ok := m["allow-private-repos"]; ok {
+		value, ok := v.(bool)
+		if !ok {
+			return nil, errors.New("checkout.allow-private-repos must be a literal boolean; use true or false")
+		}
+		cfg.AllowPrivateRepos = &value
+	}
+
+	if v, ok := m["max-repos"]; ok {
+		if value, ok := v.(int64); ok {
+			if int64(int(value)) != value {
+				return nil, errors.New("checkout.max-repos must be a positive integer no greater than 9007199254740991")
+			}
+			v = int(value)
+		}
+		cfg.MaxRepos = parseOptionalInt(v)
+		if cfg.MaxRepos == nil {
+			return nil, errors.New("checkout.max-repos must be a positive integer no greater than 9007199254740991")
+		}
+	}
+
+	if v, ok := m["pull-request"]; ok {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, errors.New("checkout.pull-request must be a boolean. Example:\ncheckout:\n  pull-request: false")
+		}
+		cfg.PullRequest = &b
+	}
+
+	if v, ok := m["pull-request-floating-head"]; ok {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, errors.New("checkout.pull-request-floating-head must be a literal boolean; use true or false")
+		}
+		cfg.PullRequestFloatingHead = b
+	}
 
 	if v, ok := m["repository"]; ok {
 		s, ok := v.(string)
 		if !ok {
-			return nil, errors.New("checkout.repository must be a string")
+			return nil, errors.New("checkout.repository must be a string. Example:\ncheckout:\n  repository: owner/repo")
 		}
 		cfg.Repository = s
+	}
+	if v, ok := m["repo"]; ok {
+		if _, exists := m["repository"]; exists {
+			return nil, errors.New("checkout.repo and checkout.repository are aliases; specify only one")
+		}
+		s, ok := v.(string)
+		if !ok {
+			return nil, errors.New("checkout.repo must be a string")
+		}
+		cfg.Repository = s
+	}
+	if _, ok := m["allow-repos"]; ok {
+		return nil, errors.New("checkout.allow-repos is not supported; use checkout.allowed-repos")
+	}
+	if v, ok := m["allowed-repos"]; ok {
+		switch value := v.(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				cfg.AllowedRepos = []string{value}
+			}
+		case []any:
+			for _, item := range value {
+				s, ok := item.(string)
+				if !ok || strings.TrimSpace(s) == "" {
+					return nil, errors.New("checkout.allowed-repos entries must be non-empty strings")
+				}
+				cfg.AllowedRepos = append(cfg.AllowedRepos, s)
+			}
+		default:
+			return nil, errors.New("checkout.allowed-repos must be a string expression or an array of repository patterns")
+		}
+		if len(cfg.AllowedRepos) == 0 {
+			return nil, errors.New("checkout.allowed-repos must not be empty; specify allowed repository patterns such as owner/*")
+		}
 	}
 
 	if v, ok := m["ref"]; ok {
 		s, ok := v.(string)
 		if !ok {
-			return nil, errors.New("checkout.ref must be a string")
+			return nil, errors.New("checkout.ref must be a string. Example:\ncheckout:\n  ref: main")
 		}
 		cfg.Ref = s
+	}
+
+	if v, ok := m["data-only"]; ok {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, errors.New("checkout.data-only must be a literal boolean; use true or false")
+		}
+		cfg.DataOnly = b
 	}
 
 	if v, ok := m["path"]; ok {
 		s, ok := v.(string)
 		if !ok {
-			return nil, errors.New("checkout.path must be a string")
+			return nil, errors.New("checkout.path must be a string. Example:\ncheckout:\n  path: external/repo")
 		}
 		cfg.PathExplicit = true
 		// Normalize "." to empty string: both mean the workspace root and
 		// are treated identically by the checkout step generator.
 		if s == "." {
 			s = ""
+		}
+		if err := validateCheckoutPath(s); err != nil {
+			return nil, err
 		}
 		cfg.Path = s
 	}
@@ -114,14 +206,14 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 	if v, ok := m["github-token"]; ok {
 		s, ok := v.(string)
 		if !ok {
-			return nil, errors.New("checkout.github-token must be a string")
+			return nil, errors.New("checkout.github-token must be a string. Example:\ncheckout:\n  github-token: ${{ secrets.MY_TOKEN }}")
 		}
 		cfg.GitHubToken = s
 	} else if v, ok := m["token"]; ok {
 		// Backward compatibility: "token" is accepted but "github-token" is preferred
 		s, ok := v.(string)
 		if !ok {
-			return nil, errors.New("checkout.token must be a string")
+			return nil, errors.New("checkout.token must be a string. Example:\ncheckout:\n  github-token: ${{ secrets.MY_TOKEN }}")
 		}
 		cfg.GitHubToken = s
 	}
@@ -130,7 +222,7 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 	if v, ok := m["github-app"]; ok {
 		appMap, ok := v.(map[string]any)
 		if !ok {
-			return nil, errors.New("checkout.github-app must be an object")
+			return nil, errors.New("checkout.github-app must be an object. Example:\ncheckout:\n  github-app:\n    app-id: ${{ vars.APP_ID }}\n    private-key: ${{ secrets.APP_PRIVATE_KEY }}")
 		}
 		cfg.GitHubApp = parseAppConfig(appMap)
 		if cfg.GitHubApp.AppID == "" || cfg.GitHubApp.PrivateKey == "" {
@@ -142,7 +234,7 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 	parseSafeOutputAppConfig := func(fieldName string, value any) (*GitHubAppConfig, error) {
 		appMap, ok := value.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("checkout.%s must be an object", fieldName)
+			return nil, fmt.Errorf("checkout.%s must be an object. Example:\ncheckout:\n  %s:\n    app-id: ${{ vars.APP_ID }}\n    private-key: ${{ secrets.APP_PRIVATE_KEY }}", fieldName, fieldName)
 		}
 		appConfig := parseAppConfig(appMap)
 		if appConfig.AppID == "" || appConfig.PrivateKey == "" {
@@ -183,22 +275,22 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 			cfg.FetchDepth = &depth
 		case float64:
 			if n != float64(int64(n)) {
-				return nil, errors.New("checkout.fetch-depth must be an integer")
+				return nil, errors.New("checkout.fetch-depth must be an integer. Example:\ncheckout:\n  fetch-depth: 0")
 			}
 			depth := int(n)
 			cfg.FetchDepth = &depth
 		default:
-			return nil, errors.New("checkout.fetch-depth must be an integer")
+			return nil, errors.New("checkout.fetch-depth must be an integer. Example:\ncheckout:\n  fetch-depth: 0")
 		}
 		if cfg.FetchDepth != nil && *cfg.FetchDepth < 0 {
-			return nil, errors.New("checkout.fetch-depth must be >= 0")
+			return nil, errors.New("checkout.fetch-depth must be >= 0, where 0 fetches the full history. Example:\ncheckout:\n  fetch-depth: 1")
 		}
 	}
 
 	if v, ok := m["sparse-checkout"]; ok {
 		s, ok := v.(string)
 		if !ok {
-			return nil, errors.New("checkout.sparse-checkout must be a string")
+			return nil, errors.New("checkout.sparse-checkout must be a string listing the paths to check out. Example:\ncheckout:\n  sparse-checkout: docs")
 		}
 		cfg.SparseCheckout = s
 	}
@@ -214,14 +306,14 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 				cfg.Submodules = "false"
 			}
 		default:
-			return nil, errors.New("checkout.submodules must be a string or boolean")
+			return nil, errors.New("checkout.submodules must be a string or boolean. Example:\ncheckout:\n  submodules: recursive")
 		}
 	}
 
 	if v, ok := m["lfs"]; ok {
 		b, ok := v.(bool)
 		if !ok {
-			return nil, errors.New("checkout.lfs must be a boolean")
+			return nil, errors.New("checkout.lfs must be a boolean. Example:\ncheckout:\n  lfs: true")
 		}
 		cfg.LFS = b
 	}
@@ -229,7 +321,7 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 	if v, ok := m["current"]; ok {
 		b, ok := v.(bool)
 		if !ok {
-			return nil, errors.New("checkout.current must be a boolean")
+			return nil, errors.New("checkout.current must be a boolean. Example:\ncheckout:\n  current: true")
 		}
 		cfg.Current = b
 	}
@@ -239,7 +331,7 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 		case string:
 			// Single string shorthand: treat as a one-element list
 			if strings.TrimSpace(fv) == "" {
-				return nil, errors.New("checkout.fetch string value must not be empty")
+				return nil, errors.New("checkout.fetch string value must not be empty, it should name a git ref to fetch. Example:\ncheckout:\n  fetch: main")
 			}
 			cfg.Fetch = []string{fv}
 		case []any:
@@ -247,23 +339,23 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 			for i, item := range fv {
 				s, ok := item.(string)
 				if !ok {
-					return nil, fmt.Errorf("checkout.fetch[%d] must be a string, got %T", i, item)
+					return nil, fmt.Errorf("checkout.fetch[%d] must be a string, got %T. Example:\ncheckout:\n  fetch: [\"main\", \"refs/pull/*/head\"]", i, item)
 				}
 				if strings.TrimSpace(s) == "" {
-					return nil, fmt.Errorf("checkout.fetch[%d] must not be empty", i)
+					return nil, fmt.Errorf("checkout.fetch[%d] must not be empty, every entry should name a git ref. Example:\ncheckout:\n  fetch: [\"main\"]", i)
 				}
 				refs = append(refs, s)
 			}
 			cfg.Fetch = refs
 		default:
-			return nil, errors.New("checkout.fetch must be a string or an array of strings")
+			return nil, errors.New("checkout.fetch must be a string or an array of strings. Example:\ncheckout:\n  fetch: [\"main\"]")
 		}
 	}
 
 	if v, ok := m["wiki"]; ok {
 		b, ok := v.(bool)
 		if !ok {
-			return nil, errors.New("checkout.wiki must be a boolean")
+			return nil, errors.New("checkout.wiki must be a boolean. Example:\ncheckout:\n  wiki: true")
 		}
 		cfg.Wiki = b
 	}
@@ -271,25 +363,107 @@ func checkoutConfigFromMap(m map[string]any) (*CheckoutConfig, error) {
 	if v, ok := m["force-clean-git-credentials"]; ok {
 		b, ok := v.(bool)
 		if !ok {
-			return nil, errors.New("checkout.force-clean-git-credentials must be a boolean")
+			return nil, errors.New("checkout.force-clean-git-credentials must be a boolean. Example:\ncheckout:\n  force-clean-git-credentials: true")
 		}
 		cfg.CleanGitCredentials = b
 	}
 
+	if err := validateRuntimeCheckoutConfig(cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
-// buildCheckoutsPromptContent returns a markdown bullet list describing all user-configured
+func validateRuntimeCheckoutConfigs(configs []*CheckoutConfig) error {
+	for _, cfg := range configs {
+		if cfg == nil {
+			continue
+		}
+		if err := validateRuntimeCheckoutConfig(cfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateRuntimeCheckoutConfig(cfg *CheckoutConfig) error {
+	if strings.ContainsAny(ExpressionPatternDotAll.ReplaceAllString(cfg.Repository, ""), "*?[]") {
+		return errors.New("checkout.repository (or repo) must specify explicit owner/repo names; wildcards are only supported in checkout.allowed-repos")
+	}
+	if !cfg.Multi {
+		if strings.ContainsAny(strings.TrimSpace(ExpressionPatternDotAll.ReplaceAllString(cfg.Repository, "expression")), "\r\n") {
+			return errors.New("checkout.repository (or repo) must select a single repository unless checkout.multi is true")
+		}
+		return nil
+	}
+	if cfg.AllowPrivateRepos != nil && len(cfg.AllowedRepos) == 0 {
+		return errors.New("checkout.allow-private-repos requires checkout.allowed-repos for runtime repository-list expansion")
+	}
+	if cfg.MaxRepos != nil {
+		if *cfg.MaxRepos <= 0 || uint64(*cfg.MaxRepos) > 9007199254740991 {
+			return errors.New("checkout.max-repos must be a positive integer no greater than 9007199254740991")
+		}
+		if len(cfg.AllowedRepos) == 0 {
+			return errors.New("checkout.max-repos requires checkout.allowed-repos for runtime repository-list expansion")
+		}
+	}
+	if len(cfg.AllowedRepos) == 0 {
+		return errors.New("checkout.multi: true requires checkout.allowed-repos; specify allowed repository patterns such as owner/*")
+	}
+	if err := validateCheckoutAllowedRepos(cfg.AllowedRepos); err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.Repository) == "" {
+		return errors.New("checkout.allowed-repos requires repository (or repo) containing the runtime repository list")
+	}
+	if !cfg.PathExplicit || path.Clean(cfg.Path) == "." || strings.Contains(cfg.Path, "${{") {
+		return errors.New("runtime repository-list checkout requires a literal, non-root path prefix. Example:\ncheckout:\n  multi: true\n  repository: ${{ inputs.repos }}\n  path: repos\n  allowed-repos: [owner/*]")
+	}
+	if cfg.Current || cfg.Wiki {
+		return errors.New("runtime repository-list checkout does not support current: true or wiki: true")
+	}
+	if cfg.LFS {
+		return errors.New("runtime repository-list checkout does not support lfs: true because LFS endpoints can bypass allowed-repos; disable checkout.lfs")
+	}
+	if cfg.Submodules != "" && cfg.Submodules != "false" {
+		return errors.New("runtime repository-list checkout does not support enabled submodules because submodule URLs can bypass allowed-repos; set checkout.submodules to false")
+	}
+	for _, app := range []*GitHubAppConfig{cfg.GitHubApp, cfg.SafeOutputGitHubApp} {
+		if app != nil && (app.Owner == "" || len(app.Repositories) == 0) {
+			return errors.New("runtime repository-list checkout GitHub App authentication requires explicit owner and repositories")
+		}
+	}
+	return nil
+}
+
+// validateCheckoutPath rejects checkout paths that escape the workspace root.
+// actions/checkout requires the path to be located under $GITHUB_WORKSPACE, and
+// paths containing ".." segments would also render misleadingly in the agent prompt
+// because they collapse into a plausible-looking but incorrect location.
+func validateCheckoutPath(p string) error {
+	if p == "" {
+		return nil
+	}
+	normalized := strings.ReplaceAll(p, "\\", "/")
+	if strings.HasPrefix(normalized, "/") {
+		return fmt.Errorf("checkout.path must be a relative path under the workspace, got %q. Example:\ncheckout:\n  path: external/repo", p)
+	}
+	if slices.Contains(strings.Split(normalized, "/"), "..") {
+		return fmt.Errorf("checkout.path must not contain \"..\" segments, got %q. Use a path under the workspace. Example:\ncheckout:\n  path: external/repo", p)
+	}
+	return nil
+}
+
 // checkouts for inclusion in the GitHub context prompt.
 // Returns an empty string when no checkouts are configured.
 //
-// Each checkout is shown with its full absolute path relative to $GITHUB_WORKSPACE.
+// Each checkout is shown with its full absolute path using the runtime github.workspace value.
 // The root checkout (path == "") is annotated as "(cwd)" since that is the working
 // directory of the agent process. The generated content may include
 // "${{ github.repository }}" for any checkout that does not have an explicit repository
 // configured; callers must ensure these expressions are processed by an ExpressionExtractor
 // so the placeholder substitution step can resolve them at runtime.
-func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string {
+func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string { //nolint:largefunc // Checkout annotations are emitted together for consistent prompt guidance.
 	if len(checkouts) == 0 {
 		checkoutManagerLog.Print("buildCheckoutsPromptContent: no checkouts configured, returning empty content")
 		return ""
@@ -303,17 +477,22 @@ func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string {
 		if cfg == nil {
 			continue
 		}
+		if cfg.Multi {
+			line := fmt.Sprintf("  - Runtime-selected repositories are checked out under `${{ github.workspace }}/%s/<owner>/<repo>`. Read `${{ runner.temp }}/gh-aw/safeoutputs/checkout-manifest.json` for their exact repository names, paths, and default branches.\n", cfg.Path)
+			sb.WriteString(line)
+			continue
+		}
 
-		// Build the full absolute path using $GITHUB_WORKSPACE as root.
+		// Build the full absolute path using the runtime workspace as root.
 		// Normalize the path: strip "./" prefix; bare "." and "" both mean root.
 		relPath := strings.TrimPrefix(cfg.Path, "./")
 		if relPath == "." {
 			relPath = ""
 		}
 		isRoot := relPath == ""
-		absPath := "$GITHUB_WORKSPACE"
+		absPath := "${{ github.workspace }}"
 		if !isRoot {
-			absPath += "/" + relPath
+			absPath = path.Join(absPath, relPath)
 		}
 
 		// Determine repo: use configured value or fall back to the triggering repository expression.
@@ -359,9 +538,10 @@ func buildCheckoutsPromptContent(checkouts []*CheckoutConfig) string {
 		sb.WriteString(line + "\n")
 	}
 
-	// General guidance about unavailable branches
-	sb.WriteString("  - **Note**: If a branch you need is not in the list above and is not listed as an additional fetched ref, " +
-		"it has NOT been checked out. For private repositories you cannot fetch it. " +
+	// General guidance about the workspace root and unavailable branches
+	sb.WriteString("  - **Note**: The workspace path reported above may contain a separate shallow, credential-free checkout of the host repository. " +
+		"Use the exact checkout path shown for the repository you need. Before concluding that a branch is unavailable, confirm your working directory matches that path and inspect refs there. " +
+		"If the branch is not present in that checkout and is not listed as an additional fetched ref, it has NOT been checked out. For private repositories you cannot fetch it. " +
 		"If the branch is required and not available, exit with an error and ask the user to add it to the " +
 		"`fetch:` option of the `checkout:` configuration (e.g., `fetch: [\"refs/pulls/open/*\"]` for all open PR refs, " +
 		"or `fetch: [\"main\", \"feature/my-branch\"]` for specific branches).\n")

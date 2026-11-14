@@ -3,12 +3,26 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBuildPushRepoMemoryOutputsExcludesLedgerCompaction(t *testing.T) {
+	outputs := buildPushRepoMemoryOutputs([]RepoMemoryEntry{
+		{ID: "default", Ledger: &RepoMemoryLedgerConfig{Compaction: &RepoMemoryLedgerCompactionConfig{MinSegments: 2, MaxSegments: 4}}},
+	})
+
+	assert.NotContains(t, outputs, "ledger_compaction")
+	assert.Equal(t, "${{ steps.push_repo_memory_default.outputs.save_status }}", outputs["save_status_default"])
+	assert.Equal(t, "${{ steps.push_repo_memory_default.outcome }}", outputs["save_outcome_default"])
+	assert.Equal(t, "${{ steps.push_repo_memory_default.outputs.save_branch }}", outputs["save_branch_default"])
+	assert.Equal(t, "${{ steps.push_repo_memory_default.outputs.save_commit }}", outputs["save_commit_default"])
+}
 
 // TestRepoMemoryConfigDefault tests basic repo-memory configuration with boolean true
 func TestRepoMemoryConfigDefault(t *testing.T) {
@@ -212,7 +226,7 @@ func TestRepoMemoryStepsGeneration(t *testing.T) {
 	}
 
 	var builder strings.Builder
-	generateRepoMemorySteps(&builder, data)
+	NewCompiler().generateRepoMemorySteps(&builder, data, "agent")
 
 	output := builder.String()
 
@@ -319,6 +333,104 @@ func TestGenerateRepoMemoryArtifactUpload(t *testing.T) {
 				"Sanitize step should call sanitize_repo_memory_filenames.sh")
 		})
 	}
+}
+
+// TestRepoMemoryFilterStepGatesUpload verifies that when allowed-extensions/file-glob
+// filtering is configured, the "Filter ... files" step has an id and the subsequent
+// custom-validation and upload-artifact steps require that step's outcome to be
+// 'success'. This ensures a filter-step failure (e.g. an fs error while removing
+// ineligible files) can never result in an unfiltered directory being validated or
+// uploaded — regression for a "fail open" review finding.
+func TestRepoMemoryFilterStepGatesUpload(t *testing.T) {
+	config := &RepoMemoryConfig{
+		Memories: []RepoMemoryEntry{
+			{
+				ID:                "default",
+				BranchName:        "memory/default",
+				AllowedExtensions: []string{".json"},
+				FileGlob:          []string{"*.json", "notes/*.md"},
+				Validation: &MemoryValidationConfig{
+					Script: "// noop",
+				},
+			},
+		},
+	}
+	data := &WorkflowData{RepoMemoryConfig: config}
+
+	var builder strings.Builder
+	generateRepoMemoryArtifactUpload(&builder, data, getActionPin)
+	output := builder.String()
+
+	filterStepID := repoMemoryFilterStepID("default")
+	validationStepID := repoMemoryValidationStepID("default")
+
+	assert.Contains(t, output, "id: "+filterStepID, "Filter step must have an id")
+
+	sanitizeNamePos := strings.Index(output, "Sanitize repo-memory filenames (default)")
+	filterNamePos := strings.Index(output, "Filter repo-memory files (default)")
+	filterIDPos := strings.Index(output, "id: "+filterStepID)
+	validationNamePos := strings.Index(output, "Validate repo-memory domain content (default)")
+	uploadNamePos := strings.Index(output, "Upload repo-memory artifact (default)")
+	require.Greater(t, sanitizeNamePos, -1)
+	require.Greater(t, filterNamePos, -1)
+	require.Greater(t, validationNamePos, -1)
+	require.Greater(t, uploadNamePos, -1)
+	assert.Less(t, sanitizeNamePos, filterNamePos, "Sanitize step must appear before filter step")
+	assert.Less(t, filterNamePos, validationNamePos, "Filter step must appear before validation step")
+	assert.Less(t, validationNamePos, uploadNamePos, "Validation step must appear before upload step")
+
+	filterSection := output[filterNamePos:validationNamePos]
+	assert.Contains(t, filterSection, "id: "+filterStepID, "Filter step id must appear within the filter step")
+	assert.Contains(t, filterSection, `ALLOWED_EXTENSIONS: '[".json"]'`, "Filter step must set ALLOWED_EXTENSIONS to the JSON-encoded extensions list")
+	assert.Contains(t, filterSection, `FILE_GLOB_FILTER: "*.json notes/*.md"`, "Filter step must set FILE_GLOB_FILTER to the space-joined glob patterns")
+	assert.Greater(t, filterIDPos, filterNamePos, "Filter step id must appear after its name")
+
+	validationSection := output[validationNamePos:uploadNamePos]
+	assert.Contains(t, validationSection, "steps."+filterStepID+".outcome == 'success'",
+		"Validation step must be gated on the filter step's success")
+
+	uploadSection := output[uploadNamePos:]
+	assert.Contains(t, uploadSection, "steps."+filterStepID+".outcome == 'success'",
+		"Upload step must be gated on the filter step's success")
+	assert.Contains(t, uploadSection, "steps."+validationStepID+".outcome == 'success'",
+		"Upload step must also be gated on the validation step's success")
+}
+
+// TestRepoMemoryFilterStepEmptyBothFieldsSkipsFilter verifies that the "no filter step"
+// branch is only reachable when a caller explicitly leaves both AllowedExtensions and
+// FileGlob empty — i.e. it's not accidentally triggered by a nil vs. empty-slice distinction.
+func TestRepoMemoryFilterStepEmptyBothFieldsSkipsFilter(t *testing.T) {
+	var builder strings.Builder
+	stepID := generateRepoMemoryFilterFilesStep(&builder, RepoMemoryEntry{
+		ID:                "default",
+		AllowedExtensions: []string{},
+		FileGlob:          []string{},
+	}, "/tmp/gh-aw/repo-memory/default", "repo-memory", "")
+
+	assert.Empty(t, stepID, "No filter step id should be returned when both fields are empty slices")
+	assert.Empty(t, builder.String(), "No filter step should be emitted when both fields are empty slices")
+}
+
+// TestRepoMemoryNoFilterStepWhenNoFilterConfigured verifies that when no
+// allowed-extensions/file-glob is configured, no filter step id is emitted and the
+// upload step is not gated on a nonexistent filter step.
+func TestRepoMemoryNoFilterStepWhenNoFilterConfigured(t *testing.T) {
+	config := &RepoMemoryConfig{
+		Memories: []RepoMemoryEntry{
+			{
+				ID:         "default",
+				BranchName: "memory/default",
+			},
+		},
+	}
+	data := &WorkflowData{RepoMemoryConfig: config}
+
+	var builder strings.Builder
+	generateRepoMemoryArtifactUpload(&builder, data, getActionPin)
+	output := builder.String()
+
+	assert.NotContains(t, output, "Filter repo-memory files (default)", "No filter step should be emitted")
+	assert.NotContains(t, output, repoMemoryFilterStepID("default"), "No filter step id should be referenced")
 }
 
 // TestRepoMemoryPromptGeneration tests that prompt section is generated correctly
@@ -1171,7 +1283,7 @@ func TestRepoMemoryWikiStepsGeneration(t *testing.T) {
 	}
 
 	var builder strings.Builder
-	generateRepoMemorySteps(&builder, data)
+	NewCompiler().generateRepoMemorySteps(&builder, data, "agent")
 
 	output := builder.String()
 	assert.Contains(t, output, "TARGET_REPO: ${{ github.repository }}.wiki",
@@ -1198,7 +1310,7 @@ func TestRepoMemoryWikiStepsWithTargetRepo(t *testing.T) {
 	}
 
 	var builder strings.Builder
-	generateRepoMemorySteps(&builder, data)
+	NewCompiler().generateRepoMemorySteps(&builder, data, "agent")
 
 	output := builder.String()
 	assert.Contains(t, output, "TARGET_REPO: myorg/myrepo.wiki",
@@ -1230,7 +1342,7 @@ func TestRepoMemoryWikiPromptSection(t *testing.T) {
 	assert.Contains(t, wikiNote, "Markdown", "Wiki note should mention Markdown syntax")
 }
 
-// TestRepoMemoryNonWikiPromptSection tests that non-wiki mode uses empty string expression for wiki note
+// TestRepoMemoryNonWikiPromptSection tests that non-wiki mode substitutes an empty wiki note.
 func TestRepoMemoryNonWikiPromptSection(t *testing.T) {
 	config := &RepoMemoryConfig{
 		Memories: []RepoMemoryEntry{
@@ -1246,10 +1358,43 @@ func TestRepoMemoryNonWikiPromptSection(t *testing.T) {
 	require.NotNil(t, section, "Expected non-nil prompt section")
 	require.NotNil(t, section.EnvVars, "Expected env vars")
 
-	wikiNote := section.EnvVars["GH_AW_WIKI_NOTE"]
-	// Non-wiki mode should use a GitHub expression that evaluates to empty string.
-	// This ensures __GH_AW_WIKI_NOTE__ is always substituted via expression interpolation.
-	assert.Equal(t, ghaEmptyStringExpr, wikiNote, "Non-wiki mode should use empty string expression for GH_AW_WIKI_NOTE")
+	require.Contains(t, section.EnvVars, "GH_AW_WIKI_NOTE")
+	assert.Empty(t, section.EnvVars["GH_AW_WIKI_NOTE"])
+	var prompt strings.Builder
+	mappings := NewCompiler().generateUnifiedPromptCreationStep(&prompt, []PromptSection{*section}, nil, nil, &WorkflowData{})
+	assert.NotContains(t, prompt.String(), "GH_AW_WIKI_NOTE:")
+	assert.Contains(t, mappings, &ExpressionMapping{EnvVar: "GH_AW_WIKI_NOTE", Content: "", IsLiteral: true})
+}
+
+func TestRepoMemoryNonWikiCompilation(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "repo-memory.md")
+	source := `---
+on:
+  workflow_dispatch:
+  admission: true
+engine: copilot
+permissions:
+  contents: read
+tools:
+  github: false
+  repo-memory:
+    branch-name: memory/repo-memory
+---
+Maintain the repository memory.
+`
+	require.NoError(t, os.WriteFile(path, []byte(source), 0o600))
+	compiler := NewCompiler(WithLint(true))
+	compiler.gitRoot = dir
+	compiler.SetReadOnly(true)
+	compiler.SetSkipValidation(true)
+	require.NoError(t, compiler.CompileWorkflow(path))
+	require.Zero(t, compiler.GetWarningCount())
+	lock, err := os.ReadFile(filepath.Join(dir, "repo-memory.lock.yml"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(lock), "GH_AW_WIKI_NOTE: ${{ '' }}")
+	assert.Contains(t, string(lock), `GH_AW_WIKI_NOTE: ""`)
 }
 
 // TestRepoMemoryWikiPushAllowedRepos tests that wiki mode sets REPO_MEMORY_ALLOWED_REPOS
@@ -1304,80 +1449,53 @@ func TestRepoMemoryNonWikiPushNoAllowedRepos(t *testing.T) {
 		"Non-wiki push step should not set REPO_MEMORY_ALLOWED_REPOS")
 }
 
-// TestBuildPushRepoMemoryConcurrencyGroup verifies that the concurrency group key is scoped
-// to the actual branch targets, so workflows pushing to different memory branches do not
-// contend with each other.
-func TestBuildPushRepoMemoryConcurrencyGroup(t *testing.T) {
-	tests := []struct {
-		name     string
-		memories []RepoMemoryEntry
-		expected string
+func TestRepoMemoryDailyAICWriterFilterExemption(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		backend   string
+		credits   *string
+		memoryIDs []string
+		writerID  string
 	}{
-		{
-			name: "single memory uses branch name in key",
-			memories: []RepoMemoryEntry{
-				{ID: "default", BranchName: "memory/daily-news"},
-			},
-			expected: "push-repo-memory-${{ github.repository }}|memory/daily-news",
-		},
-		{
-			name: "multiple memories sorted for deterministic key",
-			memories: []RepoMemoryEntry{
-				{ID: "b", BranchName: "memory/workflow-b"},
-				{ID: "a", BranchName: "memory/workflow-a"},
-			},
-			expected: "push-repo-memory-${{ github.repository }}|memory/workflow-a|memory/workflow-b",
-		},
-		{
-			name: "non-default target repo is prefixed to branch",
-			memories: []RepoMemoryEntry{
-				{ID: "default", BranchName: "memory/shared", TargetRepo: "other-org/other-repo"},
-			},
-			expected: "push-repo-memory-${{ github.repository }}|other-org/other-repo:memory/shared",
-		},
-		{
-			name: "mix of default and custom target repos",
-			memories: []RepoMemoryEntry{
-				{ID: "local", BranchName: "memory/local"},
-				{ID: "remote", BranchName: "memory/remote", TargetRepo: "other-org/other-repo"},
-			},
-			expected: "push-repo-memory-${{ github.repository }}|memory/local|other-org/other-repo:memory/remote",
-		},
-		{
-			name: "branches with hyphens use pipe separator in key",
-			memories: []RepoMemoryEntry{
-				{ID: "a", BranchName: "memory/workflow-a"},
-				{ID: "b", BranchName: "memory/workflow-b"},
-			},
-			// This expectation documents the current use of "|" as the list separator in the key.
-			// If the concurrency key encoding changes (e.g., different delimiter or encoding scheme),
-			// update this test to match the new encoding strategy.
-			expected: "push-repo-memory-${{ github.repository }}|memory/workflow-a|memory/workflow-b",
-		},
-		{
-			name: "pipe in branch name is percent-encoded so the separator stays unambiguous",
-			memories: []RepoMemoryEntry{
-				{ID: "unusual", BranchName: "memory/foo|bar"},
-			},
-			expected: "push-repo-memory-${{ github.repository }}|memory/foo%7Cbar",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := buildPushRepoMemoryConcurrencyGroup(tt.memories)
-			assert.Equal(t, tt.expected, got, "Concurrency group key should match expected value")
+		{name: "ordinary memory", memoryIDs: []string{"default"}},
+		{name: "artifact backend", credits: strPtr("10000"), memoryIDs: []string{"default"}},
+		{name: "default selected", backend: maxDailyAICBackendRepoMemory, memoryIDs: []string{"other", "default"}, writerID: "default"},
+		{name: "first selected", backend: maxDailyAICBackendRepoMemory, memoryIDs: []string{"first", "other"}, writerID: "first"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := &WorkflowData{
+				MaxDailyAICBackend: tc.backend,
+				MaxDailyAICredits:  tc.credits,
+				RepoMemoryConfig:   &RepoMemoryConfig{},
+			}
+			for _, id := range tc.memoryIDs {
+				data.RepoMemoryConfig.Memories = append(data.RepoMemoryConfig.Memories, RepoMemoryEntry{ID: id})
+			}
+			compiler := NewCompiler()
+			for _, memory := range data.RepoMemoryConfig.Memories {
+				step := compiler.buildSinglePushRepoMemoryStep(data, memory, true, false)
+				if memory.ID == tc.writerID {
+					assert.Contains(t, step, "GH_AW_DAILY_AIC_REPO_MEMORY_WRITER: ${{ steps.daily-aic-repo-memory-reset.outcome == 'success' }}",
+						"Only a successfully sanitized daily AIC writer may bypass persistence filters")
+				} else {
+					assert.NotContains(t, step, "GH_AW_DAILY_AIC_REPO_MEMORY_WRITER",
+						"Other memories must retain their configured persistence filters")
+				}
+			}
 		})
 	}
 }
 
-// TestPushRepoMemoryJobConcurrencyKey verifies that buildPushRepoMemoryJob sets a concurrency
-// key scoped to the actual memory branch rather than a repo-wide key.
-func TestPushRepoMemoryJobConcurrencyKey(t *testing.T) {
+// TestPushRepoMemoryJobHasNoConcurrencyGroup verifies that the push_repo_memory job does not
+// declare a concurrency group. GitHub Actions only queues one pending job per group, so a
+// shared group silently cancels memory writes when many runs finish at once; the push script
+// converges with a compare-and-swap retry loop instead.
+func TestPushRepoMemoryJobHasNoConcurrencyGroup(t *testing.T) {
 	data := &WorkflowData{
 		RepoMemoryConfig: &RepoMemoryConfig{
 			Memories: []RepoMemoryEntry{
 				{ID: "default", BranchName: "memory/my-workflow"},
+				{ID: "remote", BranchName: "memory/shared", TargetRepo: "other-org/other-repo"},
 			},
 		},
 	}
@@ -1387,18 +1505,13 @@ func TestPushRepoMemoryJobConcurrencyKey(t *testing.T) {
 	require.NoError(t, err, "Should build push job without error")
 	require.NotNil(t, pushJob, "Should produce a push job")
 
-	assert.Contains(t, pushJob.Concurrency, "memory/my-workflow",
-		"Concurrency key should include the memory branch name")
-	// Ensure the old repo-wide-only key is not used
-	assert.NotContains(t, pushJob.Concurrency, "push-repo-memory-${{ github.repository }}\"",
-		"Concurrency key should not be the old repo-wide-only key format")
+	assert.Empty(t, pushJob.Concurrency, "push_repo_memory job should not set a concurrency group")
+	assert.Equal(t, pushRepoMemoryTimeoutMinutes, pushJob.TimeoutMinutes, "push_repo_memory job should expose an explicit retry ceiling")
 }
 
-// TestPushRepoMemoryJobConditionGatesOnAgentNotSkipped verifies that the push_repo_memory
-// job condition uses needs.agent.result != 'skipped' and !cancelled() so the job does not
-// run on no-op workflow invocations (e.g. bot comments where pre_activation is skipped)
-// or after workflow cancellation.
-func TestPushRepoMemoryJobConditionGatesOnAgentNotSkipped(t *testing.T) {
+// TestPushRepoMemoryJobConditions verifies disabled detection only gates cancellation, while
+// enabled detection also gates the agent and detection results.
+func TestPushRepoMemoryJobConditions(t *testing.T) {
 	data := &WorkflowData{
 		RepoMemoryConfig: &RepoMemoryConfig{
 			Memories: []RepoMemoryEntry{
@@ -1415,9 +1528,9 @@ func TestPushRepoMemoryJobConditionGatesOnAgentNotSkipped(t *testing.T) {
 		require.NotNil(t, pushJob, "Should produce a push job")
 
 		assert.Equal(t,
-			"always() && (!cancelled()) && needs.agent.result == 'success'",
+			"always() && (!cancelled())",
 			pushJob.If,
-			"Condition should use always() && (!cancelled()) && agent == 'success'",
+			"Condition should run unless the workflow is cancelled",
 		)
 	})
 
@@ -1430,12 +1543,10 @@ func TestPushRepoMemoryJobConditionGatesOnAgentNotSkipped(t *testing.T) {
 			"Condition should contain always()")
 		assert.Contains(t, pushJob.If, "!cancelled()",
 			"Condition should contain !cancelled() to prevent running after cancellation")
-		assert.Contains(t, pushJob.If, "needs.agent.result == 'success'",
-			"Condition should check agent result == 'success'")
+		assert.Contains(t, pushJob.If, "needs.agent.result != 'skipped'",
+			"Condition should run for completed agent jobs, including failures")
 		assert.Contains(t, pushJob.If, "needs.detection.result",
 			"Condition should still check detection result when threat detection is enabled")
-		assert.NotContains(t, pushJob.If, "needs.agent.result != 'skipped'",
-			"Condition should NOT use != 'skipped' for agent check")
 	})
 }
 
@@ -1564,6 +1675,86 @@ func TestRepoMemoryFormatJSONPushStepEnvVar(t *testing.T) {
 		assert.NotContains(t, pushJobOutput, "FORMAT_JSON",
 			"Push step should NOT include FORMAT_JSON env var when format-json is false")
 	})
+}
+
+func TestRepoMemoryValidationConfigAndGeneratedSteps(t *testing.T) {
+	toolsMap := map[string]any{
+		"repo-memory": []any{
+			map[string]any{
+				"id":                 "default",
+				"branch-name":        "memory/notes",
+				"allowed-extensions": []any{".json"},
+				"validation": map[string]any{
+					"script":          "if (!fs.existsSync(path.join(memoryRoot, 'state.json'))) throw new Error('missing state');",
+					"timeout-minutes": 1,
+				},
+			},
+			map[string]any{
+				"id": "schema",
+				"validation": map[string]any{
+					"json-schemas": []any{
+						map[string]any{"file": "state.json", "format": "json", "schema": map[string]any{"type": "object"}},
+					},
+				},
+			},
+		},
+	}
+
+	toolsConfig, err := ParseToolsConfig(toolsMap)
+	require.NoError(t, err)
+
+	compiler := NewCompiler()
+	config, err := compiler.extractRepoMemoryConfig(toolsConfig, "")
+	require.NoError(t, err)
+	require.NotNil(t, config)
+	require.Len(t, config.Memories, 2)
+	require.NotNil(t, config.Memories[0].Validation)
+	assert.Equal(t, 1, config.Memories[0].Validation.TimeoutMinutes)
+	assert.Contains(t, config.Memories[0].Validation.Script, "missing state")
+	require.NotNil(t, config.Memories[1].Validation)
+	assert.Empty(t, config.Memories[1].Validation.Script)
+	require.Len(t, config.Memories[1].Validation.JSONSchemas, 1)
+
+	data := &WorkflowData{RepoMemoryConfig: config}
+	var restore strings.Builder
+	NewCompiler().generateRepoMemorySteps(&restore, data, "agent")
+	assert.NotContains(t, restore.String(), "Validate repo-memory baseline (default)")
+	generateRepoMemoryBaselineValidationSteps(&restore, data)
+	restoreYAML := restore.String()
+	assert.Less(t, strings.Index(restoreYAML, "Clone repo-memory branch (default)"), strings.Index(restoreYAML, "Validate repo-memory baseline (default)"))
+	assert.Contains(t, restoreYAML, "validateRepoMemoryBaseline(core)")
+	assert.NotContains(t, restoreYAML, "continue-on-error")
+
+	var upload strings.Builder
+	generateRepoMemoryArtifactUpload(&upload, data, getActionPin)
+	uploadYAML := upload.String()
+	assert.Contains(t, uploadYAML, "Validate repo-memory domain content (default)")
+	assert.Contains(t, uploadYAML, "VALIDATION_SCRIPT_B64:")
+	assert.Contains(t, uploadYAML, "MEMORY_JSON_SCHEMAS_REQUIRED: 'true'")
+	assert.Contains(t, uploadYAML, "validate_memory_step.cjs")
+	assert.Contains(t, uploadYAML, "steps."+repoMemoryValidationStepID("default")+".outcome == 'success'")
+	assert.Contains(t, uploadYAML, "steps."+repoMemoryValidationStepID("schema")+".outcome == 'success'")
+	skipCondition := "steps." + memoryValidationStepID("check_repo_memory_baseline", "default") + ".outputs.skip != 'true'"
+	assert.Contains(t, uploadYAML, "checkRepoMemoryBaseline(core)")
+	assert.Equal(t, 4, strings.Count(uploadYAML, skipCondition), "unchanged invalid memory must skip sanitize, filter, validation, and upload")
+
+	pushJob, err := compiler.buildPushRepoMemoryJob(data, false)
+	require.NoError(t, err)
+	require.NotNil(t, pushJob)
+	pushYAML := strings.Join(pushJob.Steps, "\n")
+	assert.Contains(t, pushYAML, "VALIDATION_SCRIPT_B64:")
+	assert.Contains(t, pushYAML, "GH_AW_MEMORY_SOURCE_JOB_RESULT: ${{ needs.agent.result }}")
+	assert.Contains(t, pushYAML, "MEMORY_JSON_SCHEMAS_REQUIRED: 'true'")
+	assert.Contains(t, pushYAML, "VALIDATION_TIMEOUT_SECONDS: 60")
+}
+
+func TestRepoMemoryValidationStepIDsDoNotCollide(t *testing.T) {
+	hyphenID := repoMemoryValidationStepID("my-memory")
+	underscoreID := repoMemoryValidationStepID("my_memory")
+
+	assert.NotEqual(t, hyphenID, underscoreID)
+	assert.Equal(t, "validate_repo_memory_6d792d6d656d6f7279", hyphenID)
+	assert.Equal(t, "validate_repo_memory_6d795f6d656d6f7279", underscoreID)
 }
 
 // TestValidateFileGlobPatterns tests the validateFileGlobPatterns function

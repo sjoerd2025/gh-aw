@@ -26,6 +26,8 @@
 package workflow
 
 import (
+	"net"
+	"net/url"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -36,28 +38,26 @@ var mcpRenderingLog = logger.New("workflow:mcp-rendering")
 // rewriteLocalhostToDockerHost rewrites localhost URLs to use host.docker.internal
 // This is necessary when MCP servers run on the host machine but are accessed from within
 // a Docker container (e.g., when firewall/sandbox is enabled)
-func rewriteLocalhostToDockerHost(url string) string {
-	// Define the localhost patterns to replace and their docker equivalents
-	// Each pattern is a (prefix, replacement) pair
-	replacements := []struct {
-		prefix      string
-		replacement string
-	}{
-		{"http://localhost", "http://host.docker.internal"},
-		{"https://localhost", "https://host.docker.internal"},
-		{"http://127.0.0.1", "http://host.docker.internal"},
-		{"https://127.0.0.1", "https://host.docker.internal"},
+func rewriteLocalhostToDockerHost(rawURL string) string {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || (!strings.EqualFold(parsedURL.Scheme, "http") && !strings.EqualFold(parsedURL.Scheme, "https")) {
+		return rawURL
 	}
 
-	for _, r := range replacements {
-		if strings.HasPrefix(url, r.prefix) {
-			newURL := r.replacement + url[len(r.prefix):]
-			mcpRenderingLog.Printf("Rewriting localhost URL for Docker access: %s -> %s", url, newURL)
-			return newURL
+	switch strings.ToLower(parsedURL.Hostname()) {
+	case "localhost", "127.0.0.1":
+		port := parsedURL.Port()
+		if port == "" {
+			parsedURL.Host = "host.docker.internal"
+		} else {
+			parsedURL.Host = net.JoinHostPort("host.docker.internal", port)
 		}
+		newURL := parsedURL.String()
+		mcpRenderingLog.Printf("Rewriting localhost URL for Docker access: %s -> %s", rawURL, newURL)
+		return newURL
 	}
 
-	return url
+	return rawURL
 }
 
 // shouldRewriteLocalhostToDocker returns true when MCP server localhost URLs should be
@@ -90,7 +90,7 @@ type renderStandardJSONMCPConfigOptions struct {
 }
 
 // renderDefaultJSONMCPConfig is a convenience wrapper for renderStandardJSONMCPConfig used by
-// simple JSON engines (Claude, Gemini, OpenCode) that share the standard
+// simple JSON engines (Claude, Gemini) that share the standard
 // renderCustomMCPConfigWrapperWithContext callback and differ only in their config path.
 func renderDefaultJSONMCPConfig(
 	sb *strings.Builder,
@@ -149,14 +149,19 @@ func renderStandardJSONMCPConfig(
 func buildMCPRendererFactory(workflowData *WorkflowData, format string, includeCopilotFields, inlineArgs bool) func(bool) *MCPConfigRendererUnified {
 	mcpRenderingLog.Printf("Building MCP renderer factory: format=%s, copilotFields=%t, inlineArgs=%t", format, includeCopilotFields, inlineArgs)
 	return func(isLast bool) *MCPConfigRendererUnified {
+		allowWrites := false
+		if workflowData != nil {
+			allowWrites = parseAgenticWorkflowsTool(workflowData.Tools["agentic-workflows"]).AllowWriteTools
+		}
 		return NewMCPConfigRenderer(MCPRendererOptions{
-			IncludeCopilotFields:   includeCopilotFields,
-			InlineArgs:             inlineArgs,
-			Format:                 format,
-			IsLast:                 isLast,
-			ActionMode:             GetActionModeFromWorkflowData(workflowData),
-			WriteSinkGuardPolicies: deriveWriteSinkGuardPolicyFromWorkflow(workflowData),
-			ContainerPinMappings:   workflowData.getContainerPinMappings(),
+			AllowAgenticWorkflowWrites: allowWrites,
+			IncludeCopilotFields:       includeCopilotFields,
+			InlineArgs:                 inlineArgs,
+			Format:                     format,
+			IsLast:                     isLast,
+			ActionMode:                 GetActionModeFromWorkflowData(workflowData),
+			WriteSinkGuardPolicies:     deriveWriteSinkGuardPolicyFromWorkflow(workflowData),
+			ContainerPinMappings:       workflowData.getContainerPinMappings(),
 		})
 	}
 }
@@ -164,7 +169,7 @@ func buildMCPRendererFactory(workflowData *WorkflowData, format string, includeC
 // buildStandardJSONMCPRenderers constructs MCPToolRenderers with the standard rendering callbacks
 // shared across JSON-format engines (Claude, Gemini, Copilot, Codex gateway).
 //
-// All standard tool callbacks (GitHub, Playwright, CacheMemory, AgenticWorkflows,
+// All standard tool callbacks (GitHub, CacheMemory, AgenticWorkflows,
 // SafeOutputs, MCPScripts) are wired to the corresponding unified renderer methods
 // via createRenderer. Cache-memory is always a no-op for these engines.
 //
@@ -179,9 +184,6 @@ func buildStandardJSONMCPRenderers(
 		RenderGitHub: func(yaml *strings.Builder, githubTool map[string]any, isLast bool, workflowData *WorkflowData) {
 			createRenderer(isLast).RenderGitHubMCP(yaml, githubTool, workflowData)
 		},
-		RenderPlaywright: func(yaml *strings.Builder, playwrightTool any, isLast bool) {
-			createRenderer(isLast).RenderPlaywrightMCP(yaml, playwrightTool)
-		},
 		RenderCacheMemory: noOpCacheMemoryRenderer,
 		RenderAgenticWorkflows: func(yaml *strings.Builder, isLast bool) {
 			createRenderer(isLast).RenderAgenticWorkflowsMCP(yaml)
@@ -189,8 +191,17 @@ func buildStandardJSONMCPRenderers(
 		RenderSafeOutputs: func(yaml *strings.Builder, isLast bool, workflowData *WorkflowData) {
 			createRenderer(isLast).RenderSafeOutputsMCP(yaml, workflowData)
 		},
+		RenderLedger: func(yaml *strings.Builder, isLast bool, workflowData *WorkflowData) {
+			createRenderer(isLast).RenderLedgerMCP(yaml, workflowData)
+		},
+		RenderWorkQueue: func(yaml *strings.Builder, isLast bool, workflowData *WorkflowData) {
+			createRenderer(isLast).RenderWorkQueueMCP(yaml, workflowData)
+		},
 		RenderMCPScripts: func(yaml *strings.Builder, mcpScripts *MCPScriptsConfig, isLast bool) {
 			createRenderer(isLast).RenderMCPScriptsMCP(yaml, mcpScripts, workflowData)
+		},
+		RenderEnclave: func(yaml *strings.Builder, workflowData *WorkflowData, isLast bool) {
+			writeEnclaveMCPJSON(yaml, workflowData, isLast)
 		},
 		RenderCustomMCPConfig: renderCustom,
 	}

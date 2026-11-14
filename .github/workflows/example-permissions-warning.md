@@ -10,9 +10,6 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
 imports:
   - shared/otlp.md
@@ -20,6 +17,10 @@ tools:
   cli-proxy: true
   github:
     toolsets: [repos, issues, pull_requests]
+engine:
+  id: codex
+  model-provider: github
+model: copilot/gpt-5.6-sol
 strict: false
 
 ---

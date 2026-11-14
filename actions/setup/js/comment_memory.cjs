@@ -7,18 +7,31 @@ const { getErrorMessage } = require("./error_helpers.cjs");
 const { SAFE_OUTPUT_E001 } = require("./error_codes.cjs");
 const { resolveTarget, isStagedMode } = require("./safe_output_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
-const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
+const { createAuthenticatedGitHubClient, createAuthenticatedLoginResolver } = require("./handler_auth.cjs");
 const { renderTemplateFromFile } = require("./messages_core.cjs");
-const { assembleMarkdownBodyParts } = require("./markdown_body_helpers.cjs");
+const { assembleReportBodyParts } = require("./markdown_body_helpers.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
 const { generateHistoryUrl } = require("./generate_history_link.cjs");
-const { enforceCommentLimits } = require("./comment_limit_helpers.cjs");
-const { COMMENT_MEMORY_TAG, COMMENT_MEMORY_MAX_SCAN_PAGES, COMMENT_MEMORY_CODE_FENCE, buildCodeFenceOpener } = require("./comment_memory_helpers.cjs");
+const { enforceCommentLimits, MAX_LINKS } = require("./comment_limit_helpers.cjs");
+const { COMMENT_MEMORY_TAG, COMMENT_MEMORY_MAX_SCAN_PAGES, buildCodeFenceOpener, stripCommentMemoryPayloads } = require("./comment_memory_helpers.cjs");
+const { getBodyFooterBlocks } = require("./messages_footer.cjs");
+const { appendReportExecutionProvenance } = require("./execution_provenance.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
+const { applyToNonCodeRegions } = require("./sanitize_content_core.cjs");
 // Require provenance marker to avoid accidentally updating user-authored comments
 // that happen to contain a matching comment-memory tag.
 const MANAGED_COMMENT_PROVENANCE_MARKER = "<!-- gh-aw-agentic-workflow:";
-const MANAGED_COMMENT_HEADER = "### Comment Memory";
+
+function getFrameworkMetadataBody(body) {
+  // Neither fenced memory nor legacy XML payloads are framework metadata.
+  return applyToNonCodeRegions(
+    stripCommentMemoryPayloads(body),
+    value => value,
+    () => "\n"
+  );
+}
 
 function renderManagedCommentDisclosureNote() {
   const promptsDir = process.env.GH_AW_PROMPTS_DIR || `${process.env.RUNNER_TEMP}/gh-aw/prompts`;
@@ -35,17 +48,89 @@ function sanitizeMemoryID(memoryID) {
   return normalized;
 }
 
-function buildManagedMemoryBody(rawBody, memoryID, options) {
-  const { includeFooter, runUrl, workflowName, workflowSource, workflowSourceURL, historyUrl, triggeringIssueNumber, triggeringPRNumber } = options;
+/** @returns {import("./report_ast.cjs").ReportBlock} */
+function buildCollapsedMemorySection(rawBody, memoryID, memoryTag, memoryBlock) {
+  return {
+    type: "details",
+    summary: `Peek at saved memory (${memoryID})`,
+    agentTainted: false,
+    children: [memoryBlock || { type: "code_block", language: `${memoryTag}:${memoryID}`, fenceLength: 6, value: sanitizeContent(rawBody), agentTainted: true, sizeProtected: true }],
+  };
+}
+
+/**
+ * @param {string} previousBody
+ * @param {string} runUrl
+ * @param {string} workflowName
+ * @returns {import("./report_ast.cjs").ReportBlock}
+ */
+function buildTransactionHistory(previousBody, runUrl, workflowName) {
+  const previous = parseReportMarkdown(getFrameworkMetadataBody(previousBody), { allowMetadata: true, agentTainted: true });
+  const history = previous.find(node => node.type === "details" && node.summary === "History");
+  const trustedRun = /^(https:\/\/[\w.-]+(?::\d+)?\/[\w.-]+\/[\w.-]+\/actions\/runs\/)[1-9]\d*$/.exec(runUrl);
+  /** @type {Map<string, string>} */
+  const runs = new Map();
+  const addRun = url => {
+    const match = /^(https:\/\/[\w.-]+(?::\d+)?\/[\w.-]+\/[\w.-]+\/actions\/runs\/)([1-9]\d*)$/.exec(url);
+    if (match && trustedRun && match[1] === trustedRun[1]) {
+      runs.set(url, `Workflow (run ${match[2]})`);
+    }
+  };
+  if (history?.type === "details") {
+    for (const list of history.children) {
+      if (list.type !== "list") continue;
+      for (const item of list.items) {
+        for (const block of item) {
+          if (block.type !== "paragraph") continue;
+          for (const link of block.children) {
+            if (link.type === "link") {
+              addRun(link.url);
+            }
+          }
+        }
+      }
+    }
+  } else {
+    // Older comments only retain their most recent writer in the attribution.
+    for (const node of previous) {
+      if (node.type !== "xml_marker" || node.name !== "gh-aw-agentic-workflow") continue;
+      const url = node.fields?.find(field => field.key === "run")?.value;
+      if (url) addRun(url);
+    }
+  }
+  runs.delete(runUrl);
+  runs.set(runUrl, `${workflowName} (run ${runUrl.split("/").pop()})`);
+  return {
+    type: "details",
+    summary: "History",
+    agentTainted: false,
+    sizeProtected: true,
+    children: [
+      {
+        type: "list",
+        ordered: false,
+        agentTainted: false,
+        items: [...runs].map(([url, label]) => [
+          {
+            type: "paragraph",
+            agentTainted: false,
+            children: [{ type: "link", url, agentTainted: false, children: [{ type: "text", value: label, agentTainted: false }] }],
+          },
+        ]),
+      },
+    ],
+  };
+}
+
+/** @returns {import("./report_ast.cjs").Report} */
+function buildManagedMemoryReport(rawBody, memoryID, options) {
+  const { includeFooter, bodyFooter, runUrl, workflowName, workflowSource, workflowSourceURL, historyUrl, triggeringIssueNumber, triggeringPRNumber, memoryTag = COMMENT_MEMORY_TAG, memoryBlock, previousBody = "" } = options;
   if (!/^[a-zA-Z0-9_-]+$/.test(memoryID)) {
     throw new Error(`${SAFE_OUTPUT_E001}: memory_id must contain only alphanumeric characters, hyphens, and underscores`);
   }
   core.info(`comment_memory: building managed body for memory_id='${memoryID}'`);
-  // Use code-fence-as-container so the memory content is visible in GitHub's rendered Markdown.
-  // The language specifier encodes the memory ID: ``````gh-aw-comment-memory:<id>
-  const codeFenceOpener = buildCodeFenceOpener(memoryID);
 
-  const markdownParts = assembleMarkdownBodyParts({
+  const markdownParts = assembleReportBodyParts({
     includeFooter,
     workflowName,
     runUrl,
@@ -57,34 +142,40 @@ function buildManagedMemoryBody(rawBody, memoryID, options) {
     markerWhenFooterDisabled: "xml",
   });
 
-  // Inject CAUTION at top of body if threat detection warning was raised
-  const detectionCaution = markdownParts.detectionCaution;
-  const cautionPrefix = detectionCaution ? detectionCaution + "\n\n" : "";
-
-  let body = `${cautionPrefix}${MANAGED_COMMENT_HEADER}\n\n${codeFenceOpener}\n${sanitizeContent(rawBody)}\n${COMMENT_MEMORY_CODE_FENCE}`;
+  /** @type {import("./report_ast.cjs").ReportBlock[]} */
+  const children = [
+    ...markdownParts.detectionCaution,
+    { type: "heading", level: 3, agentTainted: false, children: [{ type: "text", value: "Comment Memory", agentTainted: false }] },
+    buildCollapsedMemorySection(rawBody, memoryID, memoryTag, memoryBlock),
+    buildTransactionHistory(previousBody, runUrl, workflowName),
+  ];
 
   const tracker = getTrackerID("markdown");
   if (tracker) {
-    body += `\n\n${tracker}`;
+    children.push(...parseReportMarkdown(tracker, { allowMetadata: true, agentTainted: false }));
   }
 
   if (includeFooter) {
     core.info(`comment_memory: footer enabled for memory_id='${memoryID}'`);
     const resolvedDisclosureNote = renderManagedCommentDisclosureNote();
-    body += "\n\n" + resolvedDisclosureNote;
-    body += "\n\n" + markdownParts.footer;
+    children.push(...parseReportMarkdown(resolvedDisclosureNote, { minimumHeadingLevel: 2, agentTainted: false }), ...markdownParts.footer);
   } else {
     core.info(`comment_memory: footer disabled for memory_id='${memoryID}', adding provenance marker only`);
-    body += "\n\n" + markdownParts.noFooterMarker;
+    children.push(...markdownParts.noFooterMarker);
   }
+  children.push(...getBodyFooterBlocks(bodyFooter, { workflowName, runUrl }));
 
-  core.info(`comment_memory: built body length=${body.length} for memory_id='${memoryID}'`);
-  return body;
+  return { type: "report", title: "Comment Memory", children };
+}
+
+function buildManagedMemoryBody(rawBody, memoryID, options) {
+  return renderSizedReport(buildManagedMemoryReport(rawBody, memoryID, options)).body;
 }
 
 async function findManagedComment(github, owner, repo, itemNumber, memoryID) {
   const newFormatMarker = buildCodeFenceOpener(memoryID);
   const legacyMarker = `<${COMMENT_MEMORY_TAG} id="${memoryID}">`;
+  const getAuthenticatedLogin = createAuthenticatedLoginResolver(github, core);
   core.info(`comment_memory: scanning comments for memory_id='${memoryID}' on #${itemNumber} in ${owner}/${repo}`);
   let page = 1;
   const perPage = 100;
@@ -101,7 +192,7 @@ async function findManagedComment(github, owner, repo, itemNumber, memoryID) {
       core.info(`comment_memory: no comments found on page ${page}`);
       return null;
     }
-    const match = data.find(comment => {
+    const candidates = data.filter(comment => {
       const body = comment.body;
       if (typeof body !== "string") {
         return false;
@@ -109,7 +200,12 @@ async function findManagedComment(github, owner, repo, itemNumber, memoryID) {
       if (!body.includes(newFormatMarker) && !body.includes(legacyMarker)) {
         return false;
       }
-      return body.includes(MANAGED_COMMENT_PROVENANCE_MARKER);
+      return getFrameworkMetadataBody(body).includes(MANAGED_COMMENT_PROVENANCE_MARKER);
+    });
+    const authenticatedLogin = candidates.length > 0 ? await getAuthenticatedLogin() : null;
+    const match = candidates.find(comment => {
+      if (!comment.user?.login) return false;
+      return authenticatedLogin ? comment.user.login === authenticatedLogin : comment.user.type === "Bot";
     });
     if (match) {
       core.info(`comment_memory: found existing managed comment id=${match.id} on page ${page}`);
@@ -197,31 +293,33 @@ async function main(config = {}) {
         serverUrl: context.serverUrl,
       }) || undefined;
 
-    const managedBody = buildManagedMemoryBody(message.body || "", memoryID, {
-      includeFooter,
-      runUrl,
-      workflowName,
-      workflowSource,
-      workflowSourceURL,
-      historyUrl,
-      triggeringIssueNumber,
-      triggeringPRNumber,
-    });
     try {
-      enforceCommentLimits(managedBody);
-    } catch (error) {
-      core.warning(`comment_memory: body validation failed: ${getErrorMessage(error)}`);
-      return { success: false, error: getErrorMessage(error) };
-    }
-    core.info(`comment_memory: body validation passed for memory_id='${memoryID}'`);
+      const existing = staged ? null : await findManagedComment(githubClient, repoResolution.repoParts.owner, repoResolution.repoParts.repo, targetResult.number, memoryID);
+      const report = buildManagedMemoryReport(message.body || "", memoryID, {
+        includeFooter,
+        runUrl,
+        workflowName,
+        workflowSource,
+        workflowSourceURL,
+        historyUrl,
+        triggeringIssueNumber,
+        triggeringPRNumber,
+        bodyFooter: config.body_footer,
+        previousBody: existing?.body || "",
+      });
+      const managedBody = renderSizedReport(appendReportExecutionProvenance(report, workflowName, runUrl)).body;
+      const transactionHistory = report.children.find(node => node.type === "details" && node.summary === "History");
+      const historyList = transactionHistory?.type === "details" ? transactionHistory.children[0] : undefined;
+      const historyLinkCount = historyList?.type === "list" ? historyList.items.length : 0;
+      // Accumulated framework run links do not consume the agent's link budget.
+      enforceCommentLimits(managedBody, { maxLinks: MAX_LINKS + historyLinkCount });
+      core.info(`comment_memory: body validation passed for memory_id='${memoryID}'`);
 
-    if (staged) {
-      core.info(`🎭 Staged Mode: would upsert comment-memory '${memoryID}' on #${targetResult.number} in ${repoResolution.repo}`);
-      return { success: true, staged: true };
-    }
+      if (staged) {
+        core.info(`🎭 Staged Mode: would upsert comment-memory '${memoryID}' on #${targetResult.number} in ${repoResolution.repo}`);
+        return { success: true, staged: true };
+      }
 
-    try {
-      const existing = await findManagedComment(githubClient, repoResolution.repoParts.owner, repoResolution.repoParts.repo, targetResult.number, memoryID);
       if (existing) {
         core.info(`comment_memory: updating existing managed comment id=${existing.id}`);
         const { data } = await githubClient.rest.issues.updateComment({
@@ -258,8 +356,10 @@ async function main(config = {}) {
         managedBody,
       };
     } catch (error) {
-      core.warning(`comment_memory: upsert failed: ${getErrorMessage(error)}`);
-      return { success: false, error: getErrorMessage(error) };
+      const reason = getErrorMessage(error);
+      const errorMessage = reason.includes("exceeds maximum length") ? `${reason} No comment was changed. Reduce the saved memory size or use a new memory_id; existing History entries cannot be dropped.` : reason;
+      core.warning(`comment_memory: upsert failed: ${errorMessage}`);
+      return { success: false, error: errorMessage };
     }
   };
 }

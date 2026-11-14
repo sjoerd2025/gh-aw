@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -116,7 +117,7 @@ func TestAgentFriendlyOutputExample(t *testing.T) {
 	}
 
 	// Build audit data
-	auditData := buildAuditData(processedRun, metrics, nil)
+	auditData := buildAuditData(context.Background(), processedRun, metrics, nil)
 
 	// Test JSON output
 	t.Run("JSON Output", func(t *testing.T) {
@@ -257,6 +258,7 @@ func TestAgentFriendlyOutputExample(t *testing.T) {
 
 // TestAgentFriendlyOutputFailureScenario tests output for a failed workflow
 func TestAgentFriendlyOutputFailureScenario(t *testing.T) {
+	t.Parallel()
 	// Create a failed workflow scenario
 	run := WorkflowRun{
 		DatabaseID:   111222,
@@ -301,7 +303,7 @@ func TestAgentFriendlyOutputFailureScenario(t *testing.T) {
 	}
 
 	// Build audit data
-	auditData := buildAuditData(processedRun, metrics, nil)
+	auditData := buildAuditData(context.Background(), processedRun, metrics, nil)
 
 	// Test key findings for failure
 	t.Run("Failure Findings", func(t *testing.T) {

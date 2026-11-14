@@ -3,6 +3,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,7 +12,71 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBuildAuditComparisonCandidateFromSummaryUsesSharedSnapshot(t *testing.T) {
+	t.Parallel()
+	summary := &RunSummary{
+		RunAnalysis: RunAnalysis{
+			Run:     WorkflowRun{Turns: 2},
+			Metrics: LogMetrics{Turns: 7},
+			FirewallAnalysis: &FirewallAnalysis{
+				AnalysisBase: AnalysisBase{BlockedRequests: 3},
+			},
+			MCPFailures: []MCPFailureReport{{ServerName: "github"}},
+			ModelRouting: &ModelRoutingSummary{
+				SelectedModel:  "gpt-5.6-luna",
+				SelectedEffort: "high",
+			},
+			SafeOutputs: []CreatedItemReport{{Type: "create_issue"}},
+		},
+	}
+
+	candidate := buildAuditComparisonCandidateFromSummary(summary, t.TempDir())
+
+	assert.Equal(t, 7, candidate.Snapshot.Turns)
+	assert.Equal(t, "write_capable", candidate.Snapshot.Posture)
+	assert.Equal(t, 3, candidate.Snapshot.BlockedRequests)
+	assert.Equal(t, []string{"github"}, candidate.Snapshot.MCPFailures)
+	require.NotNil(t, candidate.Snapshot.ModelRouting)
+	assert.Equal(t, "gpt-5.6-luna", candidate.Snapshot.ModelRouting.Model)
+	assert.Equal(t, "high", candidate.Snapshot.ModelRouting.Effort)
+}
+
+func TestLoadAuditComparisonCandidateFromArtifacts(t *testing.T) {
+	t.Parallel()
+	logsPath := t.TempDir()
+	routingDir := filepath.Join(logsPath, "sandbox", "firewall", "logs", "api-proxy-logs")
+	require.NoError(t, os.MkdirAll(routingDir, 0o700))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(routingDir, "model-routing.jsonl"),
+		[]byte("{\"_schema\":\"model-routing/v0.28.37\",\"stage\":\"selection\",\"selected_model\":\"gpt-5.6-luna\",\"selected_effort\":\"high\"}\n"),
+		0o600,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(logsPath, safeOutputItemsManifestFilename),
+		[]byte("{\"type\":\"create_issue\"}\n"),
+		0o600,
+	))
+
+	candidate, err := loadAuditComparisonCandidate(WorkflowRun{DatabaseID: 42}, logsPath, false)
+	require.NoError(t, err)
+	assert.Equal(t, "write_capable", candidate.Snapshot.Posture)
+	assert.Equal(t, 0, candidate.Snapshot.Turns)
+	require.NotNil(t, candidate.Snapshot.ModelRouting)
+	assert.Equal(t, "gpt-5.6-luna", candidate.Snapshot.ModelRouting.Model)
+	assert.Equal(t, "high", candidate.Snapshot.ModelRouting.Effort)
+}
+
+func TestLoadAuditComparisonCandidateFromArtifactsFailsOnFirewallError(t *testing.T) {
+	t.Parallel()
+	logsPath := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(logsPath, nil, 0o600))
+
+	_, err := loadAuditComparisonCandidate(WorkflowRun{DatabaseID: 42}, logsPath, false)
+	require.ErrorContains(t, err, "failed to analyze baseline firewall logs")
+}
+
 func TestBuildAuditComparison_NoBaseline(t *testing.T) {
+	t.Parallel()
 	comparison := buildAuditComparison("success", auditComparisonSnapshot{Turns: 4, Posture: "read_only"}, nil, nil)
 	require.NotNil(t, comparison, "comparison should still be returned when no baseline exists")
 	assert.False(t, comparison.BaselineFound, "baseline should be marked unavailable")
@@ -20,6 +86,7 @@ func TestBuildAuditComparison_NoBaseline(t *testing.T) {
 }
 
 func TestBuildAuditComparison_RiskyChange(t *testing.T) {
+	t.Parallel()
 	baselineRun := &WorkflowRun{
 		DatabaseID:   100,
 		WorkflowName: "triage",
@@ -54,6 +121,7 @@ func TestBuildAuditComparison_RiskyChange(t *testing.T) {
 }
 
 func TestBuildAuditComparison_StableRun(t *testing.T) {
+	t.Parallel()
 	baselineRun := &WorkflowRun{DatabaseID: 99, WorkflowName: "triage", Conclusion: "success", CreatedAt: time.Now().Add(-time.Hour)}
 	comparison := buildAuditComparison(
 		"success",
@@ -69,6 +137,7 @@ func TestBuildAuditComparison_StableRun(t *testing.T) {
 }
 
 func TestBuildAuditComparison_FailedRunIsRisky(t *testing.T) {
+	t.Parallel()
 	baselineRun := &WorkflowRun{DatabaseID: 101, WorkflowName: "triage", Conclusion: "success", CreatedAt: time.Now().Add(-time.Hour)}
 	comparison := buildAuditComparison(
 		"failure",
@@ -86,6 +155,7 @@ func TestBuildAuditComparison_FailedRunIsRisky(t *testing.T) {
 }
 
 func TestSelectAuditComparisonBaselinePrefersCohortMatchOverRecency(t *testing.T) {
+	t.Parallel()
 	current := ProcessedRun{
 		Run: WorkflowRun{
 			Event: "issues",
@@ -143,6 +213,7 @@ func TestSelectAuditComparisonBaselinePrefersCohortMatchOverRecency(t *testing.T
 }
 
 func TestScoreAuditComparisonCandidateFallsBackToLatestSuccess(t *testing.T) {
+	t.Parallel()
 	current := ProcessedRun{Run: WorkflowRun{Event: "issues"}}
 	candidate := auditComparisonCandidate{
 		Run: WorkflowRun{DatabaseID: 300, CreatedAt: time.Date(2026, 3, 21, 12, 0, 0, 0, time.UTC), Event: "push"},
@@ -153,4 +224,159 @@ func TestScoreAuditComparisonCandidateFallsBackToLatestSuccess(t *testing.T) {
 	assert.Equal(t, 0, candidate.Score)
 	assert.Equal(t, "latest_success", candidate.Selection)
 	assert.Nil(t, candidate.MatchedOn)
+}
+
+func TestRecommendAuditComparisonAction(t *testing.T) {
+	t.Parallel()
+
+	newlyPresentMCPFailure := &AuditComparisonMCPFailureDelta{NewlyPresent: true}
+
+	tests := []struct {
+		name              string
+		label             string
+		currentConclusion string
+		delta             *AuditComparisonDelta
+		expectedContains  string
+	}{
+		{
+			name:              "non-success failure conclusion",
+			label:             "changed",
+			currentConclusion: "failure",
+			delta:             &AuditComparisonDelta{},
+			expectedContains:  "Investigate failure; run concluded with errors",
+		},
+		{
+			name:              "non-success non-failure conclusion",
+			label:             "changed",
+			currentConclusion: "action_required",
+			delta:             &AuditComparisonDelta{},
+			expectedContains:  "Investigate the action required conclusion",
+		},
+		{
+			name:              "nil delta with success conclusion",
+			label:             "changed",
+			currentConclusion: "success",
+			delta:             nil,
+			expectedContains:  "No action needed",
+		},
+		{
+			name:              "stable label with success conclusion",
+			label:             "stable",
+			currentConclusion: "success",
+			delta:             &AuditComparisonDelta{},
+			expectedContains:  "No action needed",
+		},
+		{
+			name:              "empty conclusion treated as success-equivalent, stable label",
+			label:             "stable",
+			currentConclusion: "",
+			delta:             &AuditComparisonDelta{},
+			expectedContains:  "No action needed",
+		},
+		{
+			name:              "posture read_only to write_capable",
+			label:             "risky",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				Posture: AuditComparisonStringDelta{Before: "read_only", After: "write_capable"},
+			},
+			expectedContains: "Review first-time write-capable behavior",
+		},
+		{
+			name:              "newly present MCP failure",
+			label:             "risky",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				MCPFailure: newlyPresentMCPFailure,
+			},
+			expectedContains: "Inspect the new MCP failure",
+		},
+		{
+			name:              "MCP failure present but not newly present falls through",
+			label:             "changed",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				MCPFailure: &AuditComparisonMCPFailureDelta{NewlyPresent: false},
+			},
+			expectedContains: "Review the behavior change",
+		},
+		{
+			name:              "blocked requests increased",
+			label:             "risky",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				BlockedRequests: AuditComparisonIntDelta{Before: 1, After: 3},
+			},
+			expectedContains: "Review network policy changes",
+		},
+		{
+			name:              "turns increased",
+			label:             "changed",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				Turns: AuditComparisonIntDelta{Before: 2, After: 5},
+			},
+			expectedContains: "Compare prompt or task-shape changes",
+		},
+		{
+			name:              "routing change",
+			label:             "changed",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				ModelRouting: &AuditComparisonRouteDelta{Changed: true},
+			},
+			expectedContains: "Review the model-routing change",
+		},
+		{
+			name:              "fallback default review message",
+			label:             "changed",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				Turns:           AuditComparisonIntDelta{Before: 5, After: 3},
+				BlockedRequests: AuditComparisonIntDelta{Before: 3, After: 1},
+			},
+			expectedContains: "Review the behavior change against the selected successful baseline",
+		},
+		{
+			name:              "priority order: posture change wins over MCP failure",
+			label:             "risky",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				Posture:      AuditComparisonStringDelta{Before: "read_only", After: "write_capable"},
+				MCPFailure:   newlyPresentMCPFailure,
+				ModelRouting: &AuditComparisonRouteDelta{Changed: true},
+			},
+			expectedContains: "Review first-time write-capable behavior",
+		},
+		{
+			name:              "priority order: MCP failure wins over blocked requests",
+			label:             "risky",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				MCPFailure:      newlyPresentMCPFailure,
+				BlockedRequests: AuditComparisonIntDelta{Before: 1, After: 5},
+				ModelRouting:    &AuditComparisonRouteDelta{Changed: true},
+			},
+			expectedContains: "Inspect the new MCP failure",
+		},
+		{
+			name:              "priority order: blocked requests wins over turns",
+			label:             "risky",
+			currentConclusion: "success",
+			delta: &AuditComparisonDelta{
+				BlockedRequests: AuditComparisonIntDelta{Before: 1, After: 5},
+				Turns:           AuditComparisonIntDelta{Before: 2, After: 8},
+				ModelRouting:    &AuditComparisonRouteDelta{Changed: true},
+			},
+			expectedContains: "Review network policy changes",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := recommendAuditComparisonAction(tt.label, tt.currentConclusion, tt.delta)
+			assert.Contains(t, result, tt.expectedContains)
+		})
+	}
 }

@@ -12,6 +12,7 @@ import (
 )
 
 func TestBashAnonymousRemovalCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getBashAnonymousRemovalCodemod()
 
 	tests := []struct {
@@ -86,6 +87,7 @@ name: Test Workflow
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Parse frontmatter to get the map
 			result, err := parser.ExtractFrontmatterFromContent(tt.input)
 			require.NoError(t, err, "Failed to parse test input frontmatter")
@@ -118,6 +120,7 @@ name: Test Workflow
 }
 
 func TestBashAnonymousCodemodWithComments(t *testing.T) {
+	t.Parallel()
 	codemod := getBashAnonymousRemovalCodemod()
 
 	input := `---
@@ -140,6 +143,7 @@ tools:
 }
 
 func TestBashAnonymousCodemodPreservesIndentation(t *testing.T) {
+	t.Parallel()
 	codemod := getBashAnonymousRemovalCodemod()
 
 	input := `---
@@ -169,70 +173,4 @@ tools:
 		}
 	}
 	assert.True(t, foundBash, "Should find bash: true in output")
-}
-
-func TestReplaceBashAnonymousWithTrue(t *testing.T) {
-	tests := []struct {
-		name        string
-		lines       []string
-		expectLines []string
-		modified    bool
-	}{
-		{
-			name: "replaces bash: in tools block",
-			lines: []string{
-				"name: Test",
-				"tools:",
-				"  bash:",
-				"  github:",
-			},
-			expectLines: []string{
-				"name: Test",
-				"tools:",
-				"  bash: true",
-				"  github:",
-			},
-			modified: true,
-		},
-		{
-			name: "does not modify outside tools block",
-			lines: []string{
-				"name: Test",
-				"bash:",
-				"tools:",
-				"  github:",
-			},
-			expectLines: []string{
-				"name: Test",
-				"bash:",
-				"tools:",
-				"  github:",
-			},
-			modified: false,
-		},
-		{
-			name: "does not modify bash with value",
-			lines: []string{
-				"name: Test",
-				"tools:",
-				"  bash: true",
-				"  github:",
-			},
-			expectLines: []string{
-				"name: Test",
-				"tools:",
-				"  bash: true",
-				"  github:",
-			},
-			modified: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, modified := replaceBashAnonymousWithTrue(tt.lines)
-			assert.Equal(t, tt.modified, modified, "Modified status mismatch")
-			assert.Equal(t, tt.expectLines, result, "Output lines mismatch")
-		})
-	}
 }

@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -454,6 +455,12 @@ Test workflow with action mode.
 	compiler := NewCompiler(WithVersion("v1.2.3"))
 	compiler.SetActionMode(ActionModeAction)
 	compiler.SetNoEmit(false)
+	const setupSHA = "0123456789abcdef0123456789abcdef01234567"
+	compiler.actionCache = NewActionCache(tempDir)
+	if !compiler.actionCache.Set("github/gh-aw-actions/setup", "v1.2.3", setupSHA) {
+		t.Fatal("Failed to seed setup action pin")
+	}
+	compiler.actionResolver = NewActionResolver(compiler.actionCache)
 
 	if err := compiler.CompileWorkflow(workflowPath); err != nil {
 		t.Fatalf("Compilation failed: %v", err)
@@ -467,9 +474,10 @@ Test workflow with action mode.
 
 	lockStr := string(lockContent)
 
-	// Verify it uses the external gh-aw-actions/setup action
-	if !strings.Contains(lockStr, "github/gh-aw-actions/setup@v1.2.3") {
-		t.Errorf("Action mode should use 'github/gh-aw-actions/setup@v1.2.3', lock file:\n%s", lockStr)
+	// Verify the external setup action uses the fixture pin, not a live resolution.
+	expectedSetupRef := "uses: github/gh-aw-actions/setup@" + setupSHA + " # v1.2.3"
+	if !strings.Contains(lockStr, expectedSetupRef) {
+		t.Errorf("Action mode should use %q", expectedSetupRef)
 	}
 
 	// Verify it does NOT use the internal gh-aw/actions/setup path
@@ -483,15 +491,17 @@ Test workflow with action mode.
 	}
 }
 
+type unavailableSHAResolver struct{}
+
+func (unavailableSHAResolver) ResolveSHA(context.Context, string, string) (string, error) {
+	return "", errors.New("resolution unavailable")
+}
+
 // TestResolveSetupActionReferenceActionModeWithResolver tests that action mode uses SHA resolver when available
 func TestResolveSetupActionReferenceActionModeWithResolver(t *testing.T) {
 	t.Run("action mode with resolver attempts SHA resolution", func(t *testing.T) {
-		// Create mock action resolver and cache
-		cache := NewActionCache("")
-		resolver := NewActionResolver(cache)
-
-		// The resolver will fail to resolve github/gh-aw-actions/setup@v1.0.0
-		// since it's not a real tag, but it should fall back gracefully to tag-based reference
+		// A resolver failure should fall back to the tag-based reference.
+		resolver := unavailableSHAResolver{}
 		ref := ResolveSetupActionReference(context.Background(), ActionModeAction, "v1.0.0", "", resolver)
 
 		// Without a valid pin or successful resolution, should return tag-based reference

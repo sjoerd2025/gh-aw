@@ -187,7 +187,7 @@ Consumer workflow.
 	if err != nil {
 		t.Fatalf("Failed to read lock file: %v", err)
 	}
-	lockContent := string(lockFileContent)
+	lockContent := compiledWorkflowBody(string(lockFileContent))
 
 	// The leaf workflow's tools (bash) should be merged.
 	// "git *" normalizes to the canonical stem form shell(git:*) at compile time.
@@ -440,7 +440,7 @@ Caller workflow.
 	if strings.Contains(lockContent, "[microsoft/apm#main github/awesome-copilot/skills/foo]") {
 		t.Error("Array input was serialized as Go slice format '[a b]'; expected JSON array")
 	}
-	if !strings.Contains(lockContent, `["microsoft/apm#main","github/awesome-copilot/skills/foo"]`) {
+	if !strings.Contains(lockContent, `[\"microsoft/apm#main\",\"github/awesome-copilot/skills/foo\"]`) {
 		t.Errorf("Expected JSON array in lock file, got:\n%s", lockContent)
 	}
 

@@ -5,7 +5,7 @@
 
 ## Overview
 
-This document provides a complete visual guide to the adaptive color palette and styling system used in GitHub Agentic Workflows. The system uses [lipgloss](https://github.com/charmbracelet/lipgloss) with adaptive colors that automatically adjust based on the user's terminal theme (light or dark).
+This document provides a visual guide to the adaptive color palette and styling system used in GitHub Agentic Workflows. The system uses [lipgloss](https://github.com/charmbracelet/lipgloss) with adaptive colors that automatically adjust based on the user's terminal theme (light or dark).
 
 **Implementation**: `pkg/styles/theme.go`
 
@@ -18,19 +18,19 @@ GitHub Agentic Workflows uses an adaptive color system that provides readability
 **Light Mode**:
 - Darker, more saturated colors for visibility on light backgrounds
 - High contrast ratios for accessibility
-- Muted tones to reduce visual fatigue during extended use
+- Muted tones for extended terminal sessions
 
 **Dark Mode**:
 - Inspired by the [Dracula color theme](https://draculatheme.com/)
-- Bright, vibrant colors optimized for dark backgrounds
-- Maintains consistency with popular dark terminal themes
+- Bright, saturated colors chosen for dark backgrounds
+- Maintains consistency with common dark terminal themes
 
 ### Automatic Adaptation
 
 The lipgloss library automatically detects the terminal's background and selects the appropriate color variant:
 - No configuration required by end users
-- Consistent experience across different terminal emulators
-- Graceful fallback for terminals with limited color support
+- Same palette across terminal emulators; rendering depends on each emulator's color support
+- Fallback for terminals with limited color support
 
 ## Color Palette
 
@@ -47,7 +47,7 @@ These colors communicate the status or severity of information.
 
 #### Visual Examples
 
-```
+```text
 Error:   [Light: darker red]  [Dark: bright red]
          "Error: File not found"
 
@@ -72,7 +72,7 @@ These colors draw attention to specific elements like commands, file paths, and 
 
 #### Visual Examples
 
-```
+```text
 Purple:  [Light: darker purple] [Dark: bright purple]
          "Command: gh aw compile"
          "File: /path/to/workflow.md"
@@ -94,7 +94,7 @@ These colors provide structure and visual hierarchy in terminal output.
 
 #### Visual Examples
 
-```
+```text
 Comment:    [Light: gray-blue]     [Dark: muted purple-gray]
             "  12 │ func main() {"
 
@@ -244,11 +244,11 @@ When adding new styles to the system:
 
 ## Color Contrast and Accessibility
 
-The color palette is designed with accessibility in mind:
+The color palette targets WCAG AA contrast ratios:
 
-- **Light Mode**: All colors have been chosen to provide sufficient contrast (WCAG AA minimum) on light backgrounds
-- **Dark Mode**: Dracula theme colors are well-tested for readability on dark backgrounds
-- **Fallback**: The system gracefully degrades in terminals with limited color support
+- **Light Mode**: Colors are intended to meet the WCAG AA contrast minimum on light backgrounds
+- **Dark Mode**: Dracula theme colors are used for readability on dark backgrounds
+- **Fallback**: The system degrades in terminals with limited color support
 
 ### Testing Your Output
 

@@ -1,13 +1,18 @@
 // @ts-check
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
+const interpolationVectors = require("../../../pkg/parser/testdata/frontmatter_hash_interpolation_vectors.json");
+const nestedImportFixture = require("../../../pkg/parser/testdata/nested_import_hash.json");
 const {
   computeFrontmatterHash,
   computeBodyHash,
   extractFrontmatterAndBody,
   extractImportsFromText,
   extractRelevantTemplateExpressions,
+  extractAllTemplateExpressions,
+  extractRuntimeImportReferences,
   marshalCanonicalJSON,
   marshalSorted,
   extractHashFromLockFile,
@@ -19,6 +24,188 @@ const {
 } = require("./frontmatter_hash_pure.cjs");
 
 describe("frontmatter_hash_pure (text-based)", () => {
+  describe("nested import resolution", () => {
+    const { workflow, imports, expressions } = nestedImportFixture;
+    const hash = text => crypto.createHash("sha256").update(text).digest("hex");
+    const expectedFrontmatter = hash(
+      marshalCanonicalJSON({
+        "frontmatter-text": workflow.frontmatter,
+        imports: imports.map(file => file.importPath).sort(),
+        "imported-frontmatters": imports
+          .map(file => file.frontmatter)
+          .sort()
+          .join("\n---\n"),
+        "template-expressions": expressions,
+      })
+    );
+    const expectedBody = hash([workflow.body, ...imports.map(file => file.body).sort()].join("\n---\n"));
+    const content = file => `---\n${file.frontmatter}\n---\n${file.body}`;
+
+    it("should hash qualified and sibling imports through the API without doubled directories", async () => {
+      const baseDir = ".github/workflows";
+      const files = new Map([workflow, ...imports].map(file => [path.join(baseDir, file.path), content(file)]));
+      const getContent = vi.fn(async ({ path: filePath }) => {
+        if (!files.has(filePath)) throw Object.assign(new Error(`Unexpected path: ${filePath}`), { status: 500 });
+        return { data: { content: files.get(filePath) } };
+      });
+      const fileReader = createGitHubFileReader({ rest: { repos: { getContent } } }, "owner", "repo", "main");
+      const workflowPath = path.join(baseDir, workflow.path);
+      const compute = async () => [await computeFrontmatterHash(workflowPath, { fileReader, readerMode: "github-api" }), await computeBodyHash(workflowPath, { fileReader })];
+      expect(await compute()).toEqual([expectedFrontmatter, expectedBody]);
+      for (const file of imports) {
+        const filePath = path.join(baseDir, file.path);
+        files.set(filePath, content({ ...file, frontmatter: `${file.frontmatter}\ndescription: changed` }));
+        const [changedFrontmatter, sameBody] = await compute();
+        expect(changedFrontmatter).not.toBe(expectedFrontmatter);
+        expect(sameBody).toBe(expectedBody);
+        files.set(filePath, content({ ...file, body: `${file.body}\nChanged \${{ vars.NESTED_CHANGE }}` }));
+        const [expressionHash, changedBody] = await compute();
+        expect(expressionHash).not.toBe(expectedFrontmatter);
+        expect(changedBody).not.toBe(expectedBody);
+        files.set(filePath, content(file));
+      }
+      expect(getContent.mock.calls.every(([request]) => !request.path.includes("/shared/shared/"))).toBe(true);
+    });
+
+    it.each(["repository", ".github"])("should hash imports in a repository named %s without missing imports", async repositoryName => {
+      const rootDir = fs.mkdtempSync(path.join(require("os").tmpdir(), "nested-import-hash-"));
+      const baseDir = path.join(rootDir, repositoryName, ".github", "workflows");
+      try {
+        for (const file of [workflow, ...imports]) {
+          const filePath = path.join(baseDir, file.path);
+          fs.mkdirSync(path.dirname(filePath), { recursive: true });
+          fs.writeFileSync(filePath, content(file));
+        }
+        const workflowPath = path.join(baseDir, workflow.path);
+        const onMissingImport = vi.fn();
+        expect(await computeFrontmatterHash(workflowPath, { onMissingImport })).toBe(expectedFrontmatter);
+        expect(await computeBodyHash(workflowPath)).toBe(expectedBody);
+        expect(onMissingImport).not.toHaveBeenCalled();
+      } finally {
+        fs.rmSync(rootDir, { recursive: true, force: true });
+      }
+    });
+
+    it.each([".github/../../outside.md", "/.agents/../../outside.md", "/outside.md"])("should reject unsafe import %s before reading it", async importPath => {
+      const workflowPath = ".github/workflows/workflow.md";
+      const fileReader = vi.fn(async filePath => {
+        if (filePath !== workflowPath) throw new Error(`Unexpected read: ${filePath}`);
+        return `---\nengine: copilot\nimports:\n  - uses: "${importPath}"\n---\nBody`;
+      });
+      for (const compute of [computeFrontmatterHash, computeBodyHash]) {
+        await expect(compute(workflowPath, { fileReader })).rejects.toThrow("security:");
+      }
+      expect(fileReader.mock.calls.every(([filePath]) => filePath === workflowPath)).toBe(true);
+    });
+  });
+
+  describe("import read failures", () => {
+    const workflowPath = ".github/workflows/test.md";
+    const cases = [
+      { name: "frontmatter imports", computeHash: computeFrontmatterHash, content: "---\nengine: copilot\nimports:\n  - shared/test.md\n---\nBody" },
+      { name: "body imports", computeHash: computeBodyHash, content: "---\nengine: copilot\nimports:\n  - shared/test.md\n---\nBody" },
+      { name: "runtime imports", computeHash: computeFrontmatterHash, content: "---\nengine: copilot\n---\n{{#runtime-import shared/test.md}}" },
+    ];
+
+    describe.each(cases)("$name", ({ name, computeHash, content }) => {
+      function readerWithError(error) {
+        return createGitHubFileReader(
+          {
+            rest: {
+              repos: {
+                getContent: vi.fn(async ({ path: filePath }) => {
+                  if (filePath === workflowPath) return { data: { content } };
+                  throw error;
+                }),
+              },
+            },
+          },
+          "owner",
+          "repo",
+          "main"
+        );
+      }
+
+      it.each([{ status: 500, message: "Internal Server Error" }, { status: 403, message: "Secondary rate limit" }, { message: "Request timed out" }])("should propagate unreadable imports: $message", async error => {
+        await expect(computeHash(workflowPath, { fileReader: readerWithError(error), readerMode: "github-api" })).rejects.toThrow(error.message);
+      });
+
+      if (name === "runtime imports") {
+        it("should skip API 404s for optional runtime-import candidates", async () => {
+          const fileReader = readerWithError({ status: 404, message: "Not Found" });
+          const hash = await computeHash(workflowPath, { fileReader, readerMode: "github-api" });
+          const expected = await computeHash(workflowPath, {
+            fileReader: async filePath => {
+              if (filePath === workflowPath) return content;
+              throw Object.assign(new Error("not found"), { code: "ENOENT" });
+            },
+            readerMode: "github-api",
+          });
+          expect(hash).toBe(expected);
+        });
+      } else {
+        it("should propagate API 404s for listed imports", async () => {
+          const fileReader = readerWithError({ status: 404, message: "Not Found" });
+          await expect(computeHash(workflowPath, { fileReader, readerMode: "github-api" })).rejects.toThrow("(HTTP 404)");
+        });
+      }
+
+      if (name !== "runtime imports") {
+        it("should skip API 404s for remote workflow-spec imports", async () => {
+          const remoteImport = "pydantic/pydantic-ai/src/pydantic_ai_harness/gh-aw/pydantic.md@4f6799896fcb386cc5d0af7e84b4b17c17dd14c3";
+          const contentWithRemoteImport = `---\nengine: copilot\nimports:\n  - ${remoteImport}\n---\nBody`;
+          const fileReader = async filePath => {
+            if (filePath === workflowPath) return contentWithRemoteImport;
+            throw Object.assign(new Error("Not Found"), { status: 404 });
+          };
+          const hash = await computeHash(workflowPath, { fileReader, readerMode: "github-api" });
+          const expected = await computeHash(workflowPath, {
+            fileReader: async filePath => {
+              if (filePath === workflowPath) return contentWithRemoteImport;
+              throw Object.assign(new Error("not found"), { code: "ENOENT" });
+            },
+            readerMode: "github-api",
+          });
+          expect(hash).toBe(expected);
+        });
+      }
+
+      it("should skip genuinely absent local imports", async () => {
+        const fileReader = async filePath => (filePath === workflowPath ? content : defaultFileReader(filePath));
+        await expect(computeHash(workflowPath, { fileReader, readerMode: "github-api" })).resolves.toMatch(/^[a-f0-9]{64}$/);
+      });
+
+      it("should propagate errors from malformed imported frontmatter", async () => {
+        const fileReader = async filePath => (filePath === workflowPath ? content : "---\nengine: copilot");
+        await expect(computeHash(workflowPath, { fileReader, readerMode: "github-api" })).rejects.toThrow("ERR_PARSE: Frontmatter not properly closed");
+      });
+    });
+  });
+
+  describe("shared interpolation hash vectors", () => {
+    it.each(interpolationVectors)("$name", async ({ markdown, relevant, all }) => {
+      expect(extractRelevantTemplateExpressions(markdown)).toEqual(relevant);
+      expect(extractAllTemplateExpressions(markdown)).toEqual(all);
+      for (const runtimeImport of [false, true]) {
+        const workflowPath = ".github/workflows/vector.md";
+        const body = runtimeImport ? "{{#runtime-import prompts/vector.md}}" : markdown;
+        const expressions = runtimeImport ? all : relevant;
+        const canonical = { "frontmatter-text": "engine: copilot" };
+        if (expressions.length > 0) canonical["template-expressions"] = expressions;
+        const expected = crypto.createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+        const files = new Map([
+          [workflowPath, "---\nengine: copilot\n---\n" + body],
+          [".github/prompts/vector.md", markdown],
+        ]);
+        const fileReader = async filePath => {
+          if (!files.has(filePath)) throw new Error(`Missing fixture: ${filePath}`);
+          return files.get(filePath);
+        };
+        expect(await computeFrontmatterHash(workflowPath, { fileReader, readerMode: "github-api" })).toBe(expected);
+      }
+    });
+  });
+
   describe("extractFrontmatterAndBody", () => {
     it("should extract frontmatter text and body", () => {
       const content = `---
@@ -119,6 +306,20 @@ engine: copilot`;
       // Object-form path: import path is extracted.
       expect(result).toEqual(["shared/tool.md"]);
     });
+
+    it("should ignore nested list items in import options", () => {
+      const frontmatterText = `imports:
+  - shared/mcp-pagination.md
+  - uses: shared/daily-pr-base.md
+    with:
+      protected-files:
+        exclude:
+          - .github/extensions/
+  - shared/otlp.md`;
+
+      const result = extractImportsFromText(frontmatterText);
+      expect(result).toEqual(["shared/mcp-pagination.md", "shared/daily-pr-base.md", "shared/otlp.md"]);
+    });
   });
 
   describe("extractRelevantTemplateExpressions", () => {
@@ -148,6 +349,186 @@ engine: copilot`;
 
       const result = extractRelevantTemplateExpressions(markdown);
       expect(result).toEqual(["$" + "{{ env.A }}", "$" + "{{ env.B }}"]);
+    });
+  });
+
+  describe("runtime import expression hashing", () => {
+    it("should extract all expressions from runtime imports and legacy import macros", () => {
+      const markdown = [
+        "{{#runtime-import prompts/direct.md}}",
+        "{{#runtime-import? prompts/optional.md}}",
+        "{{#import: prompts/legacy.md}}",
+        "{{#runtime-import prompts/ranged.md:2-3}}",
+        "{{#runtime-import https://example.com/ignored.md}}",
+      ].join("\n");
+
+      expect(extractRuntimeImportReferences(markdown)).toEqual([
+        { path: "prompts/direct.md", startLine: null, endLine: null },
+        { path: "prompts/optional.md", startLine: null, endLine: null },
+        { path: "prompts/legacy.md", startLine: null, endLine: null },
+        { path: "prompts/ranged.md", startLine: 2, endLine: 3 },
+      ]);
+
+      expect(extractAllTemplateExpressions("A $" + "{{ needs.a.outputs.x }} B $" + "{{ vars.CFG }}")).toEqual(["$" + "{{ needs.a.outputs.x }}", "$" + "{{ vars.CFG }}"]);
+    });
+
+    it("should hash runtime imports identically for relative and absolute workflow paths", async () => {
+      const content = "---\nengine: copilot\n---\n{{#runtime-import .github/prompts/relative-context.md}}";
+      const prompt = "Use ${{ github.repository }}.";
+      const files = new Map([
+        [".github/workflows/relative-workflow.md", content],
+        [".github/prompts/relative-context.md", prompt],
+        ["/repo/.github/workflows/relative-workflow.md", content],
+        ["/repo/.github/prompts/relative-context.md", prompt],
+      ]);
+      const fileReader = async filePath => {
+        if (!files.has(filePath)) throw new Error(`File not found: ${filePath}`);
+        return files.get(filePath);
+      };
+      const relativeHash = await computeFrontmatterHash(".github/workflows/relative-workflow.md", { fileReader });
+      const absoluteHash = await computeFrontmatterHash("/repo/.github/workflows/relative-workflow.md", { fileReader });
+      expect(relativeHash).toBe(absoluteHash);
+    });
+
+    it("should try later runtime-import candidates after a read failure", async () => {
+      const workflowPath = ".github/workflows/test.md";
+      const firstCandidate = ".github/shared/test.md";
+      const secondCandidate = ".github/workflows/shared/test.md";
+      const reads = [];
+      const fileReader = async filePath => {
+        reads.push(filePath);
+        if (filePath === workflowPath) return "---\nengine: copilot\n---\n{{#runtime-import shared/test.md}}";
+        if (filePath === firstCandidate) throw Object.assign(new Error("Internal Server Error"), { status: 500 });
+        if (filePath === secondCandidate) return "Imported ${{ github.repository }}";
+        throw Object.assign(new Error("Not Found"), { status: 404 });
+      };
+
+      await expect(computeFrontmatterHash(workflowPath, { fileReader, readerMode: "github-api" })).resolves.toMatch(/^[a-f0-9]{64}$/);
+      expect(reads).toContain(firstCandidate);
+      expect(reads).toContain(secondCandidate);
+    });
+
+    it("should not use local symlink containment when hashing GitHub API content", async () => {
+      const workflowPath = ".github/workflows/remote-context-workflow.md";
+      const promptPath = ".github/prompts/remote-context.md";
+      const files = new Map([
+        [workflowPath, `---\nengine: copilot\n---\n{{#runtime-import ${promptPath}}}`],
+        [promptPath, "Use ${{ github.repository }}."],
+      ]);
+      const github = {
+        rest: {
+          repos: {
+            getContent: vi.fn(async ({ path: filePath }) => {
+              if (!files.has(filePath)) throw new Error(`Missing ${filePath}`);
+              return { data: { content: files.get(filePath) } };
+            }),
+          },
+        },
+      };
+      const apiFileReader = createGitHubFileReader(github, "source-owner", "source-repo", "source-ref");
+      const fileReader = async filePath => apiFileReader(filePath);
+      const readerOptions = { fileReader, readerMode: "github-api" };
+      const originalHash = await computeFrontmatterHash(workflowPath, readerOptions);
+      const exists = vi.spyOn(fs, "existsSync").mockReturnValue(true);
+      const realpath = vi.spyOn(fs, "realpathSync").mockImplementation(() => {
+        throw new Error("Unrelated local checkout");
+      });
+      try {
+        expect(await computeFrontmatterHash(workflowPath, readerOptions)).toBe(originalHash);
+        expect(realpath).not.toHaveBeenCalled();
+        const localModeHash = await computeFrontmatterHash(workflowPath, { fileReader });
+        expect(localModeHash).not.toBe(originalHash);
+        expect(realpath).toHaveBeenCalled();
+      } finally {
+        exists.mockRestore();
+        realpath.mockRestore();
+      }
+    });
+
+    it("should include the runtime-import expression set in the frontmatter hash", async () => {
+      const workflowPath = "/repo/.github/workflows/runtime-import-hash.md";
+      const promptPath = "/repo/.github/prompts/runtime.md";
+      const files = new Map([
+        [
+          workflowPath,
+          `---
+engine: copilot
+on:
+  workflow_dispatch:
+---
+{{#runtime-import prompts/runtime.md}}
+`,
+        ],
+        [promptPath, "Issue: $" + "{{ needs.select.outputs.issue_numbers }}\n"],
+      ]);
+      const fileReader = async filePath => {
+        if (!files.has(filePath)) throw new Error(`missing ${filePath}`);
+        return files.get(filePath);
+      };
+
+      const hashA = await computeFrontmatterHash(workflowPath, { fileReader });
+      files.set(promptPath, "Unrelated text\nIssue: $" + "{{ needs.select.outputs.issue_numbers }}\n");
+      const hashSameExpression = await computeFrontmatterHash(workflowPath, { fileReader });
+      expect(hashSameExpression).toBe(hashA);
+
+      files.set(promptPath, "Issue: $" + "{{ needs.select.outputs.marker }}\n");
+      const hashB = await computeFrontmatterHash(workflowPath, { fileReader });
+      expect(hashB).not.toBe(hashA);
+    });
+
+    it("should skip symlink runtime imports that resolve outside the workspace", async () => {
+      const tempDir = fs.mkdtempSync(path.join(require("os").tmpdir(), "frontmatter-hash-symlink-"));
+      const workflowsDir = path.join(tempDir, ".github", "workflows");
+      fs.mkdirSync(workflowsDir, { recursive: true });
+      const workflowPath = path.join(workflowsDir, "runtime-import-hash.md");
+      const outsidePath = path.join(tempDir, "outside.md");
+      const symlinkPath = path.join(workflowsDir, "outside-link.md");
+      fs.writeFileSync(
+        workflowPath,
+        `---
+engine: copilot
+on:
+  workflow_dispatch:
+---
+{{#runtime-import outside-link.md}}
+`
+      );
+      fs.writeFileSync(outsidePath, "Outside $" + "{{ needs.outside.outputs.value }}\n");
+      fs.symlinkSync(outsidePath, symlinkPath);
+
+      const hashA = await computeFrontmatterHash(workflowPath);
+      fs.writeFileSync(outsidePath, "Outside $" + "{{ needs.outside.outputs.changed }}\n");
+      const hashB = await computeFrontmatterHash(workflowPath);
+
+      expect(hashB).toBe(hashA);
+    });
+
+    it("should terminate when frontmatter-imported bodies contain cyclic runtime imports", async () => {
+      const workflowPath = "/repo/.github/workflows/runtime-import-cycle-hash.md";
+      const files = new Map([
+        [
+          workflowPath,
+          `---
+engine: copilot
+imports:
+  - shared/a.md
+on:
+  workflow_dispatch:
+---
+Cycle hash coverage.
+`,
+        ],
+        ["/repo/.github/workflows/shared/a.md", "A $" + "{{ needs.a.outputs.value }}\n{{#runtime-import shared/b.md}}\n"],
+        ["/repo/.github/workflows/shared/b.md", "B $" + "{{ needs.b.outputs.value }}\n{{#runtime-import shared/a.md}}\n"],
+      ]);
+      const fileReader = async filePath => {
+        if (!files.has(filePath)) throw Object.assign(new Error(`missing ${filePath}`), { code: "ENOENT" });
+        return files.get(filePath);
+      };
+
+      const hash = await computeFrontmatterHash(workflowPath, { fileReader });
+
+      expect(hash).toMatch(/^[a-f0-9]{64}$/);
     });
   });
 
@@ -1203,7 +1584,7 @@ describe("symlink traversal regression for activation hash symlink handling", ()
       const apiReader = createGitHubFileReader(github, "owner", "repo", "main");
 
       const fsHash = await computeFrontmatterHash(mainPath, { fileReader: fsReader });
-      const apiHash = await computeFrontmatterHash(mainPath, { fileReader: apiReader });
+      const apiHash = await computeFrontmatterHash(mainPath, { fileReader: apiReader, readerMode: "github-api" });
 
       // Both hashes must agree — this is the invariant the activation job relies on
       expect(apiHash).toBe(fsHash);

@@ -1,5 +1,8 @@
 ---
 private: true
+engine:
+  id: copilot
+  copilot-sdk: true
 emoji: 📊
 description: Executive impact efficiency report from workflow outcomes tied to tracked objectives.
 on:
@@ -10,9 +13,6 @@ permissions:
   actions: read
   issues: read
 
-sandbox:
-  agent:
-    sudo: false
 
 cache:
   - key: objective-impact-report-cache-${{ github.run_id }}
@@ -33,6 +33,10 @@ tools:
     - "ls /tmp/gh-aw/agent/objective-impact-report"
     - "head -n * /tmp/gh-aw/agent/objective-impact-report/*.json /tmp/gh-aw/agent/objective-impact-report/*.jsonl"
 pre-agent-steps:
+  - name: Install gh-aw CLI
+    uses: ./actions/setup-cli
+    with:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
   - name: Prepare deterministic impact datasets
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -44,177 +48,7 @@ pre-agent-steps:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       EXPR_GITHUB_REPOSITORY: ${{ github.repository }}
-    uses: actions/github-script@v9.0.0
-    with:
-      script: |
-        const fs = require("fs");
-        const path = require("path");
-        const { execFileSync } = require("child_process");
-        const {
-          evaluateItem,
-          normalizeOutcome,
-          readJSONL,
-        } = require(path.join(process.env.GITHUB_WORKSPACE || process.cwd(), "actions/setup/js/evaluate_outcomes.cjs"));
-
-        const DATA_DIR = "/tmp/gh-aw/agent/objective-impact-report";
-        const RUNS_DIR = path.join(DATA_DIR, "safe-output-runs");
-        const OUTPUT_JSONL = path.join(DATA_DIR, "safe-output-issue-evaluations.jsonl");
-        const OUTPUT_SUMMARY = path.join(DATA_DIR, "safe-output-issue-summary.json");
-
-        function readJSON(filePath, fallback) {
-          try {
-            return JSON.parse(fs.readFileSync(filePath, "utf8"));
-          } catch {
-            return fallback;
-          }
-        }
-
-        function writeFileAtomic(filePath, content) {
-          const baseName = path.basename(filePath);
-          const parentDir = path.dirname(filePath);
-          const tmpDir = fs.mkdtempSync(path.join(parentDir, `.${baseName}.tmp-`));
-          const tmpFile = path.join(tmpDir, baseName);
-          try {
-            try {
-              fs.writeFileSync(tmpFile, content);
-            } catch (err) {
-              throw new Error(`failed to write temp file ${tmpFile}`, { cause: err });
-            }
-            try {
-              fs.renameSync(tmpFile, filePath);
-            } catch (err) {
-              throw new Error(`failed to rename temp file ${tmpFile} to ${filePath}`, { cause: err });
-            }
-          } finally {
-            fs.rmSync(tmpDir, { recursive: true, force: true });
-          }
-        }
-
-        function writeJSON(filePath, value) {
-          writeFileAtomic(filePath, JSON.stringify(value, null, 2) + "\n");
-        }
-
-        function gh(args) {
-          try {
-            return execFileSync("gh", args, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
-          } catch {
-            return null;
-          }
-        }
-
-        function ensureIssueURL(item, repo) {
-          if (item.url || typeof item.number !== "number" || !repo) {
-            return item;
-          }
-          return {
-            ...item,
-            url: `https://github.com/${repo}/issues/${item.number}`,
-          };
-        }
-
-        function loadRuns() {
-          const workflowLogs = readJSON(path.join(DATA_DIR, "workflow-logs.json"), {});
-          const runs = Array.isArray(workflowLogs.runs) ? workflowLogs.runs : [];
-          return runs
-            .map(run => ({
-              id: Number(run.id ?? run.databaseId ?? 0),
-              workflow_name: run.workflow_name || run.workflowName || "",
-              aic: run.aic ?? null,
-              created_at: run.created_at || run.createdAt || "",
-              status: run.status || "",
-              conclusion: run.conclusion || "",
-              url: run.html_url || run.url || "",
-            }))
-            .filter(run => Number.isInteger(run.id) && run.id > 0);
-        }
-
-        function loadManifest(runDir) {
-          const manifestPath = path.join(runDir, "safe-output-items.jsonl");
-          if (!fs.existsSync(manifestPath)) return [];
-          return readJSONL(manifestPath);
-        }
-
-        function downloadManifest(repo, runId, runDir) {
-          fs.mkdirSync(runDir, { recursive: true });
-          const manifestPath = path.join(runDir, "safe-output-items.jsonl");
-          if (fs.existsSync(manifestPath) && fs.statSync(manifestPath).size > 0) {
-            return true;
-          }
-          const result = gh(["run", "download", String(runId), "--repo", repo, "--name", "safe-outputs-items", "--dir", runDir]);
-          return result !== null && fs.existsSync(manifestPath) && fs.statSync(manifestPath).size > 0;
-        }
-
-        function main() {
-          const repo = process.env.EXPR_GITHUB_REPOSITORY || process.env.GITHUB_REPOSITORY || "";
-          if (!repo) {
-            console.error("EXPR_GITHUB_REPOSITORY or GITHUB_REPOSITORY is required");
-            process.exit(1);
-          }
-
-          fs.mkdirSync(DATA_DIR, { recursive: true });
-          fs.mkdirSync(RUNS_DIR, { recursive: true });
-
-          const runs = loadRuns();
-          const rows = [];
-
-          for (const run of runs) {
-            const runDir = path.join(RUNS_DIR, `run-${run.id}`);
-            if (!downloadManifest(repo, run.id, runDir)) {
-              continue;
-            }
-
-            const items = loadManifest(runDir)
-              .filter(item => item && (item.type === "create_issue" || item.type === "close_issue"))
-              .map(item => ensureIssueURL(item, item.repo || repo));
-
-            for (const item of items) {
-              const evalResult = evaluateItem(item, repo);
-              const normalized = normalizeOutcome(evalResult.result, evalResult.detail);
-              rows.push({
-                run_id: run.id,
-                workflow_name: run.workflow_name,
-                workflow_aic: run.aic,
-                workflow_run_created_at: run.created_at,
-                workflow_run_url: run.url,
-                type: item.type,
-                repo: item.repo || repo,
-                number: typeof item.number === "number" ? item.number : null,
-                url: item.url || "",
-                timestamp: item.timestamp || "",
-                result: evalResult.result,
-                detail: evalResult.detail,
-                outcome_status: normalized.outcome_status,
-                evidence_strength: normalized.evidence_strength,
-                signal: normalized.signal,
-                resolution_sec: evalResult.resolution_sec,
-                pending_age_sec: evalResult.pending_age_sec,
-                comments: evalResult.comments,
-                reactions_total: evalResult.reactions_total,
-                reactions_positive: evalResult.reactions_positive,
-                reactions_negative: evalResult.reactions_negative,
-                zero_touch: evalResult.zero_touch,
-              });
-            }
-          }
-
-          writeFileAtomic(OUTPUT_JSONL, rows.map(row => JSON.stringify(row)).join("\n") + (rows.length > 0 ? "\n" : ""));
-
-          const summary = {
-            total_issue_outcomes: rows.length,
-            create_issue_count: rows.filter(row => row.type === "create_issue").length,
-            close_issue_count: rows.filter(row => row.type === "close_issue").length,
-            accepted_count: rows.filter(row => row.outcome_status === "accepted").length,
-            rejected_count: rows.filter(row => row.outcome_status === "rejected").length,
-            pending_count: rows.filter(row => row.outcome_status === "pending").length,
-            ignored_count: rows.filter(row => row.outcome_status === "ignored").length,
-            unknown_count: rows.filter(row => row.outcome_status === "unknown").length,
-            distinct_workflows: [...new Set(rows.map(row => row.workflow_name).filter(Boolean))].length,
-            distinct_runs_with_issue_outcomes: [...new Set(rows.map(row => row.run_id))].length,
-          };
-          writeJSON(OUTPUT_SUMMARY, summary);
-        }
-
-        main();
+    run: node actions/setup/js/prepare_objective_impact_outcomes.cjs
 safe-outputs:
   close-issue:
     required-title-prefix: "Impact Efficiency Report - "
@@ -223,14 +57,11 @@ safe-outputs:
   create-issue:
     title-prefix: "Impact Efficiency Report - "
     max: 1
+imports:
+  - shared/reporting.md
 ---
 
 ### Impact Efficiency Report
-
-**Report Formatting**: Use h3 (###) or lower for all headers in your report
-to maintain proper document hierarchy. Wrap long sections in
-`<details><summary>View Full Details</summary>` tags to improve readability.
-
 
 #### Required Inputs (already precomputed)
 
@@ -246,9 +77,11 @@ Use these deterministic files first:
 - /tmp/gh-aw/agent/objective-impact-report/safe-output-issue-evaluations.jsonl
 - /tmp/gh-aw/agent/objective-impact-report/safe-output-issue-summary.json
 
-`safe-output-issue-evaluations.jsonl` provides deterministic outcome status and workflow attribution, but it does **not** include precomputed objective attribution fields. If optional `*-with-objective.json` files exist and are non-empty, use them; otherwise compute objective mapping from linked/root issue labels.
+`safe-output-issue-evaluations.jsonl` contains the current `gh aw logs --outcomes --json` classifications, evidence, workflow attribution, and any available objective attribution. Use these fields directly; never reclassify acceptance from successful issue creation or closure. If objective attribution is unavailable, use non-empty optional `*-with-objective.json` files or compute objective mapping from linked/root issue labels.
 
-Do **not** re-fetch these datasets with GitHub tools unless a required file is missing, empty, or fails JSON parsing.
+Read `safe-output-issue-summary.json` for coverage. When `partial` is true, retain available observations, label safe-output outcome totals and derived impact metrics as partial, and report `evaluated_run_count` / `selected_run_count`, `unavailable_run_count`, and each `run_errors` entry's run ID and `eval_error` in Data Quality. Missing evidence is unknown coverage, not zero outcomes or rejected work. If all selected runs are unavailable, report safe-output outcomes and their impact as unavailable; distinguish this from fully evaluated runs with verified empty outcomes.
+
+Do **not** re-fetch these datasets with GitHub tools unless a required file is missing, empty, or fails JSON parsing. An empty `safe-output-issue-evaluations.jsonl` is valid when the summary reports zero issue outcomes; use its coverage fields to distinguish verified empty results from unavailable evidence rather than re-fetching.
 
 #### Goal
 
@@ -300,7 +133,7 @@ If a run's `aic` field is missing or null, treat it as `0` and count it as missi
 Analyze only the following outcome types from the last 180 days:
 
 - **Pull request outcomes**: PRs created by GitHub Agentic Workflow runs **that have a linked closing issue** (`Closes #N`). Accepted = merged. Rejected = closed without merge. Skip open (pending) PRs. **Exclude entirely** any PR without a traceable linked issue — do not fall back to PR labels.
-- **Safe output outcomes**: issues created or closed by workflow runs via the safe-output mechanism. Accepted = issue successfully created/closed. Skip any with unresolved state.
+- **Safe output outcomes**: issues created or closed by workflow runs via the safe-output mechanism. Accepted only when `gh aw logs --outcomes` reports `outcome_status: "accepted"`. Exclude unresolved, error, and lifecycle-only classifications from delivered-value totals and report their counts separately.
 
 Exclude all other outcome types (direct issue outcomes, comments, discussions, etc.). These are omitted because their acceptance criteria are incomplete and most are left pending, which would distort the metric.
 
@@ -336,7 +169,7 @@ For each in-scope outcome, use the precomputed root-tracing results:
 2. If an optional `*-with-objective.json` dataset exists and is non-empty, use its `attribution_source`, `root_issue_numbers`, `root_issue_labels`, `objective_value`, and `objective_labels` fields directly.
 3. Otherwise, if `linked_issue_numbers` is empty, **exclude the PR from analysis entirely**. Do not fall back to PR labels. Count it in the "PRs excluded (no linked issue)" total.
 4. Otherwise, resolve root issue labels from the linked issues (deterministic cache first; live issue lookup only when labels are missing), then compute objective mapping from those root labels.
-5. For safe-output issue outcomes, use `/tmp/gh-aw/agent/objective-impact-report/safe-output-issue-evaluations.jsonl` as the primary source for outcome state, workflow attribution, and issue identity; fetch issue labels to compute objective mapping.
+5. For safe-output issue outcomes, use `/tmp/gh-aw/agent/objective-impact-report/safe-output-issue-evaluations.jsonl` as the primary source for outcome state, workflow attribution, issue identity, and available objective attribution; fetch issue labels only when objective attribution is missing.
 6. Record traced issue numbers (`root_issue_numbers` when present, otherwise `linked_issue_numbers`) in the report as the audit trail.
 7. If `objective_value` is `0` and labels are present, mark the outcome as `unmapped`, exclude it from `Σ Outcome Value`, and report it separately.
 
@@ -347,7 +180,7 @@ For each in-scope outcome:
 ```text
 Outcome Indicator:
   PR outcome:           1 if merged, 0 if closed without merge (open PRs excluded)
-  Safe output outcome:  1 if successfully created/closed, 0 otherwise
+  Safe output outcome:  1 if CLI outcome_status is accepted, 0 otherwise
 Outcome Value = Outcome Indicator × Objective Value
 ```
 
@@ -393,6 +226,12 @@ Create one issue titled:
 ```text
 Impact Efficiency Report - YYYY-MM-DD
 ```
+
+Format the report for progressive disclosure:
+
+- Begin with the compact `### Executive Summary` and keep the key takeaway, critical findings, and recommendations visible.
+- Use `###` headings for report sections and `####` headings for subsections.
+- Wrap verbose tables, long lists, or extended analysis in `<details><summary><b>View full findings</b></summary>` blocks.
 
 The report must include:
 

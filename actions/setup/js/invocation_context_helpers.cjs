@@ -1,7 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { parseRepoSlug: parseSharedRepoSlug, parseAllowedRepos, validateTargetRepo } = require("./repo_helpers.cjs");
+const { parseRepoSlug: parseSharedRepoSlug, isExactRepoSlug, parseAllowedRepos, validateTargetRepo } = require("./repo_helpers.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
 
 /**
@@ -162,7 +162,7 @@ function checkAllowedRepo(workflowRepo, targetRepo) {
   const targetRepoSlug = `${targetRepo.owner}/${targetRepo.repo}`;
   const allowedRepos = parseAllowedRepos(process.env.GH_AW_ALLOWED_REPOS);
 
-  // Fall back to per-handler safe-output allowlists when a global allowlist is
+  // Fall back to per-handler safe-output allowlists and target repos when a global allowlist is
   // not provided. This prevents post-action context resolution from rejecting
   // a repository that was already allowed by the active safe-output handler.
   if (allowedRepos.size === 0) {
@@ -179,6 +179,10 @@ function checkAllowedRepo(workflowRepo, targetRepo) {
             for (const repo of parsed) {
               allowedRepos.add(repo);
             }
+            const handlerTargetRepo = parseRepoSlug(value["target-repo"]);
+            if (isExactRepoSlug(handlerTargetRepo)) {
+              allowedRepos.add(`${handlerTargetRepo.owner}/${handlerTargetRepo.repo}`);
+            }
           }
         }
       } catch (_error) {
@@ -190,7 +194,7 @@ function checkAllowedRepo(workflowRepo, targetRepo) {
 
   const validation = validateTargetRepo(targetRepoSlug, defaultRepo, allowedRepos);
   if (!validation.valid) {
-    throw new Error(`${ERR_VALIDATION}: ${validation.error}`);
+    throw Object.assign(new Error(`${ERR_VALIDATION}: ${validation.error}`), { code: ERR_VALIDATION });
   }
 }
 
@@ -215,7 +219,7 @@ function resolveInvocationContext(rawContext) {
 
   /** @type {"native" | "workflow_dispatch" | "repository_dispatch"} */
   let source = "native";
-  let eventName = rawContext?.eventName || "";
+  let eventName = rawContext?.eventName || process.env.GITHUB_EVENT_NAME || "";
   let eventPayload = rawContext?.payload || {};
   let eventRepo = normalizeRepo(rawContext?.eventRepo);
 

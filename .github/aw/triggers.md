@@ -26,46 +26,27 @@ Use the smallest trigger that matches the request.
 
 ### Scenario Examples
 
+The matrix above gives trigger, tools, and output. These add the `paths:` scoping and definitions the matrix cannot express.
+
+### Pull Request Path Filters and Diffs
+
+- Treat `pull_request.paths` as an activation filter, not as the complete changed-file inventory. GitHub evaluates PR path filters against a three-dot diff and documents a 300-file limit; a matching change outside the files considered by that filter may not start the workflow. See [GitHub's path-filter and diff behavior](https://docs.github.com/actions/reference/workflow-syntax-for-github-actions).
+- For renames, inspect the PR's changed-file list and consider both `filename` and `previous_filename` when a file has status `renamed`. GitHub's path-filter guidance does not promise that the old path independently matches, so include patterns for both old and new locations when either should activate the workflow, or avoid a narrow filter when missing a move is unacceptable. See the [pull-request changed-files API](https://docs.github.com/rest/pulls/pulls#list-pull-requests-files).
+- For a local base-to-head Git diff, the default agent checkout is shallow (`fetch-depth: 1`). Configure checkout with `fetch-depth: 0` and ensure both base and head refs/SHA are available so Git can find the comparison range. If no local Git operations are needed, use the pull-request changed-files API instead. See [GitHub Repository Checkout](https://github.github.com/gh-aw/reference/checkout/) for checkout behavior.
+
 Engineering-focused:
 
-- **Schema/API review on PRs**: trigger `pull_request` with `paths:` scoped to backend contract files (for example `db/migrate/**`, `migrations/**`, `schema/**`, `openapi/**`, `api/**`), read via `github` (`gh-proxy`), publish findings with `add-comment`, call `noop` when contracts are unchanged.
-- **Visual regression on UI changes**: trigger `pull_request`, use only `playwright` + `cache-memory` (no extra tools), keep network minimal (allowlist only target preview/app hosts if required), state the exact baseline source (`cache-memory` key, artifact, or branch path), publish via `add-comment`, call `noop` when UI paths are unchanged.
-- **Design-token governance on PRs**:
-  - trigger `pull_request` with `paths:` scoped to token sources and theme/config files (for example `tokens/**`, `**/*tokens*.json`, `**/theme/**`, `**/tailwind*.{js,ts}`, `**/*design-token*`)
-  - read via `github` (`gh-proxy`) and validate linked token references (style dictionary source, token registry, or design-spec URL) before assessment
-  - publish actionable findings with `add-comment`
-  - call `noop` when no token files changed, when required references are absent from the in-scope changes, or when no policy/token drift is detected
-- **Deployment incident triage**: use `deployment_status` for external provider failures and `workflow_run` for GitHub Actions failures, publish incident reports via `create-issue`, derive a stable failure key (for example workflow + job + failing step or error signature), and call `noop` when a failure self-recovers or matches an existing open incident.
-- **Dependency-license compliance review on PRs**: trigger `pull_request` with `paths:` scoped to dependency manifests (for example `package.json`, `go.mod`, `requirements.txt`, `Cargo.toml`), read new dependency additions via `github` (`gh-proxy`), classify each addition by license tier (allowed / needs-review / blocked), publish findings with `add-comment`, escalate blocked additions with `create-issue` for team-wide follow-up, call `noop` when no new dependencies were added or all additions are pre-approved.
+- **Schema/API review on PRs**: `paths:` scoped to backend contract files (`db/migrate/**`, `migrations/**`, `schema/**`, `openapi/**`, `api/**`); `noop` when contracts are unchanged.
+- **Visual regression on UI changes**: use only `playwright` + `cache-memory` (no extra tools), allowlist only target preview/app hosts, and state the exact baseline source (`cache-memory` key, artifact, or branch path).
+- **Design-token governance on PRs**: `paths:` scoped to token sources and theme/config files (`tokens/**`, `**/*tokens*.json`, `**/theme/**`, `**/tailwind*.{js,ts}`, `**/*design-token*`); validate linked token references (style dictionary source, token registry, or design-spec URL) before assessment; `noop` when required references are absent from the in-scope changes or no token drift is detected.
+- **Dependency-license compliance review on PRs**: `paths:` scoped to dependency manifests (`package.json`, `go.mod`, `requirements.txt`, `Cargo.toml`); classify each addition by license tier (allowed / needs-review / blocked); escalate blocked additions with `create-issue`; `noop` when all additions are pre-approved.
+- **Deployment incident triage**: `deployment_status` for external provider failures, `workflow_run` for GitHub Actions failures; derive a stable failure key (workflow + job + failing step or error signature); `noop` when a failure self-recovers or matches an existing open incident.
 
 Non-engineering personas:
 
-- **Documentation governance**: trigger `schedule` (weekly) or `pull_request` with `paths:` scoped to docs directories, check for stale ownership, broken links, or missing metadata using `github` (`gh-proxy`), publish findings with `create-issue` for pages needing owner action, call `noop` when all docs pass checks.
-- **PM / roadmap health digest**:
-  - trigger `schedule` (weekly on weekdays)
-  - aggregate open issues by label, milestone, or area using `github` (`gh-proxy`)
-  - publish a structured summary with `create-issue` and `close-older-issues: true`
-  - use an explicit window such as `last 7 full days ending at run start (UTC)`
-  - derive a stable key such as `pm-digest:<scope>:2026-W27`
-  - call `noop` when the window has zero qualifying updates
-- **Product/stakeholder digest**:
-  - trigger `schedule` plus optional `workflow_dispatch`
-  - define an explicit window such as `last 7 full days ending at run start (UTC)` or `since previous successful run`
-  - choose grouping dimensions up front (for example team, service, owner, severity, or status)
-  - publish with `create-issue` by default
-  - reuse a stable deduplication key for the same scope and window
-  - call `noop` when there are no updates in that window
-- **Compliance audit (material drift example)**:
-  - trigger `schedule: daily on weekdays` as the preferred baseline cadence, and add `workflow_dispatch` for ad hoc reruns
-  - define **material drift** as any control-state change that affects compliance posture (for example: required policy file removed, control owner missing, control status downgraded from pass to fail, or required approval evidence link missing)
-  - use `github` (`gh-proxy`) to compare current control evidence with the previous successful run window
-  - publish violations with `create-issue` using `close-older-issues: true` and a stable key such as `compliance-drift:<framework>:<window-id>`
-  - call `noop` when no material drift is detected in the selected window
-- **Compliance review (regulatory/policy)**: trigger `schedule` (monthly) or `pull_request` with `paths:` scoped to policy files, read current policy state via `github` (`gh-proxy`), produce a structured compliance report per control or requirement, publish with `create-issue` and `close-older-issues: true`, call `noop` when all controls pass.
-
-### Recurring digest defaults
-
-For PM, stakeholder, and information-worker digests, fix the report window, grouping dimensions, deduplication key, and duplicate-suppression rule up front. See [report.md](report.md) for the canonical defaults.
+- **Documentation governance**: `schedule` (weekly) or `pull_request` with `paths:` scoped to docs directories; check stale ownership, broken links, and missing metadata; `create-issue` for pages needing owner action.
+- **PM / roadmap / stakeholder digests**: `schedule` (weekly on weekdays) plus optional `workflow_dispatch`; publish with `create-issue` and `close-older-issues: true`. Fix up front: the window (`last 7 full days ending at run start (UTC)` or `since previous successful run`), the grouping dimensions (team, service, owner, severity, or status), and a stable dedup key (`pm-digest:<scope>:2026-W27`). `noop` when the window has zero qualifying updates. See [report.md](report.md) for the canonical defaults.
+- **Compliance audit / review**: `schedule: daily on weekdays` plus `workflow_dispatch` for drift detection, or `schedule` (monthly) / `pull_request` with `paths:` scoped to policy files. Define **material drift** as any control-state change that affects compliance posture (required policy file removed, control owner missing, control status downgraded from pass to fail, or required approval evidence link missing). Compare current control evidence against the previous successful run window; publish with `create-issue` using `close-older-issues: true` and a stable key such as `compliance-drift:<framework>:<window-id>`; `noop` when no material drift is detected.
 
 ### Pattern-specific `noop` examples
 
@@ -92,6 +73,19 @@ on:
   workflow_dispatch:    # Manual trigger
 ```
 
+### Issue Template Routing
+
+The `issues` event cannot filter by issue template. A workflow triggered by `issues` receives matching issue events regardless of which template created the issue.
+
+To activate only for a particular template, configure that issue form to apply a dedicated label and use a `label_command` trigger restricted to `issues`. Otherwise, use an `issues` trigger and instruct the agent to check a template-specific marker or required fields before acting: `noop` for a known different template, and explicitly choose whether missing or ambiguous template evidence should `noop` or use a generic fallback.
+
+```yaml
+on:
+  label_command:
+    name: bug-report
+    events: [issues]
+```
+
 ### `workflow_run` Failure-Triage Pattern
 
 Use this when reacting to failures from another workflow in the same repository:
@@ -114,14 +108,9 @@ These are "non-success outcomes requiring triage"; keep the list explicit so rea
 
 Escalation rules for this pattern (required):
 
-- Derive a stable failure key before any write (for example `<workflow>:<job>:<step>:<error-signature>`).
+- Derive a stable failure key before any write (for example `<workflow>:<job>:<step>:<error-signature>`). See [create-agentic-workflow-trigger-details.md](create-agentic-workflow-trigger-details.md#incident-dedup-key-templates-workflow_run-and-deployment_status) for concrete key-format templates.
 - Search for an existing open incident by that key **before** calling `create-issue`.
-- Call `noop` instead of creating a new issue when an open incident already exists for the same key.
-
-No-op expectations for this pattern:
-
-- `noop` when the monitored run concludes `success`.
-- `noop` when the same failure already has an open incident issue (duplicate suppression).
+- `noop` when the monitored run concludes `success`, or when an open incident already exists for the same key (duplicate suppression).
 
 #### Fuzzy Scheduling
 
@@ -144,12 +133,6 @@ on:
   schedule: every 2 hours on weekdays    # Every 2 hours, Monday-Friday
   schedule: every 6 hours                # Every 6 hours, all days
 ```
-
-**Why Prefer Weekday Schedules:**
-
-- Avoids Monday backlog from weekend accumulation
-- Aligns with team business hours
-- Notifications fire when team members are active
 
 The compiler converts fuzzy schedules to deterministic cron (e.g., `daily on weekdays` → `43 5 * * 1-5`), scatters execution to avoid load spikes, and adds `workflow_dispatch:` for manual runs.
 
@@ -187,6 +170,16 @@ on:
     types: [opened]
     forks: ["trusted-org/*", "trusted-user/repo"]
 ```
+
+`pull_request_target` supports the same `forks:` field and defaults to same-repository PRs only (omitting `forks:` is equivalent to `forks: []`). List exact `owner/repo` or `owner/*` entries to admit specific forks. Strict mode rejects `"*"` unless the main workflow's top-level `features.dangerously-allow-pull-request-target-forks-all: true` is set; an imported feature does not count as this opt-in. Non-strict mode allows `"*"` with a warning, and the warning remains when strict mode is opted in. `acknowledge-risk: true` and disabled/trusted checkout do not suppress this warning — prefer `pull_request` and avoid `pull_request_target` fork admission unless base-repository context is required.
+
+#### Policy Checks on Fork PRs
+
+The default `pull_request` policy-check trigger skips fork PRs. If a check must review fork contributions directly, explicitly allow the required forks with `forks:` (prefer a narrow allowlist) and keep the workflow read-only; treat PR content as untrusted input.
+
+For PR checks against policy files (for example alt-text rules, allowlists or owners), read the policy from the default branch or a CODEOWNERS-protected path, never the PR head; otherwise the PR author can change the policy to satisfy the check.
+
+Use `workflow_run` instead when the check depends on another workflow's completed result or artifact and must wait for that workflow, rather than racing it on `pull_request`. Scope it to the named workflow and completion type, gate on its conclusion, and read the result through GitHub APIs or artifacts. Do not use `workflow_run` to check out or execute the PR's head code or as a way to bypass fork safeguards.
 
 ### Command Triggers (/mentions)
 
@@ -264,3 +257,13 @@ on:
     branches: [main]
   workflow_dispatch:
 ```
+
+### All You Can Eat Pattern
+
+```yaml
+on:
+  schedule: every 30 minutes
+  skip-if-match: 'is:issue is:open "gh-aw-workflow-id: my-workflow" in:body'
+```
+
+A frequent schedule whose activation is skipped while the previous output of the same workflow is still open, so the next item is produced as soon as the user closes the last one. See [All You Can Eat Pattern](workflow-patterns.md#all-you-can-eat-pattern).

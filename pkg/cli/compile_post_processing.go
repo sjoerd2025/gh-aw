@@ -51,6 +51,7 @@ var compilePostProcessingLog = logger.New("cli:compile_post_processing")
 
 // generateDependabotManifestsWrapper generates Dependabot manifests for compiled workflows
 func generateDependabotManifestsWrapper(
+	ctx context.Context,
 	compiler *workflow.Compiler,
 	workflowDataList []*workflow.WorkflowData,
 	workflowsDir string,
@@ -59,12 +60,12 @@ func generateDependabotManifestsWrapper(
 ) error {
 	compilePostProcessingLog.Print("Generating Dependabot manifests for compiled workflows")
 
-	if err := compiler.GenerateDependabotManifests(workflowDataList, workflowsDir, forceOverwrite); err != nil {
+	if err := compiler.GenerateDependabotManifests(ctx, workflowDataList, workflowsDir, forceOverwrite); err != nil {
 		if strict {
 			return fmt.Errorf("failed to generate Dependabot manifests: %w", err)
 		}
 		// Non-strict mode: just report as warning
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to generate Dependabot manifests: %v", err)))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Failed to generate Dependabot manifests: %v", err)))
 	}
 
 	return nil
@@ -79,6 +80,7 @@ func generateMaintenanceWorkflowWrapper(
 	gitRoot string,
 	verbose bool,
 	strict bool,
+	noLogo bool,
 ) error {
 	compilePostProcessingLog.Print("Generating maintenance workflow")
 
@@ -88,7 +90,7 @@ func generateMaintenanceWorkflowWrapper(
 		if strict {
 			return fmt.Errorf("failed to load repo config: %w", err)
 		}
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to load repo config: %v", err)))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Failed to load repo config: %v", err)))
 		repoConfig = nil
 	}
 
@@ -100,14 +102,38 @@ func generateMaintenanceWorkflowWrapper(
 		ActionTag:        compiler.GetActionTag(),
 		RepoConfig:       repoConfig,
 		RepoSlug:         compiler.GetRepositorySlug(),
+		NoLogo:           noLogo,
 	}); err != nil {
 		if strict {
 			return fmt.Errorf("failed to generate maintenance workflow: %w", err)
 		}
 		// Non-strict mode: just report as warning
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to generate maintenance workflow: %v", err)))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Failed to generate maintenance workflow: %v", err)))
 	}
 
+	return nil
+}
+
+func generateWorkQueueEventWorkflowWrapper(ctx context.Context, workflowDataList []*workflow.WorkflowData, workflowsDir string, gitRoot string, strict bool, noLogo bool) error {
+	compilePostProcessingLog.Print("Generating work queue event workflow")
+	if !workflow.WorkQueueIssueMirroringEnabled(workflowDataList) {
+		return workflow.GenerateWorkQueueEventWorkflow(ctx, workflowDataList, workflowsDir, nil)
+	}
+
+	repoConfig, err := workflow.LoadRepoConfig(gitRoot)
+	if err != nil {
+		if strict {
+			return fmt.Errorf("failed to load repo config for work queue event workflow: %w", err)
+		}
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Failed to load repo config for work queue event workflow: %v", err)))
+		repoConfig = nil
+	}
+	if err := workflow.GenerateWorkQueueEventWorkflow(ctx, workflowDataList, workflowsDir, repoConfig, noLogo); err != nil {
+		if strict {
+			return fmt.Errorf("failed to generate work queue event workflow: %w", err)
+		}
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Failed to generate work queue event workflow: %v", err)))
+	}
 	return nil
 }
 
@@ -119,6 +145,7 @@ func generateCentralSlashCommandWorkflowWrapper(
 	workflowsDir string,
 	gitRoot string,
 	strict bool,
+	noLogo bool,
 ) error {
 	compilePostProcessingLog.Print("Generating centralized slash-command workflow")
 
@@ -127,16 +154,16 @@ func generateCentralSlashCommandWorkflowWrapper(
 		if strict {
 			return fmt.Errorf("failed to load repo config: %w", err)
 		}
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf(
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf(
 			"Failed to load repo config; repo-config flags (e.g. help_command) will use defaults: %v", err)))
 		repoConfig = nil
 	}
 
-	if err := workflow.GenerateCentralSlashCommandWorkflow(ctx, workflowDataList, workflowsDir, repoConfig); err != nil {
+	if err := workflow.GenerateCentralSlashCommandWorkflow(ctx, workflowDataList, workflowsDir, repoConfig, noLogo); err != nil {
 		if strict {
 			return fmt.Errorf("failed to generate centralized slash-command workflow: %w", err)
 		}
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to generate centralized slash-command workflow: %v", err)))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Failed to generate centralized slash-command workflow: %v", err)))
 	}
 
 	return nil
@@ -159,7 +186,7 @@ func purgeOrphanedLockFiles(workflowsDir string, expectedLockFiles []string, ver
 	}
 
 	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Found %d existing .lock.yml files", len(existingLockFiles))))
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr(fmt.Sprintf("Found %d existing .lock.yml files", len(existingLockFiles))))
 	}
 
 	// Build a set of expected lock files
@@ -186,13 +213,13 @@ func purgeOrphanedLockFiles(workflowsDir string, expectedLockFiles []string, ver
 	if len(orphanedFiles) > 0 {
 		for _, orphanedFile := range orphanedFiles {
 			if err := os.Remove(orphanedFile); err != nil {
-				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to remove orphaned lock file %s: %v", filepath.Base(orphanedFile), err)))
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Failed to remove orphaned lock file %s: %v", filepath.Base(orphanedFile), err)))
 			} else {
-				fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Removed orphaned lock file: "+filepath.Base(orphanedFile)))
+				fmt.Fprintln(os.Stderr, console.FormatSuccessMessageStderr("Removed orphaned lock file: "+filepath.Base(orphanedFile)))
 			}
 		}
 		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Purged %d orphaned .lock.yml files", len(orphanedFiles))))
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessageStderr(fmt.Sprintf("Purged %d orphaned .lock.yml files", len(orphanedFiles))))
 		}
 	}
 
@@ -217,20 +244,20 @@ func purgeInvalidFiles(workflowsDir string, verbose bool) error {
 	}
 
 	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Found %d existing .invalid.yml files", len(existingInvalidFiles))))
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr(fmt.Sprintf("Found %d existing .invalid.yml files", len(existingInvalidFiles))))
 	}
 
 	// Delete all .invalid.yml files
 	for _, invalidFile := range existingInvalidFiles {
 		if err := os.Remove(invalidFile); err != nil {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to remove invalid file %s: %v", filepath.Base(invalidFile), err)))
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("Failed to remove invalid file %s: %v", filepath.Base(invalidFile), err)))
 		} else {
-			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Removed invalid file: "+filepath.Base(invalidFile)))
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessageStderr("Removed invalid file: "+filepath.Base(invalidFile)))
 		}
 	}
 
 	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Purged %d .invalid.yml files", len(existingInvalidFiles))))
+		fmt.Fprintln(os.Stderr, console.FormatSuccessMessageStderr(fmt.Sprintf("Purged %d .invalid.yml files", len(existingInvalidFiles))))
 	}
 
 	compilePostProcessingLog.Printf("Purged %d invalid files", len(existingInvalidFiles))
@@ -242,7 +269,7 @@ func displayScheduleWarnings(compiler *workflow.Compiler, jsonOutput bool) {
 	scheduleWarnings := compiler.GetScheduleWarnings()
 	if len(scheduleWarnings) > 0 && !jsonOutput {
 		for _, warning := range scheduleWarnings {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(warning))
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(warning))
 		}
 	}
 }
@@ -257,7 +284,7 @@ func displaySafeUpdateWarnings(compiler *workflow.Compiler, jsonOutput bool) {
 		return
 	}
 	for _, w := range warnings {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(w))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(w))
 	}
 }
 
@@ -284,12 +311,17 @@ func displayCentralizedSlashCommandRecommendation(compiler *workflow.Compiler, w
 		return
 	}
 
+	verb := "are"
+	if nonCentralizedSlashCommands == 1 {
+		verb = "is"
+	}
 	msg := fmt.Sprintf(
-		"Detected %d slash_command entries in this repository; %d are not using centralized routing. Consider setting `on.slash_command.strategy: centralized` to reduce duplicate triggers and route through `agentic_commands.yml`.",
+		"Detected %d slash_command entries in this repository; %d %s not using centralized routing. Consider setting `on.slash_command.strategy: centralized` to reduce duplicate triggers and route through `agentic_commands.yml`.",
 		totalSlashCommands,
 		nonCentralizedSlashCommands,
+		verb,
 	)
-	fmt.Fprintln(os.Stderr, console.FormatWarningMessage(msg))
+	fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(msg))
 	compiler.IncrementWarningCount()
 }
 

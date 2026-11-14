@@ -12,10 +12,49 @@ import (
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/types"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 var mcpLog = logger.New("parser:mcp")
+
+// IsSimpleSecretExpression reports whether value is a direct GitHub Actions
+// secrets reference without additional expression operators.
+func IsSimpleSecretExpression(value string) bool {
+	if value != strings.TrimSpace(value) {
+		return false
+	}
+	expression, ok := actionslanguageservice.WrappedExpression(value)
+	if !ok {
+		if strings.Contains(value, "${{") {
+			mcpLog.Print("Not a valid standalone secret expression")
+		}
+		return false
+	}
+	path, ok := actionslanguageservice.Reference(expression)
+	if !ok || len(path) != 2 {
+		return false
+	}
+	var namespace, secret string
+	for index, component := range path {
+		switch index {
+		case 0:
+			namespace = component
+		case 1:
+			secret = component
+		}
+	}
+	if namespace != "secrets" || secret == "" {
+		return false
+	}
+	// Keep the credential allowlist independent of expression syntax.
+	for i, ch := range secret {
+		if ch != '_' && (ch < 'A' || ch > 'Z') && (i == 0 || ch < '0' || ch > '9') {
+			return false
+		}
+	}
+	return true
+}
 
 // ValidMCPTypes defines all supported MCP server types.
 // "local" is an alias for "stdio" and gets normalized during parsing.
@@ -57,7 +96,14 @@ type MCPServerInfo struct {
 	Error     error
 	Tools     []*mcp.Tool
 	Resources []*mcp.Resource
-	Roots     []*mcp.Root
+	Prompts   []*mcp.Prompt
+	Roots     []*MCPRootInfo
+}
+
+// MCPRootInfo contains inspection-only root display data inferred from resources.
+type MCPRootInfo struct {
+	URI  string
+	Name string
 }
 
 // ExtractMCPConfigurations extracts MCP server configurations from workflow frontmatter
@@ -73,7 +119,7 @@ func ExtractMCPConfigurations(frontmatter map[string]any, serverFilter string) (
 	mcpServersSection, hasMCPServers := frontmatter["mcp-servers"]
 	if !hasMCPServers {
 		mcpLog.Print("No mcp-servers section found, checking for built-in tools")
-		// Process built-in MCP tools from tools section (github, playwright)
+		// Process built-in MCP tools from tools section.
 		if err := extractBuiltinMCPTools(frontmatter, serverFilter, &configs); err != nil {
 			return nil, err
 		}
@@ -86,7 +132,7 @@ func ExtractMCPConfigurations(frontmatter map[string]any, serverFilter string) (
 		return nil, fmt.Errorf("mcp-servers section must be a map, got %T. Example:\nmcp-servers:\n  my-server:\n    command: \"npx @my/tool\"\n    args: [\"--port\", \"3000\"]", mcpServersSection)
 	}
 
-	// Process built-in MCP tools from tools section (github, playwright)
+	// Process built-in MCP tools from tools section.
 	if err := extractBuiltinMCPTools(frontmatter, serverFilter, &configs); err != nil {
 		return nil, err
 	}
@@ -193,10 +239,8 @@ func safeOutputToolName(toolType string) (string, bool) {
 }
 
 func findOrCreateSafeOutputsConfig(configs *[]RegistryMCPServerConfig) *RegistryMCPServerConfig {
-	for i := range *configs {
-		if (*configs)[i].Name == constants.SafeOutputsMCPServerID.String() {
-			return &(*configs)[i]
-		}
+	if config := findSafeOutputsConfig(*configs); config != nil {
+		return config
 	}
 	newConfig := RegistryMCPServerConfig{
 		BaseMCPServerConfig: types.BaseMCPServerConfig{
@@ -207,7 +251,16 @@ func findOrCreateSafeOutputsConfig(configs *[]RegistryMCPServerConfig) *Registry
 		Name: constants.SafeOutputsMCPServerID.String(),
 	}
 	*configs = append(*configs, newConfig)
-	return &(*configs)[len(*configs)-1]
+	return findSafeOutputsConfig(*configs)
+}
+
+func findSafeOutputsConfig(configs []RegistryMCPServerConfig) *RegistryMCPServerConfig {
+	for index, config := range configs {
+		if config.Name == constants.SafeOutputsMCPServerID.String() {
+			return &configs[index]
+		}
+	}
+	return nil
 }
 
 func parseCustomMCPServerConfigs(mcpServers map[string]any, serverFilter string) ([]RegistryMCPServerConfig, error) {
@@ -230,7 +283,7 @@ func parseCustomMCPServerConfigs(mcpServers map[string]any, serverFilter string)
 	return configs, nil
 }
 
-// extractBuiltinMCPTools reads the tools section and appends github/playwright configs to configs.
+// extractBuiltinMCPTools reads the tools section and appends GitHub configs to configs.
 // It returns an error if a removed tool (serena) is present.
 func extractBuiltinMCPTools(frontmatter map[string]any, serverFilter string, configs *[]RegistryMCPServerConfig) error {
 	toolsSection, hasTools := frontmatter["tools"]
@@ -245,7 +298,10 @@ func extractBuiltinMCPTools(frontmatter map[string]any, serverFilter string, con
 		if toolName == "serena" {
 			return errors.New("tools.serena is removed")
 		}
-		if toolName == "github" || toolName == "playwright" {
+		if toolName == "linear" {
+			return errors.New("tools.linear requires an imported connector; import .github/workflows/connectors/linear.md and explicitly select its read capabilities")
+		}
+		if toolName == "github" {
 			config, err := processBuiltinMCPTool(toolName, toolValue, serverFilter)
 			if err != nil {
 				return err
@@ -259,7 +315,7 @@ func extractBuiltinMCPTools(frontmatter map[string]any, serverFilter string, con
 	return nil
 }
 
-// processBuiltinMCPTool handles built-in MCP tools (github and playwright)
+// processBuiltinMCPTool handles built-in MCP tools.
 func processBuiltinMCPTool(toolName string, toolValue any, serverFilter string) (*RegistryMCPServerConfig, error) {
 	if serverFilter != "" && !strings.Contains(strings.ToLower(toolName), strings.ToLower(serverFilter)) {
 		return nil, nil
@@ -269,11 +325,6 @@ func processBuiltinMCPTool(toolName string, toolValue any, serverFilter string) 
 		config := buildGitHubBuiltinConfig(toolValue)
 		return &config, nil
 	}
-	if toolName == "playwright" {
-		config := buildPlaywrightBuiltinConfig(toolValue)
-		return &config, nil
-	}
-
 	return nil, nil
 }
 
@@ -339,33 +390,6 @@ func githubBuiltinMode(toolValue any) (bool, string, map[string]any) {
 		}
 	}
 	return useRemote, customToken, toolConfig
-}
-
-func buildPlaywrightBuiltinConfig(toolValue any) RegistryMCPServerConfig {
-	config := RegistryMCPServerConfig{
-		BaseMCPServerConfig: types.BaseMCPServerConfig{
-			Type:    "docker",
-			Command: "docker",
-			Args: []string{
-				"run", "-i", "--rm", "--shm-size=2gb", "--cap-add=SYS_ADMIN",
-				"-v", constants.TmpMcpLogsMount,
-				"mcr.microsoft.com/playwright:" + string(constants.DefaultPlaywrightBrowserVersion),
-			},
-			Env: make(map[string]string),
-		},
-		Name: "playwright",
-	}
-	toolConfig, ok := toolValue.(map[string]any)
-	if !ok {
-		return config
-	}
-	if version, exists := toolConfig["version"]; exists {
-		if versionStr := stringutil.ParseVersionValue(version); versionStr != "" {
-			replaceBuiltinImage(&config, "mcr.microsoft.com/playwright:", "mcr.microsoft.com/playwright:"+versionStr)
-		}
-	}
-	appendBuiltinArgs(&config, toolConfig["args"])
-	return config
 }
 
 func appendBuiltinAllowedTools(config *RegistryMCPServerConfig, toolConfig map[string]any) {
@@ -439,6 +463,10 @@ func ParseMCPConfig(toolName string, mcpSection any, toolConfig map[string]any) 
 		return config, err
 	}
 	if err := parseMCPRegistryValue(mcpConfig, toolName, &config); err != nil {
+		return config, err
+	}
+	config.CACertFile, err = ParseMCPCACertFile(mcpConfig, config.Type, toolName)
+	if err != nil {
 		return config, err
 	}
 

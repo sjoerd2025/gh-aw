@@ -2,6 +2,164 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Security
+
+Require Go 1.27.4 for repository builds, tooling, and owned workflow runtimes to
+fix [GO-2026-6859 (CVE-2026-97054)](https://pkg.go.dev/vuln/GO-2026-6859), an
+HTTP/1 server crash caused by a `net/http` header race. Release builds reject
+older toolchains. Rebuild binaries and devcontainers with Go 1.27.4 or newer.
+
+Allow explicitly `on.bots`-listed Apps to check out same-repository PRs on
+`edited` events only when the webhook reports a non-null object-valued `body`
+change and no other changed fields. Missing change metadata, title/base changes,
+and mixed edits continue to require write-or-higher repository permission.
+
+### Breaking changes
+
+Eligible workflows that select neither a model nor routing now default to
+`goal: cost`, `mode: auto` model routing on GitHub Copilot inference. If task
+classification is unavailable or returns `unknown`, `auto` falls back to
+`balanced`. After recompilation, the selected model, output, and cost may
+differ. To retain the previous non-routed model selection, set
+`engine.model-routing: false` and recompile; to keep a stable model, configure
+it explicitly. Explicit routing configurations are unchanged. Review generated
+locks and audit model and cost changes after recompilation.
+
+Native Jira, Linear, and Azure DevOps tools, safe-output handlers, and gateway
+issue triggers have been replaced by the declarative connector runtime. Legacy
+`auth` and `allowed` settings and the old `connectors` gateway wrapper are
+rejected, and seven native read methods are no longer exposed. Migrate by
+importing the provider declaration from
+`.github/workflows/connectors/<provider>.md`, selecting read profiles and write
+effects explicitly, configuring the required credentials, and recompiling.
+Native integrations are not retained as a compatibility path; imports do not
+install provider webhooks, and unsupported operations may require workflow
+changes.
+
+`merge-pull-request` now blocks merges when the target PR changes protected
+files. Existing workflows that merged such changes will refuse those merges
+unless configured otherwise. Keep the default and merge those PRs manually,
+configure scoped exceptions with
+`safe-outputs.merge-pull-request.protected-files.exclude`, or set
+`safe-outputs.merge-pull-request.protected-files: allowed` when protected-file
+merges are intentional, then recompile. The opt-out does not bypass other merge
+gates.
+
+`pull_request_target` workflows now default to same-repository PRs only in both
+strict and non-strict mode. Omitting `forks` is equivalent to `forks: []`; no
+explicit empty list is required. To admit forks, configure exact `owner/repo`
+entries or deliberately trusted `owner/*` patterns, then recompile. Explicit
+`"*"` permits unrestricted admission in both modes, but strict mode rejects it
+unless the main workflow's top-level `features.dangerously-allow-pull-request-target-forks-all: true`
+is set; imported features do not enable this opt-in. Strict mode still rejects
+expressions and unsupported pattern forms. The compiler warns whenever unrestricted
+admission is allowed. Actor authorization and trusted-checkout restrictions remain
+mandatory in strict mode; `acknowledge-risk`, disabled checkout, and trusted checkout
+policies do not bypass fork-pattern validation or suppress the unrestricted-forks warning.
+
+The `gh aw outcomes` command has been removed. Use `gh aw logs --outcomes`
+to evaluate selected runs, or pipe a run ID to
+`gh aw logs --stdin --repo owner/repo --outcomes`. JSON reports now carry
+per-run observations in `.outcomes[]` and episode rollups in `.episode_outcomes`.
+Historical repository scoring and the separate offline episode-join command have
+also been removed. Use `gh aw logs --episodes --outcomes` for episode summaries.
+`--outcomes-dir` remains available for JSONL export.
+
+`compile --dry-run` accepts workflow `steps` and `post-steps` but omits their
+code and credentials from emitted locks, so separate dispatch cannot execute
+them. It rejects `pre-steps`, `pre-agent-steps`, `on.steps`, custom MCP
+servers/scripts, custom safe-output scripts, enabled Bash graders, and authored
+OIDC permissions, including imports. Custom jobs and custom safe-output jobs
+become disabled, credential-free placeholders with empty outputs. Existing
+actionable scanner findings fail alongside added findings. Migrate by removing
+unsupported declarations in a separate diagnostic workflow, reviewing omitted
+steps and skipped dependencies, and resolving actionable findings before live
+testing. Ordinary compilation is unchanged; dry-run is still not a hosted
+execution sandbox.
+
+AWF and downloaded Copilot CLI releases now require a reviewed checksum-manifest
+digest bundled in the trusted setup action or supplied as literal
+`sandbox.agent.checksums-sha256` (AWF) / `engine.checksums-sha256` (Copilot)
+frontmatter alongside an explicit release version. These values pin
+`checksums.txt` / `SHA256SUMS.txt`, not individual executables. Unreviewed
+downloads without a supplied pin and `latest` downloads fail closed instead of
+trusting a checksum from the same HTTPS origin. Built-in pins cover AWF v0.28.62,
+Copilot CLI v1.0.98, and the legacy Copilot v1.0.21 manifest. Obtain other
+manifest digests through an independently trusted channel and update/recompile
+workflows to consume the new setup action. Explicit Copilot pins bypass
+toolcache selection; without a supplied pin, trusted toolcache behavior is
+unchanged. Repository Go tooling, module requirements and generated runtime
+defaults now use Go 1.27.4; release builds reject older toolchains. Go root
+capture and Serena setup clear stale GOROOT values before discovering the
+selected toolchain, preventing mixed-version compiler/standard-library failures.
+
+Logs episode rollups now require a recorded nonempty `context.episode_id`.
+Call-ID grouping, synthetic episode IDs, metadata-inferred lineage, and bridges
+through uncorrelated runs are removed. Runs without canonical identity remain
+in `.runs[]` and overall totals, but not episode counts, rollups, or edges.
+Replace episode-level `root_run_id` and `primary_workflow` with
+`representative_run_id` and `representative_workflow` for selected-data identity;
+use `recorded_roots[]` for canonical root claims. Recompile workflows to record
+canonical context for future runs; historical data without it remains available
+for per-run analysis only. Compact JSON retains all canonical episodes, including
+single-run episodes. Coverage remains `unknown` or `partial`, never complete.
+
+Graders now run in conclusion as pure computation over the redacted in-memory
+unified session. Ten fast built-ins are enabled by default; other built-ins
+require explicit opt-in. Custom JavaScript runs only in a separate restricted
+`graders` job, using immutable `session`, `config`, and `helpers` inputs.
+Conclusion never receives custom executable definitions or user-provided steps.
+Repository-owned `graders.operational-value.run` Bash runs only in that separate
+job: replace legacy stdin requests with the session JSONL file in `$1` /
+`GH_AW_SESSION_FILE` and JSON config in `GH_AW_GRADER_CONFIG`. Existing metric
+arrays remain supported. Compiler validation and `grader-shell-file-write`
+reject detected file writes; trusted shell is not yet microVM-isolated.
+Recompile workflows to move grading out of the
+agent job. Read schema-version-2 results from `usage/graders/`; CLI replay now
+accepts unified-session JSONL or a JSON event array instead of legacy trace
+payloads. Custom results use a separate combined `graders` artifact, downloaded
+conditionally by audit when custom IDs are registered, including cached reports.
+The logs `graders` artifact set includes both jobs' results and supports
+workflow-call-prefixed artifacts.
+
+MCP workflow-writing tools (`add`, `update`, `fix`, and `compile`) are disabled
+by default. Operators can enable them for trusted clients and workflow sources
+with `gh aw mcp-server --allow-write-tools`; `--validate-actor` additionally
+requires repository write access. MCP `mcp-inspect` only lists configuration
+and rejects live `server` and `tool` filters. Review and trust workflow commands,
+packages, container images, and endpoints before invoking
+`gh aw mcp inspect <workflow>` directly for live discovery.
+
+`gh aw logs` now defaults to a 1024 MB (1 GB) storage budget instead of unlimited
+downloads. Use `--max-storage 0` to retain unlimited storage, or set a larger
+budget explicitly. MCP logs calls inherit this default unless `max_storage` is
+provided; `max_storage: 0` disables the limit.
+
+Global work-queue configuration moves to `.github/workflows/aw.json` under
+`work_queue`, including scheduling and backing Issue/label settings. AW handles
+authorization, credentials and approved worker routes; no queue enrollment or
+producer allowlist is needed. Missing settings support automatic first-use
+bootstrap with concurrency 16, pending limit 4,096, singleton assignments and
+three attempts with 30-second backoff. Existing queues use installed Policy;
+apply changes through an explicit quiescent `policy --from-config --epoch EPOCH`.
+Workflow-level `work-queue-policy` and `tools.work-queue.issues` are deprecated
+and conflicting definitions fail. Historical ledgers remain readable.
+
+Compatible worker deployments evolve prospective execution without draining.
+Logical contracts, explicit execution pins and frozen Dispatch bindings preserve
+existing Work, dependencies, Results, fairness debt, reservations and recovery.
+Unavailable or incompatible workers pause affected Work only. Scheduling
+economics remain separate, explicitly quiescent Policy transitions.
+
+Standalone work-queue Policy seeding is no longer supported. Submit Work through
+an authorized workflow/Action or `gh aw work-queue submit-work` / `submit-graph`;
+the first accepted submission atomically creates Policy and Work. Remove
+`initializeWorkQueue`, `initializationContext`, and pre-submission `policy`
+commands from setup scripts. The `policy` command only updates existing,
+quiescent queues. Historical Policy-only genesis records remain readable.
+
 ## v0.40.1 - 2026-02-03
 
 ### Move from githubnext/gh-aw to github/gh-aw
@@ -438,6 +596,12 @@ Run `gh aw fix --write` to apply automatic updates across your repository.
 
 ### Breaking Changes
 
+#### Removed the experimental `opencode` engine
+
+Workflows using `engine: opencode` must migrate to `copilot`, `claude`, `codex`,
+`gemini`, `antigravity`, or `pi`. The runner no longer restores
+`opencode.jsonc` or `.opencode/` configuration.
+
 #### `gh aw add` errors for packages with `aw.yml` config
 
 Running `gh aw add <package>` on a package that declares interactive config
@@ -529,6 +693,18 @@ MCP Gateway v0.1.5 introduces stricter MCP server validation:
 - Run `gh aw compile` to detect and fix invalid configurations before upgrading
 
 ### Bug Fixes
+
+#### Order nested imported steps by dependency and detect subdirectory cycles
+
+Imported `steps`, `pre-agent-steps`, and `post-steps` now place prerequisites
+before the files that import them, regardless of traversal order. Import cycles
+in subdirectories now fail compilation instead of producing a lock file.
+
+#### Create organization and enterprise defaults with explicit variable visibility
+
+`gh aw env update` now sends the required visibility when creating organization
+or enterprise variables. Use `--visibility all|private|selected`; existing
+variables keep their current visibility.
 
 #### Bump the default gh-aw-firewall version to v0.27.7 and sync the embedded AWF config schema.
 
@@ -1192,7 +1368,7 @@ were updated to match the simplified sanitization behavior.
 
 #### Remove legacy support for the `GH_AW_COPILOT_TOKEN` secret name.
 
-This change removes the legacy fallback to `GH_AW_COPILOT_TOKEN`. The effective token lookup chain is now:
+This change removes the legacy fallback to `GH_AW_COPILOT_TOKEN`. The resolved token lookup chain is now:
 
 - `COPILOT_GITHUB_TOKEN` (recommended)
 - `GH_AW_GITHUB_TOKEN` (legacy)

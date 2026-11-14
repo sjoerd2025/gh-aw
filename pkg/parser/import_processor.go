@@ -22,12 +22,23 @@ type PromptImportEntry struct {
 	Markdown   string // Non-empty when this import should be inlined into the prompt at compile time
 }
 
+// ConnectorImport retains registrations after normal import-schema/with substitution.
+type ConnectorImport struct {
+	Source        string
+	Registrations map[string]any
+}
+
 // ImportsResult holds the result of processing imports from frontmatter
 type ImportsResult struct {
+	Connectors                    []ConnectorImport
 	MergedTools                   string                // Merged tools configuration from all imports
 	MergedMCPServers              string                // Merged mcp-servers configuration from all imports
 	MergedEngines                 []string              // Merged engine configurations from all imports
+	MergedPlugins                 []string              // Agent Plugin references from all imports (merged after main-workflow plugins)
+	MergedPluginObjects           []map[string]any      // Object-form Agent Plugin references from all imports
 	MergedSafeOutputs             []string              // Merged safe-outputs configurations from all imports
+	MergedGraders                 string                // Merged graders configuration from all imports (JSON objects, one per line)
+	GraderRunSources              map[string]string     // Declaring files for imported grader run paths.
 	MergedMCPScripts              []string              // Merged mcp-scripts configurations from all imports
 	MergedMarkdown                string                // Only contains imports WITH inputs (for compile-time substitution)
 	ImportPaths                   []string              // List of import file paths for runtime-import macro generation (replaces MergedMarkdown)
@@ -48,17 +59,20 @@ type ImportsResult struct {
 	MergedSkipBots                []string              // Merged skip-bots list from all imports (union of usernames)
 	MergedSkipIfMatch             string                // on.skip-if-match from first imported workflow that defines it (JSON-encoded)
 	MergedSkipIfNoMatch           string                // on.skip-if-no-match from first imported workflow that defines it (JSON-encoded)
+	MergedAmbientFolders          []string              // Merged top-level ambient-folders list from all imports (union, deduplicated)
 	MergedActivationGitHubToken   string                // GitHub token from on.github-token in first imported workflow that defines it
 	MergedActivationGitHubApp     string                // JSON-encoded on.github-app from first imported workflow that defines it
 	MergedTopLevelGitHubApp       string                // JSON-encoded top-level github-app from first imported workflow that defines it
 	MergedCheckout                string                // JSON-encoded checkout configurations from imported workflows (one JSON value per line)
 	MergedPostSteps               string                // Merged post-steps configuration from all imports (appended in order)
+	ActionPinSourceVersions       map[string]string     // Inline labels for imported SHA-pinned action references
 	MergedLabels                  []string              // Merged labels from all imports (union of label names)
 	MergedCaches                  []string              // Merged cache configurations from all imports (appended in order)
 	MergedJobs                    string                // Merged jobs from imported YAML workflows (JSON format)
 	MergedEnv                     string                // Merged env configuration from all imports (JSON format)
 	MergedEnvSources              map[string]string     // env var name → source import path (for conflict detection and lock file header listing)
 	MergedFeatures                []map[string]any      // Merged features configuration from all imports (parsed YAML structures)
+	MergedMetadataDocs            string                // metadata.docs from the first imported workflow that defines it
 	MergedModels                  []map[string][]string // Merged model alias definitions from all imports (first import to define a key wins among imports)
 	MergedModelPolicies           []map[string][]string // Merged model policy sets from all imports (models.allowed/blocked)
 	MergedModelCosts              []map[string]any      // Merged model pricing overlays (models.json provider structure) from all imports
@@ -67,15 +81,22 @@ type ImportsResult struct {
 	MergedEngineMCPToolTimeout    string                // First engine.mcp.tool-timeout found across all imports (Go duration string, e.g. "10m")
 	MergedEngineMCPSessionTimeout string                // First engine.mcp.session-timeout found across all imports (Go duration string, e.g. "4h")
 	MergedEngineModel             string                // First engine.model found in imports that have no engine.id (model preference without engine selection)
+	EngineModelChoiceDeclared     bool                  // An import declares a top-level model, or a preference-only engine object declares model, model-routing, or fallback-models (including empty values)
 	MergedMaxTurns                string                // First max-turns value found across all imports (JSON-encoded, first-wins)
 	MergedMaxToolDenials          string                // First max-tool-denials value found across all imports (JSON-encoded, first-wins)
+	MergedMaxToolCalls            string                // First max-tool-calls value found across all imports (JSON-encoded, first-wins)
 	MergedMaxRuns                 string                // First max-runs value found across all imports (JSON-encoded, first-wins)
 	MergedMaxTurnCacheMisses      string                // First max-turn-cache-misses value found across all imports (JSON-encoded, first-wins)
 	MergedMaxAICredits            string                // First max-ai-credits value found across all imports (JSON-encoded, first-wins)
 	MergedMaxDailyAICredits       string                // First max-daily-ai-credits value found across all imports (JSON-encoded, first-wins)
+	MergedConcurrency             string                // First import-safe concurrency.group value found across all imports (JSON-encoded, first-wins)
+	MergedJobDiscriminator        string                // First concurrency.job-discriminator found across all imports (first-wins)
 	MergedExcludedEnv             []string              // Union of excluded-env lists from all imports (deduplicated, used to extend the main workflow's excluded-env)
 	ImportedFiles                 []string              // List of imported file paths (for manifest)
+	MetadataDocuments             map[string]string     // Raw selected Markdown imports, keyed by compiler-resolved path
 	AgentFile                     string                // Path to custom agent file (if imported)
+	SubAgentModels                []SubAgentModel       // models declared by imported inline agents and agent files
+	SubAgents                     []InlineSubAgent      // imported inline definitions for engine-specific validation
 	AgentImportSpec               string                // Original import specification for agent file (e.g., "owner/repo/path@ref")
 	RepositoryImports             []string              // List of repository imports (format: "owner/repo@ref") for .github folder merging
 	// ImportInputs uses map[string]any because input values can be different types (string, number, boolean).

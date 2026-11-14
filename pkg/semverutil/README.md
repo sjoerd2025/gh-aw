@@ -100,13 +100,14 @@ semverutil.IsMorePreciseVersion("v4.3.0", "v4.3.0") // false (equal precision)
 
 ### `NormalizeGitDescribeSemver(v string) string`
 
-Normalizes a version string produced by `git describe` into a canonical semver. Strips `git describe` prerelease suffixes of the form `N-gHEX` or `N-gHEX-dirty` (which indicate commits-since-tag metadata rather than real prerelease labels), leaving only the base semver. Non-`git describe` prerelease suffixes (e.g. `-beta.1`) are preserved. Returns the input unchanged if it is not a valid semver.
+Normalizes a version string produced by `git describe` into a canonical semver. Trims surrounding whitespace and conditionally adds a leading `v` to valid bare semantic versions; it does not validate or reject input. Strips `git describe` prerelease suffixes of the form `N-gHEX` or `N-gHEX-dirty` (which indicate commits-since-tag metadata rather than real prerelease labels), leaving only the base semver. Non-`git describe` prerelease suffixes (e.g. `-beta.1`) are preserved. Invalid input is returned unchanged after trimming.
 
 ```go
 semverutil.NormalizeGitDescribeSemver("v1.2.3-14-gabcdef")       // → "v1.2.3"
 semverutil.NormalizeGitDescribeSemver("v1.2.3-14-gabcdef-dirty") // → "v1.2.3"
 semverutil.NormalizeGitDescribeSemver("v1.2.3-beta.1")           // → "v1.2.3-beta.1"
 semverutil.NormalizeGitDescribeSemver("v1.2.3")                  // → "v1.2.3"
+semverutil.NormalizeGitDescribeSemver("not-a-version")           // → "not-a-version"
 ```
 
 ### `IsCompatible(pinVersion, requestedVersion string) bool`
@@ -158,7 +159,7 @@ semverutil.IsCompatible("v6.0.0", "v5") // false
 
 ## Source Synchronization
 
-Reviewed against recent source updates on 2026-07-24; `NormalizeGitDescribeSemver` added to Public API section.
+Reviewed against recent source updates on 2026-07-24; `NormalizeGitDescribeSemver` added to Public API section. Re-verified on 2026-08-14; no further public-contract deltas identified. Re-verified on 2026-08-29; no public-contract deltas identified. Re-verified on 2026-09-03; no public-contract deltas identified. Re-verified on 2026-09-08; no public-contract deltas identified. Re-verified on 2026-09-13; no public-contract deltas identified. Re-verified on 2026-09-23; no public-contract deltas identified. Re-verified on 2026-09-28; no public-contract deltas identified.
 
 ---
 

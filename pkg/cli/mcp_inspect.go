@@ -27,7 +27,7 @@ var mcpInspectLog = logger.New("cli:mcp_inspect")
 const mcpScriptsServerShutdownDelay = 500 * time.Millisecond
 
 // InspectWorkflowMCP inspects MCP servers used by a workflow and lists available tools, resources, and roots
-func InspectWorkflowMCP(ctx context.Context, workflowFile string, serverFilter string, toolFilter string, verbose bool, useActionsSecrets bool) error {
+func InspectWorkflowMCP(ctx context.Context, workflowFile string, serverFilter string, toolFilter string, verbose bool, useActionsSecrets bool) error { //nolint:largefunc // Existing inspection flow remains centralized.
 	mcpInspectLog.Printf("Inspecting workflow MCP: workflow=%s, serverFilter=%s, toolFilter=%s",
 		workflowFile, serverFilter, toolFilter)
 
@@ -232,7 +232,7 @@ func renderMCPInspectionTree(workflowPath string, workflowData *workflow.Workflo
 
 // NewMCPInspectSubcommand creates the mcp inspect subcommand
 // This is the former mcp inspect command now nested under mcp
-func NewMCPInspectSubcommand() *cobra.Command {
+func NewMCPInspectSubcommand() *cobra.Command { //nolint:largefunc // Existing command setup remains centralized.
 	var serverFilter string
 	var toolFilter string
 	var spawnInspector bool
@@ -245,6 +245,10 @@ func NewMCPInspectSubcommand() *cobra.Command {
 
 This command starts each MCP server configured in the workflow, queries its capabilities,
 and displays the results in a formatted table. It supports stdio, Docker, and HTTP MCP servers.
+
+Only run live inspection on trusted workflows: configured commands, packages, and
+container images execute locally, and configured HTTP endpoints receive connections.
+The MCP server's mcp-inspect tool only lists configuration and does not execute servers.
 
 MCP Scripts servers are automatically detected and inspected when present in the workflow.
 
@@ -268,8 +272,7 @@ The command will:
   gh aw mcp inspect weekly-research --server github --tool create_issue  # Show details for a specific tool
   gh aw mcp inspect weekly-research -v # Verbose output with detailed connection info
   gh aw mcp inspect weekly-research --inspector  # Launch @modelcontextprotocol/inspector
-  gh aw mcp inspect weekly-research --check-secrets  # Check GitHub Actions secrets
-`,
+  gh aw mcp inspect weekly-research --check-secrets  # Check GitHub Actions secrets`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var workflowFile string
@@ -329,7 +332,7 @@ func buildFrontmatterFromWorkflowData(workflowData *workflow.WorkflowData) map[s
 	}
 
 	// Override tools with the fully merged result (includes built-in tools from imports such as
-	// github, playwright, and serena). ExtractMCPConfigurations only picks up github/playwright/serena
+	// GitHub and removed built-ins). ExtractMCPConfigurations only picks up GitHub
 	// from the tools key, so extra user-defined entries here are harmless.
 	if len(workflowData.Tools) > 0 {
 		frontmatter["tools"] = workflowData.Tools

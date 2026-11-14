@@ -8,22 +8,24 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/scanfindings"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestParseYamllintLine(t *testing.T) {
+	t.Parallel()
 	t.Run("parses error line", func(t *testing.T) {
 		issue, err := parseYamllintLine("./.github/workflows/test.lock.yml:7:9: [error] wrong indentation: expected 8 but found 10 (indentation)")
 
 		require.NoError(t, err)
-		assert.Equal(t, yamllintIssue{
-			File:    "./.github/workflows/test.lock.yml",
-			Line:    7,
-			Column:  9,
-			Level:   "error",
-			Message: "wrong indentation: expected 8 but found 10",
-			Rule:    "indentation",
+		assert.Equal(t, scanfindings.Finding{
+			RuleID:   "indentation",
+			Severity: scanfindings.SeverityHigh,
+			Message:  "[error] wrong indentation: expected 8 but found 10 (indentation)",
+			File:     "./.github/workflows/test.lock.yml",
+			Line:     7,
+			Column:   9,
 		}, issue)
 	})
 
@@ -31,13 +33,13 @@ func TestParseYamllintLine(t *testing.T) {
 		issue, err := parseYamllintLine("./test.lock.yml:1:1: [warning] missing document start \"---\" (document-start)")
 
 		require.NoError(t, err)
-		assert.Equal(t, yamllintIssue{
-			File:    "./test.lock.yml",
-			Line:    1,
-			Column:  1,
-			Level:   "warning",
-			Message: "missing document start \"---\"",
-			Rule:    "document-start",
+		assert.Equal(t, scanfindings.Finding{
+			RuleID:   "document-start",
+			Severity: scanfindings.SeverityMedium,
+			Message:  "[warning] missing document start \"---\" (document-start)",
+			File:     "./test.lock.yml",
+			Line:     1,
+			Column:   1,
 		}, issue)
 	})
 
@@ -82,6 +84,7 @@ func TestParseAndDisplayYamllintOutput_AllMalformed(t *testing.T) {
 }
 
 func TestBuildYamllintContainerPaths(t *testing.T) {
+	t.Parallel()
 	t.Run("normalizes in-repo path", func(t *testing.T) {
 		gitRoot := t.TempDir()
 		lockFile := filepath.Join(gitRoot, ".github", "workflows", "static-analysis-report.lock.yml")
@@ -114,6 +117,7 @@ func TestBuildYamllintContainerPaths(t *testing.T) {
 }
 
 func TestBuildYamllintDockerArgs(t *testing.T) {
+	t.Parallel()
 	args := buildYamllintDockerArgs("/repo", []string{"./test.lock.yml"}, true)
 
 	assert.Equal(t, []string{
@@ -138,6 +142,7 @@ func TestBuildYamllintDockerArgs(t *testing.T) {
 }
 
 func TestClassifyYamllintExit(t *testing.T) {
+	t.Parallel()
 	t.Run("non-strict exit code 1 is tolerated", func(t *testing.T) {
 		assert.NoError(t, classifyYamllintExit(1, false, 2, "workflows"))
 	})

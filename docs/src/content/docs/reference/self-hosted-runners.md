@@ -9,15 +9,76 @@ Use the `runs-on` frontmatter field to target a self-hosted runner instead of th
 
 Runners must be Linux with Docker support. macOS and Windows are not supported.
 
+> [!IMPORTANT]
+> **Runner configuration is not a product availability statement.** Choose your GitHub deployment separately from your runner topology in the [deployment and runner applicability summary](/gh-aw/reference/enterprise-configuration/#deployment-and-runner-applicability). GHES, data-residency tenant, and Kubernetes ARC end-to-end combinations remain unconfirmed unless explicitly confirmed by the product owners. See also [AWF applicability and CI boundaries](https://github.com/github/gh-aw-firewall/blob/main/docs/compatibility.md#environment-and-runner-applicability) and [AWF ARC/DinD requirements](https://github.com/github/gh-aw-firewall/blob/main/docs/arc-dind.md).
+
+To enforce self-hosted runners for every generated job, set `require_self_hosted_runners` in `.github/workflows/aw.json` or pass `--require-self-hosted-runners` for a one-off compile:
+
+```json title=".github/workflows/aw.json"
+{
+  "require_self_hosted_runners": true
+}
+```
+
+The compiler checks all generated jobs, including framework and safe-output jobs. Each must use the `self-hosted` label or a runner group. The `GH_AW_REQUIRE_SELF_HOSTED_RUNNERS=true` compiler environment variable also enables this enforcement.
+
+## Host isolation checklist
+
+A self-hosted runner processes potentially hostile repository content even in private or internal repositories. The agent sandbox does not establish that the underlying host is clean. An ephemeral runner registration accepts one job, but re-registering on reused hardware, a reused VM disk, or persistent Kubernetes volumes can preserve an earlier job's compromise.
+
+Before admitting untrusted work:
+
+- Provision a clean, disposable VM or equivalent isolated environment for each job and destroy its writable state afterward. For ARC, include the DinD daemon's state and mounted volumes; replacing only the runner pod is insufficient when those persist.
+- Separate trusted release, publish, and deployment jobs from untrusted execution using distinct runner groups and infrastructure. Restrict group access to the intended repositories and workflows; do not share writable disks, Docker daemons, or credentials between trust domains.
+- Isolate or discard local npm/pip caches, build directories, tool caches, installed binaries, home directories, and Docker images/volumes. Audit Actions dependency-cache restores and writers separately from [cache-memory](/gh-aw/reference/cache-memory/); service-side cache restrictions do not protect persistent host caches.
+- Restrict Docker socket access to trusted runner components, never make the socket world-accessible, and prevent untrusted workloads from reaching other jobs' daemons. Limit host/internal-network and cloud metadata access independently of the agent's firewall.
+- Remove ambient Git, cloud, registry, SSH, and Kubernetes credentials from the host; grant only job-scoped credentials to the components that need them. Verify teardown after cancelled or failed jobs, not just successful runs.
+
+Runner labels, runner-group selection, and `require_self_hosted_runners` route or constrain jobs; they do not prove host ephemerality or enforce this checklist. Host provisioning, access controls, and lifecycle verification remain operator responsibilities.
+
 Self-hosted runners may require `sudo` depending on the selected engine and configuration. For the default GitHub Copilot engine, there are two distinct sudo considerations:
 
 - **AWF (Agentic Workflow Firewall)**: Runs rootless in the default network-isolation mode. Egress is enforced via Docker network topology — an internal Docker network (`awf-net`) with no internet route and a dual-homed Squid proxy as the sole egress path. No `sudo` and no `NET_ADMIN` are required on the runner for AWF in this mode. Container-level `iptables`, Squid proxy ACLs, and capability drops provide defense in depth, all managed inside the Docker daemon's domain.
 
-- **Copilot CLI install**: The `install_copilot_cli.sh` script runs as the runner user. By default it escalates via `sudo` for file operations (fixing `.copilot` directory ownership, cleaning stale chroot directories, and installing the Copilot binary to `/usr/local/bin`). Pass `--rootless` to the script to install to `~/.local/bin` without `sudo`, which is required on ARC pods with `allowPrivilegeEscalation: false`.
+- **Copilot CLI and threat-detect installation**: Root and passwordless-sudo runners install these binaries to `/usr/local/bin`. Rootless installation uses the job-scoped `$RUNNER_TEMP/gh-aw/bin` directory without `sudo`.
+
+### Unprivileged CLI installation
+
+Set `runner.installation: rootless` for a native Linux runner without `sudo` or write access to `/usr/local/bin`:
+
+```aw
+---
+on: issues
+runs-on: linux64-selfhosted
+runner:
+  installation: rootless
+---
+Triage this issue.
+```
+
+This setting applies to the generated Copilot CLI and threat-detect installers in the agent and detection jobs, including when `safe-outputs.threat-detection.runs-on` selects a different runner. Rootless installs use `$RUNNER_TEMP/gh-aw/bin`, a job-scoped directory that AWF mounts read-only, and publish it through `GITHUB_PATH`. This protects host-executed binaries from sandbox changes. The directory must be writable during setup. External threat detection stages the verified detector there so the sandbox can resolve it independently of its home directory. Release pins, checksum verification, HTTPS requirements, platform checks, and Copilot's trusted toolcache policy remain unchanged.
+
+Omitting `runner.installation` preserves the existing defaults. Explicit `privileged` selects the native sudo-based installation and is rejected with `runner.topology: arc-dind`.
+
+Installation privilege does not change AWF runtime privileges or enable split-filesystem handling. Leave `runner.topology` unset for a native runner; use `arc-dind` only for a split runner/daemon filesystem. Other engines, custom steps, and privileged runtime profiles may still require `sudo`. Recompile with `gh aw compile` after changing the setting; do not edit the generated lock file.
+
+When `runner.installation` is omitted, native installers automatically choose rootless mode if the runner is neither root nor able to run `sudo -n true`; root and passwordless-sudo runners retain privileged installation. ARC/DinD explicitly selects rootless mode even when sudo is available.
+
+`engine.command` skips standard Copilot installation only for the primary agent. External Copilot threat detection still installs and uses the standard `copilot` executable; it does not run the primary agent's custom command. A preinstalled executable on `PATH` does not skip either installer or its privilege checks.
+
+Rootless installation cannot repair root-owned state from previous privileged AWF runs. If preparing `~/.copilot` fails, installation stops with an ownership-repair diagnostic. Before retrying, a runner administrator must restore ownership of that directory and its contents to the runner's UID and GID and make it writable. Installers clean only their own staging directories, not shared `/tmp/awf-*-chroot-home` or `/tmp/awf-chroot-*` directories that may belong to active jobs. A runner administrator must remove confirmed stale directories before the runner is reused.
+
+## Runner HTTP proxy settings
+
+On runners that require an HTTP proxy for outbound access, configure `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` in the runner environment before the CLI proxy and MCP gateway start. Both containers inherit defined values, including the lowercase forms `http_proxy`, `https_proxy`, and `no_proxy`. Explicit MCP gateway environment settings take precedence over inherited values.
+
+The MCP gateway extends inherited proxy exclusions for its internal backend hosts so local MCP traffic remains reachable. If you explicitly override the gateway's `NO_PROXY` or `no_proxy`, include the internal hosts `host.docker.internal` and `awf-enclave-mcp` along with your organization's exclusions.
+
+CLI proxy startup checks upstream GitHub API connectivity before reporting readiness. A passing local health check alone does not establish upstream connectivity. Proxy values are redacted from CLI proxy and MCP gateway diagnostics.
 
 ## ARC with Docker-in-Docker (DinD)
 
-For a complete ARC DinD setup walkthrough for GitHub Copilot coding agent, see [How to run GitHub Copilot coding agent on ARC with Docker-in-Docker](/gh-aw/guides/arc-dind-copilot-agent/).
+For a complete ARC DinD setup walkthrough for the gh-aw Copilot engine, see [How to run the gh-aw Copilot engine on ARC with Docker-in-Docker](/gh-aw/reference/arc-dind-copilot-agent/).
 
 Actions Runner Controller (ARC) deployments that use a Docker-in-Docker sidecar split the runner container and the Docker daemon container across separate filesystems.
 
@@ -78,6 +139,8 @@ runs-on:
   labels: [linux, x64]
 ---
 ```
+
+The string, array, and object forms are supported by the top-level `runs-on`, `runs-on-slim`, `safe-outputs.runs-on`, `safe-outputs.threat-detection.runs-on`, and custom `safe-outputs.jobs.<job>.runs-on` fields.
 
 ## Sharing configuration via imports
 
@@ -187,7 +250,21 @@ Enterprises running in private clouds or air-gapped environments can redirect ac
 }
 ```
 
-Keys and values must use the `owner/repo@ref` format. Each source version must be mapped individually — wildcard and prefix matching are not supported. A console message is emitted once per applied mapping during compilation.
+Keys and values must use the `owner/repo@ref` format. Each source version must be mapped individually. A console message is emitted once per applied mapping during compilation.
+
+### Version-independent action mirrors (`action_pin_prefixes`)
+
+Use `action_pin_prefixes` to mirror an entire family of actions without updating the configuration when action versions change:
+
+```json title=".github/workflows/aw.json"
+{
+  "action_pin_prefixes": {
+    "actions/": "acme-corp/actions-"
+  }
+}
+```
+
+For example, `actions/checkout@<sha> # v4` becomes `acme-corp/actions-checkout@<sha> # v4`. The original repository is pinned first; the mirror must contain the same commits, and no network lookup of the mirror is needed. The longest matching prefix wins, and an exact `action_pins` entry takes precedence. A console message is emitted once per redirected repository.
 
 ### Container image substitutions (`container_pins`)
 
@@ -210,6 +287,25 @@ Keys and values must use the `owner/repo@ref` format. Each source version must b
 
 Keys are source image references as they appear in compiled workflows. `image` must be a valid image reference without a digest, and `digest` must be a full `sha256:<64 lowercase hex characters>` digest.
 
+### AWF infrastructure image overrides (`sandbox.agent.images`)
+
+Use `container_pins` for general container substitutions, and use `sandbox.agent.images` when replacing AWF infrastructure roles themselves. This is the supported path for self-hosted and air-gapped setups that must mirror and approve AWF sidecar images with explicit digests.
+
+```aw wrap
+sandbox:
+  agent:
+    version: v0.28.8
+    images:
+      squid: registry.example.com/approved/squid:v0.28.8@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      agent: registry.example.com/approved/agent:v0.28.8@sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      api-proxy: registry.example.com/approved/api-proxy:v0.28.8@sha256:2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+> [!NOTE]
+> The digest values in this example are placeholders. Replace them with the exact digests from your approved registry images.
+
+When this manifest is set, AWF uses these references as authoritative runtime role images. Keep values literal and digest-pinned; expressions are rejected at compile time. For role requirements and constraints (for example `cli-proxy` with `tools.github.mode: gh-proxy`, or `build-tools` with `runner.topology: arc-dind`), see [Sandbox custom infrastructure images](/gh-aw/reference/sandbox/#custom-infrastructure-images-sandboxagentimages).
+
 ### Combined example
 
 ```json title=".github/workflows/aw.json"
@@ -229,17 +325,45 @@ Keys are source image references as they appear in compiled workflows. `image` m
 Re-run `gh aw compile` after modifying `aw.json` to regenerate all affected lock files.
 
 > [!NOTE]
-> Neither `action_pins` nor `container_pins` is supported in individual workflow frontmatter. Both are repository-level settings in `aw.json` that apply across all workflows in the repository.
+> `action_pins`, `action_pin_prefixes`, and `container_pins` are repository-level settings in `aw.json`, not individual workflow frontmatter.
 
-## Related documentation
+## Learn More
 
 - [Frontmatter](/gh-aw/reference/frontmatter/#run-configuration-run-name-runs-on-runs-on-slim-timeout-minutes) — `runs-on` and `runs-on-slim` syntax reference
-- [Imports](/gh-aw/reference/imports/) — importable fields and merge semantics
 - [Threat Detection](/gh-aw/reference/threat-detection/) — detection job configuration
 - [Network Access](/gh-aw/reference/network/) — configuring outbound network permissions
 - [Sandbox](/gh-aw/reference/sandbox/) — container and Docker requirements
 - [Ephemerals](/gh-aw/reference/ephemerals/#maintenance-configuration) — full `aw.json` maintenance configuration reference
 - [Enterprise Configuration](/gh-aw/reference/enterprise-configuration/) — custom API endpoints for GHEC/GHES
+
+## GitHub Official Documentation
+
+These links point to the official GitHub documentation for self-hosted runners and related infrastructure:
+
+### Self-hosted runners
+
+- [About self-hosted runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners) — overview, system requirements, and supported architectures
+- [Adding self-hosted runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners) — step-by-step setup for repository, organization, or enterprise
+- [Using self-hosted runners in a workflow](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-self-hosted-runners-in-a-workflow) — how to target self-hosted runners with `runs-on`
+- [Configuring the self-hosted runner application as a service](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/configuring-the-self-hosted-runner-application-as-a-service) — running the runner as a background service
+- [Monitoring and troubleshooting self-hosted runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/monitoring-and-troubleshooting-self-hosted-runners) — runner logs, diagnostics, and connectivity checks
+
+### Labels and runner groups
+
+- [Using labels with self-hosted runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-labels-with-self-hosted-runners) — default and custom labels for routing jobs
+- [Managing access to self-hosted runners using groups](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/managing-access-to-self-hosted-runners-using-groups) — runner groups for organization and enterprise
+
+### Actions Runner Controller (ARC)
+
+- [About Actions Runner Controller](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/about-actions-runner-controller) — overview of the Kubernetes-based autoscaling solution
+- [Quickstart for Actions Runner Controller](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/quickstart-for-actions-runner-controller) — getting started with ARC on Kubernetes
+- [Deploying runner scale sets with Actions Runner Controller](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller) — Helm-based deployment of runner scale sets
+- [Authenticating to the GitHub API for Actions Runner Controller](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/authenticating-to-the-github-api) — PAT and GitHub App authentication for ARC
+
+### Security
+
+- [Security hardening for GitHub Actions](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions) — best practices for secrets, permissions, and self-hosted runner security
+- [About security hardening with OpenID Connect](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect) — using OIDC tokens instead of long-lived credentials
 
 ## Runner environment requirements
 
@@ -249,9 +373,11 @@ Self-hosted runners must meet these requirements for agentic workflows to run re
 
 A working Docker daemon is required. The MCP gateway and sandbox run as containers.
 
+AWF documents Docker Engine `20.10+` and Docker Compose `v2.0+` as installation baselines, not certified deployment versions. Verify `docker info` and `docker compose version` on the actual runner. See [component prerequisites and evidence](/gh-aw/reference/enterprise-configuration/#component-versions-and-validation-evidence).
+
 - **Unix socket**: Docker must be accessible via a Unix socket (typically `/var/run/docker.sock`). If `DOCKER_HOST` is unset, the gateway mounts `/var/run/docker.sock`. If `DOCKER_HOST` is `unix://...` or a bare absolute path, the gateway mounts that socket path. Other schemes (for example `tcp://...`) are ignored for mounts and default back to `/var/run/docker.sock`.
-- **Docker group**: The runner user must be in the `docker` group, or the socket must be world-readable.
-- **ARC/Kubernetes**: Docker-in-Docker (DinD) is **required** for ARC. Set `containerMode.type="dind"` in your ARC Helm configuration. The `containerMode.type="kubernetes"` mode is not supported. The dind sidecar must share the Docker socket via an `emptyDir` volume, and the gateway retries the socket check for up to 10 seconds to handle startup race conditions. See [How to run GitHub Copilot coding agent on ARC with Docker-in-Docker](/gh-aw/guides/arc-dind-copilot-agent/) for the complete setup guide, and [ARC (Actions Runner Controller)](#arc-actions-runner-controller) below for pod security details.
+- **Docker group**: Grant the runner user access through the socket's owning group (typically `docker`). Do not make the socket world-accessible; Docker daemon access is a privileged host capability.
+- **ARC/Kubernetes**: Docker-in-Docker (DinD) is **required** for this ARC execution path. Set `containerMode.type="dind"` in your ARC Helm configuration. The `containerMode.type="kubernetes"` mode without a Docker daemon does not satisfy this setup. The dind sidecar must share the Docker socket via an `emptyDir` volume, and the gateway retries the socket check for up to 10 seconds to handle startup race conditions. See [How to run the gh-aw Copilot engine on ARC with Docker-in-Docker](/gh-aw/reference/arc-dind-copilot-agent/) for the complete setup guide, and [ARC (Actions Runner Controller)](#arc-actions-runner-controller) below for pod security details.
 - **Split-daemon override**: On ARC or other split-daemon topologies where the socket path or group ID cannot be auto-detected, set `GH_AW_DOCKER_SOCK_PATH` and `GH_AW_DOCKER_SOCK_GID` environment variables at the runner level. See [Docker socket override for split-daemon topologies](#docker-socket-override-for-split-daemon-topologies) for details.
 
 ### Node.js
@@ -279,18 +405,18 @@ runtimes:
 
 ### Filesystem
 
-- **Use `RUNNER_TEMP` for transient state.** Put sandbox state, tool downloads, and intermediate outputs in `$RUNNER_TEMP`, which is cleaned between jobs. On shared runners, avoid writing arbitrary workflow data to `/tmp` because it can persist across jobs.
+- **Use `RUNNER_TEMP` for transient state.** Put sandbox state, tool downloads, and intermediate outputs in `$RUNNER_TEMP`. The runner attempts cleanup between jobs, but files it cannot delete can persist. On shared runners, avoid writing arbitrary workflow data to `/tmp`.
 - **No root assumption.** Tool installs, file operations, and sandbox setup should run as the unprivileged runner user. The Copilot CLI install script escalates via `sudo` for specific operations; see the sudo requirements above.
 - **No global installs.** Do not install packages to `/usr/local/`, `/opt/hostedtoolcache/`, or other system-wide paths. These may be read-only, shared across runners, or bind-mounted read-only inside the sandbox. Use job-scoped writable locations instead.
 - **No hardcoded `HOME` paths.** The runner's home directory may not be `/home/runner`. Use `$HOME` or `$RUNNER_TEMP` instead of hardcoded paths.
 
 ### Post-job cleanup
 
-Self-hosted runners persist between jobs. Agentic workflows should clean up after themselves:
+For reused self-hosted runners, post-job cleanup reduces residual state but is not recovery from a compromised host:
 
-- Files written to `$RUNNER_TEMP` are automatically cleaned.
-- Docker containers on the `awf-net` bridge are stopped and removed by the sandbox teardown.
-- If your workflow creates files outside `$RUNNER_TEMP` (e.g. in `$GITHUB_WORKSPACE`), the runner's built-in workspace cleanup handles this.
+- Check that `$RUNNER_TEMP` cleanup succeeded; permissions or interrupted teardown can leave files behind.
+- Sandbox teardown stops and removes its Docker containers; this does not establish that the daemon's other containers, images, volumes, or build caches are clean.
+- Explicitly manage files outside `$RUNNER_TEMP`, including `$GITHUB_WORKSPACE` and `$HOME`. Workspace cleanup is not a whole-host reset. Use the [host isolation checklist](#host-isolation-checklist) before switching trust domains.
 
 ### Network
 
@@ -303,11 +429,11 @@ Self-hosted runners need outbound HTTPS access to:
 
 ## GHES (GitHub Enterprise Server)
 
-Agentic workflows can run on GHES with some additional configuration.
+gh-aw implements GHES compatibility paths; these are not an owner-confirmed end-to-end GHES support commitment. See the [applicability summary](/gh-aw/reference/enterprise-configuration/#deployment-and-runner-applicability) and [AWF enterprise routing scope](https://github.com/github/gh-aw-firewall/blob/main/docs/enterprise-configuration.md).
 
 ### GHES compatibility mode
 
-GHES does not support the `@actions/artifact` v2.0.0+ backend used by `upload-artifact@v4+` and `download-artifact@v4+`. Compiled workflows use the latest artifact action versions by default, which fail on GHES with `GHESNotSupportedError`.
+GHES instances without the `@actions/artifact` v2.0.0+ backend cannot use `upload-artifact@v4+` and `download-artifact@v4+`. Default compiled artifact actions fail there with `GHESNotSupportedError`.
 
 Enable GHES compatibility mode in `.github/workflows/aw.json` to compile with GHES mode explicitly enabled:
 
@@ -323,11 +449,13 @@ Or compile with `--ghes` for one-off workflow generation:
 gh aw compile --ghes my-workflow.md
 ```
 
-Artifact actions continue using the latest non-v3 pins because v3 artifact actions are deprecated.
+Compatibility mode emits `upload-artifact@v3.2.2` and `download-artifact@v3.1.0`, which use the artifact backend supported by GHES. Default GitHub.com compilation continues to use the latest artifact actions.
+
+Compatibility mode also omits compiler-generated `cache-mode` fields. The historical GHES 3.21.x-and-earlier guidance concerns artifact-backend compatibility only; Actions Runner `2.327.1+` is the pinned actions' Node.js 24 requirement. Neither is a stack certification or a tested GHES release matrix. See [GHES compatibility mode and its cache security caveat](/gh-aw/reference/enterprise-configuration/#ghes-compatibility-mode).
 
 ### API endpoint
 
-GHES instances need the `api-target` engine configuration. See [Enterprise Configuration](/gh-aw/reference/enterprise-configuration/) for full setup instructions.
+For Copilot compatibility investigations, configure the inference endpoint confirmed for your deployment, independently of the GHES repository/API host. The example below is an enterprise endpoint routing example, not proof that Copilot is available on the server. See [Copilot prerequisites](/gh-aw/troubleshooting/common-issues/#copilot-engine-prerequisites-on-ghes).
 
 ```aw
 ---
@@ -344,9 +472,9 @@ network:
 
 ## ARC (Actions Runner Controller)
 
-GitHub Copilot coding agent **requires** Docker-in-Docker (DinD) mode on ARC. Set `containerMode.type="dind"` in your ARC Helm configuration. The `containerMode.type="kubernetes"` mode is not supported.
+The gh-aw Copilot engine's ARC path **requires** Docker-in-Docker (DinD). It runs Copilot CLI in an Actions job, not the separate GitHub Copilot coding-agent service. Set `containerMode.type="dind"` in your ARC Helm configuration; Kubernetes mode without a Docker daemon does not satisfy this path.
 
-Set `runner.topology: arc-dind` in workflow frontmatter to enable ARC DinD split-filesystem handling. See the [ARC with Docker-in-Docker (DinD)](#arc-with-docker-in-docker-dind) section above and the [ARC DinD setup guide](/gh-aw/guides/arc-dind-copilot-agent/) for a complete walkthrough.
+Set `runner.topology: arc-dind` in workflow frontmatter to enable ARC DinD split-filesystem handling. See the [ARC with Docker-in-Docker (DinD)](#arc-with-docker-in-docker-dind) section above and the [ARC DinD setup guide](/gh-aw/reference/arc-dind-copilot-agent/) for a complete walkthrough.
 
 ### Docker-in-Docker (dind) sidecar
 
@@ -363,4 +491,4 @@ The dind sidecar requires `privileged: true` so `dockerd` can run. The runner co
 In network-isolation mode (the default for `topology: arc-dind`), AWF enforces egress via Docker network topology — an internal Docker network with no internet route and a dual-homed Squid proxy. All network enforcement happens inside the Docker daemon's domain (the dind sidecar). The runner container only issues Docker API commands via the socket; it never manipulates host `iptables` or network namespaces.
 
 > [!NOTE]
-> If your cluster enforces `allowPrivilegeEscalation: false` or `no-new-privileges` on the runner container, pass `--rootless` to the Copilot CLI install script so it installs to `~/.local/bin` without `sudo`. See [Pod security and rootless install](/gh-aw/guides/arc-dind-copilot-agent/#pod-security-and-rootless-install) in the ARC DinD guide.
+> If your cluster enforces `allowPrivilegeEscalation: false` or `no-new-privileges` on the runner container, pass `--rootless` to the Copilot CLI install script so it installs to `$RUNNER_TEMP/gh-aw/bin` without `sudo`. See [Pod security and rootless install](/gh-aw/reference/arc-dind-copilot-agent/#pod-security-and-rootless-install) in the ARC DinD guide.

@@ -19,7 +19,7 @@ var includeLog = logger.New("parser:include_processor")
 
 // processIncludesWithVisited processes import directives with cycle detection
 func processIncludesWithVisited(content, baseDir string, extractTools bool, visited map[string]struct {
-}) (string, error) {
+}, cache *ImportCache) (string, error) {
 	if fastResult, fastPath := fastPathForNoIncludes(content, extractTools); fastPath {
 		return fastResult, nil
 	}
@@ -33,7 +33,7 @@ func processIncludesWithVisited(content, baseDir string, extractTools bool, visi
 		// Parse import directive
 		directive := ParseImportDirective(line)
 		if directive != nil {
-			includedContent, shouldSkip, err := processIncludeDirectiveWithVisited(directive, baseDir, extractTools, visited)
+			includedContent, shouldSkip, err := processIncludeDirectiveWithVisited(directive, baseDir, extractTools, visited, cache)
 			if err != nil {
 				return "", err
 			}
@@ -53,6 +53,9 @@ func processIncludesWithVisited(content, baseDir string, extractTools bool, visi
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("scan imported Markdown: %w", err)
+	}
 	return result.String(), nil
 }
 
@@ -83,9 +86,9 @@ func processIncludeDirectiveWithVisited(
 	baseDir string,
 	extractTools bool,
 	visited map[string]struct {
-	}) (string, bool, error) {
+	}, cache *ImportCache) (string, bool, error) {
 	emitIncludeDirectiveDeprecationWarning(directive)
-	resolution, shouldSkip, err := resolveDirectiveWithVisited(directive, baseDir, extractTools, visited)
+	resolution, shouldSkip, err := resolveDirectiveWithVisited(directive, baseDir, extractTools, visited, cache)
 	if err != nil || shouldSkip {
 		return "", shouldSkip, err
 	}
@@ -94,7 +97,7 @@ func processIncludeDirectiveWithVisited(
 	visited[resolution.fullPath] = struct {
 	}{}
 
-	includedContent, err := processIncludedFileWithVisited(resolution.fullPath, resolution.sectionName, extractTools, visited)
+	includedContent, err := processIncludedFileWithVisited(resolution.fullPath, resolution.sectionName, extractTools, visited, cache)
 	if err != nil {
 		return "", false, fmt.Errorf("failed to process included file '%s': %w", resolution.fullPath, err)
 	}
@@ -131,9 +134,9 @@ func resolveDirectiveWithVisited(
 	baseDir string,
 	extractTools bool,
 	visited map[string]struct {
-	}) (includeDirectiveResolution, bool, error) {
-	filePath, sectionName := splitIncludePathAndSection(directive.Path)
-	fullPath, err := ResolveIncludePath(filePath, baseDir, nil)
+	}, cache *ImportCache) (includeDirectiveResolution, bool, error) {
+	filePath, sectionName := splitPathAndSection(directive.Path)
+	fullPath, err := ResolveIncludePath(filePath, baseDir, cache)
 	if err != nil {
 		includeLog.Printf("Failed to resolve include path '%s': %v", filePath, err)
 		if directive.IsOptional {
@@ -160,24 +163,17 @@ func resolveDirectiveWithVisited(
 	}, false, nil
 }
 
-func splitIncludePathAndSection(includePath string) (string, string) {
-	if strings.Contains(includePath, "#") {
-		parts := strings.SplitN(includePath, "#", 2)
-		return parts[0], parts[1]
-	}
-	return includePath, ""
-}
-
 // processIncludedFile processes a single included file, optionally extracting a section
 // processIncludedFileWithVisited processes a single included file with cycle detection for nested includes
 func processIncludedFileWithVisited(filePath, sectionName string, extractTools bool, visited map[string]struct {
-}) (string, error) {
+}, caches ...*ImportCache) (string, error) {
 	includeLog.Printf("Reading included file: %s (extractTools=%t, section=%s)", filePath, extractTools, sectionName)
 	content, err := readFileFunc(filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read included file %s: %w", filePath, err)
 	}
 	includeLog.Printf("Read %d bytes from included file: %s", len(content), filePath)
+	content = []byte(RemoveConnectorDocumentation(string(content)))
 
 	result, validationErr, isWorkflowFile, isAgentFile, err := parseAndValidateIncludedFrontmatter(filePath, content)
 	if err != nil {
@@ -189,7 +185,7 @@ func processIncludedFileWithVisited(filePath, sectionName string, extractTools b
 	}
 
 	// Extract markdown content
-	return extractIncludedMarkdownContent(filePath, sectionName, content, visited, extractTools)
+	return extractIncludedMarkdownContent(filePath, sectionName, content, visited, extractTools, includeImportCache(caches))
 }
 
 func parseAndValidateIncludedFrontmatter(filePath string, content []byte) (*FrontmatterResult, error, bool, bool, error) {
@@ -253,25 +249,28 @@ func applyRelaxedIncludedFrontmatterValidation(filePath string, frontmatter map[
 func collectUnexpectedIncludedFrontmatterFields(frontmatter map[string]any) []string {
 	validFields := map[string]struct {
 	}{
-		"tools":          {},
-		"engine":         {},
-		"env":            {},
-		"network":        {},
-		"mcp-servers":    {},
-		"imports":        {},
-		"name":           {},
-		"description":    {},
-		"steps":          {},
-		"jobs":           {},
-		"safe-outputs":   {},
-		"mcp-scripts":    {},
-		"services":       {},
-		"runtimes":       {},
-		"permissions":    {},
-		"secret-masking": {},
-		"inputs":         {},
-		"import-schema":  {},
-		"features":       {},
+		"tools":           {},
+		"engine":          {},
+		"env":             {},
+		"network":         {},
+		"mcp-servers":     {},
+		"imports":         {},
+		"name":            {},
+		"description":     {},
+		"steps":           {},
+		"pre-steps":       {},
+		"pre-agent-steps": {},
+		"post-steps":      {},
+		"jobs":            {},
+		"safe-outputs":    {},
+		"mcp-scripts":     {},
+		"services":        {},
+		"runtimes":        {},
+		"permissions":     {},
+		"secret-masking":  {},
+		"inputs":          {},
+		"import-schema":   {},
+		"features":        {},
 	}
 	var unexpectedFields []string
 	for key := range frontmatter {
@@ -322,14 +321,14 @@ func extractToolsFromIncludedResult(result *FrontmatterResult, validationErr err
 }
 
 func extractIncludedMarkdownContent(filePath, sectionName string, content []byte, visited map[string]struct {
-}, extractTools bool) (string, error) {
+}, extractTools bool, cache *ImportCache) (string, error) {
 	markdownContent, err := ExtractMarkdownContent(string(content))
 	if err != nil {
 		return "", fmt.Errorf("failed to extract markdown from %s: %w", filePath, err)
 	}
 
 	includedDir := filepath.Dir(filePath)
-	markdownContent, err = processIncludesWithVisited(markdownContent, includedDir, extractTools, visited)
+	markdownContent, err = processIncludesWithVisited(markdownContent, includedDir, extractTools, visited, cache)
 	if err != nil {
 		return "", fmt.Errorf("failed to process nested includes in %s: %w", filePath, err)
 	}

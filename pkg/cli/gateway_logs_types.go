@@ -4,6 +4,7 @@ package cli
 
 import (
 	"encoding/json"
+	"maps"
 	"time"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -83,14 +84,55 @@ type GuardPolicyEvent struct {
 
 // GatewayServerMetrics represents usage metrics for a single MCP server
 type GatewayServerMetrics struct {
-	ServerName         string
+	MCPServerStatsBase `json:"-" console:"-"`
 	RequestCount       int
-	ToolCallCount      int
 	TotalDuration      float64 // in milliseconds
-	ErrorCount         int
-	FilteredCount      int // number of DIFC_FILTERED events for this server
-	GuardPolicyBlocked int // number of tool calls blocked by guard policies for this server
+	FilteredCount      int     // number of DIFC_FILTERED events for this server
+	GuardPolicyBlocked int     // number of tool calls blocked by guard policies for this server
 	Tools              map[string]*GatewayToolMetrics
+}
+
+// MarshalJSON preserves the gateway's capitalized JSON keys and zero-valued counts.
+func (s GatewayServerMetrics) MarshalJSON() ([]byte, error) {
+	type gatewayServerMetrics GatewayServerMetrics
+	return json.Marshal(struct {
+		ServerName    string
+		ToolCallCount int
+		ErrorCount    int
+		gatewayServerMetrics
+	}{
+		ServerName:           s.ServerName,
+		ToolCallCount:        s.ToolCallCount,
+		ErrorCount:           s.ErrorCount,
+		gatewayServerMetrics: gatewayServerMetrics(s),
+	})
+}
+
+// UnmarshalJSON maps the gateway's JSON keys into the shared MCP statistics.
+func (s *GatewayServerMetrics) UnmarshalJSON(data []byte) error {
+	type gatewayServerMetrics GatewayServerMetrics
+	staged := gatewayServerMetrics(*s)
+	// JSON replaces map values rather than decoding into existing tool pointers.
+	staged.Tools = maps.Clone(s.Tools)
+	decoded := struct {
+		ServerName    string
+		ToolCallCount int
+		ErrorCount    int
+		*gatewayServerMetrics
+	}{
+		ServerName:           s.ServerName,
+		ToolCallCount:        s.ToolCallCount,
+		ErrorCount:           s.ErrorCount,
+		gatewayServerMetrics: &staged,
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	staged.ServerName = decoded.ServerName
+	staged.ToolCallCount = decoded.ToolCallCount
+	staged.ErrorCount = decoded.ErrorCount
+	*s = GatewayServerMetrics(staged)
+	return nil
 }
 
 // GatewayToolMetrics represents usage metrics for a specific tool
@@ -126,8 +168,10 @@ type GatewayMetrics struct {
 // exchanged between the AI engine and MCP servers, as well as DIFC_FILTERED events.
 type RPCMessageEntry struct {
 	Timestamp string          `json:"timestamp"`
-	Direction string          `json:"direction"` // "IN" = received from server, "OUT" = sent to server; empty for DIFC_FILTERED
-	Type      string          `json:"type"`      // "REQUEST", "RESPONSE", or "DIFC_FILTERED"
+	Direction string          `json:"direction"`         // "IN" = received from server, "OUT" = sent to server; empty for DIFC_FILTERED
+	Type      string          `json:"type"`              // legacy field: "REQUEST", "RESPONSE", or "DIFC_FILTERED"
+	Event     string          `json:"event,omitempty"`   // schema "rpc-message/v2" field: "rpc_request", "rpc_response", or "difc_filtered"
+	Schema    string          `json:"_schema,omitempty"` // e.g. "rpc-message/v2"
 	ServerID  string          `json:"server_id"`
 	Payload   json.RawMessage `json:"payload"`
 	// Fields populated only for DIFC_FILTERED entries
@@ -140,6 +184,35 @@ type RPCMessageEntry struct {
 	AuthorLogin       string   `json:"author_login,omitempty"`
 	HTMLURL           string   `json:"html_url,omitempty"`
 	Number            string   `json:"number,omitempty"`
+}
+
+// rpcEventToType maps the "event" field values used by the schema "rpc-message/v2"
+// format (written by real Copilot CLI MCP gateway telemetry) to the legacy "type"
+// values ("REQUEST", "RESPONSE", "DIFC_FILTERED") used throughout this codebase.
+// Real-world rpc-messages.jsonl files do not populate a top-level "type" field at
+// all; they use "event" instead (e.g. "rpc_request"/"rpc_response").
+var rpcEventToType = map[string]string{
+	"rpc_request":   "REQUEST",
+	"rpc_response":  "RESPONSE",
+	"difc_filtered": "DIFC_FILTERED",
+}
+
+// EffectiveType returns the logical message type for this entry ("REQUEST",
+// "RESPONSE", or "DIFC_FILTERED"), normalizing across rpc-messages.jsonl schema
+// versions. Older/synthetic files populate the top-level "type" field directly;
+// real production files (schema "rpc-message/v2") use "event" instead. The legacy
+// "type" field takes precedence when both are present, since no known schema
+// version populates both fields with conflicting values; this keeps the contract
+// simple while remaining forward-compatible if a future schema starts setting
+// "type" explicitly again.
+func (e RPCMessageEntry) EffectiveType() string {
+	if e.Type != "" {
+		return e.Type
+	}
+	if mapped, ok := rpcEventToType[e.Event]; ok {
+		return mapped
+	}
+	return e.Event
 }
 
 // rpcRequestPayload represents the JSON-RPC request payload fields we care about.
@@ -158,6 +231,25 @@ type rpcToolCallParams struct {
 type rpcResponsePayload struct {
 	ID    any       `json:"id"`
 	Error *rpcError `json:"error,omitempty"`
+}
+
+func (p *rpcResponsePayload) UnmarshalJSON(data []byte) error {
+	type responseAlias rpcResponsePayload
+	var decoded struct {
+		responseAlias
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*p = rpcResponsePayload(decoded.responseAlias)
+	var resultMetadata struct {
+		IsError bool `json:"isError"`
+	}
+	if p.Error == nil && len(decoded.Result) > 0 && json.Unmarshal(decoded.Result, &resultMetadata) == nil && resultMetadata.IsError {
+		p.Error = &rpcError{Message: "MCP tool returned an error result"}
+	}
+	return nil
 }
 
 // rpcError represents a JSON-RPC error object.
@@ -215,8 +307,8 @@ func getOrCreateServer(metrics *GatewayMetrics, serverName string) *GatewayServe
 	}
 
 	server := &GatewayServerMetrics{
-		ServerName: serverName,
-		Tools:      make(map[string]*GatewayToolMetrics),
+		MCPServerStatsBase: MCPServerStatsBase{ServerName: serverName},
+		Tools:              make(map[string]*GatewayToolMetrics),
 	}
 	metrics.Servers[serverName] = server
 	return server

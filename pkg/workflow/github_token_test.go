@@ -26,9 +26,9 @@ func TestGetEffectiveGitHubToken(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getEffectiveGitHubToken(tt.customToken)
+			result := resolveGitHubToken(tt.customToken)
 			if result != tt.expected {
-				t.Errorf("getEffectiveGitHubToken() = %q, want %q", result, tt.expected)
+				t.Errorf("resolveGitHubToken() = %q, want %q", result, tt.expected)
 			}
 		})
 	}
@@ -54,9 +54,9 @@ func TestGetEffectiveSafeOutputGitHubToken(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getEffectiveSafeOutputGitHubToken(tt.customToken)
+			result := resolveSafeOutputGitHubToken(tt.customToken)
 			if result != tt.expected {
-				t.Errorf("getEffectiveSafeOutputGitHubToken() = %q, want %q", result, tt.expected)
+				t.Errorf("resolveSafeOutputGitHubToken() = %q, want %q", result, tt.expected)
 			}
 		})
 	}
@@ -115,6 +115,32 @@ func TestGetEffectiveAgentGitHubToken(t *testing.T) {
 				t.Errorf("getEffectiveCopilotCodingAgentGitHubToken() = %q, want %q", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestGetEffectiveAgentGitHubTokenSource(t *testing.T) {
+	if got := getEffectiveCopilotCodingAgentGitHubTokenSource(""); got != "${{ secrets.GH_AW_AGENT_TOKEN != '' && 'GH_AW_AGENT_TOKEN' || secrets.GH_AW_GITHUB_TOKEN != '' && 'GH_AW_GITHUB_TOKEN' || secrets.GITHUB_TOKEN != '' && 'GITHUB_TOKEN' || 'unavailable' }}" {
+		t.Fatalf("Unexpected default assignment credential source expression: %s", got)
+	}
+	for _, customToken := range []string{"${{ secrets.PRIVATE_TOKEN_NAME }}", "${{ inputs.token }}", "test-sensitive-value"} {
+		if got := getEffectiveCopilotCodingAgentGitHubTokenSource(customToken); got != `"configured"` {
+			t.Fatal("Custom assignment credential source must use only the configured category")
+		}
+	}
+}
+
+func TestAgentGitHubTokenAndSourceSharePrecedence(t *testing.T) {
+	originalSecrets := copilotCodingAgentGitHubTokenSecrets
+	t.Cleanup(func() {
+		copilotCodingAgentGitHubTokenSecrets = originalSecrets
+	})
+	copilotCodingAgentGitHubTokenSecrets = []string{"SECOND_AGENT_TOKEN", "FIRST_AGENT_TOKEN"}
+
+	if got := getEffectiveCopilotCodingAgentGitHubToken(""); got != "${{ secrets.SECOND_AGENT_TOKEN || secrets.FIRST_AGENT_TOKEN }}" {
+		t.Fatalf("Assignment token must follow the shared secret order, got %q", got)
+	}
+	if got := getEffectiveCopilotCodingAgentGitHubTokenSource(""); got != "${{ secrets.SECOND_AGENT_TOKEN != '' && 'SECOND_AGENT_TOKEN' || secrets.FIRST_AGENT_TOKEN != '' && 'FIRST_AGENT_TOKEN' || 'unavailable' }}" {
+		t.Fatalf("Assignment credential source must follow the shared secret order, got %q", got)
 	}
 }
 
@@ -178,6 +204,67 @@ func TestCombineTokenExpressions(t *testing.T) {
 }
 
 func TestResolvePRCheckoutToken(t *testing.T) {
+	t.Run("uses global GitHub App token for create-pull-request checkout", func(t *testing.T) {
+		safeOutputs := &SafeOutputsConfig{
+			GitHubApp: &GitHubAppConfig{
+				AppID:      "${{ vars.APP_ID }}",
+				PrivateKey: "${{ secrets.APP_KEY }}",
+			},
+			CreatePullRequests: &CreatePullRequestsConfig{},
+		}
+
+		token, isCustom := resolvePRCheckoutToken(safeOutputs, NewCheckoutManager(nil))
+		if token != "${{ steps.safe-outputs-app-token.outputs.token }}" {
+			t.Fatalf("expected global app token, got %q", token)
+		}
+		if !isCustom {
+			t.Fatalf("expected isCustom=true")
+		}
+	})
+
+	t.Run("ignore-if-missing global GitHub App falls back to safe-output token", func(t *testing.T) {
+		safeOutputs := &SafeOutputsConfig{
+			GitHubApp: &GitHubAppConfig{
+				AppID:           "${{ vars.APP_ID }}",
+				PrivateKey:      "${{ secrets.APP_KEY }}",
+				IgnoreIfMissing: true,
+			},
+			PushToPullRequestBranch: &PushToPullRequestBranchConfig{},
+		}
+
+		token, isCustom := resolvePRCheckoutToken(safeOutputs, NewCheckoutManager(nil))
+		if token != "${{ steps.safe-outputs-app-token.outputs.token || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}" {
+			t.Fatalf("expected app token with safe-output fallback, got %q", token)
+		}
+		if !isCustom {
+			t.Fatalf("expected isCustom=true")
+		}
+	})
+
+	t.Run("optional global App preserves custom and default token fallbacks", func(t *testing.T) {
+		for _, ignoreMissing := range []bool{false, true} {
+			safeOutputs := &SafeOutputsConfig{
+				GitHubToken: "${{ secrets.SO_TOKEN }}",
+				GitHubApp: &GitHubAppConfig{
+					AppID:           "${{ vars.APP_ID }}",
+					PrivateKey:      "${{ secrets.APP_KEY }}",
+					IgnoreIfMissing: ignoreMissing,
+				},
+			}
+			if ignoreMissing {
+				safeOutputs.CreatePullRequests = &CreatePullRequestsConfig{}
+			}
+			token, isCustom := resolvePRCheckoutToken(safeOutputs, NewCheckoutManager(nil))
+			expected := "${{ steps.safe-outputs-app-token.outputs.token || secrets.SO_TOKEN || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}"
+			if token != expected {
+				t.Fatalf("ignore-if-missing=%v: expected complete fallback chain, got %q", ignoreMissing, token)
+			}
+			if !isCustom {
+				t.Fatalf("expected isCustom=true")
+			}
+		}
+	})
+
 	t.Run("uses checkout safe-output app token when target-repo matches", func(t *testing.T) {
 		safeOutputs := &SafeOutputsConfig{
 			CreatePullRequests: &CreatePullRequestsConfig{

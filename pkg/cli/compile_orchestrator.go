@@ -2,29 +2,53 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var compileOrchestratorLog = logger.New("cli:compile_orchestrator")
+var compileUpdateContainerPins = updateContainerPins
 
 // CompileWorkflows compiles workflows based on the provided configuration
-func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.WorkflowData, error) {
+func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.WorkflowData, error) { //nolint:largefunc // Existing compilation lifecycle remains centralized.
+	if config.ReadOnly {
+		config.NoEmit = true
+	}
+	config = applyWorkspaceStrictMode(applyDevelopmentCompileMode(config))
 	compileOrchestratorLog.Printf("Starting workflow compilation: files=%d, validate=%v, watch=%v, noEmit=%v",
 		len(config.MarkdownFiles), config.Validate, config.Watch, config.NoEmit)
 
 	// Check context cancellation at the start
 	select {
 	case <-ctx.Done():
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Operation cancelled"))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr("Operation cancelled"))
 		return nil, ctx.Err()
 	default:
+	}
+
+	if err := validateCompileConfig(config); err != nil {
+		return nil, err
+	}
+	if err := validateMCPCompileProgressPath(config.MCPProgressFile); err != nil {
+		return nil, err
+	}
+	if config.DryRun {
+		config.dryRunReport = newDryRunCompileReport(config)
+		if !config.JSONOutput {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessageStderr(dryRunScopeMessage))
+		}
+	}
+
+	if config.Watch && IsRunningInCI() {
+		return nil, errors.New("watch mode cannot be used in CI or Copilot coding agent environments")
 	}
 
 	if os.Getenv("GH_HOST") == "" { //nolint:osgetenvlibrary
@@ -36,9 +60,8 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 		}
 	}
 
-	// Validate configuration
-	if err := validateCompileConfig(config); err != nil {
-		return nil, err
+	if config.Models && config.activeModels == nil {
+		PrepareCompileModelValidation(ctx, &config)
 	}
 
 	// Validate action mode if specified
@@ -61,6 +84,20 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 	// Initialize actionlint statistics if actionlint is enabled
 	if config.Actionlint && !config.NoEmit {
 		initActionlintStats()
+	}
+
+	// Warn or error when shellcheck is requested but not installed.
+	// Skip this check when --no-emit is set: no lock files are written so shellcheck
+	// is never invoked. When the binary is absent, Docker is used as a fallback (lazy
+	// — only when there are scripts to lint). Only warn/error when neither is available.
+	if config.shellcheckEnabled() && !config.NoEmit && !isShellcheckAvailable() {
+		if !IsDockerAvailable(ctx) {
+			if config.Strict {
+				return nil, errors.New("shellcheck not available: binary not found in PATH and Docker is not running; install shellcheck or start Docker to enable run step linting")
+			} else {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr("shellcheck binary not found in PATH and Docker is not running; run step linting will be skipped"))
+			}
+		}
 	}
 
 	// Track compilation statistics
@@ -89,6 +126,10 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 	}
 
 	// Create and configure compiler
+	if err := maybeForceRefreshContainerPins(ctx, config, workflowDir); err != nil {
+		return nil, err
+	}
+
 	compiler := createAndConfigureCompiler(config)
 	compiler.SetContext(ctx)
 
@@ -108,7 +149,7 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 		var markdownFile string
 		if len(config.MarkdownFiles) > 0 {
 			if len(config.MarkdownFiles) > 1 {
-				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Watch mode only supports a single file, using the first one"))
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr("Watch mode only supports a single file, using the first one"))
 			}
 			// Resolve the workflow file to get the full path
 			resolvedFile, err := resolveWorkflowFile(config.MarkdownFiles[0], config.Verbose)
@@ -122,11 +163,76 @@ func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.Wo
 	}
 
 	// Compile specific files or all files in directory
+	var workflowDataList []*workflow.WorkflowData
+	var err error
 	if len(config.MarkdownFiles) > 0 {
 		// Compile specific workflow files
-		return compileSpecificFiles(ctx, compiler, config, stats, &validationResults)
+		workflowDataList, err = compileSpecificFiles(ctx, compiler, config, stats, &validationResults)
+	} else {
+		// Compile all workflow files in directory
+		workflowDataList, err = compileAllFilesInDirectory(ctx, compiler, config, workflowDir, stats, &validationResults)
+	}
+	if err != nil {
+		return workflowDataList, err
 	}
 
-	// Compile all workflow files in directory
-	return compileAllFilesInDirectory(ctx, compiler, config, workflowDir, stats, &validationResults)
+	// Run repository-wide post-processing once after either pipeline succeeds,
+	// including generation of all auxiliary workflows, not once per file or directory.
+	if config.ActionsLock {
+		if err := runCompileActionsLock(ctx); err != nil {
+			return workflowDataList, err
+		}
+	}
+	return workflowDataList, nil
+}
+
+func runCompileActionsLock(ctx context.Context) error {
+	gitRoot, err := gitutil.FindGitRoot()
+	if err != nil {
+		return fmt.Errorf("failed to find repository root for gh actions-lock: %w", err)
+	}
+
+	compileOrchestratorLog.Print("Running gh actions-lock --no-narrow after compilation")
+	cmd := workflow.ExecGHContext(ctx, "actions-lock", "--no-narrow")
+	cmd.Dir = gitRoot
+	// Keep extension output separate from compile --json results on stdout.
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("gh actions-lock --no-narrow failed: %w; if the extension is missing, install it with 'gh extension install github/gh-actions-lock'", err)
+	}
+	return nil
+}
+
+func applyWorkspaceStrictMode(config CompileConfig) CompileConfig {
+	gitRoot, err := gitutil.FindGitRoot()
+	if err != nil {
+		gitRoot = ""
+	}
+	repoConfig, err := workflow.LoadRepoConfig(gitRoot)
+	if err == nil && repoConfig.Strict {
+		config.Strict = true
+	}
+	return config
+}
+
+func maybeForceRefreshContainerPins(ctx context.Context, config CompileConfig, workflowDir string) error {
+	if !config.ForceRefreshContainerPins {
+		return nil
+	}
+	if config.NoEmit {
+		if config.Verbose {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Skipping --force-refresh-container-pins because --no-emit is set"))
+		}
+		return nil
+	}
+
+	compileOrchestratorLog.Print("Refreshing container image digest pins before compilation")
+	if _, err := compileUpdateContainerPins(ctx, defaultContainerPinUpdateDeps(), workflowDir, config.Verbose, containerPinUpdateOptions{
+		refreshExisting:     true,
+		failOnResolveErrors: true,
+	}); err != nil {
+		return fmt.Errorf("failed to refresh container pins: %w", err)
+	}
+	return nil
 }

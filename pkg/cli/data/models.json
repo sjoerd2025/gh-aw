@@ -83,6 +83,15 @@
           },
           "provider_type": "anthropic"
         },
+        "claude-fable-5.1": {
+          "cost": {
+            "input": "1e-05",
+            "output": "5e-05",
+            "cache_read": "2.5e-07",
+            "cache_write": "1.25e-05"
+          },
+          "provider_type": "anthropic"
+        },
         "claude-haiku-4-5": {
           "cost": {
             "input": "1e-06",
@@ -98,6 +107,15 @@
             "output": "5e-06",
             "cache_read": "1.0000000000000001e-07",
             "cache_write": "1.25e-06"
+          },
+          "provider_type": "anthropic"
+        },
+        "claude-haiku-5-5": {
+          "cost": {
+            "input": "1e-07",
+            "output": "5e-07",
+            "cache_read": "1e-08",
+            "cache_write": "1.25e-07"
           },
           "provider_type": "anthropic"
         },
@@ -244,6 +262,24 @@
             "cache_write": "6.25e-06"
           },
           "provider_type": "anthropic"
+        },
+        "claude-opus-5-5": {
+          "cost": {
+            "input": "4e-06",
+            "output": "2e-05",
+            "cache_read": "2e-07",
+            "cache_write": "5e-06"
+          },
+          "provider_type": "anthropic"
+        },
+        "claude-sonnet-5-5": {
+          "cost": {
+            "input": "2e-06",
+            "output": "1e-05",
+            "cache_read": "1e-07",
+            "cache_write": "2.5e-06"
+          },
+          "provider_type": "anthropic"
         }
       }
     },
@@ -258,12 +294,30 @@
           },
           "provider_type": "anthropic"
         },
+        "claude-fable-5.1": {
+          "cost": {
+            "input": "1e-05",
+            "output": "5e-05",
+            "cache_read": "2.5e-07",
+            "cache_write": "1.25e-05"
+          },
+          "provider_type": "anthropic"
+        },
         "claude-haiku-4.5": {
           "cost": {
             "input": "1e-06",
             "output": "5e-06",
             "cache_read": "1.0000000000000001e-07",
             "cache_write": "1.25e-06"
+          },
+          "provider_type": "anthropic"
+        },
+        "claude-haiku-5.5": {
+          "cost": {
+            "input": "1e-07",
+            "output": "5e-07",
+            "cache_read": "1e-08",
+            "cache_write": "1.25e-07"
           },
           "provider_type": "anthropic"
         },
@@ -312,6 +366,15 @@
           },
           "provider_type": "anthropic"
         },
+        "claude-opus-5.5": {
+          "cost": {
+            "input": "4e-06",
+            "output": "2e-05",
+            "cache_read": "2e-07",
+            "cache_write": "5e-06"
+          },
+          "provider_type": "anthropic"
+        },
         "claude-sonnet-4": {
           "cost": {
             "input": "3e-06",
@@ -344,6 +407,15 @@
             "input": "2e-06",
             "output": "1e-05",
             "cache_read": "2e-07",
+            "cache_write": "2.5e-06"
+          },
+          "provider_type": "anthropic"
+        },
+        "claude-sonnet-5.5": {
+          "cost": {
+            "input": "2e-06",
+            "output": "1e-05",
+            "cache_read": "1e-07",
             "cache_write": "2.5e-06"
           },
           "provider_type": "anthropic"
@@ -388,9 +460,27 @@
         },
         "gemini-3.6-flash": {
           "cost": {
-            "input": "1.5e-06",
-            "output": "7.5e-06",
-            "cache_read": "1.5e-07"
+            "input": "7.5e-07",
+            "output": "3.75e-06",
+            "cache_read": "7.5e-08"
+          },
+          "provider_type": "openai",
+          "wire_api": "completions"
+        },
+        "gemini-3.7-flash": {
+          "cost": {
+            "input": "7.5e-07",
+            "output": "3.75e-06",
+            "cache_read": "7.5e-08"
+          },
+          "provider_type": "openai",
+          "wire_api": "completions"
+        },
+        "gemini-3.8-flash": {
+          "cost": {
+            "input": "7.5e-07",
+            "output": "3.75e-06",
+            "cache_read": "7.5e-08"
           },
           "provider_type": "openai",
           "wire_api": "completions"
@@ -408,7 +498,7 @@
           "cost": {
             "input": "2.5e-07",
             "output": "2e-06",
-            "cache_read": "2.5000000000000002e-08"
+            "cache_read": "2.5e-08"
           },
           "provider_type": "openai",
           "wire_api": "responses"
@@ -478,27 +568,90 @@
         },
         "gpt-5.6-luna": {
           "cost": {
-            "input": "1e-06",
-            "output": "6e-06",
-            "cache_read": "1e-07"
+            "input": "2e-07",
+            "output": "1.2e-06",
+            "cache_read": "2e-08",
+            "cache_write": "2.5e-07"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-5.6-luna-utility": {
+          "cost": {
+            "input": "2e-07",
+            "output": "1.2e-06",
+            "cache_read": "2e-08",
+            "cache_write": "2.5e-07"
           },
           "provider_type": "openai",
           "wire_api": "responses"
         },
         "gpt-5.6-sol": {
           "cost": {
-            "input": "5e-06",
-            "output": "3e-05",
-            "cache_read": "5e-07"
+            "input": "4e-06",
+            "output": "2e-05",
+            "cache_read": "4e-07",
+            "cache_write": "5e-06"
           },
           "provider_type": "openai",
           "wire_api": "responses"
         },
         "gpt-5.6-terra": {
           "cost": {
-            "input": "2.5e-06",
-            "output": "1.5e-05",
-            "cache_read": "2.5e-07"
+            "input": "2e-06",
+            "output": "1.2e-05",
+            "cache_read": "2e-07",
+            "cache_write": "2.5e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6-astra": {
+          "cost": {
+            "input": "1e-05",
+            "output": "5e-05",
+            "cache_read": "1e-06",
+            "cache_write": "1.25e-05"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6-sol": {
+          "cost": {
+            "input": "2e-06",
+            "output": "1e-05",
+            "cache_read": "2e-07",
+            "cache_write": "2.5e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6-luna": {
+          "cost": {
+            "input": "1e-07",
+            "output": "5e-07",
+            "cache_read": "1e-08",
+            "cache_write": "1.25e-07"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6.1-sol": {
+          "cost": {
+            "input": "2e-06",
+            "output": "1e-05",
+            "cache_read": "1e-07",
+            "cache_write": "2.5e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6.1-terra": {
+          "cost": {
+            "input": "1e-06",
+            "output": "5e-06",
+            "cache_read": "5e-08",
+            "cache_write": "1.25e-06"
           },
           "provider_type": "openai",
           "wire_api": "responses"
@@ -512,11 +665,12 @@
           "provider_type": "openai",
           "wire_api": "completions"
         },
-        "mai-code-1-flash-picker": {
+        "mai-code-1.1-flash": {
           "cost": {
-            "input": "7.5e-07",
-            "output": "4.5e-06",
-            "cache_read": "7.5e-08"
+            "input": "2e-07",
+            "output": "1.2e-06",
+            "cache_read": "2e-08",
+            "cache_write": "2.5e-07"
           },
           "provider_type": "openai",
           "wire_api": "responses"
@@ -529,6 +683,72 @@
           },
           "provider_type": "openai",
           "wire_api": "completions"
+        },
+        "kimi-k3": {
+          "cost": {
+            "input": "3e-06",
+            "output": "1.5e-05",
+            "cache_read": "3e-07"
+          },
+          "provider_type": "openai",
+          "wire_api": "completions"
+        },
+        "grok-4.5": {
+          "cost": {
+            "input": "2e-06",
+            "output": "6e-06",
+            "cache_read": "5e-07"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "grok-4.6": {
+          "cost": {
+            "input": "2e-06",
+            "output": "6e-06",
+            "cache_read": "5e-07"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "grok-4.7": {
+          "cost": {
+            "input": "2e-06",
+            "output": "6e-06",
+            "cache_read": "5e-07"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-5.6-sol-fast": {
+          "cost": {
+            "input": "8e-06",
+            "output": "4e-05",
+            "cache_read": "8e-07",
+            "cache_write": "1e-05"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6.1-sol-fast": {
+          "cost": {
+            "input": "4e-06",
+            "output": "2e-05",
+            "cache_read": "2e-07",
+            "cache_write": "5e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "mai-code-2-flash": {
+          "cost": {
+            "input": "1e-07",
+            "output": "5e-07",
+            "cache_read": "1e-08",
+            "cache_write": "0"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
         }
       }
     },
@@ -629,7 +849,8 @@
             "output": "1e-05",
             "cache_read": "1.25e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5-chat-latest": {
           "cost": {
@@ -637,7 +858,8 @@
             "output": "1e-05",
             "cache_read": "1.25e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5-codex": {
           "cost": {
@@ -645,7 +867,8 @@
             "output": "1e-05",
             "cache_read": "1.25e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5-mini": {
           "cost": {
@@ -653,7 +876,8 @@
             "output": "2e-06",
             "cache_read": "2.5000000000000002e-08"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5-nano": {
           "cost": {
@@ -661,14 +885,16 @@
             "output": "4.0000000000000003e-07",
             "cache_read": "5e-09"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5-pro": {
           "cost": {
             "input": "1.5e-05",
             "output": "0.00012"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5-search-api": {
           "cost": {
@@ -676,7 +902,8 @@
             "output": "1e-05",
             "cache_read": "1.25e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.1": {
           "cost": {
@@ -684,7 +911,8 @@
             "output": "1e-05",
             "cache_read": "1.25e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.1-chat-latest": {
           "cost": {
@@ -692,7 +920,8 @@
             "output": "1e-05",
             "cache_read": "1.25e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.1-codex": {
           "cost": {
@@ -700,7 +929,8 @@
             "output": "1e-05",
             "cache_read": "1.25e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.1-codex-max": {
           "cost": {
@@ -708,7 +938,8 @@
             "output": "1e-05",
             "cache_read": "1.25e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.1-codex-mini": {
           "cost": {
@@ -716,7 +947,8 @@
             "output": "2e-06",
             "cache_read": "2.5000000000000002e-08"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.2": {
           "cost": {
@@ -724,7 +956,8 @@
             "output": "1.4e-05",
             "cache_read": "1.75e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.2-chat-latest": {
           "cost": {
@@ -732,7 +965,8 @@
             "output": "1.4e-05",
             "cache_read": "1.75e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.2-codex": {
           "cost": {
@@ -740,14 +974,16 @@
             "output": "1.4e-05",
             "cache_read": "1.75e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.2-pro": {
           "cost": {
             "input": "2.1e-05",
             "output": "0.000168"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.3-chat-latest": {
           "cost": {
@@ -755,7 +991,8 @@
             "output": "1.4e-05",
             "cache_read": "1.75e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.3-codex": {
           "cost": {
@@ -763,7 +1000,8 @@
             "output": "1.4e-05",
             "cache_read": "1.75e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.3-codex-spark": {
           "cost": {
@@ -771,7 +1009,8 @@
             "output": "1.4e-05",
             "cache_read": "1.75e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.4": {
           "cost": {
@@ -779,7 +1018,8 @@
             "output": "1.5e-05",
             "cache_read": "2.5e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.4-mini": {
           "cost": {
@@ -787,7 +1027,8 @@
             "output": "4.5e-06",
             "cache_read": "7.5e-08"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.4-nano": {
           "cost": {
@@ -795,14 +1036,16 @@
             "output": "1.25e-06",
             "cache_read": "2e-08"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.4-pro": {
           "cost": {
             "input": "3e-05",
             "output": "0.00018"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.5": {
           "cost": {
@@ -810,14 +1053,96 @@
             "output": "3e-05",
             "cache_read": "5e-07"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-5.5-pro": {
           "cost": {
             "input": "3e-05",
             "output": "0.00018"
           },
-          "provider_type": "openai"
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-5.6-luna": {
+          "cost": {
+            "input": "2e-07",
+            "output": "1.2e-06",
+            "cache_read": "2e-08",
+            "cache_write": "2.5e-07"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-5.6-sol": {
+          "cost": {
+            "input": "4e-06",
+            "output": "2e-05",
+            "cache_read": "4e-07",
+            "cache_write": "5e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-5.6-terra": {
+          "cost": {
+            "input": "2e-06",
+            "output": "1.2e-05",
+            "cache_read": "2e-07",
+            "cache_write": "2.5e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6-astra": {
+          "cost": {
+            "input": "1e-05",
+            "output": "5e-05",
+            "cache_read": "1e-06",
+            "cache_write": "1.25e-05"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6-sol": {
+          "cost": {
+            "input": "2e-06",
+            "output": "1e-05",
+            "cache_read": "2e-07",
+            "cache_write": "2.5e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6-luna": {
+          "cost": {
+            "input": "1e-07",
+            "output": "5e-07",
+            "cache_read": "1e-08",
+            "cache_write": "1.25e-07"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6.1-sol": {
+          "cost": {
+            "input": "2e-06",
+            "output": "1e-05",
+            "cache_read": "1e-07",
+            "cache_write": "2.5e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
+        },
+        "gpt-6.1-terra": {
+          "cost": {
+            "input": "1e-06",
+            "output": "5e-06",
+            "cache_read": "5e-08",
+            "cache_write": "1.25e-06"
+          },
+          "provider_type": "openai",
+          "wire_api": "responses"
         },
         "gpt-image-1": {
           "cost": {},
@@ -933,6 +1258,15 @@
             "output": "0"
           },
           "provider_type": "openai"
+        },
+        "github/grok-4.5": {
+          "cost": {
+            "input": "2e-07",
+            "output": "6e-07",
+            "cache_read": "5e-08"
+          },
+          "provider_type": "openai",
+          "wire_api": "completions"
         }
       }
     }

@@ -4,14 +4,32 @@ import "github.com/github/gh-aw/pkg/logger"
 
 var commentMemoryLog = logger.New("workflow:comment_memory")
 
-// CommentMemoryConfig holds configuration for the comment_memory safe output type.
+// CommentMemoryConfig holds parsed tools.comment-memory configuration.
 type CommentMemoryConfig struct {
 	BaseSafeOutputConfig `yaml:",inline"`
 	Target               string   `yaml:"target,omitempty"`        // Target: "triggering" (default), "*" or explicit issue/PR number
 	TargetRepoSlug       string   `yaml:"target-repo,omitempty"`   // Target repository in owner/repo format
 	AllowedRepos         []string `yaml:"allowed-repos,omitempty"` // Additional allowed repositories
 	MemoryID             string   `yaml:"memory-id,omitempty"`     // Default memory identifier when item does not provide memory_id
-	Footer               *string  `yaml:"footer,omitempty"`        // Footer visibility control ("true"/"false" templatable string); nil defaults to visible footer
+}
+
+const commentMemoryHandlerKey = "comment_memory"
+
+func buildCommentMemoryHandlerConfig(config *CommentMemoryConfig, globalFooter *bool, globalBodyFooter string) map[string]any {
+	if config == nil {
+		return nil
+	}
+	return newHandlerConfigBuilder().
+		AddTemplatableInt("max", config.Max).
+		AddIfNotEmpty("target", config.Target).
+		AddIfNotEmpty("target-repo", config.TargetRepoSlug).
+		AddStringSlice("allowed_repos", config.AllowedRepos).
+		AddIfNotEmpty("memory_id", config.MemoryID).
+		AddIfNotEmpty("body_footer", appendBodyFooters(config.BodyFooter, globalBodyFooter)).
+		AddTemplatableBool("footer", getEffectiveFooterForTemplatable(config.Footer, globalFooter)).
+		AddIfNotEmpty("github-token", resolveHandlerGitHubTokenWithStepID(config.GitHubApp, "comment-memory-app-token", config.GitHubToken)).
+		AddTemplatableBool("staged", templatableBoolPtrToStringPtr(config.Staged)).
+		Build()
 }
 
 // extractCommentMemoryConfig extracts comment-memory configuration from tools section.
@@ -52,6 +70,7 @@ func (c *Compiler) parseCommentMemoryConfigValue(rawConfig any) *CommentMemoryCo
 		commentMemoryLog.Printf("Invalid footer value: %v", err)
 		return nil
 	}
+	preprocessTargetFieldAsString(configData, commentMemoryLog)
 
 	var config CommentMemoryConfig
 	normalizedOutputMap := map[string]any{"comment-memory": rawConfig}

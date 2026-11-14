@@ -43,14 +43,21 @@ Wait a few minutes for policy propagation, then re-run.
 
 ### Actions Restrictions Reported During Init
 
-The CLI validates three permission layers. Fix restrictions in Repository Settings → Actions → General:
-
-1. **Actions disabled**: Enable Actions ([docs](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository))
-2. **Local-only**: Switch to "Allow all actions" or enable GitHub-created actions ([docs](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#managing-github-actions-permissions-for-your-repository))
-3. **Selective allowlist**: Enable "Allow actions created by GitHub" checkbox ([docs](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#allowing-select-actions-and-reusable-workflows-to-run))
+The CLI validates three permission layers in Repository Settings → Actions → General: enable Actions, switch from local-only restrictions to allowing GitHub-created or all actions, and, if you're using a selective allowlist, enable GitHub-created actions as well. See the [repository Actions settings docs](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository) and [allowlist details](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#allowing-select-actions-and-reusable-workflows-to-run).
 
 > [!NOTE]
 > Organization policies override repository settings. Contact admins if settings are grayed out.
+
+### Copilot Pull Request Workflows Require Approval
+
+**Symptom:** Runs on a Copilot branch conclude with `action_required` without starting any jobs. This is an approval gate, not a test failure.
+
+**Solution:** Review the proposed changes, especially workflow changes, then select **Approve and run workflows** in the pull request's merge box. Changing a job's `if:` condition, adding `trusted-users`, or granting token permissions cannot bypass this pre-execution gate.
+
+To reduce repeated approvals, a repository administrator can disable **Require approval for workflow runs** under **Settings → Copilot → Cloud agent → Policies**. This is a repository setting, not gh-aw frontmatter or an actor allowlist. See [configuring automatic workflow runs](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/configuring-agent-settings#allowing-github-actions-workflows-to-run-automatically-when-copilot-pushes).
+
+> [!WARNING]
+> Automatic runs can give unreviewed Copilot code access to workflow secrets and write permissions. Review the repository's CI and agentic workflow permissions before changing this policy. Keep approval enabled where those privileges require human review.
 
 ## Workflow Compilation Issues
 
@@ -73,9 +80,12 @@ If a frontmatter setting appears to be silently ignored, the field name may be m
 
 ### Compilation Failures
 
-Common fixes: validate YAML syntax (indentation and `key: value` spacing), confirm required fields such as `on:`, and check types against the schema with `gh aw compile --verbose`.
+Validate YAML syntax (especially indentation and `key: value` spacing), confirm required fields such as `on:`, and check types against the schema with `gh aw compile --verbose`.
 
-If no lock file is generated, fix the reported errors (`gh aw compile 2>&1 | grep -i error`) and confirm `.github/workflows/` is writable. If stale `.lock.yml` files remain after deleting a workflow `.md`, remove them with `gh aw compile --purge`.
+If no lock file is generated, fix the reported errors, confirm `.github/workflows/` is writable, and remove stale `.lock.yml` files with `gh aw compile --purge` after deleting a workflow `.md`.
+
+> [!TIP]
+> After upgrading, Copilot web-tool errors or a missing `tools.bash` setting with `tools.github.min-integrity: none` can be fixed with `gh aw fix --write`, followed by `gh aw compile`. Review the [common compatibility fixes](/gh-aw/reference/releases/#common-compatibility-fixes-after-upgrading) for tool alternatives and explicit shell-access choices.
 
 ## Import and Include Issues
 
@@ -85,7 +95,7 @@ Import paths are relative to the repository root, for example `.github/workflows
 
 ### GitHub Tools Not Available
 
-Configure using `toolsets:` ([tools reference](/gh-aw/reference/github-tools/)):
+Configure GitHub access with `toolsets:` ([tools reference](/gh-aw/reference/github-tools/)). If a tool is still missing, combine toolsets such as `toolsets: [default, actions]` or inspect the resolved toolset with `gh aw mcp inspect <workflow>`.
 
 ```yaml wrap
 tools:
@@ -93,13 +103,9 @@ tools:
     toolsets: [repos, issues]
 ```
 
-### Toolset Missing Expected Tools
-
-Check [GitHub Toolsets](/gh-aw/reference/github-tools/), combine toolsets (`toolsets: [default, actions]`), or inspect with `gh aw mcp inspect <workflow>`.
-
 ### MCP Server Connection Failures
 
-Verify package installation, syntax, and environment variables:
+Verify package installation, command syntax, and required environment variables:
 
 ```yaml
 mcp-servers:
@@ -112,7 +118,7 @@ mcp-servers:
 
 ### OpenCode MCP Tools Not Being Called
 
-When integrating OpenCode-compatible engines, runs can complete without ever invoking MCP or file tools. Use an explicit `opencode.jsonc` config. Port `10004` is the local AWF API proxy port (with `--enable-api-proxy`); `MCP_GATEWAY_PORT` and `MCP_GATEWAY_API_KEY` are expanded from workflow env at runtime (substitute concrete values when running outside a workflow):
+OpenCode-compatible engines do not auto-discover MCP servers, so declare them in an explicit `opencode.jsonc`. `MCP_GATEWAY_PORT` and `MCP_GATEWAY_AGENT_ID` are expanded from workflow env at runtime; substitute concrete values outside a workflow:
 
 ```json
 {
@@ -133,7 +139,7 @@ When integrating OpenCode-compatible engines, runs can complete without ever inv
     "safeoutputs": {
       "type": "http",
       "url": "http://host.docker.internal:${MCP_GATEWAY_PORT}/mcp/safeoutputs",
-      "headers": { "Authorization": "${MCP_GATEWAY_API_KEY}" },
+      "headers": { "Authorization": "${MCP_GATEWAY_AGENT_ID}" },
       "disabled": false,
       "timeout": 30000
     }
@@ -150,13 +156,9 @@ When integrating OpenCode-compatible engines, runs can complete without ever inv
 }
 ```
 
-Key gotchas:
+Route MCP servers through URLs such as `http://host.docker.internal:${MCP_GATEWAY_PORT}/mcp/<server-name>`. Use `agent.build.permission` (singular, not `permissions`). Set `external_directory: allow` only when access outside the workspace is needed; the default `ask` acts as a deny in non-interactive runs.
 
-OpenCode does not auto-discover MCP servers, so declare an explicit top-level `mcp` block with routed URLs such as `http://host.docker.internal:${MCP_GATEWAY_PORT}/mcp/<server-name>`. Use `agent.build.permission` (singular); `permissions` is silently ignored and leaves tools unavailable. `external_directory` defaults to `ask`, which becomes an implicit deny in non-interactive runs, so set it to `allow` only when you truly need access outside the workspace.
-
-For direct Copilot endpoints (`api.githubcopilot.com`), do **not** append `/v1`. For other OpenAI-compatible providers, use the provider's documented base path so `/chat/completions` is appended correctly. Keep the local proxy URL (`http://host.docker.internal:10004`) unchanged.
-
-When using `--enable-api-proxy`, pass `COPILOT_GITHUB_TOKEN` in the execute step's `env:` so the proxy can authenticate:
+Do **not** append `/v1` to direct Copilot endpoints (`api.githubcopilot.com`). For other OpenAI-compatible providers, use the documented base path so `/chat/completions` is appended correctly. With `--enable-api-proxy`, pass `COPILOT_GITHUB_TOKEN` in the execute step's `env:`:
 
 ```yaml wrap
 - name: Execute
@@ -179,20 +181,14 @@ network:
 
 ### Cannot Find Module 'playwright'
 
-`Error: Cannot find module 'playwright'` — Playwright is provided as MCP tools, not as an npm package. Use the MCP tools instead of `require('playwright')`:
+`Error: Cannot find module 'playwright'` — the built-in tool installs `@playwright/cli`, not the Playwright JavaScript library. Use `playwright-cli` commands instead of `require('playwright')`:
 
-```javascript
-// ❌ Don't: const playwright = require('playwright')
-// ✅ Do: use MCP tools
-await mcp__playwright__browser_navigate({ url: "https://example.com" });
-await mcp__playwright__browser_snapshot();
+```bash
+playwright-cli goto "https://example.com"
+playwright-cli snapshot
 ```
 
-See [Playwright Tool documentation](/gh-aw/reference/tools/#playwright-tool-playwright) for all available tools.
-
-### Playwright MCP Initialization Failure (EOF Error)
-
-`Failed to register tools error="initialize: EOF" name=playwright` — Chromium crashes before tool registration completes due to missing Docker security flags. Upgrade to 0.41.0+ with `gh extension upgrade gh-aw`.
+See the [Playwright reference](/gh-aw/reference/playwright/) for CLI commands and MCP migration guidance.
 
 ## Permission Issues
 
@@ -209,7 +205,7 @@ safe-outputs:
   update-issue:     # no configuration required; uses defaults
 ```
 
-If your operation isn't in the [Safe Outputs reference](/gh-aw/reference/safe-outputs/), it may not be supported yet. See the [Safe Outputs Specification](/gh-aw/specs/safe-outputs-specification/) for the full list.
+If an operation isn't in the [Safe Outputs reference](/gh-aw/reference/safe-outputs/), it may not be supported; see the [Safe Outputs Specification](/gh-aw/specs/safe-outputs-specification/).
 
 ### Safe Outputs Not Creating Issues
 
@@ -240,8 +236,7 @@ Delete conflicting fields in Projects UI and recreate.
 
 ## Engine-Specific Issues
 
-- **Copilot CLI not found:** verify compilation succeeded — compiled workflows include CLI installation steps.
-- **Model not available:** use the default (`engine: copilot`) or specify an available model (`engine: {id: copilot, model: gpt-4}`).
+If the Copilot CLI is missing, first verify compilation succeeded because compiled workflows install it automatically. If a model is unavailable, fall back to the default (`engine: copilot`) or choose one your environment exposes, such as `engine: {id: copilot, model: gpt-4}`.
 
 ### Copilot License or Inference Access Issues
 
@@ -257,28 +252,37 @@ If this fails, contact your organization administrator to enable Copilot for the
 > [!NOTE]
 > `COPILOT_GITHUB_TOKEN` must belong to a user account with an active Copilot subscription. Org-managed licenses may impose additional restrictions on programmatic API access.
 
+### GitHub Inference Cybersecurity Policy Rejections
+
+The provider error `422 This content was flagged for possible cybersecurity risk.` is a terminal policy rejection. For Copilot, Claude, and Codex using GitHub inference, the harness recognizes this prefix in supported top-level error events, classifies the failure as `content_filter`, and stops automatic retries. Quoted error text, unrelated HTTP 422 errors, and sub-agent errors do not trigger this classification.
+
+The run remains failed even if the agent previously emitted `noop`. Inspect the provider diagnostic with `gh aw audit <run-id>` and contact the organization administrator or provider support if access needs review.
+
 ## GitHub Enterprise Server Issues
+
+> [!IMPORTANT]
+> **Troubleshooting a compatibility path does not establish product availability.** GHES, GHEC with data residency, and ARC/DinD are different deployment/topology dimensions. End-to-end combinations without owner confirmation remain unconfirmed. Start with the [deployment and runner applicability summary](/gh-aw/reference/enterprise-configuration/#deployment-and-runner-applicability), [AWF applicability](https://github.com/github/gh-aw-firewall/blob/main/docs/compatibility.md#environment-and-runner-applicability), and [AWF enterprise routing](https://github.com/github/gh-aw-firewall/blob/main/docs/enterprise-configuration.md).
 
 > [!TIP]
 > For a complete walkthrough of setting up and debugging workflows on **GHE Cloud with data residency** (`*.ghe.com`), see [Debugging GHE Cloud with Data Residency](/gh-aw/troubleshooting/debug-ghe/).
 
 ### Copilot Engine Prerequisites on GHES
 
-Before running Copilot-based workflows on GHES, verify:
+For a GHES compatibility investigation, first have the enterprise administrator confirm that the selected Copilot product, model, and authentication path are available under the applicable license and policies. A GHES repository token or ARC registration credential does not grant cloud Copilot inference access. For the PAT path, the `COPILOT_GITHUB_TOKEN` owner needs an active Copilot entitlement and the required account permission; organization-billed `copilot-requests: write` must be separately available on the target deployment. See [authentication requirements](/gh-aw/reference/auth/).
 
-- **Site admin:** GitHub Connect enabled (links GHES to github.com for Copilot cloud services), enterprise-level Copilot licensing activated, and outbound HTTPS allowed to `api.githubcopilot.com` and `api.enterprise.githubcopilot.com`.
-- **Enterprise/org admin:** a Copilot seat assigned to the `COPILOT_GITHUB_TOKEN` owner, and the org Copilot policy permits usage.
-- **Workflow config:**
+Verify outbound HTTPS from the runner and proxy containers to the confirmed inference endpoint, GitHub API, and required image/download hosts. GitHub Connect alone does not establish Copilot CLI or Agentic Workflows availability; any Connect requirement must come from the selected product's versioned documentation and enterprise configuration, not from the firewall example.
 
-  ```aw wrap
-  engine:
-    id: copilot
-    api-target: api.enterprise.githubcopilot.com
-  network:
-    allowed:
-      - defaults
-      - api.enterprise.githubcopilot.com
-  ```
+The following demonstrates enterprise Copilot endpoint routing **only if that endpoint is available for your account and deployment**; it is not a GHES support promise:
+
+```aw wrap
+engine:
+  id: copilot
+  api-target: api.enterprise.githubcopilot.com
+network:
+  allowed:
+    - defaults
+    - api.enterprise.githubcopilot.com
+```
 
 See [Enterprise API Endpoint](/gh-aw/reference/engines/#enterprise-api-endpoint-api-target) for GHEC/GHES `api-target` values.
 
@@ -286,41 +290,32 @@ See [Enterprise API Endpoint](/gh-aw/reference/engines/#enterprise-api-endpoint-
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `Error loading models: 400 Bad Request` | Enterprise Copilot not licensed or GitHub Connect not enabled | Enable GitHub Connect and enterprise Copilot in site admin settings |
-| `403 "unauthorized: not licensed to use Copilot"` | No Copilot seat for PAT owner | Site admin enables Copilot; org admin assigns a seat to the token owner |
-| `403 "Resource not accessible by personal access token"` | Wrong token type or missing permissions | Use fine-grained PAT with **Copilot Requests: Read**, or classic PAT with `copilot` scope — see [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token) |
+| `Error loading models: 400 Bad Request` | Possible endpoint, account, model, or policy mismatch; this error alone does not prove a GitHub Connect issue | Verify product availability, endpoint selection, and account policy with the enterprise administrator |
+| `403 "unauthorized: not licensed to use Copilot"` | Inference identity lacks an applicable Copilot entitlement | Enterprise or org administrator verifies licensing, assigns the required entitlement, and checks policy |
+| `403 "Resource not accessible by personal access token"` | Wrong token type or missing permissions | Use a fine-grained PAT with **Copilot Requests: Read**; classic PATs are rejected — see [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token) |
 | `Could not resolve to a Repository` | `GH_HOST` not set in custom jobs | Recompile (`gh aw compile`), or set `GH_HOST=github.company.com` explicitly for local CLI commands |
 | Firewall blocking `api.<ghes-host>` | Domain not in allowed list | Add to `network.allowed` (see below) |
 | `gh aw add-wizard` creates PR on github.com | Not inside a GHES repo clone | Run from within GHES repo, or use `gh aw add` + `gh pr create` |
 
-For firewall issues, add the GHES domain to your workflow's allowed list:
+For firewall issues, add the actual GHES repository hostname to your workflow's allowed list. If the GHES API is served from a separate hostname, allow that hostname too. Do not substitute a `*.ghe.com` data-residency example for a GHES host or assume that the repository API is the Copilot inference endpoint:
 
 ```aw wrap
-engine:
-  id: copilot
-  api-target: api.company.ghe.com
 network:
   allowed:
     - defaults
-    - company.ghe.com
-    - api.company.ghe.com
+    - github.company.com
+    - api.github.company.com
 ```
 
 ## Context Expression Issues
 
-- **Unauthorized expression:** use only [allowed expressions](/gh-aw/reference/templating/) (`github.event.issue.number`, `github.repository`, `steps.sanitized.outputs.text`). `secrets.*` and `env.*` are disallowed.
-- **Sanitized context empty:** `steps.sanitized.outputs.text` requires issue/PR/comment events (`on: issues:`), not `push:` or similar triggers.
+Use only [allowed expressions](/gh-aw/reference/templating/) such as `github.event.issue.number`, `github.repository`, and `steps.sanitized.outputs.text`; `secrets.*` and `env.*` are disallowed. If `steps.sanitized.outputs.text` is empty, confirm the workflow runs on issue, PR, or comment events rather than `push:`.
 
-## Build and Test Issues
+## Build, Network, and Cache Issues
 
-- **Documentation build fails:** clean install (`cd docs && rm -rf node_modules package-lock.json && npm install && npm run build`) and check for malformed frontmatter, MDX syntax errors, or broken links.
-- **Tests failing after changes:** run `make fmt && make lint && make test-unit` before iterating.
+If the docs build fails, do a clean install (`cd docs && rm -rf node_modules package-lock.json && npm install && npm run build`) and check for malformed frontmatter, MDX syntax errors, or broken links. If tests fail after changes, run `make fmt && make lint && make test-unit` before iterating.
 
-## Network and Connectivity Issues
-
-### Firewall Denials for Package Registries
-
-Add ecosystem identifiers ([Network Configuration Guide](/gh-aw/guides/network-configuration/)):
+For package registries, add ecosystem identifiers from the [Network Configuration Guide](/gh-aw/guides/network-configuration/):
 
 ```yaml wrap
 network:
@@ -332,13 +327,9 @@ network:
     - go          # Go modules
 ```
 
-### Other Network Issues
+If URLs appear as `(redacted)`, add the relevant domains to the allowed list ([Network Permissions](/gh-aw/reference/network/)), for example `allowed: [defaults, "api.example.com"]`. If remote imports fail, verify network access and authentication. For MCP server timeouts, prefer local servers such as `command: "node"` with `args: ["./server.js"]`.
 
-If URLs appear as `(redacted)`, add the relevant domains to the allowed list ([Network Permissions](/gh-aw/reference/network/)), for example `allowed: [defaults, "api.example.com"]`. If remote imports fail to download, verify both network access (`curl -I https://raw.githubusercontent.com/github/gh-aw/main/README.md`) and authentication (`gh auth status`). For MCP server timeouts, prefer local servers such as `command: "node"` with `args: ["./server.js"]`.
-
-## Cache Issues
-
-If a cache is not restoring, make sure the key pattern matches; caches expire after 7 days, for example `cache: { key: deps-${{ hashFiles('package-lock.json') }}, restore-keys: deps- }`. If cache memory is not persisting, configure the cache-memory MCP server with a key such as `tools.cache-memory.key: memory-${{ github.workflow }}-${{ github.run_id }}`.
+If a cache is not restoring, confirm the key pattern matches; caches expire after 7 days, for example `cache: { key: deps-${{ hashFiles('package-lock.json') }}, restore-keys: deps- }`. If cache memory is not persisting, configure the cache-memory MCP server with a key such as `tools.cache-memory.key: memory-${{ github.workflow }}-${{ github.run_id }}`.
 
 ## Integrity Filtering Blocking Expected Content
 
@@ -356,9 +347,15 @@ Use `min-integrity: unapproved` as a middle ground for community triage workflow
 
 ## Workflow Failures and Debugging
 
+### Codex Setup Crashes Before Agent Execution
+
+If `Configure Codex` exits with code 139 and logs a Node.js segmentation fault while converting the bundled model catalog, inspect the setup failure before changing terminal safe-output instructions. `missing_terminal_safe_output` can be a downstream symptom because the agent never started.
+
+Node.js v24.21.0 and v26.8.0 through v26.10.0 have a [short-read buffer overflow in UTF-8 pipe reads](https://github.com/nodejs/node/issues/66341). The gh-aw Codex and MCP gateway setup scripts avoid this path by reading stdin as a Buffer and then decoding it with `.toString("utf8")`. Ensure the action scripts used by the compiled workflow include this workaround.
+
 ### Timeout Errors
 
-GitHub Actions marks the run as `timed_out` when the job exceeds `timeout-minutes` (default: 20 min). The table below maps each engine's error patterns to the right fix; after updating frontmatter, recompile with `gh aw compile`. See [Long Build Times](/gh-aw/reference/sandbox/#long-build-times) for caching strategies and self-hosted runner recommendations.
+GitHub Actions marks the run as `timed_out` when the job exceeds `timeout-minutes` (default: 20 min). Use the table below to map common engine error patterns to the correct fix, then recompile with `gh aw compile`. See [Long Build Times](/gh-aw/reference/sandbox/#long-build-times) for caching strategies and self-hosted runner recommendations.
 
 | Engine | Error Pattern | Fix Setting |
 |--------|--------------|-------------|
@@ -368,6 +365,7 @@ GitHub Actions marks the run as `timed_out` when the job exceeds `timeout-minute
 | Codex | `Tool call timed out after 120 seconds` | `tools: timeout: N` (default: 120s) |
 | Copilot | *(task incomplete, workflow succeeds)* | `max-continuations: N` |
 | Any | `Failed to register tools error="initialize: timeout"` | `tools: startup-timeout: N` |
+| Copilot/Codex | Harness log says `post-result watchdog terminating idle process` after a comment, label, PR, push, or `noop` output | Increase `engine.harness.watchdog-timeout` (seconds) or `GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS` (milliseconds) |
 
 ```yaml wrap
 timeout-minutes: 60      # job-level limit
@@ -378,11 +376,22 @@ max-turns: 30            # Claude: max turns
 max-continuations: 5     # Copilot: autopilot continuations
 ```
 
+The post-result watchdog starts only after a terminal safe output is written. It cleans up child processes but can terminate silent long-running commands that write no stdout or stderr. For quiet monorepo scans or builds, increase the window:
+
+```yaml wrap
+engine:
+  id: copilot
+  harness:
+    watchdog-timeout: 600  # seconds
+```
+
+See [Harness Settings and Runtime Tuning Variables](/gh-aw/reference/environment-variables/#harness-settings-and-runtime-tuning-variables) for the raw `GH_AW_HARNESS_WATCHDOG_TIMEOUT_MS` environment variable, default, range, and clamping behavior.
+
 ### Why Did My Workflow Fail?
 
-Common causes include missing tokens, permission mismatches, network restrictions, disabled tools, and rate limits. The quickest path is usually to give an agent the run URL so it can inspect logs and suggest a fix.
+Common causes: missing tokens, permission mismatches, network restrictions, disabled tools, and rate limits. Usually the quickest path is giving an agent the run URL to inspect logs.
 
-Using Copilot Chat (requires [agentic authoring setup](/gh-aw/guides/agentic-authoring/#configuring-your-repository)):
+Using Copilot Chat (requires [agentic authoring setup](/gh-aw/setup/working-with-workflows/#configuring-your-repository-for-agentic-authoring)):
 
 ```text wrap
 agentic-workflows debug https://github.com/OWNER/REPO/actions/runs/RUN_ID
@@ -397,9 +406,11 @@ The failed workflow run is at https://github.com/OWNER/REPO/actions/runs/RUN_ID
 
 For manual investigation, use `gh aw audit <run-id>` and `gh aw logs`, then inspect the generated `.lock.yml`. See the [Debugging Workflows](/gh-aw/troubleshooting/debugging/) guide for a full walkthrough.
 
+If the failure annotation names `report_incomplete`, the agent reported that it could not complete the task. The conclusion can fail even when the agent job succeeded. Check the conclusion job summary for the reported reason, when available, and inspect `agent_output.json` in the `agent` artifact. The annotation omits agent-provided reasons and details; summaries can also be suppressed if secret redaction fails. Use `gh aw audit <run-id>` to compare the report with runtime evidence.
+
 ### Enable Debug Logging
 
-Enable verbose mode (`--verbose`), set `ACTIONS_STEP_DEBUG = true`, or inspect MCP config (`gh aw mcp inspect`). The `DEBUG` environment variable activates detailed internal logging for any `gh aw` command — output goes to `stderr` and each line shows the namespace (`workflow:compiler`), message, and time since the previous entry. Common namespaces: `cli:compile_command`, `workflow:compiler`, `workflow:expression_extraction`, `parser:frontmatter`. Wildcards match any suffix.
+Use `--verbose`, set `ACTIONS_STEP_DEBUG = true`, or inspect MCP config with `gh aw mcp inspect`. The `DEBUG` environment variable enables internal logging for any `gh aw` command (to `stderr`, showing namespace, message, and elapsed time). Common namespaces: `cli:compile_command`, `workflow:compiler`, `workflow:expression_extraction`, `parser:frontmatter`; wildcards match any suffix.
 
 ```bash
 DEBUG=* gh aw compile                              # all logs
@@ -411,8 +422,8 @@ DEBUG_COLORS=0 DEBUG=* gh aw compile 2>&1 | tee debug.log  # capture to file
 
 ## Operational Runbooks
 
-See [Workflow Health Monitoring Runbook](https://github.com/github/gh-aw/blob/main/.github/aw/runbooks/workflow-health.md) for diagnosing errors.
+For a step-by-step diagnostic checklist, see the [Workflow Health Monitoring Runbook](https://github.com/github/gh-aw/blob/main/.github/aw/runbooks/workflow-health.md).
 
 ## Getting Help
 
-Review [reference docs](/gh-aw/reference/workflow-structure/), search [existing issues](https://github.com/github/gh-aw/issues), or create an issue. See [Error Reference](/gh-aw/troubleshooting/errors/) and [Frontmatter Reference](/gh-aw/reference/frontmatter/).
+Start with the [reference docs](/gh-aw/reference/workflow-structure/), [Error Reference](/gh-aw/troubleshooting/errors/), and [Frontmatter Reference](/gh-aw/reference/frontmatter/). If that does not resolve the issue, search [existing issues](https://github.com/github/gh-aw/issues) or open a new one.

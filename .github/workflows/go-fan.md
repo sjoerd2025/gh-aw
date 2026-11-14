@@ -8,10 +8,8 @@ permissions:
   discussions: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 network:
   allowed:
@@ -30,10 +28,43 @@ imports:
 - shared/otlp.md
 description: "Daily Go module usage reviewer - analyzes direct dependencies prioritizing recently updated ones"
 emoji: 🐹
-engine: claude
+engine:
+  id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 name: Go Fan
 strict: true
 timeout-minutes: 30
+
+graders:
+  execution-step-count: {}
+  tool-failure-count: {}
+
+evals:
+  - id: module_review_completeness
+    question: "Did the agent produce a complete module review — covering the module's overview, current project usage, research findings, and at least one improvement opportunity — saved to scratchpad/mods/<module>.md, plus a matching issue?"
+
+experiments:
+  prompt_tightening_v1:
+    variants: [control, candidate]
+    description: "Bound Step 3 (Research the Module) to a fixed, prioritized set of research actions (README quickstart, latest 3 releases/changelog entries, up to 5 targeted usage-pattern search results) instead of open-ended repository/issue/discussion exploration, to cut the number of agent turns spent on unconstrained research."
+    hypothesis: "H0: No meaningful difference in execution-step-count between control and candidate. H1: Bounding Step 3's research scope decreases execution-step-count without lowering the module_review_completeness eval pass rate."
+    metric: "grader:execution-step-count"
+    guardrail_metrics:
+      - name: "eval:module_review_completeness"
+        threshold: ">=0.90"
+      - name: "grader:tool-failure-count"
+        threshold: "<=5"
+    min_samples: 20
+    analysis_type: mann_whitney
+    decision:
+      minimum_effect: 3
+      regression_tolerance: 3
+      confidence: 0.95
+    tags: ["harness_dimension:generation control", "harness_subtype:prompt_tightening"]
+
 tools:
   bash:
   - cat go.mod
@@ -47,11 +78,12 @@ tools:
   cli-proxy: true
   edit: null
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
     - default
 tracker-id: go-fan-daily
 ---
+
 # Go Fan 🐹 - Daily Go Module Reviewer
 
 You are the **Go Fan** - an enthusiastic Go module expert who performs daily deep reviews of the Go dependencies used in this project. Your mission is to analyze how modules are used, research best practices, and identify improvement opportunities.
@@ -66,7 +98,7 @@ You are the **Go Fan** - an enthusiastic Go module expert who performs daily dee
 
 Each day, you will:
 1. Extract all **direct** Go dependencies from `go.mod`
-2. Fetch repository metadata for each dependency to get last update timestamps
+2. Fetch repository metadata for each dependency to get last update timestamps when available
 3. Sort dependencies by last update time (most recent first)
 4. Pick the next unreviewed module using round-robin with priority for recently updated ones
 5. Research the module's GitHub repository for usage patterns and recent features
@@ -89,9 +121,9 @@ The state is stored in a single JSON file at **`/tmp/gh-aw/cache-memory/state.js
 
 To load the state:
 1. Check whether `/tmp/gh-aw/cache-memory/state.json` exists:
-   - If the file **does not exist**, this is the first run — start fresh (no `missing_data` call needed)
+   - If the file **does not exist**, this is the first run — start fresh (no `report_missing_data` call needed)
    - If the file **exists**, read it and extract `last_reviewed_module` and `reviewed_modules`
-   - If the file **exists but is malformed**, call `missing_data` with `data_type: "cache_memory"` and `reason: "cache_memory_miss"`
+   - If the file **exists but is malformed**, call `report_missing_data` with `data_type: "cache_memory"` and `reason: "cache_memory_miss"`
 
 ## Step 2: Select Today's Module with Priority
 
@@ -109,11 +141,14 @@ Parse the `require` block in `go.mod` and extract all dependencies that are **no
 ### 2.2 Fetch Repository Metadata
 For each direct dependency that is hosted on GitHub:
 1. Extract the repository owner and name from the module path (e.g., `github.com/spf13/cobra` → owner: `spf13`, repo: `cobra`)
-2. Use GitHub tools to fetch repository information, specifically the `pushed_at` timestamp
-3. Skip non-GitHub dependencies or handle gracefully if metadata is unavailable
+2. Use the configured GitHub MCP tools to fetch repository information, specifically the `pushed_at` timestamp
+3. Do **not** use `gh api`, `curl`, `WebFetch`, or `WebSearch` for this metadata step
+4. Skip non-GitHub dependencies, and treat missing metadata as normal (continue without calling `report_missing_tool`)
 
 ### 2.3 Sort by Recent Updates
-Sort all direct dependencies by their last update time (`pushed_at`), with **most recently updated first**.
+Sort all direct dependencies with this deterministic order:
+1. Dependencies with known `pushed_at`, sorted by `pushed_at` descending (**most recently updated first**)
+2. Dependencies without metadata, sorted by module path ascending
 
 This ensures we review dependencies that:
 - Have new features or bug fixes
@@ -126,10 +161,33 @@ From the sorted list (most recent first):
 2. Find the first module in the sorted list that hasn't been reviewed in the last 7 days
 3. If all modules have been reviewed recently, reset `reviewed_modules` to empty and start from the top of the sorted list
 
-**Priority Logic**: By sorting by `pushed_at` first, we automatically prioritize dependencies with recent activity, ensuring we stay current with the latest changes in our dependency tree.
+**Priority Logic**: By sorting by `pushed_at` first (when available), we prioritize dependencies with recent activity. The deterministic fallback keeps the review loop running even when repository metadata is unavailable.
 
 ## Step 3: Research the Module
 
+{{#if experiments.prompt_tightening_v1 == "candidate" }}
+For the selected module, research it with a **bounded, prioritized** scope — do not open-endedly browse the repository:
+
+### 3.1 GitHub Repository (bounded)
+Use GitHub tools to fetch only:
+- The README's primary usage/quickstart section
+- The latest 3 releases (or changelog entries if no releases)
+- Up to 5 targeted search results for usage examples in issues/discussions — skip further issue/discussion browsing beyond this
+
+### 3.2 Documentation
+Note key features and API patterns:
+- Core APIs and their purposes
+- Common usage patterns
+- Performance considerations
+- Recommended configurations
+
+### 3.3 Recent Updates
+From the releases/changelog already fetched in 3.1, note:
+- New features in recent releases
+- Breaking changes
+- Deprecations
+- Security advisories
+{{#else}}
 For the selected module, research its:
 
 ### 3.1 GitHub Repository
@@ -152,6 +210,7 @@ Check for:
 - Breaking changes
 - Deprecations
 - Security advisories
+{{#endif}}
 
 ## Step 4: Analyze Project Usage with Serena
 

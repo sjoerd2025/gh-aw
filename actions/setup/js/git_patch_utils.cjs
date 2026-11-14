@@ -15,7 +15,8 @@
 const fs = require("fs");
 
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { execGitSync } = require("./git_helpers.cjs");
+const { execLocalGitSync: execGitSync } = require("./git_helpers.cjs");
+const { scopedArtifactFilename } = require("./work_queue_claim_scope.cjs");
 
 /**
  * Debug logging helper - logs to stderr when DEBUG env var matches
@@ -50,7 +51,11 @@ function sanitizeForFilename(value, fallback) {
  * @returns {string} The sanitized branch name safe for use in a filename
  */
 function sanitizeBranchNameForPatch(branchName) {
-  return sanitizeForFilename(branchName, "unknown");
+  const sanitized = sanitizeForFilename(branchName, "unknown");
+  if (!sanitized || (branchName && /^-+$/.test(branchName.trim()))) {
+    throw new Error("Invalid branch name: provide a name containing more than dashes or filename separators.");
+  }
+  return sanitized;
 }
 
 /**
@@ -69,7 +74,7 @@ function sanitizeRepoSlugForPatch(repoSlug) {
  */
 function getPatchPathForBranch(branchName) {
   const sanitized = sanitizeBranchNameForPatch(branchName);
-  return `/tmp/gh-aw/aw-${sanitized}.patch`;
+  return scopedArtifactFilename(`/tmp/gh-aw/aw-${sanitized}.patch`);
 }
 
 /**
@@ -82,7 +87,7 @@ function getPatchPathForBranch(branchName) {
 function getPatchPathForBranchInRepo(branchName, repoSlug) {
   const sanitizedBranch = sanitizeBranchNameForPatch(branchName);
   const sanitizedRepo = sanitizeRepoSlugForPatch(repoSlug);
-  return `/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.patch`;
+  return scopedArtifactFilename(`/tmp/gh-aw/aw-${sanitizedRepo}-${sanitizedBranch}.patch`);
 }
 
 /**
@@ -99,6 +104,85 @@ function buildExcludePathspecs(excludedFiles) {
     return [];
   }
   return ["--", ...excludedFiles.map(p => `:(exclude)${p}`)];
+}
+
+/**
+ * Compute net UTF-8 bytes added by a unified diff.
+ *
+ * "Net added bytes" per file = (bytes in added lines) − (bytes in deleted lines), clamped to
+ * zero per file, then summed across all files in the diff.
+ *
+ * Using the net value instead of raw additions means that files which are
+ * completely rewritten with similar-sized content (e.g. a JSON object whose
+ * keys are regenerated) contribute only their actual growth to the patch-size
+ * budget rather than their entire new content.  This avoids the false positive
+ * where the tool reports "entire source code size" for a rewrite that barely
+ * changes the logical payload.
+ *
+ * Clamping is applied per file, not globally, so that a large deletion in one
+ * file cannot mask a large addition in a different file.  Each file's net
+ * contribution is clamped to zero independently before being added to the
+ * running total.
+ *
+ * Rules:
+ *   - Only lines inside diff hunks (after the first "@@" line) are examined.
+ *   - Lines that start with "+++" (file header) are excluded because they appear
+ *     before the first "@@" and are never inside a hunk.
+ *   - A new "diff " line flushes the current file's net contribution and resets
+ *     per-file counters.
+ *
+ * @param {string} patchContent - Output of `git diff` (unified diff format)
+ * @returns {number} Sum of per-file net added bytes (≥ 0)
+ */
+function getPatchDiffSizeBytes(patchContent) {
+  let inHunk = false;
+  let fileAdd = 0;
+  let fileDel = 0;
+  let total = 0;
+  for (const line of patchContent.split("\n")) {
+    if (line.startsWith("diff ")) {
+      total += Math.max(0, fileAdd - fileDel);
+      fileAdd = 0;
+      fileDel = 0;
+      inHunk = false;
+    } else if (line.startsWith("@@")) {
+      inHunk = true;
+    }
+    if (inHunk) {
+      if (line.startsWith("+")) {
+        fileAdd += Buffer.byteLength(line + "\n", "utf8");
+      } else if (line.startsWith("-")) {
+        fileDel += Buffer.byteLength(line + "\n", "utf8");
+      }
+    }
+  }
+  total += Math.max(0, fileAdd - fileDel);
+  return total;
+}
+
+/**
+ * Compute the net patch diff size for staged changes (git diff --cached).
+ *
+ * Returns the net bytes added by the staged diff: additions minus deletions,
+ * clamped to zero.  This is the "diff size" used to enforce max-patch-size on
+ * repo-memory pushes.
+ *
+ * @param {Object} options
+ * @param {(args: string[], opts?: Record<string, any>) => string} options.execGitSyncFn
+ * @param {string} [options.cwd]
+ * @param {string[]} [options.pathspecs] - Optional pathspecs to limit the staged diff
+ * @returns {number}
+ */
+function getStagedPatchDiffSizeBytes({ execGitSyncFn, cwd, pathspecs }) {
+  if (Array.isArray(pathspecs) && pathspecs.length === 0) {
+    return 0;
+  }
+  const args = ["diff", "--cached", "--no-renames"];
+  if (Array.isArray(pathspecs)) {
+    args.push("--", ...pathspecs);
+  }
+  const patchContent = execGitSyncFn(args, { stdio: "pipe", cwd });
+  return getPatchDiffSizeBytes(patchContent);
 }
 
 /**
@@ -138,7 +222,7 @@ function computeIncrementalDiffSize({ baseRef, headRef, cwd, tmpPath, excludedFi
       debugLog(`Computed incremental net diffSize=${diffSize} bytes (baseRef=${baseRef}..${headRef})`);
     }
   } catch (diffErr) {
-    debugLog(`Failed to compute incremental net diffSize - ${getErrorMessage(diffErr)}`);
+    debugLog(`Failed to compute incremental net diffSize - ${describeGitFailure(getErrorMessage(diffErr), cwd)}`);
   } finally {
     // Best-effort cleanup of the temp diff file; we only needed its size.
     try {
@@ -152,6 +236,61 @@ function computeIncrementalDiffSize({ baseRef, headRef, cwd, tmpPath, excludedFi
   return diffSize;
 }
 
+/**
+ * Returns true when `ancestor` is an ancestor of (or identical to) `descendant`.
+ * Any git failure (unknown revision, missing object, corrupt object store) is
+ * treated as "not an ancestor" - callers only need a boolean signal for base
+ * selection. Failures are suppressed here (suppressLogs: true); callers that
+ * need richer diagnostics on an unexpected failure should call
+ * describeGitFailure on their own caught error instead.
+ * @param {string} ancestor
+ * @param {string} descendant
+ * @param {string|undefined} cwd
+ * @returns {boolean}
+ */
+function isAncestorCommit(ancestor, descendant, cwd) {
+  try {
+    execGitSync(["merge-base", "--is-ancestor", "--", ancestor, descendant], { cwd, suppressLogs: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns true when the repository is a partial clone (objects are fetched lazily
+ * from a promisor remote). Artifact generation requires these objects locally.
+ * @param {string|undefined} cwd
+ * @returns {boolean}
+ */
+function isPartialClone(cwd) {
+  try {
+    return execGitSync(["config", "--get", "remote.origin.promisor"], { cwd, suppressLogs: true }).trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Appends a partial-clone diagnostic to an error message when the failure looks like
+ * unavailable objects in a promisor remote checkout.
+ * @param {string} message
+ * @param {string|undefined} cwd
+ * @returns {string}
+ */
+function describeGitFailure(message, cwd) {
+  const objectFailure = /(?:^|\n|ERR_SYSTEM: )fatal: (?:bad object \S+|(?:unable to read|could not read) [0-9a-f]{40}(?:[0-9a-f]{24})?\b|missing (?:blob|tree|commit) object\b)/i;
+  const unavailableObject = /promisor|Authentication failed|Invalid username or token|fetch-pack|object not found/i.test(message) || objectFailure.test(message);
+  const safeMessage = "Git operation failed. Ensure the checkout contains the required refs and objects before agent execution.";
+  if (!unavailableObject || !isPartialClone(cwd)) return safeMessage;
+  return (
+    `${safeMessage} ` +
+    "This repository is a partial clone (remote.origin.promisor=true) with required objects unavailable locally. " +
+    "Artifact generation disables all Git transports, including lazy fetches from the agent-writable checkout. " +
+    "Fetch the required objects during checkout (for example checkout.fetch-depth: 0 without a blob filter) to avoid lazy fetches."
+  );
+}
+
 module.exports = {
   sanitizeForFilename,
   sanitizeBranchNameForPatch,
@@ -160,4 +299,9 @@ module.exports = {
   getPatchPathForBranchInRepo,
   buildExcludePathspecs,
   computeIncrementalDiffSize,
+  getPatchDiffSizeBytes,
+  getStagedPatchDiffSizeBytes,
+  isAncestorCommit,
+  isPartialClone,
+  describeGitFailure,
 };

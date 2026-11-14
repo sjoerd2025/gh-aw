@@ -7,77 +7,6 @@ import (
 	"testing"
 )
 
-// TestEngineMethodsDelegateToShared ensures engine methods properly delegate to shared functions
-func TestEngineMethodsDelegateToShared(t *testing.T) {
-	t.Run("Claude engine Playwright delegation via unified renderer", func(t *testing.T) {
-		// Use unified renderer with Claude-specific options
-		renderer := NewMCPConfigRenderer(MCPRendererOptions{
-			IncludeCopilotFields: false,
-			InlineArgs:           false,
-			Format:               "json",
-			IsLast:               false,
-		})
-		var yaml strings.Builder
-		playwrightTool := map[string]any{}
-
-		renderer.RenderPlaywrightMCP(&yaml, playwrightTool)
-		result := yaml.String()
-
-		if !strings.Contains(result, `"playwright": {`) {
-			t.Error("Claude engine should use unified renderer for Playwright MCP config")
-		}
-	})
-
-	t.Run("Custom engine Playwright delegation", func(t *testing.T) {
-		// Use unified renderer with Custom engine options
-		renderer := NewMCPConfigRenderer(MCPRendererOptions{
-			IncludeCopilotFields: false,
-			InlineArgs:           false,
-			Format:               "json",
-			IsLast:               false,
-		})
-		var yaml strings.Builder
-		playwrightTool := map[string]any{}
-
-		renderer.RenderPlaywrightMCP(&yaml, playwrightTool)
-		result := yaml.String()
-
-		if !strings.Contains(result, `"playwright": {`) {
-			t.Error("Custom engine Playwright should produce output via unified renderer")
-		}
-	})
-
-	t.Run("Claude and Custom engines produce identical output", func(t *testing.T) {
-		// Claude engine via unified renderer
-		claudeRenderer := NewMCPConfigRenderer(MCPRendererOptions{
-			IncludeCopilotFields: false,
-			InlineArgs:           false,
-			Format:               "json",
-			IsLast:               false,
-		})
-
-		// Custom engine also uses unified renderer with same options
-		customRenderer := NewMCPConfigRenderer(MCPRendererOptions{
-			IncludeCopilotFields: false,
-			InlineArgs:           false,
-			Format:               "json",
-			IsLast:               false,
-		})
-
-		playwrightTool := map[string]any{}
-
-		var claudeYAML strings.Builder
-		claudeRenderer.RenderPlaywrightMCP(&claudeYAML, playwrightTool)
-
-		var customYAML strings.Builder
-		customRenderer.RenderPlaywrightMCP(&customYAML, playwrightTool)
-
-		if claudeYAML.String() != customYAML.String() {
-			t.Error("Claude and Custom engines should produce identical Playwright MCP config")
-		}
-	})
-}
-
 // TestRewriteLocalhostToDockerHost tests the URL rewriting function for firewall containers
 func TestRewriteLocalhostToDockerHost(t *testing.T) {
 	tests := []struct {
@@ -119,6 +48,21 @@ func TestRewriteLocalhostToDockerHost(t *testing.T) {
 			name:     "URL with localhost in path should not be fully rewritten",
 			inputURL: "https://api.github.com/localhost",
 			expected: "https://api.github.com/localhost",
+		},
+		{
+			name:     "localhost lookalike host should not be rewritten",
+			inputURL: "http://localhost.evil.example:8765/mcp",
+			expected: "http://localhost.evil.example:8765/mcp",
+		},
+		{
+			name:     "127.0.0.1 lookalike host should not be rewritten",
+			inputURL: "http://127.0.0.1.evil.example:8765/mcp",
+			expected: "http://127.0.0.1.evil.example:8765/mcp",
+		},
+		{
+			name:     "unsupported scheme should not be rewritten",
+			inputURL: "ftp://localhost:8765/mcp",
+			expected: "ftp://localhost:8765/mcp",
 		},
 	}
 

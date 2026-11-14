@@ -77,7 +77,7 @@ func TestExtractStepsFromCopilotSetup(t *testing.T) {
 						"name": "Set up Node.js",
 						"uses": "actions/setup-node@v4",
 						"with": map[string]any{
-							"node-version": "20",
+							"node-version": "24",
 						},
 					},
 				},
@@ -164,7 +164,7 @@ func TestExtractStepsFromCopilotSetup_StripsCheckoutStep(t *testing.T) {
 						"name": "Set up Node.js",
 						"uses": "actions/setup-node@v4",
 						"with": map[string]any{
-							"node-version": "20",
+							"node-version": "24",
 						},
 					},
 				},
@@ -324,7 +324,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
@@ -336,7 +336,7 @@ jobs:
 	require.NoError(t, err, "Failed to write workflow file")
 
 	// Process the file
-	stepsYAML, services, err := processYAMLWorkflowImport(workflowFile)
+	stepsYAML, services, _, err := processYAMLWorkflowImportWithSourceVersions(workflowFile)
 	require.NoError(t, err, "Should process copilot-setup-steps.yml without error")
 	assert.Empty(t, services, "Should not extract services from copilot-setup-steps.yml")
 	assert.NotEmpty(t, stepsYAML, "Should return steps YAML")
@@ -380,7 +380,7 @@ jobs:
 	require.NoError(t, err, "Failed to write workflow file")
 
 	// Process the file
-	jobsJSON, services, err := processYAMLWorkflowImport(workflowFile)
+	jobsJSON, services, _, err := processYAMLWorkflowImportWithSourceVersions(workflowFile)
 	require.NoError(t, err, "Should process regular workflow without error")
 	assert.Empty(t, services, "Should not extract services from this workflow")
 	assert.NotEmpty(t, jobsJSON, "Should return jobs JSON")
@@ -415,7 +415,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 `
 	copilotSetupFile := filepath.Join(workflowsDir, "copilot-setup-steps.yml")
 	err = os.WriteFile(copilotSetupFile, []byte(copilotSetupContent), 0600)

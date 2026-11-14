@@ -6,7 +6,7 @@ description: Label usage guidelines for GitHub Agentic Workflows issue tracking
 
 ## Purpose of Labels
 
-Labels help organize and triage issues for better project management. Use labels to:
+Labels help organize and triage issues for project management. Use labels to:
 - Categorize issue type (bug, enhancement, documentation)
 - Indicate priority level
 - Mark workflow automation status
@@ -100,7 +100,7 @@ Labels help organize and triage issues for better project management. Use labels
 - Ensure all open issues have at least a type label
 
 **Avoiding Label Overload:**
-- Use 2-4 labels per issue for effective filtering
+- Use 2-4 labels per issue to support filtering
 - Don't duplicate information (e.g., title already says "bug")
 - Prefer specific component labels over generic ones
 
@@ -116,9 +116,9 @@ Domain: constraint-solving, problem-of-the-day
 Status: good first issue, dependencies
 ```
 
-This taxonomy provides clear filtering while avoiding label sprawl. Use GitHub's issue search to combine labels effectively:
-- `is:issue is:open label:bug label:priority-high` - Critical bugs
-- `is:issue is:open label:enhancement label:good first issue` - Beginner-friendly enhancements
+This taxonomy separates labels into six categories, which can be combined in GitHub's issue search to filter issues:
+- `is:issue is:open label:bug label:priority-high` - High-priority bugs
+- `is:issue is:open label:enhancement label:good first issue` - Open enhancements suitable for new contributors
 - `is:issue is:open label:plan` - Active planning issues
 
 ## Label Distribution Analysis
@@ -134,30 +134,30 @@ Analysis of the repository (as of December 2024) shows:
 
 ### Key Findings
 
-**The label distribution is healthy and working as intended.** The high percentage of workflow labels reflects active AI-assisted planning, not a labeling problem.
+The label distribution matches the label lifecycle described in the Label Usage Best Practices section above. The high percentage of workflow labels reflects active AI-assisted planning, not a labeling problem.
 
 **Why this is not a concern:**
 1. Labels reflect actual project activity (active AI planning)
-2. Clear distinction between automated and manual issues
-3. Effective filtering with label combinations
-4. Transparent AI attribution
-5. Additional labels (type, component, priority) provide needed categorization
+2. Automated issues carry the `ai-generated` label; manual issues do not
+3. Label combinations can be used to filter issues via GitHub issue search
+4. AI-generated issues are marked with the `ai-generated` label
+5. Additional labels (type, component, priority) provide categorization for filtering
 
 ### Recommendations
 
 ✅ **Keep current structure** - No changes needed to `plan`/`ai-generated` labels
-- Working as designed
-- Serves clear purpose for tracking AI-generated planning issues
-- Enables effective filtering with combinations
+- Matches the label lifecycle described in this document
+- Serves the purpose of tracking AI-generated planning issues
+- Enables filtering with label combinations
 
-❌ **Do not create `plan-*` subcategories** - Adds complexity without benefit
+❌ **Do not create `plan-*` subcategories** - would add label categories not currently needed for filtering
 - Current system handles this with `is:open` / `is:closed` filters
 - Would fragment label space
 
 🔄 **Optional** (low priority): Remove `plan` label after sub-tasks complete
 - Would make it an "active planning" indicator
 - Keep `ai-generated` for historical tracking
-- Not required, current approach is also valid
+- Not required; the current approach is also acceptable
 
 ✅ **Monitor** for true label skew
 - Watch type/priority labels (not workflow labels)
@@ -167,9 +167,9 @@ Analysis of the repository (as of December 2024) shows:
 ## Success Metrics
 
 ✅ Zero unlabeled open issues  
-✅ Clear distinction between automated and manual issues  
-✅ Effective filtering with label combinations  
-✅ Transparent AI attribution maintained
+✅ Automated issues carry `ai-generated`; manual issues do not  
+✅ Label combinations support filtering via GitHub issue search  
+✅ `ai-generated` label remains on AI-created issues
 
 ---
 

@@ -7,6 +7,7 @@ import (
 )
 
 func TestNormalizeWorkflowName(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    string
@@ -71,6 +72,7 @@ func TestNormalizeWorkflowName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := NormalizeWorkflowName(tt.input)
 			if result != tt.expected {
 				t.Errorf("NormalizeWorkflowName(%q) = %q, expected %q", tt.input, result, tt.expected)
@@ -80,6 +82,7 @@ func TestNormalizeWorkflowName(t *testing.T) {
 }
 
 func TestNormalizeSafeOutputIdentifier(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		identifier string
@@ -164,9 +167,105 @@ func TestNormalizeSafeOutputIdentifier(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := NormalizeSafeOutputIdentifier(tt.identifier)
 			if result != tt.expected {
 				t.Errorf("NormalizeSafeOutputIdentifier(%q) = %q, want %q", tt.identifier, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizeIdentifierToHyphens(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		identifier string
+		expected   string
+	}{
+		{
+			name:       "underscore-separated to hyphen",
+			identifier: "create_issue",
+			expected:   "create-issue",
+		},
+		{
+			name:       "already hyphen-separated",
+			identifier: "create-issue",
+			expected:   "create-issue",
+		},
+		{
+			name:       "multiple underscores",
+			identifier: "add_comment_to_issue",
+			expected:   "add-comment-to-issue",
+		},
+		{
+			name:       "mixed dashes and underscores",
+			identifier: "update-pr_status",
+			expected:   "update-pr-status",
+		},
+		{
+			name:       "no dashes or underscores",
+			identifier: "createissue",
+			expected:   "createissue",
+		},
+		{
+			name:       "single underscore",
+			identifier: "add_comment",
+			expected:   "add-comment",
+		},
+		{
+			name:       "trailing underscore",
+			identifier: "update_",
+			expected:   "update-",
+		},
+		{
+			name:       "leading underscore",
+			identifier: "_create",
+			expected:   "-create",
+		},
+		{
+			name:       "consecutive underscores",
+			identifier: "create__issue",
+			expected:   "create--issue",
+		},
+		{
+			name:       "empty string",
+			identifier: "",
+			expected:   "",
+		},
+		{
+			name:       "only underscores",
+			identifier: "___",
+			expected:   "---",
+		},
+		{
+			name:       "period in workflow name",
+			identifier: "executor_workflow.agent",
+			expected:   "executor-workflow-agent",
+		},
+		{
+			name:       "period only",
+			identifier: "my.workflow",
+			expected:   "my-workflow",
+		},
+		{
+			name:       "multiple periods",
+			identifier: "my.workflow.agent",
+			expected:   "my-workflow-agent",
+		},
+		{
+			name:       "period and underscores",
+			identifier: "my_workflow.agent",
+			expected:   "my-workflow-agent",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := NormalizeIdentifierToHyphens(tt.identifier)
+			if result != tt.expected {
+				t.Errorf("NormalizeIdentifierToHyphens(%q) = %q, want %q", tt.identifier, result, tt.expected)
 			}
 		})
 	}
@@ -186,7 +285,15 @@ func BenchmarkNormalizeSafeOutputIdentifier(b *testing.B) {
 	}
 }
 
+func BenchmarkNormalizeIdentifierToHyphens(b *testing.B) {
+	identifier := "create_pull_request_review_comment"
+	for b.Loop() {
+		NormalizeIdentifierToHyphens(identifier)
+	}
+}
+
 func TestMarkdownToLockFile(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    string
@@ -226,6 +333,7 @@ func TestMarkdownToLockFile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := MarkdownToLockFile(tt.input)
 			if result != tt.expected {
 				t.Errorf("MarkdownToLockFile(%q) = %q, expected %q", tt.input, result, tt.expected)
@@ -235,6 +343,7 @@ func TestMarkdownToLockFile(t *testing.T) {
 }
 
 func TestLockFileToMarkdown(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    string
@@ -274,6 +383,7 @@ func TestLockFileToMarkdown(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := LockFileToMarkdown(tt.input)
 			if result != tt.expected {
 				t.Errorf("LockFileToMarkdown(%q) = %q, expected %q", tt.input, result, tt.expected)
@@ -283,8 +393,10 @@ func TestLockFileToMarkdown(t *testing.T) {
 }
 
 func TestRoundTripConversions(t *testing.T) {
+	t.Parallel()
 	// Test that converting back and forth preserves the base name
 	t.Run("markdown to lock and back", func(t *testing.T) {
+		t.Parallel()
 		original := "workflow.md"
 		lockFile := MarkdownToLockFile(original)
 		backToMd := LockFileToMarkdown(lockFile)
@@ -294,6 +406,7 @@ func TestRoundTripConversions(t *testing.T) {
 	})
 
 	t.Run("lock to markdown and back", func(t *testing.T) {
+		t.Parallel()
 		original := "workflow.lock.yml"
 		mdFile := LockFileToMarkdown(original)
 		backToLock := MarkdownToLockFile(mdFile)

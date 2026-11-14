@@ -17,11 +17,7 @@ import (
 
 // TestMCPServer_FixTool tests that the fix tool is exposed and functional
 func TestMCPServer_FixTool(t *testing.T) {
-	// Skip if the binary doesn't exist
-	binaryPath := "../../gh-aw"
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		t.Skip("Skipping test: gh-aw binary not found. Run 'make build' first.")
-	}
+	binaryPath := testutil.RequireGhAwBinary(t)
 
 	// Create MCP client
 	client := mcp.NewClient(&mcp.Implementation{
@@ -30,7 +26,7 @@ func TestMCPServer_FixTool(t *testing.T) {
 	}, nil)
 
 	// Start the MCP server as a subprocess with custom command path
-	serverCmd := exec.Command(binaryPath, "mcp-server", "--cmd", binaryPath)
+	serverCmd := exec.Command(binaryPath, "mcp-server", "--allow-write-tools", "--cmd", binaryPath)
 	transport := &mcp.CommandTransport{Command: serverCmd}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -82,11 +78,7 @@ func TestMCPServer_FixTool(t *testing.T) {
 
 // TestMCPServer_FixToolInvocation tests calling the fix tool
 func TestMCPServer_FixToolInvocation(t *testing.T) {
-	// Skip if the binary doesn't exist
-	binaryPath := "../../gh-aw"
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		t.Skip("Skipping test: gh-aw binary not found. Run 'make build' first.")
-	}
+	binaryPath := testutil.RequireGhAwBinary(t)
 
 	// Get absolute path to binary
 	absBinaryPath, err := filepath.Abs(binaryPath)
@@ -133,7 +125,7 @@ This is a test workflow with deprecated timeout_minutes field.
 	}, nil)
 
 	// Start the MCP server as a subprocess with custom command path (absolute path)
-	serverCmd := exec.Command(absBinaryPath, "mcp-server", "--cmd", absBinaryPath)
+	serverCmd := exec.Command(absBinaryPath, "mcp-server", "--allow-write-tools", "--cmd", absBinaryPath)
 	serverCmd.Dir = tmpDir
 	transport := &mcp.CommandTransport{Command: serverCmd}
 

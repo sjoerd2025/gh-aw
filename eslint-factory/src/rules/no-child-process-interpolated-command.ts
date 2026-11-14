@@ -1,5 +1,5 @@
 import { AST_NODE_TYPES, ESLintUtils, TSESLint, TSESTree } from "@typescript-eslint/utils";
-import { resolveWriteOnceInitializerChain } from "./command-initializer-utils";
+import { getDynamicCommandKind } from "./command-initializer-utils";
 import { isChildProcessImportBinding, isChildProcessObjectBinding, isRequireChildProcess } from "./try-catch-rule-utils";
 
 const createRule = ESLintUtils.RuleCreator(name => `https://github.com/github/gh-aw/tree/main/eslint-factory#${name}`);
@@ -7,25 +7,6 @@ const createRule = ESLintUtils.RuleCreator(name => `https://github.com/github/gh
 type SourceCodeScope = ReturnType<TSESLint.SourceCode["getScope"]>;
 type ChildProcessMethod = "exec" | "execSync" | "spawn" | "spawnSync" | "execFile" | "execFileSync";
 const SHELL_CONDITIONAL_METHODS = new Set<ChildProcessMethod>(["spawn", "spawnSync", "execFile", "execFileSync"]);
-
-function isStaticExpression(node: TSESTree.Expression): boolean {
-  if (node.type === AST_NODE_TYPES.Literal) return true;
-  if (node.type === AST_NODE_TYPES.TemplateLiteral) return node.expressions.length === 0;
-  if (node.type === AST_NODE_TYPES.BinaryExpression && node.operator === "+") {
-    return isStaticExpression(node.left) && isStaticExpression(node.right);
-  }
-  return false;
-}
-
-function isDynamicStringConcatenation(node: TSESTree.Expression): boolean {
-  return node.type === AST_NODE_TYPES.BinaryExpression && node.operator === "+" && !isStaticExpression(node);
-}
-
-function getDynamicCommandKind(node: TSESTree.Expression): string | null {
-  if (node.type === AST_NODE_TYPES.TemplateLiteral && node.expressions.length > 0) return "interpolated template literal";
-  if (isDynamicStringConcatenation(node)) return "dynamic string concatenation";
-  return null;
-}
 
 function getImportSpecifierName(node: TSESTree.ImportSpecifier): string | null {
   if (node.imported.type === AST_NODE_TYPES.Identifier) return node.imported.name;
@@ -46,35 +27,51 @@ function getShellPropertyValue(optionsArg: TSESTree.ObjectExpression): boolean {
   return false;
 }
 
-function resolveObjectExpression(arg: TSESTree.CallExpressionArgument, scopeNode: TSESTree.Node, sourceCode: TSESLint.SourceCode): TSESTree.ObjectExpression | null {
-  if (arg.type === AST_NODE_TYPES.ObjectExpression) return arg;
-  if (arg.type !== AST_NODE_TYPES.Identifier) return null;
+/**
+ * Result of resolving an identifier argument to a concrete initializer:
+ * either the initializer expression, or "unresolved" when the binding cannot
+ * be statically resolved with confidence (missing declaration, no initializer,
+ * or a re-assigned binding whose declarator value is stale at call time).
+ */
+type ResolvedArgument = { kind: "expression"; node: TSESTree.Expression } | { kind: "unresolved" };
 
+function resolveIdentifierInitializer(arg: TSESTree.Identifier, scopeNode: TSESTree.Node, sourceCode: TSESLint.SourceCode): ResolvedArgument {
   let scope: SourceCodeScope | null = sourceCode.getScope(scopeNode);
   while (scope) {
     const variable = scope.set.get(arg.name);
     if (variable && variable.defs.length > 0) {
+      // Reject re-assigned bindings (write references that are not the
+      // initializer): the declarator value is not a reliable proxy for the
+      // value at call time.
+      if (variable.references.some(ref => ref.isWrite() && !ref.init)) return { kind: "unresolved" };
       for (const def of variable.defs) {
         if (def.type !== "Variable") continue;
         const declarator = def.node as TSESTree.VariableDeclarator;
         if (declarator.id.type !== AST_NODE_TYPES.Identifier || declarator.id.name !== arg.name) continue;
-        if (declarator.init?.type === AST_NODE_TYPES.ObjectExpression) return declarator.init;
+        if (declarator.init) return { kind: "expression", node: declarator.init };
       }
-      return null;
+      return { kind: "unresolved" };
     }
     scope = scope.upper;
   }
 
-  return null;
+  return { kind: "unresolved" };
 }
 
 function isShellTrueOption(optionsArg: TSESTree.CallExpressionArgument | undefined, scopeNode: TSESTree.Node, sourceCode: TSESLint.SourceCode): boolean {
   if (!optionsArg) return false;
   if (optionsArg.type === AST_NODE_TYPES.SpreadElement) return true; // Conservative: spread arguments are treated as possibly shell-enabled.
+  if (optionsArg.type === AST_NODE_TYPES.ObjectExpression) return getShellPropertyValue(optionsArg);
+  if (optionsArg.type !== AST_NODE_TYPES.Identifier) return false;
 
-  const resolvedObject = resolveObjectExpression(optionsArg, scopeNode, sourceCode);
-  if (!resolvedObject) return false;
-  return getShellPropertyValue(resolvedObject);
+  const resolved = resolveIdentifierInitializer(optionsArg, scopeNode, sourceCode);
+  // Conservative: an identifier that cannot be resolved to a concrete value
+  // (for example a re-assigned binding) is treated as possibly shell-enabled.
+  if (resolved.kind === "unresolved") return true;
+  if (resolved.node.type === AST_NODE_TYPES.ObjectExpression) return getShellPropertyValue(resolved.node);
+  // An array initializer is the argument list, not an options object.
+  if (resolved.node.type === AST_NODE_TYPES.ArrayExpression) return false;
+  return true;
 }
 
 function requiresShellTrue(method: ChildProcessMethod): boolean {
@@ -133,7 +130,14 @@ function resolveChildProcessMethod(node: TSESTree.CallExpression, sourceCode: TS
   }
 
   if (callee.type !== AST_NODE_TYPES.MemberExpression || callee.computed) return null;
-  if (callee.object.type !== AST_NODE_TYPES.Identifier || callee.property.type !== AST_NODE_TYPES.Identifier) return null;
+  if (callee.property.type !== AST_NODE_TYPES.Identifier) return null;
+
+  if (callee.object.type === AST_NODE_TYPES.CallExpression && isRequireChildProcess(callee.object)) {
+    const method = callee.property.name;
+    return method === "exec" || method === "execSync" || method === "spawn" || method === "spawnSync" || method === "execFile" || method === "execFileSync" ? method : null;
+  }
+
+  if (callee.object.type !== AST_NODE_TYPES.Identifier) return null;
   if (!isChildProcessObjectBinding(callee.object.name, callee.object, sourceCode)) return null;
 
   const method = callee.property.name;
@@ -169,8 +173,7 @@ export const noChildProcessInterpolatedCommandRule = createRule({
         const firstArg = node.arguments[0];
         if (!firstArg || firstArg.type === AST_NODE_TYPES.SpreadElement) return;
 
-        const candidate = resolveWriteOnceInitializerChain(firstArg as TSESTree.Expression, sourceCode);
-        const kind = getDynamicCommandKind(candidate);
+        const kind = getDynamicCommandKind(firstArg as TSESTree.Expression, sourceCode);
         if (!kind) return;
 
         context.report({

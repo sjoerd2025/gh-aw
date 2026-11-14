@@ -7,6 +7,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var createCodeScanningAlertLog = logger.New("workflow:create_code_scanning_alert")
@@ -15,6 +16,7 @@ var createCodeScanningAlertLog = logger.New("workflow:create_code_scanning_alert
 type CreateCodeScanningAlertsConfig struct {
 	BaseSafeOutputConfig `yaml:",inline"`
 	Driver               string   `yaml:"driver,omitempty"`        // Driver name for SARIF tool.driver.name field (default: "GitHub Agentic Workflows Security Scanner")
+	TargetRef            string   `yaml:"target-ref,omitempty"`    // Trusted queue SARIF reference, independently resolved to the immutable worker revision
 	TargetRepoSlug       string   `yaml:"target-repo,omitempty"`   // Target repository in format "owner/repo" for cross-repository code scanning alert creation
 	AllowedRepos         []string `yaml:"allowed-repos,omitempty"` // List of additional repositories in format "owner/repo" that code scanning alerts can be created in
 }
@@ -40,6 +42,7 @@ func (c *Compiler) parseCodeScanningAlertsConfig(outputMap map[string]any) *Crea
 
 		// Parse target-repo
 		securityReportsConfig.TargetRepoSlug = extractStringFromMap(configMap, "target-repo", createCodeScanningAlertLog)
+		securityReportsConfig.TargetRef = extractStringFromMap(configMap, "target-ref", createCodeScanningAlertLog)
 		if securityReportsConfig.TargetRepoSlug != "" {
 			createCodeScanningAlertLog.Printf("Target repo for code scanning alerts: %s", securityReportsConfig.TargetRepoSlug)
 		}
@@ -80,7 +83,7 @@ func (c *Compiler) parseCodeScanningAlertsConfig(outputMap map[string]any) *Crea
 func (c *Compiler) buildCodeScanningUploadJob(data *WorkflowData) (*Job, error) {
 	createCodeScanningAlertLog.Print("Building upload_code_scanning_sarif job")
 
-	// Compute the effective token for checkout/upload in this job.
+	// Compute the resolved token for checkout/upload in this job.
 	// We cannot pass tokens through job outputs (GitHub Actions masks secret references).
 	// We must either compute the static token directly or mint a fresh GitHub App token.
 	checkoutMgr := NewCheckoutManager(data.CheckoutConfigs)
@@ -106,54 +109,10 @@ func (c *Compiler) buildCodeScanningUploadJob(data *WorkflowData) (*Job, error) 
 		restoreToken = resolveStaticCheckoutToken(data.SafeOutputs, checkoutMgr)
 	}
 
-	// Artifact prefix for workflow_call context (so the download name matches the upload name).
-	agentArtifactPrefix := artifactPrefixExprForDownstreamJob(data)
-
-	var steps []string
-
-	// Prepend any token minting steps (needed when checkout uses GitHub App auth).
+	uploadSteps := c.buildCodeScanningUploadSteps(data, restoreToken)
+	steps := make([]string, 0, typeutil.SafeAllocationCapacity(len(tokenMintSteps), len(uploadSteps)))
 	steps = append(steps, tokenMintSteps...)
-
-	// Step: Restore workspace to the triggering commit.
-	// The safe_outputs job may have checked out a different branch (e.g., the base branch for
-	// a PR) which would leave HEAD pointing at a different commit. The SARIF upload action
-	// requires HEAD to match the commit being scanned, otherwise it fails with "commit not found".
-	steps = append(steps, "      - name: Restore checkout to triggering commit\n")
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", getActionPin("actions/checkout")))
-	steps = append(steps, "        with:\n")
-	steps = append(steps, "          ref: ${{ github.sha }}\n")
-	steps = append(steps, fmt.Sprintf("          token: %s\n", restoreToken))
-	steps = append(steps, "          persist-credentials: false\n")
-	steps = append(steps, "          fetch-depth: 1\n")
-
-	// Step: Download the SARIF artifact produced by safe_outputs.
-	// The SARIF file was written to the safe_outputs job workspace and uploaded as an artifact.
-	// This job runs in a fresh workspace so we must download the artifact before uploading
-	// to GitHub Code Scanning.
-	sarifDownloadSteps := buildArtifactDownloadSteps(ArtifactDownloadConfig{
-		ArtifactName: agentArtifactPrefix + constants.SarifArtifactName,
-		DownloadPath: constants.SarifArtifactDownloadPath,
-		StepName:     "Download SARIF artifact",
-	}, c.getActionPin)
-	steps = append(steps, sarifDownloadSteps...)
-
-	// The local SARIF file path after the artifact download completes.
-	localSarifPath := path.Join(constants.SarifArtifactDownloadPath, constants.SarifFileName)
-
-	// Step: Upload SARIF file to GitHub Code Scanning.
-	steps = append(steps, "      - name: Upload SARIF to GitHub Code Scanning\n")
-	steps = append(steps, fmt.Sprintf("        id: %s\n", constants.UploadCodeScanningJobName))
-	steps = append(steps, fmt.Sprintf("        uses: %s\n", c.getActionPin("github/codeql-action/upload-sarif")))
-	steps = append(steps, "        with:\n")
-	// NOTE: github/codeql-action/upload-sarif uses 'token' as the input name, not 'github-token'
-	// Pass restoreToken as the fallback so GitHub App-minted tokens flow through consistently.
-	c.addUploadSARIFToken(&steps, data, data.SafeOutputs.CreateCodeScanningAlerts.GitHubToken, restoreToken)
-	// sarif_file now references the locally-downloaded artifact, not the path from safe_outputs
-	steps = append(steps, fmt.Sprintf("          sarif_file: %s\n", localSarifPath))
-	// ref and sha pin the upload to the exact triggering commit regardless of local git state
-	steps = append(steps, "          ref: ${{ github.ref }}\n")
-	steps = append(steps, "          sha: ${{ github.sha }}\n")
-	steps = append(steps, "          wait-for-processing: true\n")
+	steps = append(steps, uploadSteps...)
 
 	// The job only runs when the safe_outputs job exported a non-empty SARIF file path.
 	jobCondition := fmt.Sprintf("needs.%s.outputs.sarif_file != ''", constants.SafeOutputsJobName)
@@ -170,11 +129,48 @@ func (c *Compiler) buildCodeScanningUploadJob(data *WorkflowData) (*Job, error) 
 		Permissions:    permissions.RenderToYAML(),
 		TimeoutMinutes: 10,
 		Steps:          steps,
-		Needs:          []string{string(constants.SafeOutputsJobName)},
+		Needs:          []string{string(constants.ActivationJobName), string(constants.SafeOutputsJobName)},
 	}
 
 	createCodeScanningAlertLog.Print("Built upload_code_scanning_sarif job")
 	return job, nil
+}
+
+// buildCodeScanningUploadSteps restores the triggering commit because upload-sarif requires HEAD
+// to match the scanned commit, then downloads the SARIF artifact because this job has a fresh workspace.
+func (c *Compiler) buildCodeScanningUploadSteps(data *WorkflowData, restoreToken string) []string {
+	steps := []string{
+		"      - name: Restore checkout to triggering commit\n",
+		fmt.Sprintf("        uses: %s\n", getActionPin("actions/checkout")),
+		"        with:\n",
+		"          ref: ${{ github.sha }}\n",
+		fmt.Sprintf("          token: %s\n", restoreToken),
+		"          persist-credentials: false\n",
+		"          fetch-depth: 1\n",
+	}
+	steps = append(steps, buildArtifactDownloadSteps(ArtifactDownloadConfig{
+		ArtifactName: artifactPrefixExprForDownstreamJob(data) + constants.SarifArtifactName.String(),
+		DownloadPath: constants.SarifArtifactDownloadPath.String(),
+		StepName:     "Download SARIF artifact",
+	}, c.getActionPin)...)
+
+	localSarifPath := path.Join(constants.SarifArtifactDownloadPath.String(), constants.SarifFileName.String())
+
+	steps = append(steps, "      - name: Upload SARIF to GitHub Code Scanning\n")
+	steps = append(steps, fmt.Sprintf("        id: %s\n", constants.UploadCodeScanningJobName))
+	steps = append(steps, fmt.Sprintf("        uses: %s\n", c.getActionPin("github/codeql-action/upload-sarif")))
+	steps = append(steps, "        with:\n")
+	// NOTE: github/codeql-action/upload-sarif uses 'token' as the input name, not 'github-token'
+	// Pass restoreToken as the fallback so GitHub App-minted tokens flow through consistently.
+	c.addUploadSARIFToken(&steps, data, data.SafeOutputs.CreateCodeScanningAlerts.GitHubToken, restoreToken)
+	// sarif_file now references the locally-downloaded artifact, not the path from safe_outputs
+	steps = append(steps, fmt.Sprintf("          sarif_file: %s\n", localSarifPath))
+	// ref and sha pin the upload to the exact triggering commit regardless of local git state
+	steps = append(steps, "          ref: ${{ github.ref }}\n")
+	steps = append(steps, "          sha: ${{ github.sha }}\n")
+	steps = append(steps, "          wait-for-processing: true\n")
+
+	return steps
 }
 
 // addUploadSARIFToken adds the 'token' input for github/codeql-action/upload-sarif.
@@ -196,19 +192,19 @@ func (c *Compiler) addUploadSARIFToken(steps *[]string, data *WorkflowData, conf
 	// Choose the first non-empty per-config or safe-outputs-level static PAT.
 	// GitHub App tokens are NOT used here because they are minted and revoked in safe_outputs;
 	// they are unavailable in this separate downstream job.
-	effectiveCustomToken := configToken
-	if effectiveCustomToken == "" {
-		effectiveCustomToken = safeOutputsToken
+	resolvedCustomToken := configToken
+	if resolvedCustomToken == "" {
+		resolvedCustomToken = safeOutputsToken
 	}
 
-	if effectiveCustomToken != "" {
-		effectiveToken := getEffectiveSafeOutputGitHubToken(effectiveCustomToken)
+	if resolvedCustomToken != "" {
+		resolvedToken := resolveSafeOutputGitHubToken(resolvedCustomToken)
 		tokenSource := "per-config github-token"
 		if configToken == "" {
 			tokenSource = "safe-outputs github-token"
 		}
 		createCodeScanningAlertLog.Printf("Using token for SARIF upload from source: %s (upload-sarif uses 'token' not 'github-token')", tokenSource)
-		*steps = append(*steps, fmt.Sprintf("          token: %s\n", effectiveToken))
+		*steps = append(*steps, fmt.Sprintf("          token: %s\n", resolvedToken))
 		return
 	}
 

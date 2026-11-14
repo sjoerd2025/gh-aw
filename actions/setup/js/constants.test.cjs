@@ -8,11 +8,18 @@ const {
   FAQ_CREATE_PR_PERMISSIONS_URL,
   MAX_LABELS,
   MAX_ASSIGNEES,
+  MAX_CAPTURE_BYTES,
   GATEWAY_JSONL_PATH,
   RPC_MESSAGES_PATH,
   MANIFEST_FILE_PATH,
   TEMPORARY_ID_MAP_FILE_PATH,
   DETECTION_LOG_FILENAME,
+  DEFAULT_MCP_CALL_WATCHDOG_MS,
+  MCP_CALL_TRANSPORT_GRACE_MS,
+  MAX_RESTORE_RUNS,
+  MAX_RESTORE_PAGES,
+  SCAN_WINDOW_MS,
+  PROXY_ENV_NAMES,
 } = require("./constants.cjs");
 
 describe("constants", () => {
@@ -83,6 +90,33 @@ describe("constants", () => {
     });
   });
 
+  describe("Codex MCP watchdog timeouts", () => {
+    it("should export the default call timeout and transport grace period", () => {
+      expect(DEFAULT_MCP_CALL_WATCHDOG_MS).toBe(120_000);
+      expect(MCP_CALL_TRANSPORT_GRACE_MS).toBe(60_000);
+    });
+  });
+
+  describe("protected command output limits", () => {
+    it("should cap aggregate capture at 64 MiB", () => {
+      expect(MAX_CAPTURE_BYTES).toBe(67_108_864);
+    });
+  });
+
+  describe("daily AIC scan cache restore limits", () => {
+    it("should export the bounded run and page counts and scan window", () => {
+      expect(MAX_RESTORE_RUNS).toBe(10);
+      expect(MAX_RESTORE_PAGES).toBe(25);
+      expect(SCAN_WINDOW_MS).toBe(24 * 60 * 60 * 1000);
+    });
+  });
+
+  describe("proxy environment variables", () => {
+    it("should export the supported proxy variable names", () => {
+      expect(PROXY_ENV_NAMES).toEqual(["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]);
+    });
+  });
+
   describe("module exports", () => {
     it("should export all expected constants", () => {
       const exported = require("./constants.cjs");
@@ -94,11 +128,18 @@ describe("constants", () => {
         "FAQ_CREATE_PR_PERMISSIONS_URL",
         "MAX_LABELS",
         "MAX_ASSIGNEES",
+        "MAX_CAPTURE_BYTES",
         "GATEWAY_JSONL_PATH",
         "RPC_MESSAGES_PATH",
         "MANIFEST_FILE_PATH",
         "TEMPORARY_ID_MAP_FILE_PATH",
         "DETECTION_LOG_FILENAME",
+        "DEFAULT_MCP_CALL_WATCHDOG_MS",
+        "MCP_CALL_TRANSPORT_GRACE_MS",
+        "MAX_RESTORE_RUNS",
+        "MAX_RESTORE_PAGES",
+        "SCAN_WINDOW_MS",
+        "PROXY_ENV_NAMES",
       ];
       for (const key of expectedKeys) {
         expect(exported).toHaveProperty(key);

@@ -6,9 +6,24 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "enclaveDebugPublic": {
+      "type": "boolean",
+      "description": "Retain bounded redacted host-only diagnostics for verified static public-only Docker or Cloud Hypervisor enclaves. False disables automatic capture."
+    },
     "$schema": {
       "type": "string",
       "description": "JSON Schema URL for IDE validation and autocomplete."
+    },
+    "experimental": {
+      "type": "object",
+      "description": "Explicit opt-ins for experimental AWF features.",
+      "additionalProperties": false,
+      "properties": {
+        "modelRouting": {
+          "type": "boolean",
+          "description": "Experimental opt-in for task-level model routing. Must be true when apiProxy.routing is configured; without apiProxy.routing, routing remains inactive."
+        }
+      }
     },
     "network": {
       "type": "object",
@@ -35,6 +50,11 @@
             "type": "string"
           },
           "description": "DNS servers to use inside the container. Defaults to Google DNS (8.8.8.8, 8.8.4.4). Accepts IPv4 and IPv6 addresses."
+        },
+        "subnet": {
+          "type": "string",
+          "description": "IPv4 CIDR for the awf-net Docker network (default 172.30.0.0/24). Use this when the default collides with the host or cluster network, e.g. the OpenShift service CIDR 172.30.0.0/16 whose CoreDNS ClusterIP 172.30.0.10 is the address AWF assigns to Squid. Accepted prefix lengths are /16 to /26. Maps to --network-subnet.",
+          "pattern": "^(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}/(1[6-9]|2[0-6])$"
         },
         "upstreamProxy": {
           "type": "string",
@@ -68,6 +88,30 @@
         }
       ]
     },
+    "filesystem": {
+      "type": "object",
+      "description": "Host filesystem write-boundary configuration for the agent sandbox.",
+      "additionalProperties": false,
+      "properties": {
+        "allowWrite": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "allOf": [
+              {
+                "pattern": "^/[^*?\\[\\]{}]*$"
+              },
+              {
+                "not": {
+                  "pattern": "/\\.\\.(?:/|$)"
+                }
+              }
+            ]
+          },
+          "description": "Guest-visible absolute paths that may be writable. When present, existing writable host bind mounts are made read-only outside these paths. An empty array makes all non-internal host bind mounts read-only. Paths must exist and cannot use glob patterns. This option is supported by the Docker and Cloud Hypervisor runtimes; it is rejected with Docker-in-Docker agent execution."
+        }
+      }
+    },
     "apiProxy": {
       "type": "object",
       "description": "API proxy sidecar configuration. The sidecar injects real API credentials so the agent never has direct access to them.",
@@ -78,9 +122,24 @@
           "deprecated": true,
           "description": "[DEPRECATED] The API proxy sidecar is always enabled; this field is ignored. Source credentials (OPENAI_API_KEY, ANTHROPIC_API_KEY, COPILOT_GITHUB_TOKEN, COPILOT_PROVIDER_API_KEY, GEMINI_API_KEY) are always held exclusively in the sidecar and excluded from the agent environment. The negated CLI form --no-enable-api-proxy is rejected at runtime. See docs/awf-config-spec.md \u00a79.3 for details."
         },
+        "caCert": {
+          "type": "string",
+          "description": "Host path to an additional CA certificate for api-proxy upstream TLS verification. The file is bind-mounted read-only into the sidecar and exposed via NODE_EXTRA_CA_CERTS."
+        },
+        "steering": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Steering notices the API proxy injects into agent requests. Each kind of steering has its own key.",
+          "properties": {
+            "budget": {
+              "type": "boolean",
+              "description": "Enable advisory AI-credit and time budget notices. Credit notices use apiProxy.maxAiCredits (or the AI-credit hard cap when unset); time notices use container.agentTimeout. Notices are queued at 80%, 90%, 95%, and 99% of the limit and injected into the next eligible agent request; they do not interrupt running work or guarantee completion. Thresholds, triggers, wording, and placement are fixed. Alias: apiProxy.enableTokenSteering (CLI: --steering-budget / --no-steering-budget, alias --enable-token-steering). Default: true; set to false (CLI: --no-steering-budget) to turn budget notices off."
+            }
+          }
+        },
         "enableTokenSteering": {
           "type": "boolean",
-          "description": "Enable effective token budget steering. When true, the proxy injects budget-warning system messages at 80%, 90%, 95%, and 99% usage to nudge the agent to wrap up. Requires maxEffectiveTokens. Default: false."
+          "description": "Alias for apiProxy.steering.budget. Enables advisory AI-credit and time budget notices. Setting both fields to different values is a configuration error. Default: true; set to false to turn budget notices off."
         },
         "anthropicAutoCache": {
           "type": "boolean",
@@ -91,6 +150,18 @@
           "enum": ["5m", "1h"],
           "description": "TTL for Anthropic cache tail optimization. Only applies when anthropicAutoCache is enabled. Allowed values: \"5m\" or \"1h\"."
         },
+        "hostedWeb": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "claude": {
+              "$ref": "#/$defs/hostedWebPolicy"
+            },
+            "codex": {
+              "$ref": "#/$defs/hostedWebPolicy"
+            }
+          }
+        },
         "maxEffectiveTokens": {
           "type": "integer",
           "minimum": 1,
@@ -99,11 +170,11 @@
         "maxAiCredits": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "description": "Maximum cumulative AI credits allowed for a run. When reached, the API proxy rejects subsequent requests with HTTP 403 and error type 'ai_credits_limit_exceeded'. AWF also enforces a non-overridable hard cap of 10,000 AI credits; values above 10,000 are effectively clamped."
+          "description": "Maximum cumulative AI credits allowed for a run. When reached, the API proxy rejects subsequent requests with HTTP 403 and error type 'ai_credits_limit_exceeded'. With apiProxy.steering.budget, advisory notices are queued at 80%, 90%, 95%, and 99% of the effective limit. AWF always enforces an operator-controlled hard cap, defaulting to 10,000 accounted AI credits. Set AWF_AI_CREDITS_HARD_CAP in the host environment or api-proxy container to a positive finite number to lower or raise it; unset, empty, invalid, nonpositive, or non-finite values retain the default. Values above the hard cap are effectively clamped, and the agent cannot raise or disable it."
         },
         "defaultAiCreditsPricing": {
           "type": "object",
-          "description": "Fallback per-token pricing ($/1M tokens) for models not in the built-in pricing table. When maxAiCredits is active and a model is unrecognized, this rate is used. If not set, unrecognized models are rejected with HTTP 400 (type: unknown_model_ai_credits).",
+          "description": "Fallback per-token pricing ($/1M tokens) for models not in a configured pricing catalog. When maxAiCredits is active and a model is unrecognized, this rate is used. If not set, unrecognized models are rejected with HTTP 400 (type: unknown_model_ai_credits).",
           "required": ["input", "output"],
           "properties": {
             "input": {
@@ -125,6 +196,82 @@
               "type": ["number", "null"],
               "minimum": 0,
               "description": "Cache write token price per 1M tokens. Null means cache writes are free."
+            },
+            "reasoning": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Reasoning token price per 1M tokens. Defaults to output when omitted."
+            }
+          },
+          "additionalProperties": false
+        },
+        "modelPricingCatalog": {
+          "type": "object",
+          "description": "Versioned, provider-scoped model prices supplied by a compiler or other authoritative catalog. Rates are USD per million tokens and are used offline; the catalog version is recorded with AI-credit usage.",
+          "required": ["schemaVersion", "unit", "catalogId", "version", "providers"],
+          "properties": {
+            "schemaVersion": {
+              "type": "integer",
+              "const": 1
+            },
+            "unit": {
+              "type": "string",
+              "const": "USD_PER_1M_TOKENS"
+            },
+            "catalogId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "providers": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {
+                "type": "object",
+                "required": ["models"],
+                "properties": {
+                  "models": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "additionalProperties": {
+                      "type": "object",
+                      "required": ["input", "output", "cachedInput", "cacheWrite", "reasoning"],
+                      "properties": {
+                        "input": {
+                          "type": "number",
+                          "minimum": 0
+                        },
+                        "output": {
+                          "type": "number",
+                          "minimum": 0
+                        },
+                        "cachedInput": {
+                          "type": "number",
+                          "minimum": 0,
+                          "description": "Cached input token price per 1M tokens."
+                        },
+                        "cacheWrite": {
+                          "type": ["number", "null"],
+                          "minimum": 0,
+                          "description": "Cache write token price per 1M tokens. Null means no separate cache-write charge."
+                        },
+                        "reasoning": {
+                          "type": "number",
+                          "minimum": 0,
+                          "description": "Reasoning token price per 1M tokens; set to output when no distinct reasoning rate applies."
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "additionalProperties": false
+              }
             }
           },
           "additionalProperties": false
@@ -199,6 +346,15 @@
             }
           }
         },
+        "fallbackModels": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "description": "Ordered list of concrete model IDs to retry with when the requested model fails with a model-specific error: upstream 5xx, a connection error/timeout before any response, or a 400/404 reporting the model as unsupported, not found, or not accessible. 401, 403, and 429 responses never trigger a fallback. The API proxy rewrites the request's model (body 'model' field, or the Gemini '/models/<model>:' path segment), and records the model that actually served the request in token-usage logs ('model' plus a 'model_fallback' object). A redundant '<provider>/' prefix is stripped. Each fallback model must pass the same model-policy and budget guards as the requested model."
+        },
         "modelRouter": {
           "type": "object",
           "description": "Model-router settings for Copilot-compatible BYOK upstreams.",
@@ -214,13 +370,58 @@
             }
           }
         },
+        "routing": {
+          "type": "object",
+          "description": "Opt-in task-level model routing configuration prepared by a trusted workflow compiler.",
+          "additionalProperties": false,
+          "required": ["objective", "task"],
+          "properties": {
+            "provider": {
+              "type": "string",
+              "enum": ["copilot", "openai", "anthropic"],
+              "default": "copilot",
+              "description": "Provider slot whose native model catalogue is routed. Defaults to Copilot."
+            },
+            "candidateModels": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 1
+            },
+            "objective": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["goal", "mode"],
+              "properties": {
+                "goal": {
+                  "type": "string",
+                  "enum": ["cost", "cost-speed"]
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": ["economy", "balanced", "robust", "auto"]
+                }
+              }
+            },
+            "task": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["conversationFile"],
+              "properties": {
+                "conversationFile": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
         "targets": {
           "type": "object",
           "description": "Override upstream API endpoints for each provider.",
           "additionalProperties": false,
           "properties": {
             "openai": {
-              "$ref": "#/$defs/providerTarget",
+              "$ref": "#/$defs/openaiTarget",
               "description": "OpenAI API target override."
             },
             "anthropic": {
@@ -521,14 +722,25 @@
       "description": "Container and Docker configuration.",
       "additionalProperties": false,
       "properties": {
+        "containerRuntime": {
+          "type": "string",
+          "enum": ["docker", "gvisor", "sbx", "cloud-hypervisor", "nvx"],
+          "description": "Runtime for the primary agent, independent of enclave executor runtimes. The nvx runtime selects the explicit Linux x86_64 KVM one-shot microVM preview."
+        },
         "memoryLimit": {
           "type": "string",
           "description": "Docker memory limit for the agent container (e.g. \"4g\", \"512m\"). Uses Docker memory limit syntax."
         },
+        "pidsLimit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Process/thread ceiling (Docker pids_limit) for the agent container. Increase for JVM-heavy builds that spawn many threads. Defaults to 1000."
+        },
         "agentTimeout": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum time (in minutes) the agent command is allowed to run."
+          "description": "Maximum time (in minutes) the agent command is allowed to run. With apiProxy.steering.budget, advisory notices are queued at 80%, 90%, 95%, and 99% of the runtime deadline."
         },
         "enableDind": {
           "type": "boolean",
@@ -541,6 +753,46 @@
         "containerWorkDir": {
           "type": "string",
           "description": "Working directory inside the agent container."
+        },
+        "images": {
+          "type": "object",
+          "description": "Closed manifest of complete digest-pinned infrastructure image references. This compiler-authorized form cannot be combined with imageRegistry, imageTag, agentImage, sysrootImage, security.sslBump, per-enclave image overrides, dind.stagingImage, or buildLocal.",
+          "additionalProperties": false,
+          "properties": {
+            "squid": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "agent": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "apiProxy": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "router": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "cliProxy": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "buildTools": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "dohProxy": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "enclaveScript": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "enclaveAgent": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "enclaveMcpServer": {
+              "$ref": "#/$defs/digestPinnedImage"
+            },
+            "dindStaging": {
+              "$ref": "#/$defs/digestPinnedImage"
+            }
+          }
         },
         "imageRegistry": {
           "type": "string",
@@ -585,11 +837,192 @@
             "pattern": "^/[^:]+:/[^:]+(:(ro|rw))?$"
           },
           "description": "Custom volume mounts for the agent container. Format: \"/host_path:/container_path[:ro|rw]\" (both paths must be absolute). In chroot mode, container paths are automatically prefixed with /host."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["images"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": ["imageRegistry"]
+                },
+                {
+                  "required": ["imageTag"]
+                },
+                {
+                  "required": ["agentImage"]
+                },
+                {
+                  "required": ["buildLocal"]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "cloudHypervisor": {
+      "type": "object",
+      "description": "Cloud Hypervisor v53.0 microVM preview configuration. Requires the --container-runtime cloud-hypervisor CLI flag (or enclaves[].runtime: \"cloud-hypervisor\"), plus previewEnabled, to execute workloads; supported only on GitHub-hosted Ubuntu x86_64 KVM runners.",
+      "additionalProperties": false,
+      "properties": {
+        "previewEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the Cloud Hypervisor v53.0 workload-execution preview. Requires the --container-runtime cloud-hypervisor CLI flag (or enclaves[].runtime: \"cloud-hypervisor\"), plus a GitHub-hosted Ubuntu x86_64 KVM runner."
         },
-        "containerRuntime": {
+        "mountPolicy": {
           "type": "string",
-          "enum": ["gvisor", "sbx"],
-          "description": "Container runtime for the agent container. \"gvisor\" runs the agent under gVisor's runsc runtime (OCI runtime, compose-based). \"sbx\" runs the agent inside a Docker sbx microVM with hypervisor isolation; infrastructure containers (squid-proxy, api-proxy) stay in Docker Compose on the host and the sbx proxy chains upstream through AWF's Squid for domain filtering. Only the agent uses the custom runtime; infrastructure containers always use the default runc runtime. Note: when gh-aw compiles a workflow that uses the docker-sbx runtime, it passes \"--container-runtime sbx\" as a CLI flag to AWF rather than setting this field; this field is the AWF-native mechanism for specifying the runtime directly in the config JSON."
+          "enum": ["workspace-only", "workspace-and-tool-cache"],
+          "default": "workspace-only",
+          "description": "Host directory exposure policy. \"workspace-only\" is the secure default and exports the workspace plus only narrow gh-aw runtime directories when present. \"workspace-and-tool-cache\" additionally requires and mounts RUNNER_TOOL_CACHE or AGENT_TOOLSDIRECTORY read-only with host-enforced staging."
+        },
+        "cloudHypervisorBinary": {
+          "type": "string",
+          "description": "Absolute path to the Cloud Hypervisor v53.0 binary. Defaults to /usr/local/bin/cloud-hypervisor."
+        },
+        "kernelPath": {
+          "type": "string",
+          "description": "Absolute path to the trusted PCI-capable guest Linux kernel image."
+        },
+        "rootfsPath": {
+          "type": "string",
+          "description": "Absolute path to the trusted guest root filesystem image."
+        },
+        "supervisorPath": {
+          "type": "string",
+          "description": "Absolute path to the built AWF guest supervisor."
+        },
+        "artifactManifestPath": {
+          "type": "string",
+          "description": "Absolute path to the release-pinned Cloud Hypervisor artifact manifest."
+        },
+        "artifactManifestBundlePath": {
+          "type": "string",
+          "description": "Absolute path to the manifest GitHub artifact-attestation Sigstore bundle used for offline verification."
+        },
+        "artifactReleaseTag": {
+          "type": "string",
+          "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$",
+          "description": "Expected AWF release tag recorded in the attested artifact manifest."
+        },
+        "developmentAllowUnattestedArtifacts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Development-only legacy bypass. Also requires AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS=1 and complete sha256 pins."
+        },
+        "vcpuCount": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2,
+          "description": "Number of guest virtual CPUs."
+        },
+        "memoryMib": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 512,
+          "description": "Guest memory in MiB."
+        },
+        "scratchMib": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "Optional primary guest /tmp tmpfs capacity in MiB; omitted preserves rootfs storage. Enclave scratch limits remain fixed."
+        },
+        "apiTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5000,
+          "description": "Bounded timeout in milliseconds for Cloud Hypervisor API socket readiness and requests."
+        },
+        "sha256": {
+          "type": "object",
+          "description": "Development-only legacy SHA-256 pins. Release use derives all hashes from the verified artifact manifest.",
+          "additionalProperties": false,
+          "properties": {
+            "cloudHypervisor": {
+              "$ref": "#/$defs/sha256Digest"
+            },
+            "virtiofsd": {
+              "$ref": "#/$defs/sha256Digest"
+            },
+            "kernel": {
+              "$ref": "#/$defs/sha256Digest"
+            },
+            "rootfs": {
+              "$ref": "#/$defs/sha256Digest"
+            },
+            "supervisor": {
+              "$ref": "#/$defs/sha256Digest"
+            }
+          }
+        }
+      }
+    },
+    "nvx": {
+      "type": "object",
+      "description": "NVX preview one-shot microVM configuration. Requires container.containerRuntime: \"nvx\" and explicit preview opt-in; supported only on Linux x86_64 KVM hosts.",
+      "additionalProperties": false,
+      "properties": {
+        "previewEnabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "mountPolicy": {
+          "type": "string",
+          "enum": ["workspace-only", "workspace-and-tool-cache"],
+          "default": "workspace-only"
+        },
+        "layerPath": {
+          "type": "string",
+          "description": "Absolute path to the workload-specific guest distro layer."
+        },
+        "artifactManifestPath": {
+          "type": "string",
+          "description": "Absolute path to the AWF release artifact manifest."
+        },
+        "artifactManifestBundlePath": {
+          "type": "string",
+          "description": "Absolute path to the offline manifest Sigstore attestation bundle."
+        },
+        "signerWorkflow": {
+          "type": "string",
+          "description": "Expected trusted workflow identity that signed the artifact manifest."
+        },
+        "openvmmPath": {
+          "type": "string",
+          "description": "Absolute path to the trusted, attested OpenVMM binary."
+        },
+        "kernelPath": {
+          "type": "string",
+          "description": "Absolute path to the trusted, attested guest kernel."
+        },
+        "initramfsPath": {
+          "type": "string",
+          "description": "Absolute path to the trusted, attested guest initramfs."
+        },
+        "memoryMib": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 512
+        },
+        "memoryMaxBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 536870912
+        },
+        "pidsMax": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 128
+        },
+        "scratchBytes": {
+          "type": "integer",
+          "minimum": 1
         }
       }
     },
@@ -600,7 +1033,7 @@
       "properties": {
         "binariesSourcePath": {
           "type": "string",
-          "description": "Optional runner-side directory to overlay at /usr/local/bin inside chroot mode (for split-filesystem ARC/DinD runners)."
+          "description": "Optional runner-side directory mounted at /tmp/awf-runner-bin inside chroot mode and prepended to PATH (for split-filesystem ARC/DinD runners)."
         },
         "identity": {
           "type": "object",
@@ -736,6 +1169,16 @@
           "type": "integer",
           "minimum": 1,
           "description": "Maximum number of bytes transferred per minute."
+        },
+        "maxGithubApiPointsRest": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum GitHub REST API secondary-rate-limit points allowed per AWF run. Requires security.difcProxy.host."
+        },
+        "maxGithubApiPointsGraphql": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum GitHub GraphQL API secondary-rate-limit points allowed per AWF run. Requires security.difcProxy.host."
         }
       }
     },
@@ -766,9 +1209,512 @@
           "description": "Container image providing system-level build tools (gcc, make, libraries) for the agent's chroot base. Used as an init container that copies its filesystem into a named volume mounted at /host. Only used when runner.topology is 'arc-dind'. Defaults to 'ghcr.io/github/gh-aw-firewall/build-tools:<imageTag>'."
         }
       }
+    },
+    "enclaves": {
+      "type": "array",
+      "description": "Unified private-repository enclaves, expressed as the same keyed array the gh-aw compiler emits. Every entry declares exactly one \"script\" or \"agent\" executor, its shared \"repos\" list, and an optional entry-level \"timeout\". Repositories and sensitivities are shared by both executors, every invocation debits one live per-repository information budget regardless of executor kind, and AWF exposes configured executors only through an AWF-owned MCP server plus the compiler-launched trusted mcpg gateway.",
+      "minItems": 1,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One executor entry. Common runtime, image, resource, and disclosure controls are entry-level; executor-specific controls are nested under the discriminator. All are trusted AWF configuration and must never be accepted from an invocation request.",
+        "oneOf": [
+          {
+            "required": ["script"]
+          },
+          {
+            "required": ["agent"]
+          }
+        ],
+        "anyOf": [
+          {
+            "required": ["repos"]
+          },
+          {
+            "required": ["dynamic"]
+          }
+        ],
+        "not": {
+          "required": ["repos", "dynamic"]
+        },
+        "if": {
+          "required": ["dynamic"]
+        },
+        "then": {
+          "required": ["agent"]
+        },
+        "properties": {
+          "script": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Script executor. An empty object selects AWF's pinned defaults.",
+            "properties": {
+              "maxScriptBytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65536,
+                "default": 65536
+              }
+            }
+          },
+          "agent": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Agent executor. \"model\" is required.",
+            "required": ["model"],
+            "properties": {
+              "engine": {
+                "type": "string",
+                "enum": ["copilot", "claude", "codex", "gemini"],
+                "default": "copilot"
+              },
+              "profile": {
+                "type": "string",
+                "enum": ["openai", "anthropic"],
+                "default": "openai"
+              },
+              "model": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,199}$"
+              },
+              "maxTaskBytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65536,
+                "default": 4096
+              },
+              "maxModelRequests": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+                "description": "Maximum model requests permitted for one agent invocation."
+              },
+              "maxModelTokens": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000000,
+                "description": "Maximum model tokens permitted for one agent invocation."
+              },
+              "github": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Deprecated legacy credential-isolated GitHub access marker for the single-use agent enclave. Use \"tools.github\" instead; the two shapes are mutually exclusive.",
+                "required": ["cli"],
+                "properties": {
+                  "cli": {
+                    "type": "string",
+                    "enum": ["issues-read-v1"],
+                    "description": "Closed REST-only issue-read CLI profile."
+                  }
+                }
+              },
+              "tools": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Closed, fail-closed tool contracts for the single-use agent enclave. Mutually exclusive with the legacy \"github\" marker.",
+                "properties": {
+                  "github": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "Credential-isolated GitHub MCP gateway access. Repository and integrity restrictions are enforced by the compiler-created, enclave-specific MCP gateway identity; AWF only validates and wires the connection.",
+                    "required": ["allowed", "allowedRepos"],
+                    "properties": {
+                      "allowed": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "description": "Non-empty subset of the supported GitHub MCP tools.",
+                        "items": {
+                          "type": "string",
+                          "enum": ["list_issues", "issue_read"]
+                        }
+                      },
+                      "allowedRepos": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "Exact \"owner/repository\" slugs. Every entry must also be present in the enclosing enclave entry's \"repos\" list.",
+                        "items": {
+                          "type": "string",
+                          "maxLength": 140,
+                          "allOf": [
+                            {
+                              "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$"
+                            },
+                            {
+                              "not": {
+                                "pattern": "/\\.\\.?$"
+                              }
+                            },
+                            {
+                              "not": {
+                                "pattern": "/[^/]*\\.\\."
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      "minIntegrity": {
+                        "type": "string",
+                        "enum": ["none", "unapproved", "approved", "merged"],
+                        "description": "Minimum required integrity level enforced by the compiler-created MCP gateway identity."
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "repos": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Private repositories reachable from this entry. Repositories shared with the other executor entry MUST declare the same sensitivity: sensitivity fixes one shared per-run information budget for the repository across script and agent calls. Mutually exclusive with \"dynamic\".",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["repo", "sensitivity"],
+              "properties": {
+                "repo": {
+                  "type": "string",
+                  "maxLength": 140,
+                  "allOf": [
+                    {
+                      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$"
+                    },
+                    {
+                      "not": {
+                        "pattern": "/\\.\\.?$"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "/[^/]*\\.\\."
+                      }
+                    }
+                  ]
+                },
+                "sensitivity": {
+                  "type": "string",
+                  "enum": ["trusted", "public", "internal", "confidential", "sealed"]
+                }
+              }
+            }
+          },
+          "dynamic": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Agent-only dynamic GitHub-MCP-backed repository policy (ADR 0001, docs/adr/0001-agent-enclaves.md). Structurally identical to the compiler-emitted envelope: the compiler owns every bound and the invocation selector may only choose within this closed envelope. Mutually exclusive with \"repos\". AWF validates this envelope and custodies the compiler-minted delegation-control capability, but does not execute dynamic admissions in this release; see docs/awf-config-spec.md \u00a714.1a.",
+            "required": ["allowedOwners", "allowedRepositories", "sensitivity", "executor", "githubPolicy", "maxRepositories", "limits", "quotas", "auditLabels", "expiresAt"],
+            "properties": {
+              "allowedOwners": {
+                "type": "array",
+                "maxItems": 256,
+                "description": "Canonical lowercase owner scopes admitted for this envelope. No trimming, case folding, Unicode normalization, or URL decoding is applied before matching.",
+                "items": {
+                  "type": "string",
+                  "maxLength": 39,
+                  "pattern": "^[a-z0-9](?:[a-z0-9-]{0,38})$"
+                }
+              },
+              "allowedRepositories": {
+                "type": "array",
+                "maxItems": 256,
+                "description": "Canonical lowercase \"owner/repository\" selectors admitted for this envelope.",
+                "items": {
+                  "type": "string",
+                  "allOf": [
+                    {
+                      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,38})/[a-z0-9._-]{1,100}$"
+                    },
+                    {
+                      "not": {
+                        "pattern": "/\\.\\.?$"
+                      }
+                    },
+                    {
+                      "not": {
+                        "pattern": "/[^/]*\\.\\."
+                      }
+                    }
+                  ]
+                }
+              },
+              "sensitivity": {
+                "type": "string",
+                "enum": ["trusted", "public", "internal", "confidential", "sealed"]
+              },
+              "executor": {
+                "type": "string",
+                "enum": ["agent"],
+                "description": "Dynamic admission is agent-only."
+              },
+              "githubPolicy": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Closed repository-scopable read-only GitHub tool policy.",
+                "required": ["version", "tools"],
+                "properties": {
+                  "version": {
+                    "type": "string",
+                    "enum": ["github-repository-read-v1"]
+                  },
+                  "tools": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "uniqueItems": true,
+                    "description": "Exactly the closed v1 tool set.",
+                    "items": {
+                      "type": "string",
+                      "enum": ["list_issues", "issue_read"]
+                    }
+                  }
+                }
+              },
+              "maxRepositories": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000,
+                "description": "Maximum distinct repositories this envelope may admit for the workflow run."
+              },
+              "limits": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Per-invocation trusted bounds; the same resource and response controls the static agent executor declares at entry level. Every field is required because a dynamic agent entry cannot compile without them.",
+                "required": ["timeoutSeconds", "memoryLimit", "cpuLimit", "pidsLimit", "tmpfsLimit", "maxOutputBytes", "maxTaskBytes", "maxModelRequests", "maxModelTokens"],
+                "properties": {
+                  "timeoutSeconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4740,
+                    "description": "Per-invocation wall-clock budget in whole seconds. AWF forwards this value unchanged as the delegation requested_ttl."
+                  },
+                  "memoryLimit": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]*[bkmgBKMG]$"
+                  },
+                  "cpuLimit": {
+                    "type": "string",
+                    "pattern": "^(?:[0-9]{1,2})(?:\\.[0-9]{1,3})?$"
+                  },
+                  "pidsLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4096
+                  },
+                  "tmpfsLimit": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]*[bkmgBKMG]$"
+                  },
+                  "maxOutputBytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8192
+                  },
+                  "maxTaskBytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65536
+                  },
+                  "maxModelRequests": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 64
+                  },
+                  "maxModelTokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 32768
+                  }
+                }
+              },
+              "quotas": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Total, run-wide quotas debited across every dynamic admission for this envelope.",
+                "required": ["maxInvocations", "maxOutputBytes", "maxExecutionSeconds"],
+                "properties": {
+                  "maxInvocations": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000
+                  },
+                  "maxOutputBytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1048576
+                  },
+                  "maxExecutionSeconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 86400
+                  }
+                }
+              },
+              "auditLabels": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 32,
+                "uniqueItems": true,
+                "description": "Opaque audit labels AWF and mcpg reconcile all dynamic state against during shutdown. Never repository names or credentials.",
+                "items": {
+                  "type": "string",
+                  "maxLength": 128,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+                }
+              },
+              "expiresAt": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+                "description": "Absolute ISO-8601 expiry, never later than the workflow job lifetime."
+              }
+            }
+          },
+          "timeout": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4740,
+            "description": "Per-invocation wall-clock timeout in seconds. Defaults to 30 for \"script\" entries and 120 for \"agent\" entries."
+          },
+          "runtime": {
+            "type": "string",
+            "enum": ["docker", "cloud-hypervisor"],
+            "default": "docker",
+            "description": "Trusted enclave executor runtime. cloud-hypervisor is reserved behind the ADR 0002 implementation gates and currently fails closed before execution."
+          },
+          "image": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "Trusted image override. Omission uses AWF's pinned executor image."
+          },
+          "memoryLimit": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*[bkmgBKMG]$",
+            "default": "512m"
+          },
+          "cpuLimit": {
+            "type": "string",
+            "pattern": "^(?:[0-9]{1,2})(?:\\.[0-9]{1,3})?$",
+            "default": "1"
+          },
+          "pidsLimit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096,
+            "default": 128
+          },
+          "tmpfsLimit": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*[bkmgBKMG]$",
+            "default": "64m"
+          },
+          "maxOutputBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8192,
+            "default": 8192
+          },
+          "maxInvocations": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000,
+            "default": 32
+          }
+        }
+      },
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "required": ["script"]
+          },
+          "minContains": 0,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["agent"]
+          },
+          "minContains": 0,
+          "maxContains": 1
+        }
+      ]
     }
   },
   "$defs": {
+    "hostedWebPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "allowedDomains": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+          }
+        },
+        "blockedDomains": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+          }
+        },
+        "maxUses": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "not": {
+        "required": ["allowedDomains", "blockedDomains"]
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "enabled": { "const": false }
+          },
+          "not": {
+            "anyOf": [{ "required": ["allowedDomains"] }, { "required": ["blockedDomains"] }, { "required": ["maxUses"] }]
+          }
+        },
+        {
+          "properties": {
+            "enabled": { "const": true }
+          },
+          "required": ["allowedDomains"]
+        },
+        {
+          "properties": {
+            "enabled": { "const": true }
+          },
+          "required": ["blockedDomains"]
+        }
+      ]
+    },
+    "digestPinnedImage": {
+      "type": "string",
+      "pattern": "^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+(?::[0-9]{1,5})?|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?:[0-9]{1,5}|localhost)/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[a-f0-9]{64}$",
+      "description": "Literal, registry-qualified OCI image reference pinned to both a tag and a lowercase sha256 digest."
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$",
+      "description": "A SHA-256 digest encoded as exactly 64 hexadecimal characters."
+    },
     "providerTarget": {
       "type": "object",
       "description": "API provider target override.",
@@ -785,6 +1731,30 @@
         "authHeader": {
           "type": "string",
           "description": "Override the auth header name used for API requests. For OpenAI, replaces 'Authorization: Bearer <key>' with '<authHeader>: <key>' (raw key, no Bearer prefix). For Anthropic, replaces 'x-api-key'. Not applicable to Copilot or Gemini."
+        }
+      }
+    },
+    "openaiTarget": {
+      "type": "object",
+      "description": "OpenAI API target override, optionally resolved from a runner environment variable at runtime.",
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "Override the OpenAI API host."
+        },
+        "basePath": {
+          "type": "string",
+          "description": "Override the OpenAI API base path."
+        },
+        "authHeader": {
+          "type": "string",
+          "description": "Override the auth header name used for API requests. Replaces 'Authorization: ******' with '<authHeader>: <key>'."
+        },
+        "baseUrlEnv": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "Name of a runner environment variable (typically bound to a secret) holding the OpenAI-compatible base URL. AWF resolves and validates it before containers start, derives the host for network policy, keeps it out of the agent environment, and redacts it from logs and artifacts. Takes precedence over host/basePath."
         }
       }
     },
@@ -828,5 +1798,65 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["container"],
+        "properties": {
+          "container": {
+            "type": "object",
+            "required": ["images"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "security": {
+            "type": "object",
+            "not": {
+              "required": ["sslBump"]
+            }
+          },
+          "runner": {
+            "type": "object",
+            "not": {
+              "required": ["sysrootImage"]
+            }
+          },
+          "dind": {
+            "type": "object",
+            "not": {
+              "required": ["stagingImage"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["apiProxy"],
+        "properties": {
+          "apiProxy": {
+            "type": "object",
+            "required": ["routing"]
+          }
+        }
+      },
+      "then": {
+        "required": ["experimental"],
+        "properties": {
+          "experimental": {
+            "type": "object",
+            "required": ["modelRouting"],
+            "properties": {
+              "modelRouting": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

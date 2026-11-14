@@ -3,6 +3,7 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { redactSensitiveConfig } = require("./safe_outputs_config_redact.cjs");
 const { ERR_SYSTEM } = require("./error_codes.cjs");
+const { normalizeSafeOutputConfig } = require("./safe_output_names.cjs");
 
 const fs = require("fs");
 const path = require("path");
@@ -74,7 +75,7 @@ function loadConfig(server) {
       if (unresolvedInputs.length > 0) {
         const varList = unresolvedInputs.join(", ");
         const unresolvedMsg = `ERR_CONFIG: Unresolved workflow input placeholder(s) in safe-outputs config: ${varList}. The values were not passed to the MCP container. Verify that the workflow was compiled with a version that forwards GH_AW_INPUT_* to the container env.`;
-        server.error(unresolvedMsg);
+        server.debugError(unresolvedMsg);
         console.error(`[safe_outputs_config] ERR_CONFIG: Unresolved workflow input placeholder(s): ${varList}`);
         throw new Error(unresolvedMsg);
       }
@@ -91,7 +92,7 @@ function loadConfig(server) {
     safeOutputsConfigRaw = {};
   }
 
-  const safeOutputsConfig = Object.fromEntries(Object.entries(safeOutputsConfigRaw).map(([k, v]) => [k.replace(/-/g, "_"), v]));
+  const safeOutputsConfig = normalizeSafeOutputConfig(safeOutputsConfigRaw);
   server.debug(`Final processed config: ${JSON.stringify(redactSensitiveConfig(safeOutputsConfig))}`);
 
   // Handle GH_AW_SAFE_OUTPUTS with default fallback
@@ -107,7 +108,7 @@ function loadConfig(server) {
     try {
       fs.mkdirSync(outputDir, { recursive: true });
     } catch (err) {
-      throw new Error(`${ERR_SYSTEM}: Failed to create directory ${outputDir}: ${String(err)}`, { cause: err });
+      throw new Error(`${ERR_SYSTEM}: Failed to create directory ${outputDir}: ${getErrorMessage(err)}`, { cause: err });
     }
   }
 

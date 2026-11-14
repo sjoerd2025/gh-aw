@@ -121,7 +121,7 @@ describe("parse_copilot_log.cjs", () => {
       expect(result.markdown).toContain("report_intent");
       expect(result.markdown).toContain("Rendered summary content");
       const resultData = getSessionResultData(result.logEntries);
-      expect(resultData?.numTurns).toBe(1);
+      expect(resultData?.numTurns).toBeUndefined();
     });
 
     it("renders tool output preview from result.content in Copilot CLI events.jsonl", () => {
@@ -134,7 +134,7 @@ describe("parse_copilot_log.cjs", () => {
 
       const result = parseCopilotLog(eventsLog);
 
-      expect(result.markdown).toContain("bash");
+      expect(result.markdown).toContain("<summary>Commands and Tools</summary>");
       expect(result.markdown).toContain("file1.txt");
     });
 
@@ -150,7 +150,6 @@ describe("parse_copilot_log.cjs", () => {
 
       const result = parseCopilotLog(eventsLog);
 
-      expect(result.markdown).toContain("bash");
       expect(result.markdown).toContain("cat /tmp/gh-aw/agent/candidates.txt");
       expect(result.markdown).toContain("candidate-list-output");
     });
@@ -166,8 +165,9 @@ describe("parse_copilot_log.cjs", () => {
       const result = parseCopilotLog(eventsLog);
 
       expect(result.markdown).toContain("ls");
-      expect(result.markdown).toContain("/tmp");
       expect(result.markdown).toContain("file1.txt");
+      // cwd is part of input parameters which are not rendered to avoid secret leakage
+      expect(result.markdown).not.toContain('"cwd"');
     });
 
     it("preserves structured input for orphaned completion events without inventing a command", () => {
@@ -179,9 +179,10 @@ describe("parse_copilot_log.cjs", () => {
 
       const result = parseCopilotLog(eventsLog);
 
-      expect(result.markdown).toContain("bash");
-      expect(result.markdown).toContain("/tmp");
+      expect(result.markdown).toContain("<summary>Commands and Tools</summary>");
       expect(result.markdown).toContain("file1.txt");
+      // input parameters are not rendered to avoid secret leakage
+      expect(result.markdown).not.toContain('"cwd"');
     });
 
     it("renders tool output preview from array-based result.content in Copilot CLI events.jsonl", () => {
@@ -194,7 +195,6 @@ describe("parse_copilot_log.cjs", () => {
 
       const result = parseCopilotLog(eventsLog);
 
-      expect(result.markdown).toContain("bash");
       expect(result.markdown).toContain("fileA.txt");
       expect(result.markdown).toContain("fileB.txt");
     });
@@ -392,6 +392,22 @@ describe("parse_copilot_log.cjs", () => {
       expect(result.markdown).toContain("375,000");
     });
 
+    it("extracts million-scale tokens from the current Copilot CLI footer", () => {
+      const prettyLog = ["● Bash", "    └ ok", "The work is done.", "", "Tokens     ↑ 17.7m (17.5m cached, 216.2k written) • ↓ 46.5k (20.0k reasoning)"].join("\n");
+
+      const result = parseCopilotLog(prettyLog);
+      const resultEntry = getSessionResultData(result.logEntries);
+
+      expect(resultEntry.usage).toEqual(
+        expect.objectContaining({
+          input_tokens: 17700000,
+          output_tokens: 46500,
+          cache_read_input_tokens: 17500000,
+          cache_creation_input_tokens: 216200,
+        })
+      );
+    });
+
     it("strips the columnar 'Resume' footer hint from rendered pretty-print output", () => {
       // Copilot CLI footer includes a "Resume   copilot --resume=<id>" line aligned in the
       // same column block as Changes/Duration/Tokens. It is CLI chrome, not agent reasoning,
@@ -497,7 +513,7 @@ describe("parse_copilot_log.cjs", () => {
             content: [
               {
                 type: "text",
-                text: "[AWF TOKEN WARNING] You have used 90% of your effective token budget. Complete your current task and prepare final output.",
+                text: "[AWF TOKEN WARNING] You have used 90% of your AI Credits budget. Complete your current task and prepare final output.",
               },
             ],
           },
@@ -508,7 +524,7 @@ describe("parse_copilot_log.cjs", () => {
       const result = parseCopilotLog(structuredLog);
 
       expect(result.markdown).toContain("Firewall Steering");
-      expect(result.markdown).toContain("[AWF TOKEN WARNING] You have used 90% of your effective token budget.");
+      expect(result.markdown).toContain("[AWF TOKEN WARNING] You have used 90% of your AI Credits budget.");
     });
   });
 
@@ -537,6 +553,7 @@ describe("parse_copilot_log.cjs", () => {
 
     it("should handle missing log file", async () => {
       process.env.GH_AW_AGENT_OUTPUT = "/nonexistent/file.log";
+      vi.spyOn(fs, "existsSync").mockReturnValue(false);
       await main();
       expect(mockCore.info).toHaveBeenCalledWith("Log path not found: /nonexistent/file.log");
     });

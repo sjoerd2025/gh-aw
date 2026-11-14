@@ -6,6 +6,7 @@ on:
   schedule: weekly on wednesday around 12:00
 max-daily-ai-credits: 10000
 permissions:
+  actions: read
   contents: read
   issues: read
   pull-requests: read
@@ -17,7 +18,7 @@ experiments:
     variants: [detailed, concise]
     description: "Tests whether a high-level goal-oriented prompt produces the same audit quality as the current step-by-step detailed instructions"
     hypothesis: "H0: no change in audit correctness or discussion quality. H1: concise variant reduces token cost ≥20% with no degradation in validation accuracy"
-    metric: effective_token_count
+    metric: aic
     secondary_metrics: [run_duration_ms, discussion_created, validation_pass_rate]
     guardrail_metrics:
       - name: empty_output_rate
@@ -39,7 +40,7 @@ network:
 tools:
   cli-proxy: true
   playwright:
-    mode: cli
+  agentic-workflows:
   bash:
     - "date *"
     - "echo *"
@@ -57,17 +58,17 @@ imports:
       expires: 1d
 
   - shared/otlp.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
-sandbox:
-  agent:
-    sudo: false
 evals:
   - id: audit-completed
     question: Did the workflow complete the blog availability audit, including page access and content validation checks?
   - id: discussion-created
     question: Was an audit discussion created summarizing the pass or fail results and suggested remediation when needed?
+
 ---
+
 # Blog Auditor
 
 You are the Blog Auditor - an automated monitor that verifies the GitHub Next "Agentic Workflows" blog is accessible and up to date.
@@ -158,7 +159,7 @@ Extract code snippets from the blog page and validate them against the latest ag
    - Name files sequentially: `snippet-1.md`, `snippet-2.md`, etc.
    - Store the temporary directory path in a variable for cleanup
 
-4. **Validate All Snippets**: Use `gh aw compile` with the `--dir` flag to validate all snippets at once
+4. **Validate All Snippets**: Use the `agentic-workflows` MCP `compile` tool (preferred; the `gh aw` CLI may be unavailable in the sandbox) to validate the snippets. If the shell supports it, `gh aw compile` with the `--dir` flag validates all snippets at once
    ```bash
    gh aw compile --no-emit --validate --dir "$TEMP_DIR"
    ```

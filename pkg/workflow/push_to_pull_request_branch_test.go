@@ -186,8 +186,8 @@ safe-outputs:
 		t.Fatalf("Failed to read lock file: %v", err)
 	}
 
-	lockContentStr := string(lockContent)
-	if !strings.Contains(lockContentStr, `"ignore_missing_branch_failure":true`) && !strings.Contains(lockContentStr, `"ignore_missing_branch_failure": true`) {
+	pushConfig := extractPushToPullRequestBranchHandlerConfig(t, lockContent)
+	if pushConfig["ignore_missing_branch_failure"] != true {
 		t.Errorf("Generated workflow should contain ignore_missing_branch_failure in handler config JSON")
 	}
 }
@@ -224,6 +224,10 @@ safe-outputs:
 	}
 
 	lockContentStr := string(lockContent)
+	safeOutputsJobSection := extractJobSection(lockContentStr, "safe_outputs")
+	if safeOutputsJobSection == "" {
+		t.Fatalf("Could not find safe_outputs job in lock file")
+	}
 	pushConfig := extractPushToPullRequestBranchHandlerConfig(t, lockContent)
 	fallbackAsPullRequest, exists := pushConfig["fallback_as_pull_request"]
 	if !exists {
@@ -236,8 +240,11 @@ safe-outputs:
 	if fallbackAsPullRequestBool {
 		t.Errorf("Expected fallback_as_pull_request=false, got %#v", fallbackAsPullRequestBool)
 	}
-	if strings.Contains(lockContentStr, "pull-requests: write") {
+	if strings.Contains(safeOutputsJobSection, "pull-requests: write") {
 		t.Errorf("Generated workflow should NOT have pull-requests: write permission when fallback-as-pull-request is false")
+	}
+	if !strings.Contains(safeOutputsJobSection, "pull-requests: read") {
+		t.Errorf("Generated workflow should have pull-requests: read permission when fallback-as-pull-request is false")
 	}
 }
 
@@ -374,14 +381,14 @@ This workflow allows pushing to any pull request.
 		t.Fatalf("Failed to read lock file: %v", err)
 	}
 
-	lockContentStr := string(lockContent)
-
 	// Verify that the target configuration is in handler config JSON
-	if !strings.Contains(lockContentStr, `"target":"*"`) && !strings.Contains(lockContentStr, `"target": "*"`) {
+	pushConfig := extractPushToPullRequestBranchHandlerConfig(t, lockContent)
+	if pushConfig["target"] != "*" {
 		t.Errorf("Generated workflow should contain target configuration with asterisk in handler config JSON")
 	}
 
 	// Verify conditional execution allows any context
+	lockContentStr := string(lockContent)
 	if !strings.Contains(lockContentStr, "safe_outputs:") {
 		t.Errorf("Generated workflow should have always() condition for target: *")
 	}
@@ -1225,5 +1232,45 @@ By default, check-branch-protection is not set (JS handler defaults to true).
 	pushCfg := extractPushToPullRequestBranchHandlerConfig(t, lockContent)
 	if _, exists := pushCfg["check_branch_protection"]; exists {
 		t.Errorf("Handler config should NOT contain check_branch_protection when not explicitly set")
+	}
+}
+
+func TestPushToPullRequestBranchWithNumericTarget(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "test-*")
+
+	// Create a test markdown file with numeric target: 123
+	testMarkdown := `---
+on:
+  schedule:
+    - cron: "0 0 * * *"
+safe-outputs:
+  push-to-pull-request-branch:
+    target: 123
+---
+
+# Test Push to Branch with Numeric Target
+
+This workflow specifies an explicit numeric pull request target.
+`
+
+	mdFile := filepath.Join(tmpDir, "test-push-to-pull-request-branch-numeric-target.md")
+	if err := os.WriteFile(mdFile, []byte(testMarkdown), 0644); err != nil {
+		t.Fatalf("Failed to write test markdown file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(mdFile); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockFile := stringutil.MarkdownToLockFile(mdFile)
+	lockContent, err := os.ReadFile(lockFile)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	pushConfig := extractPushToPullRequestBranchHandlerConfig(t, lockContent)
+	if pushConfig["target"] != "123" {
+		t.Errorf("Expected target to be '123', got %v", pushConfig["target"])
 	}
 }

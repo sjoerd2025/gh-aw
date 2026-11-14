@@ -30,16 +30,19 @@ jobs:
       VERSION_REGEX: 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Find target and previous releases
         id: releases
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           # Include prereleases too; /releases/latest only returns non-prerelease releases.
           # For release-created events, use that exact tag as the upgrade target.
-          if [ "${{ github.event_name }}" = "release" ]; then
-            TARGET="${{ github.event.release.tag_name }}"
+          if [ "$EVENT_NAME" = "release" ]; then
+            TARGET="$RELEASE_TAG"
             PREVIOUS=$(gh api "repos/github/gh-aw/releases?per_page=50" \
               | jq -r --arg target "$TARGET" '[.[] | select(.draft == false and .tag_name != $target)][0].tag_name')
           else

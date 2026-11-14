@@ -21,7 +21,7 @@ engine:
 strict: true
 experiments:
   model_size:
-    variants: [claude-sonnet-4.6, claude-haiku-4.5]
+    variants: [claude-sonnet-5, claude-haiku-4.5]
     description: "Tests whether Claude Haiku produces equivalent instruction conciseness improvements at lower token cost versus Claude Sonnet."
     hypothesis: "H0: no change in PR creation rate or run success rate. H1: Claude Haiku reduces AI credit usage >=30% with equivalent run success rate (>=0.90)."
     metric: ai_credits_total
@@ -32,7 +32,9 @@ experiments:
       - name: empty_output_rate
         threshold: "<=0.10"
     min_samples: 20
-    weight: [50, 50]
+    continual:
+      seed: daily-caveman-model-size-v1
+      ramp: [10, 25, 50]
     start_date: "2026-06-04"
 
 network:
@@ -45,7 +47,6 @@ safe-outputs:
     expires: 3d
     title-prefix: "[caveman] "
     labels: [documentation, automation, prompt-quality]
-    draft: false
     protected-files: allowed
     allowed-files:
       - .github/aw/**
@@ -54,12 +55,44 @@ safe-outputs:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
+    config:
+      filesystem:
+        allow-write:
+          - /tmp/gh-aw/agent
+          - /workspace/.github/aw
+          - /workspace/.github/agents
 tools:
   cli-proxy: true
   cache-memory: true
+  ledger:
+    caveman-run-history:
+      type: table
+      key: run_id
+      schema:
+        type: object
+        required: [record_type, run_id, date, files_processed, files_optimized, planned_outcome]
+        properties:
+          record_type:
+            enum: [caveman_run]
+          run_id:
+            type: string
+          date:
+            type: string
+          files_processed:
+            type: integer
+            minimum: 0
+          files_optimized:
+            type: integer
+            minimum: 0
+          planned_outcome:
+            enum: [pull_request_requested, noop]
+        additionalProperties: false
+      max-record-kb: 4
+      max-patch-kb: 10
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   edit:
   bash:
@@ -68,7 +101,22 @@ tools:
 timeout-minutes: 30
 
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/otlp.md
+mcp-scripts:
+  caveman-run-state:
+    description: "Read the current run's audit record from the read-only caveman ledger."
+    env:
+      CAVEMAN_RUN_ID: ${{ github.run_id }}
+    script: |
+      const { DatabaseSync } = require("node:sqlite");
+      const db = new DatabaseSync("/tmp/gh-aw/ledgers/caveman-run-history/ledger.db", { readOnly: true });
+      try {
+        const row = db.prepare("SELECT value FROM state WHERE key = ? LIMIT 1").get(process.env.CAVEMAN_RUN_ID);
+        return { current_run: row ? JSON.parse(row.value) : null };
+      } finally {
+        db.close();
+      }
 features:
   gh-aw-detection: true
 evals:
@@ -76,6 +124,8 @@ evals:
     question: Did the agent apply caveman optimization to an instruction file in .github/aw or .github/agents?
   - id: pr_created_or_noop
     question: Was a PR created with concise improvements, or was noop used when no improvements were needed?
+  - id: prefix-information-density
+    question: Did edited files preserve actionable constraints, routing, verification and stop conditions within the first 7500 UTF-8 bytes, rather than merely shortening prose? Return UNKNOWN when no files were edited.
 ---
 
 # Daily Caveman Optimizer 🪨
@@ -85,6 +135,19 @@ You are the Caveman Optimizer — an expert at applying the [caveman optimizatio
 **Core principle**: "Why use many token when few do trick."
 
 Your mission: make instruction files in `.github/aw/` and `.github/agents/` more concise and token-efficient **without degrading their usefulness as agentic instructions**.
+
+## Prefix-first contract
+
+Copilot CLI prompt-file queries may return only **8,000 UTF-8 bytes**.
+Pack objective, mandatory constraints, conditional reference routes, verification
+and stop conditions within **7,500 bytes including metadata**. Put examples and
+inventories later; preserve exact identifiers, negation, exceptions and auth gates.
+Use short grammatical imperatives, not cryptic fragments.
+Prefer whole files under budget; for longer files end the complete contract with
+`<!-- instruction-prefix-end -->` by byte 7,500. Before accepting an edit, run
+`python3 scripts/check-instruction-prefixes.py <edited-paths>` and inspect the
+exact first 8,000 bytes for semantic completeness. Report unavailable checks;
+the script alone cannot prove comprehension.
 
 ## Critical Context: These Files Are Agentic Instructions
 
@@ -138,6 +201,8 @@ Collect the sorted list of files.
 ## Step 2: Load Round-Robin State
 
 Read `/tmp/gh-aw/cache-memory/caveman-optimizer/state.json` if it exists.
+Report `Cache hit` after successfully reading reusable state, or `Cache miss`
+if the file is missing; creating the directory alone is not a miss.
 
 Expected format:
 ```json
@@ -148,9 +213,10 @@ Expected format:
 }
 ```
 
-- If the file does not exist, this is the first run and the cache is intentionally empty. Do **not** call `missing_data` — proceed normally. Count the total number of files in the sorted list (`TOTAL=$(...)`) and pick a **random** starting index with `$(( RANDOM % TOTAL ))`. This avoids always processing the same files first when the cache is cold.
+- If the file does not exist, this is the first run and the cache is intentionally empty. Do **not** call `report_missing_data` — proceed normally. Count the total number of files in the sorted list (`TOTAL=$(...)`) and pick a **random** starting index with `$(( RANDOM % TOTAL ))`. This avoids always processing the same files first when the cache is cold.
 - If the queue in cache differs from the current file list (files added/removed), rebuild the queue from the current sorted list and reset the index to 0.
 - Pick the **next 5 files** starting from `last_processed_index + 1` (wrapping around if needed). This is your **batch** for this run.
+- **Keep cache-memory for the round-robin cursor.** Use the Git-backed ledger only for durable run audit records.
 
 ## Step 3: Analyze and Optimize Each File
 
@@ -171,7 +237,10 @@ Ask:
 
 **If the file is already tight** — mark it as "no change needed" and move on. Do not make cosmetic edits just to justify the run.
 
-**Optimization threshold**: Only edit if you can reduce the file by at least 10% in characters or lines — counting only removed prose, not whitespace changes — without removing any AW schema hints, field examples, or compiler constraints. When uncertain whether a cut loses agentic signal, keep the original text.
+**Optimization threshold**: Edit when required rules/routes are lost beyond byte
+8,000, or when removing redundant prose saves at least 10% of UTF-8 bytes.
+Prefix repair may reorder content without reducing total size. Never cut schema
+hints, valid values or compiler/security constraints merely to meet a percentage.
 
 ### 3c. Apply caveman optimization
 
@@ -179,6 +248,8 @@ Make surgical edits:
 - Shorten verbose prose sections
 - Remove redundant step descriptions
 - Compress repeated patterns
+- Move safety, routing and completion rules before optional examples; link detail
+  early. Do not remove required configuration examples when moving them.
 - Do NOT change YAML frontmatter, code blocks, schema definitions, or field names
 - Do NOT remove examples that show valid AW frontmatter or tool configuration
 - Do NOT remove "do this, not that" patterns — agents need these to avoid common mistakes
@@ -188,8 +259,8 @@ Make surgical edits:
 ### 3d. Document your changes
 
 For each file you edit, note:
-- Original approximate line count
-- New approximate line count
+- Before/after UTF-8 bytes and lines; contract-end byte
+- Required rules/routes made available within the first 8,000 bytes
 - What was removed (1 sentence each)
 
 ## Step 4: Update Cache Memory
@@ -205,8 +276,35 @@ Write the updated state to `/tmp/gh-aw/cache-memory/caveman-optimizer/state.json
 ```
 
 Use filesystem-safe format `YYYY-MM-DD` for the date (no colons, no T, no Z).
+Update this state even when the batch needs no edits, then read the file back
+to verify the write before requesting a PR or `noop`.
 
-## Step 5: Output
+## Step 5: Record the Run
+
+Before requesting a PR or `noop`, discover and invoke `caveman-run-state` through the `mcpscripts` CLI. It queries the read-only ledger with fixed, parameterized SQL using Node's SQLite API; do not invoke `sqlite3` or install a database client.
+
+If `current_run` is null, invoke `safeoutputs ledger_append '<json>'` exactly once with the following shape, replacing the date, counts, and planned outcome with this run's values. `ledger_append` is available through the `safeoutputs` CLI, not as a standalone shell command or native tool:
+
+```json
+{
+  "ledger": "caveman-run-history",
+  "operation": "upsert",
+  "value": {
+    "record_type": "caveman_run",
+    "run_id": "${{ github.run_id }}",
+    "date": "2026-10-05",
+    "files_processed": 5,
+    "files_optimized": 0,
+    "planned_outcome": "noop"
+  }
+}
+```
+
+Keep `value.run_id` a quoted string; it is the table primary key. Do not add a top-level `key` or fields beyond this schema. Use `pull_request_requested` when requesting a PR, otherwise `noop`. Do not include file contents or raw analysis notes. Do not edit ledger branches directly.
+
+Complete the query and, when needed, the append before Step 6. Queued records are not visible in this run's read-only projection and become durable only after `push_ledger_changes` succeeds. If the query or append fails or is unavailable, call `safeoutputs report_incomplete` with the concrete blocker; do not emit a clean `noop`, request a PR, or claim the audit record was persisted.
+
+## Step 6: Output
 
 **If you made changes to any files**, create a pull request using `create_pull_request`:
 
@@ -221,9 +319,9 @@ Applies the [caveman optimization](https://github.com/JuliusBrussee/caveman) pri
 
 ### Files Optimized
 
-| File | Before | After | Removed |
-|------|--------|-------|---------|
-| `file.md` | ~N lines | ~M lines | Brief description of what was cut |
+| File | Before bytes | After bytes | Contract-end byte | Change |
+|------|--------------|-------------|-------------------|--------|
+| `file.md` | N | M | <=7500 | Removed redundancy or recovered prefix rules |
 
 ### What Was Changed
 

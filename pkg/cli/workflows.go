@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/repoutil"
 	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
 	"github.com/github/gh-aw/pkg/stringutil"
@@ -68,7 +70,7 @@ type GitHubWorkflow struct {
 }
 
 // fetchGitHubWorkflows fetches workflow information from GitHub
-func fetchGitHubWorkflows(repoOverride string, verbose bool) (map[string]*GitHubWorkflow, error) {
+func fetchGitHubWorkflows(ctx context.Context, repoOverride string, verbose bool) (map[string]*GitHubWorkflow, error) { //nolint:largefunc // Existing workflow discovery and diagnostics remain centralized.
 	workflowsLog.Printf("Fetching GitHub workflows: repoOverride=%s", repoOverride)
 
 	// Start spinner for network operation (only if not in verbose mode)
@@ -77,11 +79,18 @@ func fetchGitHubWorkflows(repoOverride string, verbose bool) (map[string]*GitHub
 		spinner.Start()
 	}
 
-	args := []string{"workflow", "list", "--all", "--json", "id,name,path,state"}
+	endpoint := "repos/{owner}/{repo}/actions/workflows?per_page=100"
+	var hostname string
 	if repoOverride != "" {
-		args = append(args, "--repo", repoOverride)
+		var ownerRepo string
+		ownerRepo, hostname = repoutil.NormalizeRepoForAPI(repoOverride)
+		endpoint = fmt.Sprintf("repos/%s/actions/workflows?per_page=100", ownerRepo)
 	}
-	cmd := workflow.ExecGH(args...)
+	args := []string{"api", "--paginate", "--slurp", endpoint}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	cmd := workflow.ExecGHContext(ctx, args...)
 	output, err := cmd.Output()
 
 	if err != nil {
@@ -124,8 +133,10 @@ func fetchGitHubWorkflows(repoOverride string, verbose bool) (map[string]*GitHub
 		return nil, errors.New("gh workflow list returned invalid JSON - this may be due to network issues or authentication problems")
 	}
 
-	var workflows []GitHubWorkflow
-	if err := json.Unmarshal(output, &workflows); err != nil {
+	var pages []struct {
+		Workflows []GitHubWorkflow `json:"workflows"`
+	}
+	if err := json.Unmarshal(output, &pages); err != nil {
 		if !verbose {
 			spinner.Stop()
 		}
@@ -133,9 +144,12 @@ func fetchGitHubWorkflows(repoOverride string, verbose bool) (map[string]*GitHub
 	}
 
 	workflowMap := make(map[string]*GitHubWorkflow)
-	for i, workflow := range workflows {
-		name := extractWorkflowNameFromPath(workflow.Path)
-		workflowMap[name] = &workflows[i]
+	for _, page := range pages {
+		for i := range page.Workflows {
+			workflow := &page.Workflows[i]
+			name := extractWorkflowNameFromPath(workflow.Path)
+			workflowMap[name] = workflow
+		}
 	}
 
 	// Count user workflows (those with .md files)
@@ -176,14 +190,14 @@ func extractWorkflowNameFromPath(path string) string {
 }
 
 // getWorkflowStatus gets the status of a single workflow by name
-func getWorkflowStatus(workflowIdOrName string, repoOverride string, verbose bool) (*GitHubWorkflow, error) {
+func getWorkflowStatus(ctx context.Context, workflowIdOrName string, repoOverride string, verbose bool) (*GitHubWorkflow, error) {
 	workflowsLog.Printf("Getting workflow status: workflow=%s", workflowIdOrName)
 
 	// Extract workflow name for lookup
 	filename := normalizeWorkflowID(workflowIdOrName)
 
 	// Get all GitHub workflows
-	githubWorkflows, err := fetchGitHubWorkflows(repoOverride, verbose)
+	githubWorkflows, err := fetchGitHubWorkflows(ctx, repoOverride, verbose)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch GitHub workflows: %w", err)
 	}
@@ -278,6 +292,16 @@ func filterWorkflowFiles(files []string) []string {
 
 // getMarkdownWorkflowFiles discovers markdown workflow files in the specified directory
 func getMarkdownWorkflowFiles(workflowDir string) ([]string, error) {
+	return getMarkdownWorkflowFilesWithRecursion(workflowDir, false)
+}
+
+// getMarkdownWorkflowFilesRecursively discovers workflow Markdown files in the
+// directory tree. Fix uses this so nested workflow files receive the same codemods.
+func getMarkdownWorkflowFilesRecursively(workflowDir string) ([]string, error) {
+	return getMarkdownWorkflowFilesWithRecursion(workflowDir, true)
+}
+
+func getMarkdownWorkflowFilesWithRecursion(workflowDir string, recursive bool) ([]string, error) {
 	// Use provided directory or default
 	workflowsDir := workflowDir
 	if workflowsDir == "" {
@@ -290,16 +314,36 @@ func getMarkdownWorkflowFiles(workflowDir string) ([]string, error) {
 		return nil, fmt.Errorf("no %s directory found", workflowsDir)
 	}
 
-	// Find all markdown files in workflow directory
-	mdFiles, err := filepath.Glob(filepath.Join(workflowsDir, "*.md"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to find workflow files: %w", err)
+	var mdFiles []string
+	if recursive {
+		err := filepath.WalkDir(workflowsDir, func(path string, _ os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if strings.EqualFold(filepath.Ext(path), ".md") {
+				mdFiles = append(mdFiles, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to find workflow files: %w", err)
+		}
+	} else {
+		var err error
+		mdFiles, err = filepath.Glob(filepath.Join(workflowsDir, "*.md"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to find workflow files: %w", err)
+		}
 	}
 
 	// Filter out README.md files
 	mdFiles = filterWorkflowFiles(mdFiles)
 
-	workflowsLog.Printf("Found %d markdown workflow file(s) in %s", len(mdFiles), workflowsDir)
+	if recursive {
+		workflowsLog.Printf("Found %d markdown workflow file(s) in %s recursively", len(mdFiles), workflowsDir)
+	} else {
+		workflowsLog.Printf("Found %d markdown workflow file(s) in %s", len(mdFiles), workflowsDir)
+	}
 	return mdFiles, nil
 }
 
@@ -353,7 +397,7 @@ func filterMarkdownFilesWithFrontmatter(mdFiles []string) ([]string, error) {
 // Frontmatter is recognised only when "---" appears on the very first line.
 // Returns the first H1/H2/H3 title text, or ("", nil) when none are present.
 // Returns an error if frontmatter is opened but never closed.
-func fastParseTitleFromReader(r io.Reader) (string, error) {
+func fastParseTitleFromReader(r io.Reader) (string, error) { //nolint:largefunc // Existing streaming parser remains intentionally linear.
 	scanner := bufio.NewScanner(r)
 	// Reuse the small initial scanner buffer across calls while still allowing
 	// growth up to 1 MB for large frontmatter values or long base64-encoded lines.
@@ -419,16 +463,16 @@ func fastParseTitleFromReader(r io.Reader) (string, error) {
 }
 
 func isFrontmatterDelimiter(line []byte) bool {
-	return len(line) == 3 && line[0] == '-' && line[1] == '-' && line[2] == '-'
+	return bytes.Equal(line, []byte("---"))
 }
 
 func extractHeadingTitle(line []byte) (string, bool) {
 	switch {
-	case len(line) >= 2 && line[0] == '#' && line[1] == ' ':
+	case bytes.HasPrefix(line, []byte("# ")):
 		return string(bytes.TrimSpace(line[2:])), true
-	case len(line) >= 3 && line[0] == '#' && line[1] == '#' && line[2] == ' ':
+	case bytes.HasPrefix(line, []byte("## ")):
 		return string(bytes.TrimSpace(line[3:])), true
-	case len(line) >= 4 && line[0] == '#' && line[1] == '#' && line[2] == '#' && line[3] == ' ':
+	case bytes.HasPrefix(line, []byte("### ")):
 		return string(bytes.TrimSpace(line[4:])), true
 	default:
 		return "", false

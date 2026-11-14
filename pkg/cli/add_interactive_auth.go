@@ -12,6 +12,7 @@ import (
 
 // checkGHAuthStatus verifies the user is logged in to GitHub CLI
 func (c *AddInteractiveConfig) checkGHAuthStatus() error {
+	addInteractiveLog.Print("Checking gh auth status")
 	return checkGHAuthStatusShared(c.Verbose)
 }
 
@@ -38,7 +39,6 @@ func (c *AddInteractiveConfig) checkGitRepository() error {
 
 		// Ask the user for the repository (interactive-only feature)
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Could not determine the repository automatically."))
-		fmt.Fprintln(os.Stderr, "")
 
 		var userRepo string
 		form := console.NewInputForm(
@@ -68,14 +68,14 @@ func (c *AddInteractiveConfig) checkGitRepository() error {
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Target repository: "+repoSlug))
 	addInteractiveLog.Printf("Target repository: %s", repoSlug)
 
-	// Check if repository is public or private
-	c.isPublicRepo = checkRepoVisibilityShared(c.RepoOverride)
+	c.repositoryVisibility = getRepoVisibilityShared(c.RepoOverride)
 
 	return nil
 }
 
 // checkActionsEnabled verifies that GitHub Actions is enabled for the repository
 func (c *AddInteractiveConfig) checkActionsEnabled() error {
+	addInteractiveLog.Printf("Checking Actions enabled for repo=%s", c.RepoOverride)
 	return checkActionsEnabledShared(c.RepoOverride, c.Verbose)
 }
 
@@ -85,6 +85,7 @@ func (c *AddInteractiveConfig) checkUserPermissions() error {
 	if err != nil {
 		return err
 	}
+	addInteractiveLog.Printf("User permission check complete: hasWriteAccess=%t", hasWrite)
 	c.hasWriteAccess = hasWrite
 	return nil
 }

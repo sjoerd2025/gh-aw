@@ -111,9 +111,11 @@ The following workflow lock files have changes:
 
     // Setup mock core module
     mockCore = {
+      debug: vi.fn(),
       info: vi.fn(),
       warning: vi.fn(),
       error: vi.fn(),
+      setSecret: vi.fn(),
       summary: {
         addHeading: vi.fn().mockReturnThis(),
         addRaw: vi.fn().mockReturnThis(),
@@ -137,6 +139,10 @@ The following workflow lock files have changes:
           update: vi.fn(),
         },
         git: {
+          getCommit: vi.fn(async () => ({ data: { tree: { sha: "base-tree-sha" } } })),
+          createBlob: vi.fn(async () => ({ data: { sha: "new-blob-sha" } })),
+          createTree: vi.fn(async () => ({ data: { sha: "new-tree-sha" } })),
+          createCommit: vi.fn(async () => ({ data: { sha: "verified-initial-commit", verification: { verified: true } } })),
           createRef: vi.fn(),
         },
         repos: {
@@ -449,7 +455,7 @@ The following workflow lock files have changes:
       owner: "testowner",
       repo: "testrepo",
       ref: "refs/heads/aw/recompile-workflows",
-      sha: "base-head-sha",
+      sha: "verified-initial-commit",
     });
     expect(mockGithub.rest.issues.create).not.toHaveBeenCalled();
   });

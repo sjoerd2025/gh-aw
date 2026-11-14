@@ -14,10 +14,10 @@ permissions:
   actions: read
   discussions: read
 tracker-id: daily-fact-thread
-model: gpt-5.4
+model: openai/gpt-5.6-terra
 engine:
   id: codex
-  bare: true
+  model-provider: openai
 strict: true
 experiments:
   reasoning_depth:
@@ -36,7 +36,7 @@ experiments:
     start_date: "2026-05-11"
     issue: 31324
 timeout-minutes: 15
-runs-on: aw-gpu-runner-T4
+runs-on: ubuntu-latest
 runtimes:
   node:
     version: "22"
@@ -47,11 +47,12 @@ network:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    runtime: cloud-hypervisor
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
       - default
       - discussions
@@ -65,7 +66,7 @@ safe-outputs:
     run-failure: "🌧️ Alas! [{workflow_name}]({run_url}) {status}, its quill fallen mid-verse. The poem remains unfinished..."
 imports:
   - shared/otlp.md
-  - shared/mcp/mempalace.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 evals:
@@ -77,20 +78,7 @@ evals:
 
 ### Daily Fact About gh-aw
 
-**Report Formatting**: Use h3 (###) or lower for all headers in your report
-to maintain proper document hierarchy. Wrap long sections in
-`<details><summary>View Full Details</summary>` tags to improve readability.
-
-
 Your task is to post a poetic, whimsical fact about the ${{ github.repository }} project to discussion #4750.
-
-#### Step 0: Load Memory
-
-Before gathering repository activity, check what has already been celebrated in the palace to avoid repetition.
-
-1. Call `mempalace_status` to confirm the palace is ready.
-2. Call `mempalace_search` with `query: "gh-aw daily fact"` and `wing: "daily-facts"` to retrieve recently posted facts. On the very first run the palace will be empty — that is fine, proceed without results.
-3. Note any PR numbers, issue numbers, release tags, or contributor handles that appear in the results — **do not repeat those topics today**.
 
 #### Data Sources
 
@@ -114,9 +102,8 @@ Mine recent activity from the repository to find interesting facts. Focus on:
 
 #### Guidelines
 
-- **Check memory first**: Skip any PR, issue, or release that already appears in the palace results from Step 0
 {{#if experiments.reasoning_depth == 'multi_candidate'}}
-- **Multi-candidate deliberation**: Before writing, identify exactly **3 distinct candidate facts** (one PR, one issue or release, one contributor or pattern). For each candidate write one sentence on why it is novel today. Then score each candidate 1–5 on: (a) novelty vs palace memory, (b) intrinsic poetic potential. Select the highest-scoring candidate and write the verse for that one only.
+- **Multi-candidate deliberation**: Before writing, identify exactly **3 distinct candidate facts** (one PR, one issue or release, one contributor or pattern). For each candidate write one sentence on why it is interesting today. Then score each candidate 1–5 on: (a) timeliness, (b) intrinsic poetic potential. Select the highest-scoring candidate and write the verse for that one only.
 {{else}}
 - **Favor recent updates** but include variety - pick something interesting, not just the most recent
 {{/if}}
@@ -150,21 +137,5 @@ Bad facts:
 - "The repository was updated today." (too vague, lacks poetry)
 - "There were some changes." (not specific, uninspired)
 - Long paragraphs (keep it brief and lyrical)
-
-#### Step 3: Save to Memory
-
-After posting the comment, store the fact in the palace so it will be excluded from future runs:
-
-Call `mempalace_add_drawer` with:
-- `wing`: `"daily-facts"`
-- `room`: the category of the fact — use one of these canonical values:
-  - `"pr"` — a merged pull request
-  - `"release"` — a release or version tag
-  - `"issue"` — a closed issue
-  - `"contributor"` — a community contributor highlight
-  - `"pattern"` — a code pattern or architectural observation
-- `content`: a short record containing the PR/issue/release identifier and a one-line summary of the fact posted today
-
-This ensures tomorrow's verse celebrates something new.
 
 Now, analyze the recent activity and compose one poetic fact to share in discussion #4750.

@@ -8,9 +8,9 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
@@ -29,24 +29,14 @@ var replacements = map[string]string{
 }
 
 // Analyzer is the ioutil-deprecated analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "ioutildeprecated",
-	Doc:      "reports uses of deprecated io/ioutil functions that should be replaced with io or os package equivalents",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/ioutildeprecated",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("ioutildeprecated", "reports uses of deprecated io/ioutil functions that should be replaced with io or os package equivalents", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	root, err := astutil.Root(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +91,11 @@ func checkDotImportIoutilUsage(pass *analysis.Pass, root inspector.Cursor, gener
 		if !ok {
 			continue
 		}
-		if _, ok := cur.Parent().Node().(*ast.SelectorExpr); ok {
+		// Skip the Sel of a selector (ioutil.X is handled by
+		// checkQualifiedIoutilUsage; x.Discard is a field or method), but keep
+		// the X side so a dot-imported receiver such as Discard.Write(p) is
+		// still reported.
+		if sel, ok := cur.Parent().Node().(*ast.SelectorExpr); ok && sel.Sel == ident {
 			continue
 		}
 		pos := pass.Fset.PositionFor(ident.Pos(), false)

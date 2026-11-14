@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
@@ -9,7 +10,16 @@ import (
 
 // extractGlobalConfigFields parses safe-outputs fields that apply across handlers,
 // keeping extractSafeOutputsConfig focused on routing handler-specific configuration.
+//
+//nolint:largefunc // Legacy global configuration extraction is intentionally centralized.
 func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *SafeOutputsConfig) {
+	// Handle steering issue mode.
+	if steer, exists := outputMap["steer"]; exists {
+		if steerBool, ok := steer.(bool); ok {
+			config.Steer = steerBool
+		}
+	}
+
 	// Parse allowed-domains configuration (additional domains, unioned with network.allowed; supports ecosystem identifiers)
 	if allowedDomains, exists := outputMap["allowed-domains"]; exists {
 		if domainsArray, ok := allowedDomains.([]any); ok {
@@ -27,7 +37,7 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 	// Parse URL sanitization policy
 	if urls, exists := outputMap["urls"]; exists {
 		if urlsStr, ok := urls.(string); ok {
-			config.URLs = urlsStr
+			config.URLs = SafeOutputsURLsPolicy(urlsStr)
 		}
 	}
 
@@ -49,6 +59,10 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 		}
 	}
 
+	if requireAgentSuccess, ok := outputMap["require-agent-success"].(bool); ok {
+		config.RequireAgentSuccess = requireAgentSuccess
+	}
+
 	// Handle staged flag
 	if err := preprocessBoolFieldAsString(outputMap, "staged", safeOutputsConfigLog); err != nil {
 		safeOutputsConfigLog.Printf("staged: %v", err)
@@ -58,7 +72,7 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 			config.Staged = &value
 		}
 	}
-	if c.forceStaged {
+	if c.forceStaged || c.dryRun {
 		value := TemplatableBool("true")
 		config.Staged = &value
 	}
@@ -141,6 +155,11 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 			safeOutputsConfigLog.Printf("Global footer control: %t", footerBool)
 		}
 	}
+	if bodyFooter, exists := outputMap["body-footer"]; exists {
+		if bodyFooterString, ok := bodyFooter.(string); ok {
+			config.BodyFooter = bodyFooterString
+		}
+	}
 
 	// Handle group-reports flag
 	if groupReports, exists := outputMap["group-reports"]; exists {
@@ -168,7 +187,8 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 					}
 				}
 			}
-			config.ReportFailureAsIssue = reportFailureAsIssue // Preserve original value for proper serialization
+			reportAsIssue := TemplatableBool("true")
+			config.ReportFailureAsIssue = &reportAsIssue
 			config.ReportFailureAsIssueCategories = includedCategories
 			config.ReportFailureAsIssueExcludedCategories = excludedCategories
 			if len(includedCategories) > 0 && len(excludedCategories) > 0 {
@@ -184,17 +204,12 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 				safeOutputsConfigLog.Printf("Failed to preprocess report-failure-as-issue field: %v (ignoring invalid value and leaving field unset)", err)
 			} else {
 				if reportFailureAsIssueStr, ok := outputMap["report-failure-as-issue"].(string); ok {
-					switch reportFailureAsIssueStr {
-					case "true":
-						config.ReportFailureAsIssue = true
-					case "false":
-						config.ReportFailureAsIssue = false
-					default:
-						config.ReportFailureAsIssue = reportFailureAsIssueStr
-					}
-					safeOutputsConfigLog.Printf("Report failure as issue: %v", config.ReportFailureAsIssue)
+					reportAsIssue := TemplatableBool(reportFailureAsIssueStr)
+					config.ReportFailureAsIssue = &reportAsIssue
+					safeOutputsConfigLog.Printf("Report failure as issue: %s", reportAsIssue.String())
 				} else if reportFailureAsIssueBool, ok := outputMap["report-failure-as-issue"].(bool); ok {
-					config.ReportFailureAsIssue = reportFailureAsIssueBool
+					reportAsIssue := TemplatableBool(strconv.FormatBool(reportFailureAsIssueBool))
+					config.ReportFailureAsIssue = &reportAsIssue
 					safeOutputsConfigLog.Printf("Report failure as issue: %t", reportFailureAsIssueBool)
 				}
 			}
@@ -207,6 +222,15 @@ func (c *Compiler) extractGlobalConfigFields(outputMap map[string]any, config *S
 			config.FailureIssueRepo = failureIssueRepoStr
 			safeOutputsConfigLog.Printf("Failure issue repo: %s", failureIssueRepoStr)
 		}
+	}
+
+	// Handle report-failed-jobs as a templatable bool (default true).
+	if err := preprocessBoolFieldAsString(outputMap, "report-failed-jobs", safeOutputsConfigLog); err != nil {
+		safeOutputsConfigLog.Printf("Failed to preprocess report-failed-jobs field: %v (ignoring invalid value and leaving field unset)", err)
+	} else if reportFailedJobs, ok := outputMap["report-failed-jobs"].(string); ok {
+		value := TemplatableBool(reportFailedJobs)
+		config.ReportFailedJobs = &value
+		safeOutputsConfigLog.Printf("Report failed jobs: %s", value.String())
 	}
 
 	// Handle max-bot-mentions (templatable integer)

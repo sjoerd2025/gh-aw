@@ -13,16 +13,18 @@ package cli
 // specs/forecast-compliance-fixtures/README.md and the formal model that produced
 // the issue — see the "Formal Model" section of issue #40114):
 //   - TLA+ invariants: P1, P5, P7, P8, P9
-//   - F* pre/post conditions: P2, P3, P4, P6, P10, P11
+//   - F* pre/post conditions: P2, P3, P6, P10, P11
+//   - Output contract: P4 (replaces the retired yield-formula predicate)
 //   - Z3-SMT schema gap: P12, P13
 //
 // Fixture-level predicates (issue behavioral coverage map):
-//   - FC-P3: run_summary_zero_et.json has total_effective_tokens == 0 (T-FC-022)
-//   - FC-P4: run_summary_high_et.json has total_effective_tokens >= 1,000,000 (T-ET-006)
+//   - FC-P3: run_summary_zero_aic.json has total_aic == 0 (T-FC-022)
+//   - FC-P4: run_summary_high_aic.json has total_aic >= 1,000,000
 //   - FC-P6: run_summary_failed.json has conclusion == "failure" (T-FC-035)
+//   - FC-P7: run_summary_cancelled.json has conclusion == "cancelled" (T-FC-036)
 //   - FC-P8: RunSummary JSON round-trip serialization is lossless
-//   - FC-P9: run_started_at <= updated_at in every fixture
-//   - FC-P10: all four fixtures have required Monte Carlo input fields
+//   - FC-P9: StartedAt <= UpdatedAt in every fixture
+//   - FC-P10: all five fixtures have required Monte Carlo input fields
 
 import (
 	"encoding/json"
@@ -30,7 +32,9 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"testing"
 	"time"
 
@@ -62,23 +66,23 @@ func loadFixture(t *testing.T, name string) map[string]any {
 // Formal predicate: ∀f ∈ FixtureFields: f ∈ dom(run_summary_minimal.json)
 // Specification reference: specs/forecast-compliance-fixtures/README.md §Fixture Schema Reference
 func TestFormal_P1_FixtureFieldMapping(t *testing.T) {
+	t.Parallel()
 	fixture := loadFixture(t, "run_summary_minimal.json")
 
 	// Top-level identity field.
 	assert.Contains(t, fixture, "run_id", "P1: run_id must be present")
 
-	// run sub-object must expose conclusion, updated_at, run_started_at.
+	// run sub-object must expose conclusion, updatedAt, startedAt.
 	run, ok := fixture["run"].(map[string]any)
 	require.True(t, ok, "P1: 'run' must be a JSON object")
-	for _, field := range []string{"conclusion", "updated_at", "run_started_at"} {
+	for _, field := range []string{"conclusion", "updatedAt", "startedAt"} {
 		assert.Contains(t, run, field, "P1: run.%s must be present for forecast inputs", field)
 	}
 
-	// token_usage_summary must contain total_effective_tokens and total_aic.
+	// token_usage_summary must contain total_aic.
 	usage, ok := fixture["token_usage_summary"].(map[string]any)
 	require.True(t, ok, "P1: 'token_usage_summary' must be a JSON object")
-	assert.Contains(t, usage, "total_effective_tokens", "P1: token_usage_summary.total_effective_tokens required")
-	assert.Contains(t, usage, "total_aic", "P1: token_usage_summary.total_aic required (AIC is what the engine reads)")
+	assert.Contains(t, usage, "total_aic", "P1: token_usage_summary.total_aic required")
 }
 
 // TestFormal_P2_BernoulliSuccess verifies the Bernoulli success model:
@@ -87,6 +91,7 @@ func TestFormal_P1_FixtureFieldMapping(t *testing.T) {
 // Formal predicate: successRate = successCount / n; P(AIC>0|trial) = successRate
 // Specification reference: R-MC-020, R-MC-021
 func TestFormal_P2_BernoulliSuccess(t *testing.T) {
+	t.Parallel()
 	rng := rand.New(rand.NewSource(42)) //nolint:gosec
 
 	aicObs := []int{5_000, 6_000, 7_000}
@@ -110,8 +115,9 @@ func TestFormal_P2_BernoulliSuccess(t *testing.T) {
 //	observedRunsPerPeriod = (sampledRuns / historyDays) * periodDays
 //
 // Formal predicate: λ = (n/h) × p, where h = historyDays, p = periodDays
-// Specification reference: §3.8 Run Frequency Estimation
+// Specification reference: §3.7 Observed Runs Per Period
 func TestFormal_P3_ObservedRateFormula(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		sampledRuns int
 		historyDays int
@@ -131,30 +137,42 @@ func TestFormal_P3_ObservedRateFormula(t *testing.T) {
 	}
 }
 
-// TestFormal_P4_YieldFormula verifies the yield invariant:
-//
-//	yield = successRate × observedRunsPerPeriod
-//
-// Formal predicate: yield = sr × obs  (§3.9 example)
-// Specification reference: §3.9 Effective Yield Estimate
-func TestFormal_P4_YieldFormula(t *testing.T) {
-	cases := []struct {
-		successCount int
-		totalRuns    int
-		lambda       float64
-		wantYield    float64
-	}{
-		{successCount: 8, totalRuns: 10, lambda: 10.0, wantYield: 0.8 * 10.0},
-		{successCount: 10, totalRuns: 10, lambda: 5.0, wantYield: 1.0 * 5.0},
-		{successCount: 0, totalRuns: 10, lambda: 10.0, wantYield: 0.0},
-		{successCount: 3, totalRuns: 4, lambda: 8.0, wantYield: 0.75 * 8.0},
+// TestFormal_P4_RunLevelOutputContract replaces the obsolete yield-formula
+// predicate with the supported run-level output contract (R-OUT-014, T-FC-056).
+func TestFormal_P4_RunLevelOutputContract(t *testing.T) {
+	t.Parallel()
+
+	for field := range reflect.TypeFor[ForecastWorkflowResult]().Fields() {
+		tag := field.Tag.Get("json")
+		assert.NotContains(t, tag, "yield", "retired yield must not return as an optional field")
+		assert.NotContains(t, tag, "episode_analysis", "retired episode analysis must not return as an optional field")
 	}
-	for _, tc := range cases {
-		successRate := float64(tc.successCount) / float64(tc.totalRuns)
-		yield := successRate * tc.lambda
-		assert.InDelta(t, tc.wantYield, yield, 1e-9,
-			"P4: yield = sr(%.2f) × obs(%.2f) = %.4f",
-			successRate, tc.lambda, tc.wantYield)
+
+	for _, sampledRuns := range []int{0, 10} {
+		result := ForecastWorkflowResult{WorkflowID: "daily-report", SampledRuns: sampledRuns}
+		if sampledRuns > 0 {
+			populateForecastProjection(&result, forecastRunStats{
+				totalAIC:        10,
+				successCount:    sampledRuns,
+				aicObservations: []int{1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000},
+			}, 30, 30)
+		}
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+		var fields map[string]any
+		require.NoError(t, json.Unmarshal(data, &fields))
+		assert.NotContains(t, fields, "yield")
+		assert.NotContains(t, fields, "episode_analysis")
+		for _, name := range []string{"sampled_runs", "success_rate", "avg_aic", "p50_aic_per_run", "p95_aic_per_run", "projected_aic", "weekly_projected_aic", "monthly_projected_aic"} {
+			assert.Contains(t, fields, name, "run-level field %s must remain available", name)
+		}
+		for _, name := range []string{"monte_carlo", "weekly_monte_carlo", "monthly_monte_carlo"} {
+			if sampledRuns == 0 {
+				assert.NotContains(t, fields, name)
+			} else {
+				assert.Contains(t, fields, name)
+			}
+		}
 	}
 }
 
@@ -164,6 +182,7 @@ func TestFormal_P4_YieldFormula(t *testing.T) {
 // Formal predicate: result.Iterations = monteCarloIterations
 // Specification reference: §7.1 Simulation Trial Count
 func TestFormal_P5_MonteCarloIterations(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, 10_000, monteCarloIterations, "P5: monteCarloIterations constant must equal 10 000")
 
 	rng := rand.New(rand.NewSource(7)) //nolint:gosec
@@ -180,6 +199,7 @@ func TestFormal_P5_MonteCarloIterations(t *testing.T) {
 // Formal predicate: λ ≤ 0 ∨ ¬(λ = λ) ∨ |λ| = ∞ → result = nil
 // Specification reference: R-MC-001, R-MC-004
 func TestFormal_P6_ZeroLambdaNilResult(t *testing.T) {
+	t.Parallel()
 	obs := []int{1_000, 2_000}
 	cases := []struct {
 		name   string
@@ -193,6 +213,7 @@ func TestFormal_P6_ZeroLambdaNilResult(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			rng := rand.New(rand.NewSource(42)) //nolint:gosec
 			result := runMonteCarlo(obs, len(obs), tc.lambda, rng)
 			assert.Nil(t, result, "P6: λ=%v must yield nil (zero-projection fallback)", tc.lambda)
@@ -206,6 +227,7 @@ func TestFormal_P6_ZeroLambdaNilResult(t *testing.T) {
 // Formal predicate: ∀r ∈ runs: r.TotalAIC = 0 → aicObservations = [] → result = nil
 // Specification reference: R-MC-011, R-MC-032; forecast.go:593 (runAIC ≤ 0 → continue)
 func TestFormal_P7_ZeroAICExclusion(t *testing.T) {
+	t.Parallel()
 	rng := rand.New(rand.NewSource(42)) //nolint:gosec
 
 	// nil observations → runMonteCarlo must return nil.
@@ -223,6 +245,7 @@ func TestFormal_P7_ZeroAICExclusion(t *testing.T) {
 // Formal predicate: IsReliable ⟺ n ≥ minObservationsForReliableForecast (R-MC-030)
 // Specification reference: R-MC-030
 func TestFormal_P8_ReliabilityThreshold(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, 10, minObservationsForReliableForecast,
 		"P8: minObservationsForReliableForecast constant must equal 10")
 
@@ -260,6 +283,7 @@ func TestFormal_P8_ReliabilityThreshold(t *testing.T) {
 // Formal predicate: useNormalApproximationForPoisson(λ) ⟺ λ > 15 (R-FC-060)
 // Specification reference: R-FC-060; forecast_montecarlo.go poissonNormalApproximationThreshold
 func TestFormal_P9_PoissonBranchCrossover(t *testing.T) {
+	t.Parallel()
 	assert.InDelta(t, 15.0, poissonNormalApproximationThreshold, 0,
 		"P9: Poisson crossover threshold must equal 15")
 
@@ -286,6 +310,7 @@ func TestFormal_P9_PoissonBranchCrossover(t *testing.T) {
 // Formal predicate: Duration = UpdatedAt − StartedAt  (§6.2.2)
 // Specification reference: §6.2.2 Duration Derivation; forecast.go:573-574
 func TestFormal_P10_DurationDerivation(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		startedAt    time.Time
 		updatedAt    time.Time
@@ -330,6 +355,7 @@ func TestFormal_P10_DurationDerivation(t *testing.T) {
 // Formal predicate: config.Days ∉ {7, 30} → RunForecast returns error
 // Specification reference: R-CLI-001; forecast.go:227-229
 func TestFormal_P11_FlagValidation_Days(t *testing.T) {
+	t.Parallel()
 	invalidCases := []int{0, 1, 6, 8, 14, 29, 31, 60, 90, 365}
 	for _, days := range invalidCases {
 		cfg := ForecastConfig{Days: days, Period: "month", JSONOutput: true, SampleSize: 10}
@@ -355,29 +381,23 @@ func TestFormal_P11_FlagValidation_Days(t *testing.T) {
 
 // TestFormal_P12_FixtureAICGap verifies that the canonical fixture exposes a
 // positive total_aic, closing the gap where the engine reads TotalAIC but the
-// original fixture only set total_effective_tokens.
+// canonical fixture includes a positive total_aic.
 //
-// Formal predicate (Z3-SMT gap): total_aic > 0 ∧ total_effective_tokens > 0
+// Formal predicate: total_aic > 0
 // Specification reference: forecast.go:593 (runAIC ≤ 0 → continue skips run)
 func TestFormal_P12_FixtureAICGap(t *testing.T) {
+	t.Parallel()
 	fixture := loadFixture(t, "run_summary_minimal.json")
 
 	usage, ok := fixture["token_usage_summary"].(map[string]any)
 	require.True(t, ok, "P12: token_usage_summary must be a JSON object")
 
-	// total_effective_tokens must remain non-zero (pre-existing invariant).
-	et, hasET := usage["total_effective_tokens"]
-	require.True(t, hasET, "P12: total_effective_tokens must be present")
-	etVal, ok := et.(float64)
-	require.True(t, ok, "P12: total_effective_tokens must be a number")
-	assert.Greater(t, etVal, 0.0, "P12: total_effective_tokens must be > 0")
-
-	// total_aic must now be present and positive so the forecast engine does not
+	// total_aic must be present and positive so the forecast engine does not
 	// skip the run at forecast.go:593 (runAIC ≤ 0 → continue).
 	aic, hasAIC := usage["total_aic"]
 	require.True(t, hasAIC,
 		"P12 (gap): total_aic must be present in token_usage_summary — "+
-			"engine reads TotalAIC, not total_effective_tokens")
+			"engine reads TotalAIC, not total_aic")
 	aicVal, ok := aic.(float64)
 	require.True(t, ok, "P12: total_aic must be a number")
 	assert.Greater(t, aicVal, 0.0,
@@ -390,6 +410,7 @@ func TestFormal_P12_FixtureAICGap(t *testing.T) {
 // Formal predicate: dom(fixture) ⊇ RequiredFields
 // Specification reference: pkg/cli/logs_models.go RunSummary struct
 func TestFormal_P13_FixtureJSONConformance(t *testing.T) {
+	t.Parallel()
 	fixture := loadFixture(t, "run_summary_minimal.json")
 
 	// Required top-level fields (mapped from RunSummary struct JSON tags).
@@ -409,7 +430,7 @@ func TestFormal_P13_FixtureJSONConformance(t *testing.T) {
 	// run sub-object required fields.
 	run, ok := fixture["run"].(map[string]any)
 	require.True(t, ok, "P13: 'run' must be a JSON object")
-	runRequired := []string{"conclusion", "updated_at", "run_started_at"}
+	runRequired := []string{"conclusion", "updatedAt", "startedAt"}
 	for _, field := range runRequired {
 		assert.Contains(t, run, field,
 			"P13: run.%q must be present for duration and Bernoulli derivation", field)
@@ -418,50 +439,52 @@ func TestFormal_P13_FixtureJSONConformance(t *testing.T) {
 	// token_usage_summary required fields.
 	usage, ok := fixture["token_usage_summary"].(map[string]any)
 	require.True(t, ok, "P13: 'token_usage_summary' must be a JSON object")
-	usageRequired := []string{"total_effective_tokens", "total_aic"}
+	usageRequired := []string{"total_aic"}
 	for _, field := range usageRequired {
 		assert.Contains(t, usage, field,
 			"P13: token_usage_summary.%q must be present", field)
 	}
 }
 
-// TestFormal_FC_P3_ZeroETFixture verifies that run_summary_zero_et.json
-// models a missing-artifact scenario: total_effective_tokens must equal 0.
+// TestFormal_FC_P3_ZeroAICFixture verifies that run_summary_zero_aic.json
+// models a missing-artifact scenario: total_aic must equal 0.
 //
-// Formal predicate (FC-P3): fixture["token_usage_summary"]["total_effective_tokens"] = 0
+// Formal predicate (FC-P3): fixture["token_usage_summary"]["total_aic"] = 0
 // Specification reference: T-FC-022; specs/forecast-compliance-fixtures/README.md
-func TestFormal_FC_P3_ZeroETFixture(t *testing.T) {
-	fixture := loadFixture(t, "run_summary_zero_et.json")
+func TestFormal_FC_P3_ZeroAICFixture(t *testing.T) {
+	t.Parallel()
+	fixture := loadFixture(t, "run_summary_zero_aic.json")
 
 	usage, ok := fixture["token_usage_summary"].(map[string]any)
 	require.True(t, ok, "FC-P3: token_usage_summary must be a JSON object")
 
-	et, hasET := usage["total_effective_tokens"]
-	require.True(t, hasET, "FC-P3: total_effective_tokens must be present")
-	etVal, ok := et.(float64)
-	require.True(t, ok, "FC-P3: total_effective_tokens must be a number")
-	assert.Equal(t, 0.0, etVal,
-		"FC-P3 (T-FC-022): run_summary_zero_et.json must have total_effective_tokens == 0 "+
-			"to model a missing-artifact / no-ET scenario")
+	aic, hasAIC := usage["total_aic"]
+	require.True(t, hasAIC, "FC-P3: total_aic must be present")
+	aicVal, ok := aic.(float64)
+	require.True(t, ok, "FC-P3: total_aic must be a number")
+	assert.InDelta(t, 0.0, aicVal, 0.0,
+		"FC-P3 (T-FC-022): run_summary_zero_aic.json must have total_aic == 0 "+
+			"to model a missing-artifact scenario")
 }
 
-// TestFormal_FC_P4_HighETFixture verifies that run_summary_high_et.json
-// represents an overflow-boundary scenario: total_effective_tokens >= 1,000,000.
+// TestFormal_FC_P4_HighAICFixture verifies that run_summary_high_aic.json
+// represents an overflow-boundary scenario: total_aic >= 1,000,000.
 //
-// Formal predicate (FC-P4): fixture["token_usage_summary"]["total_effective_tokens"] >= 1_000_000
-// Specification reference: T-ET-006; specs/forecast-compliance-fixtures/README.md
-func TestFormal_FC_P4_HighETFixture(t *testing.T) {
-	fixture := loadFixture(t, "run_summary_high_et.json")
+// Formal predicate (FC-P4): fixture["token_usage_summary"]["total_aic"] >= 1_000_000
+// Specification reference: specs/forecast-compliance-fixtures/README.md
+func TestFormal_FC_P4_HighAICFixture(t *testing.T) {
+	t.Parallel()
+	fixture := loadFixture(t, "run_summary_high_aic.json")
 
 	usage, ok := fixture["token_usage_summary"].(map[string]any)
 	require.True(t, ok, "FC-P4: token_usage_summary must be a JSON object")
 
-	et, hasET := usage["total_effective_tokens"]
-	require.True(t, hasET, "FC-P4: total_effective_tokens must be present")
-	etVal, ok := et.(float64)
-	require.True(t, ok, "FC-P4: total_effective_tokens must be a number")
-	assert.GreaterOrEqual(t, etVal, 1_000_000.0,
-		"FC-P4 (T-ET-006): run_summary_high_et.json must have total_effective_tokens >= 1,000,000 "+
+	aic, hasAIC := usage["total_aic"]
+	require.True(t, hasAIC, "FC-P4: total_aic must be present")
+	aicVal, ok := aic.(float64)
+	require.True(t, ok, "FC-P4: total_aic must be a number")
+	assert.GreaterOrEqual(t, aicVal, 1_000_000.0,
+		"FC-P4: run_summary_high_aic.json must have total_aic >= 1,000,000 "+
 			"to represent the overflow-boundary test case")
 }
 
@@ -471,6 +494,7 @@ func TestFormal_FC_P4_HighETFixture(t *testing.T) {
 // Formal predicate (FC-P6): fixture["run"]["conclusion"] = "failure"
 // Specification reference: T-FC-035; specs/forecast-compliance-fixtures/README.md
 func TestFormal_FC_P6_FailedRunFixture(t *testing.T) {
+	t.Parallel()
 	fixture := loadFixture(t, "run_summary_failed.json")
 
 	run, ok := fixture["run"].(map[string]any)
@@ -483,12 +507,54 @@ func TestFormal_FC_P6_FailedRunFixture(t *testing.T) {
 			"so it is not counted as a Bernoulli success")
 }
 
+// TestFormal_FC_P7_CancelledRunFixture verifies that run_summary_cancelled.json
+// has conclusion == "cancelled", confirming it is included in the Bernoulli sample
+// (status == "completed" and conclusion != "skipped") but is not counted as a success.
+//
+// Formal predicate (FC-P7): fixture["run"]["conclusion"] = "cancelled"
+// Specification reference: T-FC-035; specs/forecast-compliance-fixtures/README.md
+func TestFormal_FC_P7_CancelledRunFixture(t *testing.T) {
+	t.Parallel()
+	fixture := loadFixture(t, "run_summary_cancelled.json")
+
+	run, ok := fixture["run"].(map[string]any)
+	require.True(t, ok, "FC-P7: 'run' must be a JSON object")
+
+	conclusion, ok := run["conclusion"].(string)
+	require.True(t, ok, "FC-P7: run.conclusion must be a string")
+	assert.Equal(t, "cancelled", conclusion,
+		"FC-P7 (T-FC-035): run_summary_cancelled.json must have conclusion == \"cancelled\" "+
+			"so it is included in the sample but not counted as a Bernoulli success")
+}
+
+// TestFormal_FC_P11_PartialAICFixture verifies that run_summary_partial_aic.json
+// represents an in-progress run with a non-zero token usage snapshot.
+//
+// Specification reference: T-FC-024; specs/forecast-compliance-fixtures/README.md
+func TestFormal_FC_P11_PartialAICFixture(t *testing.T) {
+	t.Parallel()
+	fixture := loadFixture(t, "run_summary_partial_aic.json")
+
+	run, ok := fixture["run"].(map[string]any)
+	require.True(t, ok, "FC-P11: 'run' must be a JSON object")
+	assert.Equal(t, "in_progress", run["status"],
+		"FC-P11 (T-FC-024): partial fixture must represent an in-progress run")
+
+	usage, ok := fixture["token_usage_summary"].(map[string]any)
+	require.True(t, ok, "FC-P11: token_usage_summary must be a JSON object")
+	aic, ok := usage["total_aic"].(float64)
+	require.True(t, ok, "FC-P11: total_aic must be a number")
+	assert.Greater(t, aic, 0.0,
+		"FC-P11 (T-FC-024): partial fixture must contain a non-zero token usage snapshot")
+}
+
 // TestFormal_FC_P8_RunSummaryRoundTrip verifies that marshalling a RunSummary to
 // JSON and unmarshalling it back produces an equal value (cache-hit determinism).
 //
 // Formal predicate (FC-P8): unmarshal(marshal(rs)) = rs
 // Specification reference: §8.1 Cache Round-trip Invariant
 func TestFormal_FC_P8_RunSummaryRoundTrip(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	start := time.Date(2026, 5, 1, 11, 0, 5, 0, time.UTC)
 	updated := time.Date(2026, 5, 1, 11, 5, 35, 0, time.UTC)
@@ -497,14 +563,16 @@ func TestFormal_FC_P8_RunSummaryRoundTrip(t *testing.T) {
 		CLIVersion:  "0.0.0-test",
 		RunID:       12345678,
 		ProcessedAt: now,
-		Run: WorkflowRun{
-			DatabaseID: 12345678,
-			Conclusion: "success",
-			StartedAt:  start,
-			UpdatedAt:  updated,
+		RunAnalysis: RunAnalysis{
+			Run: WorkflowRun{
+				DatabaseID: 12345678,
+				Conclusion: "success",
+				StartedAt:  start,
+				UpdatedAt:  updated,
+			},
+			JobDetails: []JobInfoWithDuration{},
 		},
 		ArtifactsList: []string{},
-		JobDetails:    []JobInfoWithDuration{},
 	}
 
 	data, err := json.Marshal(original)
@@ -528,39 +596,39 @@ func TestFormal_FC_P8_RunSummaryRoundTrip(t *testing.T) {
 		"FC-P8: Run.UpdatedAt must survive round-trip")
 }
 
-// TestFormal_FC_P9_TimestampOrdering verifies that run_started_at <= updated_at
+// TestFormal_FC_P9_TimestampOrdering verifies that StartedAt <= UpdatedAt
 // in every fixture (TLA+ ordering invariant).
 //
-// Formal predicate (FC-P9): ∀f ∈ Fixtures: f["run"]["run_started_at"] ≤ f["run"]["updated_at"]
+// Formal predicate (FC-P9): ∀f ∈ Fixtures: f.Run.StartedAt ≤ f.Run.UpdatedAt
 // Specification reference: §6.2.2 Duration Derivation
 func TestFormal_FC_P9_TimestampOrdering(t *testing.T) {
+	t.Parallel()
 	fixtures := []string{
 		"run_summary_minimal.json",
-		"run_summary_zero_et.json",
+		"run_summary_zero_aic.json",
 		"run_summary_failed.json",
-		"run_summary_high_et.json",
+		"run_summary_high_aic.json",
+		"run_summary_cancelled.json",
+		"run_summary_partial_aic.json",
 	}
 
 	for _, name := range fixtures {
 		t.Run(name, func(t *testing.T) {
-			fixture := loadFixture(t, name)
+			t.Parallel()
+			data, err := os.ReadFile(filepath.Join(fixtureDir(t), name))
+			require.NoError(t, err, "FC-P9: fixture file %q must be readable", name)
 
-			run, ok := fixture["run"].(map[string]any)
-			require.True(t, ok, "FC-P9: 'run' must be a JSON object in %s", name)
+			var summary RunSummary
+			require.NoError(t, json.Unmarshal(data, &summary),
+				"FC-P9: fixture file %q must unmarshal as RunSummary", name)
+			require.False(t, summary.Run.StartedAt.IsZero(),
+				"FC-P9: run.startedAt must populate RunSummary.Run.StartedAt in %s", name)
+			require.False(t, summary.Run.UpdatedAt.IsZero(),
+				"FC-P9: run.updatedAt must populate RunSummary.Run.UpdatedAt in %s", name)
 
-			startedStr, ok := run["run_started_at"].(string)
-			require.True(t, ok, "FC-P9: run.run_started_at must be a string in %s", name)
-			updatedStr, ok := run["updated_at"].(string)
-			require.True(t, ok, "FC-P9: run.updated_at must be a string in %s", name)
-
-			started, err := time.Parse(time.RFC3339, startedStr)
-			require.NoError(t, err, "FC-P9: run_started_at must parse as RFC3339 in %s", name)
-			updated, err := time.Parse(time.RFC3339, updatedStr)
-			require.NoError(t, err, "FC-P9: updated_at must parse as RFC3339 in %s", name)
-
-			assert.False(t, started.After(updated),
-				"FC-P9: run_started_at (%s) must be <= updated_at (%s) in %s",
-				startedStr, updatedStr, name)
+			assert.False(t, summary.Run.StartedAt.After(summary.Run.UpdatedAt),
+				"FC-P9: StartedAt (%s) must be <= UpdatedAt (%s) in %s",
+				summary.Run.StartedAt, summary.Run.UpdatedAt, name)
 		})
 	}
 }
@@ -573,6 +641,7 @@ func TestFormal_FC_P9_TimestampOrdering(t *testing.T) {
 // Formal predicate (FC-P10): ∀f ∈ Fixtures: MCInputs(f) are present and well-formed
 // Specification reference: §7 Monte Carlo Engine; R-MC-020, R-MC-021
 func TestFormal_FC_P10_MonteCarloInputCompleteness(t *testing.T) {
+	t.Parallel()
 	type fixtureExpectation struct {
 		name           string
 		wantConclusion string
@@ -581,13 +650,16 @@ func TestFormal_FC_P10_MonteCarloInputCompleteness(t *testing.T) {
 
 	cases := []fixtureExpectation{
 		{name: "run_summary_minimal.json", wantConclusion: "success", aicMustBeGT0: true},
-		{name: "run_summary_zero_et.json", wantConclusion: "success", aicMustBeGT0: false},
+		{name: "run_summary_zero_aic.json", wantConclusion: "success", aicMustBeGT0: false},
 		{name: "run_summary_failed.json", wantConclusion: "failure", aicMustBeGT0: false},
-		{name: "run_summary_high_et.json", wantConclusion: "success", aicMustBeGT0: true},
+		{name: "run_summary_high_aic.json", wantConclusion: "success", aicMustBeGT0: true},
+		{name: "run_summary_cancelled.json", wantConclusion: "cancelled", aicMustBeGT0: false},
+		{name: "run_summary_partial_aic.json", wantConclusion: "", aicMustBeGT0: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			fixturePath := filepath.Join(fixtureDir(t), tc.name)
 			if _, err := os.Stat(fixturePath); os.IsNotExist(err) {
 				t.Skipf("FC-P10: fixture %s not present on disk — skipping", tc.name)
@@ -626,5 +698,73 @@ func TestFormal_FC_P10_MonteCarloInputCompleteness(t *testing.T) {
 					"FC-P10: total_aic must be > 0 in %s (run is expected to contribute to MC sample)", tc.name)
 			}
 		})
+	}
+}
+
+// documentedForecastFixtures mirrors the baseline fixture ("Fixture Files" section)
+// plus the "Available Additional Fixtures" table in
+// specs/forecast-compliance-fixtures/README.md. This list MUST be kept in sync with
+// the JSON files present in the fixture directory; a mismatch signals that the
+// README, the fixture directory, or this test has drifted out of sync.
+var documentedForecastFixtures = []string{
+	"run_summary_minimal.json",
+	"run_summary_zero_aic.json",
+	"run_summary_failed.json",
+	"run_summary_high_aic.json",
+	"run_summary_cancelled.json",
+	"run_summary_partial_aic.json",
+}
+
+// TestFormal_FixtureCountConsistency verifies that the fixture files documented in
+// specs/forecast-compliance-fixtures/README.md exactly match the `.json` files
+// present in the fixture directory, so the README table cannot silently drift from
+// the fixtures actually exercised by the tests above.
+func TestFormal_FixtureCountConsistency(t *testing.T) {
+	t.Parallel()
+	dir := fixtureDir(t)
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err, "failed to read forecast compliance fixture directory")
+
+	var onDisk []string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		onDisk = append(onDisk, entry.Name())
+	}
+
+	documented := append([]string(nil), documentedForecastFixtures...)
+	sort.Strings(documented)
+	sort.Strings(onDisk)
+
+	assert.Equal(t, documented, onDisk,
+		"fixture files on disk in %s must match the README's documented fixture list exactly "+
+			"(update both the README and documentedForecastFixtures when fixtures change)",
+		dir)
+}
+
+// TestFormal_ForecastSpecSyncNoteAnchorsExist mechanically verifies the anchors
+// referenced by the README's "Sync note" (§12.1.3 Data Sampling Tests and §12.1.4
+// Monte Carlo Engine Tests) still exist in the forecast specification. If either
+// heading moves or is renamed, this test fails so the sync note in
+// specs/forecast-compliance-fixtures/README.md cannot silently drift out of date.
+func TestFormal_ForecastSpecSyncNoteAnchorsExist(t *testing.T) {
+	t.Parallel()
+	_, thisFile, _, ok := runtime.Caller(0)
+	require.True(t, ok, "runtime.Caller must return a valid file path")
+	specPath := filepath.Join(filepath.Dir(thisFile), "..", "..", "docs", "src", "content", "docs", "specs", "forecast-specification.md")
+
+	data, err := os.ReadFile(specPath)
+	require.NoError(t, err, "forecast specification must be readable at %s", specPath)
+	spec := string(data)
+
+	for _, anchor := range []string{
+		"#### 12.1.3 Data Sampling Tests",
+		"#### 12.1.4 Monte Carlo Engine Tests",
+	} {
+		assert.Contains(t, spec, anchor,
+			"forecast-specification.md must still contain heading %q referenced by the "+
+				"Sync note in specs/forecast-compliance-fixtures/README.md; update the sync note "+
+				"if this heading moved or was renamed", anchor)
 	}
 }

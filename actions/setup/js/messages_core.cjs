@@ -39,11 +39,10 @@ const fs = require("fs");
  * @property {string} [runStarted] - Custom workflow activation message template
  * @property {string} [runSuccess] - Custom workflow success message template
  * @property {string} [runFailure] - Custom workflow failure message template
- * @property {string} [detectionFailure] - Custom detection job failure message template
+ * @property {string} [detectionFailure] - Custom detection job failure message template. Placeholders: {workflow_name}, {run_url}, {reason_text}, {threat_kinds}
  * @property {string} [pullRequestCreated] - Custom template for pull request creation link. Placeholders: {item_number}, {item_url}
  * @property {string} [issueCreated] - Custom template for issue creation link. Placeholders: {item_number}, {item_url}
  * @property {string} [commitPushed] - Custom template for commit push link. Placeholders: {commit_sha}, {short_sha}, {commit_url}
- * @property {string} [detectionWarning] - Custom detection warning message template (continue-on-error mode). Placeholders: {workflow_name}, {run_url}, {reason_text}
  * @property {string} [agentFailureIssue] - Custom footer template for agent failure tracking issues
  * @property {string} [agentFailureComment] - Custom footer template for comments on agent failure tracking issues
  * @property {string} [closeOlderDiscussion] - Custom message for closing older discussions as outdated
@@ -143,7 +142,7 @@ function renderTemplateFromFile(templatePath, context) {
   try {
     template = fs.readFileSync(templatePath, "utf8");
   } catch (err) {
-    throw new Error(`Failed to read file ${templatePath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
   }
   return renderTemplate(template, context);
 }
@@ -219,6 +218,33 @@ function buildProtectedFileList(files, githubServer, owner, repo, branch) {
     .join("\n");
 }
 
+/**
+ * @param {string[]} files
+ * @param {string} githubServer
+ * @param {string} owner
+ * @param {string} repo
+ * @param {string} branch
+ * @returns {import("./report_ast.cjs").ReportBlock[]}
+ */
+function buildProtectedFileBlocks(files, githubServer, owner, repo, branch) {
+  return [
+    {
+      type: "list",
+      ordered: false,
+      agentTainted: false,
+      items: files.map(file => [
+        {
+          type: "paragraph",
+          agentTainted: false,
+          children: file.includes("/")
+            ? [{ type: "link", url: `${githubServer}/${owner}/${repo}/blob/${encodePathSegments(branch)}/${encodePathSegments(file)}`, children: [{ type: "text", value: file, agentTainted: true }], agentTainted: false }]
+            : [{ type: "code", value: file, agentTainted: true }],
+        },
+      ]),
+    },
+  ];
+}
+
 module.exports = {
   getMessages,
   getPromptPath,
@@ -228,4 +254,5 @@ module.exports = {
   toSnakeCase,
   encodePathSegments,
   buildProtectedFileList,
+  buildProtectedFileBlocks,
 };

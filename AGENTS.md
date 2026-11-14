@@ -2,34 +2,31 @@
 
 GitHub Agentic Workflows (`gh-aw`) is a GitHub CLI extension that compiles markdown workflows into GitHub Actions.
 
-## Important Note: gh-aw vs GitHub Copilot CLI
+## CLI boundary
 
 - **gh-aw** is the `gh aw` CLI extension.
 - **copilot** is a separate CLI used as one possible runtime engine.
 - Use `gh aw` commands for workflow authoring/compilation (`gh aw compile`, `gh aw run`, `gh aw audit`).
 
-## Ambient Context (First Invocation)
+## Ambient context
 
-To keep first-turn context small, only these repository root instruction files should be considered ambient:
-
-| File | Purpose |
-|---|---|
-| `AGENTS.md` | Minimal global operating rules and routing |
-| `SKILL.md` | Short repository capability summary |
-
-Everything else should be loaded **lazily** through skills only when needed.
+Load only `AGENTS.md` (rules/routing) and `SKILL.md` (capabilities) initially.
+Load task-specific guidance lazily through local skills.
 
 ## Critical Rules (Always Applicable)
 
-1. If you changed files, use `report_progress` to commit and push.
+1. If you changed files, use `report_progress` to commit and push if available; otherwise, use Git directly after the same validation gates.
 2. Before **intermediate** `report_progress` calls, run `make agent-report-progress-no-test` (fast, no tests). Before the **final** `report_progress`, run `make agent-report-progress` (includes `test-unit`).
    - `test-unit` is impacted-first by default (~30s target). Use `TEST_UNIT_RUN_FULL=1 make test-unit` or `make test-unit-all` when full-suite coverage is required.
    - Run `test-unit` only once per PR — at the final push, not on every intermediate save.
 3. After Go changes, run `make fmt`.
 4. After workflow markdown changes (`.md` under `.github/workflows/`), run `make recompile`.
 5. Do not add `.lock.yml` files to `.gitignore`.
-6. Never attempt to trigger a workflow run (e.g., `gh run`, `gh aw run`) as part of a Copilot cloud agent run. The token does not have the required access. Always fail with an error — do not task the user or ask them to run it manually.
+6. Copilot cloud agents may dispatch a workflow only when the user explicitly requests a dry-run test and the exact published source and lock revision has passed the review, compilation, and live-execution gates in `.github/aw/debug-agentic-workflow.md`. Compile with `--dry-run` and dispatch that reviewed revision; compilation alone does not start a run, and dispatch alone does not enable dry-run protections. Dry-run suppresses compiler-managed mutations, not arbitrary script effects. Non-dry-run dispatch remains prohibited. On an authorization error, stop and report it; never retry with different credentials, bypass protections, or ask the user to run it manually.
 7. **Large-file guard**: before reading any file with `github-mcp-server-get_file_contents`, check its size. Files larger than 20 KB must be read with targeted tools (`grep`, `glob`, `bash`, or `view` with `view_range`) instead of full-file reads. See [token-optimization.md](.github/aw/token-optimization.md) for the full technique.
+8. Execute plans without confirmation. In autopilot, act autonomously; never ask "Should I proceed?" or equivalent.
+9. **Instruction packing**: Copilot CLI prompt-file queries may expose only the first **8,000 UTF-8 bytes**, including metadata. Keep objective, mandatory constraints, task routes, verification and stop conditions within **7,500 bytes**. Put examples/detail afterward with early links. Use short, explicit imperatives; preserve semantics, safety and failure behavior. Follow `.github/skills/prompt-token-efficiency/SKILL.md`; run `make check-instruction-prefixes` for maintained entry points.
+10. **Grading contract**: Follow `.github/skills/operational-value-designer/SKILL.md`. Built-ins compute over the in-memory unified session in conclusion; custom `graders.<distinct-id>.script` JavaScript and repository-owned `graders.operational-value.run` Bash run only in the separate graders job. Bash reads session JSONL from `$1` / `GH_AW_SESSION_FILE`, config JSON from `GH_AW_GRADER_CONFIG`, and returns legacy metric arrays; detected file writes are rejected. Shell is trusted code, not yet microVM-isolated. Never add user code or steps to conclusion. Adopt workflow semantics and grader acceptance rules together at the same workflow path and commit; corrections are prospective and prior results are never rewritten.
 
 ## Upstream-managed workflow sources (read-only in this repo)
 
@@ -46,74 +43,47 @@ Workflows that declare a `source:` frontmatter entry (for example `source: githu
 
 Use skills only when the task requires specialized guidance. Do not pre-load every skill.
 
-When the relevant skill is not obvious, first discover candidates and then load only the minimal guidance needed:
+All skills are local to this repository under `.github/skills/`. **NEVER** use GitHub Agent Finder (`agentfinder.github.com`) or any other remote skill discovery service to look for skills.
 
-- Query GitHub Agent Finder directly with the built-in REST API at `https://agentfinder.github.com/api/v1/search`.
-- Send an ARD search request with the user's task in `query.text`; do not ask the user for the endpoint.
+When the relevant skill is not obvious, first discover candidates locally and then load only the minimal guidance needed:
+
+- Discover skills by listing or searching `.github/skills/*/SKILL.md` in this repository.
 - Use **skill fusion** after discovery: read only the specific skill sections or fragments needed instead of loading full skills broadly.
 
-### Use these skills by intent
+### Skill routes
 
-- Workflow create/update/debug/upgrade tasks → `.github/skills/agentic-workflows/SKILL.md`
-- Core engineering conventions, validation flow, and command playbooks → `.github/skills/developer/SKILL.md`
-- Error handling design/patterns → `.github/skills/error-recovery-patterns/SKILL.md`
-- GitHub MCP usage patterns → `.github/skills/github-mcp-server/SKILL.md`
-- Query helpers for issues/PRs/workflows/discussions/labels → matching `.github/skills/github-*-query/SKILL.md`
-- Doc-writing conventions → `.github/skills/documentation/SKILL.md`
-- Reviewing or writing `git`/`gh`/remote operations against checkouts (per-checkout credentials, sparse/shallow monorepos, safe-outputs MCP runs without credentials) → `.github/skills/checkout-credential-review/SKILL.md`
-- Authoring, validating, or debugging canvas extensions (loopback servers, actions, iframe rendering, state model, theme tokens) → `.github/skills/create-canvas/SKILL.md`
+Paths below are relative to `.github/skills/`; load only the matching `SKILL.md`.
 
-## Debugging & Logging
-
-The Go codebase uses a namespace-based debug logger (`pkg/logger`) modelled after the [debug npm package](https://www.npmjs.com/package/debug). All debug output goes to **stderr** and is gated by the `DEBUG` environment variable.
-
-### Enable logging for a `gh aw` run
-
-```bash
-# All namespaces (most verbose)
-DEBUG=* gh aw compile workflow.md
-
-# Only CLI-layer namespaces
-DEBUG=cli:* gh aw compile workflow.md
-
-# Specific namespaces
-DEBUG=cli:run_workflow_execution,cli:retry gh aw run workflow.md
-
-# All except one namespace
-DEBUG=*,-cli:ci gh aw compile workflow.md
-
-# Disable colors (useful when capturing logs to a file)
-DEBUG_COLORS=0 DEBUG=* gh aw compile workflow.md 2>debug.log
-```
-
-### Key namespaces
-
-| Pattern | What it covers |
+| Task | Skill directory |
 |---|---|
-| `cli:*` | All CLI command implementations (`pkg/cli/`) |
-| `workflow:*` | Workflow compiler and related logic |
-| `parser:*` | Frontmatter / markdown parsing |
-| `mcp:*` | MCP gateway and server interactions |
-| `agentdrain:*` | Agent drain / log mining pipeline |
-| `repoutil:*` | Git/repo utility helpers |
-| `*` | Everything |
+| Workflow create/update/debug/upgrade | `agentic-workflows` |
+| Engineering conventions and validation commands | `developer` |
+| Code organization, WASM stubs, string patterns | `developer-code-organization` |
+| Template injection, shell safety, supply chain | `developer-security` |
+| Compiler, validation, safe outputs, schemas, MCP logs | `developer-internals` |
+| Declarative engines | `custom-engine-implementation` |
+| Releases, breaking CLI changes, firewall logs | `developer-release` |
+| Error handling/recovery | `error-recovery-patterns` |
+| GitHub MCP usage | `github-mcp-server` |
+| Issue/PR/workflow/discussion/label queries | matching `github-*-query` |
+| Workflow review: compile/scans/audit/optimization | `review-agentic-workflows` |
+| Documentation | `documentation` |
+| Issue/comment/review Markdown | `issue-markdown` |
+| Docs-site layout, spacing, colour, navigation | `docs-design` |
+| Cracktro talk deck (`docs/public/cracktro/`) | `cracktro` |
+| Git/gh checkout operations: credentials, sparse/shallow, credential-free MCP | `checkout-credential-review` |
+| Canvas extensions: actions, inputs, rendering, state, themes | `create-canvas` |
+| Instruction/skill wording and 8,000-byte prefix packing | `prompt-token-efficiency` |
 
-To discover the exact namespace for a package, look for `logger.New(...)` at the top of the relevant `.go` file (e.g. `var log = logger.New("cli:run_workflow_execution")`).
+## Debugging and logging
 
-### GitHub Actions debug runs
+Use `pkg/logger`, never `fmt.Println`, `log.Printf` or ad hoc debug output.
+Declare a package-scope `logger.New("cli:my_package")`; call
+`log.Debug("operation", "key", value)` with structured key/value pairs.
+Match existing namespaces: `cli:`, `workflow:`, `parser:`, `mcp:`, `agentdrain:`,
+`repoutil:`. Find the exact namespace in the file's `logger.New(...)`.
 
-When `ACTIONS_RUNNER_DEBUG=true` is set (enabled automatically on re-run with debug logging in the GitHub UI), all loggers are activated — equivalent to `DEBUG=*`. No extra configuration is needed.
-
-### Output format
-
-Each line shows: **namespace** (coloured in the terminal), **message**, and **+elapsed** time since the previous log in that namespace.
-
-```
-cli:run_workflow_execution Starting run +0ms
-cli:retry Retrying request attempt=2 +125ms
-cli:run_workflow_execution Run complete +2.5s
-```
-
-## Why this file is intentionally short
-
-This file is loaded at first invocation and affects every task. Keep it concise and move detailed or domain-specific guidance into skills so that context is fetched only when relevant.
+Output goes to stderr, gated by `DEBUG`, as namespace, message and elapsed time.
+Use `DEBUG=*` for all, `DEBUG=cli:*` for CLI, comma-separated namespaces for a
+subset, or `DEBUG=*,-cli:ci` to exclude one. Set `DEBUG_COLORS=0` when capturing.
+`ACTIONS_RUNNER_DEBUG=true` enables all loggers automatically.

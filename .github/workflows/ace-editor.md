@@ -10,6 +10,10 @@ on:
     events: [pull_request_comment]
 max-daily-ai-credits: 10000
 timeout-minutes: 10
+engine:
+  id: codex
+  model-provider: github
+model: copilot/gpt-6.1-sol
 strict: false
 permissions:
   pull-requests: read
@@ -18,7 +22,6 @@ jobs:
   post_ace_link:
     runs-on: ubuntu-latest
     needs: [activation]
-    if: needs.activation.outputs.activated == 'true'
     permissions:
       pull-requests: write
       issues: write
@@ -42,9 +45,7 @@ jobs:
             });
 imports:
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
+  - shared/graders.md
 tools:
   cli-proxy: true
 evals:
@@ -52,6 +53,7 @@ evals:
     question: Did the agent generate an ACE editor session link in response to the /ace command?
   - id: comment_posted
     question: Was a comment posted to the pull request with the ACE editor link?
+
 ---
 
 Classic action that generates an ACE editor session link on pull request comment slash command.

@@ -1,30 +1,30 @@
 ---
 title: Safe Output Outcome Evaluation Specification
-version: 1.0.0
+version: 1.0.4
 status: Working Draft
 date: 2026-05-15
-last_updated: 2026-05-16
+last_updated: 2026-11-05
 ---
 
 # Safe Output Outcome Evaluation Specification
 
-Every safe output type has a measurable outcome. This spec defines the exact evaluation logic for each type: what to check, how to classify the outcome, and what OTel attributes to emit.
+Every safe output type has a measurable outcome. This spec defines the evaluation logic for each type and the attribute contract for optional downstream OTel export. Production evaluation runs through `gh aw logs --outcomes`, including episode collection; the CLI emits JSON and optional JSONL, not outcome OTel spans.
 
 ## Principles
 
 1. **Same as a repository observer would check.** If this action happened on GitHub, how would an observer decide it was good from visible repository state?
 2. **Direct Outcome Only.** We check whether the action stuck, not whether it caused downstream effects.
 3. **Bot-aware, not provenance-perfect.** Distinguish bot/app-visible closes and edits from non-bot ones, but do not assume non-bot actors are unassisted by AI.
-4. **Time-bounded.** Check outcomes after a configurable delay (default: 48 hours).
+4. **Observation-aware.** Evaluate snapshots after an appropriate observation period. Open issues and PRs remain pending; elapsed time alone is not rejection or acceptance.
 
 ## Norms
 
 The key words **MUST**, **MUST NOT**, and **SHOULD** in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119). These requirements apply to **outcome evaluation workers** as the primary conformance target unless a different conformance target is explicitly named in the requirement.
 
-1. Outcome evaluation workers **MUST** treat GitHub API `404` responses as terminal for deleted or inaccessible objects and classify according to object semantics (for example, a deleted issue/PR should be `rejected`, while a transient target with no persistent evaluable object should be `ignored`).
-2. Outcome evaluation workers **MUST** treat GitHub API `5xx` responses as transient infrastructure failures and return `pending` for that check cycle while recording retry metadata (`status_code`, `retry_after`, `attempt`).
-3. Outcome evaluation workers **MUST** treat GitHub API rate-limit responses (`403` with limit exhaustion or `429`) as transient. Outcome evaluation workers **SHOULD** reschedule evaluation using the reset window before emitting final outcomes.
-4. Outcome evaluation workers **MUST NOT** emit `accepted` or `rejected` when API failures prevent verification of the authoritative object state.
+1. A primary-object `404` for issue, PR, or comment creation is `rejected`/`strong`/`deleted`. A supplementary endpoint `404` MUST NOT imply object deletion.
+2. Other API failures return `error`/`weak`/`evaluation_error`. Failure to fetch supplementary PR effort evidence does not undo authoritative merge acceptance, but MUST prevent zero-touch proof.
+3. Evaluation workers MUST NOT infer acceptance from unavailable data. Each logs invocation with `--outcomes` checks current state; reevaluation requires a later invocation. Automatic scheduling and API-specific backoff remain outside this command.
+4. Successful API reads are reused across selected runs within a single collection, keyed by host and request arguments, including GraphQL variables and REST pagination. Paginated REST reads request 100 items per page and follow all pages. Complete labels in an issue or PR response satisfy label reads without another request. Failed requests, malformed responses, and GraphQL responses with errors are not cached. The in-memory cache never survives a collection or replaces action-specific classification.
 
 ## Provenance Limits
 
@@ -35,6 +35,7 @@ Outcome evaluation is based on observable GitHub state and actor identity, not h
 3. Outcome evaluation workers **MUST NOT** infer hidden AI assistance when GitHub exposes only a normal user identity.
 4. Metrics and fields that use `human_*` names are historical names. In this specification they mean actor-visible, non-bot activity unless explicit provenance metadata is available.
 5. Implementations **SHOULD** prefer explicit provenance markers when available, such as bot identities, GitHub App identities, trace IDs, labels, commit trailers, or other durable metadata emitted by the workflow.
+6. When GitHub surfaces an action under a GitHub App or bot identity (including app-token API writes performed on behalf of a human), outcome evaluation workers **MUST** classify that action as bot/app activity for `human_*` fields unless separate durable provenance metadata explicitly identifies a visible non-bot actor.
 
 ## Outcome Categories
 
@@ -44,19 +45,44 @@ Every evaluation produces one of these outcomes:
 |---------|---------|
 | `accepted` | The action was kept, merged, resolved, or engaged with |
 | `rejected` | The action was undone, closed-as-not-planned, removed, or reverted |
-| `ignored` | No observable non-bot interaction within the evaluation window |
+| `ignored` | An action reached a state without its expected effect |
 | `pending` | The object has not reached a terminal state yet |
 | `lifecycle` | Closed/removed by the workflow itself (e.g., `close-older-issues`) — not a rejection |
 | `lifecycle_close` | Closed by lifecycle/noop bot policy and not reopened by a visible non-bot actor |
+| `unknown` | Missing execution evidence, unsupported evaluator, or no action-specific observable signal |
+| `error` | API or evaluation failure prevented verification |
+
+### CLI conformance
+
+The Go CLI executes the cases in `pkg/cli/testdata/outcome_conformance.json`.
+The normalized triple `outcome_status`, `evidence_strength`, and `signal` is
+authoritative; downstream reports and telemetry MUST preserve it instead of
+reinterpreting display text. There is no separate JavaScript evaluator.
+
+Creation of a PR is accepted only after merge. Creation of an issue is accepted
+only when closed as `completed`; an open issue remains pending even when engaged.
+Non-bot follow-up requires a visible actor identity and activity after the action.
+Reactions and non-bot comment follow-up are medium evidence, not proof of causal
+impact. Label and milestone retention MUST verify the recorded mutation or
+identity, not merely that some labels or milestone exist. A submitted review
+requires its recorded review ID; arbitrary later reviews and unverified team
+membership MUST NOT establish acceptance.
+
+Unsupported evaluators return `unknown`/`none`/`unsupported_evaluator`.
+Generic target existence returns `unknown`/`weak`/`target_exists_only`.
+Unknown, error, and lifecycle counts MUST be included in summaries.
+Zero-touch acceptance requires available comment, review, and commit evidence;
+missing evidence MUST NOT default to zero human effort.
 
 ## Common OTel Attributes
 
-Every outcome span carries these attributes:
+An optional downstream exporter maps CLI evaluation records to these attributes.
+Built-in workflow telemetry does not emit outcome spans.
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `gh-aw.outcome.type` | string | Safe output type (e.g., `create_pull_request`) |
-| `gh-aw.outcome.result` | string | One of: `accepted`, `rejected`, `ignored`, `pending`, `lifecycle`, `lifecycle_close` |
+| `gh-aw.outcome.result` | string | Normalized outcome, including `unknown`, `error`, and skipped metadata outputs |
 | `gh-aw.outcome.object_url` | string | GitHub URL of the affected object |
 | `gh-aw.outcome.object_number` | int | Issue/PR/discussion number |
 | `gh-aw.outcome.repo` | string | `owner/repo` |
@@ -74,9 +100,13 @@ Every outcome span carries these attributes:
 The following implementation areas are responsible for evaluation data capture, outcome classification plumbing, and runtime event artifacts.
 
 Status meanings:
-- `implemented`: dedicated evaluator logic exists in both Go and JS.
-- `partial`: dedicated evaluator exists in one runtime; the other relies on generic fallback logic.
+- `implemented`: dedicated evaluator logic exists in the Go CLI.
+- `partial`: the Go CLI implements only part of the specified evidence contract.
 - `not-started`: no dedicated evaluator exists yet; current behavior is generic/no-op only.
+
+### Entities and Structure
+
+Each numbered section evaluates one safe-output entity: the GitHub object or workflow-execution record named immediately below its heading. Its evaluator is the Go function registered for that output type in `pkg/cli/outcome_eval.go`; `evalGenericSticky` is the explicit generic fallback, and `noop`/`missing_tool` are skipped without evaluation. The section entries below identify the entity and evaluator, including unsupported evaluators whose current result is `unknown`.
 
 ### Current Default Acceptance Map
 
@@ -87,72 +117,56 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 | Output type | Current evaluator | `accepted` at a glance |
 |-------------|-------------------|------------------------|
 | `create_pull_request` | `evalCreatePullRequest` | merged |
-| `create_issue` | `evalCreateIssue` | completed/closed |
+| `create_issue` | `evalCreateIssue` | closed as completed |
 | `add_comment` | `evalAddComment` | reacted to or replied to |
-| `add_labels` | `evalAddLabels` | label retention |
-| `add_reviewer` | dedicated review-request evaluator | reviewer acted or request remained/was removed |
+| `add_labels` | `evalAddLabels` | recorded added-label delta retained |
+| `add_reviewer` | dedicated review-request evaluator | recorded reviewer submitted a review |
 | `update_issue` | dedicated retained-update evaluator | intended edit still matches current issue state |
 | `update_pull_request` | dedicated retained-update evaluator | intended edit still matches current PR state |
-| `close_issue` | `evalCloseSticky` | still closed |
-| `close_pull_request` | `evalCloseSticky` | still closed |
+| `close_issue` | `evalCloseSticky` | retained visible non-bot close |
+| `close_pull_request` | `evalCloseSticky` | retained visible non-bot close, unmerged |
 | `close_discussion` | `evalCloseDiscussion` | none yet |
 | `create_discussion` | `evalCreateDiscussion` | none yet |
 | `update_discussion` | `evalUpdateDiscussion` | none yet (pending GraphQL) |
 | `create_pull_request_review_comment` | `evalReviewComment` | none yet |
 | `submit_pull_request_review` | dedicated review evaluator | review affected PR lifecycle |
-| `reply_to_pull_request_review_comment` | `evalGenericSticky` fallback | review target exists |
+| `reply_to_pull_request_review_comment` | `evalGenericSticky` fallback | none; existence is weak unknown |
 | `resolve_pull_request_review_thread` | `evalResolveThread` | none yet |
-| `push_to_pull_request_branch` | `evalPushToPRBranch` | merged |
+| `push_to_pull_request_branch` | `evalPushToPRBranch` | recorded commits verified in merged history |
 | `mark_pull_request_as_ready_for_review` | `evalMarkReady` | reviewed |
-| `assign_to_agent` | `evalAssignToAgent` | merged or completed |
+| `assign_to_agent` | `evalAssignToAgent` | attributable post-assignment agent PR merged |
 | `dispatch_workflow` | `evalDispatchWorkflow` | workflow run completed with success |
-| `autofix_code_scanning_alert` | `evalGenericSticky` fallback | alert target exists |
-| `create_code_scanning_alert` | `evalGenericSticky` fallback | alert target exists |
-| `link_sub_issue` | `evalGenericSticky` fallback | sub-issue link target exists |
+| `autofix_code_scanning_alert` | `evalGenericSticky` fallback | none; existence is weak unknown |
+| `create_code_scanning_alert` | `evalGenericSticky` fallback | none; existence is weak unknown |
+| `link_sub_issue` | `evalGenericSticky` fallback | none; existence is weak unknown |
 | `hide_comment` | `evalHideComment` | none yet |
-| `assign_milestone` | `evalAssignMilestone` | milestone still set |
+| `assign_milestone` | `evalAssignMilestone` | recorded milestone identity retained |
 | `replace_label` | `evalReplaceLabel` | label replacement retained |
-| `update_project` | `evalGenericSticky` fallback | object still exists |
-| `update_release` | `evalGenericSticky` fallback | object still exists |
+| `update_project` | `evalGenericSticky` fallback | none; existence is weak unknown |
+| `update_release` | `evalGenericSticky` fallback | none; existence is weak unknown |
 | `noop` | explicit skip | skipped |
 | `missing_tool` | explicit skip | skipped |
 
-| Output type | Implementation status | Go implementation areas | JS/runtime implementation areas |
-|-------------|------------------------|--------------------------|---------------------------------|
-| `create_pull_request` | implemented | `pkg/workflow/safe_outputs_config.go`, `pkg/workflow/compiler_safe_outputs.go`, `pkg/cli/outcome_eval.go` (`evalCreatePullRequest`) | `actions/setup/js/safe_outputs_handlers.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (PR-specific path) |
-| `create_issue` | implemented | `pkg/workflow/safe_outputs_config.go`, `pkg/workflow/compiler_safe_outputs.go`, `pkg/cli/outcome_eval.go` (`evalCreateIssue`) | `actions/setup/js/safe_outputs_handlers.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (issue-specific path) |
-| `add_comment` | implemented | `pkg/workflow/safe_outputs_dispatch.go`, `pkg/cli/outcome_eval.go` (`evalAddComment`) | `actions/setup/js/safe_outputs_handlers.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (issue-comment URL path) |
-| `add_labels` | partial | `pkg/workflow/safe_outputs_allowed_labels_validation.go`, `pkg/cli/outcome_eval.go` (`evalAddLabels`) | `actions/setup/js/safe_outputs_handlers.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (`evaluateAddLabels`) |
-| `add_reviewer` | implemented | `pkg/workflow/add_reviewer.go`, `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval_review.go` | `actions/setup/js/add_reviewer.cjs`, `actions/setup/js/evaluate_outcomes.cjs` |
-| `update_issue` | implemented | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval_update.go` | `actions/setup/js/update_issue.cjs`, `actions/setup/js/evaluate_outcomes.cjs` |
-| `update_pull_request` | implemented | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval_update.go` | `actions/setup/js/update_pull_request.cjs`, `actions/setup/js/evaluate_outcomes.cjs` |
-| `close_issue` | partial | `pkg/workflow/safe_outputs_dispatch.go`, `pkg/cli/outcome_eval.go` (`evalCloseSticky`) | `actions/setup/js/close_issue.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (`evaluateCloseIssue`) |
-| `close_pull_request` | partial | `pkg/workflow/safe_outputs_dispatch.go`, `pkg/cli/outcome_eval.go` (`evalCloseSticky`) | `actions/setup/js/close_pull_request.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (`evaluateClosePullRequest`) |
-| `close_discussion` | implemented | `pkg/workflow/safe_outputs_dispatch.go`, `pkg/cli/outcome_eval.go` (`evalCloseDiscussion`) | `actions/setup/js/close_discussion.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (`evaluateCloseDiscussion`) |
-| `create_discussion` | implemented | `pkg/workflow/safe_outputs_dispatch.go`, `pkg/cli/outcome_eval.go` (`evalCreateDiscussion`) | `actions/setup/js/create_discussion.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (`evaluateCreateDiscussion`) |
-| `update_discussion` | partial | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval_workflow.go` (`evalUpdateDiscussion`) | `actions/setup/js/update_discussion.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `create_pull_request_review_comment` | partial | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval.go` (`evalReviewComment`) | `actions/setup/js/create_pr_review_comment.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `submit_pull_request_review` | implemented | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval_review.go` | `actions/setup/js/submit_pr_review.cjs`, `actions/setup/js/evaluate_outcomes.cjs` |
-| `reply_to_pull_request_review_comment` | not-started | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval.go` (`evalGenericSticky` fallback) | `actions/setup/js/reply_to_pr_review_comment.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `resolve_pull_request_review_thread` | partial | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval.go` (`evalResolveThread`) | `actions/setup/js/resolve_pr_review_thread.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `push_to_pull_request_branch` | implemented | `pkg/workflow/push_to_pull_request_branch_validation.go`, `pkg/cli/outcome_eval.go` (`evalPushToPRBranch`) | `actions/setup/js/push_to_pull_request_branch.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (`evaluatePushToPullRequestBranchOutcome`) |
-| `mark_pull_request_as_ready_for_review` | partial | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval.go` (`evalMarkReady`) | `actions/setup/js/mark_pull_request_as_ready_for_review.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `assign_to_agent` | partial | `pkg/workflow/safe_outputs_dispatch.go`, `pkg/cli/outcome_eval.go` (`evalAssignToAgent`) | `actions/setup/js/assign_to_agent.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `dispatch_workflow` | partial | `pkg/workflow/dispatch_workflow.go`, `pkg/cli/outcome_eval_workflow.go` (`evalDispatchWorkflow`) | `actions/setup/js/dispatch_workflow.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `autofix_code_scanning_alert` | not-started | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval.go` (`evalGenericSticky` fallback) | `actions/setup/js/autofix_code_scanning_alert.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `create_code_scanning_alert` | not-started | `pkg/workflow/create_code_scanning_alert.go`, `pkg/cli/outcome_eval.go` (`evalGenericSticky` fallback) | `actions/setup/js/create_code_scanning_alert.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `link_sub_issue` | not-started | `pkg/workflow/link_sub_issue.go`, `pkg/cli/outcome_eval.go` (`evalGenericSticky` fallback) | `actions/setup/js/link_sub_issue.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `hide_comment` | partial | `pkg/workflow/hide_comment.go`, `pkg/cli/outcome_eval.go` (`evalHideComment`) | `actions/setup/js/hide_comment.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `assign_milestone` | partial | `pkg/workflow/assign_milestone.go`, `pkg/cli/outcome_eval.go` (`evalAssignMilestone`) | `actions/setup/js/assign_milestone.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `replace_label` | partial | `pkg/workflow/replace_label.go`, `pkg/cli/outcome_eval.go` (`evalReplaceLabel`) | `actions/setup/js/replace_label.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `update_project` | not-started | `pkg/workflow/update_project.go`, `pkg/cli/outcome_eval.go` (`evalGenericSticky` fallback) | `actions/setup/js/update_project.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `update_release` | not-started | `pkg/workflow/safe_outputs_config.go`, `pkg/cli/outcome_eval.go` (`evalGenericSticky` fallback) | `actions/setup/js/update_release.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (generic fallback) |
-| `noop` | implemented | `pkg/cli/outcome_eval.go` (explicit skip in `EvaluateOutcomes`) | `actions/setup/js/evaluate_outcomes.cjs` (`NOOP_TYPES`) |
-| `missing_tool` | implemented | `pkg/cli/outcome_eval.go` (explicit skip in `EvaluateOutcomes`) | `actions/setup/js/missing_tool.cjs`, `actions/setup/js/evaluate_outcomes.cjs` (`NOOP_TYPES`) |
+### Implementation locations
+
+The Go dispatcher is `pkg/cli/outcome_eval.go`; dedicated evaluators are split
+across `outcome_eval_{pr,issue,comment,label,generic,agent,review,update,workflow}.go`.
+Common actor and evidence helpers live in `outcome_eval_evidence.go`.
+
+Discussion, review-thread, review-comment creation, and comment-hiding
+evaluators remain unsupported. Fallback outputs have no implemented acceptance
+rule. Workflow handlers record execution evidence in the safe-output manifest;
+only logs with `--outcomes` evaluates that evidence against later GitHub state.
+The impact report projects CLI JSON without implementing classification rules.
+Per-run AIC per accepted outcome is available in outcomes summaries. Logs with
+`--outcomes` also joins observations to the selected episodes, retaining partial
+coverage qualifications. Per-item cost attribution remains separate work.
 
 ---
 
 ## 1. `create_pull_request`
+
+**Entity:** Pull request. **Evaluator:** `evalCreatePullRequest`.
 
 **Question:** Was the PR merged?
 
@@ -167,23 +181,25 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 | `state == "open"` | `pending` |
 
 **Extra signals:**
-- `human_edits`: historical field name; count actor-visible non-bot commits pushed by users other than the PR author after creation
+- `human_edits`: historical field name; count all actor-visible non-bot commits after the action, including commits by the PR author
 - `human_comments`: historical field name; count actor-visible non-bot comments on the PR
-- `zero_touch`: `accepted` and `human_edits == 0`, meaning no actor-visible non-bot follow-up
+- `zero_touch`: accepted with complete supplementary evidence and no post-action visible non-bot comments, submitted reviews, or edits
 - `time_to_outcome_hours`: `merged_at - created_at` or `closed_at - created_at`
 
 **Additional OTel attributes:**
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `ghaw.outcome.pr.merged` | bool | Whether PR was merged |
-| `ghaw.outcome.pr.review_count` | int | Number of reviews submitted |
-| `ghaw.outcome.pr.additions` | int | Lines added |
-| `ghaw.outcome.pr.deletions` | int | Lines deleted |
+| `gh-aw.outcome.pr.merged` | bool | Whether PR was merged |
+| `gh-aw.outcome.pr.review_count` | int | Number of reviews submitted |
+| `gh-aw.outcome.pr.additions` | int | Lines added |
+| `gh-aw.outcome.pr.deletions` | int | Lines deleted |
 
 ---
 
 ## 2. `create_issue`
+
+**Entity:** Issue. **Evaluator:** `evalCreateIssue`.
 
 **Question:** Was the issue resolved or dismissed?
 
@@ -197,9 +213,9 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 | `state == "closed"` and `state_reason == "not_planned"` and closed by bot | `lifecycle` |
 | `state == "closed"` and `state_reason == "not_planned"` and closed by a visible non-bot actor | `rejected` |
 | `state == "open"` and has non-bot comments | `pending` (engaged) |
-| `state == "open"` and no non-bot comments | `ignored` |
+| `state == "open"` and no non-bot comments | `pending` |
 
-**Bot detection:** check the close event in `GET /repos/{owner}/{repo}/issues/{number}/timeline` — if the actor is `github-actions[bot]`, classify as `lifecycle` not `rejected`.
+**Bot detection:** check the latest close event in `GET /repos/{owner}/{repo}/issues/{number}/events`. Honor bot actor types and known bot logins; a missing actor leaves evaluation unverifiable.
 
 **Extra signals:**
 - `human_comments`: historical field name; non-bot comments
@@ -209,13 +225,15 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `ghaw.outcome.issue.state_reason` | string | `completed` or `not_planned` |
-| `ghaw.outcome.issue.closed_by` | string | Username that closed the issue |
-| `ghaw.outcome.issue.closed_by_bot` | bool | Whether a bot closed it |
+| `gh-aw.outcome.issue.state_reason` | string | `completed` or `not_planned` |
+| `gh-aw.outcome.issue.closed_by` | string | Username that closed the issue |
+| `gh-aw.outcome.issue.closed_by_bot` | bool | Whether a bot closed it |
 
 ---
 
 ## 3. `add_comment`
+
+**Entity:** Issue comment. **Evaluator:** `evalAddComment`.
 
 **Question:** Did anyone respond or react?
 
@@ -226,9 +244,9 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 | Condition | Outcome |
 |-----------|---------|
 | Comment has replies (subsequent comments referencing it) or reactions > 0 | `accepted` |
-| Comment exists, no replies, no reactions | `ignored` |
+| Comment exists, no visible non-bot follow-up, no reactions | `pending` |
 | Comment was deleted (404) | `rejected` |
-| Comment was minimized | `rejected` |
+| Minimized state | Not currently evaluated |
 
 **Extra signals:**
 - Reaction count and types
@@ -238,13 +256,15 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `ghaw.outcome.comment.reactions` | int | Total reaction count |
-| `ghaw.outcome.comment.replies` | int | Subsequent comments on same thread |
-| `ghaw.outcome.comment.minimized` | bool | Whether the comment was hidden |
+| `gh-aw.outcome.comment.reactions` | int | Total reaction count |
+| `gh-aw.outcome.comment.replies` | int | Subsequent comments on same thread |
+| `gh-aw.outcome.comment.minimized` | bool | Whether the comment was hidden |
 
 ---
 
 ## 4. `add_labels`
+
+**Entity:** Issue or pull-request label set and the recorded label delta. **Evaluator:** `evalAddLabels`.
 
 **Question:** Did the labels stick?
 
@@ -262,20 +282,21 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `ghaw.outcome.labels.added` | int | Labels the workflow added |
-| `ghaw.outcome.labels.retained` | int | Labels still present |
-| `ghaw.outcome.labels.removed` | int | Labels that were removed |
+| `gh-aw.outcome.labels.added` | int | Labels the workflow added |
+| `gh-aw.outcome.labels.retained` | int | Labels still present |
+| `gh-aw.outcome.labels.removed` | int | Labels that were removed |
 
-**API failure safeguards (`add_labels`):**
-
-1. If `GET /repos/{owner}/{repo}/issues/{number}/labels` returns `404`, the evaluator **MUST** classify as `rejected` because the authoritative labeling target is no longer reachable.
-2. If the API returns `5xx`, timeout, or transport failure, the evaluator **MUST** classify as `pending`, record retry metadata, and retry without emitting a terminal outcome.
-3. If the API returns rate-limit responses (`403` exhaustion or `429`), the evaluator **MUST** classify as `pending` and reschedule evaluation using the reset window.
-4. While any transient API failure condition exists, evaluators **MUST NOT** emit `accepted` or `rejected` for label stickiness.
+**API failure safeguards (`add_labels`):** failures return
+`error`/`weak`/`evaluation_error`, never acceptance based on missing data.
+Recorded before-state and the actual added-label delta are required. Automatic
+retry scheduling remains a collector lifecycle concern, not an implemented
+classification rule.
 
 ---
 
 ## 5. `add_reviewer`
+
+**Entity:** Reviewer request and attributable pull-request review. **Evaluator:** `evalAddReviewer`.
 
 **Question:** Did the reviewer actually review?
 
@@ -293,12 +314,14 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `ghaw.outcome.reviewer.reviewed` | bool | Whether the assigned reviewer submitted a review |
-| `ghaw.outcome.reviewer.review_state` | string | `approved`, `changes_requested`, `commented` |
+| `gh-aw.outcome.reviewer.reviewed` | bool | Whether the assigned reviewer submitted a review |
+| `gh-aw.outcome.reviewer.review_state` | string | `approved`, `changes_requested`, `commented` |
 
 ---
 
 ## 6. `update_issue`
+
+**Entity:** Issue fields recorded in the before/after snapshots. **Evaluator:** `evalUpdateIssue`.
 
 **Question:** Did the edit stick?
 
@@ -319,6 +342,8 @@ Rows marked `evalGenericSticky` fallback are generic existence checks, not type-
 
 ## 7. `update_pull_request`
 
+**Entity:** Pull-request fields recorded in the before/after snapshots. **Evaluator:** `evalUpdatePullRequest`.
+
 **Question:** Did the edit stick?
 
 Same retained-update logic as `update_issue` but on a PR object, using persisted execution-time snapshots instead of `updated_at`.
@@ -331,6 +356,8 @@ Same retained-update logic as `update_issue` but on a PR object, using persisted
 
 ## 8. `close_issue`
 
+**Entity:** Issue closure state and visible close actor. **Evaluator:** `evalCloseSticky`.
+
 **Question:** Did it stay closed?
 
 **API:** `GET /repos/{owner}/{repo}/issues/{number}`
@@ -342,12 +369,14 @@ Same retained-update logic as `update_issue` but on a PR object, using persisted
 | Condition | Outcome |
 |-----------|---------|
 | Issue still closed and close actor is `github-actions[bot]` or configured lifecycle bot | `lifecycle_close` |
-| Issue still closed and close actor is a non-lifecycle actor (visible non-bot user or non-lifecycle GitHub App/integration) | `rejected` |
+| Issue still closed and latest close actor is a visible non-bot user | `accepted` |
 | Issue reopened | `rejected` |
 
 ---
 
 ## 9. `close_pull_request`
+
+**Entity:** Pull-request closure state and visible close actor. **Evaluator:** `evalCloseSticky`.
 
 **Question:** Did it stay closed?
 
@@ -360,12 +389,17 @@ Same retained-update logic as `update_issue` but on a PR object, using persisted
 | Condition | Outcome |
 |-----------|---------|
 | PR still closed and close actor is `github-actions[bot]` or configured lifecycle bot | `lifecycle_close` |
-| PR still closed and close actor is a non-lifecycle actor (visible non-bot user or non-lifecycle GitHub App/integration) | `rejected` |
+| PR still closed, unmerged, and latest close actor is a visible non-bot user | `accepted` |
+| PR merged after the close action | `rejected` |
 | PR reopened | `rejected` |
 
 ---
 
 ## 10. `close_discussion`
+
+**Entity:** GitHub Discussion closure state. **Evaluator:** `evalCloseDiscussion` (currently unsupported).
+
+**Proposed rule only:** current runtimes return `unknown`/`none`/`unsupported_evaluator`. The conditions below are not implemented acceptance rules.
 
 **Question:** Did it stay closed?
 
@@ -382,6 +416,10 @@ Same retained-update logic as `update_issue` but on a PR object, using persisted
 
 ## 11. `create_discussion`
 
+**Entity:** GitHub Discussion. **Evaluator:** `evalCreateDiscussion` (currently unsupported).
+
+**Proposed rule only:** current runtimes return `unknown` with no evidence.
+
 **Question:** Did anyone engage?
 
 **API:** GraphQL `repository.discussion(number:)` → `comments.totalCount`, `answer`
@@ -397,12 +435,14 @@ Same retained-update logic as `update_issue` but on a PR object, using persisted
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `ghaw.outcome.discussion.replies` | int | Reply count |
-| `ghaw.outcome.discussion.answered` | bool | Whether marked as answered |
+| `gh-aw.outcome.discussion.replies` | int | Reply count |
+| `gh-aw.outcome.discussion.answered` | bool | Whether marked as answered |
 
 ---
 
 ## 12. `update_discussion`
+
+**Entity:** GitHub Discussion fields recorded in the execution evidence. **Evaluator:** `evalUpdateDiscussion` (currently unsupported).
 
 **Question:** Did the edit stick?
 
@@ -411,6 +451,10 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 ---
 
 ## 13. `create_pull_request_review_comment`
+
+**Entity:** Pull-request review comment. **Evaluator:** `evalReviewComment` (currently unsupported).
+
+**Proposed rule only:** current runtimes return `unknown` with no evidence.
 
 **Question:** Was the thread resolved or engaged?
 
@@ -428,6 +472,8 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 14. `submit_pull_request_review`
 
+**Entity:** Submitted pull-request review and its recorded review ID. **Evaluator:** `evalSubmitPullRequestReview`.
+
 **Question:** Was the feedback addressed?
 
 **API:** `GET /repos/{owner}/{repo}/pulls/{number}/commits` (check for commits after review)
@@ -436,14 +482,18 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 | Condition | Outcome |
 |-----------|---------|
-| New commits pushed after review submission | `accepted` |
+| Recorded changes-requested review followed by commits and merge | `accepted` (medium evidence) |
 | Review dismissed | `rejected` |
 | No new commits and PR still open | `pending` |
-| PR merged (regardless of follow-up commits) | `accepted` |
+| Recorded approval/comment review retained on merged PR | `accepted` |
 
 ---
 
 ## 15. `reply_to_pull_request_review_comment`
+
+**Entity:** Reply target for a pull-request review comment. **Evaluator:** `evalGenericSticky` (generic fallback).
+
+**Proposed rule only:** current fallback verifies only target existence and returns weak `unknown`.
 
 **Question:** Was the conversation advanced?
 
@@ -461,6 +511,10 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 16. `resolve_pull_request_review_thread`
 
+**Entity:** Pull-request review thread. **Evaluator:** `evalResolveThread` (currently unsupported).
+
+**Proposed rule only:** current runtimes return `unknown` with no evidence.
+
 **Question:** Did it stay resolved?
 
 **API:** GraphQL `pullRequest.reviewThreads` → `isResolved`
@@ -476,6 +530,8 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 17. `push_to_pull_request_branch`
 
+**Entity:** Recorded commits pushed to a pull-request branch. **Evaluator:** `evalPushToPRBranch`.
+
 **Question:** Was the code accepted?
 
 **API:** `GET /repos/{owner}/{repo}/pulls/{number}`
@@ -484,14 +540,16 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 | Condition | Outcome |
 |-----------|---------|
-| PR merged | `accepted` |
+| PR merged and recorded pushed commits verified in merge ancestry | `accepted` |
 | PR closed without merge | `rejected` |
 | PR still open | `pending` |
-| PR merged but pushed commits were reverted | `rejected` |
+| PR merged but recorded commits not verified in ancestry | `unknown` |
 
 ---
 
 ## 18. `mark_pull_request_as_ready_for_review`
+
+**Entity:** Pull-request draft/review state and subsequent review activity. **Evaluator:** `evalMarkReady`.
 
 **Question:** Did someone review it?
 
@@ -501,7 +559,7 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 | Condition | Outcome |
 |-----------|---------|
-| At least one review submitted after marking | `accepted` |
+| At least one visible non-bot review submitted strictly after marking | `accepted` |
 | No reviews but PR still open | `pending` |
 | PR merged or closed with no reviews | `ignored` |
 
@@ -509,11 +567,18 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 19. `assign_to_agent`
 
+**Entity:** Assigned issue and attributable agent-authored pull request. **Evaluator:** `evalAssignToAgent`.
+
 **Question:** Did the agent produce a result?
 
 **API:**
 1. `GET /repos/{owner}/{repo}/issues/{number}` → check state
 2. Search for PRs from agent: `GET /repos/{owner}/{repo}/issues/{number}/timeline` → find linked PRs from `copilot-swe-agent`
+
+The linked PR's repository MUST come from the timeline source issue's
+`repository_url`. Its number MUST NOT be resolved against the assignment
+issue's repository by default. Missing repository evidence leaves the link
+unattributable.
 
 **Evaluation:**
 
@@ -522,23 +587,29 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 | Agent PR created and merged | `accepted` |
 | Agent PR created but closed without merge | `rejected` |
 | Agent PR created and still open | `pending` |
-| No agent PR created | `ignored` |
-| Issue resolved without agent PR | `accepted` (resolved by other means) |
+| No attributable post-assignment agent PR | `unknown` |
+| Issue resolved without attributable agent PR | `unknown` |
 
 **Additional OTel attributes:**
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `ghaw.outcome.agent.pr_number` | int | PR number created by agent |
-| `ghaw.outcome.agent.pr_merged` | bool | Whether agent's PR was merged |
+| `gh-aw.outcome.agent.pr_number` | int | PR number created by agent |
+| `gh-aw.outcome.agent.pr_merged` | bool | Whether agent's PR was merged |
 
 ---
 
 ## 20. `dispatch_workflow`
 
+**Entity:** Dispatched workflow run. **Evaluator:** `evalDispatchWorkflow`.
+
 **Question:** Did the dispatched workflow succeed?
 
-**API:** `GET /repos/{owner}/{repo}/actions/runs` filtered by workflow and time window
+**API:** `GET /repos/{owner}/{repo}/actions/runs/{recorded_run_id}`; no guessed workflow/time-window attribution
+
+Manifest capture preserves the dispatch handler's returned run ID in
+`metadata.run_id`. Positive safe-integer IDs may be represented as JSON numbers
+or decimal strings; malformed IDs MUST NOT be partially parsed.
 
 **Evaluation:**
 
@@ -551,6 +622,10 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 ---
 
 ## 21. `autofix_code_scanning_alert`
+
+**Entity:** Code-scanning alert. **Evaluator:** `evalGenericSticky` (generic fallback).
+
+**Proposed rule only:** current fallback returns weak `unknown`, not acceptance.
 
 **Question:** Was the fix accepted?
 
@@ -572,6 +647,10 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 22. `create_code_scanning_alert`
 
+**Entity:** Code-scanning alert. **Evaluator:** `evalGenericSticky` (generic fallback).
+
+**Proposed rule only:** current fallback returns weak `unknown`, not acceptance.
+
 **Question:** Was the alert triaged?
 
 **API:** `GET /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}`
@@ -588,6 +667,10 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 23. `link_sub_issue`
 
+**Entity:** Parent/child issue relationship. **Evaluator:** `evalGenericSticky` (generic fallback).
+
+**Proposed rule only:** current fallback returns weak `unknown`, not acceptance.
+
 **Question:** Did the link stick?
 
 **API:** GraphQL `issue.subIssues`
@@ -602,6 +685,10 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 ---
 
 ## 24. `hide_comment`
+
+**Entity:** Hidden issue or pull-request comment. **Evaluator:** `evalHideComment` (currently unsupported).
+
+**Proposed rule only:** current runtimes return `unknown` with no evidence.
 
 **Question:** Did it stay hidden?
 
@@ -618,6 +705,8 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 25. `assign_milestone`
 
+**Entity:** Issue milestone assignment and recorded milestone number. **Evaluator:** `evalAssignMilestone`.
+
 **Question:** Did the milestone stick?
 
 **API:** `GET /repos/{owner}/{repo}/issues/{number}`
@@ -626,12 +715,16 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 | Condition | Outcome |
 |-----------|---------|
-| Milestone still assigned | `accepted` |
+| Recorded milestone number still assigned | `accepted` |
 | Milestone removed or changed | `rejected` |
 
 ---
 
 ## 26. `update_project`
+
+**Entity:** Project item and recorded field update. **Evaluator:** `evalGenericSticky` (generic fallback).
+
+**Proposed rule only:** current fallback returns weak `unknown`, not acceptance.
 
 **Question:** Did the field value stick?
 
@@ -648,6 +741,10 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 27. `update_release`
 
+**Entity:** Release and recorded release update. **Evaluator:** `evalGenericSticky` (generic fallback).
+
+**Proposed rule only:** current fallback returns weak `unknown`, not acceptance.
+
 **Question:** Did the edit stick?
 
 **API:** `GET /repos/{owner}/{repo}/releases/{release_id}`
@@ -663,13 +760,19 @@ Same logic as `update_issue` but via GraphQL on the discussion body.
 
 ## 28. `noop`
 
+**Entity:** No GitHub object; no operation. **Evaluator:** skipped by `EvaluateOutcomes`.
+
 No outcome to evaluate. Skip.
 
 ## 29. `missing_tool`
 
+**Entity:** Missing safe-output tool request; no GitHub object. **Evaluator:** skipped by `EvaluateOutcomes`.
+
 No outcome to evaluate. Skip.
 
 ## 30. `replace_label`
+
+**Entity:** Issue or pull-request label set and the recorded replacement delta. **Evaluator:** `evalReplaceLabel`.
 
 **Question:** Did the label replacement stick? Specifically: is `label_to_add` present on the item and is `label_to_remove` absent?
 
@@ -682,8 +785,7 @@ No outcome to evaluate. Skip.
 | `label_to_add` is present on the item AND `label_to_remove` is absent | `accepted` |
 | `label_to_add` is absent from the item | `rejected` |
 | `label_to_add` is present but `label_to_remove` is also still present | `rejected` (partial failure — remove did not apply) |
-| Item not found (`404`) | `rejected` |
-| API transient failure (`5xx`, timeout, transport error) | `pending` |
+| API failure, including missing labeling target | `error` with weak evidence |
 | `lifecycle` | N/A — `replace_label` has no lifecycle bot-close behavior |
 | `lifecycle_close` | N/A — `replace_label` has no lifecycle bot-close behavior |
 | `ignored` | N/A — label state is always evaluable when the item is accessible; no time-bounded engagement signal applies |
@@ -691,40 +793,80 @@ No outcome to evaluate. Skip.
 **Extra signals:**
 - `label_to_add`: the label name that should be present after the replacement
 - `label_to_remove`: the label name that should be absent after the replacement
-- `zero_touch`: `accepted` and no actor-visible non-bot label changes detected after the replacement
+- Label zero-touch attribution is not currently implemented.
 
 **Additional OTel attributes:**
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `ghaw.outcome.replace_label.label_to_add` | string | Label that should be present after the replacement |
-| `ghaw.outcome.replace_label.label_to_remove` | string | Label that should be absent after the replacement |
-| `ghaw.outcome.replace_label.add_present` | bool | Whether `label_to_add` is present at evaluation time |
-| `ghaw.outcome.replace_label.remove_absent` | bool | Whether `label_to_remove` is absent at evaluation time |
+| `gh-aw.outcome.replace_label.label_to_add` | string | Label that should be present after the replacement |
+| `gh-aw.outcome.replace_label.label_to_remove` | string | Label that should be absent after the replacement |
+| `gh-aw.outcome.replace_label.add_present` | bool | Whether `label_to_add` is present at evaluation time |
+| `gh-aw.outcome.replace_label.remove_absent` | bool | Whether `label_to_remove` is absent at evaluation time |
 
 **API failure safeguards (`replace_label`):**
 
-1. If `GET /repos/{owner}/{repo}/issues/{number}/labels` returns `404`, outcome evaluation workers **MUST** classify as `rejected` because the authoritative labeling target is no longer reachable.
-2. If the API returns `5xx`, timeout, or transport failure, outcome evaluation workers **MUST** classify as `pending`, record retry metadata, and retry without emitting a terminal outcome.
-3. If the API returns rate-limit responses (`403` exhaustion or `429`), outcome evaluation workers **MUST** classify as `pending` and reschedule evaluation using the reset window.
-4. While any transient API failure condition exists, outcome evaluation workers **MUST NOT** emit `accepted` or `rejected` for label replacement state.
+The evaluator requires recorded before/after label state and compares the actual
+replacement delta. Missing snapshots return `unknown` with no evidence.
+API failures return `error`; execution-time handler retry policy in
+`replace-label-spec.md` is separate from delayed outcome classification.
 
 **References:** See [replace-label-spec.md](replace-label-spec.md) for the full definition of the `replace_label` safe-output type, including the message schema, processing model, and REST interface.
 
 ---
 
+## Safeguards
+
+This matrix covers failure and unverifiable states for every numbered safe-output section. Missing execution evidence or API data MUST NOT be converted into acceptance. Proposed evaluation rules in the operation sections remain inactive until an evaluator implements them.
+
+| Section | Safe output | Failure outcome | Unknown or unverifiable outcome |
+|---|---|---|---|
+| 1 | `create_pull_request` | Primary-object `404` is `rejected`/`deleted`; other primary API failures are `error`/`evaluation_error`. Supplementary effort-evidence failures do not downgrade an `accepted` merged-PR result; they only withhold zero-touch proof. | Missing PR reference is `unknown`/`missing_reference`. |
+| 2 | `create_issue` | Primary-object `404` is `rejected`/`deleted`; API failure or unavailable close actor is an evaluation error. | Missing reference is `unknown`; unavailable actor MUST NOT count as acceptance. |
+| 3 | `add_comment` | Primary-comment `404` is `rejected`/`deleted`; supplementary API failure is `error`. | Supplementary `404` MUST NOT imply deletion; missing comment reference is `unknown`. |
+| 4 | `add_labels` | API failure is `error`/`evaluation_error`. | Missing before-state or added-label delta is `unknown`; target existence alone is insufficient. |
+| 5 | `add_reviewer` | Review API failure is `error`. | Unverified team membership or missing request identity is `unknown`; absence of a review is pending or ignored, not accepted. |
+| 6 | `update_issue` | API failure is `error`; fields reverted or changed independently are `rejected`. | Missing before/after snapshots is `unknown`/`missing_execution_state`. |
+| 7 | `update_pull_request` | API failure is `error`; fields reverted or changed independently are `rejected`. | Missing before/after snapshots is `unknown`/`missing_execution_state`. |
+| 8 | `close_issue` | Issue/event API failure is `error`; reopening is `rejected`. | Missing close-actor evidence is an evaluation error and MUST NOT count as acceptance. |
+| 9 | `close_pull_request` | PR/event API failure is `error`; reopening or a later merge is `rejected`. | Missing close-actor evidence is an evaluation error and MUST NOT count as acceptance. |
+| 10 | `close_discussion` | A future GraphQL failure is `error`. | Current runtime is `unknown`/`unsupported_evaluator`. |
+| 11 | `create_discussion` | A future GraphQL failure is `error`. | Current runtime is `unknown`/`unsupported_evaluator`. |
+| 12 | `update_discussion` | A future GraphQL failure is `error`. | Missing GraphQL evaluator or snapshots is `unknown`; current runtime uses `unsupported_evaluator`. |
+| 13 | `create_pull_request_review_comment` | A future GraphQL failure is `error`. | Current runtime is `unknown`/`unsupported_evaluator`. |
+| 14 | `submit_pull_request_review` | Review API failure is `error`; dismissed recorded review is `rejected`. | Missing or unmatched recorded review ID is `unknown`; another review MUST NOT be borrowed. |
+| 15 | `reply_to_pull_request_review_comment` | Target lookup failure is `error`. | Current generic fallback is `unknown`/`target_exists_only`; missing target reference is `unknown`/`missing_reference`. |
+| 16 | `resolve_pull_request_review_thread` | A future GraphQL failure is `error`. | Current runtime is `unknown`/`unsupported_evaluator`. |
+| 17 | `push_to_pull_request_branch` | PR/ancestry API failure is `error`; closed unmerged PR is `rejected`. | Missing or unverified pushed-commit evidence is `unknown`; merge alone is insufficient. |
+| 18 | `mark_pull_request_as_ready_for_review` | Review/PR API failure is `error`. | Missing or invalid action timestamp MUST NOT count as acceptance; no qualifying review remains pending or ignored. |
+| 19 | `assign_to_agent` | Issue/timeline/API failure is `error`; attributable PR closed unmerged is `rejected`. | Missing repository evidence or no attributable post-action PR is `unknown`. |
+| 20 | `dispatch_workflow` | Run lookup failure is `error`; failed completed run is `rejected`. | Missing or malformed run ID is pending with `missing_run_id`; do not guess a run from time or workflow name. |
+| 21 | `autofix_code_scanning_alert` | Target lookup failure is `error`. | Current generic fallback is `unknown`/`target_exists_only`; existence MUST NOT imply a fix. |
+| 22 | `create_code_scanning_alert` | Target lookup failure is `error`. | Current generic fallback is `unknown`/`target_exists_only`; existence MUST NOT imply triage. |
+| 23 | `link_sub_issue` | Target lookup failure is `error`. | Current generic fallback is `unknown`/`target_exists_only`; existence MUST NOT imply a retained link. |
+| 24 | `hide_comment` | A future GraphQL failure is `error`. | Current runtime is `unknown`/`unsupported_evaluator`. |
+| 25 | `assign_milestone` | Issue API failure is `error`; mismatched or removed milestone is `rejected`. | Missing expected milestone identity is `unknown`/`missing_execution_state`. |
+| 26 | `update_project` | Target lookup failure is `error`. | Current generic fallback is `unknown`/`target_exists_only`; existence MUST NOT imply a retained field value. |
+| 27 | `update_release` | Target lookup failure is `error`. | Current generic fallback is `unknown`/`target_exists_only`; existence MUST NOT imply a retained edit. |
+| 28 | `noop` | Not applicable; no action is evaluated. | Explicitly skipped, not classified as unknown. |
+| 29 | `missing_tool` | Not applicable; no action is evaluated. | Explicitly skipped, not classified as unknown. |
+| 30 | `replace_label` | API failure is `error`; incomplete/reverted replacement is `rejected`. | Missing before/after label state is `unknown`/`missing_execution_state`. |
+
 ## Derived Metrics
 
 From the outcome evaluations above, compute:
 
-| Metric | Formula | Description | Go aggregation owner | OTel emission owner |
-|--------|---------|-------------|----------------------|---------------------|
-| `acceptance_rate` | accepted / (accepted + rejected) | How often actions are kept | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) | `actions/setup/js/emit_outcome_spans.cjs` (`buildSummaryAttributes`) |
-| `waste_rate` | rejected / total | How often actions are undone | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) | `actions/setup/js/emit_outcome_spans.cjs` (`buildSummaryAttributes`) |
-| `ignore_rate` | ignored / total | How often actions get no response | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) | `actions/setup/js/emit_outcome_spans.cjs` (`buildSummaryAttributes`) |
-| `zero_touch_rate` | zero_touch / accepted | How often accepted actions need no actor-visible non-bot edits | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) | `actions/setup/js/emit_outcome_spans.cjs` (`buildSummaryAttributes`) |
-| `time_to_outcome` | median(time_to_outcome_hours) | How fast outcomes resolve | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) | `actions/setup/js/emit_outcome_spans.cjs` (`buildSummaryAttributes`) |
-| `cost_per_accepted_outcome` | total_run_cost / accepted_count | Efficiency metric | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) | `actions/setup/js/emit_outcome_spans.cjs` (`buildSummaryAttributes`) |
+| Metric | Formula | Description | CLI aggregation owner |
+|--------|---------|-------------|-----------------------|
+| `acceptance_rate` | accepted / (accepted + rejected) | How often actions are kept | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) |
+| `waste_rate` | rejected / total | How often actions are undone | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) |
+| `ignore_rate` | ignored / total | How often actions get no response | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) |
+| `zero_touch_rate` | zero_touch / accepted | How often accepted actions need no actor-visible non-bot edits | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) |
+| `time_to_outcome` | median(time_to_outcome_hours) | How fast outcomes resolve | `pkg/cli/outcome_eval.go` (`ComputeOutcomeSummary`) |
+| `cost_per_accepted_outcome` | total_run_cost / accepted_count | Efficiency metric | `pkg/cli/outcome_economics.go` (`addAIC`) |
+
+These metrics are returned in `.outcomes[]` of `gh aw logs --outcomes --json`. `--outcomes-dir` writes
+per-item JSONL for downstream processing; OTel conversion is not built in.
 
 ## Implementation Priority
 
@@ -744,48 +886,84 @@ These cover the majority of safe output usage. Add the rest incrementally.
 
 ### Conformance Test Table
 
-The table below specifies one conformance test row per safe-output type. Each row defines the expected OTel attribute value emitted by a correct evaluator, the pass condition (what must be true for `accepted`), and the fail condition (what signals `rejected`). Implementations **MUST** satisfy the pass condition and **MUST** not emit `accepted` when the fail condition is observed.
+The current runtime classifications below supersede existence-based acceptance
+conditions in the original design sections. `gh-aw.outcome.type` preserves the
+safe-output type; status and evidence strength are separate attributes.
 
-| Output type | Expected `ghaw.outcome.type` OTel attribute | Pass condition | Fail condition |
-|---|---|---|---|
-| `create_pull_request` | `create_pull_request` | PR exists in open or merged state; was not closed-as-not-planned or reverted within the evaluation window | PR closed-as-not-planned, reverted, or deleted within the evaluation window |
-| `create_issue` | `create_issue` | Issue exists in open state, or was closed by a visible non-bot action (not bot policy) within the evaluation window | Issue closed-as-not-planned by a visible non-bot actor within the evaluation window, or deleted |
-| `add_comment` | `add_comment` | Comment exists on the target object at evaluation time | Comment was deleted or hidden by a visible non-bot actor within the evaluation window |
-| `add_labels` | `add_labels` | At least one of the bot-applied labels is still present on the target object at evaluation time | All bot-applied labels were removed by a visible non-bot actor within the evaluation window |
-| `add_reviewer` | `add_reviewer` | Requested reviewer is still listed as a requested reviewer, or has already submitted a review | Reviewer request was removed by a visible non-bot actor before any review was submitted |
-| `update_issue` | `update_issue` | Updated field(s) (title, body, assignee) match the values the bot submitted at evaluation time | Updated field(s) were reverted to pre-bot values by a visible non-bot actor within the evaluation window |
-| `update_pull_request` | `update_pull_request` | Updated field(s) (title, body, base branch) match the values the bot submitted at evaluation time | Updated field(s) were reverted to pre-bot values by a visible non-bot actor within the evaluation window |
-| `close_issue` | `close_issue` | Issue remains closed at evaluation time | Issue was reopened by a visible non-bot actor within the evaluation window |
-| `close_pull_request` | `close_pull_request` | PR remains closed (not merged) at evaluation time | PR was reopened or merged after the bot closed it within the evaluation window |
-| `close_discussion` | `close_discussion` | Discussion remains closed at evaluation time | Discussion was reopened by a visible non-bot actor within the evaluation window |
-| `create_discussion` | `create_discussion` | Discussion exists and has not been deleted or locked within the evaluation window | Discussion was deleted or permanently locked (preventing any responses) within the evaluation window |
-| `update_discussion` | `update_discussion` | Updated field(s) (title, body, category) match the values the bot submitted at evaluation time | Updated field(s) were reverted to pre-bot values by a visible non-bot actor within the evaluation window |
-| `create_pull_request_review_comment` | `create_pull_request_review_comment` | Review comment exists on the PR diff at evaluation time | Review comment was deleted by a visible non-bot actor within the evaluation window |
-| `submit_pull_request_review` | `submit_pull_request_review` | PR review record exists with the submitted state (APPROVED, CHANGES_REQUESTED, COMMENT) at evaluation time | Review was dismissed by a visible non-bot actor within the evaluation window |
-| `reply_to_pull_request_review_comment` | `reply_to_pull_request_review_comment` | Reply comment exists in the review thread at evaluation time | Reply comment was deleted by a visible non-bot actor within the evaluation window |
-| `resolve_pull_request_review_thread` | `resolve_pull_request_review_thread` | Review thread remains resolved at evaluation time | Thread was re-opened (un-resolved) by a visible non-bot actor within the evaluation window |
-| `push_to_pull_request_branch` | `push_to_pull_request_branch` | The pushed commit SHA is still present in the PR branch history at evaluation time | The commit was force-pushed out of the branch history by a visible non-bot actor within the evaluation window |
-| `mark_pull_request_as_ready_for_review` | `mark_pull_request_as_ready_for_review` | PR is no longer in draft state at evaluation time | PR was converted back to draft by a visible non-bot actor within the evaluation window |
-| `assign_to_agent` | `assign_to_agent` | Assignment record exists on the target issue/PR at evaluation time | Assignment was removed by a visible non-bot actor before the assigned agent acted on it |
-| `dispatch_workflow` | `dispatch_workflow` | The dispatched workflow run exists and reached a terminal state (success or failure) within the evaluation window | The dispatched workflow run was cancelled before reaching a terminal state; or no corresponding run record is found |
-| `autofix_code_scanning_alert` | `autofix_code_scanning_alert` | Code scanning alert is in a fixed or dismissed state at evaluation time | Alert was re-opened or the fix commit was reverted within the evaluation window |
-| `create_code_scanning_alert` | `create_code_scanning_alert` | Alert record exists in the repository's code scanning results at evaluation time | Alert was immediately dismissed (within the evaluation window) with no investigation action |
-| `link_sub_issue` | `link_sub_issue` | Sub-issue link exists on the parent issue at evaluation time | Sub-issue link was removed by a visible non-bot actor within the evaluation window |
-| `hide_comment` | `hide_comment` | Comment is minimized (hidden) at evaluation time | Comment was un-hidden by a visible non-bot actor within the evaluation window |
-| `assign_milestone` | `assign_milestone` | Milestone assignment is present on the target issue/PR at evaluation time | Milestone assignment was removed by a visible non-bot actor within the evaluation window |
-| `update_project` | `update_project` | Project item field(s) match the values the bot submitted at evaluation time | Project item field(s) were reverted to pre-bot values by a visible non-bot actor within the evaluation window |
-| `update_release` | `update_release` | Release field(s) (name, body, tag, draft status) match the values the bot submitted at evaluation time | Release field(s) were reverted by a visible non-bot actor, or the release was deleted within the evaluation window |
-| `noop` | `noop` | Evaluation is skipped; no outcome is computed | N/A — `noop` always results in `ignored` |
-| `missing_tool` | `missing_tool` | Evaluation is skipped; no outcome is computed | N/A — `missing_tool` always results in `ignored` |
-| `replace_label` | `replace_label` | `label_to_add` is present on the target item AND `label_to_remove` is absent at evaluation time | `label_to_add` is absent, or `label_to_remove` is still present, or the item was deleted within the evaluation window |
+| Output type | Acceptance evidence | Other classifications |
+|---|---|---|
+| `create_pull_request` | Merged PR | Open pending; closed unmerged rejected |
+| `create_issue` | Closed completed | Open pending, even with engagement; not-planned human close rejected, bot close lifecycle; missing close actor error |
+| `add_comment` | Reactions or post-comment visible non-bot follow-up | Otherwise pending; primary comment 404 rejected; supplementary failure cannot prove deletion |
+| `add_labels`, `replace_label` | Recorded delta retained | Missing snapshots unknown; delta reverted/replaced rejected |
+| `update_issue`, `update_pull_request` | All recorded changed fields retained; retained merged PR gives strong evidence | Missing execution state or no delta unknown; reverted/replaced rejected |
+| `close_issue`, `close_pull_request` | Retained close with visible non-bot close actor | Bot close lifecycle_close; reopened or PR merged rejected; missing actor error |
+| `add_reviewer` | Review attributable to a recorded requested user | Pending matched request pending; removed request rejected; team membership unverified unknown |
+| `submit_pull_request_review` | Exact recorded review approved and PR merged, or changes requested followed by commits and merge | Missing exact review unknown; dismissed rejected; latest open review pending |
+| `push_to_pull_request_branch` | Recorded pushed SHAs verified as ancestors of merge commit | Missing execution evidence unknown; unverified ancestry unknown; open pending; closed unmerged rejected |
+| `mark_pull_request_as_ready_for_review` | Visible non-bot submitted review strictly after action | Open pending; closed/merged without qualifying review ignored |
+| `assign_to_agent` | Post-action link to recognized agent-authored PR that merged | No attributable PR unknown; linked open PR pending; closed unmerged rejected |
+| `dispatch_workflow` | Recorded run completed successfully | Failed, timed-out, cancelled, or action-required rejected; nonterminal pending; other completion ignored |
+| `assign_milestone` | Current milestone matches recorded milestone number | Missing identity unknown; mismatch rejected |
+| Discussion actions, review-comment creation, review-thread resolution, `hide_comment` | No supported evaluator | Unknown with `unsupported_evaluator` |
+| `noop`, `missing_tool`, `missing_data`, `report_incomplete` | Not evaluated | Skipped |
+| Other generic fallback types | Target existence is not acceptance evidence | Unknown with `target_exists_only`; missing reference unknown; API failure error |
+
+### Sync Notes: Specification Section-to-Implementation and Test Mapping
+
+The evaluator implementation and outcome-conformance tests live in `pkg/cli`; `pkg/workflow` owns safe-output configuration and compilation. Compiler tests do not establish outcome-evaluator support. Evaluator and test evidence per operation lives in [Current Default Acceptance Map](#current-default-acceptance-map) and the Conformance Test Table above; the 95-case fixture corpus is `pkg/cli/testdata/outcome_conformance.json`, executed by `pkg/cli/outcome_conformance_test.go`. The executable TLA+ checker projects the same cases; see [verification scope](outcomes/README.md).
+
+| Specification area | Implementation or test path |
+|---|---|
+| `## Implementation`, `### Current Default Acceptance Map` | `pkg/cli/outcome_eval.go`, the `pkg/cli/outcome_eval_*.go` evaluators, `pkg/cli/testdata/outcome_conformance.json` |
+| `## Derived Metrics` | `pkg/cli/outcome_eval.go`, `pkg/cli/outcome_economics.go` |
+| `### Implementation locations` | The 30 `pkg/workflow` paths in the table below |
+| `## Conformance`, `### Conformance Test Table` | `pkg/cli/outcome_conformance_test.go`, `pkg/cli/testdata/outcome_conformance.json` |
+| `### OTel Backend Unavailability` | `pkg/cli/outcome_eval.go` produces JSON/JSONL without an OTLP exporter; downstream export behavior is specified in `specs/otel-observability-spec.md` §16.6 |
+| `### Conformance Safeguard Coverage Requirements` | `pkg/cli/outcome_conformance_test.go`, `pkg/cli/testdata/outcome_conformance.json`; OTLP endpoint filtering is tested by `actions/setup/js/send_otlp_span.test.cjs` |
+| `## Formal Model` | `outcomes/OutcomeEvaluation.tla`, `outcomes/OutcomeEvaluation.cfg`, `outcomes/check.mjs` |
+| `## Legacy Runtime Safeguard Tests`, `## Runtime Test Suite` | `pkg/cli/outcome_eval_formal_test.go`, `pkg/cli/outcome_conformance_test.go` |
+
+| Section | Output type | Implementation file(s) |
+|---|---|---|
+| §1 | `create_pull_request` | `pkg/workflow/create_pull_request.go` |
+| §2 | `create_issue` | `pkg/workflow/create_issue.go` |
+| §3 | `add_comment` | `pkg/workflow/add_comment.go` |
+| §4 | `add_labels` | `pkg/workflow/add_labels.go` |
+| §5 | `add_reviewer` | `pkg/workflow/add_reviewer.go` |
+| §6 | `update_issue` | `pkg/workflow/update_issue.go` |
+| §7 | `update_pull_request` | `pkg/workflow/update_pull_request.go` |
+| §8 | `close_issue` | `pkg/workflow/close_entity_helpers.go` |
+| §9 | `close_pull_request` | `pkg/workflow/close_entity_helpers.go` |
+| §10 | `close_discussion` | `pkg/workflow/close_entity_helpers.go` |
+| §11 | `create_discussion` | `pkg/workflow/create_discussion.go` |
+| §12 | `update_discussion` | `pkg/workflow/update_discussion.go` |
+| §13 | `create_pull_request_review_comment` | `pkg/workflow/create_pr_review_comment.go` |
+| §14 | `submit_pull_request_review` | `pkg/workflow/submit_pr_review.go` |
+| §15 | `reply_to_pull_request_review_comment` | `pkg/workflow/reply_to_pr_review_comment.go` |
+| §16 | `resolve_pull_request_review_thread` | `pkg/workflow/resolve_pr_review_thread.go` |
+| §17 | `push_to_pull_request_branch` | `pkg/workflow/push_to_pull_request_branch.go`, `pkg/workflow/push_to_pull_request_branch_validation.go` |
+| §18 | `mark_pull_request_as_ready_for_review` | `pkg/workflow/mark_pull_request_as_ready_for_review.go` |
+| §19 | `assign_to_agent` | `pkg/workflow/assign_to_agent.go` |
+| §20 | `dispatch_workflow` | `pkg/workflow/dispatch_workflow.go`, `pkg/workflow/dispatch_workflow_validation.go`, `pkg/workflow/dispatch_workflow_file_resolver.go` |
+| §21 | `autofix_code_scanning_alert` | `pkg/workflow/autofix_code_scanning_alert.go` |
+| §22 | `create_code_scanning_alert` | `pkg/workflow/create_code_scanning_alert.go` |
+| §23 | `link_sub_issue` | `pkg/workflow/link_sub_issue.go` |
+| §24 | `hide_comment` | `pkg/workflow/hide_comment.go` |
+| §25 | `assign_milestone` | `pkg/workflow/assign_milestone.go` |
+| §26 | `update_project` | `pkg/workflow/update_project.go` |
+| §27 | `update_release` | `pkg/workflow/update_release.go` |
+| §28 | `noop` | `pkg/workflow/noop.go` |
+| §29 | `missing_tool` | `pkg/workflow/missing_issue_reporting.go` |
+| §30 | `replace_label` | `pkg/workflow/replace_label.go` |
+
+When any mapped configuration, evaluator, or test path changes, update this table in the same change. The output-type sections propose future rules where marked; their current evaluator and test entries remain authoritative until implementation changes.
 
 ### OTel Backend Unavailability
 
-When the OTLP exporter is unavailable (e.g., endpoint unreachable, network timeout, authentication failure) during outcome evaluation, the following safeguards **MUST** apply:
+The `gh aw logs --outcomes` evaluator has no OTLP exporter: it classifies outcomes and writes JSON/optional JSONL without making telemetry requests. An unavailable OTLP backend therefore cannot affect CLI classification or suppress the CLI output, and this specification does not require an evaluator-owned audit file or retry loop. A downstream exporter MUST preserve the produced outcome records when its own export fails and MUST NOT report failed delivery as successful; exporter ordering, local mirrors, and failure handling are defined in the [OpenTelemetry Observability Specification](otel-observability-spec.md#16-reliability-and-failure-handling).
 
-1. **Graceful degradation**: Outcome evaluation workers **MUST** complete their classification logic (determining `accepted`, `rejected`, `ignored`, etc.) regardless of OTLP exporter availability. The computed outcome **MUST** be persisted to a local audit fallback log (e.g., a NDJSON file at a known path such as `/tmp/gh-aw/outcome-audit.ndjson`) before any attempt to export to OTLP. If the OTLP export fails, the local audit log entry **MUST** still be written and **MUST NOT** be discarded. This ensures the outcome is recoverable even when the telemetry backend is down.
-
-2. **Audit fallback and retry**: When OTLP export fails, the evaluation worker **SHOULD** schedule a retry using an exponential back-off strategy (initial delay: 5 seconds; maximum delay: 5 minutes; maximum attempts: 5). If all retries are exhausted without a successful export, the worker **MUST** record the export failure in the local audit log with a `export_failed: true` flag and the final error reason. A downstream reconciliation process **SHOULD** periodically sweep the local audit log and re-attempt export for any entries marked `export_failed: true`.
+The CLI conformance corpus covers GitHub API failures that affect evaluation, not OTLP transport failures. The fail-closed check for a default OTLP endpoint with missing credentials is exercised by `actions/setup/js/send_otlp_span.test.cjs` in the runtime exporter, outside the CLI outcome evaluator.
 
 ### Conformance Safeguard Coverage Requirements
 
@@ -793,7 +971,7 @@ Conformance suites **MUST** include explicit safeguard coverage classes in addit
 
 1. **Class A (state success/failure):** validates standard accepted/rejected/ignored/pending transitions from authoritative object state.
 2. **Class B (human override/lifecycle):** validates human edits, deletions, reopen events, and lifecycle outcomes where applicable.
-3. **Class C (API degradation):** validates `404`, `5xx`, timeout, and rate-limit behaviors, including retry metadata and non-terminal handling.
+3. **Class C (API degradation):** validates `404`, `5xx`, timeout, and rate-limit behaviors, including non-terminal handling. OTLP export is not part of CLI evaluation.
 
 Every safe-output type **MUST** have at least one Class A test. Types that query GitHub APIs for evaluation **MUST** also include at least one Class C test case.
 
@@ -801,124 +979,40 @@ Every safe-output type **MUST** have at least one Class A test. Types that query
 
 ## Formal Model
 
-The outcome evaluation engine is encoded as a state machine with invariants using TLA+, F* pre/post contracts, and Z3/SMT-LIB arithmetic bounds.
+The executable specification is
+[`outcomes/OutcomeEvaluation.tla`](outcomes/OutcomeEvaluation.tla), with finite
+bounds in [`outcomes/OutcomeEvaluation.cfg`](outcomes/OutcomeEvaluation.cfg).
+[`outcomes/check.mjs`](outcomes/check.mjs) runs checksum-pinned TLC, shared fixture
+agreement, and deliberate negative controls. [Reproduction and verification
+scope](outcomes/README.md) documents the results and assumptions.
 
-**State space** (`OutcomeState`):
+The model observes one action's evidence snapshot, computes abstract Go and
+JavaScript results in either order, publishes typed results, and reconciles
+status counts. Safety invariants constrain acceptance evidence, execution
+attribution, review timing, primary-404 deletion, zero-touch completeness,
+runtime parity, typed export preservation, and summary reconciliation. Weak
+fairness establishes eventual publication within this abstract pipeline.
 
-```
-OutcomeState ≜ [
-  type       : SafeOutputType,
-  result     : OutcomeResult,
-  evalError  : String ∪ {nil},
-  detail     : String,
-  apiStatus  : Int ∪ {nil},
-  actor      : ActorIdentity,
-  checkTime  : Timestamp
-]
-```
-
-**TLA+ invariants** (one per state-machine guarantee):
-
-```tla
-OutcomeDomain ≜
-  ∀ s ∈ OutcomeState :
-    s.result ∈ {"accepted","rejected","ignored","pending","lifecycle","lifecycle_close"}
-    ∨ s.result ∈ {"unknown","error"}
-
-APIFailureNeverTerminal ≜
-  ∀ s ∈ OutcomeState :
-    (s.apiStatus ∈ {500,502,503,429} ∨ s.apiStatus = 403 ∧ RateLimited(s)) ⟹
-      s.result ≠ "accepted" ∧ s.result ≠ "rejected"
-
-NotFoundClassification ≜
-  ∀ s ∈ OutcomeState :
-    s.apiStatus = 404 ∧ persistent(s.type) ⟹ s.result = "rejected" ∧
-    s.apiStatus = 404 ∧ transient(s.type) ⟹ s.result = "ignored"
-
-BotActorProvenance ≜
-  ∀ actor : ActorIdentity :
-    isBotActor(actor) ↔ HasSuffix(actor.login, "[bot]") ∨ actor.login ∈ KnownBotLogins
-
-PRMergeAcceptance ≜
-  ∀ pr : PullRequest :
-    pr.merged = true                   ⟹ outcome = "accepted" ∧
-    pr.state = "closed" ∧ ¬pr.merged  ⟹ outcome = "rejected" ∧
-    pr.state = "open"                  ⟹ outcome = "pending"
-
-IssueBotCloseLifecycle ≜
-  ∀ issue : Issue :
-    issue.state = "closed" ∧ issue.stateReason = "not_planned" ∧ closedByBot  ⟹ result = "lifecycle" ∧
-    issue.state = "closed" ∧ issue.stateReason = "not_planned" ∧ ¬closedByBot ⟹ result = "rejected" ∧
-    issue.state = "closed" ∧ issue.stateReason = "completed"                   ⟹ result = "accepted"
-
-CloseStickyReopenRejection ≜
-  ∀ item : close_issue ∪ close_pull_request :
-    current.state = "closed" ⟹ result = "accepted" ∧
-    current.state = "open"   ⟹ result = "rejected"
-```
-
-**F* pre/post contracts** (selected):
-
-```fstar
-val evaluateWithAPIError :
-  item:CreatedItemReport → err:APIError →
-  Tot OutcomeReport
-  (requires err.status ∈ {500, 502, 503, 429} ∨ RateLimited err)
-  (ensures fun r → r.Result ≠ OutcomeAccepted ∧ r.Result ≠ OutcomeRejected)
-
-val labelRetentionMonotonicity :
-  before:list string → after:list string → current:list string →
-  Tot retainedStateComparison
-  (requires Subset before after)
-  (ensures fun c →
-    Subset after current ⟹ c.Retained ≠ [] ∧
-    ¬Subset after current ⟹ c.Reverted ≠ [] ∨ c.Replaced ≠ [])
-
-val compareUpdateSnapshot :
-  before:state → after:state → current:state → fields:list string →
-  Tot retainedStateComparison
-  (ensures fun c →
-    current = after  ⟹ c.Retained = c.Changed ∧
-    current = before ⟹ c.Reverted = c.Changed ∧
-    current ≠ before ∧ current ≠ after ⟹ c.Replaced = c.Changed)
-
-val evaluateOutcome :
-  item:CreatedItemReport → transportOK:bool →
-  Tot OutcomeReport
-  (requires True)
-  (ensures fun r →
-    r.Type ≠ "" ∧ r.Result ∈ KnownOutcomeResults ∧
-    normalizeOutcomeEvaluation(r).OutcomeStatus ≠ "" ∧
-    normalizeOutcomeEvaluation(r).EvidenceStrength ≠ "")
-```
-
-**Z3/SMT-LIB bounds** (derived metrics zero-safety):
-
-```smt2
-(declare-const accepted Int)
-(declare-const rejected Int)
-(declare-const total    Int)
-(assert (>= accepted 0))
-(assert (>= rejected 0))
-(assert (>= total (+ accepted rejected)))
-(assert (=> (> (+ accepted rejected) 0)
-            (= acceptance_rate (/ accepted (+ accepted rejected)))))
-(assert (=> (> total 0)
-            (= waste_rate (/ rejected total))))
-(assert (=> (= (+ accepted rejected) 0) (= acceptance_rate 0.0)))
-(assert (=> (= total 0) (= waste_rate 0.0)))
-(check-sat) ; sat — formulas are consistent and division-by-zero safe
-```
+This is bounded model checking, not an unbounded proof or verification of native
+Go/JavaScript execution. Fixture projection links the model to tested examples;
+actor recognition, timestamp parsing, GitHub API behavior, collection/revisit
+scheduling, OTLP transport, and AIC attribution remain outside the proof.
+Earlier F* and SMT-LIB examples were design sketches, not checked artifacts;
+no F*, Z3, or TLAPS proof is claimed.
 
 ---
 
-## Behavioral Coverage Map
+## Legacy Runtime Safeguard Tests
+
+The following named Go tests are runtime checks, not TLC invariants or generated
+formal proofs. The shared conformance corpus and executable TLA+ model are the
+current cross-runtime evidence contract.
 
 | Predicate / Invariant | Test Function | Description |
 |---|---|---|
-| `P1` OutcomeDomain | `TestFormalOutcomeDomainInvariant` | All OutcomeResult values are within the six defined strings |
+| `P1` OutcomeDomain | `TestFormalOutcomeDomainInvariant` | Checks the supported normalized status domain |
 | `P2` No-Terminal-Under-API-Failure | `TestFormalAPIFailurePending` | 5xx and rate-limit responses yield `pending`/`error`, never `accepted`/`rejected` |
-| `P3` 404-Terminal-Classification | `TestFormal404Classification` | 404 on persistent object → `rejected`; on transient → `ignored` |
+| `P3` 404-Terminal-Classification | `TestFormal404Classification` | Primary persistent-object 404 rejected; supplementary 404 cannot prove deletion |
 | `P4` Bot-Actor-Provenance | `TestFormalBotActorProvenance` | Bot identity → bot action; user identity → non-bot action |
 | `P5` PR-Merge-Acceptance | `TestFormalPRMergeAcceptance` | merged=true→accepted; closed+!merged→rejected; open→pending |
 | `P6` Issue-Bot-Close-Lifecycle | `TestFormalIssueBotCloseLifecycle` | Bot closes not_planned→lifecycle; human→rejected; completed→accepted |
@@ -926,14 +1020,18 @@ val evaluateOutcome :
 | `P8` Update-Snapshot-Comparison | `TestFormalUpdateSnapshotComparison` | current=after→accepted; current=before or diverged→rejected |
 | `P9` CloseSticky-Reopen-Rejection | `TestFormalCloseStickyReopenRejection` | Reopened object→rejected; lifecycle bot closed→lifecycle_close |
 | `P10` Derived-Metrics-Consistency | `TestFormalDerivedMetricsConsistency` | acceptance_rate and waste_rate formulas; division-by-zero safety |
-| `P11` OTel-Graceful-Degradation | `TestFormalOTelGracefulDegradation` | OTLP failure still writes audit log; outcome not discarded |
+| `P11` Evaluation-API-Degradation | `TestFormalOutcomeSurvivesAPIFailure` | GitHub API transport failure produces a normalized evaluation report; it does not claim an OTLP exporter or audit-file write |
 | `P12` Conformance-Class-Coverage | `TestFormalConformanceClassCoverage` | Class A/C test existence invariant structure |
+| `P14` API-Error-Not-Terminal | `TestFormalAPIErrorNotTerminal` | An authoritative PR fetch error produces `error`, never a terminal outcome |
+| `P15` Zero-Touch-Requires-No-Reviews | `TestFormalZeroTouchRequiresNoReviews` | Requires complete evidence and no post-action non-bot comments, submitted reviews, or edits |
+
+`P13` covers the worker's configurable evaluation delay and is intentionally outside this in-process evaluator suite.
 
 ---
 
-## Generated Test Suite
+## Runtime Test Suite
 
-The 12 test functions above are implemented in
+The named test functions above are implemented in
 `pkg/cli/outcome_eval_formal_test.go` using the Go `testify` library.
 All tests carry the `//go:build !integration` tag so they run in the default
 unit-test suite without any special flags.
@@ -948,13 +1046,24 @@ Each test function:
 Run the full formal suite:
 
 ```sh
-go test ./pkg/cli/ -run 'TestFormalOutcomeDomainInvariant|TestFormalAPIFailurePending|TestFormal404Classification|TestFormalBotActorProvenance|TestFormalPRMergeAcceptance|TestFormalIssueBotCloseLifecycle|TestFormalLabelStickiness|TestFormalUpdateSnapshotComparison|TestFormalCloseStickyReopenRejection|TestFormalDerivedMetricsConsistency|TestFormalOTelGracefulDegradation|TestFormalConformanceClassCoverage' -v
+go test ./pkg/cli/ -run 'TestFormalOutcomeDomainInvariant|TestFormalAPIFailurePending|TestFormal404Classification|TestFormalBotActorProvenance|TestFormalPRMergeAcceptance|TestFormalIssueBotCloseLifecycle|TestFormalLabelStickiness|TestFormalUpdateSnapshotComparison|TestFormalCloseStickyReopenRejection|TestFormalDerivedMetricsConsistency|TestFormalOutcomeSurvivesAPIFailure|TestFormalConformanceClassCoverage|TestFormalAPIErrorNotTerminal|TestFormalZeroTouchRequiresNoReviews' -v
 ```
 
-### Formal Notation Cross-References
+## Change Log
 
-| Notation | Predicates | Purpose |
-|---|---|---|
-| TLA+ state-machine invariants | P1, P4, P5, P6, P9 | State transition correctness |
-| F* pre/post contracts | P2, P3, P7, P8, P11, P12 | Function-level contracts |
-| Z3/SMT-LIB arithmetic bounds | P10 | Division-by-zero safety for derived metrics |
+### Version 1.0.3 (Working Draft, 2026-11-05)
+
+- Added explicit entity/evaluator identification to all 30 safe-output sections.
+- Corrected the OTLP-unavailable contract to match the CLI boundary: there is no CLI OTLP exporter or evaluator-owned retry/audit-log implementation; cross-referenced the runtime exporter safeguards.
+- Re-verified the implementation-location table against the repository; all listed paths exist.
+
+### Version 1.0.2 (Working Draft, 2026-11-03)
+
+- Added failure and unknown safeguards for all 30 safe-output sections.
+- Mapped all implementation and conformance sections to source paths and named coverage tests, adding focused outcome fixtures for six previously uncovered operation types.
+
+### Version 1.0.1 (Working Draft, 2026-08-01)
+
+- Clarified provenance-resolution rules for `human_*` metrics when GitHub Apps act on behalf of humans.
+- Added a section-to-test cross-reference table for all 30 safe-output types, marking uncovered rows as `not-started`.
+- See also: `specs/otel-observability-spec.md` §13 (Outcome Evaluation) and §19 (Change Log).

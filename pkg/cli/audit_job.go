@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,24 +29,23 @@ type auditJobRunOptions struct {
 
 // auditJobRun performs a targeted audit of a specific job within a workflow run
 // If stepNumber > 0, focuses on extracting output for that specific step
-func auditJobRun(opts auditJobRunOptions) error {
+func auditJobRun(ctx context.Context, opts auditJobRunOptions) error {
 	opts.hostname = resolveAuditHostname(opts.hostname)
 	auditLog.Printf("Starting job-specific audit: runID=%d, jobID=%d, stepNumber=%d, hostname=%s", opts.runID, opts.jobID, opts.stepNumber, opts.hostname)
 	if err := os.MkdirAll(opts.outputDir, constants.DirPermSensitive); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
-	jobLogContent, jobLogPath, err := fetchAuditJobLog(opts)
+	jobLogContent, jobLogPath, err := fetchAuditJobLog(ctx, opts)
 	if err != nil {
 		return err
 	}
 	if err := extractAuditJobDetails(opts, jobLogContent); err != nil {
 		return err
 	}
-	renderAuditJobSummary(opts, jobLogPath)
-	return nil
+	return renderAuditJobSummary(opts, jobLogPath)
 }
 
-func fetchAuditJobLog(opts auditJobRunOptions) (string, string, error) {
+func fetchAuditJobLog(ctx context.Context, opts auditJobRunOptions) (string, string, error) {
 	args := []string{"run", "view"}
 	if opts.owner != "" && opts.repo != "" {
 		args = append(args, "-R", fmt.Sprintf("%s/%s", opts.owner, opts.repo))
@@ -55,10 +55,13 @@ func fetchAuditJobLog(opts auditJobRunOptions) (string, string, error) {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Fetching logs for job %d...", opts.jobID)))
 		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Executing: gh "+strings.Join(args, " ")))
 	}
-	cmd := workflow.ExecGH(args...)
+	cmd := workflow.ExecGHContext(ctx, args...)
 	workflow.SetGHHostEnv(cmd, opts.hostname)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
 		return "", "", fmt.Errorf("failed to fetch job logs: %w\nOutput: %s", err, string(output))
 	}
 	jobLogPath := filepath.Join(opts.outputDir, fmt.Sprintf("job-%d.log", opts.jobID))
@@ -114,19 +117,22 @@ func extractFirstFailingStepOutput(opts auditJobRunOptions, jobLogContent string
 	return nil
 }
 
-func renderAuditJobSummary(opts auditJobRunOptions, jobLogPath string) {
+func renderAuditJobSummary(opts auditJobRunOptions, jobLogPath string) error {
 	if opts.jsonOutput {
-		return
+		return nil
 	}
-	absOutputDir, _ := filepath.Abs(opts.outputDir)
+	absOutputDir := opts.outputDir
+	if abs, err := filepath.Abs(opts.outputDir); err == nil {
+		absOutputDir = abs
+	}
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Job audit complete. Logs saved to "+absOutputDir))
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("\nDownloaded files:"))
 	fmt.Fprintf(os.Stderr, "  - %s (full job log)\n", jobLogPath)
 	if opts.stepNumber > 0 {
 		renderRequestedStepSummary(opts)
-		return
+		return nil
 	}
-	renderFailingStepSummary(opts)
+	return renderFailingStepSummary(opts)
 }
 
 func renderRequestedStepSummary(opts auditJobRunOptions) {
@@ -136,12 +142,16 @@ func renderRequestedStepSummary(opts auditJobRunOptions) {
 	}
 }
 
-func renderFailingStepSummary(opts auditJobRunOptions) {
+func renderFailingStepSummary(opts auditJobRunOptions) error {
 	failingStepPath := filepath.Join(opts.outputDir, fmt.Sprintf("job-%d-step-*-failed.log", opts.jobID))
-	matches, _ := filepath.Glob(failingStepPath)
+	matches, err := filepath.Glob(failingStepPath)
+	if err != nil {
+		return fmt.Errorf("could not search for failing step logs: %w", err)
+	}
 	for _, match := range matches {
 		fmt.Fprintf(os.Stderr, "  - %s (first failing step)\n", match)
 	}
+	return nil
 }
 
 // extractStepOutput extracts the output of a specific step from job logs

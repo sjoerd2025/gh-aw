@@ -9,8 +9,8 @@ import (
 	"slices"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
@@ -20,26 +20,12 @@ import (
 var pkgLog = logger.New("linters:wgdonenotdeferred")
 
 // Analyzer is the wgdonenotdeferred analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "wgdonenotdeferred",
-	Doc:      "reports sync.WaitGroup Done() calls that are not deferred, which can cause deadlock if the function panics",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/wgdonenotdeferred",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("wgdonenotdeferred", "reports sync.WaitGroup Done() calls that are not deferred, which can cause deadlock if the function panics", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
 
-	insp, err := astutil.Inspector(pass)
-	if err != nil {
-		return nil, err
-	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +34,7 @@ func run(pass *analysis.Pass) (any, error) {
 		(*ast.FuncDecl)(nil),
 	}
 
-	insp.Preorder(nodeFilter, func(n ast.Node) {
+	return analyzerutil.Preorder(pass, nodeFilter, func(n ast.Node) {
 		fn, ok := n.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
 			return
@@ -59,12 +45,11 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 		inspectBody(pass, noLintIndex, fn.Body)
 	})
-
-	return nil, nil
 }
 
 func inspectBody(pass *analysis.Pass, noLintIndex nolint.DirectiveIndex, body *ast.BlockStmt) {
 	var stack []ast.Node
+	deferredFuncLits := make(map[*ast.FuncLit]struct{})
 
 	ast.Inspect(body, func(node ast.Node) bool {
 		if node == nil {
@@ -73,19 +58,24 @@ func inspectBody(pass *analysis.Pass, noLintIndex nolint.DirectiveIndex, body *a
 		}
 
 		if deferStmt, ok := node.(*ast.DeferStmt); ok {
-			// A deferred function literal is already deferred; its body should not
-			// be analyzed as non-deferred Done() calls.
 			if deferStmt.Call != nil {
-				if _, ok := deferStmt.Call.Fun.(*ast.FuncLit); ok {
-					return false
+				if deferredFuncLit, ok := astutil.UnwrapParenExpr(deferStmt.Call.Fun).(*ast.FuncLit); ok {
+					deferredFuncLits[deferredFuncLit] = struct{}{}
 				}
+			}
+		}
+
+		if funcLit, ok := node.(*ast.FuncLit); ok {
+			if _, deferred := deferredFuncLits[funcLit]; deferred {
+				stack = append(stack, node)
+				return false
 			}
 		}
 
 		inLoop := false
 	loopSearch:
-		for i := range slices.Backward(stack) {
-			switch stack[i].(type) {
+		for _, ancestor := range slices.Backward(stack) {
+			switch ancestor.(type) {
 			case *ast.FuncLit:
 				break loopSearch
 			case *ast.ForStmt, *ast.RangeStmt:
@@ -100,7 +90,7 @@ func inspectBody(pass *analysis.Pass, noLintIndex nolint.DirectiveIndex, body *a
 			// A deferred call appears as a DeferStmt, not an ExprStmt, so checking for
 			// ExprStmt naturally excludes deferred calls.
 			if exprStmt, ok := node.(*ast.ExprStmt); ok {
-				if call, ok := exprStmt.X.(*ast.CallExpr); ok {
+				if call, ok := astutil.UnwrapParenExpr(exprStmt.X).(*ast.CallExpr); ok {
 					if isWaitGroupDone(pass, call) {
 						pos := pass.Fset.PositionFor(call.Pos(), false)
 						if !nolint.HasDirectiveForLinter(pos, noLintIndex, "wgdonenotdeferred") {
@@ -119,7 +109,7 @@ func inspectBody(pass *analysis.Pass, noLintIndex nolint.DirectiveIndex, body *a
 }
 
 func isWaitGroupDone(pass *analysis.Pass, call *ast.CallExpr) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Done" {
 		return false
 	}

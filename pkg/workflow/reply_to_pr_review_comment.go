@@ -12,7 +12,6 @@ type ReplyToPullRequestReviewCommentConfig struct {
 	BaseSafeOutputConfig   `yaml:",inline"`
 	SafeOutputTargetConfig `yaml:",inline"`
 	SafeOutputFilterConfig `yaml:",inline"`
-	Footer                 *string `yaml:"footer,omitempty"` // Whether to add AI-generated footer to replies
 }
 
 // parseReplyToPullRequestReviewCommentConfig handles reply-to-pull-request-review-comment configuration
@@ -28,10 +27,8 @@ func (c *Compiler) parseReplyToPullRequestReviewCommentConfig(outputMap map[stri
 			c.parseBaseSafeOutputConfig(configMap, &config.BaseSafeOutputConfig, 10)
 
 			// Parse target
-			if target, exists := configMap["target"]; exists {
-				if targetStr, ok := target.(string); ok {
-					config.Target = targetStr
-				}
+			if targetStr := extractTargetFromMap(configMap, replyToPRReviewCommentLog); targetStr != "" {
+				config.Target = targetStr
 			}
 
 			// Parse target-repo using shared helper with validation
@@ -52,6 +49,9 @@ func (c *Compiler) parseReplyToPullRequestReviewCommentConfig(outputMap map[stri
 				}
 			}
 
+			// Parse filter config (required-labels, required-title-prefix)
+			config.SafeOutputFilterConfig = ParseFilterConfig(configMap)
+
 			// Parse footer as templatable bool
 			if err := preprocessBoolFieldAsString(configMap, "footer", replyToPRReviewCommentLog); err != nil {
 				replyToPRReviewCommentLog.Printf("Invalid footer value: %v", err)
@@ -61,7 +61,7 @@ func (c *Compiler) parseReplyToPullRequestReviewCommentConfig(outputMap map[stri
 				config.Footer = &footer
 			}
 
-			replyToPRReviewCommentLog.Printf("Parsed reply-to-pull-request-review-comment config: max=%d", config.Max)
+			replyToPRReviewCommentLog.Printf("Parsed reply-to-pull-request-review-comment config: max=%v", config.Max)
 		} else {
 			// If configData is nil or not a map, still set the default max
 			config.Max = defaultIntStr(10)

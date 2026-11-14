@@ -29,7 +29,7 @@ set +o histexpand
 #   $RUNNER_TEMP/gh-aw/                     - runner temp gh-aw directory
 #
 # Common cache directories (node_modules, __pycache__, .cache, vendor, .npm, .yarn,
-# .pnpm-store, site-packages, .bundle) are excluded to keep the listing concise.
+# .pnpm-store, site-packages, .bundle, tool-cache) are excluded to keep the listing concise.
 # Exclusions use -prune so find does not descend into excluded trees.
 #
 # Environment variables (set automatically by GitHub Actions):
@@ -37,6 +37,7 @@ set +o histexpand
 #   HOME               - agent user home directory
 #   RUNNER_TEMP        - runner temporary directory
 #   GITHUB_OUTPUT      - path to the GitHub Actions output file
+#   GITHUB_STEP_SUMMARY- path to the GitHub Actions step summary file (optional)
 #
 # GitHub Actions outputs written:
 #   pre-agent-audit-file        - path to the audit file
@@ -48,7 +49,21 @@ set +o histexpand
 set -euo pipefail
 
 AUDIT_FILE="/tmp/gh-aw/pre-agent-audit.txt"
+if [ -L /tmp/gh-aw ]; then
+  echo "::error::Refusing to use a symlinked gh-aw temporary directory" >&2
+  exit 1
+fi
 mkdir -p /tmp/gh-aw
+if [ -L /tmp/gh-aw ] || [ ! -d /tmp/gh-aw ]; then
+  echo "::error::gh-aw temporary path is not a real directory" >&2
+  exit 1
+fi
+if [ -L "$AUDIT_FILE" ] || [ -L "${GITHUB_OUTPUT}" ] || { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -L "${GITHUB_STEP_SUMMARY}" ]; }; then
+  echo "::error::Refusing to write through a symlinked audit output path" >&2
+  exit 1
+fi
+AUDIT_TMP="$(mktemp /tmp/gh-aw/.pre-agent-audit.XXXXXX)"
+trap 'rm -f -- "$AUDIT_TMP"' EXIT
 
 # list_dir prints a section header and runs find on the given directory,
 # pruning common cache folders so find does not descend into them.
@@ -57,7 +72,7 @@ list_dir() {
   local label="$1"
   local dir="$2"
   echo "--- ${label}: ${dir} ---"
-  find "${dir}" \
+  find -P "${dir}" \
     \( \
       -name 'node_modules' \
       -o -name '__pycache__' \
@@ -68,6 +83,7 @@ list_dir() {
       -o -name '.pnpm-store' \
       -o -name 'site-packages' \
       -o -name '.bundle' \
+      -o -name 'tool-cache' \
     \) -prune \
     -o -print \
     2>/dev/null || echo "(not found)"
@@ -97,9 +113,43 @@ list_dir() {
 
   echo "--- Runner ---"
   list_dir "gh-aw temp directory"    "${RUNNER_TEMP}/gh-aw"
-} > "${AUDIT_FILE}"
+} > "${AUDIT_TMP}"
 
-LINE_COUNT="$(wc -l < "${AUDIT_FILE}" | tr -d ' ')"
+# Render the audit listing as a collapsed, compact tree in the step summary.
+render_summary_tree() {
+  local line
+  local label
+  echo "<details>"
+  echo "<summary>Pre-agent workspace audit</summary>"
+  echo
+  echo '```text'
+  while IFS= read -r line; do
+    case "${line}" in
+      "=== "*) continue ;;
+      "--- "*": "*" ---")
+        label="${line#--- }"
+        echo "│   ├── ${label% ---}"
+        ;;
+      "--- "*" ---")
+        label="${line#--- }"
+        echo "├── ${label% ---}"
+        ;;
+      "(not found)") echo "│   │   └── ${line}" ;;
+      "") continue ;;
+      *) echo "│   │   └── ${line}" ;;
+    esac
+  done < "${AUDIT_TMP}"
+  echo '```'
+  echo "</details>"
+}
+
+LINE_COUNT="$(wc -l < "${AUDIT_TMP}" | tr -d ' ')"
+render_summary_tree >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+if [ -L "$AUDIT_FILE" ]; then
+  echo "::error::Refusing to replace a symlinked audit file" >&2
+  exit 1
+fi
+mv -f -- "$AUDIT_TMP" "$AUDIT_FILE"
 echo "pre-agent-audit-file=${AUDIT_FILE}" >> "${GITHUB_OUTPUT}"
 echo "pre-agent-audit-line-count=${LINE_COUNT}" >> "${GITHUB_OUTPUT}"
 echo "Pre-agent audit written to ${AUDIT_FILE} (${LINE_COUNT} lines)"

@@ -19,9 +19,7 @@ engine:
 max-tool-denials: 3
 imports:
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
+  - shared/reporting.md
 tools:
   cli-proxy: true
   edit:
@@ -105,7 +103,9 @@ Create a workflow that includes:
 **Frontmatter (YAML):**
 - `on:` - Appropriate trigger(s)
 - `permissions:` - Minimal required permissions
-- `engine:` - Default to "copilot"
+- `engine:` - Omit when the request gives no engine preference or
+  engine-specific requirement. If an explicit model requirement forces engine
+  selection, try Copilot first.
 - `tools:` - Only include tools that are actually needed
 - `safe-outputs:` - Configure if the workflow should create issues/PRs/comments/discussions
 - `timeout-minutes:` - Reasonable timeout (typically 10-15 minutes)
@@ -250,7 +250,6 @@ on:
 permissions:
   contents: read
   issues: write
-engine: copilot
 tools:
   github:
     mode: gh-proxy

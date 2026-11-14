@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/github/gh-aw/pkg/workflow"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -550,19 +552,23 @@ imports:
 
 # Workflow
 `
-	spec := &WorkflowSpec{
-		RepoSpec: RepoSpec{
-			RepoSlug: "github/gh-aw",
-			Version:  "v1.0.0",
-		},
-		WorkflowPath: ".github/workflows/ci-coach.md",
-	}
-
 	tmpDir := t.TempDir()
-	// No network in unit tests: the download attempt for the first import will fail silently
-	// (verbose=false).  The second import must be deduplicated without a second download.
-	err := fetchAndSaveRemoteFrontmatterImports(t.Context(), content, spec, tmpDir, false, false, nil)
+	downloadCalls := 0
+	opts := frontmatterImportsOpts{
+		owner:           "github",
+		repo:            "gh-aw",
+		ref:             "v1.0.0",
+		originalBaseDir: ".github/workflows",
+		targetDir:       tmpDir,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(context.Context, string, string, string, string) ([]byte, error) {
+			downloadCalls++
+			return nil, errors.New("download failed")
+		},
+	}
+	err := fetchFrontmatterImportsRecursive(t.Context(), content, ".github/workflows", opts)
 	require.NoError(t, err, "section-fragment deduplication should not error")
+	require.Equal(t, 1, downloadCalls, "duplicate sections should trigger only one download")
 
 	entries, readErr := os.ReadDir(tmpDir)
 	require.NoError(t, readErr)
@@ -672,7 +678,11 @@ func TestFetchAndSaveRemoteIncludes_PathTraversalRejected(t *testing.T) {
 	spec := &WorkflowSpec{
 		RepoSpec: RepoSpec{RepoSlug: "github/gh-aw", Version: "main"},
 	}
-	err := fetchAndSaveRemoteIncludes(t.Context(), "@include ../secrets/evil.md\n", spec, targetDir, false, false, nil, mockFetch)
+	err := fetchAndSaveRemoteIncludesWithOptions(t.Context(), "@include ../secrets/evil.md\n", includesFetchOptions{
+		spec:      spec,
+		targetDir: targetDir,
+		fetchFn:   mockFetch,
+	})
 	require.Error(t, err)
 	require.NoFileExists(t, filepath.Join(tmpDir, ".github", "secrets", "evil.md"))
 }
@@ -690,7 +700,11 @@ func TestFetchAndSaveRemoteIncludes_NestedTraversalRejected(t *testing.T) {
 		RepoSpec: RepoSpec{RepoSlug: "github/gh-aw", Version: "main"},
 	}
 	// A path that doesn't start with "../" but still escapes via a sub-directory component.
-	err := fetchAndSaveRemoteIncludes(t.Context(), "@include subdir/../../secrets/evil.md\n", spec, targetDir, false, false, nil, mockFetch)
+	err := fetchAndSaveRemoteIncludesWithOptions(t.Context(), "@include subdir/../../secrets/evil.md\n", includesFetchOptions{
+		spec:      spec,
+		targetDir: targetDir,
+		fetchFn:   mockFetch,
+	})
 	require.Error(t, err)
 	require.NoFileExists(t, filepath.Join(tmpDir, ".github", "secrets", "evil.md"))
 }
@@ -707,7 +721,11 @@ func TestFetchAndSaveRemoteIncludes_SharedIncludeStaysUnderSharedDir(t *testing.
 	spec := &WorkflowSpec{
 		RepoSpec: RepoSpec{RepoSlug: "github/gh-aw", Version: "main"},
 	}
-	err := fetchAndSaveRemoteIncludes(t.Context(), "@include shared/helper.md\n", spec, targetDir, false, false, nil, mockFetch)
+	err := fetchAndSaveRemoteIncludesWithOptions(t.Context(), "@include shared/helper.md\n", includesFetchOptions{
+		spec:      spec,
+		targetDir: targetDir,
+		fetchFn:   mockFetch,
+	})
 	require.NoError(t, err)
 	assert.FileExists(t, filepath.Join(tmpDir, ".github", "shared", "helper.md"))
 }
@@ -856,6 +874,341 @@ imports:
 		"transitive dep must be written to shared/control-aux.md")
 	assert.NoFileExists(t, filepath.Join(tmpDir, "control-aux.md"),
 		"transitive dep must not be written at the root level")
+}
+
+func TestFetchFrontmatterImportsRecursive_PreservesRelativeLayout(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseDir string
+		imports string
+		files   map[string]string
+	}{
+		{
+			name:    "shared imports",
+			baseDir: ".github/workflows",
+			imports: "shared/review.md",
+			files:   map[string]string{".github/workflows/shared/review.md": "# Shared review\n"},
+		},
+		{
+			name:    "external prompt",
+			baseDir: ".github/workflows",
+			imports: "../prompts/review.md",
+			files:   map[string]string{".github/prompts/review.md": "# External review\n"},
+		},
+		{
+			name:    "nested and transitive imports",
+			baseDir: ".github/workflows",
+			imports: "shared/review.md",
+			files: map[string]string{
+				".github/workflows/shared/review.md": "---\nimports:\n  - ./../../prompts/review.md\n---\n# Shared review\n",
+				".github/prompts/review.md":          "---\nimports:\n  - ./nested/context.md\n---\n# External review\n",
+				".github/prompts/nested/context.md":  "# Nested context\n",
+			},
+		},
+		{
+			name:    "source workflow in custom directory",
+			baseDir: "library/workflows",
+			imports: "../prompts/review.md",
+			files:   map[string]string{"library/prompts/review.md": "# External review\n"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repoRoot := t.TempDir()
+			require.NoError(t, initTestGitRepo(repoRoot))
+			t.Chdir(repoRoot)
+			targetDir := filepath.Join(repoRoot, ".github", "workflows")
+			require.NoError(t, os.MkdirAll(targetDir, 0755))
+			content := fmt.Sprintf("---\non: workflow_dispatch\nengine: copilot\nnetwork: defaults\nimports:\n  - %s\ninlined-imports: true\n---\n# Review workflow\n", tt.imports)
+			workflowPath := filepath.Join(targetDir, "review.md")
+			require.NoError(t, os.WriteFile(workflowPath, []byte(content), 0600))
+			var downloaded []string
+			opts := frontmatterImportsOpts{
+				originalBaseDir: tt.baseDir,
+				targetDir:       targetDir,
+				strict:          true,
+				seen:            make(map[string]struct{}),
+				downloadFn: func(_ context.Context, _, _, remotePath, _ string) ([]byte, error) {
+					downloaded = append(downloaded, remotePath)
+					body, ok := tt.files[remotePath]
+					if !ok {
+						return nil, fmt.Errorf("unexpected download: %s", remotePath)
+					}
+					return []byte(body), nil
+				},
+			}
+			require.NoError(t, fetchFrontmatterImportsRecursive(t.Context(), content, tt.baseDir, opts))
+			require.Len(t, downloaded, len(tt.files))
+			for remotePath, body := range tt.files {
+				rel, err := filepath.Rel(filepath.FromSlash(tt.baseDir), filepath.FromSlash(remotePath))
+				require.NoError(t, err)
+				localContent, err := os.ReadFile(filepath.Join(targetDir, rel))
+				require.NoError(t, err)
+				assert.Equal(t, body, string(localContent))
+			}
+			assert.NoDirExists(t, filepath.Join(targetDir, ".github"))
+
+			compiler := workflow.NewCompiler()
+			compiler.SetQuiet(true)
+			compiler.SetStrictMode(true)
+			require.NoError(t, compiler.CompileWorkflow(workflowPath))
+			assert.FileExists(t, filepath.Join(targetDir, "review.lock.yml"))
+
+			// Existing imports must still be traversed to restore missing dependencies.
+			clear(opts.seen)
+			downloaded = nil
+			require.NoError(t, fetchFrontmatterImportsRecursive(t.Context(), content, tt.baseDir, opts))
+			assert.Empty(t, downloaded)
+			if tt.name == "nested and transitive imports" {
+				require.NoError(t, os.Remove(filepath.Join(repoRoot, ".github", "prompts", "nested", "context.md")))
+				clear(opts.seen)
+				require.NoError(t, fetchFrontmatterImportsRecursive(t.Context(), content, tt.baseDir, opts))
+				assert.Equal(t, []string{".github/prompts/nested/context.md"}, downloaded)
+			}
+		})
+	}
+}
+
+func TestFetchFrontmatterImportsRecursive_RejectsUnsafeDestinations(t *testing.T) {
+	for _, strict := range []bool{false, true} {
+		for _, tt := range []struct {
+			baseDir    string
+			importPath string
+		}{
+			{".github/workflows", "../../../outside.md"},
+			{".github/workflows", "/../outside.md"},
+			{".github/workflows", "/"},
+			{".github/workflows", "/scripts/helper.md"},
+			{".github/workflows", "/.agents/agent.md"},
+			{".github/workflows", "../../README.md"},
+			{".github/workflows/nested", "../../../outside.md"},
+		} {
+			t.Run(fmt.Sprintf("strict=%t/%s/%s", strict, tt.baseDir, tt.importPath), func(t *testing.T) {
+				repoRoot := t.TempDir()
+				require.NoError(t, initTestGitRepo(repoRoot))
+				opts := frontmatterImportsOpts{
+					originalBaseDir: tt.baseDir,
+					targetDir:       filepath.Join(repoRoot, ".github", "workflows"),
+					strict:          strict,
+					seen:            make(map[string]struct{}),
+					downloadFn: func(context.Context, string, string, string, string) ([]byte, error) {
+						t.Fatal("unsafe imports must be rejected before downloading")
+						return nil, nil
+					},
+				}
+				content := fmt.Sprintf("---\nimports:\n  - %q\n---\n", tt.importPath)
+				err := fetchFrontmatterImportsRecursive(t.Context(), content, tt.baseDir, opts)
+				if strict {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+				entries, err := os.ReadDir(repoRoot)
+				require.NoError(t, err)
+				require.Len(t, entries, 1)
+				assert.Equal(t, ".git", entries[0].Name())
+			})
+		}
+	}
+}
+
+func TestFetchFrontmatterImportsRecursive_RejectsSymlinkEscape(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, initTestGitRepo(repoRoot))
+	outside := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(repoRoot, ".github"), 0755))
+	require.NoError(t, os.Symlink(outside, filepath.Join(repoRoot, ".github", "prompts")))
+	opts := frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       filepath.Join(repoRoot, ".github", "workflows"),
+		strict:          true,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(context.Context, string, string, string, string) ([]byte, error) {
+			t.Fatal("symlink escapes must be rejected before downloading")
+			return nil, nil
+		},
+	}
+	err := fetchFrontmatterImportsRecursive(t.Context(), "---\nimports:\n  - ../prompts/new/review.md\n---\n", ".github/workflows", opts)
+	require.Error(t, err)
+	assert.NoFileExists(t, filepath.Join(outside, "new", "review.md"))
+}
+
+func TestFetchFrontmatterImportsRecursive_CustomDestinationBoundary(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, initTestGitRepo(repoRoot))
+	opts := frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       filepath.Join(repoRoot, "workflows"),
+		strict:          true,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(context.Context, string, string, string, string) ([]byte, error) {
+			t.Fatal("imports escaping a custom destination must be rejected before downloading")
+			return nil, nil
+		},
+	}
+	err := fetchFrontmatterImportsRecursive(t.Context(), "---\nimports:\n  - ../../outside.md\n---\n", ".github/workflows", opts)
+	require.ErrorContains(t, err, "outside repository root")
+}
+
+func TestFetchFrontmatterImportsRecursive_CustomDestinationInDirectory(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, initTestGitRepo(repoRoot))
+	targetDir := filepath.Join(repoRoot, "workflows")
+	require.NoError(t, os.MkdirAll(targetDir, 0755))
+	var downloaded []string
+	opts := frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       targetDir,
+		strict:          true,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(_ context.Context, _, _, remotePath, _ string) ([]byte, error) {
+			downloaded = append(downloaded, remotePath)
+			return []byte("# Shared\n"), nil
+		},
+	}
+	err := fetchFrontmatterImportsRecursive(t.Context(), "---\nimports:\n  - shared/review.md\n---\n", ".github/workflows", opts)
+	require.NoError(t, err)
+	require.Equal(t, []string{".github/workflows/shared/review.md"}, downloaded)
+	assert.FileExists(t, filepath.Join(targetDir, "shared", "review.md"))
+}
+
+func TestFetchFrontmatterImportsRecursive_CustomDestinationRejectsEscapingImport(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, initTestGitRepo(repoRoot))
+	targetDir := filepath.Join(repoRoot, "workflows")
+	require.NoError(t, os.MkdirAll(targetDir, 0755))
+	opts := frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       targetDir,
+		strict:          true,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(context.Context, string, string, string, string) ([]byte, error) {
+			t.Fatal("imports outside the custom destination must be rejected before downloading")
+			return nil, nil
+		},
+	}
+	err := fetchFrontmatterImportsRecursive(t.Context(), "---\nimports:\n  - ../prompts/review.md\n---\n", ".github/workflows", opts)
+	require.ErrorContains(t, err, "outside import destination boundary")
+}
+
+func TestFetchFrontmatterImportsRecursive_AbsoluteInRootSymlinks(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, initTestGitRepo(repoRoot))
+	promptsDir := filepath.Join(repoRoot, ".github", "prompts")
+	require.NoError(t, os.MkdirAll(promptsDir, 0755))
+	target := filepath.Join(promptsDir, "installed.md")
+	require.NoError(t, os.WriteFile(target, []byte("---\nimports:\n  - nested.md\n---\n# Installed\n"), 0600))
+	link := filepath.Join(promptsDir, "review.md")
+	require.NoError(t, os.Symlink(target, link))
+
+	opts := frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       filepath.Join(repoRoot, ".github", "workflows"),
+		strict:          true,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(_ context.Context, _, _, remotePath, _ string) ([]byte, error) {
+			require.Equal(t, ".github/prompts/nested.md", remotePath)
+			return []byte("# Nested\n"), nil
+		},
+	}
+	content := "---\nimports:\n  - ../prompts/review.md\n---\n"
+	require.NoError(t, fetchFrontmatterImportsRecursive(t.Context(), content, ".github/workflows", opts))
+	assert.FileExists(t, filepath.Join(promptsDir, "nested.md"))
+
+	opts.force = true
+	clear(opts.seen)
+	opts.downloadFn = func(_ context.Context, _, _, remotePath, _ string) ([]byte, error) {
+		require.Equal(t, ".github/prompts/review.md", remotePath)
+		return []byte("# Updated\n"), nil
+	}
+	require.NoError(t, fetchFrontmatterImportsRecursive(t.Context(), content, ".github/workflows", opts))
+	updated, err := os.ReadFile(target)
+	require.NoError(t, err)
+	assert.Equal(t, "# Updated\n", string(updated))
+	linkTarget, err := os.Readlink(link)
+	require.NoError(t, err)
+	assert.Equal(t, target, linkTarget)
+}
+
+func TestFetchFrontmatterImportsRecursive_AbsoluteInRootSymlinkParent(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, initTestGitRepo(repoRoot))
+	targetDir := filepath.Join(repoRoot, ".github", "shared-prompts")
+	require.NoError(t, os.MkdirAll(targetDir, 0755))
+	linkDir := filepath.Join(repoRoot, ".github", "prompts")
+	require.NoError(t, os.Symlink(targetDir, linkDir))
+
+	opts := frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       filepath.Join(repoRoot, ".github", "workflows"),
+		strict:          true,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(context.Context, string, string, string, string) ([]byte, error) {
+			return []byte("# Review\n"), nil
+		},
+	}
+	content := "---\nimports:\n  - ../prompts/nested/review.md\n---\n"
+	require.NoError(t, fetchFrontmatterImportsRecursive(t.Context(), content, ".github/workflows", opts))
+	assert.FileExists(t, filepath.Join(targetDir, "nested", "review.md"))
+}
+
+func TestFetchFrontmatterImportsRecursive_RejectsImportOutsideGitHubBoundary(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, initTestGitRepo(repoRoot))
+	opts := frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       filepath.Join(repoRoot, ".github", "workflows"),
+		strict:          true,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(context.Context, string, string, string, string) ([]byte, error) {
+			t.Fatal("imports outside workspace/.github must be rejected before downloading")
+			return nil, nil
+		},
+	}
+	err := fetchFrontmatterImportsRecursive(t.Context(), "---\nimports:\n  - /scripts/helper.md\n---\n", ".github/workflows", opts)
+	require.ErrorContains(t, err, "outside import destination boundary")
+}
+
+func TestFetchFrontmatterImportsRecursive_WarnsWhenDestinationRootCannotOpen(t *testing.T) {
+	targetDir := filepath.Join(t.TempDir(), "missing")
+	reader, writer, err := os.Pipe()
+	require.NoError(t, err)
+	originalStderr := os.Stderr
+	os.Stderr = writer
+	err = fetchFrontmatterImportsRecursive(t.Context(), "---\nimports:\n  - shared/review.md\n---\n", ".github/workflows", frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       targetDir,
+		verbose:         true,
+		seen:            make(map[string]struct{}),
+	})
+	os.Stderr = originalStderr
+	require.NoError(t, writer.Close())
+	output, readErr := io.ReadAll(reader)
+	require.NoError(t, reader.Close())
+	require.NoError(t, readErr)
+	require.NoError(t, err)
+	assert.Contains(t, string(output), "Failed to open import destination root")
+}
+
+func TestFetchFrontmatterImportsRecursive_RejectsDanglingSymlinkEscape(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, initTestGitRepo(repoRoot))
+	outsidePath := filepath.Join(t.TempDir(), "review.md")
+	promptsDir := filepath.Join(repoRoot, ".github", "prompts")
+	require.NoError(t, os.MkdirAll(promptsDir, 0755))
+	require.NoError(t, os.Symlink(outsidePath, filepath.Join(promptsDir, "review.md")))
+	opts := frontmatterImportsOpts{
+		originalBaseDir: ".github/workflows",
+		targetDir:       filepath.Join(repoRoot, ".github", "workflows"),
+		strict:          true,
+		seen:            make(map[string]struct{}),
+		downloadFn: func(context.Context, string, string, string, string) ([]byte, error) {
+			return []byte("# Review\n"), nil
+		},
+	}
+	err := fetchFrontmatterImportsRecursive(t.Context(), "---\nimports:\n  - ../prompts/review.md\n---\n", ".github/workflows", opts)
+	require.Error(t, err)
+	assert.NoFileExists(t, outsidePath)
 }
 
 func TestFetchAndSaveRemoteRuntimeImports_EmptyRepoSlug(t *testing.T) {
@@ -1536,6 +1889,141 @@ safe-outputs:
 	assert.Contains(t, tracker.CreatedFiles, ymlPath)
 }
 
+func TestFetchAndSaveRemoteDispatchWorkflows_YmlFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	ymlContent := `name: Dispatched workflow
+on:
+  workflow_dispatch:
+jobs:
+  run: {runs-on: ubuntu-latest, steps: [{run: echo hello}]}
+`
+	downloader := func(_ context.Context, _, _, remotePath, _ string) ([]byte, error) {
+		if filepath.Ext(remotePath) == ".yml" {
+			return []byte(ymlContent), nil
+		}
+		return nil, errors.New("not found")
+	}
+	content := `---
+engine: copilot
+safe-outputs:
+  dispatch-workflow:
+    - worker
+---
+`
+	spec := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "github/gh-aw", Version: "main"},
+		WorkflowPath: ".github/workflows/orchestrator.md",
+	}
+	tracker := &FileTracker{OriginalContent: make(map[string][]byte), gitRoot: tmpDir}
+
+	err := fetchAndSaveRemoteDispatchWorkflows(context.Background(), content, spec, tmpDir, false, false, tracker, downloader)
+	require.NoError(t, err)
+
+	ymlPath := filepath.Join(tmpDir, "worker.yml")
+	got, err := os.ReadFile(ymlPath)
+	require.NoError(t, err)
+	assert.YAMLEq(t, ymlContent, string(got))
+	assert.Contains(t, tracker.CreatedFiles, ymlPath)
+}
+
+// TestFetchAndSaveRemoteDispatchWorkflows_ConflictDifferentSource verifies that an existing
+// dispatch workflow from a different source causes an error when force=false.
+func TestFetchAndSaveRemoteDispatchWorkflows_ConflictDifferentSource(t *testing.T) {
+	tmpDir := t.TempDir()
+	conflictContent := `---
+source: otherorg/other-repo/.github/workflows/worker.md@v1
+---
+# Worker from other repo
+`
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "worker.md"), []byte(conflictContent), 0600))
+
+	content := `---
+engine: copilot
+safe-outputs:
+  dispatch-workflow:
+    - worker
+---
+
+# Orchestrator
+`
+	spec := &WorkflowSpec{
+		RepoSpec: RepoSpec{
+			RepoSlug: "github/gh-aw",
+			Version:  "main",
+		},
+		WorkflowPath: ".github/workflows/orchestrator.md",
+	}
+
+	err := fetchAndSaveRemoteDispatchWorkflows(context.Background(), content, spec, tmpDir, false, false, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "dispatch workflow")
+	require.ErrorContains(t, err, "already exists")
+
+	// The existing file must be untouched.
+	gotContent, readErr := os.ReadFile(filepath.Join(tmpDir, "worker.md"))
+	require.NoError(t, readErr)
+	assert.Equal(t, conflictContent, string(gotContent))
+}
+
+// TestFetchAndSaveRemoteDispatchWorkflows_TrackingBeforeWrite verifies that TrackModified is
+// called with the original file content (i.e. before os.WriteFile overwrites it), so that
+// RollbackAllFiles can restore the correct previous state.
+func TestFetchAndSaveRemoteDispatchWorkflows_TrackingBeforeWrite(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	originalContent := `---
+source: github/gh-aw/.github/workflows/worker.md@v0.9.0
+engine: copilot
+---
+# Old worker
+`
+	workerPath := filepath.Join(tmpDir, "worker.md")
+	require.NoError(t, os.WriteFile(workerPath, []byte(originalContent), 0600))
+
+	newContent := `---
+engine: copilot
+---
+# New worker
+`
+	downloader := func(_ context.Context, _, _, remotePath, _ string) ([]byte, error) {
+		if filepath.Ext(remotePath) == ".md" {
+			return []byte(newContent), nil
+		}
+		return nil, errors.New("not found")
+	}
+
+	content := `---
+engine: copilot
+safe-outputs:
+  dispatch-workflow:
+    - worker
+---
+
+# Orchestrator
+`
+	spec := &WorkflowSpec{
+		RepoSpec: RepoSpec{
+			RepoSlug: "github/gh-aw",
+			Version:  "v1.0.0",
+		},
+		WorkflowPath: ".github/workflows/orchestrator.md",
+	}
+
+	tracker := &FileTracker{
+		OriginalContent: make(map[string][]byte),
+		gitRoot:         tmpDir,
+	}
+
+	err := fetchAndSaveRemoteDispatchWorkflows(context.Background(), content, spec, tmpDir, false, true, tracker, downloader)
+	require.NoError(t, err)
+
+	// The tracker must have captured the *original* content, not the newly written bytes.
+	absWorkerPath, _ := filepath.Abs(workerPath)
+	captured, ok := tracker.OriginalContent[absWorkerPath]
+	require.True(t, ok, "worker.md should be in OriginalContent")
+	assert.Equal(t, []byte(originalContent), captured, "tracker should capture original content before overwrite")
+}
+
 // TestFetchAndSaveRemoteCallWorkflows_TrackingBeforeWrite verifies that TrackModified is
 // called with the original file content (i.e. before os.WriteFile overwrites it), so that
 // RollbackAllFiles can restore the correct previous state.
@@ -1634,77 +2122,6 @@ safe-outputs:
 		require.NoError(t, statErr, "%s.md should be created", name)
 	}
 }
-
-// --- extractResources tests ---
-
-// TestExtractResources_BasicList verifies that resource paths are extracted from the resources field.
-func TestExtractResources_BasicList(t *testing.T) {
-	content := `---
-engine: copilot
-on: issues
-resources:
-  - triage-issue.md
-  - close-stale.md
-  - my-action.yml
----
-
-# Workflow
-`
-	resources, err := extractResources(content)
-	require.NoError(t, err, "should not error for valid resources")
-	assert.Equal(t, []string{"triage-issue.md", "close-stale.md", "my-action.yml"}, resources, "should extract all listed resources")
-}
-
-// TestExtractResources_MacroRejected verifies that an entry with GitHub Actions expression syntax causes an error.
-func TestExtractResources_MacroRejected(t *testing.T) {
-	content := `---
-engine: copilot
-on: issues
-resources:
-  - plain-workflow.md
-  - ${{ vars.WORKFLOW }}.md
----
-
-# Workflow
-`
-	resources, err := extractResources(content)
-	require.Error(t, err, "should error when a resource entry contains macro syntax")
-	assert.Nil(t, resources, "should return nil resources on error")
-	require.ErrorContains(t, err, "${{", "error message should mention the disallowed syntax")
-}
-
-// TestExtractResources_AllMacrosRejected verifies that all-macro lists return an error.
-func TestExtractResources_AllMacrosRejected(t *testing.T) {
-	content := `---
-engine: copilot
-on: issues
-resources:
-  - ${{ vars.WORKFLOW_A }}
-  - ${{ vars.WORKFLOW_B }}
----
-
-# Workflow
-`
-	resources, err := extractResources(content)
-	require.Error(t, err, "should error when all resources are macros")
-	assert.Nil(t, resources)
-}
-
-// TestExtractResources_NoResourcesField verifies that nil is returned when no resources field.
-func TestExtractResources_NoResourcesField(t *testing.T) {
-	content := `---
-engine: copilot
-on: issues
----
-
-# Workflow
-`
-	resources, err := extractResources(content)
-	require.NoError(t, err, "should not error when no resources field")
-	assert.Empty(t, resources, "should return nil when no resources field")
-}
-
-// --- fetchAndSaveRemoteResources tests ---
 
 // TestFetchAndSaveRemoteResources_NoResources verifies that the function is a no-op when the
 // workflow has no resources field.

@@ -26,7 +26,7 @@ permissions:
   contents: read
   issues: read
   actions: read
-model: claude-sonnet-4.6
+model: claude-sonnet-5
 engine:
   id: claude
 strict: true
@@ -36,9 +36,6 @@ network:
     - defaults
     - node
     - ai-gateway.vercel.sh
-sandbox:
-  agent:
-    sudo: false
 tools:
   bash:
     - "*"
@@ -57,7 +54,7 @@ steps:
       persist-credentials: false
 
   - name: Setup Node.js
-    uses: actions/setup-node@v7.0.0
+    uses: actions/setup-node@v7.1.0
     with:
       node-version: "22"
 
@@ -110,11 +107,14 @@ steps:
       } > "$AGENT_ROOT/context.md"
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 evals:
   - id: deepsec_scan_completed
     question: Did the agent complete the prepared DeepSec scan workflow or explicitly noop when credentials or actionable findings were unavailable?
   - id: deepsec_issue_or_noop
     question: Did the run create exactly one issue for actionable DeepSec findings, or noop with a concise explanation?
+features:
+  gh-aw-detection: true
 ---
 
 # DeepSec Security Scan

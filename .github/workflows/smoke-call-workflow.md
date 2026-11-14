@@ -4,6 +4,7 @@ emoji: "🧪"
 name: Smoke Call Workflow
 description: Smoke test for the call-workflow safe output - orchestrator that calls a worker via workflow_call at compile-time fan-out
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-call-workflow
     strategy: centralized
@@ -15,13 +16,18 @@ on:
 permissions:
   contents: read
   pull-requests: read
-model: gpt-5.4-mini
+model: gpt-5.3-codex
 engine:
   id: codex
 strict: true
 network:
   allowed:
     - defaults
+evals:
+  - id: worker_selection
+    question: Does the agent request the smoke-workflow-call worker through its smoke_workflow_call safe-output tool rather than substituting noop?
+  - id: worker_input
+    question: Does the worker request pass the exact task-description value smoke test checkout validation?
 safe-outputs:
   allowed-domains: [default-safe-outputs]
   call-workflow:
@@ -35,6 +41,9 @@ tools:
   cli-proxy: true
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Call Workflow Orchestrator

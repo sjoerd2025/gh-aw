@@ -1,16 +1,16 @@
 package workflow
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"path"
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/jsonutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/goccy/go-yaml"
@@ -18,6 +18,7 @@ import (
 
 const (
 	behaviorSecretStrategyUniversalLLMConsumer  = "universal-llm-consumer"
+	behaviorSecretStrategyGeminiAPIKey          = "gemini-api-key"
 	behaviorProviderEnvModeUniversalLLMConsumer = "universal-llm-consumer"
 	behaviorConfigMergeJSON                     = "json-merge"
 )
@@ -33,6 +34,9 @@ type BehaviorDefinedEngine struct {
 
 var _ CodingAgentEngine = (*BehaviorDefinedEngine)(nil)
 
+const protectedSessionCaptureID = "${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ strategy.job-index || 0 }}"
+const protectedSessionCaptureLogPath = "${{ runner.temp }}/gh-aw-protected-capture-" + protectedSessionCaptureID
+
 func NewBehaviorDefinedEngine(def *EngineDefinition) (*BehaviorDefinedEngine, error) {
 	if def == nil {
 		return nil, errors.New("engine definition is required")
@@ -40,28 +44,44 @@ func NewBehaviorDefinedEngine(def *EngineDefinition) (*BehaviorDefinedEngine, er
 	if def.Behaviors == nil {
 		return nil, fmt.Errorf("engine definition %q is missing behaviors", def.ID)
 	}
+	if err := validateBehaviorOutputFiles(def.Behaviors.OutputFiles); err != nil {
+		return nil, fmt.Errorf("engine definition %q behaviors.output-files: %w", def.ID, err)
+	}
+	if def.Behaviors.Execution != nil && def.Behaviors.Execution.ProtectedSessionCapture && def.Behaviors.LogParser == "" {
+		return nil, fmt.Errorf("engine definition %q enables protected-session-capture without a log-parser", def.ID)
+	}
+	capabilities := def.Behaviors.Capabilities.ToRuntimeCapabilities()
+	capabilities.MCP = true
+	// Declaring a plugins behavior block is what enables Agent Plugins for the engine:
+	// without it the compiler has no way to make plugins visible to the CLI.
+	capabilities.Plugins = def.Behaviors.Plugins != nil
+	if plugins := def.Behaviors.Plugins; plugins != nil {
+		if plugins.Directory == "" && len(plugins.InstallArgs) == 0 {
+			return nil, fmt.Errorf("engine definition %q declares behaviors.plugins without 'directory' or 'install-args'", def.ID)
+		}
+		if plugins.Directory != "" {
+			if _, ok := resolvePluginDirectory(plugins.Directory); !ok {
+				return nil, fmt.Errorf("engine definition %q declares an unsupported behaviors.plugins.directory %q; use a workspace-relative or '~/' path without '..' segments", def.ID, plugins.Directory)
+			}
+		}
+	}
+	if def.MCP != nil {
+		capabilities.MCP = *def.MCP
+	}
+
 	engine := &BehaviorDefinedEngine{
-		UniversalLLMConsumerEngine: UniversalLLMConsumerEngine{
-			BaseEngine: BaseEngine{
-				id:               def.ID,
-				displayName:      def.DisplayName,
-				description:      def.Description,
-				experimental:     def.Experimental,
-				ghSkillAgentName: def.GHSkillAgentName,
-				capabilities:     def.Behaviors.Capabilities.ToRuntimeCapabilities(),
-			},
-		},
-		definition: def,
+		id:               def.ID,
+		displayName:      def.DisplayName,
+		description:      def.Description,
+		experimental:     def.Experimental,
+		ghSkillAgentName: def.GHSkillAgentName,
+		capabilities:     capabilities,
+		definition:       def,
+	}
+	if engine.protectedSessionCaptureEnabled() && engine.buildWrappedLogParserScript() == "" {
+		return nil, fmt.Errorf("engine definition %q enables protected-session-capture without a usable log-parser", def.ID)
 	}
 	return engine, nil
-}
-
-func newBuiltinBehaviorDefinedEngine(id string) (*BehaviorDefinedEngine, error) {
-	def, err := getBuiltinEngineDefinition(id)
-	if err != nil {
-		return nil, err
-	}
-	return NewBehaviorDefinedEngine(def)
 }
 
 func (e *BehaviorDefinedEngine) behavior() *EngineBehaviorDefinition {
@@ -69,6 +89,18 @@ func (e *BehaviorDefinedEngine) behavior() *EngineBehaviorDefinition {
 		return nil
 	}
 	return e.definition.Behaviors
+}
+
+func (e *BehaviorDefinedEngine) protectedSessionCaptureEnabled() bool {
+	behavior := e.behavior()
+	return behavior != nil && behavior.Execution != nil && behavior.Execution.ProtectedSessionCapture
+}
+
+func (e *BehaviorDefinedEngine) GetLogFileForParsing() string {
+	if e.protectedSessionCaptureEnabled() {
+		return protectedSessionCaptureLogPath
+	}
+	return e.BaseEngine.GetLogFileForParsing()
 }
 
 func (e *BehaviorDefinedEngine) usesUniversalLLMConsumer() bool {
@@ -85,8 +117,16 @@ func (e *BehaviorDefinedEngine) GetModelEnvVarName() string {
 }
 
 func (e *BehaviorDefinedEngine) GetRequiredSecretNames(workflowData *WorkflowData) []string {
+	var backend UniversalLLMBackend
 	if e.usesUniversalLLMConsumer() {
-		return e.GetUniversalRequiredSecretNames(workflowData)
+		backend = e.resolveBackend(workflowData)
+	}
+	return e.getRequiredSecretNamesForBackend(workflowData, backend)
+}
+
+func (e *BehaviorDefinedEngine) getRequiredSecretNamesForBackend(workflowData *WorkflowData, backend UniversalLLMBackend) []string {
+	if e.usesUniversalLLMConsumer() {
+		return e.getUniversalRequiredSecretNamesForBackend(workflowData, backend)
 	}
 
 	seen := make(map[string]struct{})
@@ -134,41 +174,84 @@ func (e *BehaviorDefinedEngine) GetSupportedEnvVarKeys() []string {
 
 func (e *BehaviorDefinedEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
 	behavior := e.behavior()
-	if behavior == nil || behavior.Installation == nil {
+	if behavior == nil {
 		return GitHubActionStep{}
 	}
 	if e.usesUniversalLLMConsumer() {
+		if behavior.Installation == nil {
+			return GitHubActionStep{}
+		}
 		return e.GetUniversalSecretValidationStep(
 			workflowData,
 			e.definition.DisplayName,
 			behavior.Installation.DocumentationURL,
 		)
 	}
-	secrets := e.GetRequiredSecretNames(workflowData)
-	if len(secrets) == 0 {
-		return GitHubActionStep{}
+	secrets := make([]string, 0, len(e.definition.Auth))
+	seen := make(map[string]struct{}, len(e.definition.Auth))
+	for _, binding := range e.definition.Auth {
+		if binding.Secret == "" || setutil.Contains(seen, binding.Secret) {
+			continue
+		}
+		seen[binding.Secret] = struct{}{}
+		secrets = append(secrets, binding.Secret)
 	}
-	return BuildDefaultSecretValidationStep(workflowData, secrets, e.definition.DisplayName, behavior.Installation.DocumentationURL)
+	documentationURL := ""
+	if behavior.Installation != nil {
+		documentationURL = behavior.Installation.DocumentationURL
+	}
+	return BuildEngineSecretValidationStep(workflowData, EngineSecretValidationConfig{
+		SecretNames: secrets,
+		EngineName:  e.definition.DisplayName,
+		DocsURL:     documentationURL,
+	})
 }
 
+//nolint:largefunc // Existing installation steps assembly is kept in generated order.
 func (e *BehaviorDefinedEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActionStep {
 	behavior := e.behavior()
-	if behavior == nil || behavior.Installation == nil {
+	if behavior == nil {
 		return nil
 	}
+	requiresNode := behavior.HarnessScript != "" || isSkipIfDecisionEnabled(workflowData)
 	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
-		return nil
+		var steps []GitHubActionStep
+		if requiresNode {
+			steps = append(steps, generateNodeJsSetupStep(workflowData))
+		}
+		return buildNpmEngineInstallStepsWithAWF(steps, workflowData, false)
+	}
+
+	// Behavior-defined engines that execute via a harness script (e.g. Goose) run the
+	// harness through Node.js, so Node.js (and, when the firewall is enabled, the AWF
+	// binary) must always be installed even when no package-manager based installation
+	// is declared for the engine's CLI itself.
+	if behavior.Installation == nil {
+		if !requiresNode {
+			// Engines that install their CLI through `pre-agent-steps`
+			// declare no installation block at all, but the agent still runs inside the
+			// firewall sandbox, so the AWF binary must be installed.
+			return BuildNpmEngineInstallStepsWithAWF(nil, workflowData)
+		}
+		return BuildNpmEngineInstallStepsWithAWF([]GitHubActionStep{generateNodeJsSetupStep(workflowData)}, workflowData)
 	}
 
 	install := behavior.Installation
 	if install.PackageManager != "npm" {
-		return nil
+		// Non-npm installations are performed by the engine's own steps, but the AWF
+		// binary is still required to run the agent inside the firewall sandbox.
+		var steps []GitHubActionStep
+		if isSkipIfDecisionEnabled(workflowData) {
+			steps = append(steps, generateNodeJsSetupStep(workflowData))
+		}
+		return BuildNpmEngineInstallStepsWithAWF(steps, workflowData)
 	}
 	version := install.Version
 	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.Version != "" {
 		version = workflowData.EngineConfig.Version
 	}
 
+	cooldownDays := resolveEngineCooldownDays(workflowData)
 	npmSteps := GenerateNpmInstallSteps(
 		install.PackageName,
 		version,
@@ -177,9 +260,26 @@ func (e *BehaviorDefinedEngine) GetInstallationSteps(workflowData *WorkflowData)
 		NPMInstallOptions{
 			IncludeNodeSetup:  install.IncludeNodeSetup,
 			RunInstallScripts: install.PostInstallScripts,
-			CooldownEnabled:   install.Cooldown,
+			CooldownDays:      &cooldownDays,
 		},
 	)
+	// MicroVMs cannot rely on the global npm installation. Stage the CLI in
+	// the runtime tree mounted by Cloud Hypervisor or exported through NVX.
+	binaryName := install.BinaryName
+	if binaryName == "" && behavior.Execution != nil {
+		binaryName = behavior.Execution.CommandName
+	}
+	if binaryName != "" && (isCloudHypervisorRuntime(workflowData) || isNVXRuntime(workflowData)) {
+		npmSteps = append(npmSteps, GenerateMicroVMNpmCLIInstallStep(
+			install.PackageName,
+			version,
+			install.StepName+" in microVM path",
+			binaryName,
+			install.PostInstallScripts,
+			true,
+			cooldownDays,
+		))
+	}
 	if install.VerifyCommand != "" {
 		npmSteps = append(npmSteps, GitHubActionStep{
 			"      - name: " + install.VerifyStepName,
@@ -187,6 +287,30 @@ func (e *BehaviorDefinedEngine) GetInstallationSteps(workflowData *WorkflowData)
 		})
 	}
 	return BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
+}
+
+// GetPluginInstallationSteps checks out pinned Agent Plugins and makes them available to
+// the engine, either by staging them in the engine's plugin folder or by running the
+// engine CLI's plugin installation command, as declared in the plugins behavior.
+func (e *BehaviorDefinedEngine) GetPluginInstallationSteps(workflowData *WorkflowData) []GitHubActionStep {
+	behavior := e.behavior()
+	if behavior == nil || behavior.Plugins == nil {
+		return nil
+	}
+
+	commandName := behavior.Plugins.CommandName
+	if commandName == "" && behavior.Execution != nil {
+		commandName = behavior.Execution.CommandName
+	}
+	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
+		commandName = workflowData.EngineConfig.Command
+	}
+
+	return generatePluginInstallationSteps(workflowData, pluginInstallSpec{
+		Command:     commandName,
+		InstallArgs: behavior.Plugins.InstallArgs,
+		Directory:   behavior.Plugins.Directory,
+	})
 }
 
 func (e *BehaviorDefinedEngine) GetAgentManifestFiles() []string {
@@ -206,11 +330,16 @@ func (e *BehaviorDefinedEngine) GetAgentManifestPathPrefixes() []string {
 }
 
 func (e *BehaviorDefinedEngine) RenderMCPConfig(sb *strings.Builder, tools map[string]any, mcpTools []string, workflowData *WorkflowData) error {
-	behavior := e.behavior()
-	if behavior == nil || behavior.MCP == nil || behavior.MCP.ConfigPath == "" {
-		return nil
+	// The rendered config is piped to start_mcp_gateway.cjs, which is what actually
+	// launches the MCP gateway container. It must therefore be emitted even when the
+	// engine declares no MCP config path (e.g. engines with `mcp: false` that consume
+	// MCP-backed tools through cli-proxy): skipping it leaves the gateway container
+	// unstarted while AWF still attempts to attach it to the internal network.
+	configPath := constants.ShellMcpServersJsonPath
+	if behavior := e.behavior(); behavior != nil && behavior.MCP != nil && behavior.MCP.ConfigPath != "" {
+		configPath = behavior.MCP.ConfigPath
 	}
-	return renderDefaultJSONMCPConfig(sb, tools, mcpTools, workflowData, behavior.MCP.ConfigPath)
+	return renderDefaultJSONMCPConfig(sb, tools, mcpTools, workflowData, configPath)
 }
 
 // harnessScriptHeredocDelimiter is the shell heredoc delimiter used when writing
@@ -218,9 +347,50 @@ func (e *BehaviorDefinedEngine) RenderMCPConfig(sb *strings.Builder, tools map[s
 // it is extremely unlikely to appear at the start of a line in any JavaScript harness.
 const harnessScriptHeredocDelimiter = "GHAW_HARNESS_SCRIPT_3c7b9f1a_EOF"
 
+// mcpConfigAdapterHeredocDelimiter is the shell heredoc delimiter used when writing
+// the MCP config-adapter script to disk. It is intentionally long and project-specific
+// so that it is extremely unlikely to appear at the start of a line in any JavaScript.
+const mcpConfigAdapterHeredocDelimiter = "GHAW_MCP_CONFIG_ADAPTER_SCRIPT_7e1a4d2c_EOF"
+
 // harnessScriptFilename returns the filename (not path) for the engine's harness script.
 func (e *BehaviorDefinedEngine) harnessScriptFilename() string {
 	return e.GetID() + "_harness.cjs"
+}
+
+// mcpConfigAdapterFilename returns the filename (not path) for the engine's MCP
+// config-adapter script.
+func (e *BehaviorDefinedEngine) mcpConfigAdapterFilename() string {
+	return e.GetID() + "_mcp_config_adapter.cjs"
+}
+
+// buildScriptWriteStep generates a GitHub Actions step that writes script content to
+// ${RUNNER_TEMP}/gh-aw/actions/<filename> via a bash heredoc using delimiter. Returns
+// nil and logs a warning if script contains the delimiter, which would break the
+// generated shell command.
+func (e *BehaviorDefinedEngine) buildScriptWriteStep(stepName, filename, script, delimiter string) GitHubActionStep {
+	if script == "" {
+		return nil
+	}
+	// Safety check: if the script contains the heredoc delimiter at the start
+	// of any line, the heredoc would be terminated prematurely. Detect this at
+	// compile time and log a clear error rather than generating a broken step.
+	if strings.Contains(script, "\n"+delimiter) || strings.HasPrefix(script, delimiter) {
+		behaviorDefinedEngineLog.Printf(
+			"WARNING: engine %q script %q contains heredoc delimiter %q; write step skipped",
+			e.GetID(), filename, delimiter,
+		)
+		return nil
+	}
+	command := fmt.Sprintf(
+		"mkdir -p \"%[1]s\"\ncat <<'%[4]s' > \"%[1]s/%[2]s\"\n%[3]s\n%[4]s\nchmod 755 \"%[1]s/%[2]s\"", //nolint:generatedyamlheredoc // Legacy engine script rendering remains to be migrated.
+		SetupActionDestinationShell,
+		filename,
+		script,
+		delimiter,
+	)
+	stepLines := []string{"      - name: " + stepName}
+	stepLines = FormatStepWithCommandAndEnv(stepLines, command, nil)
+	return GitHubActionStep(stepLines)
 }
 
 // buildHarnessWriteStep generates a GitHub Actions step that writes the behavior-defined
@@ -233,26 +403,146 @@ func (e *BehaviorDefinedEngine) buildHarnessWriteStep() GitHubActionStep {
 	if behavior == nil || behavior.HarnessScript == "" {
 		return nil
 	}
-	// Safety check: if the harness script contains the heredoc delimiter at the start
-	// of any line, the heredoc would be terminated prematurely. Detect this at
-	// compile time and log a clear error rather than generating a broken step.
-	if strings.Contains(behavior.HarnessScript, "\n"+harnessScriptHeredocDelimiter) ||
-		strings.HasPrefix(behavior.HarnessScript, harnessScriptHeredocDelimiter) {
-		behaviorDefinedEngineLog.Printf(
-			"WARNING: engine %q harness-script contains heredoc delimiter %q; harness write step skipped",
-			e.GetID(), harnessScriptHeredocDelimiter,
-		)
-		return nil
-	}
-	filename := e.harnessScriptFilename()
-	command := fmt.Sprintf(
-		"mkdir -p %[1]s\ncat <<'%[4]s' > %[1]s/%[2]s\n%[3]s\n%[4]s\nchmod 755 %[1]s/%[2]s",
-		SetupActionDestinationShell,
-		filename,
+	return e.buildScriptWriteStep(
+		"Write "+e.GetDisplayName()+" harness script",
+		e.harnessScriptFilename(),
 		behavior.HarnessScript,
 		harnessScriptHeredocDelimiter,
 	)
-	stepLines := []string{"      - name: Write " + e.GetDisplayName() + " harness script"}
+}
+
+// GetMCPConfigAdapterWriteStep generates a GitHub Actions step that writes the
+// behavior-defined engine's mcp.config-adapter script content to
+// ${RUNNER_TEMP}/gh-aw/actions/<engine-id>_mcp_config_adapter.cjs so that
+// start_mcp_gateway.cjs can execute it in place of a built-in per-engine converter.
+// Returns nil (satisfying the MCPConfigAdapterProvider interface as a no-op) if the
+// engine's behaviors do not declare a config-adapter script.
+func (e *BehaviorDefinedEngine) GetMCPConfigAdapterWriteStep() GitHubActionStep {
+	behavior := e.behavior()
+	if behavior == nil || behavior.MCP == nil || behavior.MCP.ConfigAdapter == "" {
+		return nil
+	}
+	return e.buildScriptWriteStep(
+		"Write "+e.GetDisplayName()+" MCP config adapter script",
+		e.mcpConfigAdapterFilename(),
+		behavior.MCP.ConfigAdapter,
+		mcpConfigAdapterHeredocDelimiter,
+	)
+}
+
+// GetMCPConfigAdapterFilename returns the filename (not path) of the engine's MCP
+// config-adapter script, or an empty string if no config-adapter is declared.
+func (e *BehaviorDefinedEngine) GetMCPConfigAdapterFilename() string {
+	behavior := e.behavior()
+	if behavior == nil || behavior.MCP == nil || behavior.MCP.ConfigAdapter == "" {
+		return ""
+	}
+	return e.mcpConfigAdapterFilename()
+}
+
+// logParserHeredocDelimiter is the shell heredoc delimiter used when writing
+// the log-parser script to disk.
+const logParserHeredocDelimiter = "GHAW_LOG_PARSER_SCRIPT_5d2e8b3f_EOF"
+
+// logParserScriptFilename returns the filename (not path) for the engine's log-parser script.
+func (e *BehaviorDefinedEngine) logParserScriptFilename() string {
+	return e.GetID() + "_log_parser"
+}
+
+// buildWrappedLogParserScript wraps the user-supplied log-parser source with the
+// createEngineLogParser bootstrap and returns the complete script content.
+// Returns "" if no log-parser is defined or if the wrapped script contains the
+// heredoc delimiter (which would break the generated shell heredoc).
+func (e *BehaviorDefinedEngine) buildWrappedLogParserScript() string {
+	behavior := e.behavior()
+	if behavior == nil || behavior.LogParser == "" {
+		return ""
+	}
+	// Wrap the user-provided parse function with the createEngineLogParser
+	// bootstrap so the script conforms to the contract expected by
+	// log_parser_bootstrap.cjs (runLogParser). The author only needs to define
+	// a parseLog(logContent) function; the wrapper handles file I/O and exports.
+	wrapped := fmt.Sprintf(`// @ts-check
+// Auto-generated log parser for behavior-defined engine %q.
+const { createEngineLogParser } = require("./log_parser_shared.cjs");
+
+// --- begin engine-provided parse function ---
+%s
+// --- end engine-provided parse function ---
+
+const main = createEngineLogParser({
+  parserName: %q,
+  parseFunction: parseLog,
+  supportsDirectories: false,
+});
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { main, parseLog };
+}`,
+		e.GetDisplayName(),
+		behavior.LogParser,
+		e.GetDisplayName(),
+	)
+	// Safety check: if the wrapped script contains the heredoc delimiter at the
+	// start of any line, the heredoc would be terminated prematurely. Detect
+	// this at compile time so GetLogParserScriptId() and buildLogParserWriteStep()
+	// are always consistent.
+	if strings.Contains(wrapped, "\n"+logParserHeredocDelimiter) || strings.HasPrefix(wrapped, logParserHeredocDelimiter) {
+		behaviorDefinedEngineLog.Printf(
+			"WARNING: engine %q log-parser script contains heredoc delimiter %q; log-parser step suppressed",
+			e.GetID(), logParserHeredocDelimiter,
+		)
+		return ""
+	}
+	return wrapped
+}
+
+// GetLogParserScriptId returns the log-parser script ID for this engine.
+// Returns "" when no log-parser is defined, or when the wrapped script would
+// contain the heredoc delimiter (which prevents the write step from running).
+// This is always consistent with buildLogParserWriteStep: the ID is non-empty
+// only when the write step will actually emit the script file.
+func (e *BehaviorDefinedEngine) GetLogParserScriptId() string {
+	if e.buildWrappedLogParserScript() == "" {
+		return ""
+	}
+	return e.logParserScriptFilename()
+}
+
+// GetLogParserScriptSource returns the generated parser source for local parsing.
+func (e *BehaviorDefinedEngine) GetLogParserScriptSource() string {
+	return e.buildWrappedLogParserScript()
+}
+
+// buildLogParserWriteStep generates a GitHub Actions step that writes the
+// behavior-defined engine's log-parser script to
+// ${RUNNER_TEMP}/gh-aw/actions/<engine-id>_log_parser.cjs so the post-agent
+// log-parsing step can require() it.
+//
+// The raw log-parser JavaScript from the behavior definition is wrapped with a
+// createEngineLogParser call from log_parser_shared.cjs so that the author only
+// needs to define a parseLog(logContent) function returning
+// {markdown, logEntries, mcpFailures, maxTurnsHit}.
+//
+// The step runs with "if: always()" so the script is written even if an earlier
+// step in the job fails, ensuring the log-parsing step (which also runs always)
+// can always require() the file.
+func (e *BehaviorDefinedEngine) buildLogParserWriteStep() GitHubActionStep {
+	script := e.buildWrappedLogParserScript()
+	if script == "" {
+		return nil
+	}
+	stepLines := []string{
+		"      - name: Write " + e.GetDisplayName() + " log parser script",
+		"        if: always()",
+	}
+	command := fmt.Sprintf(
+		"mkdir -p \"%[1]s\"\ncat <<'%[4]s' > \"%[1]s/%[2]s\"\n%[3]s\n%[4]s\nchmod 755 \"%[1]s/%[2]s\"", //nolint:generatedyamlheredoc // Legacy log-parser rendering remains to be migrated.
+		SetupActionDestinationShell,
+		e.logParserScriptFilename()+".cjs",
+		script,
+		logParserHeredocDelimiter,
+	)
 	stepLines = FormatStepWithCommandAndEnv(stepLines, command, nil)
 	return GitHubActionStep(stepLines)
 }
@@ -263,6 +553,24 @@ func (e *BehaviorDefinedEngine) GetExecutionSteps(workflowData *WorkflowData, lo
 		return nil
 	}
 
+	exec := behavior.Execution
+	var backend UniversalLLMBackend
+	if e.usesUniversalLLMConsumer() || exec.ProviderEnvMode == behaviorProviderEnvModeUniversalLLMConsumer {
+		backend = e.resolveBackend(workflowData)
+	}
+	firewallEnabled := e.behaviorDefinedFirewallEnabled(workflowData)
+	engineCommand := e.buildBehaviorDefinedEngineCommand(exec, workflowData)
+	if isSkipIfDecisionEnabled(workflowData) {
+		engineCommand = buildShellHarnessCommand(e.GetID(), engineCommand)
+	}
+	command := e.buildBehaviorDefinedExecutionCommand(exec, workflowData, logFile, engineCommand, firewallEnabled, backend)
+	env := e.buildBehaviorDefinedExecutionEnv(exec, workflowData, firewallEnabled, backend)
+	steps := e.buildBehaviorDefinedSetupSteps()
+	steps = append(steps, e.buildBehaviorDefinedExecutionStep(exec, workflowData, command, env, backend))
+	return steps
+}
+
+func (e *BehaviorDefinedEngine) buildBehaviorDefinedSetupSteps() []GitHubActionStep {
 	var steps []GitHubActionStep
 	if configStep := e.buildConfigFileStep(); len(configStep) > 0 {
 		steps = append(steps, configStep)
@@ -270,138 +578,147 @@ func (e *BehaviorDefinedEngine) GetExecutionSteps(workflowData *WorkflowData, lo
 	if harnessStep := e.buildHarnessWriteStep(); len(harnessStep) > 0 {
 		steps = append(steps, harnessStep)
 	}
+	if logParserStep := e.buildLogParserWriteStep(); len(logParserStep) > 0 {
+		steps = append(steps, logParserStep)
+	}
+	return steps
+}
 
-	exec := behavior.Execution
+func (e *BehaviorDefinedEngine) buildBehaviorDefinedEngineCommand(exec *EngineExecutionDefinition, workflowData *WorkflowData) string {
 	commandName := exec.CommandName
 	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
 		commandName = workflowData.EngineConfig.Command
 	}
-
-	var engineCommand string
-	if behavior.HarnessScript != "" {
-		// Harness execution: the harness is responsible for reading GH_AW_PROMPT and
-		// spawning the engine CLI. Pass the shell-escaped command name and configured args
-		// so the harness can forward them or use them to build the full command.
+	if behavior := e.behavior(); behavior != nil && behavior.HarnessScript != "" {
 		harnessArgs := []string{shellEscapeArg(commandName)}
 		if len(exec.Args) > 0 {
 			harnessArgs = append(harnessArgs, shellJoinArgs(exec.Args))
 		}
-		harnessPath := SetupActionDestinationShell + "/" + e.harnessScriptFilename()
-		engineCommand = fmt.Sprintf("%s %s %s", nodeRuntimeResolutionCommand, harnessPath, strings.Join(harnessArgs, " "))
-	} else {
-		commandParts := []string{commandName}
-		if len(exec.Args) > 0 {
-			commandParts = append(commandParts, shellJoinArgs(exec.Args))
+		harnessPath := path.Join(SetupActionDestinationShell, e.harnessScriptFilename())
+		nodeCommand := nodeRuntimeResolutionCommand
+		if exec.ProtectedSessionCapture {
+			nodeCommand = strings.TrimSuffix(nodeCommand, `"$GH_AW_NODE_EXEC"`) + `exec "$GH_AW_NODE_EXEC"`
 		}
-		if modelFragment := e.modelFlagFragment(exec, workflowData); modelFragment != "" {
-			commandParts = append(commandParts, modelFragment)
-		}
-		if mcpFragment := e.mcpFlagFragment(exec, workflowData); mcpFragment != "" {
-			commandParts = append(commandParts, mcpFragment)
-		}
-		commandParts = append(commandParts, fmt.Sprintf(`"$(cat %s)"`, constants.AwPromptsFile))
-		engineCommand = strings.Join(commandParts, " ")
-		engineCommand = getWorkspaceCommandPrefixFor(workflowData.EngineConfig) + engineCommand
+		return fmt.Sprintf("%s %s %s", nodeCommand, harnessPath, strings.Join(harnessArgs, " "))
 	}
 
+	if exec.ProtectedSessionCapture {
+		commandName = "exec " + commandName
+	}
+	commandParts := []string{commandName}
+	if len(exec.Args) > 0 {
+		commandParts = append(commandParts, shellJoinArgs(exec.Args))
+	}
+	if modelFragment := e.modelFlagFragment(exec, workflowData); modelFragment != "" {
+		commandParts = append(commandParts, modelFragment)
+	}
+	if mcpFragment := e.mcpFlagFragment(exec, workflowData); mcpFragment != "" {
+		commandParts = append(commandParts, mcpFragment)
+	}
+	commandParts = append(commandParts, fmt.Sprintf(`"$(cat %s)"`, constants.AwPromptsFile))
+	return getWorkspaceCommandPrefixFor(workflowData.EngineConfig) + strings.Join(commandParts, " ")
+}
+
+func (e *BehaviorDefinedEngine) behaviorDefinedFirewallEnabled(workflowData *WorkflowData) bool {
 	firewallEnabled := isFirewallEnabled(workflowData)
-	// harness-script requires the AWF API proxy sidecar (/reflect) to dynamically
-	// configure the agentic engine at runtime. Force AWF execution when a harness is
-	// present unless the sandbox has been explicitly disabled via sandbox.agent: false,
-	// which also prevents the /reflect endpoint from being available.
-	if behavior.HarnessScript != "" && !isFirewallDisabledBySandboxAgent(workflowData) {
+	if behavior := e.behavior(); behavior != nil && (behavior.HarnessScript != "" || e.protectedSessionCaptureEnabled()) && !isFirewallDisabledBySandboxAgent(workflowData) {
 		firewallEnabled = true
 	}
-	var command string
-	if firewallEnabled {
-		command = e.buildFirewallCommand(exec, workflowData, logFile, engineCommand)
-	} else if exec.WriteTimestamp {
-		command = fmt.Sprintf("set -o pipefail\nexport no_proxy=\"${NO_PROXY:-}\"\nprintf '%%s' \"$(date +%%s%%3N)\" > %s\n%s 2>&1 | tee -a %s",
-			AgentCLIStartMsPath, engineCommand, logFile)
-	} else {
-		command = fmt.Sprintf("set -o pipefail\nexport no_proxy=\"${NO_PROXY:-}\"\n%s 2>&1 | tee -a %s", engineCommand, logFile)
-	}
+	return firewallEnabled
+}
 
+func (e *BehaviorDefinedEngine) buildBehaviorDefinedExecutionCommand(exec *EngineExecutionDefinition, workflowData *WorkflowData, logFile, engineCommand string, firewallEnabled bool, backend UniversalLLMBackend) string {
+	if firewallEnabled {
+		return e.buildFirewallCommand(exec, workflowData, logFile, engineCommand, backend)
+	}
+	if exec.WriteTimestamp {
+		return fmt.Sprintf("set -o pipefail\nexport no_proxy=\"${NO_PROXY:-}\"\nprintf '%%s' \"$(date +%%s%%3N)\" > %s\n%s 2>&1 | tee -a %s",
+			AgentCLIStartMsPath, engineCommand, logFile)
+	}
+	return fmt.Sprintf("set -o pipefail\nexport no_proxy=\"${NO_PROXY:-}\"\n%s 2>&1 | tee -a %s", engineCommand, logFile)
+}
+
+func (e *BehaviorDefinedEngine) buildBehaviorDefinedExecutionEnv(exec *EngineExecutionDefinition, workflowData *WorkflowData, firewallEnabled bool, backend UniversalLLMBackend) map[string]string {
 	env := map[string]string{
 		"GH_AW_PROMPT":     constants.AwPromptsFile,
 		"GITHUB_WORKSPACE": "${{ github.workspace }}",
+		"NO_PROXY":         constants.AWFNoProxyHosts,
 		"RUNNER_TEMP":      "${{ runner.temp }}",
-		// Set NO_PROXY so that the AWF agent's HTTP client skips the squid proxy
-		// for local endpoints. The lowercase no_proxy variant is exported inside
-		// the run script rather than as a YAML env key because GitHub's workflow
-		// parser rejects case-insensitive duplicate env keys (NO_PROXY/no_proxy),
-		// which causes workflow_dispatch to fail with "failed to parse workflow".
-		"NO_PROXY": constants.AWFNoProxyHosts,
 	}
 	injectWorkflowCallNetworkAllowedEnv(env, workflowData)
-
-	// Apply static env vars declared in the engine definition first so that
-	// the dynamic AWF vars below can still override them if needed.
 	maps.Copy(env, exec.Env)
-
 	if exec.ProviderEnvMode == behaviorProviderEnvModeUniversalLLMConsumer {
-		e.ApplyUniversalProviderEnv(env, workflowData, firewallEnabled)
-	}
-
-	if exec.MCPConfigEnvVar != "" && HasMCPServers(workflowData) {
-		if behavior.ConfigFile != nil {
-			env[exec.MCPConfigEnvVar] = "${{ github.workspace }}/" + behavior.ConfigFile.Path
-		} else {
-			mcpPath := constants.McpServersJsonPathExpr
-			if behavior.MCP != nil && behavior.MCP.ConfigPath != "" {
-				mcpPath = behavior.MCP.ConfigPath
-			}
-			env[exec.MCPConfigEnvVar] = mcpPath
+		e.applyUniversalProviderEnvForBackend(env, workflowData, firewallEnabled, backend)
+		if firewallEnabled && backend == UniversalLLMBackendCopilot {
+			env[constants.CopilotBYOKDummyAPIKeyEnvVar] = constants.CopilotBYOKDummyAPIKey
 		}
 	}
-
+	e.applyBehaviorDefinedMCPEnv(exec, workflowData, env)
 	for _, binding := range e.definition.Auth {
 		if binding.Secret != "" {
 			env[binding.Secret] = "${{ secrets." + binding.Secret + " }}"
 		}
 	}
-
-	// When a harness script is present and the AWF firewall is running, signal to the
-	// harness that the AWF API proxy sidecar is available so it can read /reflect data.
-	if behavior.HarnessScript != "" && firewallEnabled {
+	if behavior := e.behavior(); behavior != nil && behavior.HarnessScript != "" && firewallEnabled {
 		env["AWF_REFLECT_ENABLED"] = "1"
 	}
-
 	applySafeOutputEnvToMap(env, workflowData)
+	applyDefaultMaxAICreditsEnvToMap(env, workflowData)
+	applyAWFRuntimeAgentTimeoutEnvToMap(env, workflowData)
 	applyTraceContextEnvToMap(env)
 	applyOptionalEngineToolTimeouts(env, workflowData)
 	applyEngineMaxTurnsEnv(env, workflowData)
 	applyEngineCwdEnv(env, workflowData)
+	applyEngineVersionEnv(env, workflowData)
 	applyEngineAndAgentEnv(env, workflowData, behaviorDefinedEngineLog)
-	applyMCPScriptsSecretEnv(env, workflowData)
+	e.applyBehaviorDefinedModelEnv(exec, workflowData, env)
+	if exec.ProtectedSessionCapture && firewallEnabled {
+		env["RUNNER_TEMP"] = "${{ runner.temp }}"
+		env["GH_AW_PROTECTED_SESSION_CAPTURE"] = "1"
+		env["GH_AW_PROTECTED_CAPTURE_ID"] = protectedSessionCaptureID
+	}
+	applyDurableExecutionEnv(env, workflowData)
+	return env
+}
 
-	if exec.ModelEnvVarName != "" {
-		if workflowData != nil && workflowData.Model != "" {
-			modelVal := workflowData.Model
-			if exec.ModelEnvProviderPrefix != "" {
-				if parts := strings.SplitN(modelVal, "/", 2); len(parts) == 2 {
-					modelVal = exec.ModelEnvProviderPrefix + "/" + parts[1]
-				}
-			}
-			env[exec.ModelEnvVarName] = modelVal
+func (e *BehaviorDefinedEngine) applyBehaviorDefinedMCPEnv(exec *EngineExecutionDefinition, workflowData *WorkflowData, env map[string]string) {
+	if exec.MCPConfigEnvVar == "" || !HasMCPServers(workflowData) {
+		return
+	}
+	behavior := e.behavior()
+	if behavior != nil && behavior.ConfigFile != nil {
+		env[exec.MCPConfigEnvVar] = "${{ github.workspace }}/" + behavior.ConfigFile.Path
+		return
+	}
+	mcpPath := constants.McpServersJsonPathExpr
+	if behavior != nil && behavior.MCP != nil && behavior.MCP.ConfigPath != "" {
+		mcpPath = behavior.MCP.ConfigPath
+	}
+	env[exec.MCPConfigEnvVar] = mcpPath
+}
+
+func (e *BehaviorDefinedEngine) applyBehaviorDefinedModelEnv(exec *EngineExecutionDefinition, workflowData *WorkflowData, env map[string]string) {
+	if exec.ModelEnvVarName == "" || workflowData == nil || workflowData.Model == "" {
+		return
+	}
+	modelVal := workflowData.Model
+	if exec.ModelEnvProviderPrefix != "" {
+		if _, model, ok := strings.Cut(modelVal, "/"); ok {
+			modelVal = path.Join(exec.ModelEnvProviderPrefix, model)
 		}
 	}
+	env[exec.ModelEnvVarName] = modelVal
+}
 
+func (e *BehaviorDefinedEngine) buildBehaviorDefinedExecutionStep(exec *EngineExecutionDefinition, workflowData *WorkflowData, command string, env map[string]string, backend UniversalLLMBackend) GitHubActionStep {
 	stepLines := []string{
 		"      - name: " + exec.StepName,
 		"        id: agentic_execution",
+		"        timeout-minutes: " + resolveStepTimeoutValue(workflowData),
 	}
-	if workflowData != nil && workflowData.TimeoutMinutes != "" {
-		timeoutValue := strings.TrimPrefix(workflowData.TimeoutMinutes, "timeout-minutes: ")
-		stepLines = append(stepLines, "        timeout-minutes: "+timeoutValue)
-	} else {
-		stepLines = append(stepLines, fmt.Sprintf("        timeout-minutes: %d", int(constants.DefaultAgenticWorkflowTimeout/time.Minute)))
-	}
-	filteredEnv := FilterEnvForSecrets(env, e.GetRequiredSecretNames(workflowData))
+	filteredEnv := FilterEnvForSecrets(env, e.getRequiredSecretNamesForBackend(workflowData, backend))
 	addCliProxyGHTokenToEnv(filteredEnv, workflowData)
-	stepLines = FormatStepWithCommandAndEnv(stepLines, command, filteredEnv)
-	steps = append(steps, GitHubActionStep(stepLines))
-	return steps
+	return GitHubActionStep(FormatStepWithCommandAndEnv(stepLines, wrapAgentExecutionCommand(command), filteredEnv))
 }
 
 func (e *BehaviorDefinedEngine) modelFlagFragment(exec *EngineExecutionDefinition, workflowData *WorkflowData) string {
@@ -427,29 +744,68 @@ func (e *BehaviorDefinedEngine) mcpFlagFragment(exec *EngineExecutionDefinition,
 	return shellJoinArgs([]string{exec.MCPConfigFlag, path})
 }
 
-func (e *BehaviorDefinedEngine) buildFirewallCommand(exec *EngineExecutionDefinition, workflowData *WorkflowData, logFile, engineCommand string) string {
+func (e *BehaviorDefinedEngine) buildFirewallCommand(exec *EngineExecutionDefinition, workflowData *WorkflowData, logFile, engineCommand string, backend UniversalLLMBackend) string {
 	allowedDomains := e.allowedDomains(workflowData)
 	// Propagate no_proxy inside the AWF container.  --env-all forwards NO_PROXY
 	// from the YAML env block, but Bun (and other runtimes) also check the
 	// lowercase variant, so we export it explicitly from the uppercase value.
 	engineCommandWithPath := fmt.Sprintf("export no_proxy=\"${NO_PROXY:-}\" && %s && %s", GetNpmBinPathSetup(), engineCommand)
+	if exec.ProviderEnvMode == behaviorProviderEnvModeUniversalLLMConsumer && backend == UniversalLLMBackendCopilot {
+		// Introduce the client key after AWF credential discovery, never in its startup environment.
+		engineCommandWithPath = `export OPENAI_API_KEY="$` + constants.CopilotBYOKDummyAPIKeyEnvVar + `" && ` + engineCommandWithPath
+	}
+	// microVM runtimes stage the engine CLI under ${RUNNER_TEMP}/gh-aw/engine-cli/bin
+	// because the runner tool cache is not mounted inside the sandbox.
+	if microVMCLIPath := GetMicroVMNpmCLIPathSetup(workflowData); microVMCLIPath != "" {
+		engineCommandWithPath = fmt.Sprintf("%s && %s", microVMCLIPath, engineCommandWithPath)
+	}
 	if mcpCLIPath := GetMCPCLIPathSetup(workflowData); mcpCLIPath != "" {
 		engineCommandWithPath = fmt.Sprintf("%s && %s", mcpCLIPath, engineCommandWithPath)
 	}
 
+	excludedSecretNames := e.getRequiredSecretNamesForBackend(workflowData, backend)
+	if e.behavior().SecretStrategy != behaviorSecretStrategyGeminiAPIKey {
+		for _, binding := range e.definition.Auth {
+			excludedSecretNames = slices.DeleteFunc(excludedSecretNames, func(secretName string) bool {
+				return secretName == binding.Secret
+			})
+		}
+	}
+
 	return BuildAWFCommand(AWFCommandConfig{
 		EngineName:         e.GetID(),
+		EngineRuntimeID:    e.definition.RuntimeID,
 		EngineCommand:      engineCommandWithPath,
 		LogFile:            logFile,
 		WorkflowData:       workflowData,
 		UsesTTY:            false,
 		AllowedDomains:     allowedDomains,
-		ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, e.GetRequiredSecretNames(workflowData)),
+		ExcludeEnvVarNames: ComputeAWFExcludeEnvVarNames(workflowData, excludedSecretNames),
+		ProtectLogCapture:  exec.ProtectedSessionCapture,
 	})
 }
 
 func (e *BehaviorDefinedEngine) allowedDomains(workflowData *WorkflowData) string {
 	engineName := constants.EngineName(e.GetID())
+	behavior := e.behavior()
+	if behavior != nil && behavior.Network != nil {
+		var defaults []string
+		if e.usesUniversalLLMConsumer() || (behavior.Execution != nil && behavior.Execution.ProviderEnvMode == behaviorProviderEnvModeUniversalLLMConsumer) {
+			// AWF-proxied inference uses its gateway target, not direct agent egress.
+			defaults = behavior.Network.Defaults
+		} else {
+			model := ""
+			if workflowData != nil && workflowData.EngineConfig != nil {
+				model = workflowData.Model
+			}
+			var err error
+			defaults, err = resolveEngineNetworkDomains(behavior.Network, model)
+			if err != nil {
+				panic(fmt.Sprintf("BUG: invalid model %q reached domain computation (should have been caught by validation): %v", model, err))
+			}
+		}
+		return mergeDomainsWithNetworkToolsAndRuntimes(defaults, workflowData.NetworkPermissions, workflowData.Tools, workflowData.Runtimes)
+	}
 	if e.usesUniversalLLMConsumer() && workflowData != nil && workflowData.EngineConfig != nil {
 		return mustGetAllowedDomainsForEngineWithModel(engineName, workflowData.Model, workflowData.NetworkPermissions, workflowData.Tools, workflowData.Runtimes)
 	}
@@ -462,18 +818,23 @@ func (e *BehaviorDefinedEngine) buildConfigFileStep() GitHubActionStep {
 		return nil
 	}
 	config := behavior.ConfigFile
+	shellcheckDirective := ""
+	if strings.Contains(config.Content, "$") {
+		shellcheckDirective = "# shellcheck disable=SC2016\n"
+	}
 	command := fmt.Sprintf(`umask 077
 mkdir -p "$(dirname "$GITHUB_WORKSPACE/%s")"
 CONFIG="$GITHUB_WORKSPACE/%s"
-BASE_CONFIG='%s'
+%sBASE_CONFIG='%s'
 if [ -f "$CONFIG" ]; then
   MERGED=$(jq -n --argjson base "$BASE_CONFIG" --argjson existing "$(cat "$CONFIG")" '$existing * $base')
   echo "$MERGED" > "$CONFIG"
 else
   echo "$BASE_CONFIG" > "$CONFIG"
 fi
-chmod 600 "$CONFIG"`, config.Path, config.Path, config.Content)
+chmod 600 "$CONFIG"`, config.Path, config.Path, shellcheckDirective, config.Content)
 	if config.MergeStrategy != behaviorConfigMergeJSON {
+		//nolint:generatedyamlheredoc // Legacy behavior config rendering remains to be migrated to the JavaScript renderer.
 		command = fmt.Sprintf(`umask 077
 mkdir -p "$(dirname "$GITHUB_WORKSPACE/%s")"
 cat <<'EOF' > "$GITHUB_WORKSPACE/%s"
@@ -494,7 +855,7 @@ func isEngineDefinitionForm(def *EngineDefinition) bool {
 	// Treat richer metadata-only objects as shared engine definitions. Plain engine
 	// config objects ("id", "model", "env", etc.) should continue down the normal
 	// EngineConfig path instead of being registered as catalog entries.
-	if def.DisplayName != "" || def.RuntimeID != "" || def.Experimental || def.GHSkillAgentName != "" || def.Behaviors != nil || len(def.Auth) > 0 {
+	if def.DisplayName != "" || def.RuntimeID != "" || def.Experimental || def.GHSkillAgentName != "" || def.Behaviors != nil || def.DetectionEngine != "" || len(def.Auth) > 0 {
 		return true
 	}
 	if def.Provider.Name != "" || def.Provider.Auth != nil || def.Provider.Request != nil {
@@ -546,8 +907,8 @@ func parseEngineDefinitionFromJSON(engineJSON string) (*EngineDefinition, error)
 		engineDefinitionCache.Delete(engineJSON)
 	}
 	var engineData any
-	if err := json.Unmarshal([]byte(engineJSON), &engineData); err != nil {
-		return nil, fmt.Errorf("failed to parse engine JSON: %w", err)
+	if err := jsonutil.UnmarshalString(engineJSON, &engineData); err != nil {
+		return nil, fmt.Errorf("engine JSON is not recognized, expected a valid JSON object describing the engine: %w", err)
 	}
 	dataMap, ok := engineData.(map[string]any)
 	if !ok {
@@ -563,11 +924,11 @@ func parseEngineDefinitionFromJSON(engineJSON string) (*EngineDefinition, error)
 	}
 	yamlBytes, err := yaml.Marshal(dataMap)
 	if err != nil {
-		return nil, fmt.Errorf("failed to convert engine JSON to yaml: %w", err)
+		return nil, fmt.Errorf("engine JSON could not be converted to YAML, expected values that marshal cleanly (e.g. no unsupported types): %w", err)
 	}
 	var def EngineDefinition
 	if err := yaml.Unmarshal(yamlBytes, &def); err != nil {
-		return nil, fmt.Errorf("failed to parse engine definition: %w", err)
+		return nil, fmt.Errorf("engine definition is not recognized, expected fields matching the EngineDefinition schema: %w", err)
 	}
 	if def.RuntimeID == "" {
 		def.RuntimeID = def.ID
@@ -603,9 +964,9 @@ func deepCopyAny(v any) any {
 		}
 		return cp
 	case []any:
-		cp := make([]any, len(val))
-		for i, elem := range val {
-			cp[i] = deepCopyAny(elem)
+		cp := make([]any, 0, len(val))
+		for _, elem := range val {
+			cp = append(cp, deepCopyAny(elem))
 		}
 		return cp
 	default:
@@ -670,8 +1031,24 @@ func deepCopyEngineDefinition(src EngineDefinition) EngineDefinition {
 }
 
 // deepCopyEngineBehaviorDefinition returns a fully independent copy of src.
+//
+//nolint:largefunc // Deep copy initializes all fields explicitly.
 func deepCopyEngineBehaviorDefinition(src EngineBehaviorDefinition) EngineBehaviorDefinition {
 	dst := src // value copy covers all scalar fields
+	if src.Durable != nil {
+		durable := *src.Durable
+		durable.Installation = append([]EngineInstallationDefinition(nil), src.Durable.Installation...)
+		durable.Files = append([]string(nil), src.Durable.Files...)
+		for i := range durable.Installation {
+			if cooldown := durable.Installation[i].Cooldown; cooldown != nil {
+				copy := *cooldown
+				durable.Installation[i].Cooldown = &copy
+			}
+		}
+		copy := deepCopyEngineBehaviorDefinition(EngineBehaviorDefinition{Execution: src.Durable.Execution})
+		durable.Execution = copy.Execution
+		dst.Durable = &durable
+	}
 
 	// SupportedEnvVarKeys
 	if src.SupportedEnvVarKeys != nil {
@@ -691,6 +1068,20 @@ func deepCopyEngineBehaviorDefinition(src EngineBehaviorDefinition) EngineBehavi
 			copy(manifestCopy.PathPrefixes, src.Manifest.PathPrefixes)
 		}
 		dst.Manifest = &manifestCopy
+	}
+
+	// Network (has Defaults []string and ProviderDomains map[string]string)
+	if src.Network != nil {
+		networkCopy := *src.Network
+		if src.Network.Defaults != nil {
+			networkCopy.Defaults = make([]string, len(src.Network.Defaults))
+			copy(networkCopy.Defaults, src.Network.Defaults)
+		}
+		if src.Network.ProviderDomains != nil {
+			networkCopy.ProviderDomains = make(map[string]string, len(src.Network.ProviderDomains))
+			maps.Copy(networkCopy.ProviderDomains, src.Network.ProviderDomains)
+		}
+		dst.Network = &networkCopy
 	}
 
 	// Installation (only scalar fields; pointer dereference suffices)

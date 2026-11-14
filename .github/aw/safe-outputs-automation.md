@@ -18,7 +18,14 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
       target-repo: "owner/repo"       # Optional: cross-repository
   ```
 
-- `update-release:` - Update GitHub release descriptions
+- `create-security-advisory:` - Experimental. Create draft security advisories in the workflow repository. Requires an external `github-token` or `github-app` (per-output or global) with Repository security advisories write permission; `GITHUB_TOKEN` is not supported. The agent supplies `summary`, `description`, and `vulnerabilities`, plus optional `severity` and `cwe_ids`. Descriptions include standard attribution, detection warnings, execution metadata, and global body-footer policy within the 65000-character limit. Never publishes or creates private forks. Use a private workflow repository for confidential findings because payloads may appear in run logs and artifacts.
+- `add-security-advisory-comment:` - Experimental. Comment on an existing advisory in the workflow repository using `ghsa_id` and `body`. Requires an external token or GitHub App with Repository security advisories write permission. Supports `max`, `footer`, and `staged`; never publishes or falls back to a public issue comment. Verify endpoint availability on the target installation; comments follow advisory visibility.
+
+  Both advisory outputs preview complete prepared requests in staged-mode logs and step summaries, with secret values redacted and no credentials or API writes. Their `max` defaults to 1 (literal range 1–10); expressions resolving to `-1` remain unlimited. Failed API attempts consume the limit and are not retried automatically.
+
+  Both accept `samples` as a tool-argument object or list for deterministic replay via `features.samples: true` or `gh aw compile --use-samples`. Use `staged: true` to suppress replayed API writes.
+
+- `update-release:` - Update GitHub release descriptions. Agent-generated release notes and release-description changes must use this safe output; never perform those mutations directly with `gh`, the GitHub API, or a GitHub write tool.
 
   ```yaml
   safe-outputs:
@@ -71,10 +78,11 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
       target-repo: org/other-repo         # Optional: cross-repo dispatch target (owner/repo or expression)
       allowed-repos: [org/*]              # Optional: allowlist for cross-repo dispatch targets
       target-ref: main                    # Optional: ref to dispatch against (overrides caller's GITHUB_REF)
+      allowed-refs: ["release/*"]         # Optional: glob allowlist for agent-provided per-call ref overrides (default: caller's ref only)
   ```
 
-  Triggers other agentic workflows using workflow_dispatch. Agent output includes `workflow_name` (without .md extension) and optional `inputs` (key-value pairs). Cross-repo dispatch is supported via `target-repo` plus an `allowed-repos` allowlist; cross-repo targets require a token with `actions: write` on the target repository.
-- `dispatch-repository:` - Dispatch `repository_dispatch` events to external repositories (experimental)
+  Triggers other agentic workflows using workflow_dispatch. Agent output includes `workflow_name` (without .md extension) and optional `inputs` (key-value pairs). Cross-repo dispatch is supported via `target-repo` plus an `allowed-repos` allowlist; cross-repo targets require a token with `actions: write` on the target repository. For queue workers, load [work-queue.md](work-queue.md) and use `work_queue_dispatch_next` to request a bounded pool prefix. Trusted processing selects Work and the installed worker profile; do not select `work_id` through `dispatch_workflow` or declare reserved assignment/caller inputs.
+- `dispatch-repository:` - Dispatch `repository_dispatch` events to external repositories
 
   ```yaml
   safe-outputs:
@@ -99,7 +107,6 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
 
   Accepts both `dispatch-repository` (dash, canonical) and `dispatch_repository` (underscore, deprecated alias). Each key in the config defines a named MCP tool. Requires a token with `repo` scope since `GITHUB_TOKEN` cannot trigger `repository_dispatch` in external repositories. Use `github-token` or set a PAT as `GH_AW_SAFE_OUTPUTS_TOKEN`.
 
-  **⚠️ Experimental**: Compilation emits a warning when this feature is used.
 - `call-workflow:` - Call reusable workflows via workflow_call fan-out (orchestrator pattern)
 
   ```yaml
@@ -141,6 +148,7 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
   safe-outputs:
     create-check-run:
       name: "Security Analysis"       # Optional: check run name (defaults to workflow name)
+      target: "triggering"            # Optional: "triggering" (default), "*" (any PR), or explicit PR number
       max: 1                          # Optional: max check runs per workflow run (default: 1)
       output:                         # Optional: static fallback values used when the agent omits the field
         title: "Pending analysis"     # Fallback title (max 256 chars)
@@ -166,9 +174,11 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
     assign-to-agent:
       name: "copilot"                 # Optional: agent name
       model: "claude-sonnet-4-5"      # Optional: model override
+      reasoning-effort: "high"        # Optional: none/minimal/low/medium/high/xhigh, forwarded without model-capability checks
       custom-agent: "agent-id"        # Optional: custom agent ID
       custom-instructions: "..."      # Optional: additional instructions for the agent
       allowed: [copilot]              # Optional: restrict to specific agent names
+      required-labels: [copilot-ready] # Optional: ALL of these labels must be present on the issue/PR for assignment to run
       max: 1                          # Optional: max assignments (default: 1)
       target: "*"                     # Optional: "triggering" (default), "*", or number
       target-repo: "owner/repo"       # Optional: where the issue lives (cross-repository)
@@ -215,6 +225,7 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
         - outdated
         - resolved
       target-repo: "owner/repo"       # Optional: cross-repository
+      discussions: true               # Optional: opt-in to discussions:write permission for hiding discussion comments (default: false)
   ```
 
   Allowed reasons: `spam`, `abuse`, `off_topic`, `outdated`, `resolved`, `low_quality`.
@@ -243,33 +254,47 @@ description: Safe-output reference for workflow dispatch, code scanning, checks,
   ```
 
   Agent calls `set_issue_field` with `value` plus either `field_name` (preferred) or `field_node_id`. `issue_number` is optional and defaults to the triggering issue.
+- `approve-workflow-run:` - Approve a pending workflow run in the "action required" state
+
+  ```yaml
+  safe-outputs:
+    approve-workflow-run:
+      allowed-workflows: [ci.yml]     # Required: workflow filenames eligible for approval (no paths)
+      allowed-repos: [org/fork]       # Optional: fork repositories allowed for approval (default: current repository only)
+      allowed-pull-requests: ["123"]  # Optional: restrict to specific PR numbers
+      protected-files: blocked        # Optional: "blocked" (default), "fallback-to-issue", or "allowed"
+      github-token: ${{ secrets.APPROVE_WORKFLOW_RUN_TOKEN }}  # Required: external token/app (github.token cannot approve runs requiring approval)
+  ```
+
+  Requires `actions: write` (added automatically) plus an external `github-token` or `github-app` — the default `github.token` is not permitted to approve workflow runs requiring approval.
 - `noop:` - Log completion message for transparency (auto-enabled)
 
   ```yaml
   safe-outputs:
     noop:
+      max: 2                          # Optional: max noop messages (default: 2)
       report-as-issue: false          # Optional: report noop as issue (default: true)
   ```
 
   Fallback ensuring workflows never complete silently. Agents emit human-visible messages even when no other action is required (e.g., "Analysis complete - no issues found").
-- `missing-tool:` - Report missing tools or functionality (auto-enabled)
+- `report-missing-tool:` - Report missing tools or functionality (auto-enabled; `missing-tool:` is a deprecated alias — run `gh aw fix` to migrate)
 
   ```yaml
   safe-outputs:
-    missing-tool:
-      create-issue: true              # Optional: create issues for missing tools (default: false when this block is set; auto-enabled as true only when `missing-tool` is omitted)
+    report-missing-tool:
+      create-issue: true              # Optional: create issues for missing tools (default: false when this block is set; auto-enabled as true only when `report-missing-tool` is omitted)
       report-as-failure: true         # Optional: classify the run as an agent failure (default: true)
       title-prefix: "[missing tool]"  # Optional: prefix for issue titles
       labels: [tool-request]          # Optional: labels for created issues
   ```
 
   Lets agents report tools or functionality they need but lack; tracks feature requests. When `create-issue` is true, reports create or update GitHub issues.
-- `missing-data:` - Report missing data required to complete tasks (auto-enabled)
+- `report-missing-data:` - Report missing data required to complete tasks (auto-enabled; `missing-data:` is a deprecated alias — run `gh aw fix` to migrate)
 
   ```yaml
   safe-outputs:
-    missing-data:
-      create-issue: true              # Optional: create issues for missing data (default: false when this block is set; auto-enabled as true only when `missing-data` is omitted)
+    report-missing-data:
+      create-issue: true              # Optional: create issues for missing data (default: false when this block is set; auto-enabled as true only when `report-missing-data` is omitted)
       report-as-failure: true         # Optional: classify the run as an agent failure (default: true)
       title-prefix: "[missing data]"  # Optional: prefix for issue titles
       labels: [data-request]          # Optional: labels for created issues

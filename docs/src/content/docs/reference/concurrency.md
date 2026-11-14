@@ -23,6 +23,8 @@ Workflow-level concurrency groups include the workflow name plus context-specifi
 
 This ensures workflows on different issues, PRs, or branches run concurrently without interference.
 
+For triggers where `cancel-in-progress` is not enabled, the generated top-level group also emits `queue: max` by default, so back-to-back triggers (for example rapid pushes) are queued and run sequentially instead of displacing pending runs. Set `features.group-concurrency-queue: false` to opt out (see [Queue Behavior](#queue-behavior-queue)).
+
 ## Per-Engine Concurrency
 
 The default per-engine pattern `gh-aw-{engine-id}` ensures only one agent job runs per engine across all workflows, preventing AI resource exhaustion. The group includes only the engine ID and `gh-aw-` prefix — workflow name, issue/PR numbers, and branches are excluded.
@@ -83,7 +85,9 @@ concurrency:
   queue: max
 ```
 
-Compiler-generated concurrency groups (agent, output, and conclusion jobs) emit `queue: max` by default so back-to-back triggers run sequentially rather than being dropped. Set `features.group-concurrency-queue: false` to omit `queue` from generated groups and revert to the Actions default:
+Compiler-generated concurrency groups (the top-level workflow group, and the agent, output, and conclusion jobs) emit `queue: max` by default so back-to-back triggers run sequentially rather than being dropped. The top-level group only emits `queue: max` when `cancel-in-progress` is not enabled, since GitHub Actions rejects the combination of `queue: max` and `cancel-in-progress: true`. Set `features.group-concurrency-queue: false` to omit `queue` from generated groups and revert to the Actions default:
+
+For slash-command workflows that also handle pull request events, the top-level group uses an event-dependent `cancel-in-progress` expression so pull request updates cancel outdated runs without canceling command runs. Because GitHub Actions requires `queue` to be a literal value, the compiler omits it for this mixed-trigger group; the default `single` queue behavior applies.
 
 ```yaml wrap
 features:
@@ -140,11 +144,13 @@ Common expressions:
 `job-discriminator` is a gh-aw extension and is stripped from the compiled lock file. It does not appear in the generated GitHub Actions YAML.
 :::
 
+Shared workflows may define `concurrency.job-discriminator`. When multiple shared workflows define it, the first imported value wins; a value in the main workflow always takes precedence.
+
 :::note
 `job-discriminator` has no effect on workflows triggered by `workflow_dispatch`-only, `push`, or `pull_request` events, or when the engine provides an explicit job-level concurrency configuration.
 :::
 
-## Related Documentation
+## Learn More
 
 - [Frontmatter](/gh-aw/reference/frontmatter/) - Complete frontmatter reference
 - [Safe Outputs](/gh-aw/reference/safe-outputs/) - Safe output processing and job configuration

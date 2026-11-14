@@ -2,6 +2,11 @@
 
 This prompt guides you, a coding agent, to create, debug, update or do other actions related to **GitHub Agentic Workflows (gh-aw)** in a repository.
 
+For a debugging, failed-run, or log-investigation request, load
+[debugging bootstrap](.github/aw/debug-bootstrap.md) from the same repository/ref **before Step 1**, then follow
+its shared debugging strategy instead of the setup, editing, and publication
+steps below. Keep this URL as a compatibility entry point for existing links.
+
 ## Step 1: Install GitHub Agentic Workflows CLI Extension
 
 Check if `gh aw` is installed by running
@@ -38,12 +43,15 @@ You should see version information displayed. If you encounter an error, check t
 
 ## Step 2: Create the Workflow or do Other Actions
 
-Follow carefully the instructions in the appropriate prompt file based on the user's request. Read ALL the instructions in the prompt file before taking any action.
+Fetch (download) the full content of the appropriate prompt file based on the user's request, then follow its instructions carefully. Read ALL the instructions in the prompt file before taking any action.
 
-Below, ROOT is the location where you found this file. For example,
+For these authoring steps only, use the main branch as ROOT.
+Debugging requests already delegated above keep their supplied guidance repository/ref
+and do not enter these steps:
 
-- if this file is at `https://raw.githubusercontent.com/github/gh-aw/main/create.md` then the ROOT is `https://raw.githubusercontent.com/github/gh-aw/main`
-- if this file is at `https://raw.githubusercontent.com/github/gh-aw/v0.35.1/create.md` then the ROOT is `https://github.com/github/gh-aw/v0.35.1/main`
+- ROOT is `https://raw.githubusercontent.com/github/gh-aw/main`
+
+Prompt files under `ROOT/.github/aw/` may reference other files in that same directory using relative links (e.g. `[designer.md](designer.md)`). Resolve those links against `ROOT/.github/aw/` as well, and fetch and read them before proceeding if they are relevant to the task.
 
 Here are the common actions you may be asked to do, with links to the appropriate prompt files:
 
@@ -75,7 +83,8 @@ Here are the common actions you may be asked to do, with links to the appropriat
 
 **Load when**: User needs to investigate, audit, debug, or understand a workflow, troubleshoot issues, analyze logs, or fix errors
 
-**Prompt file**: `ROOT/.github/aw/debug-agentic-workflow.md`
+**Prompt file**: [debugging bootstrap](.github/aw/debug-bootstrap.md) at this file's repository/ref; it loads
+the canonical `.github/aw/debug-agentic-workflow.md` strategy.
 
 **Use cases**:
 
@@ -125,7 +134,7 @@ If creating a workflow, the actual files you created will be under `.github/work
 If creating a workflow, check the .gitattributes file and make sure it exists and contains at least the following line:
 
 ```text
-.github/workflows/*.lock.yml linguist-generated=true merge=ours
+.github/workflows/*.lock.yml linguist-generated=true
 ```
 
 You do not need to run `gh aw init` as part of your workflow creation. However if you did run this you may also see:
@@ -155,7 +164,9 @@ If there is branch protection on the default branch, create a pull request inste
 
 ## Troubleshooting
 
-See the separate guides on troubleshooting common issues.
+- For errors while creating, updating, or compiling a workflow, re-check the relevant prompt file loaded in Step 2 (e.g. `ROOT/.github/aw/create-agentic-workflow.md`).
+- For failing or unexpected workflow runs, use [the debugging bootstrap](.github/aw/debug-bootstrap.md) at the same repository/ref and follow its shared strategy.
+- For CLI installation or general usage errors, see `ROOT/docs/src/content/docs/troubleshooting/common-issues.md`.
 
 ## Instructions
 
@@ -169,7 +180,7 @@ When a user interacts with you:
 ## Quick Reference
 
 ```bash
-# Create a new workflow
+# Create a new workflow (bare template; prefer the guided interview in Step 2 for full support)
 gh aw new <workflow-name>
 
 # Compile workflows
@@ -177,7 +188,7 @@ gh aw compile [workflow-name]
 
 # Debug workflow runs
 gh aw logs [workflow-name]
-gh aw audit <run-id>
+gh aw audit <run-url>  # preserve host/repository and any job/step scope
 
 # Upgrade workflows
 gh aw fix --write

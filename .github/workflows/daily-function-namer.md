@@ -12,12 +12,16 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 
 tracker-id: daily-function-namer
 
-model: copilot/gpt-5.4
 engine:
   id: pi
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 imports:
   - uses: shared/daily-audit-base.md
     with:
@@ -36,7 +40,7 @@ safe-outputs:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   cache-memory: true
@@ -144,7 +148,7 @@ The script outputs:
 
 Use these values directly for the rest of the workflow. Do **not** re-derive or re-compute them manually.
 
-**On cold start** (`/tmp/gh-aw/cache-memory/function-namer-state.json` missing): treat this as expected initialization, not a failure. Do **not** call `missing_data` for a missing state file on first run or cold cache; run the Step 1 script as written, accept `LAST_INDEX=-1`, and continue.
+**On cold start** (`/tmp/gh-aw/cache-memory/function-namer-state.json` missing): treat this as expected initialization, not a failure. Do **not** call `report_missing_data` for a missing state file on first run or cold cache; run the Step 1 script as written, accept `LAST_INDEX=-1`, and continue.
 
 ## Step 2: Enumerate All Functions in the Package
 
@@ -440,4 +444,6 @@ Only include a rename suggestion if you are confident it would measurably improv
 
 ### Output Format
 
-Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks to reduce scrolling.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.

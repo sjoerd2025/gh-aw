@@ -15,16 +15,17 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 tracker-id: daily-multi-device-docs-tester
 max-turns: 80  # 10 devices × ~5 turns each + setup/report overhead
-model: copilot/gpt-5.4
+model: copilot/gpt-5
 engine:
   id: pi
+  model-provider: github
 strict: true
 timeout-minutes: 30
 runtimes:
@@ -36,27 +37,8 @@ tools:
     mode: gh-proxy
   timeout: 120  # Multi-device runs include preview startup and Playwright tests
   playwright:
-    mode: cli
   bash:
-    - "npm install*"
-    - "npm run build*"
-    - "npm run dev*"
-    - "npm run preview*"
-    - "npx astro*"
-    - "npx playwright*"
-    - "playwright-cli*"  # CLI-mode playwright commands
-    - "curl*"
-    - "kill*"
-    - "lsof*"
-    - "ls*"             # List files for directory navigation
-    - "pwd*"            # Print working directory
-    - "cd*"             # Change directory
-    - "nohup*"          # Start server in background
-    - "cat*"            # Read log files
-    - "echo*"           # Debug output and shell commands
-    - "sleep*"          # Wait between retries
-    - "rm*"             # Cleanup temp files
-    - "mkdir*"          # Create directories
+    - "*"
 safe-outputs:
   upload-artifact:
     max-uploads: 3
@@ -82,11 +64,18 @@ imports:
 
   - shared/otlp.md
 pre-agent-steps:
+  - name: Checkout agentics workflows
+    uses: actions/checkout@v7.0.1
+    with:
+      repository: githubnext/agentics
+      path: .agentics
+      persist-credentials: false
+      sparse-checkout: workflows
   - name: Resolve slide deck PDF
     env:
       EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
     run: |
-      cd "$EXPR_GITHUB_WORKSPACE/docs"
+      cd "$EXPR_GITHUB_WORKSPACE/docs" || exit 1
       node ../scripts/ensure-docs-slide-pdf.js
   - name: Configure Playwright CLI launch options
     env:
@@ -110,7 +99,6 @@ pre-agent-steps:
     run: |
       PREFLIGHT_LOG="$EXPR_GITHUB_WORKSPACE/.playwright/preflight.log"
       set +e
-      cd "$EXPR_GITHUB_WORKSPACE"
       playwright-cli open --config "$EXPR_GITHUB_WORKSPACE/.playwright/cli.config.json" about:blank > "$PREFLIGHT_LOG" 2>&1
       PREFLIGHT_STATUS=$?
       playwright-cli close >> "$PREFLIGHT_LOG" 2>&1 || true
@@ -124,12 +112,18 @@ pre-agent-steps:
   - name: Install and build docs
     env:
       EXPR_GITHUB_WORKSPACE: ${{ github.workspace }}
+      AGENTICS_WORKFLOWS_DIR: ${{ github.workspace }}/.agentics/workflows
     run: |
-      cd "$EXPR_GITHUB_WORKSPACE/docs"
-      npm install
+      cd "$EXPR_GITHUB_WORKSPACE/docs" || exit 1
+      npm ci
       npm run build
 features:
   gh-aw-detection: true
+evals:
+  - id: device_tests_completed
+    question: Did the agent test the documentation site across the requested device form factors?
+  - id: results_reported
+    question: Did the agent report the multi-device test results and any responsive design or functionality findings?
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -240,6 +234,12 @@ For each device viewport, use playwright-cli to:
 - Test interactions (navigation, search, buttons)
 - Check for layout issues (overflow, truncation, broken layouts)
 
+The responsive header switches at 800px. Below 800px, test the landing page navigation explicitly:
+- On `/gh-aw/`, click `.site-menu-toggle`, verify `aria-expanded` is `true`, and verify `#site-menu` is visible.
+- Click the visible `#site-menu .mobile-menu-cta[href$="setup/quick-start/"]` and verify the URL is `/gh-aw/setup/quick-start/`.
+- On documentation pages, the same button opens `#starlight__sidebar` instead of `#site-menu`; do not assume the landing-page menu structure applies there.
+At 800px and above, verify `.site-menu-toggle` is hidden and `.site-header-nav` is visible.
+
 ## Step 4: Analyze Results
 
 Organize findings by severity:
@@ -326,5 +326,7 @@ No manual server cleanup is required. The server process will be cleaned up auto
 The workflow will fail if you do not call either the `create-issue` or `noop` tool before exiting, regardless of whether testing succeeded or not.
 
 ### Output Format
+
+Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body. Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks for progressive disclosure.
 
 Structure reports as: overview → key metrics/issues → collapsible detail → next actions.

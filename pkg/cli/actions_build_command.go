@@ -70,16 +70,16 @@ func ActionsValidateCommand() error {
 		return nil
 	}
 
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("✅ Validating all actions"))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Validating all actions"))
 
 	allValid := true
 	for _, actionName := range actionDirs {
 		actionPath := filepath.Join(actionsDir, actionName)
 		if err := validateActionYml(actionPath); err != nil {
-			fmt.Fprintln(os.Stderr, console.FormatErrorMessage(fmt.Sprintf("✗ %s/action.yml: %s", actionName, err)))
+			fmt.Fprintln(os.Stderr, console.FormatErrorMessage(fmt.Sprintf("%s/action.yml: %s", actionName, err)))
 			allValid = false
 		} else {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  ✓ %s/action.yml is valid", actionName)))
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  %s/action.yml is valid", actionName)))
 		}
 	}
 
@@ -119,7 +119,7 @@ func ActionsCleanCommand() error {
 				if err := os.Remove(indexPath); err != nil {
 					return fmt.Errorf("failed to remove %s: %w", indexPath, err)
 				}
-				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  ✓ Removed %s/index.js", actionName)))
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  Removed %s/index.js", actionName)))
 				cleanedCount++
 			}
 		}
@@ -207,7 +207,7 @@ func buildAction(actionsDir, actionName string) error {
 	actionPath := filepath.Join(actionsDir, actionName)
 
 	// Validate action.yml
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("  ✓ Validating action.yml"))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("  Validating action.yml"))
 	if err := validateActionYml(actionPath); err != nil {
 		return err
 	}
@@ -222,21 +222,32 @@ func buildAction(actionsDir, actionName string) error {
 	if err != nil {
 		return fmt.Errorf("failed to check action type: %w", err)
 	}
+	actionsBuildLog.Printf("Detected action type: action=%s, composite=%t", actionName, isComposite)
 
 	if isComposite {
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("  ✓ Composite action - no JavaScript bundling needed"))
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("  Composite action - no JavaScript bundling needed"))
 		return nil
 	}
 
+	if err := buildJavaScriptAction(actionPath, actionName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func buildJavaScriptAction(actionPath, actionName string) error {
 	srcPath := filepath.Join(actionPath, "src", "index.js")
 	outputPath := filepath.Join(actionPath, "index.js")
+	actionsBuildLog.Printf("Bundling JavaScript action: action=%s, src=%s, output=%s", actionName, srcPath, outputPath)
 
 	// Check if source file exists
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+		actionsBuildLog.Printf("JavaScript action source missing: %s", srcPath)
 		return fmt.Errorf("source file not found: %s", srcPath)
 	}
 
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("  ✓ Reading source file"))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("  Reading source file"))
 	sourceContent, err := os.ReadFile(srcPath)
 	if err != nil {
 		return fmt.Errorf("failed to read source file: %w", err)
@@ -244,7 +255,7 @@ func buildAction(actionsDir, actionName string) error {
 
 	// Get dependencies for this action
 	dependencies := getActionDependencies(actionName)
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  ✓ Found %d dependencies", len(dependencies))))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  Found %d dependencies", len(dependencies))))
 
 	// Get all JavaScript sources
 	sources := workflow.GetJavaScriptSources()
@@ -256,9 +267,11 @@ func buildAction(actionsDir, actionName string) error {
 			files[dep] = content
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("    - "+dep))
 		} else {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("    ⚠ Warning: Could not find "+dep))
+			actionsBuildLog.Printf("Dependency not found in embedded JavaScript sources: action=%s, dependency=%s", actionName, dep)
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("    Could not find "+dep))
 		}
 	}
+	actionsBuildLog.Printf("Resolved %d of %d dependencies for action=%s", len(files), len(dependencies), actionName)
 
 	// Generate FILES object with embedded content
 	filesJSON, err := json.MarshalIndent(files, "", "  ")
@@ -278,9 +291,10 @@ func buildAction(actionsDir, actionName string) error {
 	if err := os.WriteFile(outputPath, []byte(outputContent), constants.FilePermSensitive); err != nil {
 		return fmt.Errorf("failed to write output file: %w", err)
 	}
+	actionsBuildLog.Printf("Wrote bundled action: output=%s, bytes=%d", outputPath, len(outputContent))
 
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("  ✓ Built "+outputPath))
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  ✓ Embedded %d files", len(files))))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("  Built "+outputPath))
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  Embedded %d files", len(files))))
 
 	return nil
 }
@@ -318,7 +332,7 @@ func buildSetupAction(actionsDir, actionName string) error {
 					jsCount++
 				}
 			}
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  ✓ JavaScript files in js/ (source of truth): %d", jsCount)))
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  JavaScript files in js/ (source of truth): %d", jsCount)))
 		}
 	}
 
@@ -333,7 +347,7 @@ func buildSetupAction(actionsDir, actionName string) error {
 					shCount++
 				}
 			}
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  ✓ Shell scripts in sh/ (source of truth): %d", shCount)))
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("  Shell scripts in sh/ (source of truth): %d", shCount)))
 		}
 	}
 

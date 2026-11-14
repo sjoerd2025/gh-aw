@@ -4,16 +4,15 @@ emoji: "📦"
 description: Generates a comprehensive summary of GitHub Actions artifacts usage across all workflows in the repository
 on:
   workflow_dispatch:
-  schedule: weekly on sunday around 06:00
 max-daily-ai-credits: 10000
 permissions:
   contents: read
   actions: read
   copilot-requests: write
 engine:
-  id: copilot
-  copilot-sdk: true
-max-tool-denials: 3
+  id: codex
+  model-provider: openai
+model: openai/gpt-6-luna
 network:
   allowed:
     - defaults
@@ -21,26 +20,31 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 tools:
+  work-queue:
+    worker: true
+    require-assignment: true
   cli-proxy: true
   edit:
   bash: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [actions, repos]
 safe-outputs:
   create-discussion:
     expires: 1d
     category: "artifacts"
     max: 1
+    fallback-to-issue: false
     close-older-discussions: true
 timeout-minutes: 15
 strict: true
 imports:
+  - shared/daily-report-worker.md
   - shared/reporting.md
   - shared/safe-output-app.md
   - shared/otlp.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
 evals:
@@ -48,13 +52,18 @@ evals:
     question: Did the agent analyze GitHub Actions artifacts usage across all workflows in the repository?
   - id: summary_produced
     question: Was a comprehensive summary report of artifacts usage produced?
+
 ---
 
 ### Artifacts Summary
 
-**Report Formatting**: Use h3 (###) or lower for all headers in your report
-to maintain proper document hierarchy. Wrap long sections in
-`<details><summary>View Full Details</summary>` tags to improve readability.
+**Report Formatting**: Use `###` or lower for every report heading; reserve h1/h2
+for the platform-rendered title. Follow this order: overview → key metrics/issues
+→ collapsible detailed findings → next actions or limitations. Keep the executive
+summary and decision-relevant metrics visible. Put long tables, lists, and evidence
+in `<details><summary><b>...</b></summary>...</details>` blocks. Use `- [ ]` for
+follow-up actions and format applicable run references as
+`[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)`.
 
 
 Generate a comprehensive summary table of GitHub Actions artifacts usage in the repository ${{ github.repository }}.
@@ -62,7 +71,7 @@ Generate a comprehensive summary table of GitHub Actions artifacts usage in the 
 #### Task Requirements
 
 1. **Analyze all workflows** in the repository to identify which ones generate artifacts
-2. **Collect artifact data** for recent workflow runs (last 30 days recommended)
+2. **Collect artifact data** for the 30-day window ending at midnight UTC after the assigned `report_date`; exclude runs outside that window
 3. **Generate a summary table** with the following columns:
    - Workflow Name
    - Total Artifacts Count
@@ -91,18 +100,36 @@ Please:
 
 #### Output Format
 
-Create an issue with a markdown table like this:
+Create a discussion titled "Artifacts Usage Report - [report_date]" with a markdown table like this:
 
 ```markdown
-# Artifacts Usage Report
+### Summary
+
+One or two sentences with the outcome and the most important storage metric.
+
+### Key Metrics and Issues
+
+State the total artifacts and storage used, plus the most important trend or concern.
+
+<details>
+<summary><b>Artifact usage by workflow</b></summary>
 
 | Workflow Name | Artifacts Count | Total Size | Avg Size | Latest Run | Status |
 |---------------|-----------------|------------|----------|------------|--------|
 | workflow-1    | 45             | 2.3 GB     | 52 MB    | 2024-01-15 | Active |
 | workflow-2    | 12             | 456 MB     | 38 MB    | 2024-01-10 | Active |
 
-## Insights & Recommendations
-[Your analysis and recommendations here]
+### Insights and Recommendations
+
+- Identify which workflows generate the most artifacts and use the most storage.
+- Note artifact usage trends and relevant retention policies.
+- Describe specific storage optimizations.
+
+</details>
+
+### Next Actions or Limitations
+
+- [ ] Follow up on the highest-priority storage optimization.
 ```
 
 #### Important Notes

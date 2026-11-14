@@ -10,17 +10,18 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
-model: copilot/gpt-5.4
+  copilot-requests: write
 engine:
-  id: pi
+  id: codex
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 strict: true
-sandbox:
-  agent:
-    sudo: false
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
   cache-memory: true
   bash: true
 safe-outputs:
@@ -45,8 +46,18 @@ safe-outputs:
 timeout-minutes: 30
 imports:
   - shared/otlp.md
+  - shared/reporting.md
+  - shared/graders.md
 features:
   gh-aw-detection: true
+
+evals:
+  - id: five-scenarios
+    question: When safe test changes can be produced, does the agent request exactly five scenario pull requests? Return UNKNOWN when a concrete blocker prevents safe test changes.
+  - id: chaos-branches
+    question: Do all requested test pull requests use branch names beginning with chaos/? Return UNKNOWN when no pull requests are requested.
+  - id: sandboxed-edits
+    question: Are all proposed edits confined to tmp/chaos, scratchpad/chaos, or tests/chaos?
 ---
 
 # Chaos PR Bundle Fuzzer
@@ -96,11 +107,3 @@ For each selected persona:
 - If at least one PR is created, finish after recording summary stats in cache-memory.
 - If no safe PR can be produced, call `noop` with a concise reason.
 - Keep logs concise and action-oriented.
-
-## Report Formatting
-
-When writing PR bodies and run summaries:
-
-- Use h3 (###) or lower for all headers to maintain proper document hierarchy.
-- Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
-- Structure: Brief summary (always visible) → Key metrics (always visible) → Detailed results (in `<details>`) → Recommendations (always visible)

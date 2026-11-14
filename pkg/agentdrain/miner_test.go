@@ -3,7 +3,9 @@
 package agentdrain
 
 import (
-	"fmt"
+	"encoding/json"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,78 +15,80 @@ import (
 )
 
 func TestNewMiner(t *testing.T) {
+	t.Parallel()
 	cfg := DefaultConfig()
 	m, err := NewMiner(cfg)
 	require.NoError(t, err, "NewMiner should not return an error")
 	require.NotNil(t, m, "NewMiner should return a non-nil miner")
 }
 
-func TestTrain(t *testing.T) {
+func TestNewMinerRejectsInvalidAnomalyThresholds(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
-		name            string
-		simThreshold    float64
-		lines           []string
-		wantClusters    int
-		wantWildcard    bool
-		wantClusterIDNZ bool // last result ClusterID should be non-zero
+		name   string
+		mutate func(*Config)
 	}{
 		{
-			name:            "single line creates one cluster",
-			simThreshold:    DefaultConfig().SimThreshold,
-			lines:           []string{"stage=plan action=start"},
-			wantClusters:    1,
-			wantWildcard:    false,
-			wantClusterIDNZ: true,
+			name: "similarity threshold above one",
+			mutate: func(cfg *Config) {
+				cfg.SimThreshold = 1.1
+			},
 		},
 		{
-			name:            "two identical lines stay in one cluster without wildcard",
-			simThreshold:    DefaultConfig().SimThreshold,
-			lines:           []string{"stage=plan action=start", "stage=plan action=start"},
-			wantClusters:    1,
-			wantWildcard:    false,
-			wantClusterIDNZ: true,
+			name: "NaN similarity threshold",
+			mutate: func(cfg *Config) {
+				cfg.SimThreshold = math.NaN()
+			},
 		},
 		{
-			name:         "two distinct lines create separate clusters",
-			simThreshold: DefaultConfig().SimThreshold,
-			lines:        []string{"stage=plan action=start", "stage=finish status=ok"},
-			wantClusters: 2,
-			wantWildcard: false,
-		},
-		{
-			name:            "similar lines merge and produce wildcard",
-			simThreshold:    0.4,
-			lines:           []string{"stage=tool_call tool=search", "stage=tool_call tool=read_file"},
-			wantClusters:    1,
-			wantWildcard:    true,
-			wantClusterIDNZ: true,
+			name: "negative rare cluster threshold",
+			mutate: func(cfg *Config) {
+				cfg.RareClusterThreshold = -1
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			cfg := DefaultConfig()
-			cfg.SimThreshold = tt.simThreshold
+			tt.mutate(&cfg)
+
 			m, err := NewMiner(cfg)
-			require.NoError(t, err, "NewMiner should succeed")
-
-			var result *MatchResult
-			for _, line := range tt.lines {
-				result, err = m.Train(line)
-				require.NoError(t, err, "Train should not return an error for line %q", line)
-			}
-
-			if tt.wantClusterIDNZ {
-				assert.NotZero(t, result.ClusterID, "last result ClusterID should be non-zero")
-			}
-			if tt.wantWildcard {
-				assert.Contains(t, result.Template, "<*>", "merged template should contain wildcard")
-			}
+			require.Error(t, err)
+			assert.Nil(t, m)
 		})
 	}
 }
 
+func TestLoadJSONRefreshesAndValidatesAnomalyThresholds(t *testing.T) {
+	t.Parallel()
+	m, err := NewMiner(DefaultConfig())
+	require.NoError(t, err)
+
+	data, err := m.SaveJSON()
+	require.NoError(t, err)
+
+	var snapshot Snapshot
+	require.NoError(t, json.Unmarshal(data, &snapshot))
+	snapshot.Config.SimThreshold = 0.8
+	data, err = json.Marshal(snapshot)
+	require.NoError(t, err)
+	require.NoError(t, m.LoadJSON(data))
+	assert.InDelta(t, 0.8, m.detector.threshold, 0)
+
+	// NaN cannot round-trip through JSON (encoding/json rejects it), so the
+	// invalid-threshold path is exercised here with an out-of-range value.
+	snapshot.Config.SimThreshold = 1.1
+	data, err = json.Marshal(snapshot)
+	require.NoError(t, err)
+
+	require.Error(t, m.LoadJSON(data))
+}
+
 func TestTrainEvent(t *testing.T) {
+	t.Parallel()
 	m, err := NewMiner(DefaultConfig())
 	require.NoError(t, err, "NewMiner should succeed")
 
@@ -99,12 +103,13 @@ func TestTrainEvent(t *testing.T) {
 }
 
 func TestClusters(t *testing.T) {
+	t.Parallel()
 	m, err := NewMiner(DefaultConfig())
 	require.NoError(t, err, "NewMiner should succeed")
 
 	assert.Empty(t, m.Clusters(), "Clusters should be empty for a new miner")
 
-	_, err = m.Train("stage=plan action=start")
+	_, err = m.TrainEvent(AgentEvent{Stage: "plan", Fields: map[string]string{"action": "start"}})
 	require.NoError(t, err, "Train should not return an error")
 
 	clusters := m.Clusters()
@@ -113,6 +118,7 @@ func TestClusters(t *testing.T) {
 }
 
 func TestMasking(t *testing.T) {
+	t.Parallel()
 	masker, err := NewMasker(DefaultConfig().MaskRules)
 	require.NoError(t, err, "NewMasker should not return an error")
 
@@ -139,6 +145,7 @@ func TestMasking(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			out := masker.Mask(tt.input)
 			assert.Contains(t, out, tt.wantContain, "Mask(%q) should contain %q", tt.input, tt.wantContain)
 		})
@@ -146,6 +153,7 @@ func TestMasking(t *testing.T) {
 }
 
 func TestFlattenEvent(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		evt              AgentEvent
@@ -203,6 +211,7 @@ func TestFlattenEvent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := FlattenEvent(tt.evt, tt.exclude)
 			assert.Equal(t, tt.expected, got, "FlattenEvent output mismatch for case %q", tt.name)
 			if tt.excludedField != "" {
@@ -222,6 +231,7 @@ func TestFlattenEvent(t *testing.T) {
 }
 
 func TestTokenize(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		line     string
@@ -251,23 +261,15 @@ func TestTokenize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := Tokenize(tt.line)
 			assert.Equal(t, tt.expected, got, "Tokenize(%q) should split into expected tokens", tt.line)
 		})
 	}
 }
 
-func TestTrainEmptyLine(t *testing.T) {
-	m, err := NewMiner(DefaultConfig())
-	require.NoError(t, err, "NewMiner should succeed for empty-line training test")
-
-	result, err := m.Train(" \t\n ")
-	assert.Nil(t, result, "Train should return nil result for whitespace-only input")
-	require.Error(t, err, "Train should return an error for whitespace-only input")
-	require.ErrorContains(t, err, "empty line after masking", "Train error should explain empty line after masking")
-}
-
 func TestNewMaskerInvalidPattern(t *testing.T) {
+	t.Parallel()
 	masker, err := NewMasker([]MaskRule{
 		{
 			Name:        "invalid",
@@ -294,8 +296,7 @@ func TestConcurrency(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for i := range linesEach {
-				line := fmt.Sprintf("stage=work goroutine=%d iter=%d", id, i)
-				_, trainErr := m.Train(line)
+				_, trainErr := m.TrainEvent(AgentEvent{Stage: "work", Fields: map[string]string{"goroutine": strconv.Itoa(id), "iter": strconv.Itoa(i)}})
 				assert.NoError(t, trainErr, "Train should not error during concurrent access")
 			}
 		}(g)
@@ -305,6 +306,7 @@ func TestConcurrency(t *testing.T) {
 }
 
 func TestStageRouting(t *testing.T) {
+	t.Parallel()
 	cfg := DefaultConfig()
 	stages := []string{"plan", "tool_call", "finish"}
 	coord, err := NewCoordinator(cfg, stages)
@@ -325,6 +327,7 @@ func TestStageRouting(t *testing.T) {
 }
 
 func TestCoordinatorAnalyzeEvent(t *testing.T) {
+	t.Parallel()
 	cfg := DefaultConfig()
 	stages := []string{"plan", "tool_call"}
 	coord, err := NewCoordinator(cfg, stages)
@@ -351,6 +354,7 @@ func TestCoordinatorAnalyzeEvent(t *testing.T) {
 }
 
 func TestStageSequence(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		events   []AgentEvent
@@ -382,6 +386,7 @@ func TestStageSequence(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := StageSequence(tt.events)
 			assert.Equal(t, tt.expected, got, "StageSequence result mismatch")
 		})
@@ -389,6 +394,7 @@ func TestStageSequence(t *testing.T) {
 }
 
 func TestPersistenceRoundTrip(t *testing.T) {
+	t.Parallel()
 	cfg := DefaultConfig()
 	stages := []string{"plan", "tool_call", "finish"}
 	coord, err := NewCoordinator(cfg, stages)
@@ -427,6 +433,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 }
 
 func TestComputeSimilarity(t *testing.T) {
+	t.Parallel()
 	param := "<*>"
 	tests := []struct {
 		name     string
@@ -467,6 +474,7 @@ func TestComputeSimilarity(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := computeSimilarity(tt.a, tt.b, param)
 			assert.InDelta(t, tt.expected, got, 1e-9, "computeSimilarity(%v, %v) mismatch", tt.a, tt.b)
 		})
@@ -474,6 +482,7 @@ func TestComputeSimilarity(t *testing.T) {
 }
 
 func TestMergeTemplate(t *testing.T) {
+	t.Parallel()
 	param := "<*>"
 	tests := []struct {
 		name     string
@@ -508,6 +517,7 @@ func TestMergeTemplate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got := mergeTemplate(tt.existing, tt.incoming, param)
 			assert.Equal(t, tt.expected, got, "mergeTemplate(%v, %v) mismatch", tt.existing, tt.incoming)
 		})

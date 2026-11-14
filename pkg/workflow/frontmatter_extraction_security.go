@@ -1,6 +1,12 @@
 package workflow
 
-import "github.com/github/gh-aw/pkg/logger"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/github/gh-aw/pkg/logger"
+)
 
 var frontmatterExtractionSecurityLog = logger.New("workflow:frontmatter_extraction_security")
 
@@ -9,7 +15,6 @@ func (c *Compiler) extractNetworkPermissions(frontmatter map[string]any) *Networ
 	frontmatterExtractionSecurityLog.Print("Extracting network permissions from frontmatter")
 
 	if network, exists := frontmatter["network"]; exists {
-		// Handle string format: "defaults"
 		if networkStr, ok := network.(string); ok {
 			frontmatterExtractionSecurityLog.Printf("Network permissions string format: %s", networkStr)
 			if networkStr == "defaults" {
@@ -18,19 +23,16 @@ func (c *Compiler) extractNetworkPermissions(frontmatter map[string]any) *Networ
 					ExplicitlyDefined: true,
 				}
 			}
-			// Unknown string format, return nil
 			frontmatterExtractionSecurityLog.Printf("Unknown network string format: %s", networkStr)
 			return nil
 		}
 
-		// Handle object format: { allowed: [...], blocked: [...] } or {}
 		if networkObj, ok := network.(map[string]any); ok {
 			frontmatterExtractionSecurityLog.Printf("Network permissions object format with %d fields", len(networkObj))
 			permissions := &NetworkPermissions{
 				ExplicitlyDefined: true,
 			}
 
-			// Extract allowed domains if present
 			if allowed, hasAllowed := networkObj["allowed"]; hasAllowed {
 				if allowedSlice, ok := allowed.([]any); ok {
 					for _, domain := range allowedSlice {
@@ -48,7 +50,6 @@ func (c *Compiler) extractNetworkPermissions(frontmatter map[string]any) *Networ
 				}
 			}
 
-			// Extract blocked domains if present
 			if blocked, hasBlocked := networkObj["blocked"]; hasBlocked {
 				if blockedSlice, ok := blocked.([]any); ok {
 					for _, domain := range blockedSlice {
@@ -60,7 +61,10 @@ func (c *Compiler) extractNetworkPermissions(frontmatter map[string]any) *Networ
 				}
 			}
 
-			// Empty object {} means no network access (empty allowed list)
+			if hostedWeb, hasHostedWeb := networkObj["hosted-web"]; hasHostedWeb {
+				applyHostedWebPolicy(permissions, hostedWeb)
+			}
+
 			return permissions
 		}
 	}
@@ -68,8 +72,72 @@ func (c *Compiler) extractNetworkPermissions(frontmatter map[string]any) *Networ
 	return nil
 }
 
+func applyHostedWebPolicy(permissions *NetworkPermissions, hostedWeb any) {
+	if policy, ok := extractHostedWebPolicy(hostedWeb); ok {
+		permissions.HostedWeb = policy
+	} else {
+		permissions.InvalidHostedWeb = true
+		permissions.HostedWebRawValue = describeHostedWebValue(hostedWeb)
+	}
+}
+
+func describeHostedWebValue(hostedWeb any) string {
+	switch value := hostedWeb.(type) {
+	case bool:
+		return fmt.Sprintf("boolean %t", value)
+	case string:
+		return fmt.Sprintf("string %q", value)
+	case []any:
+		return "array"
+	case nil:
+		return "null"
+	default:
+		return fmt.Sprintf("%T", hostedWeb)
+	}
+}
+
+// extractHostedWebPolicy accepts hosted-web: false for explicit disablement;
+// enablement is represented by the object form, not by hosted-web: true.
+func extractHostedWebPolicy(hostedWeb any) (*HostedWebPolicy, bool) {
+	switch hostedWeb := hostedWeb.(type) {
+	case bool:
+		if !hostedWeb {
+			return &HostedWebPolicy{}, true
+		}
+		return nil, false
+	case map[string]any:
+		policy := &HostedWebPolicy{Enabled: true}
+		policy.Allowed = extractStringSlice(hostedWeb["allowed"])
+		policy.Blocked = extractStringSlice(hostedWeb["blocked"])
+		switch maxUses := hostedWeb["max-uses"].(type) {
+		case int:
+			policy.MaxUses = maxUses
+		case uint64:
+			policy.MaxUses = int(maxUses)
+		case float64:
+			policy.MaxUses = int(maxUses)
+		}
+		return policy, true
+	}
+	return nil, false
+}
+
+func extractStringSlice(value any) []string {
+	values, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value, ok := value.(string); ok {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 // extractSandboxConfig extracts sandbox configuration from front matter
-func (c *Compiler) extractSandboxConfig(frontmatter map[string]any) *SandboxConfig {
+func (c *Compiler) extractSandboxConfig(frontmatter map[string]any) *SandboxConfig { //nolint:largefunc // Existing parser handles legacy and current sandbox shapes in one place.
 	frontmatterExtractionSecurityLog.Print("Extracting sandbox configuration from frontmatter")
 
 	sandbox, exists := frontmatter["sandbox"]
@@ -121,9 +189,9 @@ func (c *Compiler) extractSandboxConfig(frontmatter map[string]any) *SandboxConf
 		config.MCP = c.extractMCPGatewayConfig(mcpVal)
 	}
 
-	// If we found agent field, return the new format config
-	if config.Agent != nil {
-		frontmatterExtractionSecurityLog.Print("Sandbox configured with new format (agent)")
+	// Agent and MCP select the new sandbox format.
+	if config.Agent != nil || config.MCP != nil {
+		frontmatterExtractionSecurityLog.Print("Sandbox configured with new format")
 		return config
 	}
 
@@ -143,7 +211,7 @@ func (c *Compiler) extractSandboxConfig(frontmatter map[string]any) *SandboxConf
 }
 
 // extractAgentSandboxConfig extracts agent sandbox configuration
-func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
+func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig { //nolint:largefunc // Existing parser handles all sandbox.agent fields in one pass.
 	// Handle boolean format: agent: false (disables agent sandbox but keeps MCP gateway)
 	if agentBool, ok := agentVal.(bool); ok {
 		if !agentBool {
@@ -197,26 +265,14 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 		}
 	}
 
+	if digest, ok := agentObj["checksums-sha256"].(string); ok {
+		agentConfig.ChecksumsSHA256 = digest
+	}
+
 	// Extract platform (AWF platform.type override)
 	if platformVal, hasPlatform := agentObj["platform"]; hasPlatform {
 		if platformStr, ok := platformVal.(string); ok {
 			agentConfig.Platform = platformStr
-		}
-	}
-
-	// Extract sudo (AWF topology egress mode).
-	// Semantics are inverted from the frontmatter field:
-	//   sudo: false  → no sudo = network isolation mode  → NetworkIsolation=true
-	//   sudo: true   → sudo enabled = normal mode        → NetworkIsolation=false  (deprecated; error in strict mode, warning otherwise)
-	//   (omitted)    → default = network isolation mode  → NetworkIsolation=true   (same as sudo: false)
-	agentConfig.NetworkIsolation = true // Default: sudo: false (network isolation enabled)
-	if sudoVal, hasSudo := agentObj["sudo"]; hasSudo {
-		if sudoBool, ok := sudoVal.(bool); ok {
-			agentConfig.NetworkIsolation = !sudoBool
-			if sudoBool {
-				// sudo: true was explicitly set; record it so validation can warn/error.
-				agentConfig.SudoExplicitlyEnabled = true
-			}
 		}
 	}
 
@@ -266,6 +322,14 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 		}
 	}
 
+	// Extract memory (memory limit for the AWF container)
+	if memoryVal, hasMemory := agentObj["memory"]; hasMemory {
+		if memoryStr, ok := memoryVal.(string); ok {
+			agentConfig.Memory = memoryStr
+			frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.memory: %s", memoryStr)
+		}
+	}
+
 	// Extract runtime (container runtime for the agent container)
 	if runtimeVal, hasRuntime := agentObj["runtime"]; hasRuntime {
 		if runtimeStr, ok := runtimeVal.(string); ok {
@@ -274,15 +338,63 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 		}
 	}
 
-	// Extract legacy-security (opt-in to legacy sudo/iptables mode)
-	if legacyVal, hasLegacy := agentObj["legacy-security"]; hasLegacy {
-		if legacyStr, ok := legacyVal.(string); ok && legacyStr == "enable" {
-			agentConfig.LegacySecurity = true
-			frontmatterExtractionSecurityLog.Print("Extracted sandbox.agent.legacy-security: enable")
+	if nvxVal, hasNVX := agentObj["nvx"]; hasNVX {
+		if encoded, err := json.Marshal(nvxVal); err == nil {
+			var nvxConfig AgentNVXConfig
+			if err := json.Unmarshal(encoded, &nvxConfig); err == nil {
+				agentConfig.NVX = &nvxConfig
+				frontmatterExtractionSecurityLog.Print("Extracted sandbox.agent.nvx configuration")
+			}
+		}
+	}
+
+	// Extract allow-host-ports (additional host TCP ports for the AWF sandbox)
+	if portsVal, hasPorts := agentObj["allow-host-ports"]; hasPorts {
+		if portsSlice, ok := portsVal.([]any); ok {
+			for _, portVal := range portsSlice {
+				switch v := portVal.(type) {
+				case int:
+					agentConfig.AllowHostPorts = append(agentConfig.AllowHostPorts, v)
+				case int64:
+					agentConfig.AllowHostPorts = append(agentConfig.AllowHostPorts, int(v))
+				case uint64:
+					agentConfig.AllowHostPorts = append(agentConfig.AllowHostPorts, int(v))
+				case float64:
+					if float64(int(v)) == v {
+						agentConfig.AllowHostPorts = append(agentConfig.AllowHostPorts, int(v))
+					}
+				}
+			}
+			frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.allow-host-ports: %v", agentConfig.AllowHostPorts)
+		}
+	}
+
+	// Extract images (digest-pinned AWF infrastructure image manifest)
+	if imagesVal, hasImages := agentObj["images"]; hasImages {
+		if imagesObj, ok := imagesVal.(map[string]any); ok {
+			agentConfig.Images = make(map[string]string, len(imagesObj))
+			for role, value := range imagesObj {
+				role = sandboxImageRoleFromFrontmatter(role)
+				if valueStr, ok := value.(string); ok {
+					agentConfig.Images[role] = strings.TrimSpace(valueStr)
+					continue
+				}
+				// Preserve non-string values as their formatted form so validation
+				// can report an actionable error instead of silently dropping them.
+				agentConfig.Images[role] = fmt.Sprintf("%v", value)
+			}
+			frontmatterExtractionSecurityLog.Printf("Extracted sandbox.agent.images: %d role(s)", len(agentConfig.Images))
 		}
 	}
 
 	// Extract model-fallback (AWF API proxy model fallback enable/disable flag)
+	if value, ok := agentObj["enclave-debug-public"].(bool); ok {
+		agentConfig.EnclaveDebugPublic = &value
+	}
+	if value, ok := agentObj["host-github-token"].(string); ok {
+		agentConfig.HostGitHubToken = value
+	}
+
 	if mfVal, hasMF := agentObj["model-fallback"]; hasMF {
 		switch v := mfVal.(type) {
 		case bool:
@@ -301,7 +413,24 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 		}
 	}
 
-	// Extract targets (per-provider API proxy target overrides, e.g. authHeader, extraHeaders)
+	// Extract token-steering (AWF API proxy token steering enable/disable flag).
+	if tsVal, hasTS := agentObj["token-steering"]; hasTS {
+		if value, ok := tsVal.(bool); ok {
+			agentConfig.TokenSteering = &value
+			frontmatterExtractionSecurityLog.Print("Extracted sandbox.agent.token-steering")
+		}
+	}
+
+	// Extract ca-cert (host path to an additional CA certificate for API proxy
+	// upstream TLS verification; maps to apiProxy.caCert).
+	if caCertVal, hasCACert := agentObj["ca-cert"]; hasCACert {
+		if value, ok := caCertVal.(string); ok {
+			agentConfig.CACert = strings.TrimSpace(value)
+			frontmatterExtractionSecurityLog.Print("Extracted sandbox.agent.ca-cert")
+		}
+	}
+
+	// Extract targets (per-provider API proxy target overrides)
 	if targetsVal, hasTargets := agentObj["targets"]; hasTargets {
 		if targetsObj, ok := targetsVal.(map[string]any); ok {
 			agentConfig.Targets = make(map[string]*AgentAPIProxyTargetConfig)
@@ -311,10 +440,10 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 					continue
 				}
 				targetConfig := &AgentAPIProxyTargetConfig{}
-				if authHeader, ok := targetObj["authHeader"].(string); ok {
+				if authHeader, ok := targetObj["auth-header"].(string); ok {
 					targetConfig.AuthHeader = authHeader
 				}
-				if extraHeaders, ok := targetObj["extraHeaders"].(map[string]any); ok {
+				if extraHeaders, ok := targetObj["extra-headers"].(map[string]any); ok {
 					targetConfig.ExtraHeaders = make(map[string]string)
 					for k, v := range extraHeaders {
 						if s, ok := v.(string); ok {
@@ -322,7 +451,7 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 						}
 					}
 				}
-				if extraBodyFields, ok := targetObj["extraBodyFields"].(map[string]any); ok {
+				if extraBodyFields, ok := targetObj["extra-body-fields"].(map[string]any); ok {
 					targetConfig.ExtraBodyFields = make(map[string]string)
 					for k, v := range extraBodyFields {
 						if s, ok := v.(string); ok {
@@ -330,7 +459,7 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 						}
 					}
 				}
-				if sessionId, ok := targetObj["sessionId"].(string); ok {
+				if sessionId, ok := targetObj["session-id"].(string); ok {
 					targetConfig.SessionId = sessionId
 				}
 				agentConfig.Targets[provider] = targetConfig
@@ -345,7 +474,7 @@ func (c *Compiler) extractAgentSandboxConfig(agentVal any) *AgentSandboxConfig {
 // extractMCPGatewayConfig extracts MCP gateway configuration from frontmatter
 // Per MCP Gateway Specification v1.0.0: Only container-based execution is supported.
 // Direct command execution is not supported.
-func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig {
+func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig { //nolint:largefunc // Existing parser handles all sandbox.mcp fields in one pass.
 	// Handle nil or boolean false
 	if mcpVal == nil {
 		return nil
@@ -400,10 +529,10 @@ func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig 
 		}
 	}
 
-	// Extract apiKey
-	if apiKeyVal, hasAPIKey := mcpObj["api-key"]; hasAPIKey {
-		if apiKeyStr, ok := apiKeyVal.(string); ok {
-			mcpConfig.APIKey = apiKeyStr
+	// Extract agent ID
+	if agentIDVal, hasAgentID := mcpObj["agent-id"]; hasAgentID {
+		if agentIDStr, ok := agentIDVal.(string); ok {
+			mcpConfig.AgentID = agentIDStr
 		}
 	}
 
@@ -425,8 +554,8 @@ func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig 
 		}
 	}
 
-	// Extract entrypointArgs (for container only)
-	if entrypointArgsVal, hasEntrypointArgs := mcpObj["entrypointArgs"]; hasEntrypointArgs {
+	// Extract entrypoint-args (for container only)
+	if entrypointArgsVal, hasEntrypointArgs := mcpObj["entrypoint-args"]; hasEntrypointArgs {
 		if entrypointArgsSlice, ok := entrypointArgsVal.([]any); ok {
 			for _, arg := range entrypointArgsSlice {
 				if argStr, ok := arg.(string); ok {
@@ -500,18 +629,13 @@ func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig 
 		}
 	}
 
-	// Extract trustedBots / trusted-bots (additional bot identities to pass to the gateway)
-	for _, key := range []string{"trustedBots", "trusted-bots"} {
-		if trustedBotsVal, hasTrustedBots := mcpObj[key]; hasTrustedBots {
-			if trustedBotsSlice, ok := trustedBotsVal.([]any); ok {
-				for _, bot := range trustedBotsSlice {
-					if botStr, ok := bot.(string); ok {
-						mcpConfig.TrustedBots = append(mcpConfig.TrustedBots, botStr)
-					}
+	// Frontmatter uses trusted-bots; trustedBots is the generated gateway JSON field.
+	if trustedBotsVal, hasTrustedBots := mcpObj["trusted-bots"]; hasTrustedBots {
+		if trustedBotsSlice, ok := trustedBotsVal.([]any); ok {
+			for _, bot := range trustedBotsSlice {
+				if botStr, ok := bot.(string); ok {
+					mcpConfig.TrustedBots = append(mcpConfig.TrustedBots, botStr)
 				}
-			}
-			if len(mcpConfig.TrustedBots) > 0 {
-				break
 			}
 		}
 	}
@@ -541,7 +665,7 @@ func (c *Compiler) extractMCPGatewayConfig(mcpVal any) *MCPGatewayRuntimeConfig 
 }
 
 // extractSRTConfig extracts Sandbox Runtime configuration from a map
-func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
+func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig { //nolint:largefunc // Existing SRT config extraction preserves legacy key handling.
 	configObj, ok := configVal.(map[string]any)
 	if !ok {
 		return nil
@@ -554,8 +678,8 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 		if networkObj, ok := networkVal.(map[string]any); ok {
 			netConfig := &SRTNetworkConfig{}
 
-			// Extract allowedDomains
-			if allowedDomains, hasAllowed := networkObj["allowedDomains"]; hasAllowed {
+			// Extract allowed-domains
+			if allowedDomains, hasAllowed := networkObj["allowed-domains"]; hasAllowed {
 				if domainsSlice, ok := allowedDomains.([]any); ok {
 					for _, domain := range domainsSlice {
 						if domainStr, ok := domain.(string); ok {
@@ -565,8 +689,8 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 				}
 			}
 
-			// Extract blockedDomains
-			if blockedDomains, hasBlocked := networkObj["blockedDomains"]; hasBlocked {
+			// Extract blocked-domains
+			if blockedDomains, hasBlocked := networkObj["blocked-domains"]; hasBlocked {
 				if domainsSlice, ok := blockedDomains.([]any); ok {
 					for _, domain := range domainsSlice {
 						if domainStr, ok := domain.(string); ok {
@@ -576,8 +700,8 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 				}
 			}
 
-			// Extract allowUnixSockets
-			if unixSockets, hasUnixSockets := networkObj["allowUnixSockets"]; hasUnixSockets {
+			// Extract allow-unix-sockets
+			if unixSockets, hasUnixSockets := networkObj["allow-unix-sockets"]; hasUnixSockets {
 				if socketsSlice, ok := unixSockets.([]any); ok {
 					for _, socket := range socketsSlice {
 						if socketStr, ok := socket.(string); ok {
@@ -587,15 +711,15 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 				}
 			}
 
-			// Extract allowLocalBinding
-			if allowLocalBinding, hasAllowLocalBinding := networkObj["allowLocalBinding"]; hasAllowLocalBinding {
+			// Extract allow-local-binding
+			if allowLocalBinding, hasAllowLocalBinding := networkObj["allow-local-binding"]; hasAllowLocalBinding {
 				if bindingBool, ok := allowLocalBinding.(bool); ok {
 					netConfig.AllowLocalBinding = bindingBool
 				}
 			}
 
-			// Extract allowAllUnixSockets
-			if allowAllUnixSockets, hasAllowAllUnixSockets := networkObj["allowAllUnixSockets"]; hasAllowAllUnixSockets {
+			// Extract allow-all-unix-sockets
+			if allowAllUnixSockets, hasAllowAllUnixSockets := networkObj["allow-all-unix-sockets"]; hasAllowAllUnixSockets {
 				if unixSocketsBool, ok := allowAllUnixSockets.(bool); ok {
 					netConfig.AllowAllUnixSockets = unixSocketsBool
 				}
@@ -610,8 +734,8 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 		if filesystemObj, ok := filesystemVal.(map[string]any); ok {
 			fsConfig := &SRTFilesystemConfig{}
 
-			// Extract denyRead
-			if denyRead, hasDenyRead := filesystemObj["denyRead"]; hasDenyRead {
+			// Extract deny-read
+			if denyRead, hasDenyRead := filesystemObj["deny-read"]; hasDenyRead {
 				if pathsSlice, ok := denyRead.([]any); ok {
 					fsConfig.DenyRead = []string{}
 					for _, path := range pathsSlice {
@@ -622,9 +746,10 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 				}
 			}
 
-			// Extract allowWrite
-			if allowWrite, hasAllowWrite := filesystemObj["allowWrite"]; hasAllowWrite {
+			// Extract allow-write
+			if allowWrite, hasAllowWrite := filesystemObj["allow-write"]; hasAllowWrite {
 				if pathsSlice, ok := allowWrite.([]any); ok {
+					fsConfig.AllowWrite = []string{}
 					for _, path := range pathsSlice {
 						if pathStr, ok := path.(string); ok {
 							fsConfig.AllowWrite = append(fsConfig.AllowWrite, pathStr)
@@ -633,8 +758,8 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 				}
 			}
 
-			// Extract denyWrite
-			if denyWrite, hasDenyWrite := filesystemObj["denyWrite"]; hasDenyWrite {
+			// Extract deny-write
+			if denyWrite, hasDenyWrite := filesystemObj["deny-write"]; hasDenyWrite {
 				if pathsSlice, ok := denyWrite.([]any); ok {
 					fsConfig.DenyWrite = []string{}
 					for _, path := range pathsSlice {
@@ -649,8 +774,8 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 		}
 	}
 
-	// Extract ignoreViolations
-	if ignoreViolations, hasIgnoreViolations := configObj["ignoreViolations"]; hasIgnoreViolations {
+	// Extract ignore-violations
+	if ignoreViolations, hasIgnoreViolations := configObj["ignore-violations"]; hasIgnoreViolations {
 		if violationsObj, ok := ignoreViolations.(map[string]any); ok {
 			violations := make(map[string][]string)
 			for key, value := range violationsObj {
@@ -668,8 +793,8 @@ func (c *Compiler) extractSRTConfig(configVal any) *SandboxRuntimeConfig {
 		}
 	}
 
-	// Extract enableWeakerNestedSandbox
-	if enableWeakerNestedSandbox, hasEnableWeaker := configObj["enableWeakerNestedSandbox"]; hasEnableWeaker {
+	// Extract enable-weaker-nested-sandbox
+	if enableWeakerNestedSandbox, hasEnableWeaker := configObj["enable-weaker-nested-sandbox"]; hasEnableWeaker {
 		if weakerBool, ok := enableWeakerNestedSandbox.(bool); ok {
 			srtConfig.EnableWeakerNestedSandbox = weakerBool
 		}

@@ -19,6 +19,7 @@ engine:
 imports:
   - shared/github-guard-policy.md
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
@@ -35,6 +36,11 @@ safe-outputs:
     allowed: [copilot]    # Only allow copilot agent
 timeout-minutes: 5
 
+evals:
+  - id: requirements-preserved
+    question: Does the requested issue-body update preserve the user's original workflow requirements when appending the design instructions?
+  - id: triggering-issue-handoff
+    question: Does the agent request assignment of the triggering issue to the Copilot coding agent?
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -75,8 +81,9 @@ This issue has been assigned to an AI agent for workflow design. The agent will:
 
 2. **Generate a NEW workflow specification file** (`.md`) with:
    - Kebab-case workflow ID derived from the name
-   - Complete YAML frontmatter (triggers, permissions, engine, tools, safe-outputs)
-   - Clear prompt body with instructions for the AI agent
+   - A concise, outcome-oriented `intent:` derived before choosing implementation
+   - Complete YAML frontmatter (triggers, permissions, engine, tools, safe-outputs) selected from that intent
+   - Clear prompt body that determines applicability, produces required effects, and calls `noop` for counter-cases
    - Security best practices applied
 
 3. **Compile the workflow** using `gh aw compile <workflow-id>` to generate the `.lock.yml` file
@@ -87,7 +94,7 @@ This issue has been assigned to an AI agent for workflow design. The agent will:
 
 **IMPORTANT - Issue Form Mode**: The agent operates in non-interactive mode and will:
 - Parse the issue form data directly
-- Make intelligent decisions about triggers, tools, and permissions based on the description
+- Derive and augment a canonical intent before choosing triggers, tools, permissions, and outputs
 - Create a complete, working workflow without back-and-forth conversation
 - Follow the same pattern as the campaign generator
 

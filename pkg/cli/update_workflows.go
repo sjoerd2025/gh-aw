@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,10 +13,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/github/gh-aw/pkg/constants"
-
 	"github.com/github/gh-aw/pkg/console"
-	"github.com/github/gh-aw/pkg/gitutil"
+	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/ctxutil"
+	"github.com/github/gh-aw/pkg/errorutil"
+	"github.com/github/gh-aw/pkg/githubapi"
 	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/semverutil"
 	"github.com/github/gh-aw/pkg/workflow"
@@ -25,6 +25,7 @@ import (
 
 var defaultBranchCache sync.Map
 var branchCommitCache sync.Map
+var updateNoticeCache sync.Map
 
 // updatePublicAPIClient is a shared HTTP client used for unauthenticated GitHub
 // API fallback calls in the update workflow path. It carries a timeout to
@@ -42,6 +43,16 @@ type latestBranchCommitInfo struct {
 	CommittedAt time.Time
 }
 
+type cachedDefaultBranch struct {
+	branch string
+	err    error
+}
+
+type cachedBranchCommit struct {
+	info latestBranchCommitInfo
+	err  error
+}
+
 // clearUpdateResolutionCaches clears per-run ref-resolution caches so update
 // operations always start from fresh repository state.
 func clearUpdateResolutionCaches() {
@@ -53,7 +64,18 @@ func clearUpdateResolutionCaches() {
 		branchCommitCache.Delete(key)
 		return true
 	})
+	updateNoticeCache.Range(func(key, value any) bool {
+		updateNoticeCache.Delete(key)
+		return true
+	})
 	clearVersionLabelCache()
+}
+
+func printUpdateInfoOnce(message string) {
+	if _, loaded := updateNoticeCache.LoadOrStore(message, struct{}{}); loaded {
+		return
+	}
+	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(message))
 }
 
 // UpdateWorkflowsOptions configures workflow update behavior.
@@ -74,10 +96,12 @@ type UpdateWorkflowsOptions struct {
 	NoRedirect             bool
 	CoolDown               time.Duration
 	Approve                bool
+	AutoMerge              bool
+	PRMessage              string
 }
 
 // UpdateWorkflows updates workflows from their source repositories
-func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
+func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error { //nolint:largefunc
 	clearUpdateResolutionCaches()
 	updateLog.Printf("Scanning for workflows with source field: dir=%s, filter=%v, noMerge=%v, noCompile=%v, noRedirect=%v, disableSecurityScanner=%v, coolDown=%v", opts.WorkflowsDir, opts.WorkflowNames, opts.NoMerge, opts.NoCompile, opts.NoRedirect, opts.DisableSecurityScanner, opts.CoolDown)
 
@@ -87,15 +111,22 @@ func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
 		workflowsDir = getWorkflowsDir()
 	}
 
-	// Find all workflows with source field
-	workflows, err := findWorkflowsWithSource(workflowsDir, opts.WorkflowNames, opts.Verbose)
+	workflowTargets, packageUpdates, err := resolveInstalledPackageUpdates(opts.WorkflowNames)
 	if err != nil {
 		return err
 	}
 
+	var workflows []*workflowWithSource
+	if len(opts.WorkflowNames) == 0 || len(workflowTargets) > 0 {
+		workflows, err = findWorkflowsWithSource(workflowsDir, workflowTargets, opts.Verbose)
+		if err != nil {
+			return err
+		}
+	}
+
 	updateLog.Printf("Found %d workflows with source field", len(workflows))
 
-	if len(workflows) == 0 {
+	if len(workflows) == 0 && len(packageUpdates) == 0 {
 		if len(opts.WorkflowNames) > 0 {
 			return errors.New("no workflows found matching the specified names with source field")
 		}
@@ -110,6 +141,7 @@ func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
 	var failedUpdates []updateFailure
 
 	manifestGroups := make(map[string][]*workflowWithSource)
+	packageGroupOptions := make(map[string]UpdateWorkflowsOptions)
 	var directWorkflows []*workflowWithSource
 	for _, wf := range workflows {
 		if _, ok, err := parseManifestSourceSpec(wf.SourceSpec); err != nil {
@@ -123,6 +155,32 @@ func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
 			continue
 		}
 		directWorkflows = append(directWorkflows, wf)
+	}
+	for _, pkg := range packageUpdates {
+		source := pkg.record.Source
+		if len(pkg.workflows) > 0 {
+			source = pkg.workflows[0].SourceSpec
+		}
+		if _, ok, err := parseManifestSourceSpec(source); err != nil || !ok {
+			if err == nil {
+				err = fmt.Errorf("source %q is not a repository package", source)
+			}
+			failedUpdates = append(failedUpdates, updateFailure{
+				Name:  pkg.record.Package,
+				Error: fmt.Sprintf("invalid source: %v", err),
+			})
+			continue
+		}
+		source = strings.TrimSpace(source)
+		manifestGroups[source] = append(manifestGroups[source], pkg.workflows...)
+		packageOpts := opts
+		if packageOpts.WorkflowsDir == "" {
+			packageOpts.WorkflowsDir = pkg.workflowsDir
+		}
+		if packageOpts.EngineOverride == "" {
+			packageOpts.EngineOverride = pkg.engineOverride
+		}
+		packageGroupOptions[source] = packageOpts
 	}
 
 	// Update each workflow
@@ -140,19 +198,28 @@ func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
 		successfulUpdates = append(successfulUpdates, wf.Name)
 	}
 	for source, grouped := range manifestGroups {
-		groupSuccesses, groupFailures := updateManifestWorkflowGroup(ctx, source, grouped, opts)
+		groupOpts := opts
+		if packageOpts, ok := packageGroupOptions[source]; ok {
+			groupOpts = packageOpts
+		}
+		groupSuccesses, groupFailures := updateManifestWorkflowGroup(ctx, source, grouped, groupOpts)
 		successfulUpdates = append(successfulUpdates, groupSuccesses...)
 		failedUpdates = append(failedUpdates, groupFailures...)
 	}
 
 	// Show summary
-	showUpdateSummary(successfulUpdates, failedUpdates)
+	showUpdateSummary(successfulUpdates, failedUpdates, opts.NoCompile)
+
+	// Fail closed even after partial success so callers cannot publish an
+	// incomplete update. Only transient rate-limit-only failures are exempt.
+	if len(failedUpdates) > 0 && !allFailuresAreRateLimited(failedUpdates) {
+		return fmt.Errorf("%d workflow(s) failed to update; review the errors above", len(failedUpdates))
+	}
 
 	if len(successfulUpdates) == 0 {
 		// If all failures were due to GitHub API rate limiting, treat as non-fatal.
 		// Rate limiting is a transient infrastructure condition, not a code error.
 		if len(failedUpdates) > 0 && allFailuresAreRateLimited(failedUpdates) {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage("All workflow updates skipped due to GitHub API rate limiting"))
 			return nil
 		}
 		return errors.New("no workflows were successfully updated")
@@ -166,7 +233,7 @@ func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error {
 // (non-fatal) from genuine update failures (fatal).
 func allFailuresAreRateLimited(failures []updateFailure) bool {
 	for _, f := range failures {
-		if !gitutil.IsRateLimitError(f.Error) {
+		if !errorutil.IsRateLimitError(f.Error) {
 			return false
 		}
 	}
@@ -174,7 +241,7 @@ func allFailuresAreRateLimited(failures []updateFailure) bool {
 }
 
 // findWorkflowsWithSource finds all workflows that have a source field
-func findWorkflowsWithSource(workflowsDir string, filterNames []string, verbose bool) ([]*workflowWithSource, error) {
+func findWorkflowsWithSource(workflowsDir string, filterNames []string, verbose bool) ([]*workflowWithSource, error) { //nolint:largefunc
 	updateLog.Printf("Finding workflows with source field in %s", workflowsDir)
 	var workflows []*workflowWithSource
 
@@ -249,10 +316,15 @@ func findWorkflowsWithSource(workflowsDir string, filterNames []string, verbose 
 			continue
 		}
 
+		var sourceSHA string
+		if sha, ok := result.Frontmatter["source-sha"].(string); ok {
+			sourceSHA = sha
+		}
 		workflows = append(workflows, &workflowWithSource{
 			Name:       workflowName,
 			Path:       workflowPath,
 			SourceSpec: strings.TrimSpace(source),
+			SourceSHA:  sourceSHA,
 		})
 	}
 
@@ -262,7 +334,15 @@ func findWorkflowsWithSource(workflowsDir string, filterNames []string, verbose 
 // resolveLatestRef resolves the latest ref for a workflow source
 type latestRefResolution struct {
 	Ref             string
+	CommitSHA       string
 	CoolDownBlocked bool
+}
+
+func (r latestRefResolution) downloadRef() string {
+	if IsCommitSHA(r.CommitSHA) {
+		return r.CommitSHA
+	}
+	return r.Ref
 }
 
 func resolveLatestRef(ctx context.Context, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (string, error) {
@@ -274,7 +354,20 @@ func resolveLatestRef(ctx context.Context, repo, currentRef string, allowMajor, 
 }
 
 func resolveLatestRefWithResult(ctx context.Context, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (latestRefResolution, error) {
-	return resolveLatestRefWithDeps(ctx, defaultWorkflowUpdateDeps(), repo, currentRef, allowMajor, verbose, coolDown)
+	result, err := resolveLatestRefWithDeps(ctx, defaultWorkflowUpdateDeps(), repo, currentRef, allowMajor, verbose, coolDown)
+	if err != nil || result.CoolDownBlocked {
+		return result, err
+	}
+	if IsCommitSHA(result.Ref) {
+		result.CommitSHA = result.Ref
+		return result, nil
+	}
+	commit, err := getLatestBranchCommitInfoCached(ctx, repo, result.Ref)
+	if err != nil {
+		return latestRefResolution{}, fmt.Errorf("failed to resolve source commit for %s@%s: %w", repo, result.Ref, err)
+	}
+	result.CommitSHA = commit.SHA
+	return result, nil
 }
 
 func resolveLatestRefWithDeps(ctx context.Context, deps workflowUpdateDeps, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (latestRefResolution, error) {
@@ -287,8 +380,7 @@ func resolveLatestRefWithDeps(ctx context.Context, deps workflowUpdateDeps, repo
 	// Check if current ref is a tag (looks like a semantic version)
 	if isSemanticVersionTag(currentRef) {
 		updateLog.Print("Current ref is semantic version tag, resolving latest release")
-		ref, err := resolveLatestReleaseWithDeps(ctx, deps, repo, currentRef, allowMajor, verbose, coolDown)
-		return latestRefResolution{Ref: ref}, err
+		return resolveLatestReleaseWithResult(ctx, deps, repo, currentRef, allowMajor, verbose, coolDown)
 	}
 
 	// Check if current ref is a commit SHA (40-character hex string)
@@ -316,7 +408,7 @@ func resolveLatestRefWithDeps(ctx context.Context, deps workflowUpdateDeps, repo
 	if !isExemptFromCoolDown(repo) && commitCoolDown > 0 {
 		if result := checkCommitCoolDownWithDate(repo, currentRef, latestCommit.CommittedAt, commitCoolDown); result.InCoolDown {
 			cooldownLog.Printf("Workflow source %s branch %s: %s", repo, currentRef, result.Message)
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping commit candidate %s@%s: %s", repo, currentRef, result.Message)))
+			printUpdateInfoOnce(fmt.Sprintf("Skipping commit candidate %s@%s: %s", repo, currentRef, result.Message))
 			return latestRefResolution{Ref: currentRef, CoolDownBlocked: true}, nil
 		}
 	}
@@ -353,7 +445,7 @@ func resolveLatestCommitFromDefaultBranchWithDeps(ctx context.Context, deps work
 	if !isExemptFromCoolDown(repo) && coolDown > 0 {
 		if result := checkCommitCoolDownWithDate(repo, defaultBranch, latestCommit.CommittedAt, coolDown); result.InCoolDown {
 			cooldownLog.Printf("Workflow source %s default branch %s: %s", repo, defaultBranch, result.Message)
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Skipping commit candidate %s@%s: %s", repo, defaultBranch, result.Message)))
+			printUpdateInfoOnce(fmt.Sprintf("Skipping commit candidate %s@%s: %s", repo, defaultBranch, result.Message))
 			return latestRefResolution{Ref: currentSHA, CoolDownBlocked: true}, nil
 		}
 	}
@@ -365,17 +457,14 @@ func resolveLatestCommitFromDefaultBranchWithDeps(ctx context.Context, deps work
 // repeating identical GitHub API calls during batched update runs.
 func getRepoDefaultBranchCached(ctx context.Context, repo string) (string, error) {
 	if cached, ok := defaultBranchCache.Load(repo); ok {
-		if branch, isString := cached.(string); isString {
-			return branch, nil
+		if result, ok := cached.(cachedDefaultBranch); ok {
+			return result.branch, result.err
 		}
 	}
 
 	branch, err := getRepoDefaultBranch(ctx, repo)
-	if err != nil {
-		return "", err
-	}
-	defaultBranchCache.Store(repo, branch)
-	return branch, nil
+	defaultBranchCache.Store(repo, cachedDefaultBranch{branch: branch, err: err})
+	return branch, err
 }
 
 // getLatestBranchCommitInfoCached wraps getLatestBranchCommitInfo with a cache
@@ -383,17 +472,14 @@ func getRepoDefaultBranchCached(ctx context.Context, repo string) (string, error
 func getLatestBranchCommitInfoCached(ctx context.Context, repo, branch string) (latestBranchCommitInfo, error) {
 	key := repoBranchKey{repo: repo, branch: branch}
 	if cached, ok := branchCommitCache.Load(key); ok {
-		if info, ok := cached.(latestBranchCommitInfo); ok {
-			return info, nil
+		if result, ok := cached.(cachedBranchCommit); ok {
+			return result.info, result.err
 		}
 	}
 
 	info, err := getLatestBranchCommitInfo(ctx, repo, branch)
-	if err != nil {
-		return latestBranchCommitInfo{}, err
-	}
-	branchCommitCache.Store(key, info)
-	return info, nil
+	branchCommitCache.Store(key, cachedBranchCommit{info: info, err: err})
+	return info, err
 }
 
 // fetchPublicGitHubAPI makes an unauthenticated GET request to the GitHub public
@@ -401,28 +487,11 @@ func getLatestBranchCommitInfoCached(ctx context.Context, repo, branch string) (
 // SAML-enforced token) cannot access cross-organization public repositories.
 // Unauthenticated requests are subject to a lower rate limit (60 req/hour) but
 // are sufficient for the handful of calls needed during update resolution.
-func fetchPublicGitHubAPI(ctx context.Context, endpoint string) ([]byte, error) {
+func fetchPublicGitHubAPI(ctx context.Context, endpoint string) (result []byte, resultErr error) {
 	apiURL := "https://api.github.com" + endpoint
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-
-	resp, err := updatePublicAPIClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return body, nil
+	finish := ctxutil.StartOperation(ctx, "GitHub public GET "+endpoint)
+	defer func() { finish(resultErr) }()
+	return githubapi.GetPublic(ctx, updatePublicAPIClient, apiURL)
 }
 
 func fetchPublicReleaseTagsPaginated(ctx context.Context, repo string) ([]string, error) {
@@ -456,8 +525,18 @@ func fetchPublicReleaseTagsPaginated(ctx context.Context, repo string) ([]string
 
 // getRepoDefaultBranch fetches the default branch name for a repository.
 func getRepoDefaultBranch(ctx context.Context, repo string) (string, error) {
-	output, err := workflow.RunGHContext(ctx, "Fetching repo info...", "api", "/repos/"+repo, "--jq", ".default_branch")
-	if err != nil && gitutil.IsAuthError(err.Error()) {
+	var output []byte
+	var err error
+	if client := updateGitHubClientFromContext(ctx); client != nil {
+		var result struct {
+			DefaultBranch string `json:"default_branch"`
+		}
+		_, err = client.get(ctx, "/repos/"+repo, &result)
+		output = []byte(result.DefaultBranch)
+	} else {
+		output, err = workflow.RunGHContext(ctx, "Fetching repo info...", "api", "/repos/"+repo, "--jq", ".default_branch")
+	}
+	if err != nil && errorutil.IsAuthError(err.Error()) {
 		updateLog.Printf("GitHub API auth failed for %s, retrying without token", repo)
 		body, fallbackErr := fetchPublicGitHubAPI(ctx, "/repos/"+repo)
 		if fallbackErr != nil {
@@ -490,8 +569,14 @@ func getRepoDefaultBranch(ctx context.Context, repo string) (string, error) {
 func getLatestBranchCommitInfo(ctx context.Context, repo, branch string) (latestBranchCommitInfo, error) {
 	// URL-encode the branch name since it may contain slashes (e.g. "feature/foo")
 	endpoint := fmt.Sprintf("/repos/%s/commits/%s", repo, url.PathEscape(branch))
-	output, err := workflow.RunGHContext(ctx, "Fetching commit info...", "api", endpoint)
-	if err != nil && gitutil.IsAuthError(err.Error()) {
+	var output json.RawMessage
+	var err error
+	if client := updateGitHubClientFromContext(ctx); client != nil {
+		_, err = client.get(ctx, endpoint, &output)
+	} else {
+		output, err = workflow.RunGHContext(ctx, "Fetching commit info...", "api", endpoint)
+	}
+	if err != nil && errorutil.IsAuthError(err.Error()) {
 		updateLog.Printf("GitHub API auth failed for branch %s of %s, retrying without token", branch, repo)
 		body, fallbackErr := fetchPublicGitHubAPI(ctx, endpoint)
 		if fallbackErr != nil {
@@ -547,9 +632,15 @@ func defaultWorkflowUpdateDeps() workflowUpdateDeps {
 		getRepoDefaultBranch:  getRepoDefaultBranchCached,
 		getLatestBranchCommit: getLatestBranchCommitInfoCached,
 		runReleasesAPI: func(ctx context.Context, repo string) ([]byte, error) {
-			endpoint := fmt.Sprintf("/repos/%s/releases", repo)
-			output, err := workflow.RunGHContext(ctx, "Fetching releases...", "api", "--paginate", endpoint, "--jq", ".[].tag_name")
-			if err != nil && gitutil.IsAuthError(err.Error()) {
+			endpoint := fmt.Sprintf("/repos/%s/releases?per_page=100", repo)
+			var output []byte
+			var err error
+			if client := updateGitHubClientFromContext(ctx); client != nil {
+				output, err = client.releaseTags(ctx, repo)
+			} else {
+				output, err = workflow.RunGHContext(ctx, "Fetching releases...", "api", "--paginate", endpoint, "--jq", ".[].tag_name")
+			}
+			if err != nil && errorutil.IsAuthError(err.Error()) {
 				updateLog.Printf("GitHub API auth failed for releases of %s, retrying without token", repo)
 				tags, fallbackErr := fetchPublicReleaseTagsPaginated(ctx, repo)
 				if fallbackErr != nil {
@@ -562,7 +653,12 @@ func defaultWorkflowUpdateDeps() workflowUpdateDeps {
 	}
 }
 
-func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (string, error) {
+func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (string, error) { //nolint:largefunc
+	result, err := resolveLatestReleaseWithResult(ctx, deps, repo, currentRef, allowMajor, verbose, coolDown)
+	return result.Ref, err
+}
+
+func resolveLatestReleaseWithResult(ctx context.Context, deps workflowUpdateDeps, repo, currentRef string, allowMajor, verbose bool, coolDown time.Duration) (latestRefResolution, error) { //nolint:largefunc
 	updateLog.Printf("Resolving latest release for repo %s (current: %s, allowMajor=%v)", repo, currentRef, allowMajor)
 
 	if verbose {
@@ -572,13 +668,14 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 	// Get all releases using gh CLI
 	output, err := deps.runReleasesAPI(ctx, repo)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch releases: %w", err)
+		return latestRefResolution{}, fmt.Errorf("failed to fetch releases: %w", err)
 	}
 
-	releases := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(releases) == 0 || releases[0] == "" {
-		return "", errors.New("no releases found")
+	trimmedReleases := strings.TrimSpace(string(output))
+	if trimmedReleases == "" {
+		return latestRefResolution{}, errors.New("no releases found")
 	}
+	releases := strings.Fields(trimmedReleases)
 
 	// Parse current version
 	currentVer := parseVersion(currentRef)
@@ -600,14 +697,14 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 		}
 
 		if latestStable == "" {
-			return "", fmt.Errorf("no stable releases found for %s", repo)
+			return latestRefResolution{}, fmt.Errorf("no stable releases found for %s", repo)
 		}
 
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Current version is not valid, using latest stable release: "+latestStable))
 		}
 
-		return latestStable, nil
+		return latestRefResolution{Ref: latestStable}, nil
 	}
 
 	// Find all compatible non-prerelease releases.
@@ -616,7 +713,7 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 	compatibleReleases := sortedCompatibleReleaseCandidates(releases, currentVer, allowMajor)
 
 	if len(compatibleReleases) == 0 {
-		return "", errors.New("no compatible release found")
+		return latestRefResolution{}, errors.New("no compatible release found")
 	}
 
 	// Collect upgrade candidates: releases strictly newer than current.
@@ -624,15 +721,16 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 
 	// No upgrade available – already at the latest compatible release.
 	if len(upgradeCandidates) == 0 {
-		return currentRef, nil
+		return latestRefResolution{Ref: currentRef}, nil
 	}
 
 	// If the repo is exempt from cooldown, return the best (newest) upgrade candidate.
-	if isExemptFromCoolDown(repo) {
+	if isExemptFromCoolDown(repo) && len(upgradeCandidates) > 0 {
+		candidate := upgradeCandidates[0]
 		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Found newer release: "+upgradeCandidates[0].tag))
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Found newer release: "+candidate.tag))
 		}
-		return upgradeCandidates[0].tag, nil
+		return latestRefResolution{Ref: candidate.tag}, nil
 	}
 
 	// Iterate from newest to oldest upgrade candidate, stopping at the first release
@@ -646,7 +744,7 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Found newer release: "+c.tag))
 			}
-			return c.tag, nil
+			return latestRefResolution{Ref: c.tag}, nil
 		}
 		cooldownSkippedCount++
 		cooldownLog.Printf("Workflow source %s: %s", repo, result.Message)
@@ -660,11 +758,11 @@ func resolveLatestReleaseWithDeps(ctx context.Context, deps workflowUpdateDeps, 
 	}
 
 	// All upgrade candidates are still within the cooldown window.
-	return currentRef, nil
+	return latestRefResolution{Ref: currentRef, CoolDownBlocked: true}, nil
 }
 
 // updateWorkflow updates a single workflow from its source
-func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWorkflowsOptions) error {
+func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWorkflowsOptions) error { //nolint:largefunc
 	updateLog.Printf("Updating workflow: name=%s, source=%s, force=%v, noMerge=%v", wf.Name, wf.SourceSpec, opts.Force, opts.NoMerge)
 
 	if opts.Verbose {
@@ -687,6 +785,9 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 
 	sourceSpec := resolvedLocation.sourceSpec
 	currentRef := resolvedLocation.currentRef
+	if IsCommitSHA(wf.SourceSHA) && len(resolvedLocation.redirectHistory) == 0 {
+		currentRef = wf.SourceSHA
+	}
 	latestRef := resolvedLocation.latestRef
 	sourceFieldRef := resolvedLocation.sourceFieldRef
 	newContent := resolvedLocation.content
@@ -704,17 +805,6 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 	if !opts.Force && currentRef == latestRef && len(resolvedLocation.redirectHistory) == 0 {
 		updateLog.Printf("Workflow already at latest ref: %s, checking for local modifications", currentRef)
 
-		// Download the source content to check if local file has been modified
-		sourceContent, err := downloadWorkflowContentFn(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, opts.Verbose)
-		if err != nil {
-			// If we can't download for comparison, just show the up-to-date message
-			if opts.Verbose {
-				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to download source for comparison: %v", err)))
-			}
-			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Workflow %s is already up to date (%s)", wf.Name, shortRef(currentRef))))
-			return nil
-		}
-
 		// Read current workflow content
 		currentContent, err := os.ReadFile(wf.Path)
 		if err != nil {
@@ -722,7 +812,7 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 		}
 
 		// Check if local file differs from source
-		if hasLocalModifications(string(sourceContent), string(currentContent), wf.SourceSpec, filepath.Dir(wf.Path), opts.Verbose) {
+		if hasLocalModifications(string(newContent), string(currentContent), wf.SourceSpec, filepath.Dir(wf.Path), opts.Verbose) {
 			updateLog.Printf("Local modifications detected in workflow: %s", wf.Name)
 			fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Workflow %s is already up to date (%s)", wf.Name, shortRef(currentRef))))
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Local copy of %s has been modified from source", wf.Name)))
@@ -748,11 +838,17 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 
 	// When merge mode is on, detect local modifications to confirm we
 	// actually need to merge (if no local mods, override is fine either way).
+	var baseContent []byte
 	if merge {
-		baseContent, dlErr := downloadWorkflowContentFn(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, opts.Verbose)
+		var dlErr error
+		if currentRef == latestRef {
+			baseContent = newContent
+		} else {
+			baseContent, dlErr = downloadWorkflowContentFn(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, opts.Verbose)
+		}
 		if dlErr == nil {
 			localContent, readErr := os.ReadFile(wf.Path)
-			if readErr == nil && hasLocalModifications(string(baseContent), string(localContent), wf.SourceSpec, filepath.Dir(wf.Path), opts.Verbose) {
+			if readErr == nil && hasLocalModifications(string(baseContent), string(localContent), sourceSpecWithRef(sourceSpec, currentRef), filepath.Dir(wf.Path), opts.Verbose) {
 				updateLog.Printf("Local modifications detected in %s, merging to preserve changes", wf.Name)
 				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Local modifications detected in %s, merging to preserve your changes", wf.Name)))
 			} else {
@@ -777,9 +873,12 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Downloading base version from %s/%s@%s", sourceSpec.Repo, sourceSpec.Path, currentRef)))
 		}
 
-		baseContent, err := downloadWorkflowContentFn(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, opts.Verbose)
-		if err != nil {
-			return fmt.Errorf("failed to download base workflow: %w", err)
+		if baseContent == nil {
+			var err error
+			baseContent, err = downloadWorkflowContentFn(ctx, sourceSpec.Repo, sourceSpec.Path, currentRef, opts.Verbose)
+			if err != nil {
+				return fmt.Errorf("failed to download base workflow: %w", err)
+			}
 		}
 
 		// Read current workflow content
@@ -790,7 +889,7 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 
 		// Perform 3-way merge using git merge-file
 		updateLog.Printf("Performing 3-way merge for workflow: %s", wf.Name)
-		mergedContent, conflicts, err := MergeWorkflowContent(string(baseContent), string(currentContent), string(newContent), wf.SourceSpec, sourceSpecWithRef(sourceSpec, sourceFieldRef), wf.Path, opts.Verbose)
+		mergedContent, conflicts, err := MergeWorkflowContent(string(baseContent), string(currentContent), string(newContent), sourceSpecWithRef(sourceSpec, currentRef), sourceSpecWithRef(sourceSpec, latestRef), wf.Path, opts.Verbose)
 		if err != nil {
 			updateLog.Printf("Merge failed for workflow %s: %v", wf.Name, err)
 			return fmt.Errorf("failed to merge workflow content: %w", err)
@@ -840,6 +939,17 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 		}
 	}
 
+	finalContent, err = updateTopLevelFieldInFrontmatterRaw(finalContent, "source", sourceSpecWithRef(sourceSpec, sourceFieldRef))
+	if err != nil {
+		return fmt.Errorf("failed to update source frontmatter: %w", err)
+	}
+	if IsCommitSHA(latestRef) {
+		finalContent, err = updateTopLevelFieldInFrontmatterRaw(finalContent, "source-sha", fmt.Sprintf("%q", latestRef))
+		if err != nil {
+			return fmt.Errorf("failed to record installed source commit: %w", err)
+		}
+	}
+
 	// Handle stop-after field modifications
 	if opts.NoStopAfter {
 		// Remove stop-after field if requested
@@ -883,24 +993,42 @@ func updateWorkflow(ctx context.Context, wf *workflowWithSource, opts UpdateWork
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage("Security scanning disabled"))
 	}
 
+	if hasConflicts && !opts.NoCompile {
+		return fmt.Errorf("could not update %s due to merge conflicts; existing workflow left unchanged; resolve local and upstream changes before retrying", wf.Name)
+	}
+
+	// Preserve the pre-update content so it can be restored if the newly
+	// fetched content fails to compile. Without this, a broken upstream
+	// change (e.g. a dispatch-workflow target that doesn't exist locally)
+	// would be left on disk and could break a later, unrelated recompile.
+	originalContent, err := os.ReadFile(wf.Path)
+	if err != nil {
+		return fmt.Errorf("failed to read current workflow before update: %w", err)
+	}
+
 	// Write updated content
 	if err := os.WriteFile(wf.Path, []byte(finalContent), constants.FilePermPublic); err != nil {
 		return fmt.Errorf("failed to write updated workflow: %w", err)
 	}
 
 	if hasConflicts {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Updated %s from %s to %s with CONFLICTS - please review and resolve manually", wf.Name, shortRef(currentRef), shortRef(latestRef))))
-		return nil // Not an error, but user needs to resolve conflicts
+		return fmt.Errorf("updated %s from %s to %s with merge conflicts; resolve the conflict markers before compiling", wf.Name, shortRef(currentRef), shortRef(latestRef))
 	}
 
 	updateLog.Printf("Successfully updated workflow %s from %s to %s", wf.Name, currentRef, latestRef)
 	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Updated %s from %s to %s", wf.Name, shortRef(currentRef), shortRef(latestRef))))
 
-	// Compile the updated workflow with refreshStopTime enabled (unless --no-compile is set)
+	// Compile the updated workflow using the same path as the compile command.
 	if !opts.NoCompile {
 		updateLog.Printf("Compiling updated workflow: %s", wf.Name)
-		if err := compileWorkflowWithRefresh(ctx, wf.Path, opts.Verbose, false, opts.EngineOverride, true, opts.Approve); err != nil {
+		if err := compileWorkflowsForUpdate(ctx, []string{wf.Path}, opts.WorkflowsDir, opts.EngineOverride, opts.Verbose, opts.Approve); err != nil {
 			updateLog.Printf("Compilation failed for workflow %s: %v", wf.Name, err)
+			if restoreErr := os.WriteFile(wf.Path, originalContent, constants.FilePermPublic); restoreErr != nil {
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to restore original content for %s after compile failure: %v", wf.Name, restoreErr)))
+			} else {
+				updateLog.Printf("Restored original content for %s after compile failure", wf.Name)
+				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Reverted %s to its previous content because the updated version failed to compile", wf.Name)))
+			}
 			return fmt.Errorf("failed to compile updated workflow: %w", err)
 		}
 	} else {

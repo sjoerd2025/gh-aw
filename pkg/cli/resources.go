@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -10,15 +11,25 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/gitutil"
+	"github.com/github/gh-aw/pkg/workflow"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/parser"
 )
 
-// extractResources extracts file paths from the top-level "resources" frontmatter field.
+type extractedResource struct {
+	path              string
+	isGraderEvaluator bool
+}
+
+type resourceDownloader func(ctx context.Context, owner, repo, filePath, ref string) ([]byte, error)
+
+// extractResourceEntries extracts file paths from the top-level "resources" frontmatter
+// field.
 // Returns an error if any entry contains GitHub Actions expression syntax (e.g. "${{"),
 // since macros are not permitted in resource paths.
-func extractResources(content string) ([]string, error) {
+func extractResourceEntries(content string) ([]extractedResource, error) {
 	result, err := parser.ExtractFrontmatterFromContent(content)
 	if err != nil {
 		remoteWorkflowLog.Printf("Failed to extract frontmatter for resources: %v", err)
@@ -28,31 +39,49 @@ func extractResources(content string) ([]string, error) {
 		return nil, nil
 	}
 
-	resourcesField, exists := result.Frontmatter["resources"]
-	if !exists {
-		return nil, nil
-	}
-
-	var paths []string
-	switch v := resourcesField.(type) {
-	case []any:
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				paths = append(paths, s)
+	var resources []extractedResource
+	if resourcesField, exists := result.Frontmatter["resources"]; exists {
+		switch v := resourcesField.(type) {
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					resources = append(resources, extractedResource{path: s})
+				}
+			}
+		case []string:
+			for _, s := range v {
+				resources = append(resources, extractedResource{path: s})
 			}
 		}
-	case []string:
-		paths = v
+	}
+
+	graders, err := workflow.ParseGradersFromFrontmatter(result.Frontmatter)
+	if err != nil {
+		return nil, err
+	}
+	for _, grader := range graders.Graders {
+		if grader.Run != "" {
+			resources = append(resources, extractedResource{path: grader.Run, isGraderEvaluator: true})
+		}
 	}
 
 	// Reject entries that contain GitHub Actions expression syntax — macros are not allowed.
-	for _, p := range paths {
+	unique := make([]extractedResource, 0, len(resources))
+	seen := make(map[string]int, len(resources))
+	for _, resource := range resources {
+		p := resource.path
 		if strings.Contains(p, "${{") {
 			return nil, fmt.Errorf("resources entry %q contains GitHub Actions expression syntax (${{) which is not allowed; use static paths only", p)
 		}
+		if index, exists := seen[p]; exists {
+			unique[index].isGraderEvaluator = unique[index].isGraderEvaluator || resource.isGraderEvaluator //nolint:uncheckedsliceindex // seen stores indices into unique as entries are appended.
+			continue
+		}
+		seen[p] = len(unique)
+		unique = append(unique, resource)
 	}
 
-	return paths, nil
+	return unique, nil
 }
 
 // fetchAndSaveRemoteResources fetches files listed in the top-level "resources" frontmatter
@@ -68,6 +97,10 @@ func extractResources(content string) ([]string, error) {
 // For non-Markdown resource files: if the target already exists and force is false, an error
 // is returned regardless of origin (non-markdown files have no source tracking).
 func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *WorkflowSpec, targetDir string, verbose bool, force bool, tracker *FileTracker) error {
+	return fetchAndSaveRemoteResourcesWithDownloader(ctx, content, spec, targetDir, verbose, force, tracker, parser.DownloadFileFromGitHub)
+}
+
+func fetchAndSaveRemoteResourcesWithDownloader(ctx context.Context, content string, spec *WorkflowSpec, targetDir string, verbose bool, force bool, tracker *FileTracker, download resourceDownloader) error { //nolint:largefunc // Keep resource conflict, download, and tracking behavior together.
 	if spec.RepoSlug == "" {
 		return nil
 	}
@@ -76,7 +109,7 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 	if len(parts) != 2 {
 		return nil
 	}
-	owner, repo := parts[0], parts[1]
+	owner, repo := parts[0], parts[1] //nolint:uncheckedsliceindex // len(parts) == 2 was checked above.
 	ref := spec.Version
 	if ref == "" {
 		defaultBranch, err := getRepoDefaultBranch(ctx, spec.RepoSlug)
@@ -89,7 +122,7 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 		spec.Version = ref
 	}
 
-	resourcePaths, err := extractResources(content)
+	resourcePaths, err := extractResourceEntries(content)
 	if err != nil {
 		return err
 	}
@@ -99,17 +132,12 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 
 	// Resources are resolved relative to the source workflow's directory in the remote repo.
 	workflowBaseDir := getParentDir(spec.WorkflowPath)
+	var gitRoot string
 
-	// Pre-compute the absolute target directory for path-traversal boundary checks.
-	absTargetDir, err := filepath.Abs(targetDir)
-	if err != nil {
-		remoteWorkflowLog.Printf("Failed to resolve absolute path for target directory %s: %v", targetDir, err)
-		return nil
-	}
-
-	for _, resourcePath := range resourcePaths {
+	for _, resource := range resourcePaths {
+		resourcePath := resource.path
 		// Early rejection of path traversal patterns. This is a fast first-pass check;
-		// the filepath.Rel boundary check below is the authoritative security control.
+		// the symlink-aware path validation below is the authoritative security control.
 		if strings.Contains(resourcePath, "..") {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping resource with unsafe path: %q", resourcePath)))
@@ -117,14 +145,16 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 			continue
 		}
 
-		// Resolve the remote file path
 		var remoteFilePath string
-		if rest, ok := strings.CutPrefix(resourcePath, "/"); ok {
+		repositoryEvaluator := resource.isGraderEvaluator && !strings.HasPrefix(resourcePath, "./")
+		if repositoryEvaluator {
+			remoteFilePath = resourcePath
+		} else if rest, ok := strings.CutPrefix(resourcePath, "/"); ok {
 			remoteFilePath = rest
 		} else if workflowBaseDir != "" {
-			remoteFilePath = path.Join(workflowBaseDir, resourcePath)
+			remoteFilePath = path.Join(workflowBaseDir, strings.TrimPrefix(resourcePath, "./"))
 		} else {
-			remoteFilePath = resourcePath
+			remoteFilePath = strings.TrimPrefix(resourcePath, "./")
 		}
 		remoteFilePath = path.Clean(remoteFilePath)
 
@@ -138,15 +168,23 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 		if localRelPath == "" || localRelPath == "." {
 			continue
 		}
-		targetPath := filepath.Join(targetDir, localRelPath)
-
-		// Belt-and-suspenders: verify the resolved path stays inside targetDir
-		absTargetPath, absErr := filepath.Abs(targetPath)
-		if absErr != nil {
-			remoteWorkflowLog.Printf("Failed to resolve absolute path for resource %s: %v", resourcePath, absErr)
-			continue
+		targetBaseDir := targetDir
+		if repositoryEvaluator {
+			if gitRoot == "" {
+				gitRoot, err = gitutil.FindGitRootFrom(targetDir)
+				if err != nil {
+					return fmt.Errorf("cannot resolve repository root for grader resource %q: %w", resourcePath, err)
+				}
+			}
+			targetBaseDir = gitRoot
+			localRelPath = filepath.FromSlash(resourcePath)
 		}
-		if rel, relErr := filepath.Rel(absTargetDir, absTargetPath); relErr != nil || strings.HasPrefix(rel, "..") {
+		targetPath := filepath.Join(targetBaseDir, localRelPath)
+
+		if err := fileutil.ValidatePathWithinBase(targetBaseDir, targetPath); err != nil {
+			if resource.isGraderEvaluator {
+				return fmt.Errorf("unsafe grader evaluator destination %q: %w", resourcePath, err)
+			}
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Refusing to write resource outside target directory: %q", resourcePath)))
 			}
@@ -154,10 +192,9 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 		}
 
 		// Check whether the target file already exists.
-		fileExists := false
-		if fileutil.FileExists(targetPath) {
-			fileExists = true
-			if !force {
+		fileExists := fileutil.FileExists(targetPath)
+		if fileExists {
+			if !force && !resource.isGraderEvaluator {
 				isMarkdown := strings.HasSuffix(strings.ToLower(targetPath), ".md")
 				if isMarkdown {
 					// For markdown files, allow same-source overwrites.
@@ -182,17 +219,29 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 		}
 
 		// Download from source repository
-		fileContent, err := parser.DownloadFileFromGitHub(ctx, owner, repo, remoteFilePath, ref)
+		fileContent, err := download(ctx, owner, repo, remoteFilePath, ref)
 		if err != nil {
+			if resource.isGraderEvaluator {
+				return fmt.Errorf("cannot download grader evaluator %q: %w", resourcePath, err)
+			}
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to fetch resource %s: %v", remoteFilePath, err)))
 			}
 			continue
 		}
-
+		if fileExists && !force && resource.isGraderEvaluator {
+			existing, err := os.ReadFile(targetPath)
+			if err != nil {
+				return fmt.Errorf("cannot read existing grader evaluator %q: %w", resourcePath, err)
+			}
+			if bytes.Equal(existing, fileContent) {
+				continue
+			}
+			return fmt.Errorf("grader evaluator %q already exists with different content; use --force to replace it", resourcePath)
+		}
 		// For markdown resources, embed the source field for future conflict detection.
 		if strings.HasSuffix(strings.ToLower(remoteFilePath), ".md") {
-			depSourceString := spec.RepoSlug + "/" + remoteFilePath + "@" + ref
+			depSourceString := path.Join(spec.RepoSlug, remoteFilePath) + "@" + ref
 			if updated, srcErr := addSourceToWorkflow(string(fileContent), depSourceString); srcErr == nil {
 				fileContent = []byte(updated)
 			}
@@ -200,6 +249,9 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 
 		// Create parent directory if needed
 		if err := os.MkdirAll(filepath.Dir(targetPath), constants.DirPermPublic); err != nil {
+			if resource.isGraderEvaluator {
+				return fmt.Errorf("cannot create grader evaluator directory %q: %w", resourcePath, err)
+			}
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to create directory for resource %s: %v", remoteFilePath, err)))
 			}
@@ -208,6 +260,9 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 
 		// Write the file
 		if err := os.WriteFile(targetPath, fileContent, constants.FilePermSensitive); err != nil {
+			if resource.isGraderEvaluator {
+				return fmt.Errorf("cannot write grader evaluator %q: %w", resourcePath, err)
+			}
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to write resource %s: %v", remoteFilePath, err)))
 			}

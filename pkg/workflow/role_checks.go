@@ -15,6 +15,19 @@ import (
 
 var roleLog = logger.New("workflow:role_checks")
 
+// Keep in sync with actions/setup/js/check_rate_limit.cjs and the user-rate-limit.events schema enum.
+var rateLimitProgrammaticEvents = []string{
+	"discussion",
+	"discussion_comment",
+	"issue_comment",
+	"issues",
+	"pull_request",
+	"pull_request_review",
+	"pull_request_review_comment",
+	"repository_dispatch",
+	"workflow_dispatch",
+}
+
 // generateMembershipCheck generates steps for the check_membership job that only sets outputs
 func (c *Compiler) generateMembershipCheck(data *WorkflowData, steps []string) []string {
 	if len(data.Command) > 0 {
@@ -23,6 +36,12 @@ func (c *Compiler) generateMembershipCheck(data *WorkflowData, steps []string) [
 		steps = append(steps, "      - name: Check team membership for workflow\n")
 	}
 	steps = append(steps, fmt.Sprintf("        id: %s\n", constants.CheckMembershipStepID))
+	// For command workflows the command position check runs first (before this step).
+	// Only run the membership check when the command was actually triggered to avoid
+	// a confusing "access denied" warning on every non-slash-command activation.
+	if len(data.Command) > 0 {
+		steps = append(steps, fmt.Sprintf("        if: steps.%s.outputs.%s == 'true'\n", constants.CheckCommandPositionStepID, constants.CommandPositionOkOutput))
+	}
 	steps = append(steps, fmt.Sprintf("        uses: %s\n", getCachedActionPin("actions/github-script", data)))
 
 	// Add environment variables for permission check
@@ -30,6 +49,9 @@ func (c *Compiler) generateMembershipCheck(data *WorkflowData, steps []string) [
 	steps = append(steps, fmt.Sprintf("          GH_AW_REQUIRED_ROLES: %q\n", strings.Join(data.Roles, ",")))
 	if len(data.Bots) > 0 {
 		steps = append(steps, fmt.Sprintf("          GH_AW_ALLOWED_BOTS: %q\n", strings.Join(data.Bots, ",")))
+		if hasCopilotBotName(data.Bots) {
+			steps = append(steps, fmt.Sprintf("          GH_AW_COPILOT_BOT_NAMES: %q\n", strings.Join(constants.CopilotBotNames, ",")))
+		}
 	}
 	if data.AllowBotAuthoredTriggerComment {
 		steps = append(steps, "          GH_AW_ALLOW_BOT_AUTHORED_TRIGGER_COMMENT: \"true\"\n")
@@ -215,86 +237,76 @@ func parseOptionalStringSliceField(value any, fieldName string) []string {
 // extractRateLimitConfig extracts the user-rate-limit config from frontmatter.
 func (c *Compiler) extractRateLimitConfig(frontmatter map[string]any) *RateLimitConfig {
 	rateLimitValue, exists := frontmatter["user-rate-limit"]
+	if !exists || rateLimitValue == nil {
+		roleLog.Print("No user-rate-limit configuration specified")
+		return nil
+	}
 
-	if exists && rateLimitValue != nil {
-		switch v := rateLimitValue.(type) {
-		case map[string]any:
-			config := &RateLimitConfig{}
+	rateLimitMap, ok := rateLimitValue.(map[string]any)
+	if !ok {
+		roleLog.Printf("user-rate-limit value is not an object, ignoring configuration: %T", rateLimitValue)
+		return nil
+	}
 
-			// Extract max-runs-per-window (default: 5)
-			maxValue, ok := v["max-runs-per-window"]
-			if !ok {
-				maxValue, ok = v["max-runs"]
-			}
-			if !ok {
-				maxValue, ok = v["max"] // legacy compatibility
-			}
-			if ok {
-				switch max := maxValue.(type) {
-				case int:
-					config.Max = max
-				case int64:
-					config.Max = int(max)
-				case uint64:
-					config.Max = int(max)
-				case float64:
-					config.Max = int(max)
-				}
-			}
+	config := &RateLimitConfig{
+		Max:          extractRateLimitInt(rateLimitMap, "max-runs-per-window"),
+		Window:       extractRateLimitInt(rateLimitMap, "window"),
+		Events:       c.extractRateLimitEvents(rateLimitMap, frontmatter),
+		IgnoredRoles: extractRateLimitIgnoredRoles(rateLimitMap),
+	}
 
-			// Extract window (default: 60 minutes)
-			if windowValue, ok := v["window"]; ok {
-				switch window := windowValue.(type) {
-				case int:
-					config.Window = window
-				case int64:
-					config.Window = int(window)
-				case uint64:
-					config.Window = int(window)
-				case float64:
-					config.Window = int(window)
-				}
-			}
+	roleLog.Printf("Extracted user-rate-limit config: max=%d, window=%d, events=%v, ignored-roles=%v", config.Max, config.Window, config.Events, config.IgnoredRoles)
+	return config
+}
 
-			// Extract events
-			if eventsValue, ok := v["events"]; ok {
-				switch events := eventsValue.(type) {
-				case []any:
-					config.Events = parseStringSliceAny(events, nil)
-				case []string:
-					config.Events = events
-				case string:
-					config.Events = []string{events}
-				}
-			} else {
-				// If events not specified, infer from the 'on:' section of frontmatter
-				config.Events = c.inferEventsFromTriggers(frontmatter)
-				if len(config.Events) > 0 {
-					roleLog.Printf("Inferred events from workflow triggers: %v", config.Events)
-				}
+func extractRateLimitInt(config map[string]any, keys ...string) int {
+	for _, key := range keys {
+		if value, ok := config[key]; ok {
+			switch typedValue := value.(type) {
+			case int:
+				return typedValue
+			case int64:
+				return int(typedValue)
+			case uint64:
+				return int(typedValue)
+			case float64:
+				return int(typedValue)
 			}
-
-			// Extract ignored-roles
-			if ignoredRolesValue, ok := v["ignored-roles"]; ok {
-				switch ignoredRoles := ignoredRolesValue.(type) {
-				case []any:
-					config.IgnoredRoles = parseStringSliceAny(ignoredRoles, nil)
-				case []string:
-					config.IgnoredRoles = ignoredRoles
-				case string:
-					config.IgnoredRoles = []string{ignoredRoles}
-				}
-			} else {
-				// Default: admin, maintain, and write roles are exempt from rate limiting
-				config.IgnoredRoles = []string{"admin", "maintain", "write"}
-				roleLog.Print("No ignored-roles specified, using defaults: admin, maintain, write")
-			}
-
-			roleLog.Printf("Extracted user-rate-limit config: max=%d, window=%d, events=%v, ignored-roles=%v", config.Max, config.Window, config.Events, config.IgnoredRoles)
-			return config
 		}
 	}
-	roleLog.Print("No user-rate-limit configuration specified")
+	return 0
+}
+
+func (c *Compiler) extractRateLimitEvents(config map[string]any, frontmatter map[string]any) []string {
+	if eventsValue, ok := config["events"]; ok {
+		return extractRateLimitStringSlice(eventsValue)
+	}
+
+	events := c.inferEventsFromTriggers(frontmatter)
+	if len(events) > 0 {
+		roleLog.Printf("Inferred events from workflow triggers: %v", events)
+	}
+	return events
+}
+
+func extractRateLimitIgnoredRoles(config map[string]any) []string {
+	if ignoredRolesValue, ok := config["ignored-roles"]; ok {
+		return extractRateLimitStringSlice(ignoredRolesValue)
+	}
+
+	roleLog.Print("No ignored-roles specified, using defaults: admin, maintain, write")
+	return []string{"admin", "maintain", "write"}
+}
+
+func extractRateLimitStringSlice(value any) []string {
+	switch typedValue := value.(type) {
+	case []any:
+		return parseStringSliceAny(typedValue, nil)
+	case []string:
+		return typedValue
+	case string:
+		return []string{typedValue}
+	}
 	return nil
 }
 
@@ -302,20 +314,13 @@ func (c *Compiler) extractRateLimitConfig(frontmatter map[string]any) *RateLimit
 func (c *Compiler) inferEventsFromTriggers(frontmatter map[string]any) []string {
 	onValue, exists := frontmatter["on"]
 	if !exists || onValue == nil {
-		return nil
+		return append([]string(nil), rateLimitProgrammaticEvents...)
 	}
 
 	var events []string
-	programmaticTriggers := map[string]string{
-		"discussion":                  "discussion",
-		"discussion_comment":          "discussion_comment",
-		"issue_comment":               "issue_comment",
-		"issues":                      "issues",
-		"pull_request":                "pull_request",
-		"pull_request_review":         "pull_request_review",
-		"pull_request_review_comment": "pull_request_review_comment",
-		"repository_dispatch":         "repository_dispatch",
-		"workflow_dispatch":           "workflow_dispatch",
+	programmaticTriggers := make(map[string]string, len(rateLimitProgrammaticEvents))
+	for _, event := range rateLimitProgrammaticEvents {
+		programmaticTriggers[event] = event
 	}
 
 	switch on := onValue.(type) {
@@ -341,13 +346,28 @@ func (c *Compiler) inferEventsFromTriggers(frontmatter map[string]any) []string 
 
 	// Sort events alphabetically for consistent output
 	sort.Strings(events)
+	if len(events) == 0 {
+		// If "on" exists but has no supported rate-limit triggers, keep the omitted-events fallback broad.
+		return append([]string(nil), rateLimitProgrammaticEvents...)
+	}
 	return events
+}
+
+func rolesAreAll(roles []string) bool {
+	return slices.Equal(roles, []string{"all"})
 }
 
 // needsRoleCheck determines if the workflow needs permission checks with full context
 func (c *Compiler) needsRoleCheck(data *WorkflowData, frontmatter map[string]any) bool {
+	if data.DryRun {
+		return true
+	}
+	if len(data.WebhookSubscriptions) > 0 {
+		roleLog.Print("Role check needed: hosted webhook trigger")
+		return true
+	}
 	// If user explicitly specified "roles: all", no permission checks needed
-	if len(data.Roles) == 1 && data.Roles[0] == "all" {
+	if rolesAreAll(data.Roles) {
 		roleLog.Print("Role check not needed: roles set to 'all'")
 		return false
 	}
@@ -372,85 +392,63 @@ func (c *Compiler) needsRoleCheck(data *WorkflowData, frontmatter map[string]any
 // hasSafeEventsOnly checks if the workflow uses only safe events that don't require permission checks
 func (c *Compiler) hasSafeEventsOnly(data *WorkflowData, frontmatter map[string]any) bool {
 	// If user explicitly specified "roles: all", skip permission checks
-	if len(data.Roles) == 1 && data.Roles[0] == "all" {
+	if rolesAreAll(data.Roles) {
 		return true
 	}
 
 	// Parse the "on" section to determine events
 	if onValue, exists := frontmatter["on"]; exists {
 		if onMap, ok := onValue.(map[string]any); ok {
-			// Check if only safe events are present
-			hasUnsafeEvents := false
-			hasWorkflowDispatch := false
-
-			for eventName := range onMap {
-				// Skip command events as they are handled separately
-				// Skip stop-after and reaction as they are not event types
-				// Skip roles, bots, labels, and other configuration keys as they are not event types
-				if eventName == "command" || eventName == "stop-after" || eventName == "reaction" || eventName == "roles" || eventName == "bots" || eventName == "labels" || eventName == "allow-bot-authored-trigger-comment" {
-					continue
-				}
-
-				// Track if workflow_dispatch is present
-				if eventName == "workflow_dispatch" {
-					hasWorkflowDispatch = true
-				}
-
-				// Check if this event is in the safe list
-				isSafe := slices.Contains(constants.SafeWorkflowEvents, eventName)
-				if !isSafe {
-					hasUnsafeEvents = true
-					break
-				}
-			}
-
-			// If there are events and none are unsafe, then it's safe
-			eventCount := len(onMap)
-			// Subtract non-event entries
-			if _, hasSlashCommand := onMap["slash_command"]; hasSlashCommand {
-				eventCount--
-			}
-			if _, hasCommand := onMap["command"]; hasCommand {
-				eventCount--
-			}
-			if _, hasStopAfter := onMap["stop-after"]; hasStopAfter {
-				eventCount--
-			}
-			if _, hasReaction := onMap["reaction"]; hasReaction {
-				eventCount--
-			}
-			if _, hasRoles := onMap["roles"]; hasRoles {
-				eventCount--
-			}
-			if _, hasBots := onMap["bots"]; hasBots {
-				eventCount--
-			}
-			if _, hasLabelNames := onMap["labels"]; hasLabelNames {
-				eventCount--
-			}
-			if _, hasAllowBotAuthored := onMap["allow-bot-authored-trigger-comment"]; hasAllowBotAuthored {
-				eventCount--
-			}
-
-			// Special handling for workflow_dispatch:
-			// workflow_dispatch can be triggered by users with "write" access,
-			// so it's only considered "safe" if "write" is in the allowed roles
-			if hasWorkflowDispatch && !hasUnsafeEvents {
-				// Check if "write" is in the allowed roles
-				hasWriteRole := slices.Contains(data.Roles, "write")
-				// If write is not in the allowed roles, workflow_dispatch needs permission checks
-				if !hasWriteRole {
-					return false
-				}
-			}
-
-			return eventCount > 0 && !hasUnsafeEvents
+			return hasOnlySafeOnMapEvents(onMap, data.Roles)
 		}
 	}
 
 	// If no "on" section or it's a string, check for default command trigger
 	// For command workflows, they are not considered "safe only"
 	return false
+}
+
+func hasOnlySafeOnMapEvents(onMap map[string]any, roles []string) bool {
+	hasUnsafeEvents := false
+	hasWorkflowDispatch := false
+
+	for eventName := range onMap {
+		if isRoleCheckConfigKey(eventName) {
+			continue
+		}
+		if eventName == "workflow_dispatch" {
+			hasWorkflowDispatch = true
+		}
+		if !slices.Contains(constants.SafeWorkflowEvents, eventName) {
+			hasUnsafeEvents = true
+			break
+		}
+	}
+
+	if hasWorkflowDispatch && !hasUnsafeEvents && !slices.Contains(roles, "write") {
+		return false
+	}
+	return countWorkflowEvents(onMap) > 0 && !hasUnsafeEvents
+}
+
+func isRoleCheckConfigKey(key string) bool {
+	switch key {
+	case "allow-bot-authored-trigger-comment", "bots", "command", "cooldown", "labels", "reaction", "roles", "stop-after":
+		return true
+	default:
+		return false
+	}
+}
+
+func countWorkflowEvents(onMap map[string]any) int {
+	eventCount := 0
+	for eventName := range onMap {
+		// slash_command is not a standalone GitHub event, but the safety scan still treats it as unsafe.
+		if !isRoleCheckConfigKey(eventName) && eventName != "slash_command" {
+			eventCount++
+		}
+	}
+	return eventCount
 }
 
 // hasWorkflowRunTrigger checks if the agentic workflow's frontmatter declares a workflow_run trigger
@@ -475,14 +473,27 @@ func (c *Compiler) hasWorkflowRunTrigger(frontmatter map[string]any) bool {
 	return false
 }
 
-// buildWorkflowRunRepoSafetyCondition generates the if condition to ensure workflow_run is from same repo and not a fork
-// The condition uses: (event_name != 'workflow_run') OR (repository IDs match AND not from fork)
-// This allows all non-workflow_run events, but requires repository match and fork check for workflow_run events
+// buildWorkflowRunRepoSafetyCondition generates the if condition to ensure workflow_run is from same repo and not a fork.
+// The condition uses:
+// (event_name != 'workflow_run') OR (workflow_run payload exists AND repository payload exists AND repository IDs match AND not from fork).
+// This allows all non-workflow_run events, but requires fail-closed repository checks for workflow_run events.
 func (c *Compiler) buildWorkflowRunRepoSafetyCondition() string {
 	// Check that event is NOT workflow_run
 	eventNotWorkflowRun := BuildNotEquals(
 		BuildPropertyAccess("github.event_name"),
 		BuildStringLiteral("workflow_run"),
+	)
+
+	// Guard nested workflow_run fields explicitly so mixed-trigger workflows
+	// short-circuit safely and workflow_run events fail closed if GitHub omits
+	// repository metadata unexpectedly.
+	workflowRunPayloadPresent := BuildNotEquals(
+		BuildPropertyAccess("github.event.workflow_run"),
+		BuildNullLiteral(),
+	)
+	workflowRunRepositoryPresent := BuildNotEquals(
+		BuildPropertyAccess("github.event.workflow_run.repository"),
+		BuildNullLiteral(),
 	)
 
 	// Check that repository IDs match
@@ -496,8 +507,14 @@ func (c *Compiler) buildWorkflowRunRepoSafetyCondition() string {
 		Child: BuildPropertyAccess("github.event.workflow_run.repository.fork"),
 	}
 
-	// Combine repository ID check AND not-from-fork check
-	repoSafetyCheck := BuildAnd(repoIDCheck, notFromForkCheck)
+	// Combine existence, repository ID, and fork checks.
+	repoSafetyCheck := BuildAnd(
+		workflowRunPayloadPresent,
+		BuildAnd(
+			workflowRunRepositoryPresent,
+			BuildAnd(repoIDCheck, notFromForkCheck),
+		),
+	)
 
 	// Combine with OR: allow if NOT workflow_run OR (repository matches AND not fork)
 	combinedCheck := BuildOr(eventNotWorkflowRun, repoSafetyCheck)

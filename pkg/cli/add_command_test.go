@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,7 @@ func validateEngineStub(engine string) error {
 }
 
 func TestNewAddCommand(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddCommand(validateEngineStub)
 
 	require.NotNil(t, cmd, "NewAddCommand should not return nil")
@@ -56,6 +58,10 @@ func TestNewAddCommand(t *testing.T) {
 	assert.NotNil(t, createPRFlag, "Should have 'create-pull-request' flag")
 	prFlag := flags.Lookup("pr")
 	assert.NotNil(t, prFlag, "Should have 'pr' flag (alias)")
+	autoMergeFlag := flags.Lookup("auto-merge")
+	require.NotNil(t, autoMergeFlag)
+	assert.Equal(t, "false", autoMergeFlag.DefValue)
+	assert.Contains(t, autoMergeFlag.Usage, "requires --create-pull-request")
 
 	// Check force flag
 	forceFlag := flags.Lookup("force")
@@ -81,9 +87,164 @@ func TestNewAddCommand(t *testing.T) {
 	// Check stop-after flag
 	stopAfterFlag := flags.Lookup("stop-after")
 	assert.NotNil(t, stopAfterFlag, "Should have 'stop-after' flag")
+
+	ghAwRefFlag := flags.Lookup("gh-aw-ref")
+	assert.NotNil(t, ghAwRefFlag, "Should have 'gh-aw-ref' flag")
+}
+
+func TestAddCommandAutoMergeRequiresPR(t *testing.T) {
+	t.Parallel()
+	for _, prFlag := range []string{"", "pr", "create-pull-request"} {
+		t.Run(prFlag, func(t *testing.T) {
+			t.Parallel()
+			engineErr := errors.New("engine validation reached")
+			cmd := NewAddCommand(func(string) error { return engineErr })
+			require.NoError(t, cmd.Flags().Set("auto-merge", "true"))
+			if prFlag != "" {
+				require.NoError(t, cmd.Flags().Set(prFlag, "true"))
+			}
+			err := cmd.RunE(cmd, []string{"owner/repo/workflow"})
+			if prFlag == "" {
+				require.ErrorContains(t, err, "--auto-merge requires --create-pull-request")
+			} else {
+				require.ErrorIs(t, err, engineErr)
+			}
+		})
+	}
+}
+
+func TestAddOptionsAutoMergeRequiresPR(t *testing.T) {
+	t.Parallel()
+	opts := AddOptions{AutoMerge: true}
+	result, err := AddWorkflows(context.Background(), []string{"invalid-source"}, opts)
+	require.ErrorContains(t, err, "--auto-merge requires --create-pull-request")
+	assert.Nil(t, result)
+
+	result, err = AddResolvedWorkflows(context.Background(), nil, nil, opts)
+	require.ErrorContains(t, err, "--auto-merge requires --create-pull-request")
+	assert.Nil(t, result)
+}
+
+func TestAddCommandAutoMergePropagation(t *testing.T) {
+	for _, prFlag := range []string{"pr", "create-pull-request"} {
+		t.Run(prFlag, func(t *testing.T) {
+			repoDir := initPRTransferRepo(t)
+			chdirForTest(t, repoDir)
+			prependFakeGH(t, "exit 0\n")
+			sourcePath := filepath.Join(t.TempDir(), "test-workflow.md")
+			require.NoError(t, os.WriteFile(sourcePath, []byte("---\non: workflow_dispatch\npermissions:\n  contents: read\n---\n# Test workflow\n"), 0o600))
+			originalCreatePR := createPRRunGHContextWithHost
+			originalAutoMerge := autoMergeRunGH
+			originalMissingMarkers := addMissingInitMarkers
+			t.Cleanup(func() {
+				createPRRunGHContextWithHost = originalCreatePR
+				autoMergeRunGH = originalAutoMerge
+				addMissingInitMarkers = originalMissingMarkers
+			})
+			addMissingInitMarkers = func(string, string) ([]string, error) { return nil, nil }
+			const prURL = "https://github.com/octo/repo/pull/42"
+			created := false
+			createPRRunGHContextWithHost = func(_ context.Context, _, _ string, args ...string) ([]byte, error) {
+				if args[0] == "repo" {
+					return []byte(`{"owner":{"login":"octo"},"name":"repo"}`), nil
+				}
+				created = true
+				return []byte(prURL), nil
+			}
+			enableErr := errors.New("auto-merge unavailable")
+			autoMergeCalls := 0
+			autoMergeRunGH = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+				assert.True(t, created, "auto-merge must happen after PR creation")
+				autoMergeCalls++
+				return nil, enableErr
+			}
+			cmd := NewAddCommand(validateEngineStub)
+			cmd.SetContext(context.Background())
+			for _, flag := range []string{prFlag, "auto-merge", "no-gitattributes"} {
+				require.NoError(t, cmd.Flags().Set(flag, "true"))
+			}
+			err := cmd.RunE(cmd, []string{sourcePath})
+			require.ErrorIs(t, err, enableErr)
+			require.ErrorContains(t, err, prURL)
+			assert.Equal(t, 1, autoMergeCalls)
+			assert.Equal(t, "main", strings.TrimSpace(gitOutput(t, repoDir, "branch", "--show-current")))
+		})
+	}
+}
+
+func TestResolveAddGhAwRef_FullSHA(t *testing.T) {
+	t.Parallel()
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	resolved, err := resolveAddGhAwRef(context.Background(), sha)
+	require.NoError(t, err)
+	assert.Equal(t, sha, resolved)
+}
+
+func TestCompileWorkflowWithActionRef(t *testing.T) {
+	t.Parallel()
+	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tmpDir := t.TempDir()
+	require.NoError(t, initTestGitRepo(tmpDir))
+	workflowFile := filepath.Join(tmpDir, ".github", "workflows", "pinned.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(workflowFile), 0o755))
+	require.NoError(t, os.WriteFile(workflowFile, []byte(`---
+on: workflow_dispatch
+permissions:
+  contents: read
+---
+
+# Pinned workflow
+`), 0o644))
+
+	require.NoError(t, compileWorkflowWithActionRef(context.Background(), workflowFile, false, true, "", sha))
+	lockContent, err := os.ReadFile(filepath.Join(tmpDir, ".github", "workflows", "pinned.lock.yml"))
+	require.NoError(t, err)
+	assert.Contains(t, string(lockContent), "github/gh-aw/actions/setup@"+sha)
+}
+
+func TestAddCompilationRejectsLintErrors(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		name := "direct"
+		if tracked {
+			name = "tracked"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, initTestGitRepo(dir))
+			workflowFile := filepath.Join(dir, ".github", "workflows", "unsafe.md")
+			require.NoError(t, os.MkdirAll(filepath.Dir(workflowFile), 0o755))
+			require.NoError(t, os.WriteFile(workflowFile, []byte(`---
+on: workflow_dispatch
+strict: false
+engine: copilot
+permissions:
+  contents: read
+jobs:
+  print-message:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: echo "${{ secrets.TEST_SECRET }}"
+---
+Test.
+`), 0o600))
+
+			var err error
+			if tracked {
+				err = compileWorkflowWithTrackingAndOptions(context.Background(), workflowFile, trackedWorkflowCompileOptions{
+					quiet: true, tracker: NewFileTracker(),
+				})
+			} else {
+				err = compileWorkflowWithActionRef(context.Background(), workflowFile, false, true, "", "")
+			}
+			require.ErrorContains(t, err, "[secret-leak]")
+			require.NoFileExists(t, filepath.Join(dir, ".github", "workflows", "unsafe.lock.yml"))
+		})
+	}
 }
 
 func TestNewAddCommand_MentionsEnterpriseSourceResolution(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddCommand(validateEngineStub)
 	require.NotNil(t, cmd)
 
@@ -93,6 +254,7 @@ func TestNewAddCommand_MentionsEnterpriseSourceResolution(t *testing.T) {
 }
 
 func TestAddWorkflows(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		workflows     []string
@@ -115,6 +277,7 @@ func TestAddWorkflows(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			opts := AddOptions{}
 			_, err := AddWorkflows(context.Background(), tt.workflows, opts)
 
@@ -165,6 +328,14 @@ func TestAddResolvedWorkflows(t *testing.T) {
 							WorkflowName: "test-workflow",
 							WorkflowPath: "test.md",
 						},
+						Content: []byte(`---
+on: workflow_dispatch
+permissions:
+  contents: read
+---
+
+# Test workflow
+`),
 					},
 				},
 			}
@@ -186,6 +357,7 @@ func TestAddResolvedWorkflows(t *testing.T) {
 }
 
 func TestAddWorkflowsResult(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name                string
 		prNumber            int
@@ -226,6 +398,7 @@ func TestAddWorkflowsResult(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := &AddWorkflowsResult{
 				PRNumber:            tt.prNumber,
 				PRURL:               tt.prURL,
@@ -241,6 +414,7 @@ func TestAddWorkflowsResult(t *testing.T) {
 }
 
 func TestAddCommandFlagInteractions(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		flagSetup   func(cmd *cobra.Command)
@@ -286,6 +460,7 @@ func TestAddCommandFlagInteractions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			cmd := NewAddCommand(validateEngineStub)
 
 			// Apply flag setup
@@ -303,6 +478,7 @@ func TestAddCommandFlagInteractions(t *testing.T) {
 }
 
 func TestAddCommandFlagDefaults(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddCommand(validateEngineStub)
 	flags := cmd.Flags()
 
@@ -320,6 +496,7 @@ func TestAddCommandFlagDefaults(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.flagName, func(t *testing.T) {
+			t.Parallel()
 			flag := flags.Lookup(tt.flagName)
 			require.NotNil(t, flag, "Flag should exist: %s", tt.flagName)
 			assert.Equal(t, tt.defaultValue, flag.DefValue, "Default value should match for flag: %s", tt.flagName)
@@ -328,6 +505,7 @@ func TestAddCommandFlagDefaults(t *testing.T) {
 }
 
 func TestAddCommandBooleanFlags(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddCommand(validateEngineStub)
 	flags := cmd.Flags()
 
@@ -335,6 +513,7 @@ func TestAddCommandBooleanFlags(t *testing.T) {
 
 	for _, flagName := range boolFlags {
 		t.Run(flagName, func(t *testing.T) {
+			t.Parallel()
 			flag := flags.Lookup(flagName)
 			require.NotNil(t, flag, "Boolean flag should exist: %s", flagName)
 			assert.Equal(t, "false", flag.DefValue, "Boolean flag should default to false: %s", flagName)
@@ -343,6 +522,7 @@ func TestAddCommandBooleanFlags(t *testing.T) {
 }
 
 func TestAddCommandArgs(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddCommand(validateEngineStub)
 
 	// Test that Args validator is set (MinimumNArgs(1))
@@ -360,6 +540,7 @@ func TestAddCommandArgs(t *testing.T) {
 }
 
 func TestRejectBootstrapProfileForRegularAdd(t *testing.T) {
+	t.Parallel()
 	profileWithConfig := &resolvedBootstrapProfile{
 		PackageID: "githubnext/central-agentic-ops",
 		Profile: &repositoryPackageBootstrap{
@@ -370,6 +551,7 @@ func TestRejectBootstrapProfileForRegularAdd(t *testing.T) {
 	}
 
 	t.Run("rejects regular add for packages with manifest config", func(t *testing.T) {
+		t.Parallel()
 		err := rejectBootstrapProfileForRegularAdd([]string{"githubnext/central-agentic-ops"}, profileWithConfig)
 		require.Error(t, err)
 		require.ErrorContains(t, err, "package githubnext/central-agentic-ops declares aw.yml config")
@@ -377,12 +559,14 @@ func TestRejectBootstrapProfileForRegularAdd(t *testing.T) {
 	})
 
 	t.Run("uses requested sources in the add-wizard guidance", func(t *testing.T) {
+		t.Parallel()
 		err := rejectBootstrapProfileForRegularAdd([]string{"githubnext/central-agentic-ops", "./local-workflow.md"}, profileWithConfig)
 		require.Error(t, err)
 		require.ErrorContains(t, err, "gh aw add-wizard githubnext/central-agentic-ops ./local-workflow.md")
 	})
 
 	t.Run("allows packages without manifest config", func(t *testing.T) {
+		t.Parallel()
 		err := rejectBootstrapProfileForRegularAdd([]string{"owner/pkg"}, nil)
 		require.NoError(t, err)
 
@@ -462,6 +646,51 @@ func TestEnsureAddRepositoryInitialized(t *testing.T) {
 	})
 }
 
+// TestEnsureAddRepositoryInitializedWithDetails_AbsolutePaths verifies that
+// ensureAddRepositoryInitializedWithDetails returns absolute paths for files
+// that were actually written by init, and skips files that init deliberately
+// does not create (e.g. .gitattributes when --no-gitattributes is used).
+func TestEnsureAddRepositoryInitializedWithDetails_AbsolutePaths(t *testing.T) {
+	repoDir := t.TempDir()
+
+	originalFindGitRoot := addFindGitRoot
+	originalInitRepository := addInitRepository
+	originalMissingInitMarkers := addMissingInitMarkers
+	t.Cleanup(func() {
+		addFindGitRoot = originalFindGitRoot
+		addInitRepository = originalInitRepository
+		addMissingInitMarkers = originalMissingInitMarkers
+	})
+
+	// Use a marker whose isBootstrapInitMarkerSatisfied check uses the default
+	// branch (file exists and size > 0), so the test does not need to reproduce
+	// marker-specific content such as a SKILL.md or MCP config.
+	writtenMarker := ".vscode/settings.json"
+	skippedMarker := ".gitattributes"
+
+	addFindGitRoot = func() (string, error) { return repoDir, nil }
+	addMissingInitMarkers = func(string, string) ([]string, error) {
+		return []string{writtenMarker, skippedMarker}, nil
+	}
+	addInitRepository = func(InitOptions) error {
+		// Simulate init: create the settings.json marker but skip .gitattributes.
+		p := filepath.Join(repoDir, filepath.FromSlash(writtenMarker))
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			return err
+		}
+		return os.WriteFile(p, []byte(`{}`), 0644)
+	}
+
+	files, err := ensureAddRepositoryInitializedWithDetails("", false, true)
+	require.NoError(t, err)
+
+	// Only the actually-written file should be returned.
+	require.Len(t, files, 1)
+	// The returned path must be absolute.
+	require.True(t, filepath.IsAbs(files[0]), "expected absolute path, got %q", files[0])
+	require.Equal(t, filepath.Join(repoDir, filepath.FromSlash(writtenMarker)), files[0])
+}
+
 func TestAddResolvedWorkflows_IgnoresBootstrapRequireOwnerTypeDuringInstall(t *testing.T) {
 	originalCheckOwnerType := bootstrapCheckOwnerType
 	t.Cleanup(func() {
@@ -513,7 +742,7 @@ on:
 # Worker
 `), 0o644))
 
-	compileDispatchWorkflowDependencies(context.Background(), mainPath, false, true, "", false, nil)
+	compileDispatchWorkflowDependenciesWithOptions(context.Background(), mainPath, compileDepsOptions{quiet: true})
 
 	lockPath := filepath.Join(workflowsDir, "worker.lock.yml")
 	_, err := os.Stat(lockPath)
@@ -548,7 +777,9 @@ safe-outputs:
 	// Write an intentionally broken worker file (no frontmatter — compile will fail).
 	require.NoError(t, os.WriteFile(workerPath, []byte(`not valid workflow content`), 0o644))
 
-	err := compileCallWorkflowDependencies(context.Background(), mainPath, false, true, "", false, nil)
+	err := compileCallWorkflowDependenciesWithOptions(context.Background(), mainPath, compileDepsOptions{
+		quiet: true, propagateErrors: true,
+	})
 	require.Error(t, err, "worker compilation failure should propagate as an error")
 	require.ErrorContains(t, err, "worker", "error should mention the worker name")
 }
@@ -587,13 +818,15 @@ on:
 	require.NoError(t, os.WriteFile(lockPath, []byte("# stale lock"), 0o644))
 
 	// Without force: stale lock is preserved.
-	err := compileCallWorkflowDependencies(context.Background(), mainPath, false, true, "", false, nil)
+	err := compileCallWorkflowDependenciesWithOptions(context.Background(), mainPath, compileDepsOptions{quiet: true})
 	require.NoError(t, err)
 	content, _ := os.ReadFile(lockPath)
 	assert.Equal(t, "# stale lock", string(content), "without force, stale lock should not be recompiled")
 
 	// With force: stale lock gets recompiled.
-	err = compileCallWorkflowDependencies(context.Background(), mainPath, false, true, "", true, nil)
+	err = compileCallWorkflowDependenciesWithOptions(context.Background(), mainPath, compileDepsOptions{
+		quiet: true, force: true,
+	})
 	require.NoError(t, err)
 	recompiled, _ := os.ReadFile(lockPath)
 	assert.NotEqual(t, "# stale lock", string(recompiled), "with force, stale lock should be recompiled")
@@ -601,6 +834,7 @@ on:
 }
 
 func TestValidateWorkflowDestination_SkipsExistingWorkflowFromSameSource(t *testing.T) {
+	t.Parallel()
 	workflowsDir := t.TempDir()
 	existingPath := filepath.Join(workflowsDir, "dependabot.md")
 	require.NoError(t, os.WriteFile(existingPath, []byte(`---
@@ -615,6 +849,7 @@ source: githubnext/central-agentic-ops/.github/workflows/dependabot.md@main
 }
 
 func TestValidateWorkflowDestination_ErrorsForExistingWorkflowFromDifferentSource(t *testing.T) {
+	t.Parallel()
 	workflowsDir := t.TempDir()
 	existingPath := filepath.Join(workflowsDir, "dependabot.md")
 	require.NoError(t, os.WriteFile(existingPath, []byte(`---
@@ -631,6 +866,7 @@ source: octo/other/.github/workflows/dependabot.md@main
 
 // TestAddMultipleWorkflowsNameFlag verifies that --name is not allowed when multiple workflows are specified.
 func TestAddMultipleWorkflowsNameFlag(t *testing.T) {
+	t.Parallel()
 	cmd := NewAddCommand(validateEngineStub)
 
 	// Simulate calling the command with --name and multiple workflow arguments
@@ -638,7 +874,7 @@ func TestAddMultipleWorkflowsNameFlag(t *testing.T) {
 
 	err := cmd.Execute()
 	require.Error(t, err, "Should error when --name is used with multiple workflows")
-	require.ErrorContains(t, err, "--name flag cannot be used when adding multiple workflows", "Error should mention --name restriction")
+	require.ErrorContains(t, err, "--name was set while multiple workflows were provided", "Error should mention --name restriction")
 }
 
 // setupMinimalGitRepo initialises a bare-minimum git repo in dir and returns the
@@ -673,13 +909,14 @@ func TestAddWorkflowWithTracking_SourceFieldVariants(t *testing.T) {
 	simpleContent := []byte("---\non: push\n---\n\n# Workflow\n")
 	const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-	tests := []struct {
+	type testCase struct {
 		name            string
 		spec            *WorkflowSpec
 		sourceInfo      *FetchedWorkflow
 		wantContains    string
 		wantNotContains string
-	}{
+	}
+	tests := []testCase{
 		{
 			// Local workflows must NOT get a source: field — the code guards on !sourceInfo.IsLocal.
 			name: "local workflow — no source field written",
@@ -712,7 +949,7 @@ func TestAddWorkflowWithTracking_SourceFieldVariants(t *testing.T) {
 				IsLocal:    false,
 				SourcePath: ".github/workflows/my-workflow.md", // identical — no fallback
 			},
-			wantContains:    "source: owner/repo/.github/workflows/my-workflow.md@" + sha,
+			wantContains:    "source: owner/repo/.github/workflows/my-workflow.md@main",
 			wantNotContains: "",
 		},
 		{
@@ -731,9 +968,30 @@ func TestAddWorkflowWithTracking_SourceFieldVariants(t *testing.T) {
 				IsLocal:    false,
 				SourcePath: ".github/workflows/my-workflow.md", // resolved via fallback
 			},
-			wantContains:    "source: current-org/current-repo/.github/workflows/my-workflow.md@" + sha,
+			wantContains:    "source: current-org/current-repo/.github/workflows/my-workflow.md@main",
 			wantNotContains: "source: current-org/current-repo/my-workflow.md",
 		},
+	}
+
+	for _, ref := range []string{"v1.2.0", "v1", "release/stable", sha, ""} {
+		wantRef := ref
+		if wantRef == "" {
+			wantRef = sha
+		}
+		tests = append(tests, testCase{
+			name: "remote workflow ref " + ref,
+			spec: &WorkflowSpec{
+				RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: ref},
+				WorkflowPath: ".github/workflows/my-workflow.md",
+				WorkflowName: "my-workflow",
+			},
+			sourceInfo: &FetchedWorkflow{
+				Content:    simpleContent,
+				CommitSHA:  sha,
+				SourcePath: ".github/workflows/my-workflow.md",
+			},
+			wantContains: "source: owner/repo/.github/workflows/my-workflow.md@" + wantRef,
+		})
 	}
 
 	for _, tt := range tests {
@@ -811,7 +1069,7 @@ func TestAddWorkflowWithTracking_UsesActualFetchedPath(t *testing.T) {
 
 	// The source: field must use the full path, not the short-form WorkflowPath
 	assert.Contains(t, string(written),
-		"source: owner/repo/.github/workflows/my-workflow.md@abc123def456789012345678901234567890abcd",
+		"source: owner/repo/.github/workflows/my-workflow.md@main",
 		"source field should use the actual fetched path so gh aw update can find the file")
 	assert.NotContains(t, string(written),
 		"source: owner/repo/my-workflow.md",
@@ -895,13 +1153,219 @@ func TestAddWorkflowWithTracking_ActionWorkflow_Force(t *testing.T) {
 	assert.Equal(t, newContent, written)
 }
 
-func TestAddWorkflowsWithTracking_RollsBackWrittenFilesOnWriteFailure(t *testing.T) {
+func TestAddWorkflowsWithTracking_PackageResourceWritesOwnershipRecord(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-package-resource-*")
+	setupMinimalGitRepo(t, tempDir)
+
+	resourceContent := []byte("name: Bug report\n")
+	workflows := []*ResolvedWorkflow{
+		{
+			Spec: &WorkflowSpec{
+				RepoSpec: RepoSpec{
+					RepoSlug:    "owner/repo",
+					Version:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					PackagePath: "packages/repo-assist",
+				},
+				WorkflowPath:           "packages/repo-assist/templates/bug.yml",
+				WorkflowName:           "bug",
+				DestinationPath:        ".github/ISSUE_TEMPLATE/bug.yml",
+				FromRepositoryManifest: true,
+				IsPackageResourceFile:  true,
+			},
+			Content: resourceContent,
+			SourceInfo: &FetchedWorkflow{
+				Content:    resourceContent,
+				CommitSHA:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				IsLocal:    false,
+				SourcePath: "packages/repo-assist/templates/bug.yml",
+			},
+			IsPackageResourceFile: true,
+		},
+	}
+
+	err := addWorkflowsWithTracking(context.Background(), workflows, NewFileTracker(), AddOptions{
+		NoGitattributes:        true,
+		DisableSecurityScanner: true,
+		Quiet:                  true,
+	})
+	require.NoError(t, err)
+
+	resourcePath := filepath.Join(tempDir, ".github", "ISSUE_TEMPLATE", "bug.yml")
+	written, err := os.ReadFile(resourcePath)
+	require.NoError(t, err)
+	assert.Equal(t, resourceContent, written)
+
+	recordFiles, err := filepath.Glob(filepath.Join(tempDir, ".github", "aw", "packages", "*.json"))
+	require.NoError(t, err)
+	require.Len(t, recordFiles, 1)
+	record, err := os.ReadFile(recordFiles[0])
+	require.NoError(t, err)
+	assert.Contains(t, string(record), `"source": "owner/repo/packages/repo-assist@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`)
+	assert.Contains(t, string(record), `"destination": ".github/ISSUE_TEMPLATE/bug.yml"`)
+	assert.Contains(t, string(record), `"sha256":`)
+}
+
+func TestAddWorkflowsWithTracking_PackageSharedScriptResourceWritesOwnershipRecord(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-package-shared-script-resource-*")
+	setupMinimalGitRepo(t, tempDir)
+
+	resourceContent := []byte("export function registrationPage() {\n  return `<form action=\"/register\"><script>document.forms[0].submit()</script></form>`;\n}\n")
+	workflows := []*ResolvedWorkflow{
+		{
+			Spec: &WorkflowSpec{
+				RepoSpec: RepoSpec{
+					RepoSlug:    "owner/repo",
+					Version:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					PackagePath: "packages/repo-assist",
+				},
+				WorkflowPath:           "packages/repo-assist/shared/runtime.mjs",
+				WorkflowName:           "runtime",
+				DestinationPath:        ".github/workflows/shared/runtime.mjs",
+				FromRepositoryManifest: true,
+				IsPackageResourceFile:  true,
+			},
+			Content: resourceContent,
+			SourceInfo: &FetchedWorkflow{
+				Content:    resourceContent,
+				CommitSHA:  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				IsLocal:    false,
+				SourcePath: "packages/repo-assist/shared/runtime.mjs",
+			},
+			IsPackageResourceFile: true,
+		},
+	}
+
+	err := addWorkflowsWithTracking(context.Background(), workflows, NewFileTracker(), AddOptions{
+		NoGitattributes: true,
+		Quiet:           true,
+	})
+	require.NoError(t, err)
+	err = addWorkflowsWithTracking(context.Background(), workflows, NewFileTracker(), AddOptions{
+		NoGitattributes: true,
+		Force:           true,
+		Quiet:           true,
+	})
+	require.NoError(t, err, "reapplying the resource must not require disabling security scanning")
+
+	resourcePath := filepath.Join(tempDir, ".github", "workflows", "shared", "runtime.mjs")
+	written, err := os.ReadFile(resourcePath)
+	require.NoError(t, err)
+	assert.Equal(t, resourceContent, written)
+
+	recordFiles, err := filepath.Glob(filepath.Join(tempDir, ".github", "aw", "packages", "*.json"))
+	require.NoError(t, err)
+	require.Len(t, recordFiles, 1)
+	record, err := os.ReadFile(recordFiles[0])
+	require.NoError(t, err)
+	assert.Contains(t, string(record), `"source": "owner/repo/packages/repo-assist@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`)
+	assert.Contains(t, string(record), `"destination": ".github/workflows/shared/runtime.mjs"`)
+	assert.Contains(t, string(record), `"sha256":`)
+
+	unsafeMarkdown := &ResolvedWorkflow{
+		Spec:    &WorkflowSpec{WorkflowPath: ".github/workflows/unsafe.md", WorkflowName: "unsafe"},
+		Content: []byte("<script>alert(1)</script>"),
+	}
+	err = addWorkflowsWithTracking(context.Background(), append(workflows, unsafeMarkdown), NewFileTracker(), AddOptions{
+		NoGitattributes: true,
+		Force:           true,
+		Quiet:           true,
+	})
+	require.ErrorContains(t, err, "failed security scan")
+	written, err = os.ReadFile(resourcePath)
+	require.NoError(t, err)
+	assert.Equal(t, resourceContent, written)
+	assert.NoFileExists(t, filepath.Join(tempDir, ".github", "workflows", "unsafe.md"))
+}
+
+func TestValidateWorkflowSecurity_PackageResourceContent(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		content     []byte
+		isResource  bool
+		wantFinding bool
+	}{
+		{"javascript template", ".github/workflows/shared/page.mjs", []byte("const page = `<form><script>alert(1)</script></form>`;"), true, false},
+		{"unicode in javascript", ".github/workflows/shared/page.mjs", []byte("const value = 'safe\u202Eunsafe';"), true, true},
+		{"binary resource", ".github/aw/assets/image.png", []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, true, false},
+		{"markdown resource", ".github/aw/instructions.md", []byte("<script>alert(1)</script>"), true, true},
+		{"workflow markdown", ".github/workflows/unsafe.md", []byte("<script>alert(1)</script>"), false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolved := &ResolvedWorkflow{
+				Spec:                  &WorkflowSpec{WorkflowPath: tt.path, DestinationPath: tt.path},
+				Content:               tt.content,
+				IsPackageResourceFile: tt.isResource,
+			}
+			err := validateWorkflowSecurity(resolved, AddOptions{})
+			if tt.wantFinding {
+				require.ErrorContains(t, err, "failed security scan")
+				require.ErrorContains(t, err, "file '")
+				assert.NotContains(t, err.Error(), "workflow '")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestAddWorkflowsWithTracking_PackageResourceRejectsLocalDrift(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-package-resource-drift-*")
+	setupMinimalGitRepo(t, tempDir)
+
+	spec := &WorkflowSpec{
+		RepoSpec: RepoSpec{
+			RepoSlug:    "owner/repo",
+			Version:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			PackagePath: "packages/repo-assist",
+		},
+		WorkflowPath:           "packages/repo-assist/policy/controls.json",
+		WorkflowName:           "controls",
+		DestinationPath:        ".github/aw/policy/controls.json",
+		FromRepositoryManifest: true,
+		IsPackageResourceFile:  true,
+	}
+	first := []*ResolvedWorkflow{{
+		Spec:                  spec,
+		Content:               []byte(`{"version":1}`),
+		SourceInfo:            &FetchedWorkflow{Content: []byte(`{"version":1}`), CommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		IsPackageResourceFile: true,
+	}}
+	err := addWorkflowsWithTracking(context.Background(), first, NewFileTracker(), AddOptions{
+		NoGitattributes:        true,
+		DisableSecurityScanner: true,
+		Quiet:                  true,
+	})
+	require.NoError(t, err)
+
+	resourcePath := filepath.Join(tempDir, ".github", "aw", "policy", "controls.json")
+	require.NoError(t, os.WriteFile(resourcePath, []byte(`{"local":true}`), 0644))
+
+	second := []*ResolvedWorkflow{{
+		Spec:                  spec,
+		Content:               []byte(`{"version":2}`),
+		SourceInfo:            &FetchedWorkflow{Content: []byte(`{"version":2}`), CommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		IsPackageResourceFile: true,
+	}}
+	err = addWorkflowsWithTracking(context.Background(), second, NewFileTracker(), AddOptions{
+		NoGitattributes:        true,
+		DisableSecurityScanner: true,
+		Quiet:                  true,
+	})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "local modifications")
+	written, readErr := os.ReadFile(resourcePath)
+	require.NoError(t, readErr)
+	assert.Equal(t, `{"local":true}`, string(written))
+}
+
+func TestAddWorkflowsWithTracking_RollsBackWrittenFilesOnDestinationValidationFailure(t *testing.T) {
 	tempDir := testutil.TempDir(t, "test-add-workflows-rollback-*")
 	workflowsDir := setupMinimalGitRepo(t, tempDir)
 
 	validContent := []byte("---\nengine: claude\n---\n\n# workflow\n")
-	// workflow name "nested/blocked" intentionally causes write failure because
-	// addWorkflowWithTracking does not create nested workflow directories.
+	// A later invalid destination must roll back earlier successful writes.
 	workflows := []*ResolvedWorkflow{
 		{
 			Spec: &WorkflowSpec{
@@ -931,16 +1395,17 @@ func TestAddWorkflowsWithTracking_RollsBackWrittenFilesOnWriteFailure(t *testing
 		Quiet:                  true,
 	})
 	require.Error(t, err)
-	require.ErrorContains(t, err, "failed to write destination file")
+	require.ErrorContains(t, err, "invalid workflow name")
 
 	_, statErr := os.Stat(filepath.Join(workflowsDir, "ok.md"))
-	assert.True(t, os.IsNotExist(statErr), "successful writes from this operation should be rolled back on later write failure")
+	assert.True(t, os.IsNotExist(statErr), "successful writes from this operation should be rolled back on later destination validation failure")
 
 	_, blockedStatErr := os.Stat(filepath.Join(workflowsDir, "nested", "blocked.md"))
 	assert.True(t, os.IsNotExist(blockedStatErr), "failing workflow should not leave partial output files")
 }
 
 func TestAddSkillFileWithTracking_PreservesPathFromSkillsRoot(t *testing.T) {
+	t.Parallel()
 	gitRoot := testutil.TempDir(t, "test-add-skill-path-*")
 	resolved := &ResolvedWorkflow{
 		Spec: &WorkflowSpec{
@@ -967,7 +1432,9 @@ func TestAddSkillFileWithTracking_PreservesPathFromSkillsRoot(t *testing.T) {
 }
 
 func TestAddSkillFileWithTracking_RejectsInvalidPaths(t *testing.T) {
+	t.Parallel()
 	t.Run("rejects path that escapes skill directory", func(t *testing.T) {
+		t.Parallel()
 		gitRoot := testutil.TempDir(t, "test-add-skill-traversal-*")
 		resolved := &ResolvedWorkflow{
 			Spec: &WorkflowSpec{
@@ -983,6 +1450,7 @@ func TestAddSkillFileWithTracking_RejectsInvalidPaths(t *testing.T) {
 	})
 
 	t.Run("rejects source path when skill root cannot be determined", func(t *testing.T) {
+		t.Parallel()
 		gitRoot := testutil.TempDir(t, "test-add-skill-missing-root-*")
 		resolved := &ResolvedWorkflow{
 			Spec: &WorkflowSpec{
@@ -999,7 +1467,9 @@ func TestAddSkillFileWithTracking_RejectsInvalidPaths(t *testing.T) {
 }
 
 func TestAddCopilotRequestsPermissionToContent(t *testing.T) {
+	t.Parallel()
 	t.Run("adds permission to workflow without existing permissions block", func(t *testing.T) {
+		t.Parallel()
 		content := "---\nengine: copilot\n---\nDo the thing.\n"
 		result, err := addCopilotRequestsPermissionToContent(content)
 		require.NoError(t, err)
@@ -1008,6 +1478,7 @@ func TestAddCopilotRequestsPermissionToContent(t *testing.T) {
 	})
 
 	t.Run("adds permission to workflow with existing permissions block", func(t *testing.T) {
+		t.Parallel()
 		content := "---\nengine: copilot\npermissions:\n  contents: read\n---\nDo the thing.\n"
 		result, err := addCopilotRequestsPermissionToContent(content)
 		require.NoError(t, err)
@@ -1016,6 +1487,7 @@ func TestAddCopilotRequestsPermissionToContent(t *testing.T) {
 	})
 
 	t.Run("is idempotent when permission already present", func(t *testing.T) {
+		t.Parallel()
 		content := "---\nengine: copilot\npermissions:\n  copilot-requests: write\n---\nDo the thing.\n"
 		result, err := addCopilotRequestsPermissionToContent(content)
 		require.NoError(t, err)
@@ -1024,10 +1496,32 @@ func TestAddCopilotRequestsPermissionToContent(t *testing.T) {
 	})
 
 	t.Run("returns error when permissions is a non-mapping scalar", func(t *testing.T) {
+		t.Parallel()
 		content := "---\nengine: copilot\npermissions: read-all\n---\nDo the thing.\n"
 		_, err := addCopilotRequestsPermissionToContent(content)
 		require.Error(t, err)
 		require.ErrorContains(t, err, "non-mapping scalar")
+	})
+}
+
+func TestAddCopilotRequestsNonePermissionToContent(t *testing.T) {
+	t.Parallel()
+	t.Run("adds none permission to workflow without existing permissions block", func(t *testing.T) {
+		t.Parallel()
+		content := "---\nengine: copilot\n---\nDo the thing.\n"
+		result, err := addCopilotRequestsNonePermissionToContent(content)
+		require.NoError(t, err)
+		assert.Contains(t, result, "permissions:")
+		assert.Contains(t, result, "copilot-requests: none")
+	})
+
+	t.Run("replaces existing write permission", func(t *testing.T) {
+		t.Parallel()
+		content := "---\nengine: copilot\npermissions:\n  copilot-requests: write\n---\nDo the thing.\n"
+		result, err := addCopilotRequestsNonePermissionToContent(content)
+		require.NoError(t, err)
+		assert.Contains(t, result, "copilot-requests: none")
+		assert.NotContains(t, result, "copilot-requests: write")
 	})
 }
 
@@ -1056,6 +1550,29 @@ func TestAddWorkflowWithTracking_CopilotRequestsPermission(t *testing.T) {
 		written, readErr := os.ReadFile(filepath.Join(workflowsDir, "my-workflow.md"))
 		require.NoError(t, readErr)
 		assert.Contains(t, string(written), "copilot-requests: write")
+	})
+
+	t.Run("injects copilot-requests none permission when option is set", func(t *testing.T) {
+		dir := testutil.TempDir(t, "test-copilot-requests-none-perm-*")
+		setupMinimalGitRepo(t, dir)
+
+		content := "---\nengine: copilot\n---\nDo the thing.\n"
+		resolved := &ResolvedWorkflow{
+			Spec:       &WorkflowSpec{WorkflowPath: "workflows/my-workflow3.md", WorkflowName: "my-workflow3"},
+			Content:    []byte(content),
+			SourceInfo: &FetchedWorkflow{IsLocal: true},
+		}
+
+		err := addWorkflowWithTracking(context.Background(), resolved, nil, AddOptions{
+			Quiet:                            true,
+			AddCopilotRequestsNonePermission: true,
+			DisableSecurityScanner:           true,
+		})
+		require.NoError(t, err)
+
+		written, readErr := os.ReadFile(filepath.Join(dir, ".github", "workflows", "my-workflow3.md"))
+		require.NoError(t, readErr)
+		assert.Contains(t, string(written), "copilot-requests: none")
 	})
 
 	t.Run("does not inject permission when option is false", func(t *testing.T) {

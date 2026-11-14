@@ -3,6 +3,8 @@ private: true
 emoji: "🔍"
 name: Go Pattern Detector
 description: Detects common Go code patterns and anti-patterns to maintain code quality and consistency
+features:
+  gh-aw-detection: true
 on:
   schedule:
     - cron: "daily around 14:00 on weekdays"  # ~2 PM UTC weekdays
@@ -12,9 +14,6 @@ permissions:
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
 jobs:
   ast_grep:
@@ -71,7 +70,11 @@ strict: true
 tools:
   cli-proxy: true
 
-
+evals:
+  - id: contextual-tag-defect
+    question: For a proposed issue, does each flagged json:"-" occurrence have source-context evidence that ignoring the field causes the described problem? Return UNKNOWN when no issue is proposed.
+  - id: valid-uses-not-reported
+    question: When inspected matches are established as intentional valid exclusions, does the proposed output refrain from reporting those matches as defects? Return UNKNOWN when no such valid matches are established.
 ---
 
 # Go Code Pattern Detector

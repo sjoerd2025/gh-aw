@@ -57,16 +57,59 @@ func TestMaskOTLPHeadersScript(t *testing.T) {
 		{
 			name: "short values are not emitted as masks",
 			env: []string{
-				"OTEL_EXPORTER_OTLP_HEADERS=Authorization=4,Api-Key=1234,Edge=abcd,Trace=abc",
+				"OTEL_EXPORTER_OTLP_HEADERS=Authorization=4,Api-Key=1234,Edge=abcd,Trace=abc,Short=abcdefg,Token=abcdefgh",
 			},
 			want: []string{
-				"::add-mask::Authorization=4,Api-Key=1234,Edge=abcd,Trace=abc",
-				"::add-mask::1234",
-				"::add-mask::abcd",
+				"::add-mask::Authorization=4,Api-Key=1234,Edge=abcd,Trace=abc,Short=abcdefg,Token=abcdefgh",
+				"::add-mask::abcdefgh",
 			},
 			wantNot: []string{
 				"::add-mask::4",
+				"::add-mask::1234",
+				"::add-mask::abcd",
 				"::add-mask::abc",
+				"::add-mask::abcdefg",
+			},
+		},
+		{
+			name: "boolean placeholder preserves true job outputs",
+			env: []string{
+				"OTEL_EXPORTER_OTLP_HEADERS=X-No-Auth=true",
+			},
+			want: []string{"::add-mask::X-No-Auth=true"},
+			wantNot: []string{
+				"::add-mask::true",
+			},
+		},
+		{
+			name: "boolean and numeric placeholders are not individual masks",
+			env: []string{
+				"OTEL_EXPORTER_OTLP_HEADERS=X-Flag=false,X-Enabled=TRUE,X-Disabled=FALSE,X-Id=1234567890123456",
+				"GH_AW_OTLP_ALL_HEADERS=X-No-Auth=true,X-Id=12345678,Api-Key=real-credential",
+			},
+			want: []string{
+				"::add-mask::X-Flag=false,X-Enabled=TRUE,X-Disabled=FALSE,X-Id=1234567890123456",
+				"::add-mask::X-No-Auth=true,X-Id=12345678,Api-Key=real-credential",
+				"::add-mask::real-credential",
+			},
+			wantNot: []string{
+				"::add-mask::true",
+				"::add-mask::false",
+				"::add-mask::TRUE",
+				"::add-mask::FALSE",
+				"::add-mask::12345678",
+				"::add-mask::1234567890123456",
+			},
+		},
+		{
+			name: "short bearer credential retains raw token mask",
+			env: []string{
+				"OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer " + "abcd",
+			},
+			want: []string{
+				"::add-mask::Authorization=Bearer " + "abcd",
+				"::add-mask::Bearer " + "abcd",
+				"::add-mask::abcd",
 			},
 		},
 	}
@@ -85,7 +128,7 @@ func TestMaskOTLPHeadersScript(t *testing.T) {
 			output := string(out)
 			normalizedOutput := "\n" + strings.TrimSpace(output) + "\n"
 			for _, want := range tt.want {
-				assert.Contains(t, output, want)
+				assert.Contains(t, normalizedOutput, "\n"+want+"\n")
 			}
 			for _, wantNot := range tt.wantNot {
 				assert.NotContains(t, normalizedOutput, "\n"+wantNot+"\n")
@@ -123,9 +166,10 @@ func TestMaskOTLPAttributesScript(t *testing.T) {
 	scriptPath := filepath.Join(filepath.Dir(file), "..", "..", "actions", "setup", "sh", "mask_otlp_attributes.sh")
 
 	tests := []struct {
-		name string
-		env  []string
-		want []string
+		name    string
+		env     []string
+		want    []string
+		wantNot []string
 	}{
 		{
 			name: "masks each attribute value individually",
@@ -135,6 +179,18 @@ func TestMaskOTLPAttributesScript(t *testing.T) {
 			want: []string{
 				"::add-mask::my-session",
 				"::add-mask::my-user",
+			},
+		},
+		{
+			name: "short attribute values are not emitted as masks",
+			env: []string{
+				`GH_AW_OTLP_ATTRIBUTES={"a":"1","b":"176","c":"abc","d":"abcd"}`,
+			},
+			want: []string{"::add-mask::abcd"},
+			wantNot: []string{
+				"::add-mask::1",
+				"::add-mask::176",
+				"::add-mask::abc",
 			},
 		},
 		{
@@ -165,8 +221,12 @@ func TestMaskOTLPAttributesScript(t *testing.T) {
 			require.NoError(t, err, "mask script should succeed, output:\n%s", out)
 
 			output := string(out)
+			normalizedOutput := "\n" + strings.TrimSpace(output) + "\n"
 			for _, want := range tt.want {
 				assert.Contains(t, output, want)
+			}
+			for _, wantNot := range tt.wantNot {
+				assert.NotContains(t, normalizedOutput, "\n"+wantNot+"\n")
 			}
 			if len(tt.want) == 0 {
 				assert.Empty(t, strings.TrimSpace(output), "expected no output for this case")

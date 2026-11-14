@@ -52,16 +52,13 @@ imports:
 timeout-minutes: 30
 features:
   gh-aw-detection: true
-sandbox:
-  agent:
-    sudo: false
 evals:
   - id: sessions_analyzed
     question: Did the agent analyze Copilot sessions from the last 14 days?
   - id: three_issues_created
     question: Were three optimization issues created with evidence-backed recommendations?
 steps:
-  - name: Token budget guard
+  - name: Estimate first-turn token budget
     run: |
       PROMPT_FILE="/tmp/gh-aw/aw-prompts/prompt.txt"
       if [ -f "$PROMPT_FILE" ]; then
@@ -83,6 +80,8 @@ steps:
       if [ -d "$LOG_DIR" ]; then
         for f in "$LOG_DIR"/*; do
           if [ -f "$f" ]; then
+            # Structured events must remain valid and complete for telemetry analysis.
+            case "$f" in *-events.jsonl) continue ;; esac
             SIZE=$(wc -c < "$f")
             if [ "$SIZE" -gt "$THRESHOLD" ]; then
               # THRESHOLD (10240) > FIRST_CHUNK+LAST_CHUNK (6144), so no chunk overlap possible
@@ -95,6 +94,7 @@ steps:
         done
       fi
 ---
+
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Copilot Opt — Session Optimization Analyzer
@@ -111,6 +111,7 @@ Pre-fetched data is available from shared imports:
 
 - `/tmp/gh-aw/agent/session-data/sessions-list.json`
 - `/tmp/gh-aw/agent/session-data/logs/` (conversation logs and/or fallback logs)
+- `/tmp/gh-aw/agent/session-data/tool-summaries.json` (per-session tool latency and UTF-8 payload sizes; unavailable measurements are null)
 - `/tmp/gh-aw/agent/pr-data/copilot-prs.json` (cross-analysis source — always present)
 
 These paths are populated by imported setup components:
@@ -122,6 +123,7 @@ These paths are populated by imported setup components:
 0. **Use `gh` CLI for GitHub reads** (`gh pr list`, `gh pr view`, `gh issue list`, etc.) in analysis steps. The `gh` CLI is pre-authenticated and is the primary tool for reading from GitHub.
 1. Process **all available sessions** in the last 14 days (deterministic; no sampling unless data is too large to load in one pass).
 2. Parse session event data from `events.jsonl` when available.
+   Use `tool-summaries.json` for an initial scan; transcript-only or missing sessions do not provide structured tool measurements. Check invalid events and unmatched/incomplete calls before drawing conclusions.
 3. Detect these classes of issues:
    - slow MCP/tool calls
    - oversized tool responses
@@ -138,6 +140,16 @@ These paths are populated by imported setup components:
 7. Create **exactly three GitHub issues** (one per recommendation).
 
 If data is incomplete, proceed with available evidence and clearly state data quality limitations.
+
+## Tool Discipline
+
+Use absolute paths with `view`, `find`, and `jq`; keep every shell command and pipeline stage within the configured allowlist. Do not use `cd`, `cut`, or `sed`; use `jq` for JSON selection, normalization, and truncation instead.
+
+Permitted analysis commands are `jq`, `python`, `grep`, `find`, `cat`, `head`, `tail`, `sort`, `uniq`, `wc`, `ls`, `pwd`, and `date`. Use `python` or `grep` for plain-text transcripts; `awk`, `xargs`, and `tr` are not permitted.
+
+Read the phase instructions below with `view` from their staged absolute paths. Do not depend on automatic repository skill discovery.
+
+After a permission denial, identify the unsupported command before proceeding. Use only an explicitly allowed alternative; do not retry variants of the denied command or probe permissions. If a required capability has no allowed alternative, report that specific limitation through the configured safe-output tools instead of exhausting the three-denial budget.
 
 ## Phase 0 — Setup
 
@@ -169,19 +181,19 @@ Use UTC for all time filtering.
 
 ## Phase 2 — Performance Analysis
 
-Invoke skill `opt-phase-performance` for the full performance analysis procedure. Aggregate across all sessions to identify recurring systemic patterns.
+Read `/tmp/gh-aw/.github/skills/opt-phase-performance/SKILL.md` with `view` for the full performance analysis procedure. Aggregate across all sessions to identify recurring systemic patterns.
 
 ## Phase 3 — PR Cross-Analysis and Duplicate Pattern Detection
 
-This phase is **mandatory**. Invoke skill `opt-phase-pr-analysis` for the full PR cross-analysis and duplicate pattern detection procedure (including jq commands and the retry-blocked topics table).
+This phase is **mandatory**. Read `/tmp/gh-aw/.github/skills/opt-phase-pr-analysis/SKILL.md` with `view` for the full PR cross-analysis and duplicate pattern detection procedure (including jq commands and the retry-blocked topics table).
 
 ## Phase 4 — Recommendation Selection
 
-Produce exactly three recommendations ranked by impact. Invoke skill `opt-phase-recommendations` for the full selection rules, domains, and criteria.
+Produce exactly three recommendations ranked by impact. Read `/tmp/gh-aw/.github/skills/opt-phase-recommendations/SKILL.md` with `view` for the full selection rules, domains, and criteria.
 
 ## Phase 5 — Issue Creation (Exactly Three)
 
-Create exactly three GitHub issues. Invoke skill `opt-phase-issue-creation` for the full issue template, retry-blocked addendum format, and label rules.
+Create exactly three GitHub issues. Read `/tmp/gh-aw/.github/skills/opt-phase-issue-creation/SKILL.md` with `view` for the full issue template, retry-blocked addendum format, and label rules.
 
 ## Items That Should Not Be Addressed
 

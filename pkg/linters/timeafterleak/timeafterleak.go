@@ -7,36 +7,30 @@ package timeafterleak
 import (
 	"go/ast"
 	"go/token"
-	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:timeafterleak")
+
 // Analyzer is the time-after-leak analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "timeafterleak",
-	Doc:      "reports time.After calls used as the channel-receive expression in a select CommClause that is enclosed by a for or range loop; does not flag receives inside case bodies, single-case selects without a default, or selects enclosed only by a function literal boundary",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/timeafterleak",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("timeafterleak", "reports time.After calls used as the channel-receive expression in a select CommClause that is enclosed by a for or range loop; does not flag receives inside case bodies, single-case selects without a default, or selects enclosed only by a function literal boundary", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	insp, err := astutil.Inspector(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +56,7 @@ func run(pass *analysis.Pass) (any, error) {
 			continue
 		}
 
+		pkgLog.Printf("flagging time.After inside loop select at %s", pos)
 		pass.ReportRangef(call,
 			"time.After creates a new timer on each loop iteration that is not garbage collected until it fires; use time.NewTimer with Reset and Stop instead")
 	}
@@ -71,23 +66,24 @@ func run(pass *analysis.Pass) (any, error) {
 
 // isTimeAfterCall reports whether call is an invocation of time.After.
 func isTimeAfterCall(pass *analysis.Pass, call *ast.CallExpr) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "After" {
 		return false
 	}
-	ident, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return false
+	return astutil.IsPkgSelector(pass, sel, "time")
+}
+
+// parentSkippingParens returns the nearest ancestor of cur that is not a
+// *ast.ParenExpr, so that <-(time.After(d)) and (<-time.After(d)) are matched
+// the same as <-time.After(d).
+func parentSkippingParens(cur inspector.Cursor) inspector.Cursor {
+	parent := cur.Parent()
+	for {
+		if _, isParen := parent.Node().(*ast.ParenExpr); !isParen {
+			return parent
+		}
+		parent = parent.Parent()
 	}
-	obj := pass.TypesInfo.ObjectOf(ident)
-	if obj == nil {
-		return false
-	}
-	pkgName, ok := obj.(*types.PkgName)
-	if !ok {
-		return false
-	}
-	return pkgName.Imported().Path() == "time"
 }
 
 // isInsideLoopSelectComm reports whether cur is a time.After call used as the
@@ -97,7 +93,7 @@ func isTimeAfterCall(pass *analysis.Pass, call *ast.CallExpr) bool {
 // fire before the loop can continue — no timer accumulation is possible.
 func isInsideLoopSelectComm(cur inspector.Cursor) bool {
 	// The immediate parent of time.After(...) must be a channel-receive UnaryExpr.
-	recvCur := cur.Parent()
+	recvCur := parentSkippingParens(cur)
 	unary, ok := recvCur.Node().(*ast.UnaryExpr)
 	if !ok || unary.Op != token.ARROW {
 		return false
@@ -105,7 +101,7 @@ func isInsideLoopSelectComm(cur inspector.Cursor) bool {
 
 	// The parent of the receive expression must be the Comm statement of a CommClause.
 	// Comm is an ExprStmt (case <-ch:) or AssignStmt (case v := <-ch:).
-	commStmtCur := recvCur.Parent()
+	commStmtCur := parentSkippingParens(recvCur)
 	var commStmt ast.Stmt
 	switch s := commStmtCur.Node().(type) {
 	case *ast.ExprStmt:

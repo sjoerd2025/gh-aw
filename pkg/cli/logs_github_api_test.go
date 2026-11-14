@@ -29,9 +29,9 @@ func TestWorkflowRunUnmarshal(t *testing.T) {
 "conclusion": "success",
 "createdAt": "2026-01-01T00:00:00Z",
 "startedAt": "2026-01-01T00:00:01Z",
-"updatedAt": "2026-01-01T00:01:00Z"
-}
-]`
+"updatedAt": "2026-01-01T00:01:00Z",
+"attempt": 2
+}]`
 
 	var runs []WorkflowRun
 	require.NoError(t, json.Unmarshal([]byte(rawJSON), &runs), "unmarshal should succeed")
@@ -40,6 +40,204 @@ func TestWorkflowRunUnmarshal(t *testing.T) {
 	assert.Equal(t, int64(42), runs[0].DatabaseID, "DatabaseID should be populated")
 	assert.Equal(t, "My Workflow", runs[0].WorkflowName, "WorkflowName should be populated")
 	assert.Empty(t, runs[0].WorkflowPath, "WorkflowPath should be empty when 'path' field is absent")
+	assert.Equal(t, 2, runs[0].Attempt, "Attempt should be populated")
+}
+
+func TestLogsCachedWorkflowRunMetadataIsCurrent(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Date(2026, time.September, 1, 10, 2, 0, 0, time.UTC)
+	cached := WorkflowRun{
+		DatabaseID: 42,
+		URL:        "https://github.com/octo/repo/actions/runs/42",
+		Repository: "octo/repo",
+		Attempt:    3,
+		Status:     "completed",
+		UpdatedAt:  updatedAt,
+	}
+	tests := []struct {
+		name      string
+		current   WorkflowRun
+		owner     string
+		repo      string
+		hostname  string
+		cachedURL string
+		want      bool
+	}{
+		{name: "matching repository", current: cached, owner: "octo", repo: "repo", want: true},
+		{name: "case insensitive repository", current: cached, owner: "Octo", repo: "Repo", want: true},
+		{name: "implicit repository", current: cached, want: true},
+		{name: "matching enterprise host", current: WorkflowRun{DatabaseID: 42, URL: "https://ghe.example.com/octo/repo/actions/runs/42"}, owner: "octo", repo: "repo", hostname: "GHE.EXAMPLE.COM", cachedURL: "https://ghe.example.com/octo/repo/actions/runs/42", want: true},
+		{name: "different requested host", current: cached, owner: "octo", repo: "repo", hostname: "ghe.example.com"},
+		{name: "different inferred host", current: WorkflowRun{DatabaseID: 42, URL: "https://ghe.example.com/octo/repo/actions/runs/42"}, owner: "octo", repo: "repo"},
+		{name: "missing host context", current: WorkflowRun{DatabaseID: 42}, owner: "octo", repo: "repo"},
+		{name: "different repository", current: cached, owner: "other", repo: "repo"},
+		{name: "different run", current: WorkflowRun{DatabaseID: 43}, owner: "octo", repo: "repo"},
+		{name: "different attempt", current: WorkflowRun{DatabaseID: 42, Attempt: 4}, owner: "octo", repo: "repo"},
+		{name: "newer update", current: WorkflowRun{DatabaseID: 42, UpdatedAt: updatedAt.Add(time.Minute)}, owner: "octo", repo: "repo"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			testCached := cached
+			if tt.cachedURL != "" {
+				testCached.URL = tt.cachedURL
+			}
+			assert.Equal(t, tt.want, cachedWorkflowRunMetadataIsCurrent(testCached, tt.current, tt.owner, tt.repo, tt.hostname))
+		})
+	}
+}
+
+func TestFilterIgnoredWorkflowRuns(t *testing.T) {
+	runs := []WorkflowRun{{DatabaseID: 100}, {DatabaseID: 200}, {DatabaseID: 300}}
+
+	filtered := filterIgnoredWorkflowRuns(runs, []int64{100, 300})
+
+	require.Len(t, filtered, 1)
+	assert.Equal(t, int64(200), filtered[0].DatabaseID)
+	assert.Equal(t, []WorkflowRun{{DatabaseID: 100}, {DatabaseID: 200}, {DatabaseID: 300}}, runs)
+}
+
+func TestApplyWorkflowRunListRepository(t *testing.T) {
+	runs := []WorkflowRun{
+		{DatabaseID: 1, Repository: ""},
+		{DatabaseID: 2, Repository: "cached/repo"},
+	}
+
+	applyWorkflowRunListRepository(runs, "github.com/github/gh-aw")
+
+	assert.Equal(t, "github/gh-aw", runs[0].Repository)
+	assert.Equal(t, "cached/repo", runs[1].Repository)
+}
+
+func TestListWorkflowRunsPopulatesCacheIdentity(t *testing.T) {
+	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	argsLogPath := filepath.Join(fakeBinDir, "gh-args.log")
+	fakeGHScript := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + argsLogPath + "\"\n" +
+		"cat <<'EOF'\n" +
+		`[{"databaseId":42,"workflowName":"Daily report","status":"completed","conclusion":"success","updatedAt":"2026-01-01T00:01:00Z","attempt":3}]` + "\n" +
+		"EOF\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	runs, _, err := listWorkflowRunsWithPagination(ListWorkflowRunsOptions{
+		Context:      context.Background(),
+		WorkflowName: "daily-report",
+		Limit:        1,
+		RepoOverride: "github/gh-aw",
+	})
+
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	assert.Equal(t, 3, runs[0].Attempt)
+	assert.Equal(t, "github/gh-aw", runs[0].Repository)
+	argsLog, err := os.ReadFile(argsLogPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(argsLog), "displayTitle,attempt")
+	assert.Contains(t, string(argsLog), "--repo github/gh-aw")
+}
+
+func TestListWorkflowRunsCachesAndReusesCompletePayload(t *testing.T) {
+	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	argsLogPath := filepath.Join(fakeBinDir, "gh-args.log")
+	fakeGHScript := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + argsLogPath + "\"\n" +
+		"cat <<'EOF'\n" +
+		`[{"databaseId":42,"workflowName":"Daily report","status":"completed","conclusion":"success","updatedAt":"2026-01-01T00:01:00Z","attempt":3,"futureField":{"nested":true}}]` + "\n" +
+		"EOF\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cachePath := filepath.Join(t.TempDir(), "logs.jsonl")
+	opts := ListWorkflowRunsOptions{
+		Context:           context.Background(),
+		WorkflowName:      "daily-report",
+		Limit:             1,
+		RepoOverride:      "github/gh-aw",
+		CachedJSONLWriter: newCachedLogsJSONLWriter(cachePath),
+	}
+	runs, _, err := listWorkflowRunsWithPagination(opts)
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+
+	cache, err := loadCachedLogsJSONL(cachePath)
+	require.NoError(t, err)
+	data, err := os.ReadFile(cachePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"futureField"`)
+
+	require.NoError(t, os.Remove(fakeGH))
+	opts.CachedJSONLCache = cache
+	opts.CachedJSONLWriter = nil
+	cachedRuns, _, err := listWorkflowRunsWithPagination(opts)
+	require.NoError(t, err)
+	assert.Equal(t, runs, cachedRuns)
+
+	argsLog, err := os.ReadFile(argsLogPath)
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(string(argsLog), "\n"), "cached payload should avoid a second gh invocation")
+}
+
+func TestFetchAndCacheWorkflowRunMetadata(t *testing.T) {
+	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	outputDir := t.TempDir()
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	argsLogPath := filepath.Join(fakeBinDir, "gh-args.log")
+	fakeGHScript := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + argsLogPath + "\"\n" +
+		"cat <<'EOF'\n" +
+		`{"id":42,"run_number":7,"run_attempt":3,"html_url":"https://github.com/octo/repo/actions/runs/42","status":"completed","conclusion":"success","name":"Daily report","path":".github/workflows/daily-report.lock.yml","created_at":"2026-09-01T10:00:00Z","run_started_at":"2026-09-01T10:00:01Z","updated_at":"2026-09-01T10:02:00Z","event":"schedule","head_branch":"main","head_sha":"abc123","display_title":"Daily report","actor":{"login":"octocat"},"repository":{"full_name":"octo/repo"}}` + "\n" +
+		"EOF\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	currentRun := WorkflowRun{DatabaseID: 42, URL: "https://github.com/octo/repo/actions/runs/42", Attempt: 3, Status: "completed"}
+	run, err := fetchAndCacheWorkflowRunMetadata(context.Background(), currentRun, outputDir, "octo", "repo", "", false)
+	require.NoError(t, err)
+	assert.Equal(t, int64(42), run.DatabaseID)
+	assert.Equal(t, 3, run.Attempt)
+	assert.Equal(t, ".github/workflows/daily-report.lock.yml", run.WorkflowPath)
+	assert.Equal(t, "octo/repo", run.Repository)
+	assert.Equal(t, "octocat", run.Actor)
+
+	cachePath := filepath.Join(outputDir, runAPIResponseFileName)
+	cached, err := os.ReadFile(cachePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(cached), `"run_attempt":3`)
+
+	require.NoError(t, os.Remove(fakeGH))
+	cachedRun, err := fetchAndCacheWorkflowRunMetadata(context.Background(), currentRun, outputDir, "octo", "repo", "", false)
+	require.NoError(t, err, "the second read should use the cache without invoking gh")
+	assert.Equal(t, run, cachedRun)
+
+	argsLog, err := os.ReadFile(argsLogPath)
+	require.NoError(t, err)
+	assert.Equal(t, "api repos/octo/repo/actions/runs/42\n", string(argsLog))
+
+	needsRefresh, err := workflowRunMetadataCacheNeedsRefresh(outputDir, currentRun, "octo", "other-repo", "")
+	require.NoError(t, err)
+	assert.True(t, needsRefresh, "a cache entry from another repository must be refreshed")
+
+	needsRefresh, err = workflowRunMetadataCacheNeedsRefresh(outputDir, WorkflowRun{
+		DatabaseID: 42,
+		Attempt:    4,
+		Status:     "completed",
+	}, "octo", "repo", "")
+	require.NoError(t, err)
+	assert.True(t, needsRefresh, "a cache entry from another attempt must be refreshed")
+
+	require.NoError(t, os.WriteFile(cachePath, []byte(strings.Replace(string(cached), `"status":"completed"`, `"status":"in_progress"`, 1)), 0o600))
+	needsRefresh, err = workflowRunMetadataCacheNeedsRefresh(outputDir, currentRun, "octo", "repo", "")
+	require.NoError(t, err)
+	assert.True(t, needsRefresh, "a mutable cache entry must be refreshed")
+
+	metadataApplied := applyWorkflowRunMetadata(&WorkflowRun{WorkflowName: "Daily report"}, WorkflowRun{
+		WorkflowName: ".github/workflows/daily-report.lock.yml",
+	})
+	assert.False(t, metadataApplied, "a path-like API name must not replace a resolved display name")
 }
 
 // TestBuildCreatedFilter verifies that buildCreatedFilter always produces a single
@@ -229,30 +427,108 @@ func TestListWorkflowRunsErrorHandling(t *testing.T) {
 
 func TestFetchJobDetailsWithCountsIncludesSteps(t *testing.T) {
 	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	outputDir := t.TempDir()
 	fakeGH := filepath.Join(fakeBinDir, "gh")
 	argsLogPath := filepath.Join(fakeBinDir, "gh-args.log")
 	fakeGHScript := "#!/bin/sh\n" +
 		"printf '%s\\n' \"$*\" >> \"" + argsLogPath + "\"\n" +
 		"cat <<'EOF'\n" +
-		"{\"name\":\"agent\",\"status\":\"completed\",\"conclusion\":\"failure\",\"started_at\":\"2026-06-28T01:31:00Z\",\"completed_at\":\"2026-06-28T01:33:00Z\",\"steps\":[{\"name\":\"Set up job\",\"status\":\"completed\",\"conclusion\":\"success\"},{\"name\":\"Run agent\",\"status\":\"completed\",\"conclusion\":\"failure\"}]}\n" +
+		"[{\"total_count\":1,\"jobs\":[{\"id\":42,\"run_id\":28307653871,\"run_attempt\":2,\"html_url\":\"https://github.com/github/gh-aw/actions/runs/28307653871/job/42\",\"status\":\"completed\",\"conclusion\":\"failure\",\"created_at\":\"2026-06-28T01:30:00Z\",\"started_at\":\"2026-06-28T01:31:00Z\",\"completed_at\":\"2026-06-28T01:33:00Z\",\"name\":\"agent\",\"runner_name\":\"GitHub Actions 1\",\"steps\":[{\"name\":\"Set up job\",\"status\":\"completed\",\"conclusion\":\"success\",\"number\":1,\"started_at\":\"2026-06-28T01:31:00Z\",\"completed_at\":\"2026-06-28T01:31:10Z\"},{\"name\":\"Run agent\",\"status\":\"completed\",\"conclusion\":\"failure\",\"number\":2,\"started_at\":\"2026-06-28T01:31:10Z\",\"completed_at\":\"2026-06-28T01:33:00Z\"}]}]}]\n" +
 		"EOF\n"
 	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
 
 	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	jobs, failedJobs, err := fetchJobDetailsWithCounts(context.Background(), 28307653871, false)
+	cachePath := filepath.Join(outputDir, jobsAPIResponseFileName)
+	require.NoError(t, os.WriteFile(cachePath, []byte("old cache"), 0o644))
+
+	jobs, failedJobs, err := fetchJobDetailsWithCounts(context.Background(), 28307653871, outputDir, false, 2)
 	require.NoError(t, err)
 	require.Len(t, jobs, 1)
 	assert.Equal(t, 1, failedJobs, "failed job count should include failed jobs")
 	assert.Equal(t, 2*time.Minute, jobs[0].Duration, "job duration should still be derived from timestamps")
+	assert.Equal(t, int64(42), jobs[0].ID, "high-level GitHub job metadata should be preserved")
+	assert.Equal(t, 2, jobs[0].RunAttempt)
+	assert.Equal(t, "GitHub Actions 1", jobs[0].RunnerName)
 	require.Len(t, jobs[0].Steps, 2)
 	assert.Equal(t, "Run agent", jobs[0].Steps[1].Name, "step names should be parsed from gh api output")
 	assert.Equal(t, "failure", jobs[0].Steps[1].Conclusion, "step conclusions should be parsed from gh api output")
+	assert.Equal(t, 2, jobs[0].Steps[1].Number)
 
 	argsLog, err := os.ReadFile(argsLogPath)
 	require.NoError(t, err)
-	assert.Contains(t, string(argsLog), "repos/{owner}/{repo}/actions/runs/28307653871/jobs", "should query the run jobs API")
-	assert.Contains(t, string(argsLog), "steps:", "gh jq projection should request step data")
+	assert.Contains(t, string(argsLog), "repos/{owner}/{repo}/actions/runs/28307653871/attempts/2/jobs?per_page=100", "should query the exact run attempt")
+	assert.Contains(t, string(argsLog), "--paginate --slurp", "should cache all pages of the jobs API response")
+	assert.NotContains(t, string(argsLog), "--jq", "should cache the complete API response without a projection")
+
+	cachedResponse, err := os.ReadFile(cachePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(cachedResponse), `"total_count":1`)
+	assert.Contains(t, string(cachedResponse), `"runner_name":"GitHub Actions 1"`)
+	cachedInfo, err := os.Stat(cachePath)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), cachedInfo.Mode().Perm())
+}
+
+func TestFetchJobDetailsWithCountsReturnsJobsWhenCacheWriteFails(t *testing.T) {
+	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	fakeGHScript := "#!/bin/sh\n" +
+		"cat <<'EOF'\n" +
+		"[{\"total_count\":1,\"jobs\":[{\"name\":\"agent\",\"status\":\"completed\",\"conclusion\":\"failure\"}]}]\n" +
+		"EOF\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
+
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	missingOutputDir := filepath.Join(t.TempDir(), "missing", "run")
+	jobs, failedJobs, err := fetchJobDetailsWithCounts(context.Background(), 28307653871, missingOutputDir, false)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to cache jobs API response")
+	require.Len(t, jobs, 1)
+	assert.Equal(t, "agent", jobs[0].Name)
+	assert.Equal(t, 1, failedJobs)
+}
+
+func TestFetchJobDetailsWithCountsSkipsMalformedJobs(t *testing.T) {
+	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	fakeGHScript := "#!/bin/sh\n" +
+		"cat <<'EOF'\n" +
+		"[{\"total_count\":3,\"jobs\":[{\"name\":\"failed\",\"status\":\"completed\",\"conclusion\":\"failure\"},{\"name\":42,\"status\":\"completed\",\"conclusion\":\"failure\"},{\"name\":\"passed\",\"status\":\"completed\",\"conclusion\":\"success\"}]}]\n" +
+		"EOF\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
+
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	jobs, failedJobs, err := fetchJobDetailsWithCounts(context.Background(), 28307653871, "", false)
+
+	require.NoError(t, err)
+	require.Len(t, jobs, 2)
+	assert.Equal(t, "failed", jobs[0].Name)
+	assert.Equal(t, "passed", jobs[1].Name)
+	assert.Equal(t, 1, failedJobs)
+}
+
+func TestFetchJobDetailsWithCountsSkipsMalformedPages(t *testing.T) {
+	fakeBinDir := testutil.TempDir(t, "fake-gh-*")
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	fakeGHScript := "#!/bin/sh\n" +
+		"cat <<'EOF'\n" +
+		"[{\"total_count\":1,\"jobs\":[{\"name\":\"first\",\"status\":\"completed\",\"conclusion\":\"success\"}]},{\"total_count\":1,\"jobs\":\"malformed\"},{\"total_count\":1,\"jobs\":[{\"name\":\"last\",\"status\":\"completed\",\"conclusion\":\"failure\"}]}]\n" +
+		"EOF\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
+
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	jobs, failedJobs, err := fetchJobDetailsWithCounts(context.Background(), 28307653871, "", false)
+
+	require.NoError(t, err)
+	require.Len(t, jobs, 2)
+	assert.Equal(t, "first", jobs[0].Name)
+	assert.Equal(t, "last", jobs[1].Name)
+	assert.Equal(t, 1, failedJobs)
 }
 
 // TestFetchJobDetailsWithCountsNullConclusion verifies that jobs and steps with null conclusions
@@ -265,13 +541,13 @@ func TestFetchJobDetailsWithCountsNullConclusion(t *testing.T) {
 	// A job still in progress has conclusion="" for itself and for any pending steps.
 	fakeGHScript := "#!/bin/sh\n" +
 		"cat <<'EOF'\n" +
-		"{\"name\":\"agent\",\"status\":\"in_progress\",\"conclusion\":\"\",\"started_at\":\"2026-06-28T01:31:00Z\",\"completed_at\":\"0001-01-01T00:00:00Z\",\"steps\":[{\"name\":\"Set up job\",\"status\":\"completed\",\"conclusion\":\"success\"},{\"name\":\"Run agent\",\"status\":\"in_progress\",\"conclusion\":\"\"}]}\n" +
+		"[{\"total_count\":1,\"jobs\":[{\"name\":\"agent\",\"status\":\"in_progress\",\"conclusion\":null,\"started_at\":\"2026-06-28T01:31:00Z\",\"completed_at\":null,\"steps\":[{\"name\":\"Set up job\",\"status\":\"completed\",\"conclusion\":\"success\"},{\"name\":\"Run agent\",\"status\":\"in_progress\",\"conclusion\":null}]}]}]\n" +
 		"EOF\n"
 	require.NoError(t, os.WriteFile(fakeGH, []byte(fakeGHScript), 0o755))
 
 	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	jobs, failedJobs, err := fetchJobDetailsWithCounts(context.Background(), 28307653871, false)
+	jobs, failedJobs, err := fetchJobDetailsWithCounts(context.Background(), 28307653871, "", false)
 	require.NoError(t, err)
 	require.Len(t, jobs, 1, "in-progress jobs with null conclusion should not be dropped")
 	assert.Equal(t, 0, failedJobs, "in-progress job should not count as failed")

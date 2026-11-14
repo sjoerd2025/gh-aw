@@ -40,6 +40,7 @@ imports:
   - shared/reporting.md
 
 safe-outputs:
+  steer: true
   create-pull-request:
     expires: ${{ github.aw.import-inputs.expires }}
     title-prefix: "${{ github.aw.import-inputs.title-prefix }}"

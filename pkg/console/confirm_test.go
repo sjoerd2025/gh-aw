@@ -3,6 +3,7 @@
 package console
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -10,15 +11,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestConfirmAction(t *testing.T) {
-	// Note: This test can't fully test the interactive behavior without mocking
-	// the terminal input, but we can verify the function signature and basic setup
+// TestConfirmAction_NonTTY verifies that ConfirmAction does not read from
+// stdin when it is not connected to a terminal.
+func TestConfirmAction_NonTTY(t *testing.T) {
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { os.Stdin = oldStdin })
+	t.Cleanup(func() { r.Close() })
+	t.Cleanup(func() { w.Close() })
+	os.Stdin = r
+	_, err = w.WriteString("y\n")
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
 
-	t.Run("function signature", func(t *testing.T) {
-		// This test just verifies the function exists and has the right signature
-		// Actual interactive testing would require a mock terminal
-		_ = ConfirmAction
-	})
+	result, err := ConfirmAction("Delete all workflows?", "Yes, delete", "Cancel")
+	require.Error(t, err)
+	assert.False(t, result)
+	require.ErrorContains(t, err, "stdin is not a TTY")
 }
 
 func TestShowTextConfirm(t *testing.T) {
@@ -37,7 +47,11 @@ func TestShowTextConfirm(t *testing.T) {
 		{name: "NO uppercase", input: "NO\n", wantResult: false},
 		{name: "no full", input: "no\n", wantResult: false},
 		{name: "2 for negative", input: "2\n", wantResult: false},
+		{name: "single letter uppercase Y", input: "Y\n", wantResult: true},
+		{name: "single letter uppercase N", input: "N\n", wantResult: false},
+		{name: "whitespace padded yes", input: "  y  \n", wantResult: true},
 		{name: "invalid input", input: "maybe\n", wantErr: true, errContains: "invalid input"},
+		{name: "empty input EOF", input: "", wantErr: true, errContains: "invalid input"},
 	}
 
 	for _, tt := range tests {

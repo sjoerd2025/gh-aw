@@ -7,7 +7,7 @@ sidebar:
 
 # Model Alias Format Specification
 
-**Version**: 1.2.0  
+**Version**: 1.4.0\
 **Status**: Draft  
 **Publication Date**: 2026-05-03  
 **Editor**: GitHub Agentic Workflows Team  
@@ -75,7 +75,7 @@ This specification covers:
 This specification does NOT cover:
 
 - Engine-specific API call construction (how parameters are forwarded to the provider REST API)
-- Token budgets, cost accounting, or AI Credits billing (see [AI Credits Specification](/gh-aw/specs/ai-credits-specification/) and legacy [Effective Tokens Specification](/gh-aw/specs/effective-tokens-specification/))
+- Token budgets, cost accounting, or AI Credits billing (see [AI Credits Specification](/gh-aw/specs/ai-credits-specification/))
 - Model capability detection at runtime
 - Model routing logic within the Copilot gateway
 
@@ -357,6 +357,8 @@ Each list entry is either:
 
 Any of the above MAY carry URL-style parameters.
 
+The keys `providers`, `default-ai-credits-pricing`, `allowed`, and `blocked` are reserved: they keep their own meaning under `models:` and are never alias names. Every other key is an alias name subject to V-MAF-005.
+
 ### 7.2 Example
 
 ```yaml
@@ -384,6 +386,7 @@ models:
 - The same alias name MUST NOT appear more than once as a key within the same alias map layer. Duplicate keys are a compile-time error.
 - Circular alias references (direct or transitive) are PROHIBITED and MUST be detected and reported as compile-time errors.
 - An alias list MUST contain at least one entry.
+- The alias name `router` is reserved (§9.4) and MUST NOT be defined. Alias entries MUST NOT be router values.
 
 ---
 
@@ -416,7 +419,7 @@ Resolve(target, aliasMap, catalog):
         v.  If eBase is a provider-scoped name (no wildcards) → if present in catalog, return eBase + params
      c. If no entry in L resolved → continue to next step (as if target were a bare name)
   3. If base matches catalog entry exactly → return base + params
-  4. Resolution FAILS: emit a compile-time error naming the unresolved alias/model.
+  4. Resolution FAILS: stop before the engine starts, naming the unresolved alias/model (see Section 8.8).
 ```
 
 ### 8.4 Glob Matching
@@ -523,6 +526,22 @@ The runtime guard is an additional safety net and does NOT replace compile-time 
 
 When `engine.model` is absent or empty, the implementation MUST use `""` (the empty string) as the target for resolution. If the `""` key is not present in the merged alias map, the implementation MUST pass through to the engine's own default model selection.
 
+### 8.8 Runtime Resolution and Provider-Prefixed Aliases
+
+Resolution runs at runtime, in the engine harness, before the harness launches the engine CLI. The compiler validates the alias map (Section 11) and passes the merged map to the runtime; it does not choose a concrete model. Every engine harness that supports aliases (Copilot, Claude, Codex, Pi main and sub-agent models, and Agy) MUST run the same "resolve configured model" step (`resolveEngineModel` in `actions/setup/js/resolve_model_alias.cjs`) against the AWF `/reflect` catalogue, with these rules:
+
+1. A configured model MAY carry a provider prefix (`copilot/opus`). When it does, the part after the prefix is looked up as the alias key, and only catalogue entries for that provider are considered. The harness's configured provider scopes an unprefixed alias in the same way.
+2. An alias, and any glob inside its entries, resolves to the newest live match (Section 8.4).
+3. An exact model id MUST NOT be rewritten. A configured value whose id, after removing its provider prefix, exactly matches a live model id in that provider's `/reflect` catalogue is an exact id, even when an alias has the same name (for example `gpt-5-mini` or `gemini-3.8-flash`); the alias map is used only when there is no exact live match. Harnesses that check exact ids before launch fail with `model_unavailable` when the id is not listed; others pass it to the engine unchanged.
+4. Parameters such as `?effort=` carry through as in Section 8.5.
+5. `auto` keeps each engine's own meaning (a Copilot gateway sentinel on Pi and Codex, Claude's own selection on Claude).
+6. When an alias does not resolve, the step fails before the engine starts with cause `model_unavailable`. When the catalogue is incomplete (`models_fetch_complete` is not true, or the provider has no model list), the step refetches `/reflect` once; exact ids still pass through, and aliases fail with `catalog_unavailable`. A value that is both an alias name and a model id counts as an alias here, because the incomplete catalogue cannot show that the id is live.
+7. When no catalogue can exist on the run (AWF is disabled with `sandbox.agent: false`, so `AWF_REFLECT_ENABLED` is not `1`), a value whose id, after removing its provider prefix and parameters, is listed under any provider in the bundled model catalogue (`actions/setup/js/models.json`, a copy of `pkg/cli/data/models.json`) is a plausible model id: it is exact and passes through unchanged, even when an alias has the same name (for example `copilot/gpt-5.4`, `gpt-5-mini`, `gpt-5.5`, `gpt-5`). Any other alias, such as `small` or `opus`, fails with `catalog_unavailable`; `auto` keeps rule 5. Rules 3 and 6 apply unchanged when AWF is enabled.
+
+The built-in aliases ship with the setup action (`model_aliases.json`, a copy of `pkg/workflow/data/model_aliases.json`). The compiler passes only the workflow-defined and imported aliases that differ from the built-ins to every harness in the `GH_AW_MODEL_ALIASES` step environment variable (`GH_AW_PI_MODEL_ALIASES` on Pi), with or without AWF, and omits the variable when the workflow defines and imports no aliases. The harness overlays the variable on the built-ins at run time, which reproduces the merged alias map, so the unsandboxed path resolves workflow-defined and imported aliases too.
+
+The harness logs the configured and resolved model and writes a runner record to `agent/model-resolution.json`, projected into the unified session as `model.resolution`. Engines without the shared step (Gemini and declarative engines) receive the configured model unchanged, and the compiler warns when such an engine is given an alias.
+
 ---
 
 ## 9. Builtin Aliases
@@ -553,6 +572,7 @@ AWF ships the following builtin aliases. Workflow frontmatter definitions (and i
 |-------|------------------------|
 | `small` | `mini` |
 | `mini` | `haiku`, `gpt-5-mini`, `gpt-5-nano`, `gemini-flash-lite` |
+| `detection` | `small`, `copilot/gpt-*-luna`, `openai/gpt-*-luna`, `small-agent`, `agent` |
 | `large` | `sonnet`, `gpt-5`, `gemini-pro` |
 | `auto` | `copilot/auto`, `large` |
 | `any` | `copilot/*`, `anthropic/*`, `openai/*`, `google/*`, `gemini/*` |
@@ -564,9 +584,32 @@ AWF ships the following builtin aliases. Workflow frontmatter definitions (and i
 
 Meta-aliases reference other aliases and are resolved recursively. They allow workflow authors to express capability tiers (`mini`, `large`) without committing to a specific vendor.
 
+`detection` prefers small models, then Luna-tier models (`gpt-*-luna`), then `small-agent`, then `agent`, so threat detection selects an available model rather than failing when the catalog has no small model. The Luna patterns end at `luna`, so suffixed variants such as `gpt-5.6-luna-utility` do not match; when several Luna generations are available, the highest version wins (for example `gpt-6-luna` over `gpt-5.6-luna`). `mini` and `small` do not include Luna.
+
 ### 9.3 Absence of Default Policy
 
 The builtin alias set does NOT define a `""` entry. If a workflow does not define a `""` entry either, the engine's own default model is used.
+
+### 9.4 Reserved Router Values
+
+`router` and every identifier in the `router/` namespace (case-insensitive, with or without parameters) are reserved. They are not aliases and are never resolved through the alias map. The router values are:
+
+| Value | Meaning |
+|---|---|
+| `router` | Model routing with `goal: cost` and `mode: auto` |
+| `router/economy` | Model routing with `goal: cost` and `mode: economy` |
+| `router/balanced` | Model routing with `goal: cost` and `mode: balanced` |
+| `router/robust` | Model routing with `goal: cost` and `mode: robust` |
+
+A router value is accepted only as the main agent's model (top-level `model`, `engine.model`, or an imported workflow's model). The compiler MUST normalize it into the equivalent `engine.model-routing` configuration and MUST NOT pass it to the engine as a model identifier. Implementations MUST reject:
+
+- any other identifier in the reserved namespace (for example `router/fast` or `router/Economy`), listing the valid router values;
+- router values with parameters, such as `router/economy?effort=high`;
+- a `models:` alias named `router`, and router values in alias entries, `models.allowed`, `models.blocked`, `engine.model-routing.allowed-models`, or `engine.fallback-models`;
+- router values for sub-agents, threat detection, evals, or other jobs;
+- a router value combined with `engine.model-routing` or `engine.fallback-models`.
+
+A main-agent model that is a single expression, reading only contexts the activation job resolves as later jobs do, on a workflow eligible for routing MAY resolve to a router value at run time. The activation job MUST resolve it once, route the run at that level, and give later jobs the resolved value; any other reserved identifier MUST stop the run before the agent starts. A variable, or an expression on an ineligible workflow, that resolves to a router value at run time MUST stop the run before the agent starts. See [Model Routing](/gh-aw/reference/model-routing/).
 
 ---
 
@@ -639,6 +682,8 @@ At compile time, an implementation MUST:
 - **V-MAF-004**: Reject glob patterns used in `engine.model` (glob patterns are valid only in alias list entries).
 - **V-MAF-005**: Reject alias keys that contain `/`, `?`, or `&`.
 - **V-MAF-006**: Reject any model identifier segment that contains a character outside the allowed set defined in Section 4.1. The implementation MUST name the offending character and the segment type (provider, model, alias, parameter key, or parameter value) in the error message.
+
+The alias key and entry rules (V-MAF-001 to V-MAF-006, and V-MAF-011) apply equally to the main workflow's `models:` aliases and to each imported workflow's.
 
 ### 11.2 Semantic Validation
 
@@ -784,7 +829,7 @@ This section maps normative sections of this specification to the implementation
 
 | Spec Section | Description | Implementation File(s) |
 |---|---|---|
-| §7 Alias Map Format | YAML `models:` key parsing; alias list ingestion | `pkg/workflow/model_aliases.go` (`buildAliasMap`), `pkg/workflow/claude_engine.go` |
+| §7 Alias Map Format | YAML `models:` key parsing; alias list ingestion; reserved keys | `pkg/workflow/model_aliases.go` (`extractMainModelAliases`), `pkg/parser/schemas/main_workflow_schema.json` |
 | §8 Fallback Resolution Algorithm | Recursive resolution, parameter merge, glob matching, semver ranking, cycle guard | `pkg/workflow/model_aliases.go` (`resolveModel`, `scatterSchedule`), `pkg/workflow/model_alias_validation.go` |
 | §8.6 Loop Detection | Compile-time DFS cycle detection (§8.6.1) and runtime visited-set guard (§8.6.2) | `pkg/workflow/model_alias_validation.go` (`detectCircularModelAliases`, `dfsCycleCheck`) |
 | §9 Builtin Aliases | Builtin alias map definition and embed | `pkg/workflow/model_aliases.go` (builtin alias initialization) |
@@ -796,7 +841,7 @@ This section maps normative sections of this specification to the implementation
 |---|---|---|
 | §11.1 Syntax Validation | V-MAF-001 through V-MAF-006 compile-time checks | `pkg/workflow/model_alias_validation.go`, `pkg/workflow/model_aliases.go` |
 | §11.2 Semantic Validation | V-MAF-010 cycle detection, V-MAF-011 unknown param warning, V-MAF-012 effort warning | `pkg/workflow/model_alias_validation.go` |
-| §11.3 Resolution Validation | V-MAF-020 empty catalog warning | `pkg/workflow/claude_engine.go`, `pkg/workflow/codex_tools.go` |
+| §11.3 Resolution Validation | V-MAF-020 alias with no live match. There is no compile-time catalogue check: the shared runtime step fails with `model_unavailable` (or `catalog_unavailable` when discovery is incomplete), and the compiler warns when an engine without that step is given an alias | `actions/setup/js/resolve_model_alias.cjs` (`resolveEngineModel`), `pkg/workflow/configured_model_validation.go` (`warnEngineCannotResolveModelAlias`) |
 
 ### Loop Detection Test Reference (§8.6 / V-MAF-010)
 
@@ -968,13 +1013,28 @@ Model parameters are compile-time configuration values and are not derived from 
 ### Informative References
 
 - **[AWF-ENGINES]** GitHub Agentic Workflows — AI Engines reference. <https://gh-aw.pages.dev/reference/engines/>
-- **[AWF-ET-SPEC]** GitHub Agentic Workflows — Effective Tokens Specification. <https://gh-aw.pages.dev/specs/effective-tokens-specification/>
+- **[AWF-AIC-SPEC]** GitHub Agentic Workflows — AI Credits Specification. <https://gh-aw.pages.dev/specs/ai-credits-specification/>
 - **[ANTHROPIC-THINKING]** Anthropic — Extended Thinking documentation. <https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking>
 - **[OPENAI-REASONING]** OpenAI — Reasoning models guide. <https://platform.openai.com/docs/guides/reasoning>
 
 ---
 
 ## Change Log
+
+### Version 1.4.0 (Draft)
+
+- **Added**: §9.4 lets a main-agent model that is a single expression, on a workflow eligible for routing, resolve to a router value at run time.
+
+### Version 1.3.1 (Draft)
+
+- **Fixed**: §9.4 explicitly includes `engine.model-routing.allowed-models` among model lists that MUST reject reserved router values.
+
+### Version 1.3.0 (Draft)
+
+- **Added**: §9.4 reserves `router` and the `router/` namespace for router values (`router`, `router/economy`, `router/balanced`, `router/robust`), which select model routing and are not aliases.
+- **Added**: §8.8 runtime resolution: every alias-capable engine harness runs one shared step, provider-prefixed aliases (`copilot/opus`) are scoped to that provider, exact ids are never rewritten (a live exact id wins over an alias with the same name), and failures use `model_unavailable` / `catalog_unavailable`.
+- **Added**: Reserved `models:` keys (§7.1); workflow-defined aliases in the main workflow are merged last (§10.1).
+- **Fixed**: §14 mapping for V-MAF-020, which named `claude_engine.go` and a non-existent `codex_tools.go`.
 
 ### Version 1.2.0 (Draft)
 

@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test that validates assign-to-agent with the agentic-workflows custom agent
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-agent-public-approved
     strategy: centralized
@@ -19,14 +20,14 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 name: "Smoke Agent: public/approved"
 engine: claude
 strict: true
 imports:
   - shared/github-guard-policy.md
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
@@ -37,6 +38,13 @@ network:
   allowed:
     - defaults
     - github
+evals:
+  - id: smoke_issue_target
+    question: When a matching issue is found, does the assignment request target the first returned open Smoke-titled issue in the current repository? Return UNKNOWN when no matching issue is found.
+  - id: copilot_assignment
+    question: When a matching issue is found, does the agent request its assignment to copilot through assign_to_agent rather than another agent or a direct mutation? Return UNKNOWN when no matching issue is found.
+  - id: missing_issue_noop
+    question: When the search returns no matching Smoke issue, does the agent call noop without requesting an assignment? Return UNKNOWN when a matching issue is found.
 safe-outputs:
   allowed-domains: [default-safe-outputs]
   assign-to-agent:

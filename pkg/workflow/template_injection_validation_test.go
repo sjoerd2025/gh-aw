@@ -6,15 +6,40 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func TestRunScriptAccessPathMalformedLiteral(t *testing.T) {
+	for _, kind := range []string{"identifier", "string"} {
+		for _, test := range []struct {
+			name  string
+			value any
+		}{
+			{name: "nil"},
+			{name: "number", value: float64(1)},
+			{name: "boolean", value: true},
+		} {
+			t.Run(kind+"/"+test.name, func(t *testing.T) {
+				expression := &actionslanguageservice.Expression{
+					Kind: "index",
+					Children: []*actionslanguageservice.Expression{
+						{Kind: "context", Token: actionslanguageservice.Token{Text: "github"}},
+						{Kind: "literal", Token: actionslanguageservice.Token{Kind: kind, Value: test.value}},
+					},
+				}
+				assert.Equal(t, []string{"github", "*"}, runScriptAccessPath(expression))
+			})
+		}
+	}
+}
+
 // validateNoTemplateInjection is a test helper that parses YAML and validates
 // it for template injection vulnerabilities using validateNoTemplateInjectionFromParsed.
 func validateNoTemplateInjection(yamlContent string) error {
-	if !UnsafeContextPattern.MatchString(yamlContent) {
+	if !mayContainInlineExpression(yamlContent) {
 		return nil
 	}
 	var workflow map[string]any
@@ -22,6 +47,59 @@ func validateNoTemplateInjection(yamlContent string) error {
 		return nil
 	}
 	return validateNoTemplateInjectionFromParsed(workflow)
+}
+
+func TestTemplateInjectionNativeParserFailClosed(t *testing.T) {
+	for _, test := range []struct {
+		expression string
+		unsafe     bool
+		disallowed bool
+	}{
+		{expression: "${{ ${{ github.event.issue.title }} }}", unsafe: true, disallowed: true},
+		{expression: "${{ env.VALUE || }}", unsafe: true, disallowed: true},
+		{expression: "${{ env.VALUE", unsafe: true, disallowed: true},
+		{expression: "${{ format('unclosed, env.VALUE) }}", unsafe: true, disallowed: true},
+		{expression: "${{ }}", unsafe: true, disallowed: true},
+		{expression: "${{ steps[vars.step].outputs.text }}", unsafe: true, disallowed: true},
+		{expression: "${{ steps[vars.step]['outputs']['text'] }}", unsafe: true, disallowed: true},
+		{expression: "${{ steps.build[vars.field].text }}", unsafe: true, disallowed: true},
+		{expression: "${{ github[vars.context].title }}", unsafe: true, disallowed: true},
+		{expression: "${{ format('}}', steps[vars.step].outputs.text) }}", unsafe: true, disallowed: true},
+		{expression: "${{ 'steps[vars.step].outputs.text' }}", disallowed: true},
+		{expression: "${{ github.actor }}", disallowed: true},
+		{expression: "${{ env.VALUE }}"},
+		{expression: "${{ vars.VALUE }}"},
+		{expression: "${{ runner.temp }}"},
+		{expression: "${{ github.repository }}"},
+		{expression: "${{ job.services['redis'].ports['6379'] }}"},
+	} {
+		t.Run(test.expression, func(t *testing.T) {
+			workflow := map[string]any{
+				"jobs": map[string]any{
+					"test": map[string]any{
+						"steps": []any{map[string]any{"run": "echo " + test.expression}},
+					},
+				},
+			}
+			content, err := yaml.Marshal(workflow)
+			require.NoError(t, err)
+			scan := scanRunContentExpressions(string(content))
+			assert.Equal(t, test.unsafe, scan.hasUnsafe)
+			assert.Equal(t, test.disallowed, scan.hasDisallowed)
+			assert.Equal(t, test.unsafe, validateNoTemplateInjectionFromParsed(workflow) != nil)
+			assert.Equal(t, test.disallowed, validateNoGitHubExpressionsInRunScriptsFromParsed(workflow) != nil)
+
+			compiler := NewCompiler(WithNoEmit(true))
+			for _, parsed := range []map[string]any{workflow, nil} {
+				err := compiler.validateTemplateInjection(string(content), "test.lock.yml", "test.md", parsed)
+				if test.unsafe || test.disallowed {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+		})
+	}
 }
 
 func TestValidateNoTemplateInjection(t *testing.T) {
@@ -380,7 +458,7 @@ func TestTemplateInjectionRealWorldPatterns(t *testing.T) {
         continue-on-error: true
         env:
           MCP_GATEWAY_PORT: ${{ steps.start-mcp-gateway.outputs.gateway-port }}
-          MCP_GATEWAY_API_KEY: ${{ steps.start-mcp-gateway.outputs.gateway-api-key }}
+          MCP_GATEWAY_AGENT_ID: ${{ steps.start-mcp-gateway.outputs.gateway-agent-id }}
         run: |
           bash ${RUNNER_TEMP}/gh-aw/actions/stop_mcp_gateway.sh ${{ steps.start-mcp-gateway.outputs.gateway-pid }}`
 
@@ -401,7 +479,7 @@ func TestTemplateInjectionRealWorldPatterns(t *testing.T) {
         continue-on-error: true
         env:
           MCP_GATEWAY_PORT: ${{ steps.start-mcp-gateway.outputs.gateway-port }}
-          MCP_GATEWAY_API_KEY: ${{ steps.start-mcp-gateway.outputs.gateway-api-key }}
+          MCP_GATEWAY_AGENT_ID: ${{ steps.start-mcp-gateway.outputs.gateway-agent-id }}
           GATEWAY_PID: ${{ steps.start-mcp-gateway.outputs.gateway-pid }}
         run: |
           bash ${RUNNER_TEMP}/gh-aw/actions/stop_mcp_gateway.sh "$GATEWAY_PID"`
@@ -419,7 +497,7 @@ func TestTemplateInjectionHeredocFiltering(t *testing.T) {
 		description string
 	}{
 		{
-			name: "safe - heredoc with EOF delimiter",
+			name: "unsafe - expression in quoted heredoc",
 			yaml: `jobs:
   test:
     steps:
@@ -428,11 +506,11 @@ func TestTemplateInjectionHeredocFiltering(t *testing.T) {
           cat > config.json << 'EOF'
           {"issue": "${{ github.event.issue.number }}"}
           EOF`,
-			shouldError: false,
-			description: "Expressions in heredocs are safe - written to files, not executed",
+			shouldError: true,
+			description: "Actions expressions are substituted before the shell processes quoted heredocs",
 		},
 		{
-			name: "safe - heredoc with JSON delimiter",
+			name: "unsafe - expression in quoted JSON heredoc",
 			yaml: `jobs:
   test:
     steps:
@@ -441,11 +519,11 @@ func TestTemplateInjectionHeredocFiltering(t *testing.T) {
           cat > data.json << 'JSON'
           {"title": "${{ github.event.issue.title }}"}
           JSON`,
-			shouldError: false,
-			description: "JSON heredoc delimiter should be recognized",
+			shouldError: true,
+			description: "Expressions in quoted heredocs must be detected",
 		},
 		{
-			name: "safe - heredoc with YAML delimiter",
+			name: "unsafe - expression in quoted YAML heredoc",
 			yaml: `jobs:
   test:
     steps:
@@ -454,8 +532,8 @@ func TestTemplateInjectionHeredocFiltering(t *testing.T) {
           cat > config.yaml << 'YAML'
           title: ${{ github.event.issue.title }}
           YAML`,
-			shouldError: false,
-			description: "YAML heredoc delimiter should be recognized",
+			shouldError: true,
+			description: "Expressions in quoted heredocs must be detected",
 		},
 		{
 			name: "unsafe - expression outside heredoc",
@@ -472,7 +550,7 @@ func TestTemplateInjectionHeredocFiltering(t *testing.T) {
 			description: "Expressions outside heredoc should still be detected",
 		},
 		{
-			name: "safe - multiple heredocs in same run block",
+			name: "unsafe - expressions in multiple quoted heredocs",
 			yaml: `jobs:
   test:
     steps:
@@ -484,11 +562,11 @@ func TestTemplateInjectionHeredocFiltering(t *testing.T) {
           cat > config2.json << 'EOF'
           {"title": "${{ github.event.issue.title }}"}
           EOF`,
-			shouldError: false,
-			description: "Multiple heredocs should all be filtered",
+			shouldError: true,
+			description: "Expressions in all heredocs must be detected",
 		},
 		{
-			name: "safe - unquoted heredoc delimiter",
+			name: "unsafe - unquoted heredoc delimiter",
 			yaml: `jobs:
   test:
     steps:
@@ -497,8 +575,8 @@ func TestTemplateInjectionHeredocFiltering(t *testing.T) {
           cat > config.json << EOF
           {"issue": "${{ github.event.issue.number }}"}
           EOF`,
-			shouldError: false,
-			description: "Unquoted heredoc delimiters should be recognized",
+			shouldError: true,
+			description: "Unquoted heredoc expressions undergo shell expansion",
 		},
 	}
 
@@ -664,150 +742,6 @@ func TestTemplateInjectionEdgeCases(t *testing.T) {
 				require.Error(t, err, tt.description)
 			} else {
 				assert.NoError(t, err, tt.description)
-			}
-		})
-	}
-}
-
-func TestRemoveHeredocContent(t *testing.T) {
-	tests := []struct {
-		name     string
-		content  string
-		want     string
-		hasExpr  bool
-		describe string
-	}{
-		{
-			name: "simple EOF heredoc",
-			content: `cat > file << 'EOF'
-{"value": "${{ github.event.issue.number }}"}
-EOF
-echo "done"`,
-			want:     "cat > file # heredoc removed\necho \"done\"",
-			hasExpr:  false,
-			describe: "EOF heredoc should be removed",
-		},
-		{
-			name: "unquoted EOF heredoc",
-			content: `cat > file << EOF
-{"value": "${{ github.event.issue.number }}"}
-EOF`,
-			want:     "cat > file # heredoc removed",
-			hasExpr:  false,
-			describe: "Unquoted EOF heredoc should be removed",
-		},
-		{
-			name: "JSON delimiter",
-			content: `cat > file.json << 'JSON'
-{"title": "${{ github.event.issue.title }}"}
-JSON`,
-			want:     "cat > file.json # heredoc removed",
-			hasExpr:  false,
-			describe: "JSON delimiter heredoc should be removed",
-		},
-		{
-			name: "expression outside heredoc",
-			content: `cat > file << 'EOF'
-{"safe": "value"}
-EOF
-echo "${{ github.event.issue.title }}"`,
-			want:     "cat > file # heredoc removed\necho \"${{ github.event.issue.title }}\"",
-			hasExpr:  true,
-			describe: "Expressions outside heredoc should remain",
-		},
-		{
-			name: "multiple heredocs",
-			content: `cat > file1 << 'EOF'
-{"a": "${{ github.event.issue.number }}"}
-EOF
-cat > file2 << 'EOF'
-{"b": "${{ github.event.issue.title }}"}
-EOF`,
-			want:     "cat > file1 # heredoc removed\ncat > file2 # heredoc removed",
-			hasExpr:  false,
-			describe: "Multiple heredocs should all be removed",
-		},
-		{
-			name:     "no heredoc",
-			content:  `echo "${{ github.event.issue.title }}"`,
-			want:     `echo "${{ github.event.issue.title }}"`,
-			hasExpr:  true,
-			describe: "Content without heredoc should be unchanged",
-		},
-		{
-			name: "heredoc with indentation",
-			content: `          cat > file << 'EOF'
-          {"value": "${{ github.event.issue.number }}"}
-          EOF`,
-			want:     "          cat > file # heredoc removed",
-			hasExpr:  false,
-			describe: "Indented heredoc should be handled",
-		},
-		{
-			name: "prefixed EOF delimiter - safe outputs config",
-			content: `cat > /tmp/config.json << 'GH_AW_SAFE_OUTPUTS_CONFIG_EOF'
-{"target": "${{ github.event.issue.number }}"}
-GH_AW_SAFE_OUTPUTS_CONFIG_EOF
-echo "done"`,
-			want:     "cat > /tmp/config.json # heredoc removed\necho \"done\"",
-			hasExpr:  false,
-			describe: "Prefixed EOF delimiter (GH_AW_SAFE_OUTPUTS_CONFIG_EOF) should be removed",
-		},
-		{
-			name: "prefixed JSON delimiter",
-			content: `cat > /tmp/config.json << 'GH_AW_CONFIG_JSON'
-{"handlers": {"update_issue": {"target": "${{ github.event.issue.number }}"}}}
-GH_AW_CONFIG_JSON`,
-			want:     "cat > /tmp/config.json # heredoc removed",
-			hasExpr:  false,
-			describe: "Prefixed JSON delimiter should be removed",
-		},
-		{
-			name: "prefixed YAML delimiter",
-			content: `cat > /tmp/workflow.yml << 'GH_AW_WORKFLOW_YAML'
-env:
-  TARGET: ${{ github.event.issue.number }}
-GH_AW_WORKFLOW_YAML`,
-			want:     "cat > /tmp/workflow.yml # heredoc removed",
-			hasExpr:  false,
-			describe: "Prefixed YAML delimiter should be removed",
-		},
-		{
-			name: "unquoted prefixed delimiter",
-			content: `cat > file << GH_AW_TOOLS_EOF
-{"value": "${{ github.event.issue.number }}"}
-GH_AW_TOOLS_EOF`,
-			want:     "cat > file # heredoc removed",
-			hasExpr:  false,
-			describe: "Unquoted prefixed delimiter should be removed",
-		},
-		{
-			name: "multiple prefixed delimiters",
-			content: `cat > file1 << 'GH_AW_SAFE_OUTPUTS_CONFIG_EOF'
-{"a": "${{ github.event.issue.number }}"}
-GH_AW_SAFE_OUTPUTS_CONFIG_EOF
-cat > file2 << 'GH_AW_MCP_CONFIG_EOF'
-{"b": "${{ github.event.issue.title }}"}
-GH_AW_MCP_CONFIG_EOF`,
-			want:     "cat > file1 # heredoc removed\ncat > file2 # heredoc removed",
-			hasExpr:  false,
-			describe: "Multiple prefixed delimiters should all be removed",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := removeHeredocContent(tt.content)
-
-			// Check if expression is present
-			hasExpr := strings.Contains(got, "${{")
-
-			assert.Equal(t, tt.hasExpr, hasExpr,
-				"Expression presence mismatch: %s", tt.describe)
-
-			if !tt.hasExpr {
-				assert.NotContains(t, got, "${{",
-					"Should not contain expressions after heredoc removal: %s", tt.describe)
 			}
 		})
 	}
@@ -1024,13 +958,13 @@ func TestTemplateInjectionInvalidYAML(t *testing.T) {
 		description string
 	}{
 		{
-			name: "malformed YAML - missing closing bracket",
+			name: "malformed YAML - unclosed quoted scalar",
 			yaml: `jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - name: Test
-        run: echo "${{ github.event.issue.title"`,
+        run: "echo '${{ github.event.issue.title }}'`,
 			shouldError: false,
 			description: "Invalid YAML should skip validation gracefully (no error)",
 		},
@@ -1239,7 +1173,7 @@ func TestTemplateInjectionYAMLParsingEdgeCases(t *testing.T) {
       - name: Setup
         uses: actions/setup-node@v4
         with:
-          node-version: 20`,
+          node-version: 24`,
 			shouldError: false,
 			description: "Steps without run fields should not cause errors",
 		},
@@ -1433,10 +1367,8 @@ func TestScanRunContentExpressions(t *testing.T) {
 	}
 }
 
-// TestScanRunContentExpressionsHeredoc verifies that expressions inside heredocs
-// are not flagged as disallowed – this ensures that ${{ }} expressions inside
-// unquoted heredocs (e.g. heredoc config blocks) are exempt from template-injection
-// checks by our internal validator.
+// TestScanRunContentExpressionsHeredoc checks that expressions in any heredoc body
+// are detected on the raw-YAML fast path because Actions evaluates them before Bash.
 func TestScanRunContentExpressionsHeredoc(t *testing.T) {
 	tests := []struct {
 		name              string
@@ -1459,7 +1391,7 @@ func TestScanRunContentExpressionsHeredoc(t *testing.T) {
 			wantHasDisallowed: false,
 		},
 		{
-			name: "unsafe expression inside unquoted heredoc is not flagged",
+			name: "unsafe expression inside unquoted heredoc is flagged",
 			yaml: `jobs:
   test:
     steps:
@@ -1467,8 +1399,8 @@ func TestScanRunContentExpressionsHeredoc(t *testing.T) {
           cat << EOF
           title: ${{ github.event.issue.title }}
           EOF`,
-			wantHasUnsafe:     false,
-			wantHasDisallowed: false,
+			wantHasUnsafe:     true,
+			wantHasDisallowed: true,
 		},
 		{
 			name: "disallowed expression OUTSIDE heredoc is still flagged",
@@ -1510,7 +1442,7 @@ func TestScanRunContentExpressionsHeredoc(t *testing.T) {
 			wantHasDisallowed: false,
 		},
 		{
-			name: "quoted heredoc delimiter (single-quoted) skips content",
+			name: "quoted heredoc expression is detected",
 			yaml: `jobs:
   test:
     steps:
@@ -1518,8 +1450,8 @@ func TestScanRunContentExpressionsHeredoc(t *testing.T) {
           cat << 'EOF'
           literal: ${{ github.event.issue.title }}
           EOF`,
-			wantHasUnsafe:     false,
-			wantHasDisallowed: false,
+			wantHasUnsafe:     true,
+			wantHasDisallowed: true,
 		},
 	}
 
@@ -1529,94 +1461,6 @@ func TestScanRunContentExpressionsHeredoc(t *testing.T) {
 
 			assert.Equal(t, tt.wantHasUnsafe, got.hasUnsafe, "hasUnsafe mismatch")
 			assert.Equal(t, tt.wantHasDisallowed, got.hasDisallowed, "hasDisallowed mismatch")
-		})
-	}
-}
-
-// TestDetectHeredocDelimiter verifies the heredoc delimiter extraction function.
-func TestDetectHeredocDelimiter(t *testing.T) {
-	tests := []struct {
-		name      string
-		line      string
-		wantDelim string
-		wantOK    bool
-	}{
-		{
-			name:      "unquoted delimiter",
-			line:      `cat << EOF | node script.cjs`,
-			wantDelim: "EOF",
-			wantOK:    true,
-		},
-		{
-			name:      "compiler-style delimiter with prefix",
-			line:      `cat << GH_AW_MCP_CONFIG_01641c1bd0fd81fa_EOF | "$GH_AW_NODE" "${RUNNER_TEMP}/actions/start.cjs"`,
-			wantDelim: "GH_AW_MCP_CONFIG_01641c1bd0fd81fa_EOF",
-			wantOK:    true,
-		},
-		{
-			name:      "single-quoted delimiter",
-			line:      `cat << 'EOF'`,
-			wantDelim: "EOF",
-			wantOK:    true,
-		},
-		{
-			name:      "double-quoted delimiter",
-			line:      `cat << "MY_DELIM"`,
-			wantDelim: "MY_DELIM",
-			wantOK:    true,
-		},
-		{
-			name:      "strip-tab variant",
-			line:      `cat <<- EOF`,
-			wantDelim: "EOF",
-			wantOK:    true,
-		},
-		{
-			name:      "no heredoc",
-			line:      `echo hello`,
-			wantDelim: "",
-			wantOK:    false,
-		},
-		{
-			name:      "less-than operator is not a heredoc",
-			line:      `if [ $x < 5 ]; then`,
-			wantDelim: "",
-			wantOK:    false,
-		},
-		{
-			name:      "bash here-string is not a heredoc",
-			line:      `cat <<< "hello world"`,
-			wantDelim: "",
-			wantOK:    false,
-		},
-		{
-			name:      "arithmetic bitshift is not a heredoc",
-			line:      `echo $((1 << 2))`,
-			wantDelim: "",
-			wantOK:    false,
-		},
-		{
-			name:      "arithmetic bitshift no spaces is not a heredoc",
-			line:      `result=$((flags<<4))`,
-			wantDelim: "",
-			wantOK:    false,
-		},
-		{
-			name:      "delimiter starting with dash is not a heredoc",
-			line:      `cat << -EOF`,
-			wantDelim: "",
-			wantOK:    false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			trimmed := strings.TrimLeft(tt.line, " \t")
-			gotDelim, gotOK := detectHeredocDelimiter(trimmed)
-			assert.Equal(t, tt.wantOK, gotOK)
-			if tt.wantOK {
-				assert.Equal(t, tt.wantDelim, gotDelim)
-			}
 		})
 	}
 }

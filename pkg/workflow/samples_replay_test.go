@@ -5,6 +5,7 @@ package workflow
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -115,6 +116,202 @@ Trivial workflow whose only job is to be compiled with --use-samples.
 			t.Error("Expected no `detection:` job under --use-samples")
 		}
 	})
+}
+
+func TestUseSamplesIncludesReportIncomplete(t *testing.T) {
+	const md = `---
+on:
+  workflow_dispatch:
+engine: copilot
+safe-outputs:
+  report-incomplete:
+    samples:
+      - reason: "intentional sample"
+        details: "replay this report_incomplete call"
+---
+
+Report the task as incomplete.
+`
+
+	tmpFile, err := os.CreateTemp("", "report-incomplete-samples-*.md")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, os.Remove(tmpFile.Name()))
+	})
+	_, err = tmpFile.WriteString(md)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Close())
+
+	compiler := NewCompiler()
+	compiler.SetUseSamples(true)
+	require.NoError(t, compiler.CompileWorkflow(tmpFile.Name()))
+
+	lockPath := strings.TrimSuffix(tmpFile.Name(), ".md") + ".lock.yml"
+	t.Cleanup(func() {
+		require.NoError(t, os.Remove(lockPath))
+	})
+	lockContent, err := os.ReadFile(lockPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(lockContent), `"tool":"report_incomplete"`)
+	assert.Contains(t, string(lockContent), `"reason":"intentional sample"`)
+	assert.NotContains(t, string(lockContent), "GH_AW_SAMPLES: |\n          []")
+}
+
+// TestFeaturesSamplesOptInReplacesAgentStep verifies that a workflow
+// declaring `features: { samples: true }` in its own frontmatter compiles
+// into samples-mode output under a plain `gh aw compile`, without needing
+// the hidden `--use-samples` flag / SetUseSamples(true).
+func TestFeaturesSamplesOptInReplacesAgentStep(t *testing.T) {
+	const md = `---
+on:
+  workflow_dispatch:
+permissions: read-all
+engine:
+  id: claude
+features:
+  samples: true
+safe-outputs:
+  create-issue:
+    samples:
+      - title: "Deterministic test issue"
+        body: "Issue body emitted by gh-aw samples replay."
+---
+
+Trivial workflow that opts into samples replay via features.samples.
+`
+
+	tmpFile, err := os.CreateTemp("", "features-samples-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(md); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(tmpFile.Name()); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	workflowData, err := compiler.ParseWorkflowFile(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("ParseWorkflowFile failed: %v", err)
+	}
+	if !workflowData.UseSamples {
+		t.Fatal("Expected workflowData.UseSamples to be true from features.samples: true, without SetUseSamples")
+	}
+
+	lockPath := strings.TrimSuffix(tmpFile.Name(), ".md") + ".lock.yml"
+	defer os.Remove(lockPath)
+	b, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("read lock: %v", err)
+	}
+	lockContent := string(b)
+	if !strings.Contains(lockContent, "Replay safe-outputs samples (deterministic)") {
+		t.Error("Expected `Replay safe-outputs samples (deterministic)` step in lock file")
+	}
+	if !strings.Contains(lockContent, "apply_samples.cjs") {
+		t.Error("Expected lock file to invoke apply_samples.cjs driver")
+	}
+	// Threat detection must be force-disabled when features.samples is set, mirroring
+	// the --use-samples behaviour.
+	if strings.Contains(lockContent, "\n  detection:\n") {
+		t.Error("Expected no `detection:` job with features.samples: true")
+	}
+	// features.samples is documented as an internal/hidden compiler knob; it must not
+	// leak into GH_AW_INFO_FEATURES, which is runtime-visible metadata.
+	if strings.Contains(lockContent, "GH_AW_INFO_FEATURES") && strings.Contains(lockContent, `"samples"`) {
+		t.Error("Expected GH_AW_INFO_FEATURES to omit the internal `samples` feature flag")
+	}
+}
+
+// TestFeaturesSamplesFromImportEnablesReplay verifies that `features: { samples: true }`
+// declared only in an imported shared workflow still activates samples replay for the
+// importing workflow: WorkflowData.UseSamples must be true, threat detection must be
+// force-disabled, and the compiled lock file must contain the deterministic replay step
+// instead of invoking the agent.
+func TestFeaturesSamplesFromImportEnablesReplay(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "features-samples-import-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	sharedDir := filepath.Join(tmpDir, ".github", "workflows", "shared")
+	if err := os.MkdirAll(sharedDir, 0755); err != nil {
+		t.Fatalf("Failed to create shared directory: %v", err)
+	}
+
+	sharedPath := filepath.Join(sharedDir, "samples-config.md")
+	sharedContent := `---
+features:
+  samples: true
+---
+
+# Shared Samples Configuration
+`
+	if err := os.WriteFile(sharedPath, []byte(sharedContent), 0644); err != nil {
+		t.Fatalf("Failed to write shared workflow file: %v", err)
+	}
+
+	mainPath := filepath.Join(tmpDir, ".github", "workflows", "main.md")
+	mainContent := `---
+on: workflow_dispatch
+permissions: read-all
+engine:
+  id: claude
+imports:
+  - shared/samples-config.md
+safe-outputs:
+  create-issue:
+    samples:
+      - title: "Deterministic test issue"
+        body: "Issue body emitted by gh-aw samples replay."
+---
+
+# Main Workflow
+
+Test that features.samples: true from an import enables samples replay.
+`
+	if err := os.WriteFile(mainPath, []byte(mainContent), 0644); err != nil {
+		t.Fatalf("Failed to write main workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+
+	if err := compiler.CompileWorkflow(mainPath); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	workflowData, err := compiler.ParseWorkflowFile(mainPath)
+	if err != nil {
+		t.Fatalf("ParseWorkflowFile failed: %v", err)
+	}
+	if !workflowData.UseSamples {
+		t.Fatal("Expected workflowData.UseSamples to be true from imported features.samples: true")
+	}
+	if workflowData.SafeOutputs != nil && workflowData.SafeOutputs.ThreatDetection != nil {
+		t.Fatal("Expected threat-detection to be force-disabled when samples replay is enabled via imports")
+	}
+
+	lockPath := strings.TrimSuffix(mainPath, ".md") + ".lock.yml"
+	lockContent, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockStr := string(lockContent)
+
+	if !strings.Contains(lockStr, "Replay safe-outputs samples (deterministic)") {
+		t.Error("Expected `Replay safe-outputs samples (deterministic)` step in lock file")
+	}
+	if !strings.Contains(lockStr, "apply_samples.cjs") {
+		t.Error("Expected lock file to invoke apply_samples.cjs driver")
+	}
+	if strings.Contains(lockStr, "\n  detection:\n") {
+		t.Error("Expected no `detection:` job when samples replay is enabled via imports")
+	}
 }
 
 // TestUseSamplesCreatePullRequestWithPatch is the end-to-end smoke test for
@@ -353,9 +550,8 @@ emit a valid empty-array GH_AW_SAMPLES under --use-samples.
 
 // TestUseSamplesPreservesRuntimeExpressionsInLockFile verifies that a sample
 // value containing a `${{ ... }}` GitHub Actions expression compiles cleanly
-// AND lands verbatim in the GH_AW_SAMPLES env value of the lock file, so that
-// GitHub Actions substitutes the real value on the runner before
-// apply_samples.cjs reads it.
+// AND is transported separately from replay control data, so GitHub Actions
+// substitutes the value before apply_samples.cjs binds the authored argument.
 //
 // Regression for https://github.com/github/gh-aw/issues/37532.
 func TestUseSamplesPreservesRuntimeExpressionsInLockFile(t *testing.T) {
@@ -404,9 +600,8 @@ Runtime-templated sample for workflow_dispatch-driven testing.
 	lock := string(b)
 
 	samplesJSON := extractGHAWSamplesJSON(t, lock)
-	assert.Contains(t, samplesJSON, "${{ github.event.inputs.issue_number }}", "GH_AW_SAMPLES should preserve live runtime expression for substitution")
-	// The marshalled payload must still be valid JSON (the expression sits
-	// inside a JSON string, so no escaping concerns at compile time).
+	assert.NotContains(t, samplesJSON, "${{", "GH_AW_SAMPLES must not interpolate runtime values into JSON")
+	assert.Contains(t, lock, `GH_AW_SAMPLE_VALUE_0: "${{ github.event.inputs.issue_number }}"`)
 	var parsed []any
 	err = json.Unmarshal([]byte(samplesJSON), &parsed)
 	require.NoError(t, err, "GH_AW_SAMPLES should remain valid JSON at compile time")
@@ -524,6 +719,84 @@ Default-auth workflow — should not need the per-repo token map.
 }
 
 // extractGHAWRepoTokensJSON pulls the literal block scalar value of
+// TestUseSamplesForwardsWorkflowInputEnvVars verifies that when a safe-outputs
+// field references a workflow_dispatch input (e.g. `target: ${{ inputs.pull_request_number }}`),
+// the compiler forwards the corresponding GH_AW_INPUT_* environment variable
+// to the "Replay safe-outputs samples (deterministic)" step so that
+// safe_outputs_config.cjs can resolve the ${GH_AW_INPUT_…} placeholder written
+// into config.json. Regression test for https://github.com/github/gh-aw/issues/54810.
+func TestUseSamplesForwardsWorkflowInputEnvVars(t *testing.T) {
+	const md = `---
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        required: true
+        type: string
+      pull_request_number:
+        required: true
+        type: number
+permissions: read-all
+engine:
+  id: claude
+safe-outputs:
+  push-to-pull-request-branch:
+    branch: ${{ inputs.branch_name }}
+    target: ${{ inputs.pull_request_number }}
+    samples:
+      - message: "sample push"
+        patch: |
+          diff --git a/sample.txt b/sample.txt
+          new file mode 100644
+          --- /dev/null
+          +++ b/sample.txt
+          @@ -0,0 +1 @@
+          +sample
+---
+
+Workflow whose safe-outputs config references workflow_dispatch inputs.
+`
+	tmpFile, err := os.CreateTemp("", "use-samples-inputs-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(md); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	compiler := NewCompiler()
+	compiler.SetUseSamples(true)
+	if err := compiler.CompileWorkflow(tmpFile.Name()); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	lockPath := strings.TrimSuffix(tmpFile.Name(), ".md") + ".lock.yml"
+	defer os.Remove(lockPath)
+	b, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("read lock: %v", err)
+	}
+	lock := string(b)
+
+	require.Contains(t, lock, "Replay safe-outputs samples (deterministic)")
+
+	// Locate the replay step's env block and verify it forwards the
+	// GH_AW_INPUT_PULL_REQUEST_NUMBER var referenced by `target:`.
+	replayIdx := strings.Index(lock, "Replay safe-outputs samples (deterministic)")
+	require.GreaterOrEqual(t, replayIdx, 0)
+	nextStepIdx := strings.Index(lock[replayIdx+1:], "\n      - name:")
+	var replayStep string
+	if nextStepIdx < 0 {
+		replayStep = lock[replayIdx:]
+	} else {
+		replayStep = lock[replayIdx : replayIdx+1+nextStepIdx]
+	}
+
+	assert.Contains(t, replayStep, "GH_AW_INPUT_PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}",
+		"replay step must forward GH_AW_INPUT_PULL_REQUEST_NUMBER so safe_outputs_config.cjs can resolve the placeholder")
+}
+
 // GH_AW_REPO_TOKENS out of the compiled YAML and returns the unindented JSON
 // text. Mirrors extractGHAWSamplesJSON.
 func extractGHAWRepoTokensJSON(t *testing.T, lock string) string {
@@ -553,4 +826,95 @@ func extractGHAWRepoTokensJSON(t *testing.T, lock string) string {
 		out.WriteString("\n")
 	}
 	return strings.TrimSpace(out.String())
+}
+
+// TestUseSamplesReplaysReplaceLabel is a regression test for
+// https://github.com/github/gh-aw/issues/54811: a `replace-label` safe output
+// configured with `samples:` must validate at compile time and be collected
+// into GH_AW_SAMPLES as a `replace_label` MCP `tools/call` so that
+// `--use-samples` suites actually perform the label transition instead of
+// silently replaying nothing.
+func TestUseSamplesReplaysReplaceLabel(t *testing.T) {
+	const md = `---
+on:
+  issues:
+    types: [opened]
+permissions: read-all
+engine:
+  id: claude
+safe-outputs:
+  replace-label:
+    allowed-transitions:
+      - from: old
+        to: new
+    samples:
+      - item_number: "${{ github.event.issue.number }}"
+        label_to_remove: old
+        label_to_add: new
+---
+
+Replace-label workflow replayed deterministically from samples.
+`
+
+	tmpFile, err := os.CreateTemp("", "use-samples-replace-label-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(md); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	compiler := NewCompiler()
+	compiler.SetUseSamples(true)
+	if err := compiler.CompileWorkflow(tmpFile.Name()); err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+	lockPath := strings.TrimSuffix(tmpFile.Name(), ".md") + ".lock.yml"
+	defer os.Remove(lockPath)
+	b, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("read lock: %v", err)
+	}
+	lock := string(b)
+
+	samplesJSON := extractGHAWSamplesJSON(t, lock)
+	if !strings.Contains(samplesJSON, `"tool":"replace_label"`) {
+		t.Fatalf("GH_AW_SAMPLES should contain a replace_label entry; got %s", samplesJSON)
+	}
+	assert.NotContains(t, samplesJSON, "${{", "runtime expressions must be outside replay JSON")
+	assert.Contains(t, lock, `GH_AW_SAMPLE_VALUE_0: "${{ github.event.issue.number }}"`)
+}
+
+// TestSafeOutputsMissingSamples verifies the diagnostic helper that backs the
+// compile-time warning emitted when samples replay is enabled but an enabled
+// safe output declares no samples — the failure mode reported in
+// https://github.com/github/gh-aw/issues/54811 where a sampled run succeeded
+// with an empty GH_AW_SAMPLES and left the fixture untouched.
+func TestSafeOutputsMissingSamples(t *testing.T) {
+	t.Run("nil config", func(t *testing.T) {
+		if got := safeOutputsMissingSamples(nil); got != nil {
+			t.Fatalf("expected nil for nil config, got %v", got)
+		}
+	})
+
+	t.Run("enabled handler without samples is reported", func(t *testing.T) {
+		config := &SafeOutputsConfig{ReplaceLabel: &ReplaceLabelConfig{}}
+		got := safeOutputsMissingSamples(config)
+		if len(got) != 1 || got[0] != "replace-label" {
+			t.Fatalf("expected [replace-label], got %v", got)
+		}
+	})
+
+	t.Run("handler with samples is not reported", func(t *testing.T) {
+		config := &SafeOutputsConfig{ReplaceLabel: &ReplaceLabelConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Samples: []map[string]any{{"item_number": 1, "label_to_remove": "old", "label_to_add": "new"}},
+			},
+		}}
+		if got := safeOutputsMissingSamples(config); len(got) != 0 {
+			t.Fatalf("expected no missing samples, got %v", got)
+		}
+	})
 }

@@ -22,20 +22,33 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/fileutil"
+	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/scanfindings"
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var grypeLog = logger.New("cli:grype")
+
+const (
+	// grypeConfigFilename is the optional grype configuration file at the repository
+	// root. It carries documented, risk-accepted ignore rules for vulnerabilities that
+	// have no upstream fix available.
+	grypeConfigFilename      = ".grype.yaml"
+	grypeContainerConfigPath = "/tmp/gh-aw-grype-config.yaml"
+)
 
 // grypeFinding represents a single vulnerability match from grype JSON output.
 type grypeFinding struct {
@@ -60,8 +73,8 @@ type grypeOutput struct {
 	Matches []grypeFinding `json:"matches"`
 }
 
-// grypeCache caches grype scan results by image reference to avoid rescanning
-// the same image within a single compile run.
+// grypeCache caches grype scan results by image reference and config content to
+// avoid rescanning identical scans within a single compile run.
 type grypeCache struct {
 	mu      sync.Mutex
 	results map[string]*grypeOutput
@@ -95,7 +108,8 @@ func (c *grypeCache) setError(key string, err error) {
 	c.errors[key] = err
 }
 
-// grypeScanResultCache is the process-wide grype result cache.
+// grypeScanResultCache is the process-wide grype result cache. Its keys include
+// the image reference and the grype configuration content.
 var grypeScanResultCache = &grypeCache{
 	results: make(map[string]*grypeOutput),
 	errors:  make(map[string]error),
@@ -163,9 +177,7 @@ func runGrypeOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 	images := collectContainerImagesFromLockFiles(lockFiles)
 	if len(images) == 0 {
 		grypeLog.Print("No container images found in lock files")
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("No container images found in lock files to scan with grype"))
-		}
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("Running grype vulnerability scanner (0 container images found in lock files)"))
 		return nil
 	}
 
@@ -177,24 +189,31 @@ func runGrypeOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 	}
 
 	totalFindings := 0
+	var findings []scanfindings.Finding
 	var scanErrors []string
 
-	for _, img := range images {
-		// Prefer the pinned reference (image@sha256:...) for immutability guarantees.
-		imageRef := img.PinnedImage
-		if imageRef == "" {
-			imageRef = img.Image
-		}
+	configFile := grypeConfigFile()
+	if configFile != "" {
+		grypeLog.Printf("Using grype config %s", configFile)
+	}
 
-		output, err := grypeRunOnImage(imageRef, verbose)
+	// These status lines are consumed by the completeness gate in .github/workflows/static-analysis-report.md.
+	grypePlanImageScans(images)
+	for _, img := range images {
+		imageRef := grypeImageReference(img)
+
+		output, err := grypeRunOnImage(imageRef, configFile, verbose)
 		if err != nil {
 			grypeLog.Printf("Grype scan failed for %s: %v", img.Image, err)
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Grype scan failed for %s: %v", imageRef, err)))
 			scanErrors = append(scanErrors, fmt.Sprintf("%s: %v", img.Image, err))
 			continue
 		}
 
 		count := grypeDisplayFindings(img.Image, output)
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Grype scan completed for %s: %d vulnerability finding(s)", imageRef, count)))
 		totalFindings += count
+		findings = append(findings, grypeFindingsToShared(img.Image, output.Matches)...)
 	}
 
 	if len(scanErrors) > 0 {
@@ -207,37 +226,160 @@ func runGrypeOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
 	}
 
 	if strict && totalFindings > 0 {
-		return fmt.Errorf("strict mode: grype found %d vulnerability finding(s) in container images", totalFindings)
+		return withScannerFindings(fmt.Errorf("strict mode: grype found %d vulnerability finding(s) in container images", totalFindings), findings)
 	}
 
 	return nil
 }
 
+func grypePlanImageScans(images []workflow.GHAWManifestContainer) {
+	for _, img := range images {
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Grype scan planned for "+grypeImageReference(img)))
+	}
+}
+
+func grypeImageReference(img workflow.GHAWManifestContainer) string {
+	if img.PinnedImage != "" {
+		return img.PinnedImage
+	}
+	return img.Image
+}
+
+// grypeConfigFile returns the path to the optional repository-root grype configuration
+// file, or an empty string when the file is absent or the current directory is not a
+// git checkout. The config carries documented ignore rules for risk-accepted findings.
+func grypeConfigFile() string {
+	repoRoot, err := gitutil.FindGitRoot()
+	if err != nil {
+		grypeLog.Printf("Skipping grype config lookup: %v", err)
+		return ""
+	}
+
+	configFile := filepath.Join(repoRoot, grypeConfigFilename)
+	info, err := os.Stat(configFile)
+	if err != nil || !info.Mode().IsRegular() {
+		grypeLog.Printf("No grype config found at %s", configFile)
+		return ""
+	}
+
+	return configFile
+}
+
+// grypeDockerArgs builds the `docker run` arguments used to scan a single image.
+// When configFile is non-empty, it is mounted read-only into the scanner container
+// and passed to grype via --config so repository-level ignore rules are applied.
+func grypeDockerArgs(validatedImageRef, configFile string) ([]string, error) {
+	if err := validateExecArgument(validatedImageRef); err != nil {
+		return nil, fmt.Errorf("invalid grype image reference: %w", err)
+	}
+
+	args := []string{"run", "--rm"}
+
+	grypeImageRef, err := validateDockerImageRef(GrypeImage)
+	if err != nil {
+		return nil, fmt.Errorf("invalid grype scanner image reference %q: %w", GrypeImage, err)
+	}
+
+	var configArgs []string
+	if configFile != "" {
+		containerConfigPath, err := validateContainerMountPath(grypeContainerConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("invalid grype container config path %q: %w", grypeContainerConfigPath, err)
+		}
+		volumeMount, err := buildDockerReadonlyFileMount(configFile, containerConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("invalid grype config mount: %w", err)
+		}
+		if err := validateExecArgument(volumeMount); err != nil {
+			return nil, fmt.Errorf("invalid grype config volume mount: %w", err)
+		}
+		args = append(args, "-v", volumeMount)
+		configArgs = []string{"--config", containerConfigPath}
+	}
+
+	args = append(args, grypeImageRef)
+	args = append(args, configArgs...)
+	args = append(args, validatedImageRef, "-o", "json")
+
+	return args, nil
+}
+
+// grypeCacheKey returns a cache key that varies with the image and the contents
+// of the optional Grype configuration. Configuration paths alone are insufficient
+// because separate repositories can use different policies at the same path.
+func grypeCacheKey(imageRef, configFile string) (string, error) {
+	if configFile == "" {
+		return imageRef + "\x00", nil
+	}
+
+	content, err := os.ReadFile(configFile)
+	if err != nil {
+		return "", fmt.Errorf("read grype config %q: %w", configFile, err)
+	}
+	digest := sha256.Sum256(content)
+	return fmt.Sprintf("%s\x00%x", imageRef, digest), nil
+}
+
+// validateExecArgument is a final defense-in-depth gate applied to variable-origin
+// docker argv values (image references, volume mounts, container paths) right where
+// they are constructed. It must not be applied to hardcoded literals such as "--rm"
+// or "-v", since those legitimately start with '-'.
+func validateExecArgument(arg string) error {
+	if arg == "" {
+		return errors.New("argument cannot be empty")
+	}
+	if strings.HasPrefix(arg, "-") {
+		return errors.New("argument must not start with '-' (flag injection risk)")
+	}
+	if containsControlCharacters(arg) {
+		return errors.New("argument contains invalid control characters")
+	}
+	return nil
+}
+
 // grypeRunOnImage runs grype on a single container image reference via Docker,
 // using the result cache to avoid re-scanning images already checked in this run.
-func grypeRunOnImage(imageRef string, verbose bool) (*grypeOutput, error) {
+// When configFile is non-empty it is mounted read-only into the scanner container
+// and passed to grype via --config.
+func grypeRunOnImage(imageRef, configFile string, verbose bool) (*grypeOutput, error) { //nolint:largefunc
+	cacheKey, err := grypeCacheKey(imageRef, configFile)
+	if err != nil {
+		return nil, err
+	}
+
 	// Check cache first.
-	if result, err, ok := grypeScanResultCache.get(imageRef); ok {
+	if result, err, ok := grypeScanResultCache.get(cacheKey); ok {
 		grypeLog.Printf("Grype cache hit for %s", imageRef)
 		return result, err
 	}
 
 	grypeLog.Printf("Scanning %s with grype", imageRef)
 
-	// #nosec G204 -- imageRef is extracted from the gh-aw-manifest in compiled lock files,
-	// which are produced by this tool from trusted markdown sources. exec.Command passes
-	// args directly to the OS without shell interpretation, preventing command injection.
-	cmd := exec.Command(
-		"docker",
-		"run",
-		"--rm",
-		GrypeImage,
-		imageRef,
-		"-o", "json",
-	)
+	// Validate the image reference before it reaches docker: lock-file manifests can carry
+	// attacker-influenced content, and an image reference starting with "-" (or containing
+	// control characters) would otherwise be interpreted as a docker/grype option.
+	validatedImageRef, err := validateDockerImageRef(imageRef)
+	if err != nil {
+		return nil, err
+	}
+
+	dockerPath, err := fileutil.ResolveExecutablePath("docker")
+	if err != nil {
+		return nil, fmt.Errorf("docker command not found: %w", err)
+	}
+
+	dockerArgs, err := grypeDockerArgs(validatedImageRef, configFile)
+	if err != nil {
+		return nil, err
+	}
+
+	// #nosec G204 -- dockerPath is resolved from the fixed executable name "docker" and
+	// validatedImageRef is allow-list validated above. exec.Command passes args directly to
+	// the OS without shell interpretation, preventing command injection.
+	cmd := exec.Command(dockerPath, dockerArgs...)
 
 	if verbose {
-		dockerCmd := fmt.Sprintf("docker run --rm %s %s -o json", GrypeImage, imageRef)
+		dockerCmd := shellJoinArgs(append([]string{"docker"}, dockerArgs...))
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Run grype directly: "+dockerCmd))
 	}
 
@@ -250,9 +392,9 @@ func grypeRunOnImage(imageRef string, verbose bool) (*grypeOutput, error) {
 	// Parse JSON output regardless of exit code — grype exits non-zero when vulnerabilities
 	// are found (exit 1), so a non-zero exit does not necessarily indicate a tool failure.
 	var output grypeOutput
-	var parseErr error
-	if stdout.Len() > 0 && strings.HasPrefix(strings.TrimSpace(stdout.String()), "{") {
-		parseErr = json.Unmarshal(stdout.Bytes(), &output)
+	parseErr := json.Unmarshal(stdout.Bytes(), &output)
+	if parseErr == nil && output.Matches == nil {
+		parseErr = errors.New("missing or null matches array")
 	}
 
 	if runErr != nil {
@@ -260,19 +402,19 @@ func grypeRunOnImage(imageRef string, verbose bool) (*grypeOutput, error) {
 		if !errors.As(runErr, &exitErr) {
 			// Command could not be started (e.g., Docker not found).
 			scanErr := fmt.Errorf("grype failed: %w", runErr)
-			grypeScanResultCache.setError(imageRef, scanErr)
+			grypeScanResultCache.setError(cacheKey, scanErr)
 			return nil, scanErr
 		}
 		exitCode := exitErr.ExitCode()
 		// Exit code 1 means grype found vulnerabilities — that is expected and parseable.
 		// Any other non-zero code signals a real tool failure.
-		if exitCode != 1 || (parseErr != nil && stdout.Len() == 0) {
+		if exitCode != 1 {
 			stderrStr := strings.TrimSpace(stderr.String())
 			if stderrStr != "" {
 				grypeLog.Printf("grype stderr for %s: %s", imageRef, stderrStr)
 			}
 			scanErr := fmt.Errorf("grype failed with exit code %d on %s", exitCode, imageRef)
-			grypeScanResultCache.setError(imageRef, scanErr)
+			grypeScanResultCache.setError(cacheKey, scanErr)
 			return nil, scanErr
 		}
 		// Exit code 1 with JSON output — vulnerability findings were returned normally.
@@ -280,11 +422,11 @@ func grypeRunOnImage(imageRef string, verbose bool) (*grypeOutput, error) {
 
 	if parseErr != nil {
 		scanErr := fmt.Errorf("failed to parse grype JSON output for %s: %w", imageRef, parseErr)
-		grypeScanResultCache.setError(imageRef, scanErr)
+		grypeScanResultCache.setError(cacheKey, scanErr)
 		return nil, scanErr
 	}
 
-	grypeScanResultCache.set(imageRef, &output)
+	grypeScanResultCache.set(cacheKey, &output)
 	return &output, nil
 }
 
@@ -296,26 +438,28 @@ func grypeDisplayFindings(imageTag string, output *grypeOutput) int {
 		return 0
 	}
 
-	for _, match := range output.Matches {
+	findings := grypeFindingsToShared(imageTag, output.Matches)
+	scanfindings.Render(os.Stderr, findings)
+
+	return len(findings)
+}
+
+// grypeFindingsToShared maps grype's native vulnerability matches onto the shared
+// finding representation used by every scanner integration. Container images have
+// no source location, so the image tag is reported as the finding location.
+func grypeFindingsToShared(imageTag string, matches []grypeFinding) []scanfindings.Finding {
+	findings := make([]scanfindings.Finding, 0, len(matches))
+	for _, match := range matches {
 		vuln := match.Vulnerability
 		art := match.Artifact
 
-		severity := vuln.Severity
-		if severity == "" {
-			severity = "Unknown"
-		}
-
-		// Map severity to error type for display purposes.
-		errorType := "warning"
-		switch strings.ToLower(severity) {
-		case "critical", "high":
-			errorType = "error"
-		case "low", "negligible", "informational":
-			errorType = "info"
+		severityLabel := vuln.Severity
+		if severityLabel == "" {
+			severityLabel = "Unknown"
 		}
 
 		// Build a compact message: [Severity] CVE-ID: package@version (fix: x.y.z) (url)
-		message := fmt.Sprintf("[%s] %s: %s@%s", severity, vuln.ID, art.Name, art.Version)
+		message := fmt.Sprintf("[%s] %s: %s@%s", severityLabel, vuln.ID, art.Name, art.Version)
 		if len(vuln.Fix.Versions) > 0 {
 			message = fmt.Sprintf("%s (fix: %s)", message, strings.Join(vuln.Fix.Versions, ", "))
 		}
@@ -323,18 +467,10 @@ func grypeDisplayFindings(imageTag string, output *grypeOutput) int {
 			message = fmt.Sprintf("%s (%s)", message, vuln.DataSource)
 		}
 
-		compilerErr := console.CompilerError{
-			Position: console.ErrorPosition{
-				File:   imageTag,
-				Line:   1,
-				Column: 1,
-			},
-			Type:    errorType,
-			Message: message,
-		}
-
-		fmt.Fprint(os.Stderr, console.FormatError(compilerErr))
+		findings = append(findings, scanfindings.NewFinding(scanfindings.NewFindingParams{
+			RuleID: vuln.ID, SeverityLabel: severityLabel, Message: message,
+			File: imageTag, Line: 1, Column: 1,
+		}))
 	}
-
-	return len(output.Matches)
+	return findings
 }

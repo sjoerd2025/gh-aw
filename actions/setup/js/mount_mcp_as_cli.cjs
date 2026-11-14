@@ -27,6 +27,7 @@ const http = require("http");
 const path = require("path");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { renderSafeOutputsPromptDocs } = require("./mcp_cli_schema_docs.cjs");
+const { iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 
 const MANIFEST_FILE = path.join(process.env.RUNNER_TEMP || "/home/runner/work/_temp", "gh-aw/mcp-cli/manifest.json");
 // Use RUNNER_TEMP so the bin and tools directories are inside the AWF sandbox mount
@@ -39,6 +40,18 @@ const SAFEOUTPUTS_SERVER_NAME = "safeoutputs";
 
 /** Default timeout (ms) for HTTP calls to the local MCP gateway */
 const DEFAULT_HTTP_TIMEOUT_MS = 15000;
+
+/**
+ * Maximum number of times to retry tools/list when a server returns 0 tools.
+ * The gateway may report a backend as "running" before the backend has finished
+ * building its tool schema (a race condition more likely with large configs).
+ */
+const TOOLS_EMPTY_MAX_RETRIES = 5;
+
+/**
+ * Milliseconds to wait between tools/list retry attempts when the result is empty.
+ */
+const TOOLS_EMPTY_RETRY_DELAY_MS = 1000;
 
 /**
  * Parse a tools JSON file and return a validated tools array.
@@ -70,6 +83,25 @@ function loadToolsFromJSONFile(toolsPath, core) {
 function getSafeOutputsGatewayEmptyFlagPath() {
   const runnerTemp = process.env.RUNNER_TEMP || "/home/runner/work/_temp";
   return path.join(runnerTemp, "gh-aw", "safeoutputs", "gateway_empty.flag");
+}
+
+/**
+ * Remove safe-output registration evidence left by a previous setup run.
+ *
+ * @param {string} [runnerTemp]
+ */
+function clearStaleSafeOutputsRegistrationEvidence(runnerTemp = RUNNER_TEMP) {
+  const evidencePaths = [path.join(runnerTemp, "gh-aw", "safeoutputs", "gateway_empty.flag"), path.join(runnerTemp, "gh-aw", "mcp-cli", "tools", "safeoutputs.json")];
+  for (const evidencePath of evidencePaths) {
+    try {
+      fs.unlinkSync(evidencePath);
+    } catch (err) {
+      const isMissingFile = err !== null && typeof err === "object" && "code" in err && err.code === "ENOENT";
+      if (!isMissingFile) {
+        throw new Error(`Failed to clear stale safe-output registration evidence at ${evidencePath}: ${getErrorMessage(err)}`, { cause: err });
+      }
+    }
+  }
 }
 
 /**
@@ -232,10 +264,15 @@ function httpPostJSON(urlStr, headers, body, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS
 
     const req = http.request(options, res => {
       let data = "";
+      res.on("error", err => {
+        clearTimeout(timer);
+        reject(err);
+      });
       res.on("data", chunk => {
         data += chunk;
       });
       res.on("end", () => {
+        clearTimeout(timer);
         let parsed;
         try {
           parsed = JSON.parse(data);
@@ -251,14 +288,14 @@ function httpPostJSON(urlStr, headers, body, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS
     });
 
     req.on("error", err => {
+      clearTimeout(timer);
       reject(err);
     });
 
-    req.setTimeout(timeoutMs, () => {
-      // req.destroy() is the correct modern API; req.abort() is deprecated since Node.js v14
-      req.destroy();
-      reject(new Error(`HTTP request timed out after ${timeoutMs}ms`));
-    });
+    // Bound the entire response, not just socket inactivity between body chunks.
+    const timer = setTimeout(() => {
+      req.destroy(Object.assign(new Error(`HTTP request timed out after ${timeoutMs}ms`), { code: "ETIMEDOUT" }));
+    }, timeoutMs);
 
     req.write(bodyStr);
     req.end();
@@ -295,21 +332,52 @@ function parseMCPResponseBody(body) {
 
   /** @type {unknown} */
   let lastDataMessage = null;
-  for (const line of trimmed.split(/\r?\n/)) {
-    if (!line.startsWith("data:")) {
-      continue;
-    }
-    const payload = line.slice(5).trim();
-    if (!payload || payload === "[DONE]") {
-      continue;
-    }
-    try {
-      lastDataMessage = JSON.parse(payload);
-    } catch {
-      // Ignore non-JSON SSE data lines.
-    }
+  for (const event of iterateJsonlEvents(trimmed, {
+    lineFilter: line => line.startsWith("data:"),
+    lineTransform: line => line.slice(5),
+  })) {
+    if (event.type === "json" && event.rawLine.startsWith("data:")) lastDataMessage = event.value;
   }
   return lastDataMessage;
+}
+
+/**
+ * Require an object-valued JSON-RPC result before continuing the handshake.
+ *
+ * @param {unknown} body
+ * @returns {body is {result: Record<string, unknown>}}
+ */
+function hasMCPResult(body) {
+  return !!body && typeof body === "object" && !Array.isArray(body) && !("error" in body) && "result" in body && !!body.result && typeof body.result === "object" && !Array.isArray(body.result);
+}
+
+/**
+ * Only server-side HTTP failures and JSON-RPC internal errors are transient.
+ *
+ * @param {number} statusCode
+ * @param {unknown} body
+ * @returns {boolean}
+ */
+function isRetryableMCPFailure(statusCode, body) {
+  if (statusCode >= 500 && statusCode < 600) {
+    return true;
+  }
+  if (statusCode < 200 || statusCode >= 300) {
+    return false;
+  }
+  return !!body && typeof body === "object" && "error" in body && !!body.error && typeof body.error === "object" && "code" in body.error && body.error.code === -32603;
+}
+
+/**
+ * @param {unknown} err
+ * @returns {string | undefined}
+ */
+function safeMCPTransportCode(err) {
+  const codes = ["ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "ETIMEDOUT", "EPIPE", "ENOTFOUND", "EAI_AGAIN", "ERR_STREAM_PREMATURE_CLOSE"];
+  if (err && typeof err === "object" && "code" in err && typeof err.code === "string" && codes.includes(err.code)) {
+    return err.code;
+  }
+  return undefined;
 }
 
 /**
@@ -317,12 +385,18 @@ function parseMCPResponseBody(body) {
  * Follows the standard MCP handshake: initialize → notifications/initialized → tools/list.
  *
  * @param {string} serverUrl - HTTP URL of the MCP server endpoint
- * @param {string} apiKey - Bearer token for gateway authentication
+ * @param {string} agentId - Bearer token for gateway authentication
  * @param {typeof import("@actions/core")} core - GitHub Actions core
- * @returns {Promise<Array<{name: string, description?: string, inputSchema?: unknown}>>}
+ * @param {number} [timeoutMs=DEFAULT_HTTP_TIMEOUT_MS]
+ * `emptyWasSuccessful` marks a valid tools/list response (including non-empty lists).
+ * `retryable` marks transient failures only; successful responses set it to false.
+ * `failure` contains only the handshake phase, HTTP status, and whitelisted
+ * transport code, never response bodies or transport error messages.
+ *
+ * @returns {Promise<{tools: Array<{name: string, description?: string, inputSchema?: unknown}>, emptyWasSuccessful: boolean, retryable: boolean, failure?: {phase: "initialize" | "notifications/initialized" | "tools/list", statusCode?: number, code?: string}}>}
  */
-async function fetchMCPTools(serverUrl, apiKey, core) {
-  const authHeaders = { Authorization: apiKey };
+async function fetchMCPToolsResult(serverUrl, agentId, core, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS) {
+  const authHeaders = { Authorization: agentId };
 
   // Step 1: initialize – establish the session and capture Mcp-Session-Id if present
   /** @type {any} */
@@ -341,40 +415,119 @@ async function fetchMCPTools(serverUrl, apiKey, core) {
           protocolVersion: "2024-11-05",
         },
       },
-      DEFAULT_HTTP_TIMEOUT_MS
+      timeoutMs
     );
+    const initBody = parseMCPResponseBody(initResp.body);
+    if (initResp.statusCode !== 200 || !hasMCPResult(initBody)) {
+      core.warning(`  initialize did not succeed (HTTP ${initResp.statusCode})`);
+      return { tools: [], emptyWasSuccessful: false, retryable: isRetryableMCPFailure(initResp.statusCode, initBody), failure: { phase: "initialize", statusCode: initResp.statusCode } };
+    }
     const sessionId = initResp.headers["mcp-session-id"];
     if (sessionId && typeof sessionId === "string") {
       sessionHeader = { "Mcp-Session-Id": sessionId };
     }
   } catch (err) {
-    core.warning(`  initialize failed for ${serverUrl}: ${getErrorMessage(err)}`);
-    return [];
+    core.warning("  initialize failed due to a transport error");
+    return { tools: [], emptyWasSuccessful: false, retryable: true, failure: { phase: "initialize", code: safeMCPTransportCode(err) } };
   }
 
   // Step 2: notifications/initialized – required by MCP spec to complete the handshake.
-  // The server responds with 204 No Content; errors here are non-fatal.
+  // Accept an empty 2xx acknowledgment or a valid JSON-RPC result.
   try {
-    await httpPostJSON(serverUrl, { ...authHeaders, ...sessionHeader }, { jsonrpc: "2.0", method: "notifications/initialized", params: {} }, 10000);
+    const notificationResp = await httpPostJSON(serverUrl, { ...authHeaders, ...sessionHeader }, { jsonrpc: "2.0", method: "notifications/initialized", params: {} }, Math.min(10000, timeoutMs));
+    const notificationBody = parseMCPResponseBody(notificationResp.body);
+    const emptyBody = typeof notificationResp.body === "string" && notificationResp.body.trim() === "";
+    if (notificationResp.statusCode < 200 || notificationResp.statusCode >= 300 || (!emptyBody && !hasMCPResult(notificationBody))) {
+      core.warning(`  notifications/initialized did not succeed (HTTP ${notificationResp.statusCode})`);
+      return { tools: [], emptyWasSuccessful: false, retryable: isRetryableMCPFailure(notificationResp.statusCode, notificationBody), failure: { phase: "notifications/initialized", statusCode: notificationResp.statusCode } };
+    }
   } catch (err) {
-    core.warning(`  notifications/initialized failed for ${serverUrl}: ${getErrorMessage(err)}`);
+    core.warning("  notifications/initialized failed due to a transport error");
+    return { tools: [], emptyWasSuccessful: false, retryable: true, failure: { phase: "notifications/initialized", code: safeMCPTransportCode(err) } };
   }
 
   // Step 3: tools/list – get the available tool definitions
   try {
-    const listResp = await httpPostJSON(serverUrl, { ...authHeaders, ...sessionHeader }, { jsonrpc: "2.0", id: 2, method: "tools/list" }, DEFAULT_HTTP_TIMEOUT_MS);
+    const listResp = await httpPostJSON(serverUrl, { ...authHeaders, ...sessionHeader }, { jsonrpc: "2.0", id: 2, method: "tools/list" }, timeoutMs);
     const respBody = parseMCPResponseBody(listResp.body);
-    if (respBody && typeof respBody === "object" && "result" in respBody && respBody.result && typeof respBody.result === "object") {
+    if (listResp.statusCode === 200 && hasMCPResult(respBody)) {
       const result = respBody.result;
       if ("tools" in result && Array.isArray(result.tools)) {
-        return /** @type {Array<{name: string, description?: string, inputSchema?: unknown}>} */ result.tools;
+        return {
+          tools: /** @type {Array<{name: string, description?: string, inputSchema?: unknown}>} */ result.tools,
+          emptyWasSuccessful: true,
+          retryable: false,
+        };
       }
     }
-    return [];
+    return { tools: [], emptyWasSuccessful: false, retryable: isRetryableMCPFailure(listResp.statusCode, respBody), failure: { phase: "tools/list", statusCode: listResp.statusCode } };
   } catch (err) {
-    core.warning(`  tools/list failed for ${serverUrl}: ${getErrorMessage(err)}`);
-    return [];
+    core.warning("  tools/list failed due to a transport error");
+    return { tools: [], emptyWasSuccessful: false, retryable: true, failure: { phase: "tools/list", code: safeMCPTransportCode(err) } };
   }
+}
+
+/**
+ * Query the tools list from an MCP server via JSON-RPC.
+ *
+ * @param {string} serverUrl - HTTP URL of the MCP server endpoint
+ * @param {string} agentId - ****** for gateway authentication
+ * @param {typeof import("@actions/core")} core - GitHub Actions core
+ * @param {number} [timeoutMs=DEFAULT_HTTP_TIMEOUT_MS]
+ * @returns {Promise<Array<{name: string, description?: string, inputSchema?: unknown}>>}
+ */
+async function fetchMCPTools(serverUrl, agentId, core, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS) {
+  const result = await fetchMCPToolsResult(serverUrl, agentId, core, timeoutMs);
+  return result.tools;
+}
+
+/**
+ * Fetch MCP tools with retry on empty result.
+ *
+ * The MCP gateway may report a backend as "running" before that backend has
+ * finished building its internal tool schema (a race between process-level
+ * readiness and schema construction). This is more likely with large
+ * dispatch-workflow configs where building tool definitions takes long enough
+ * that tools/list can still return 0 tools immediately after the health check
+ * passes. Retrying a handful of times with a short delay bridges that gap, but
+ * only for successful empty tools/list responses; transport/protocol failures
+ * stop immediately so unavailable backends still fail fast.
+ *
+ * @param {string} serverUrl
+ * @param {string} agentId
+ * @param {string} serverName - Server name, used only for log messages
+ * @param {typeof import("@actions/core")} core
+ * @param {object} [options]
+ * @param {(ms: number) => Promise<void>} [options.sleep] - Delay function (injectable for tests)
+ * @param {(url: string, key: string, c: typeof import("@actions/core")) => Promise<Array<{name: string, description?: string, inputSchema?: unknown}> | {tools: Array<{name: string, description?: string, inputSchema?: unknown}>, emptyWasSuccessful: boolean}>} [options.fetchFn] - Fetch function (injectable for tests)
+ * @returns {Promise<Array<{name: string, description?: string, inputSchema?: unknown}>>}
+ */
+async function fetchMCPToolsWithRetry(serverUrl, agentId, serverName, core, { sleep = undefined, fetchFn = undefined } = {}) {
+  const doSleep = sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const doFetchResult = async (url, key, c) => {
+    if (!fetchFn) {
+      return fetchMCPToolsResult(url, key, c);
+    }
+    const result = await fetchFn(url, key, c);
+    if (Array.isArray(result)) {
+      return { tools: result, emptyWasSuccessful: true };
+    }
+    return result;
+  };
+  let result = await doFetchResult(serverUrl, agentId, core);
+  for (let attempt = 1; attempt <= TOOLS_EMPTY_MAX_RETRIES && result.emptyWasSuccessful && result.tools.length === 0; attempt++) {
+    core.warning(`  tools/list returned 0 tools for '${serverName}', retrying in ${TOOLS_EMPTY_RETRY_DELAY_MS}ms (attempt ${attempt}/${TOOLS_EMPTY_MAX_RETRIES})...`);
+    await doSleep(TOOLS_EMPTY_RETRY_DELAY_MS);
+    result = await doFetchResult(serverUrl, agentId, core);
+    if (!result.emptyWasSuccessful) {
+      core.warning(`  stopping empty tools/list retries for '${serverName}' because tools/list did not complete successfully`);
+      break;
+    }
+  }
+  if (result.emptyWasSuccessful && result.tools.length === 0) {
+    core.warning(`  tools/list still returned 0 tools for '${serverName}' after ${TOOLS_EMPTY_MAX_RETRIES} retries; continuing with empty tool list`);
+  }
+  return result.tools;
 }
 
 /**
@@ -384,27 +537,27 @@ async function fetchMCPTools(serverUrl, apiKey, core) {
  * protocol (initialize → notifications/initialized → tools/call), help
  * display, argument parsing, console logging, and JSONL audit logging.
  *
- * The gateway API key is baked directly into the generated script at
- * generation time because MCP_GATEWAY_API_KEY is excluded from the AWF
- * sandbox environment (--exclude-env MCP_GATEWAY_API_KEY) and would not
+ * The gateway agent ID is baked directly into the generated script at
+ * generation time because MCP_GATEWAY_AGENT_ID is excluded from the AWF
+ * sandbox environment (--exclude-env MCP_GATEWAY_AGENT_ID) and would not
  * be accessible to the agent at runtime.
  *
  * @param {string} serverName - Name of the MCP server
  * @param {string} serverUrl - HTTP URL of the MCP server endpoint
  * @param {string} toolsFile - Path to the cached tools JSON file
- * @param {string} apiKey - Gateway API key, baked into the script at generation time
+ * @param {string} agentId - Gateway agent ID, baked into the script at generation time
  * @param {string} bridgeScript - Absolute path to mcp_cli_bridge.cjs
  * @returns {string} Content of the bash wrapper script
  */
-function generateCLIWrapperScript(serverName, serverUrl, toolsFile, apiKey, bridgeScript) {
+function generateCLIWrapperScript(serverName, serverUrl, toolsFile, agentId, bridgeScript) {
   // Sanitize all values that are embedded in the shell script to prevent injection.
   // Server names are pre-validated by isValidServerName(), but we still escape all
   // values for defense-in-depth.
   const safeName = shellEscapeDoubleQuoted(serverName);
   const safeUrl = shellEscapeDoubleQuoted(serverUrl);
-  const safeToolsFile = shellEscapeDoubleQuoted(toolsFile);
-  const safeApiKey = shellEscapeDoubleQuoted(apiKey);
-  const safeBridge = shellEscapeDoubleQuoted(bridgeScript);
+  const safeToolsFile = shellEscapeDoubleQuoted(path.relative(CLI_BIN_DIR, toolsFile));
+  const safeAgentId = shellEscapeDoubleQuoted(agentId);
+  const safeBridge = shellEscapeDoubleQuoted(path.relative(CLI_BIN_DIR, bridgeScript));
 
   return `#!/usr/bin/env bash
 set +o histexpand
@@ -420,11 +573,12 @@ set +o histexpand
 # All calls are delegated to the mcp_cli_bridge.cjs Node.js bridge which
 # handles the MCP session protocol, logging, and JSONL audit trail.
 
-exec node "${safeBridge}" \\
+CLI_DIR="$(cd -- "$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
+exec node "\${CLI_DIR}/${safeBridge}" \\
   --server-name "${safeName}" \\
   --server-url "${safeUrl}" \\
-  --tools-file "${safeToolsFile}" \\
-  --api-key "${safeApiKey}" \\
+  --tools-file "\${CLI_DIR}/${safeToolsFile}" \\
+  --api-key "${safeAgentId}" \\
   "\$@"
 `;
 }
@@ -438,6 +592,7 @@ async function main() {
   const core = global.core;
 
   core.info("Mounting MCP servers as CLI tools...");
+  clearStaleSafeOutputsRegistrationEvidence();
 
   if (!fs.existsSync(MANIFEST_FILE)) {
     core.info("No MCP CLI manifest found, skipping CLI mounting");
@@ -466,7 +621,7 @@ async function main() {
     fs.mkdirSync(CLI_BIN_DIR, { recursive: true });
     fs.mkdirSync(TOOLS_DIR, { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create MCP CLI directories: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to create MCP CLI directories: ${getErrorMessage(err)}`, { cause: err });
   }
 
   // The bridge script lives alongside mount_mcp_as_cli.cjs in the setup actions directory.
@@ -478,9 +633,9 @@ async function main() {
     core.info(`Bridge script: ${bridgeScript}`);
   }
 
-  const apiKey = process.env.MCP_GATEWAY_API_KEY || "";
-  if (!apiKey) {
-    core.warning("MCP_GATEWAY_API_KEY is not set; generated CLI wrappers will not be able to authenticate with the gateway");
+  const agentId = process.env.MCP_GATEWAY_AGENT_ID || "";
+  if (!agentId) {
+    core.warning("MCP_GATEWAY_AGENT_ID is not set; generated CLI wrappers will not be able to authenticate with the gateway");
   }
 
   const gatewayDomain = process.env.MCP_GATEWAY_DOMAIN || "";
@@ -521,15 +676,19 @@ async function main() {
 
     const toolsFile = path.join(TOOLS_DIR, `${name}.json`);
 
-    // Query tools from the server using the host-accessible URL (mount step runs on host)
-    let tools = await fetchMCPTools(url, apiKey, core);
+    // Query tools from the server using the host-accessible URL (mount step runs on host).
+    // Retries on empty to handle the race between gateway health-reporting and
+    // the backend finishing internal tool-schema construction (common with large configs).
+    let tools = await fetchMCPToolsWithRetry(url, agentId, name, core);
     const validate = SERVER_VALIDATORS[name];
     if (validate) {
       tools = validate(tools, core);
     }
     core.info(`  Found ${tools.length} tool(s)`);
 
-    // Cache the tool list
+    // Cache the tool list. This file only contains tool name/description/schema
+    // metadata returned by the gateway; it does not contain the agent ID or any
+    // other secret, so world-readable permissions (0o644) are acceptable here.
     try {
       fs.writeFileSync(toolsFile, JSON.stringify(tools, null, 2), { mode: 0o644 });
     } catch (err) {
@@ -538,13 +697,31 @@ async function main() {
 
     // Write the CLI wrapper script using the container-accessible URL
     const scriptPath = path.join(CLI_BIN_DIR, name);
+    let scriptFd;
     try {
-      fs.writeFileSync(scriptPath, generateCLIWrapperScript(name, containerUrl, toolsFile, apiKey, bridgeScript), { mode: 0o755 });
+      // Owner-only permissions: the wrapper script embeds the plaintext gateway agent ID,
+      // so it must not be world- or group-readable (matches chmod 600 used elsewhere for
+      // this same credential, e.g. convert_gateway_config_copilot.sh).
+      // Note: writeFileSync(mode) only applies when creating a new file; for existing files,
+      // force mode with fchmodSync so prior permissive modes (e.g., 0o755) are corrected.
+      scriptFd = fs.openSync(scriptPath, "w", 0o700);
+      fs.fchmodSync(scriptFd, 0o700);
+      fs.writeFileSync(scriptFd, generateCLIWrapperScript(name, containerUrl, toolsFile, agentId, bridgeScript), "utf8");
+      fs.closeSync(scriptFd);
+      scriptFd = undefined;
       mountedServers.push(name);
       mountedServerTools.push({ name, tools });
       core.info(`  ✓ Mounted as: ${scriptPath}`);
     } catch (err) {
       core.warning(`  Failed to write CLI wrapper for ${name}: ${getErrorMessage(err)}`);
+    } finally {
+      if (scriptFd !== undefined) {
+        try {
+          fs.closeSync(scriptFd);
+        } catch {
+          // Ignore close errors in cleanup path; main error already reported above.
+        }
+      }
     }
   }
 
@@ -582,6 +759,8 @@ module.exports = {
   AWF_GATEWAY_IP,
   main,
   fetchMCPTools,
+  fetchMCPToolsResult,
+  fetchMCPToolsWithRetry,
   generateCLIWrapperScript,
   isValidServerName,
   shellEscapeDoubleQuoted,
@@ -590,7 +769,10 @@ module.exports = {
   loadToolsFromJSONFile,
   recoverSafeOutputsToolsIfNeeded,
   getSafeOutputsGatewayEmptyFlagPath,
+  clearStaleSafeOutputsRegistrationEvidence,
   writeSafeOutputsGatewayEmptyFlag,
   SERVER_VALIDATORS,
   buildMCPCLIServersPromptList,
+  TOOLS_EMPTY_MAX_RETRIES,
+  TOOLS_EMPTY_RETRY_DELAY_MS,
 };

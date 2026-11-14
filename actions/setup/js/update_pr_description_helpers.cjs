@@ -7,9 +7,14 @@
  * @module update_pr_description_helpers
  */
 
-const { assembleMarkdownBodyParts, buildGeneratedFooter } = require("./markdown_body_helpers.cjs");
-const { generateWorkflowIdMarker } = require("./generate_footer.cjs");
+const { assembleReportBodyParts, buildGeneratedFooter, buildGeneratedFooterBlocks } = require("./markdown_body_helpers.cjs");
+const { getBodyFooterBlocks } = require("./messages_footer.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
+const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
+const { generateHistoryUrl } = require("./generate_history_link.cjs");
+const { appendReportExecutionProvenance, stripExecutionProvenance } = require("./execution_provenance.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
 
 /**
  * Build the AI footer with workflow attribution
@@ -62,20 +67,22 @@ function buildIslandEndMarker(workflowId) {
  * @returns {{found: boolean, startIndex: number, endIndex: number}} Island location info
  */
 function findIsland(body, workflowId) {
-  const startMarker = buildIslandStartMarker(workflowId);
-  const endMarker = buildIslandEndMarker(workflowId);
-
-  const startIndex = body.indexOf(startMarker);
-  if (startIndex === -1) {
+  const starts = [buildIslandStartMarker(workflowId), `<!-- gh-aw-island-start: ${workflowId} -->`];
+  const ends = [buildIslandEndMarker(workflowId), `<!-- gh-aw-island-end: ${workflowId} -->`];
+  const startIndex = Math.min(...starts.map(marker => body.indexOf(marker)).filter(index => index >= 0));
+  if (!Number.isFinite(startIndex)) {
     return { found: false, startIndex: -1, endIndex: -1 };
   }
 
-  const endIndex = body.indexOf(endMarker, startIndex);
-  if (endIndex === -1) {
+  const endPositions = ends
+    .map(marker => ({ index: body.indexOf(marker, startIndex), length: marker.length }))
+    .filter(position => position.index >= 0)
+    .sort((a, b) => a.index - b.index);
+  if (!endPositions.length) {
     return { found: false, startIndex: -1, endIndex: -1 };
   }
 
-  return { found: true, startIndex, endIndex: endIndex + endMarker.length };
+  return { found: true, startIndex, endIndex: endPositions[0].index + endPositions[0].length };
 }
 
 /**
@@ -89,68 +96,133 @@ function findIsland(body, workflowId) {
  * @param {string} params.runUrl - URL of the workflow run
  * @param {string} params.workflowId - Workflow ID (stable identifier across runs)
  * @param {boolean} [params.includeFooter=true] - Whether to include AI-generated footer (default: true)
+ * @param {string} [params.bodyFooter] - Deterministic body footer template
  * @param {string} [params.historyUrl] - GitHub search URL for items created by this workflow
  * @returns {string} Updated body content
  */
 function updateBody(params) {
-  const { currentBody, newContent, operation, workflowName, runUrl, workflowId, includeFooter = true, historyUrl } = params;
-  // When footer is enabled use the full footer (includes install instructions, XML marker, etc.)
-  // When footer is disabled still add standalone workflow-id marker for searchability
-  const aiFooter = includeFooter ? buildAIFooter(workflowName, runUrl, historyUrl) : "";
-  const workflowIdMarker = !includeFooter && workflowId ? `\n\n${generateWorkflowIdMarker(workflowId)}` : "";
+  return renderSizedReport(buildUpdatedBodyReport(params)).body;
+}
 
-  // Sanitize new content to prevent injection attacks
+/**
+ * @param {Parameters<typeof updateBody>[0]} params
+ * @returns {import("./report_ast.cjs").Report}
+ */
+function buildUpdatedBodyReport(params) {
+  const { currentBody, newContent, operation, workflowName, runUrl, workflowId, includeFooter = true, bodyFooter, historyUrl } = params;
   const sanitizedNewContent = sanitizeContent(newContent);
-
-  // Inject CAUTION at top of new content if threat detection warning was raised
-  const { detectionCaution } = assembleMarkdownBodyParts({
+  const ctx = typeof context !== "undefined" ? context : null;
+  const { detectionCaution } = assembleReportBodyParts({
     includeFooter: false,
     workflowName,
     runUrl,
   });
-  const contentWithCaution = detectionCaution ? `${detectionCaution}\n\n${sanitizedNewContent}` : sanitizedNewContent;
+  const content = [...detectionCaution, ...parseReportMarkdown(stripExecutionProvenance(sanitizedNewContent), { minimumHeadingLevel: 2, allowMetadata: true, agentTainted: true })];
+  if (includeFooter)
+    content.push(
+      ...buildGeneratedFooterBlocks({
+        workflowName,
+        runUrl,
+        historyUrl,
+        workflowSource: process.env.GH_AW_WORKFLOW_SOURCE ?? "",
+        workflowSourceURL: process.env.GH_AW_WORKFLOW_SOURCE_URL ?? "",
+        triggeringIssueNumber: ctx?.payload?.issue?.number,
+        triggeringPRNumber: ctx?.payload?.pull_request?.number,
+        triggeringDiscussionNumber: ctx?.payload?.discussion?.number,
+      })
+    );
+  content.push(...getBodyFooterBlocks(bodyFooter, { workflowName, runUrl }));
+  if (!includeFooter && workflowId) content.push({ type: "xml_marker", name: "gh-aw-workflow-id", value: workflowId, agentTainted: false });
+  /** @param {string} source */
+  const existing = source => parseReportMarkdown(stripExecutionProvenance(source), { minimumHeadingLevel: 2, allowMetadata: true, agentTainted: true });
+  /** @param {import("./report_ast.cjs").ReportBlock[]} children @returns {import("./report_ast.cjs").Report} */
+  const report = children => ({ type: "report", title: "Updated body", children });
 
   if (operation === "replace") {
     // Replace: use new content with optional AI footer
     core.info("Operation: replace (full body replacement)");
-    return contentWithCaution + aiFooter + workflowIdMarker;
+    return report(content);
   }
 
   if (operation === "replace-island") {
     // Try to find existing island for this workflow ID
     const island = findIsland(currentBody, workflowId);
-    const startMarker = buildIslandStartMarker(workflowId);
-    const endMarker = buildIslandEndMarker(workflowId);
-    const islandContent = `${startMarker}\n${contentWithCaution}${aiFooter}${workflowIdMarker}\n${endMarker}`;
+    /** @type {import("./report_ast.cjs").ReportBlock[]} */
+    const islandContent = [
+      { type: "xml_marker", name: "gh-aw-island-start", value: workflowId, compact: true, agentTainted: false },
+      ...content,
+      { type: "xml_marker", name: "gh-aw-island-end", value: workflowId, compact: true, agentTainted: false },
+    ];
 
     if (island.found) {
       // Replace the island content
       core.info(`Operation: replace-island (updating existing island for workflow ${workflowId})`);
       const before = currentBody.substring(0, island.startIndex);
       const after = currentBody.substring(island.endIndex);
-      return before + islandContent + after;
+      return report([...existing(before), ...islandContent, ...existing(after)]);
     } else {
       // Island not found, fall back to append mode
       core.info(`Operation: replace-island (island not found for workflow ${workflowId}, falling back to append)`);
-      return currentBody + `\n\n---\n\n${islandContent}`;
+      return report([...existing(currentBody), { type: "separator", agentTainted: false }, ...islandContent]);
     }
   }
 
   if (operation === "prepend") {
     // Prepend: add content, AI footer (if enabled), and horizontal line at the start
     core.info("Operation: prepend (add to start with separator)");
-    const prependSection = `${contentWithCaution}${aiFooter}${workflowIdMarker}\n\n---\n\n`;
-    return prependSection + currentBody;
+    return report([...content, { type: "separator", agentTainted: false }, ...existing(currentBody)]);
   }
 
   // Default to append
   core.info("Operation: append (add to end with separator)");
-  const appendSection = `\n\n---\n\n${contentWithCaution}${aiFooter}${workflowIdMarker}`;
-  return currentBody + appendSection;
+  return report([...existing(currentBody), { type: "separator", agentTainted: false }, ...content]);
+}
+
+/**
+ * Build an updated entity body with workflow attribution.
+ * @param {Object} params - Body update parameters
+ * @param {any} params.context - GitHub Actions context for the target repository
+ * @param {string} params.currentBody - Current body content
+ * @param {string} params.newContent - New content to add or replace
+ * @param {string} params.operation - Body update operation
+ * @param {boolean} params.includeFooter - Whether to include the generated footer
+ * @param {any} [params.workflowRepo] - Original workflow repository for run attribution
+ * @param {"issue" | "pull_request"} params.itemType - Updated entity type
+ * @param {string} [params.bodyFooter] - Deterministic body footer template
+ * @returns {string} Updated body content
+ */
+function buildUpdatedBody({ context, currentBody, newContent, operation, includeFooter, workflowRepo, itemType, bodyFooter }) {
+  const workflowName = process.env.GH_AW_WORKFLOW_NAME || "GitHub Agentic Workflow";
+  const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
+  const workflowCallId = process.env.GH_AW_CALLER_WORKFLOW_ID || "";
+  const runUrl = buildWorkflowRunUrl(context, workflowRepo || context.repo);
+  const historyUrl =
+    generateHistoryUrl({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      itemType,
+      workflowCallId,
+      workflowId,
+      serverUrl: context.serverUrl,
+    }) || undefined;
+
+  const report = buildUpdatedBodyReport({
+    currentBody,
+    newContent,
+    operation,
+    workflowName,
+    runUrl,
+    workflowId,
+    includeFooter,
+    bodyFooter,
+    historyUrl,
+  });
+  return renderSizedReport(appendReportExecutionProvenance(report, workflowName, runUrl)).body;
 }
 
 module.exports = {
   buildAIFooter,
+  buildUpdatedBody,
   buildIslandStartMarker,
   buildIslandEndMarker,
   findIsland,

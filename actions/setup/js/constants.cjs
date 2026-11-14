@@ -21,6 +21,12 @@ const AGENT_OUTPUT_FILENAME = "agent_output.json";
  */
 const TMP_GH_AW_PATH = "/tmp/gh-aw";
 
+/**
+ * Default GitHub REST API version for Actions clients.
+ * @type {string}
+ */
+const GITHUB_API_VERSION = "2026-03-10";
+
 // ---------------------------------------------------------------------------
 // GitHub reviewer bot
 // ---------------------------------------------------------------------------
@@ -67,6 +73,18 @@ const MAX_LABELS = 10;
  */
 const MAX_ASSIGNEES = 5;
 
+/**
+ * Maximum number of older entities to close
+ * @type {number}
+ */
+const MAX_CLOSE_COUNT = 10;
+
+/**
+ * Maximum aggregate bytes retained across protected command output streams and attempts.
+ * @type {number}
+ */
+const MAX_CAPTURE_BYTES = 64 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // File paths
 // ---------------------------------------------------------------------------
@@ -90,6 +108,16 @@ const RPC_MESSAGES_PATH = `${TMP_GH_AW_PATH}/mcp-logs/rpc-messages.jsonl`;
 const MANIFEST_FILE_PATH = `${TMP_GH_AW_PATH}/safe-output-items.jsonl`;
 
 /**
+ * Path to the ledger transaction log JSONL file.
+ * The ledger MCP server appends redacted `ledger_mutation` audit entries here during the
+ * agent run. A trusted step merges validated entries into the safe-output file before
+ * ingestion; the file is deliberately separate from the safe-output manifest so agent-run
+ * writes can never be mistaken for executed safe outputs.
+ * @type {string}
+ */
+const LEDGER_TRANSACTION_LOG_PATH = `${TMP_GH_AW_PATH}/ledger-transactions.jsonl`;
+
+/**
  * Path to the temporary ID map JSON file.
  * This file stores the mapping of temporary IDs (e.g., aw_abc123) to their resolved
  * GitHub resource references ({repo, number}) for review and audit purposes.
@@ -97,6 +125,16 @@ const MANIFEST_FILE_PATH = `${TMP_GH_AW_PATH}/safe-output-items.jsonl`;
  * @type {string}
  */
 const TEMPORARY_ID_MAP_FILE_PATH = `${TMP_GH_AW_PATH}/temporary-id-map.json`;
+
+/**
+ * Path to the safe-output error report JSON file.
+ * This file records structured diagnostics (error code, message, failing safe-output
+ * types) whenever the safe-output handler manager fails, so that failures of the
+ * "Process Safe Outputs" step remain diagnosable after the job logs expire.
+ * The file is uploaded as part of the safe-outputs-items artifact.
+ * @type {string}
+ */
+const SAFE_OUTPUT_ERRORS_FILE_PATH = `${TMP_GH_AW_PATH}/safe-output-errors.json`;
 
 /**
  * Path to the OTLP telemetry mirror file.
@@ -130,20 +168,74 @@ const DETECTION_LOG_FILENAME = "detection.log";
  */
 const DETECTION_RESULT_FILENAME = "detection_result.json";
 
+/**
+ * Default timeout for a Codex MCP tool call when no server timeout is configured.
+ * @type {number}
+ */
+const DEFAULT_MCP_CALL_WATCHDOG_MS = 120_000;
+
+/**
+ * Grace period added to the configured MCP tool timeout before terminating Codex.
+ * @type {number}
+ */
+const MCP_CALL_TRANSPORT_GRACE_MS = 60_000;
+
+/**
+ * Maximum number of prior runs to check when restoring the AIC scan cache.
+ * @type {number}
+ */
+const MAX_RESTORE_RUNS = 10;
+
+/**
+ * Maximum number of repository history pages to search when restoring the AIC scan cache.
+ * @type {number}
+ */
+const MAX_RESTORE_PAGES = 25;
+
+/**
+ * Time window searched when restoring the AIC scan cache.
+ * @type {number}
+ */
+const SCAN_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Proxy environment variables forwarded to setup containers.
+ * @type {ReadonlyArray<string>}
+ */
+const PROXY_ENV_NAMES = Object.freeze(["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"]);
+
+/**
+ * GitHub Actions step name for starting the MCP gateway.
+ * @type {string}
+ */
+const STEP_NAME_START_MCP_GATEWAY = "Start MCP Gateway";
+
 module.exports = {
   AGENT_OUTPUT_FILENAME,
   TMP_GH_AW_PATH,
+  GITHUB_API_VERSION,
   COPILOT_REVIEWER_BOT,
   COPILOT_REVIEWER_BOT_ID,
   FAQ_CREATE_PR_PERMISSIONS_URL,
   MAX_LABELS,
   MAX_ASSIGNEES,
+  MAX_CLOSE_COUNT,
+  MAX_CAPTURE_BYTES,
   GATEWAY_JSONL_PATH,
   RPC_MESSAGES_PATH,
   MANIFEST_FILE_PATH,
+  LEDGER_TRANSACTION_LOG_PATH,
   TEMPORARY_ID_MAP_FILE_PATH,
+  SAFE_OUTPUT_ERRORS_FILE_PATH,
   OTEL_JSONL_PATH,
   GITHUB_RATE_LIMITS_JSONL_PATH,
   DETECTION_LOG_FILENAME,
   DETECTION_RESULT_FILENAME,
+  DEFAULT_MCP_CALL_WATCHDOG_MS,
+  MCP_CALL_TRANSPORT_GRACE_MS,
+  MAX_RESTORE_RUNS,
+  MAX_RESTORE_PAGES,
+  SCAN_WINDOW_MS,
+  PROXY_ENV_NAMES,
+  STEP_NAME_START_MCP_GATEWAY,
 };

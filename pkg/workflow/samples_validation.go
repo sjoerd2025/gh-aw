@@ -4,18 +4,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/syncutil"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 var samplesValidationLog = logger.New("workflow:samples_validation")
 
-var sampleRuntimeExpressionPattern = regexp.MustCompile(`(?s)\$\{\{.*?\}\}`)
+var sampleRuntimeExpressionPattern = actionslanguageservice.Pattern{}
 
 // sampleRuntimeExpressionPlaceholder is the sentinel substituted for any
 // sample value that contains a `${{ ... }}` GitHub Actions expression, used
@@ -28,12 +29,12 @@ const sampleRuntimeExpressionPlaceholder = "aw_sample"
 // that are NOT passed to the MCP tool's `tools/call` arguments. They are stripped
 // from the sample before schema validation and consumed by the replay driver
 // (e.g. to pre-stage a branch + patch on disk).
-var sampleSidecarFields = map[string]map[string]bool{
+var sampleSidecarFields = map[string]map[string]struct{}{
 	"create_pull_request": {
-		"patch": true,
+		"patch": {},
 	},
 	"push_to_pull_request_branch": {
-		"patch": true,
+		"patch": {},
 	},
 }
 
@@ -59,23 +60,19 @@ type toolSchemaEntry struct {
 // compiledToolSchemas caches the per-tool jsonschema.Schema parsed from the
 // embedded safe_outputs_tools.json. Compiled lazily on first use.
 var (
-	compiledToolSchemasOnce sync.Once
-	compiledToolSchemas     map[string]toolSchemaEntry
-	compiledToolSchemasErr  error
-
+	compiledToolSchemasLoader      syncutil.OnceLoader[map[string]toolSchemaEntry]
 	sortedSafeOutputFieldNamesOnce sync.Once
 	sortedSafeOutputFieldNames     []string
 )
 
 func getCompiledToolSchemas() (map[string]toolSchemaEntry, error) {
-	compiledToolSchemasOnce.Do(func() {
+	return compiledToolSchemasLoader.Get(func() (map[string]toolSchemaEntry, error) {
 		var tools []struct {
 			Name        string          `json:"name"`
 			InputSchema json.RawMessage `json:"inputSchema"`
 		}
 		if err := json.Unmarshal([]byte(safeOutputsToolsJSONContent), &tools); err != nil {
-			compiledToolSchemasErr = fmt.Errorf("failed to parse safe_outputs_tools.json for samples validation: %w", err)
-			return
+			return nil, fmt.Errorf("failed to parse safe_outputs_tools.json for samples validation: %w", err)
 		}
 
 		sharedDefs := extractSharedInputSchemaDefs(tools)
@@ -86,28 +83,24 @@ func getCompiledToolSchemas() (map[string]toolSchemaEntry, error) {
 			}
 			var rawMap map[string]any
 			if err := json.Unmarshal(t.InputSchema, &rawMap); err != nil {
-				compiledToolSchemasErr = fmt.Errorf("failed to parse inputSchema for tool %q: %w", t.Name, err)
-				return
+				return nil, fmt.Errorf("failed to parse inputSchema for tool %q: %w", t.Name, err)
 			}
 			normalizeInputSchemaRefs(rawMap, sharedDefs)
 			normalizedSchemaBytes, err := json.Marshal(rawMap)
 			if err != nil {
-				compiledToolSchemasErr = fmt.Errorf("failed to normalize inputSchema for tool %q: %w", t.Name, err)
-				return
+				return nil, fmt.Errorf("failed to normalize inputSchema for tool %q: %w", t.Name, err)
 			}
 
 			schemaURL := fmt.Sprintf("inmem://safe-outputs-tools/%s.json", t.Name)
 			schema, err := compileSchema(string(normalizedSchemaBytes), schemaURL)
 			if err != nil {
-				compiledToolSchemasErr = fmt.Errorf("failed to compile inputSchema for tool %q: %w", t.Name, err)
-				return
+				return nil, fmt.Errorf("failed to compile inputSchema for tool %q: %w", t.Name, err)
 			}
 			out[t.Name] = toolSchemaEntry{raw: rawMap, compiled: schema}
 		}
 		samplesValidationLog.Printf("Compiled %d safe-outputs tool schemas for sample validation", len(out))
-		compiledToolSchemas = out
+		return out, nil
 	})
-	return compiledToolSchemas, compiledToolSchemasErr
 }
 
 func extractSharedInputSchemaDefs(tools []struct {
@@ -205,7 +198,7 @@ func validateSafeOutputsSamples(config *SafeOutputsConfig) error {
 			return err
 		}
 	}
-	return nil
+	return validateConnectorSamples(config)
 }
 
 // extractBaseSafeOutputConfig returns the embedded BaseSafeOutputConfig of the
@@ -246,7 +239,39 @@ func validateSamplesForTool(toolName string, samples []map[string]any) error {
 		return fmt.Errorf("samples: no MCP tool schema found for %q (yaml key %q). Available tools come from pkg/workflow/js/safe_outputs_tools.json", toolName, toolDisplayKey(toolName))
 	}
 	displayKey := toolDisplayKey(toolName)
-	sidecars := sampleSidecarFields[toolName]
+	return validateSamplesAgainstSchema(displayKey, samples, entry, sampleSidecarFields[toolName])
+}
+
+func validateConnectorSamples(config *SafeOutputsConfig) error {
+	for _, name := range sliceutil.SortedKeys(config.Scripts) {
+		script := config.Scripts[name]
+		if script == nil || script.connectorOptions == nil || len(script.connectorOptions.Samples) == 0 {
+			continue
+		}
+		if script.connectorInputSchema == nil {
+			return fmt.Errorf("safe-outputs.%s.samples: missing generated connector tool schema", name)
+		}
+		data, err := json.Marshal(script.connectorInputSchema)
+		if err != nil {
+			return fmt.Errorf("safe-outputs.%s.samples: encode tool schema: %w", name, err)
+		}
+		schema, err := compileSchema(string(data), "inmem://connector-samples/"+name+".json")
+		if err != nil {
+			return fmt.Errorf("safe-outputs.%s.samples: compile tool schema: %w", name, err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("safe-outputs.%s.samples: decode tool schema: %w", name, err)
+		}
+		entry := toolSchemaEntry{raw: raw, compiled: schema}
+		if err := validateSamplesAgainstSchema(name, script.connectorOptions.Samples, entry, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSamplesAgainstSchema(displayKey string, samples []map[string]any, entry toolSchemaEntry, sidecars map[string]struct{}) error {
 	for i, sample := range samples {
 		stripped := stripSidecarFields(sample, sidecars)
 		substituted, ok := substituteRuntimeExpressionsForValidation(stripped, entry.raw).(map[string]any)
@@ -416,10 +441,10 @@ func schemaNumberAsInt(schema map[string]any, key string) (int, bool) {
 // stripSidecarFields returns a shallow copy of sample with sidecar keys removed.
 // The original map is never modified, even when no sidecars are configured —
 // callers may mutate the returned map without affecting the caller's input.
-func stripSidecarFields(sample map[string]any, sidecars map[string]bool) map[string]any {
+func stripSidecarFields(sample map[string]any, sidecars map[string]struct{}) map[string]any {
 	out := make(map[string]any, len(sample))
 	for k, v := range sample {
-		if sidecars[k] {
+		if _, isSidecar := sidecars[k]; isSidecar {
 			continue
 		}
 		out[k] = v

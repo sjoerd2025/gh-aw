@@ -29,7 +29,9 @@ on:
           }
           core.info(`has_changes=${hasChanges}`);
           core.setOutput('has_changes', hasChanges ? 'true' : 'false');
-max-daily-ai-credits: 10000
+max-daily-ai-credits:
+  value: 10000
+  backend: repo-memory
 permissions:
   contents: read
   issues: read
@@ -37,9 +39,9 @@ permissions:
   copilot-requests: write
 tracker-id: daily-cli-performance
 engine:
-  id: copilot
-  copilot-sdk: true
-max-tool-denials: 3
+  id: codex
+  model-provider: github
+model: copilot/gpt-6-luna
 tools:
   cli-proxy: true
   repo-memory:
@@ -50,20 +52,24 @@ tools:
   bash: true
   edit:
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default, issues]
 safe-outputs:
-  create-issue:
-    expires: 2d
+  steer: false
+  create-pull-request:
+    draft: true
+    exclude-lock-yml: true
     title-prefix: "[performance] "
     labels: [performance, automation, cookie]
     max: 3
-    group: true
   add-comment:
     max: 5
 timeout-minutes: 20
 strict: true
 imports:
+  - shared/pr-safe-output-defaults.md
+  - shared/lock-safe-pull-request.md
+  - shared/mcp-pagination.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily-cli-performance] "
@@ -79,7 +85,7 @@ features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    id: awf
 evals:
   - id: benchmarks_run
     question: Did the agent run CLI performance benchmarks and track performance trends?
@@ -91,11 +97,11 @@ evals:
 
 # Daily CLI Performance Agent
 
-You are the Daily CLI Performance Agent - an expert system that monitors compilation performance, tracks benchmarks over time, detects regressions, and opens issues when performance problems are found.
+You are the Daily CLI Performance Agent - an expert system that monitors compilation performance, tracks benchmarks over time, detects regressions, and implements validated fixes in pull requests.
 
 ## Mission
 
-Run daily performance benchmarks for workflow compilation, store results in cache memory, analyze trends, and open issues if performance regressions are detected.
+Run daily performance benchmarks for workflow compilation, store results in cache memory, analyze trends, and implement confirmed performance regressions as validated pull requests.
 
 **Repository**: ${{ github.repository }}
 **Run ID**: ${{ github.run_id }}
@@ -104,12 +110,20 @@ Run daily performance benchmarks for workflow compilation, store results in cach
 ## Available Safe-Input Tools
 
 This workflow imports `shared/go-make.md` which provides:
-- **mcpscripts-go** - Execute Go commands (e.g., args: "test ./...", "build ./cmd/gh-aw")
-- **mcpscripts-make** - Execute Make targets (e.g., args: "build", "test-unit", "bench")
+- **mcpscripts-go** - Execute Go commands (e.g., args: ["test", "./..."], ["build", "./cmd/gh-aw"])
+- **mcpscripts-make** - Execute Make targets (e.g., args: ["build"], ["test-unit"], ["bench"])
 
 **IMPORTANT**: Use **bash** for all benchmark and validation commands in this workflow. MCP connections time out after ~5 minutes of inactivity; the analysis phases in this workflow may exceed that threshold, causing end-of-phase MCP calls to fail with `MCP error -32003: context canceled`. Always prefer `make <target>` or `go <args>` in bash over `mcpscripts-*` tools in this workflow.
 
 ## Phase 1: Run Performance Benchmarks
+
+Toolchain and cache access are governed by the immutable security policy; this
+task grants no additional permissions. Do not inspect the process environment,
+provision toolchains, or alter environment/cache settings to work around policy.
+Never substitute restored historical metrics for a new measurement.
+If security policy blocks a required benchmark
+or validation command, call `report_incomplete` with the limitation; do not
+store partial results or create an unvalidated regression pull request.
 
 ### 1.1 Run Compilation Benchmarks
 
@@ -128,6 +142,8 @@ make bench-performance
 ```
 
 This runs targeted performance benchmarks and saves results to `bench_performance.txt`.
+If the command fails, stop and call `report_incomplete`; do not parse or persist
+its partial output as a successful measurement.
 
 The targeted benchmarks include:
 - **Workflow compilation**: CompileSimpleWorkflow, CompileComplexWorkflow, CompileMCPWorkflow, CompileMemoryUsage
@@ -155,71 +171,26 @@ grep "Benchmark" /tmp/gh-aw/agent/benchmarks/bench_results.txt > /tmp/gh-aw/agen
 
 ### 1.2 Parse Benchmark Results
 
-Parse the benchmark output and extract key metrics:
+Parse the benchmark output and require every expected benchmark with complete,
+finite metrics before updating history or analyzing trends:
 
 ```bash
-# Extract benchmark results using awk
-cat > /tmp/gh-aw/agent/benchmarks/parse_results.sh << 'EOF'
-#!/bin/bash
-# Parse Go benchmark output and create JSON
-results_file="/tmp/gh-aw/agent/benchmarks/bench_results.txt"
-output_file="/tmp/gh-aw/agent/benchmarks/current_metrics.json"
-
-# Initialize JSON
-echo "{" > "$output_file"
-{
-  echo '  "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",'
-  echo '  "date": "'$(date -u +%Y-%m-%d)'",'
-  echo '  "benchmarks": {'
-} >> "$output_file"
-
-first=true
-while IFS= read -r line; do
-  if [[ $line =~ ^Benchmark([A-Za-z_]+)-([0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]ns/op[[:space:]]+([0-9]+)[[:space:]]B/op[[:space:]]+([0-9]+)[[:space:]]allocs/op ]]; then
-    name="${BASH_REMATCH[1]}"
-    iterations="${BASH_REMATCH[3]}"
-    ns_per_op="${BASH_REMATCH[4]}"
-    bytes_per_op="${BASH_REMATCH[5]}"
-    allocs_per_op="${BASH_REMATCH[6]}"
-    
-    # Add comma if not first entry
-    if [ "$first" = true ]; then
-      first=false
-    else
-      echo "," >> "$output_file"
-    fi
-    
-    # Write benchmark entry
-    {
-      echo -n "    \"$name\": {"
-      echo -n "\"ns_per_op\": $ns_per_op, "
-      echo -n "\"bytes_per_op\": $bytes_per_op, "
-      echo -n "\"allocs_per_op\": $allocs_per_op, "
-      echo -n "\"iterations\": $iterations"
-      echo -n "}"
-    } >> "$output_file"
-  fi
-done < "$results_file"
-
-{
-  echo ""
-  echo "  }"
-  echo "}"
-} >> "$output_file"
-
-echo "Parsed benchmark results to $output_file"
-cat "$output_file"
-EOF
-
-chmod +x /tmp/gh-aw/agent/benchmarks/parse_results.sh
-/tmp/gh-aw/agent/benchmarks/parse_results.sh
+python3 scripts/parse_benchmark_results.py \
+  /tmp/gh-aw/agent/benchmarks/bench_results.txt \
+  /tmp/gh-aw/agent/benchmarks/current_metrics.json
 ```
+
+If parsing fails, call `report_incomplete` with the validation error and do not
+update historical metrics or publish a regression claim.
 
 ## Phase 2: Load Historical Data
 
 ### 2.1 Check for Historical Benchmark Data
 
-Look for historical data in cache memory:
+Only after Phase 1 completes successfully, read
+`/tmp/gh-aw/repo-memory/default/benchmark_history.jsonl` for historical comparison
+only. This history must never substitute for the current run's benchmark
+measurement and validated metrics.
 
 ```bash
 # List available historical data
@@ -231,11 +202,42 @@ if [ ! -f /tmp/gh-aw/repo-memory/default/benchmark_history.jsonl ]; then
   touch /tmp/gh-aw/repo-memory/default/benchmark_history.jsonl
 fi
 
-# Prune history to the last 14 entries (bounded context window)
 HISTORY_FILE="/tmp/gh-aw/repo-memory/default/benchmark_history.jsonl"
 MAX_HISTORY_ENTRIES=14
+
+# Drop any lines that are not valid single-line JSON objects. This repairs files
+# corrupted by earlier runs that appended pretty-printed (multi-line) JSON.
+python3 - "$HISTORY_FILE" << 'PYEOF' || { echo "Error: failed to sanitize history file"; exit 1; }
+import json
+import sys
+
+path = sys.argv[1]
+valid = []
+dropped = 0
+with open(path, 'r') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            dropped += 1
+            continue
+        if isinstance(entry, dict):
+            valid.append(json.dumps(entry, separators=(',', ':')))
+        else:
+            dropped += 1
+if dropped:
+    print(f"Dropped {dropped} malformed history line(s)")
+with open(path, 'w') as f:
+    for line in valid:
+        f.write(line + "\n")
+print(f"Valid history entries: {len(valid)}")
+PYEOF
+
+# Prune history to the last 14 entries (bounded context window)
 ENTRY_COUNT=$(wc -l < "$HISTORY_FILE" | tr -d ' ')
-echo "Current history entries: $ENTRY_COUNT"
 if [ "$ENTRY_COUNT" -gt "$MAX_HISTORY_ENTRIES" ]; then
   echo "Pruning history to last $MAX_HISTORY_ENTRIES entries (was $ENTRY_COUNT)"
   tail -"$MAX_HISTORY_ENTRIES" "$HISTORY_FILE" > "${HISTORY_FILE}.tmp" \
@@ -244,11 +246,12 @@ if [ "$ENTRY_COUNT" -gt "$MAX_HISTORY_ENTRIES" ]; then
     || { echo "Error: failed to replace history file after pruning"; exit 1; }
 fi
 
-# Append current results to history
-{
-  cat /tmp/gh-aw/agent/benchmarks/current_metrics.json
-  echo ""
-} >> "$HISTORY_FILE"
+# Append current results to history as a single compacted JSONL line.
+# NOTE: current_metrics.json is pretty-printed, so it MUST be compacted before
+# appending — appending it verbatim breaks the one-object-per-line JSONL format.
+python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(',', ':')))" \
+  /tmp/gh-aw/agent/benchmarks/current_metrics.json >> "$HISTORY_FILE" \
+  || { echo "Error: failed to append current metrics to history file"; exit 1; }
 
 echo "Historical data updated ($(wc -l < "$HISTORY_FILE" | tr -d ' ') entries)"
 ```
@@ -267,6 +270,7 @@ Analyze benchmark trends and detect performance regressions
 """
 import json
 import os
+import statistics
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -281,6 +285,11 @@ MAX_HISTORY_ENTRIES = 14
 # Regression thresholds
 REGRESSION_THRESHOLD = 1.10  # 10% slower is a regression
 WARNING_THRESHOLD = 1.05     # 5% slower is a warning
+
+# Environment-noise detection: when most unrelated benchmarks regress at once, the
+# runner was almost certainly noisy (shared/overloaded CI host), not the code.
+NOISE_MIN_REGRESSIONS = 3    # need at least this many regressions to suspect noise
+NOISE_REGRESSION_RATIO = 0.5 # ...covering at least this fraction of all benchmarks
 
 def load_history():
     """Load historical benchmark data — capped at last MAX_HISTORY_ENTRIES entries to bound context size"""
@@ -319,9 +328,10 @@ def analyze_benchmark(name, current_ns, history_data):
             'change_percent': 0
         }
     
-    # Calculate average of recent history (last 7 data points)
+    # Use the median of recent history (last 7 data points) as the baseline —
+    # the median is far less sensitive to one-off noisy runs than the mean
     recent_history = historical_values[-7:] if len(historical_values) >= 7 else historical_values
-    avg_historical = sum(recent_history) / len(recent_history)
+    avg_historical = statistics.median(recent_history)
     
     # Calculate change percentage
     change_percent = ((current_ns - avg_historical) / avg_historical) * 100
@@ -382,12 +392,26 @@ def main():
         elif result['status'] == 'stable':
             analysis['summary']['stable'] += 1
     
+    # Detect likely environment noise: many unrelated benchmarks slowing down in the
+    # same run points at a noisy runner rather than a real code regression.
+    # Warnings count as degraded too, since noise spreads unevenly across benchmarks.
+    summary_counts = analysis['summary']
+    regressions = summary_counts['regressions']
+    degraded = regressions + summary_counts['warnings']
+    total = summary_counts['total']
+    likely_noise = (
+        regressions >= NOISE_MIN_REGRESSIONS
+        and total > 0
+        and degraded / total >= NOISE_REGRESSION_RATIO
+    )
+    analysis['summary']['likely_environment_noise'] = likely_noise
+
     # Save analysis
     with open(OUTPUT_FILE, 'w') as f:
         json.dump(analysis, f, indent=2)
     
     summary = analysis['summary']
-    print(f"Analysis complete! total={summary['total']} regressions={summary['regressions']} warnings={summary['warnings']} improvements={summary['improvements']}")
+    print(f"Analysis complete! total={summary['total']} regressions={summary['regressions']} warnings={summary['warnings']} improvements={summary['improvements']} likely_environment_noise={summary['likely_environment_noise']}")
 
 if __name__ == '__main__':
     main()
@@ -397,7 +421,7 @@ chmod +x /tmp/gh-aw/agent/benchmarks/analyze_trends.py
 python3 /tmp/gh-aw/agent/benchmarks/analyze_trends.py
 ```
 
-## Phase 4: Open Issues for Regressions
+## Phase 4: Fix Confirmed Regressions
 
 ### 4.1 Check for Performance Problems
 
@@ -409,17 +433,18 @@ echo "=== Performance Analysis Summary ==="
 cat /tmp/gh-aw/agent/benchmarks/analysis.json | python3 -m json.tool
 ```
 
-### 4.2 Open Issues for Regressions
+### 4.2 Create Pull Requests for Confirmed Regressions
 
-If regressions are detected, open issues with detailed information.
+If regressions are detected, identify and implement a focused fix, rerun the affected benchmark, and create a pull request with the before/after evidence.
 
-**Rules for opening issues:**
-1. Open one issue per regression detected (max 3 as per safe-outputs config)
-2. Include benchmark name, current performance, historical average, and change percentage
-3. Add "performance" and "automation" labels
-4. Use title format: `[performance] Regression in [BenchmarkName]: X% slower`
+**Rules for creating pull requests:**
+1. Do **not** create regression pull requests when the analysis reports `"likely_environment_noise": true` (many unrelated benchmarks regressing at once indicates a noisy runner, not a code regression) — mention it in the report instead and recommend a re-run
+2. Otherwise, implement one focused pull request per independently fixable regression (max 3). Do not submit a PR unless the affected benchmark demonstrates improvement and focused tests pass.
+3. Include benchmark name, current performance, historical median, and change percentage
+4. Add "performance" and "automation" labels
+5. Use title format: `[performance] Regression in [BenchmarkName]: X% slower`
 
-**Issue template:**
+**Pull request template:**
 
 ```markdown
 ### 📊 Performance Regression Detected
@@ -469,13 +494,13 @@ If regressions are detected, open issues with detailed information.
 
 ### 4.3 Implementation
 
-Parse the analysis and create issues:
+Parse the analysis to select confirmed regressions for implementation:
 
 ```bash
-cat > /tmp/gh-aw/agent/benchmarks/create_issues.py << 'EOF'
+cat > /tmp/gh-aw/agent/benchmarks/select_regressions.py << 'EOF'
 #!/usr/bin/env python3
 """
-Create GitHub issues for performance regressions
+Select performance regressions for validated remediation pull requests
 """
 import json
 import os
@@ -501,6 +526,13 @@ def main():
         print("✅ No performance regressions detected!")
         return
     
+    if analysis['summary'].get('likely_environment_noise'):
+        print(f"⏭️ {len(regressions)} regression(s) detected across unrelated benchmarks — "
+              "classified as likely environment noise, no regression pull requests will be created.")
+        with open('/tmp/gh-aw/agent/benchmarks/regressions.json', 'w') as f:
+            json.dump([], f, indent=2)
+        return
+
     print(f"⚠️ Found {len(regressions)} regression(s):")
     for reg in regressions:
         print(f"  - {reg['name']}: {reg['change_percent']:+.1f}%")
@@ -513,11 +545,14 @@ if __name__ == '__main__':
     main()
 EOF
 
-chmod +x /tmp/gh-aw/agent/benchmarks/create_issues.py
-python3 /tmp/gh-aw/agent/benchmarks/create_issues.py
+chmod +x /tmp/gh-aw/agent/benchmarks/select_regressions.py
+python3 /tmp/gh-aw/agent/benchmarks/select_regressions.py
 ```
 
-Now, for each regression found, use the `create issue` tool to open an issue with the details.
+For each confirmed regression in `regressions.json` (empty when likely environment noise),
+implement and validate the fix, commit locally, and call `create_pull_request` with the branch
+and measured before/after details. Use `noop` for noise or no regressions; use
+`report_incomplete` for a confirmed regression that cannot be safely fixed or validated.
 
 ## Phase 5: Generate Performance Report
 
@@ -674,7 +709,7 @@ A successful daily run will:
 ✅ **Store in memory** - Append results to `benchmark_history.jsonl` in cache-memory (pruned to last 14 entries)  
 ✅ **Analyze trends** - Compare current performance with recent historical average (bounded to last 14 entries)  
 ✅ **Detect regressions** - Identify benchmarks that are >10% slower  
-✅ **Open issues** - Create GitHub issues for each regression detected (max 3)  
+✅ **Fix regressions** - Create validated pull requests for confirmed regressions (max 3)
 ✅ **Generate report** - Display comprehensive performance summary
 
 ## Performance Baselines
@@ -689,10 +724,11 @@ Target compilation times (from PR description):
 Performance data is stored in:
 - **Location**: `/tmp/gh-aw/repo-memory/default/`
 - **File**: `benchmark_history.jsonl`
-- **Format**: JSON Lines (one entry per day)
+- **Format**: JSON Lines (one compacted single-line JSON object per day — never pretty-printed)
 - **Retention**: Last 14 entries (≈2 weeks) — older entries are pruned each run to bound context size (`MAX_HISTORY_ENTRIES` in the bash pruning step and `analyze_trends.py`)
+- **Self-healing**: Lines that are not valid single-line JSON objects are dropped before appending, repairing any previously corrupted file
 
-Each entry contains:
+Each entry is written as one line; shown formatted here for readability:
 ```json
 {
   "timestamp": "2025-12-31T17:00:00Z",
@@ -707,5 +743,11 @@ Each entry contains:
   }
 }
 ```
+
+## Reporting Guidelines
+
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks for progressive disclosure.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
 
 Begin your daily performance analysis now!

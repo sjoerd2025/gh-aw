@@ -1,8 +1,10 @@
 // @ts-check
+const { iterateJsonl, iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 require("./shim.cjs");
 
 const fs = require("fs");
 const path = require("path");
+const { parseAICreditsExceededProxyRejectionRecord } = require("./harness_error_patterns.cjs");
 
 const MAX_AI_CREDITS_FIELDS = new Set(["max_ai_credits", "maxAiCredits"]);
 const AI_CREDITS_FIELDS = new Set(["ai_credits", "aiCredits"]);
@@ -10,17 +12,104 @@ const AI_CREDITS_RATE_LIMIT_ERROR_FIELDS = new Set(["ai_credits_rate_limit_error
 // Note: these text fields are intentionally broad (common field names like "error", "message") because
 // rate-limit signals can appear in any of them. This asymmetry vs parseMaxAICreditsFromAuditLog is deliberate.
 const AI_CREDITS_RATE_LIMIT_TEXT_FIELDS = new Set(["error", "message", "reason", "details", "detail", "type", "code"]);
-const AI_CREDITS_RATE_LIMIT_PATTERNS = [/ai[\s_-]*credits?.*(?:rate[\s-]*limit|limit exceeded|budget exceeded|exceeded)/i, /(?:rate[\s-]*limit|too many requests).*(?:ai[\s_-]*credits?)/i, /\bai_credits_limit_exceeded\b/i];
+const AI_CREDITS_RATE_LIMIT_PATTERNS = [/ai[\s_-]*credits?.{0,80}(?:rate[\s-]*limit|limit exceeded|budget exceeded|exceeded)/i, /(?:rate[\s-]*limit|too many requests).{0,80}(?:ai[\s_-]*credits?)/i, /\bai_credits_limit_exceeded\b/i];
 const MAX_AI_CREDITS_EXCEEDED_FIELDS = new Set(["max_ai_credits_exceeded", "maxAiCreditsExceeded"]);
+const AI_CREDITS_TOTAL_FIELDS = new Set(["ai_credits_total", "aiCreditsTotal"]);
 /** @type {{ aiCredits: string, maxAICredits: string, rateLimitError: boolean, maxAICreditsExceeded: boolean }} */
 const EMPTY_AI_CREDITS_STATE = { aiCredits: "", maxAICredits: "", rateLimitError: false, maxAICreditsExceeded: false };
+const EMPTY_AGENT_STDIO_STATE = { ...EMPTY_AI_CREDITS_STATE, proxyHTTP403: false };
 const BUDGET_EXCEEDED_EVENT = "budget_exceeded";
 // The literal error type emitted by the AWF API proxy (HTTP 400) when maxAiCredits is active
 // and the requested model is not in the built-in pricing table.
 const UNKNOWN_MODEL_AI_CREDITS_TYPE = "unknown_model_ai_credits";
-const MAX_AI_CREDITS_EXCEEDED_STDIO_RE = /maximum ai credits exceeded(?:\s*\((\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\))?/i;
+// The literal error type emitted by the AWF API proxy (HTTP 403) when the consecutive cache
+// miss counter reaches the apiProxy.maxCacheMisses limit. Engine-agnostic: all engines share
+// the same proxy guardrail.
+const MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE = "max_cache_misses_exceeded";
+// Guardrail rejections emitted by the AWF API proxy as HTTP 403 responses. Each is a
+// deliberate policy decision by the proxy — never a credential problem — so retrying the
+// same request against the same (already spent) proxy counter can never succeed.
+// Engine-agnostic: all engines share the same proxy guardrails.
+const API_PROXY_GUARD_REJECTION_EVENT_TYPES = [MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE, "effective_tokens_limit_exceeded", "permission_denied_limit_exceeded", "model_policy_violation"];
+// Counter fields carried by proxy guard rejection events, reported alongside the guard name
+// so the step log states what limit was hit and at which value.
+const API_PROXY_GUARD_COUNTER_FIELDS = ["consecutive_cache_misses", "max_cache_misses", "effective_tokens", "max_effective_tokens", "permission_denied_count", "max_permission_denied", "model"];
+// Raw stderr fallback assumes unprefixed subprocess diagnostics; only explicitly allowlisted wrappers are unwrapped below.
+const MAX_AI_CREDITS_EXCEEDED_STDIO_RE =
+  /^(?:(?:Execution failed:\s*)?CAPIError:\s*429\s+|Failed to get response from the AI model; retried \d+ times(?: \(total retry wait time:[^)]+\))?(?: \(Request-ID [^)]+\))?\.? Last error: CAPIError:\s*429\s+|Fatal:\s*)Maximum AI credits exceeded(?:\s*\((\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\))?\.?$/i;
+const MAX_AI_CREDITS_EXCEEDED_NATIVE_ERROR_RE = /^(?:(?:API Error:\s*)?403(?::\s*|\s+)(?:Forbidden[.:]?\s*)?)?Maximum AI credits exceeded(?:\s*\((\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\))?\.?$/i;
 const DEFAULT_AGENT_STDIO_LOG = "/tmp/gh-aw/agent-stdio.log";
 const AGENT_STDIO_LOG_MAX_TAIL = 64 * 1024; // 64 KB — sufficient for any realistic error block
+
+/**
+ * Compatibility for native diagnostics alongside the pair-only harness parser.
+ * Never walk arbitrary JSON fields: only engine-owned error slots are eligible.
+ * @param {string} line
+ * @param {any} record Already decoded JSONL record, if valid.
+ * @returns {{ aiCredits: string, maxAICredits: string } | null}
+ */
+function parseNativeAICreditsRejection(line, record) {
+  let diagnostic = line;
+  let nativeEnvelope = false;
+  if (line.trimStart().startsWith("{")) {
+    if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+    if (record.role || record.data?.role || record.error?.role || record.parentToolUseId || record.parent_tool_use_id || record.parentToolCallId || record.agentId || record.data?.parentToolCallId || record.data?.agentId) return null;
+    if (["warning", "info"].includes(record.data?.severity || record.severity)) return null;
+    if (record.message?.role && !["message_end", "turn_end", "assistant"].includes(record.type)) return null;
+    if (record.message?.role && record.message.role !== "assistant") return null;
+    const rejection = parseAICreditsExceededProxyRejectionRecord(record);
+    if (rejection) return { aiCredits: String(rejection.aiCredits), maxAICredits: String(rejection.maxAICredits) };
+    if (["message_end", "turn_end"].includes(record.type) && record.message?.role === "assistant" && record.message.stopReason === "error") {
+      diagnostic = record.message.errorMessage;
+    } else if (record.type === "error" && typeof record.error === "string" && record.message === undefined) {
+      diagnostic = record.error;
+    } else if (record.type === "session.error" && record.data) {
+      diagnostic = record.data.message;
+    } else {
+      return null;
+    }
+    nativeEnvelope = true;
+  } else {
+    const sdkError = /^\[(?:copilot-sdk-driver|sdk-driver)\]\s+(?:\[sdk-driver\]\s+)?(?:error|unhandled error):\s*(?:Error:\s*)?([\s\S]*)$/i.exec(line);
+    if (sdkError) {
+      diagnostic = sdkError[1];
+      nativeEnvelope = true;
+    }
+    // Pi strips the HTTP status from its JSON-quoted error field.
+    const providerError = /^\[gh-aw\/pi-provider\]\s+\S+\s+provider_error provider=.+? model=.+? api=\S+ status=403 method=\S+ url=.+? response_headers=\S+ error=("(?:[^"\\]|\\.)*")$/.exec(line);
+    if (providerError) {
+      try {
+        diagnostic = JSON.parse(providerError[1]);
+      } catch {
+        return null;
+      }
+      nativeEnvelope = true;
+    }
+  }
+  if (typeof diagnostic !== "string") return null;
+  let match = MAX_AI_CREDITS_EXCEEDED_STDIO_RE.exec(diagnostic);
+  if (!match && nativeEnvelope) {
+    // Goose's terminal error wraps the response and appends fixed retry advice.
+    diagnostic = diagnostic.replace(/^Ran into this error: Authentication error: Status: 403 Forbidden\. Response: /, "").replace(/\n\nPlease retry if you think this is a transient or recoverable error\.$/, "");
+    // Pi may retain the provider's JSON error body after the HTTP status.
+    const jsonBody = /^(?:403(?::\s*|\s+))?(\{.*\})$/.exec(diagnostic);
+    if (jsonBody) {
+      try {
+        const body = JSON.parse(jsonBody[1]);
+        if (body.role || body.error?.role || ["assistant", "user", "tool", "tool_result", "toolResponse", "message"].includes(body.type)) return null;
+        diagnostic = typeof body.error?.message === "string" ? body.error.message : body.message;
+      } catch {
+        return null;
+      }
+    }
+    match = typeof diagnostic === "string" ? MAX_AI_CREDITS_EXCEEDED_NATIVE_ERROR_RE.exec(diagnostic) : null;
+  }
+  if (!match) return null;
+  const aiCredits = match[1] || "";
+  const maxAICredits = match[2] || "";
+  if (aiCredits && (!Number.isFinite(Number(aiCredits)) || !Number.isFinite(Number(maxAICredits)) || Number(maxAICredits) <= 0 || Number(aiCredits) < Number(maxAICredits))) return null;
+  return { aiCredits, maxAICredits };
+}
 
 /**
  * @param {unknown} value
@@ -40,27 +129,11 @@ function parsePositiveNumberString(value) {
 }
 
 /**
- * @param {string} left
- * @param {string} right
- * @returns {boolean}
- */
-function isNumberStringGreaterThanOrEqual(left, right) {
-  if (!left || !right) return false;
-  const leftNumber = Number.parseFloat(left);
-  const rightNumber = Number.parseFloat(right);
-  return Number.isFinite(leftNumber) && Number.isFinite(rightNumber) && leftNumber >= rightNumber;
-}
-
-/**
  * @param {boolean} hasRateLimitSignal
- * @param {string} aiCredits
- * @param {string} maxAICredits
  * @returns {boolean}
  */
-function shouldReportAICreditsRateLimitError(hasRateLimitSignal, aiCredits, maxAICredits) {
-  if (!hasRateLimitSignal) return false;
-  if (!aiCredits || !maxAICredits) return true;
-  return isNumberStringGreaterThanOrEqual(aiCredits, maxAICredits);
+function shouldReportAICreditsRateLimitError(hasRateLimitSignal) {
+  return hasRateLimitSignal;
 }
 
 /**
@@ -77,6 +150,27 @@ function isTrueLike(value) {
  */
 function sanitizeModelName(value) {
   return typeof value === "string" ? value.replace(/\r?\n|\r/g, " ").trim() : "";
+}
+
+/**
+ * Read the compiler's effective proxy budget when network audit entries omit it.
+ * @returns {string}
+ */
+function parseMaxAICreditsFromAWFConfig() {
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const configPath = process.env.GH_AW_AWF_CONFIG_PATH || path.join(agentOutputFile ? path.dirname(agentOutputFile) : "/tmp/gh-aw", "awf-config.json");
+  if (!fs.existsSync(configPath)) return "";
+  try {
+    /** @type {unknown} */
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    if (!config || typeof config !== "object" || !("apiProxy" in config)) return "";
+    const apiProxy = config.apiProxy;
+    if (!apiProxy || typeof apiProxy !== "object" || !("maxAiCredits" in apiProxy)) return "";
+    return parsePositiveNumberString(apiProxy.maxAiCredits);
+  } catch (error) {
+    core.warning(`Could not read AWF AI credits budget from ${configPath}: ${error instanceof Error ? error.message : String(error)}`);
+    return "";
+  }
 }
 
 /**
@@ -142,6 +236,39 @@ function resolveUnknownModelAICreditsLogPaths(auditJsonlPathOverride) {
 }
 
 /**
+ * @param {string} [auditJsonlPathOverride]
+ * @returns {string[]}
+ */
+function resolveTokenUsageLogPaths(auditJsonlPathOverride) {
+  if (auditJsonlPathOverride) {
+    const auditDir = path.dirname(auditJsonlPathOverride);
+    return [path.join(auditDir, "api-proxy-logs", "token-usage.jsonl"), path.join(auditDir, "token-usage.jsonl")];
+  }
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const roots = [];
+  if (agentOutputFile) roots.push(path.dirname(agentOutputFile));
+
+  /** @type {string[]} */
+  const candidates = [];
+  const seen = new Set();
+  const addCandidate = candidate => {
+    if (!candidate || seen.has(candidate)) return;
+    seen.add(candidate);
+    candidates.push(candidate);
+  };
+
+  for (const root of roots) {
+    addCandidate(path.join(root, "sandbox", "firewall", "logs", "api-proxy-logs", "token-usage.jsonl"));
+    addCandidate(path.join(root, "sandbox", "firewall", "audit", "api-proxy-logs", "token-usage.jsonl"));
+  }
+
+  addCandidate("/tmp/gh-aw/sandbox/firewall/logs/api-proxy-logs/token-usage.jsonl");
+  addCandidate("/tmp/gh-aw/sandbox/firewall-audit-logs/api-proxy-logs/token-usage.jsonl");
+  addCandidate("/tmp/gh-aw/sandbox/firewall/audit/api-proxy-logs/token-usage.jsonl");
+  return candidates;
+}
+
+/**
  * Depth-first traversal of a nested object, calling visitor for each [key, value] pair.
  * Traversal stops early if visitor returns true.
  *
@@ -195,7 +322,7 @@ function parseAICreditsErrorInfoFromAuditEntry(entry) {
       if (parsed) aiCredits = parsed;
     }
     if (AI_CREDITS_RATE_LIMIT_ERROR_FIELDS.has(key) && isTrueLike(value)) rateLimitError = true;
-    if (AI_CREDITS_RATE_LIMIT_TEXT_FIELDS.has(key) && typeof value === "string") {
+    if (AI_CREDITS_RATE_LIMIT_TEXT_FIELDS.has(key) && typeof value === "string" && !/\btool[_\s-]*result\b/i.test(value)) {
       if (AI_CREDITS_RATE_LIMIT_PATTERNS.some(pattern => pattern.test(value))) rateLimitError = true;
     }
   });
@@ -218,22 +345,7 @@ function parseAICreditsErrorInfoFromAuditEntry(entry) {
 function iterateAuditEntries(auditJsonlPathOverride, defaultValue, contentGuard, accumulate) {
   try {
     const auditJsonlPath = resolveFirewallAuditLogPath(auditJsonlPathOverride);
-    if (!fs.existsSync(auditJsonlPath)) return defaultValue;
-    const content = fs.readFileSync(auditJsonlPath, "utf8");
-    if (!content.trim()) return defaultValue;
-    if (contentGuard && !contentGuard(content)) return defaultValue;
-    let result = defaultValue;
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed[0] !== "{") continue;
-      try {
-        const nextResult = accumulate(result, JSON.parse(trimmed));
-        if (nextResult !== undefined) result = nextResult;
-      } catch {
-        // ignore malformed lines
-      }
-    }
-    return result;
+    return iterateJSONLFiles([auditJsonlPath], defaultValue, contentGuard, accumulate);
   } catch {
     return defaultValue;
   }
@@ -260,11 +372,9 @@ function iterateJSONLFiles(filePaths, defaultValue, contentGuard, accumulate, sh
         const content = fs.readFileSync(filePath, "utf8");
         if (!content.trim()) continue;
         if (contentGuard && !contentGuard(content)) continue;
-        for (const line of content.split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed[0] !== "{") continue;
+        for (const entry of iterateJsonl(content, { lineFilter: line => line.startsWith("{") })) {
           try {
-            const nextResult = accumulate(result, JSON.parse(trimmed));
+            const nextResult = accumulate(result, entry);
             if (nextResult !== undefined) result = nextResult;
             if (shouldStop && shouldStop(result)) return result;
           } catch {
@@ -318,7 +428,6 @@ function parseAICreditsErrorInfoFromAuditLog(auditJsonlPathOverride) {
  * Detects a `max_ai_credits_exceeded` signal from a single firewall audit log entry.
  * Checks for the explicit `max_ai_credits_exceeded` boolean field, its camelCase variant,
  * or a `budget_exceeded` event with `reason: "hard_limit"` and `forced_termination: true`
- * as written by the aw-harness upon hard-limit abort (§11.2.2).
  * Only inspects top-level fields to avoid false positives from nested provider responses.
  *
  * @param {unknown} entry
@@ -347,11 +456,40 @@ function parseMaxAICreditsExceededFromAuditEntry(entry) {
  * @returns {boolean}
  */
 function parseMaxAICreditsExceededFromAuditLog(auditJsonlPathOverride) {
-  return iterateAuditEntries(
+  const explicitExceeded = iterateAuditEntries(
     auditJsonlPathOverride,
     false,
     content => /(?:max_ai_credits_exceeded|maxAiCreditsExceeded|budget_exceeded)/.test(content),
     (acc, entry) => acc || parseMaxAICreditsExceededFromAuditEntry(entry)
+  );
+  if (explicitExceeded) return true;
+
+  const configuredMaxAICredits = parsePositiveNumberString(process.env.GH_AW_MAX_AI_CREDITS) || parseMaxAICreditsFromAuditLog(auditJsonlPathOverride) || parseMaxAICreditsFromAWFConfig();
+  if (!configuredMaxAICredits) return false;
+
+  const latestAICreditsTotal = parseLatestAICreditsTotalFromTokenUsageLog(auditJsonlPathOverride);
+  if (!latestAICreditsTotal) return false;
+  return Number.parseFloat(latestAICreditsTotal) >= Number.parseFloat(configuredMaxAICredits);
+}
+
+/**
+ * @param {string} [auditJsonlPathOverride]
+ * @returns {string}
+ */
+function parseLatestAICreditsTotalFromTokenUsageLog(auditJsonlPathOverride) {
+  return iterateJSONLFiles(
+    resolveTokenUsageLogPaths(auditJsonlPathOverride),
+    "",
+    content => /(?:ai_credits_total|aiCreditsTotal)/.test(content),
+    (acc, entry) => {
+      let latestTotal = "";
+      traverseObjectTree(entry, (key, value) => {
+        if (!AI_CREDITS_TOTAL_FIELDS.has(key)) return false;
+        latestTotal = parsePositiveNumberString(value);
+        return !!latestTotal;
+      });
+      return latestTotal || acc;
+    }
   );
 }
 
@@ -426,6 +564,124 @@ function parseUnknownModelAICreditsAndModelFromAuditLog(auditJsonlPathOverride) 
 }
 
 /**
+ * Detects a `max_cache_misses_exceeded` event from the AWF API proxy event logs.
+ * The proxy emits this HTTP 403 error when the consecutive cache miss counter reaches
+ * the configured `apiProxy.maxCacheMisses` limit. Detection is engine-agnostic:
+ * all agentic engines share the same AWF API proxy guardrail.
+ * Structured entries emitted by the AWF API proxy look like:
+ *   { "type": "max_cache_misses_exceeded", "consecutive_cache_misses": 6, "max_cache_misses": 5 }
+ *
+ * @param {string} [eventLogPathOverride]
+ * @returns {boolean}
+ */
+function parseMaxCacheMissesExceededFromEventLog(eventLogPathOverride) {
+  return iterateJSONLFiles(
+    resolveUnknownModelAICreditsLogPaths(eventLogPathOverride),
+    false,
+    content => content.includes(MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE),
+    (acc, entry) => {
+      if (acc) return true; // already detected, short-circuit
+      return traverseObjectTree(entry, (_key, value) => value === MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE) || undefined;
+    },
+    acc => acc
+  );
+}
+
+/**
+ * Resolves the candidate JSONL files that can carry AWF API proxy guard rejection events.
+ * In addition to the api-proxy event logs, the proxy's token tracker audit log and the
+ * copy of the detection run's firewall logs (made by the detection job) are considered, so
+ * the same detection works in the agent job and in the threat-detection job.
+ *
+ * @param {string} [eventLogPathOverride]
+ * @returns {string[]}
+ */
+function resolveAPIProxyGuardLogPaths(eventLogPathOverride) {
+  if (eventLogPathOverride) return [eventLogPathOverride];
+  const candidates = resolveUnknownModelAICreditsLogPaths();
+  const seen = new Set(candidates);
+  const addCandidate = candidate => {
+    if (!candidate || seen.has(candidate)) return;
+    seen.add(candidate);
+    candidates.push(candidate);
+  };
+  const agentOutputFile = process.env.GH_AW_AGENT_OUTPUT;
+  const roots = [];
+  if (agentOutputFile) roots.push(path.dirname(agentOutputFile));
+  roots.push("/tmp/gh-aw");
+  roots.push("/tmp/gh-aw/threat-detection");
+  for (const root of roots) {
+    for (const base of ["logs", "audit"]) {
+      addCandidate(path.join(root, "sandbox", "firewall", base, "api-proxy-logs", "token-tracker-audit.jsonl"));
+      addCandidate(path.join(root, "sandbox", "firewall", base, "api-proxy-logs", "event-logs.jsonl"));
+      addCandidate(path.join(root, "sandbox", "firewall", base, "api-proxy-logs", "events.jsonl"));
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Detects an AWF API proxy guard rejection (HTTP 403) from the proxy's structured logs and
+ * returns the guard name together with the counters it reported. The proxy answers with such
+ * a rejection when one of its guardrails fires (consecutive cache misses, effective token
+ * limit, permission-denied limit, model policy). These are deliberate policy outcomes, not
+ * credential failures, and the counter is not reset by retrying.
+ * Structured entries emitted by the AWF API proxy look like:
+ *   { "type": "max_cache_misses_exceeded", "consecutive_cache_misses": 6, "max_cache_misses": 5 }
+ *
+ * @param {string} [eventLogPathOverride]
+ * @returns {{ guard: string, counters: Record<string, string|number> } | null}
+ */
+function parseAPIProxyGuardRejectionFromEventLog(eventLogPathOverride) {
+  /** @type {{ guard: string, counters: Record<string, string|number> } | null} */
+  let rejection = null;
+  iterateJSONLFiles(
+    resolveAPIProxyGuardLogPaths(eventLogPathOverride),
+    false,
+    content => API_PROXY_GUARD_REJECTION_EVENT_TYPES.some(type => content.includes(type)),
+    (acc, entry) => {
+      if (acc) return true; // already detected, keep the first rejection
+      /** @type {string} */
+      let guard = "";
+      traverseObjectTree(entry, (_key, value) => {
+        if (typeof value === "string" && API_PROXY_GUARD_REJECTION_EVENT_TYPES.includes(value)) {
+          guard = value;
+          return true;
+        }
+        return false;
+      });
+      if (!guard) return undefined;
+      /** @type {Record<string, string|number>} */
+      const counters = {};
+      traverseObjectTree(entry, (key, value) => {
+        if (!API_PROXY_GUARD_COUNTER_FIELDS.includes(key)) return false;
+        if (typeof value === "number" && Number.isFinite(value)) counters[key] = value;
+        else if (typeof value === "string" && value.trim()) counters[key] = value.trim();
+        return false;
+      });
+      rejection = { guard, counters };
+      return true;
+    },
+    acc => acc
+  );
+  return rejection;
+}
+
+/**
+ * Formats a proxy guard rejection for a single-line step log entry, e.g.
+ *   "max_cache_misses_exceeded (consecutive_cache_misses=5, max_cache_misses=5)".
+ *
+ * @param {{ guard: string, counters?: Record<string, string|number> } | null | undefined} rejection
+ * @returns {string}
+ */
+function formatAPIProxyGuardRejection(rejection) {
+  if (!rejection || !rejection.guard) return "";
+  const counters = rejection.counters || {};
+  const parts = Object.keys(counters).map(key => `${key}=${counters[key]}`);
+  return parts.length > 0 ? `${rejection.guard} (${parts.join(", ")})` : rejection.guard;
+}
+
+/**
  * Single-pass combined read of the audit log, returning all AI credits fields at once.
  * Used by resolveAICreditsFailureState to avoid reading the same file twice.
  * No contentGuard is applied: rate-limit signal detection must scan all entries anyway,
@@ -472,15 +728,19 @@ function logAICreditSource(label, auditValue, stdioValue, envValue, envVarName) 
 function resolveAICreditsFailureState({ logProvenance = true } = {}) {
   const stdioSignals = parseAICreditsExceededFromAgentStdio();
   const { aiCredits: auditAICredits, maxAICredits: auditMaxAICredits, rateLimitError: auditRateLimitError, maxAICreditsExceeded: auditMaxAICreditsExceeded } = parseAuditLogCombined();
+  const tokenAICredits = parseLatestAICreditsTotalFromTokenUsageLog();
+  const configMaxAICredits = auditMaxAICredits ? "" : parseMaxAICreditsFromAWFConfig();
   const envAICredits = parsePositiveNumberString(process.env.GH_AW_AIC);
   const envMaxAICredits = parsePositiveNumberString(process.env.GH_AW_MAX_AI_CREDITS);
   const envRateLimitSignal = process.env.GH_AW_AI_CREDITS_RATE_LIMIT_ERROR === "true";
-  const envRateLimitSignalHasEvidence = envRateLimitSignal && !!(auditAICredits || stdioSignals.aiCredits || envAICredits);
+  const envRateLimitSignalHasEvidence = envRateLimitSignal && !!(auditAICredits || tokenAICredits || stdioSignals.aiCredits || envAICredits);
 
   // Log provenance so failing issues can be diagnosed when credit data is missing.
   if (logProvenance) {
-    logAICreditSource("aiCredits", auditAICredits, stdioSignals.aiCredits, envAICredits, "GH_AW_AIC");
-    logAICreditSource("maxAICredits", auditMaxAICredits, stdioSignals.maxAICredits, envMaxAICredits, "GH_AW_MAX_AI_CREDITS");
+    if (!auditAICredits && tokenAICredits) core.info(`[ai-credits] aiCredits source=token_usage value=${tokenAICredits}`);
+    else logAICreditSource("aiCredits", auditAICredits, stdioSignals.aiCredits, envAICredits, "GH_AW_AIC");
+    if (configMaxAICredits) core.info(`[ai-credits] maxAICredits source=awf_config value=${configMaxAICredits}`);
+    else logAICreditSource("maxAICredits", auditMaxAICredits, stdioSignals.maxAICredits, envMaxAICredits, "GH_AW_MAX_AI_CREDITS");
 
     const rawRateLimitSignalSource = auditRateLimitError
       ? "audit_log"
@@ -494,15 +754,18 @@ function resolveAICreditsFailureState({ logProvenance = true } = {}) {
     core.info(`[ai-credits] rateLimitSignal source=${rawRateLimitSignalSource}`);
   }
 
-  const aiCredits = auditAICredits || stdioSignals.aiCredits || envAICredits || "";
-  const maxAICredits = auditMaxAICredits || stdioSignals.maxAICredits || envMaxAICredits || "";
+  const aiCredits = auditAICredits || tokenAICredits || stdioSignals.aiCredits || envAICredits || "";
+  const maxAICredits = auditMaxAICredits || configMaxAICredits || stdioSignals.maxAICredits || envMaxAICredits || "";
   const rawAICreditsRateLimitError = auditRateLimitError || stdioSignals.rateLimitError || envRateLimitSignalHasEvidence;
-  const aiCreditsRateLimitError = shouldReportAICreditsRateLimitError(rawAICreditsRateLimitError, aiCredits, maxAICredits);
-  return { aiCredits, maxAICredits, aiCreditsRateLimitError, maxAICreditsExceeded: auditMaxAICreditsExceeded || stdioSignals.maxAICreditsExceeded };
+  const aiCreditsRateLimitError = shouldReportAICreditsRateLimitError(rawAICreditsRateLimitError);
+  // A completed response can cross the cap without another request being rejected.
+  // Require a failed job and evidence that the local proxy rejected a request.
+  const tokenBudgetExceeded = process.env.GH_AW_AGENT_CONCLUSION === "failure" && stdioSignals.proxyHTTP403 && !!tokenAICredits && !!maxAICredits && Number.parseFloat(tokenAICredits) >= Number.parseFloat(maxAICredits);
+  return { aiCredits, maxAICredits, aiCreditsRateLimitError, maxAICreditsExceeded: auditMaxAICreditsExceeded || stdioSignals.maxAICreditsExceeded || tokenBudgetExceeded };
 }
 
 /**
- * @returns {{ aiCredits: string, maxAICredits: string, rateLimitError: boolean, maxAICreditsExceeded: boolean }}
+ * @returns {{ aiCredits: string, maxAICredits: string, rateLimitError: boolean, maxAICreditsExceeded: boolean, proxyHTTP403: boolean }}
  */
 function parseAICreditsExceededFromAgentStdio() {
   try {
@@ -512,11 +775,11 @@ function parseAICreditsExceededFromAgentStdio() {
     // silently break detection.
     const derivedPath = agentOutputFile ? path.join(path.dirname(agentOutputFile), "agent-stdio.log") : null;
     const stdioLogPath = derivedPath && fs.existsSync(derivedPath) ? derivedPath : DEFAULT_AGENT_STDIO_LOG;
-    if (!fs.existsSync(stdioLogPath)) return EMPTY_AI_CREDITS_STATE;
+    if (!fs.existsSync(stdioLogPath)) return EMPTY_AGENT_STDIO_STATE;
     // Read only the tail to avoid OOM on large logs; the error token always
     // appears near the end of the file.
     const stat = fs.statSync(stdioLogPath);
-    if (stat.size === 0) return EMPTY_AI_CREDITS_STATE;
+    if (stat.size === 0) return EMPTY_AGENT_STDIO_STATE;
     const readSize = Math.min(stat.size, AGENT_STDIO_LOG_MAX_TAIL);
     const buf = Buffer.alloc(readSize);
     const fd = fs.openSync(stdioLogPath, "r");
@@ -526,22 +789,44 @@ function parseAICreditsExceededFromAgentStdio() {
       fs.closeSync(fd);
     }
     const content = buf.toString("utf8");
-    // Use matchAll and take the last occurrence — in retried runs the final
-    // entry carries the authoritative (highest) credit values.
-    const RE_G = new RegExp(MAX_AI_CREDITS_EXCEEDED_STDIO_RE.source, "gi");
-    const allMatches = [...content.matchAll(RE_G)];
-    const match = allMatches.at(-1);
-    if (!match) return EMPTY_AI_CREDITS_STATE;
-    const aiCredits = parsePositiveNumberString(match[1] || "");
-    const maxAICredits = parsePositiveNumberString(match[2] || "");
-    return {
-      aiCredits,
-      maxAICredits,
-      rateLimitError: true,
-      maxAICreditsExceeded: true,
-    };
+    // JSON tool/assistant records can quote rejection examples. Only inspect
+    // authenticated transport errors or a complete native stderr diagnostic.
+    let result = { ...EMPTY_AGENT_STDIO_STATE };
+    for (const event of iterateJsonlEvents(content)) {
+      const line = event.rawLine.replace(/\r?\n$/, "");
+      const proxyFailure = line.match(/^Authentication failed with provider at (\S+) \(HTTP 403\)\.?$/i);
+      if (proxyFailure && isLikelyAWFAPIProxyURL(proxyFailure[1])) result.proxyHTTP403 = true;
+      const rejection = parseNativeAICreditsRejection(line, event.type === "json" ? event.value : undefined);
+      if (!rejection) continue;
+      const { aiCredits, maxAICredits } = rejection;
+      result = { aiCredits, maxAICredits, rateLimitError: true, maxAICreditsExceeded: true, proxyHTTP403: result.proxyHTTP403 };
+    }
+    return result;
   } catch {
-    return EMPTY_AI_CREDITS_STATE;
+    return EMPTY_AGENT_STDIO_STATE;
+  }
+}
+
+/**
+ * @param {string} providerUrl
+ * @returns {boolean}
+ */
+function isLikelyAWFAPIProxyURL(providerUrl) {
+  try {
+    const { hostname, port } = new URL(providerUrl);
+    const normalizedHostname = hostname.toLowerCase();
+    return (
+      port === "10002" &&
+      (normalizedHostname === "api-proxy" ||
+        normalizedHostname === "host.docker.internal" ||
+        normalizedHostname === "localhost" ||
+        /^127(?:\.\d{1,3}){3}$/.test(normalizedHostname) ||
+        /^10(?:\.\d{1,3}){3}$/.test(normalizedHostname) ||
+        /^192\.168(?:\.\d{1,3}){2}$/.test(normalizedHostname) ||
+        /^172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}$/.test(normalizedHostname))
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -552,5 +837,10 @@ module.exports = {
   parseMaxAICreditsExceededFromAuditLog,
   parseUnknownModelAICreditsFromAuditLog,
   parseUnknownModelAICreditsAndModelFromAuditLog,
+  parseMaxCacheMissesExceededFromEventLog,
+  parseAPIProxyGuardRejectionFromEventLog,
+  formatAPIProxyGuardRejection,
   resolveAICreditsFailureState,
+  MAX_CACHE_MISSES_EXCEEDED_EVENT_TYPE,
+  API_PROXY_GUARD_REJECTION_EVENT_TYPES,
 };

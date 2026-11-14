@@ -20,7 +20,14 @@ const { getMessages, getPromptPath, renderTemplate, renderTemplateFromFile, toSn
 const DEFAULT_DISCLOSURE_HEADER_TEMPLATE = "safe_outputs_disclosure_header.md";
 const DISCLOSURE_HEADER_DEFAULT_SENTINEL = "true";
 
-const DEFAULT_DISCLOSURE_HEADER = renderTemplateFromFile(getPromptPath(DEFAULT_DISCLOSURE_HEADER_TEMPLATE), {}).trimEnd();
+let defaultDisclosureHeader;
+
+function getDefaultDisclosureHeader() {
+  if (defaultDisclosureHeader === undefined) {
+    defaultDisclosureHeader = renderTemplateFromFile(getPromptPath(DEFAULT_DISCLOSURE_HEADER_TEMPLATE), {}).trimEnd();
+  }
+  return defaultDisclosureHeader;
+}
 
 /**
  * Get the body header text, using the custom template if configured.
@@ -29,13 +36,12 @@ const DEFAULT_DISCLOSURE_HEADER = renderTemplateFromFile(getPromptPath(DEFAULT_D
  * @returns {string} The rendered header text, or empty string if not configured
  */
 function getBodyHeader(ctx) {
-  const messages = getMessages();
-  if (!messages?.bodyHeader) {
-    return "";
-  }
+  return renderTemplate(getBodyHeaderTemplate(), toSnakeCase(ctx));
+}
 
-  const templateContext = toSnakeCase(ctx);
-  return renderTemplate(messages.bodyHeader, templateContext);
+/** @returns {string} */
+function getBodyHeaderTemplate() {
+  return getMessages()?.bodyHeader || "";
 }
 
 /**
@@ -47,6 +53,11 @@ function getBodyHeader(ctx) {
  * @returns {string} The rendered disclosure header text, or empty string if not configured
  */
 function getDisclosureHeader(ctx) {
+  return renderTemplate(getDisclosureHeaderTemplate(), toSnakeCase(ctx));
+}
+
+/** @returns {string} */
+function getDisclosureHeaderTemplate() {
   const messages = getMessages();
   const disclosureHeader = messages?.disclosureHeader;
   if (!disclosureHeader) {
@@ -55,20 +66,23 @@ function getDisclosureHeader(ctx) {
 
   let template = "";
   if (disclosureHeader === true || disclosureHeader === DISCLOSURE_HEADER_DEFAULT_SENTINEL) {
-    template = DEFAULT_DISCLOSURE_HEADER;
+    template = getDefaultDisclosureHeader();
   } else if (typeof disclosureHeader === "string") {
     template = disclosureHeader;
   } else {
     return "";
   }
 
-  const templateContext = toSnakeCase(ctx);
-  return renderTemplate(template, templateContext);
+  return template;
 }
 
 module.exports = {
   getBodyHeader,
   getDisclosureHeader,
-  DEFAULT_DISCLOSURE_HEADER,
+  getBodyHeaderTemplate,
+  getDisclosureHeaderTemplate,
+  get DEFAULT_DISCLOSURE_HEADER() {
+    return getDefaultDisclosureHeader();
+  },
   DISCLOSURE_HEADER_DEFAULT_SENTINEL,
 };

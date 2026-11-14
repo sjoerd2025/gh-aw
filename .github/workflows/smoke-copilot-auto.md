@@ -3,6 +3,7 @@ private: true
 emoji: "🌸"
 description: Smoke Copilot Auto — generates a haiku and posts it as a PR comment
 on:
+  schedule: every 2 days
   label_command:
     name: smoke
     events: [pull_request]
@@ -16,10 +17,23 @@ model: auto
 engine:
   id: copilot
   bare: true
+imports:
+  - shared/smoke-test-brevity.md
+  - shared/reporting.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: copilot-events
 tools:
   github:
     mode: gh-proxy
     toolsets: [default]
+evals:
+  - id: pr_inspired_haiku
+    question: When PR context is available, does the requested comment contain a three-line 5-7-5 haiku inspired by that PR? Return UNKNOWN when no PR context is available.
+  - id: inspiration_caption
+    question: When PR context is available, does the requested comment include a one-sentence caption connecting the haiku to the PR? Return UNKNOWN when no PR context is available.
+  - id: no_pr_noop
+    question: When no PR context is available, does the agent call noop without requesting a PR comment? Return UNKNOWN when PR context is available.
 safe-outputs:
   add-comment:
     hide-older-comments: true
@@ -27,11 +41,12 @@ safe-outputs:
 timeout-minutes: 5
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Auto Haiku
-
-**IMPORTANT: Keep all outputs extremely short and concise.**
 
 ## Task
 

@@ -128,12 +128,15 @@ This workflow tests the safe_outputs job generation.
 	}
 
 	// Verify job properties
-	if !strings.Contains(lockContent, "timeout-minutes: 45") {
-		t.Error("Expected 45-minute timeout in safe_outputs job")
+	if !strings.Contains(lockContent, "timeout-minutes: 15") {
+		t.Error("Expected 15-minute timeout in safe_outputs job")
 	}
 
-	if !strings.Contains(lockContent, "permissions:\n      issues: write\n      pull-requests: write") {
+	if !strings.Contains(lockContent, "permissions:\n      issues: write # Create or update issues and comments.\n      pull-requests: write # Create or update pull requests and review comments.") {
 		t.Error("Expected correct permissions in safe_outputs job")
+	}
+	if strings.Contains(lockContent, "discussions: write") {
+		t.Error("Expected add_labels to omit discussions write permission")
 	}
 
 	// Verify the job uses github-script
@@ -417,6 +420,7 @@ safe-outputs:
   add-labels:
     allowed: [triage, bug, enhancement, needs-review]
     max: 5
+    max-labels: 25
 ---
 
 # Test Output Label Max Count Configuration
@@ -462,6 +466,9 @@ This workflow tests the output labels max configuration parsing.
 	expectedMaxCount := 5
 	if templatableIntValue(workflowData.SafeOutputs.AddLabels.Max) != expectedMaxCount {
 		t.Errorf("Expected max to be %d, got %v", expectedMaxCount, workflowData.SafeOutputs.AddLabels.Max)
+	}
+	if got := templatableIntValue(workflowData.SafeOutputs.AddLabels.MaxLabels); got != 25 {
+		t.Errorf("Expected max-labels to be 25, got %d", got)
 	}
 }
 

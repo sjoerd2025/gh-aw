@@ -3,63 +3,40 @@
 "use strict";
 
 const { emitInfrastructureIncomplete } = require("./safeoutputs_cli.cjs");
+const { fetchAWFReflect } = require("./awf_reflect.cjs");
 
 // Stop retrying this long before the step hard timeout so the harness can emit
 // structured safe-output diagnostics instead of being terminated by Actions.
 const SOFT_TIMEOUT_BUFFER_MS = 90 * 1000;
 
-const AI_CREDITS_EXCEEDED_PATTERNS = [/\bmax[\s_-]*ai[\s_-]*credits[\s_-]*exceeded\b/i, /\bai[\s_-]*credits[\s_-]*rate[\s_-]*limit[\s_-]*error\b/i, /ai[\s_-]*credits?.*(?:rate[\s-]*limit|limit exceeded|budget exceeded|exceeded)/i];
-
-const AWF_API_PROXY_BLOCKING_REQUESTS_PATTERNS = [/\bawf\b.*\bapi[\s_-]*proxy\b.*\bblocking requests\b/i, /\bapi[\s_-]*proxy\b.*\bblocking requests\b/i, /\bapi[\s_-]*proxy\b.*\bblocked requests?\b/i, /\bDIFC_FILTERED\b/];
-const GOAL_ALREADY_ACTIVE_PATTERNS = [/\bthis thread already has a goal\b[\s\S]*?\buse update_goal\b/i, /\bcannot create a new goal because this thread has an unfinished goal\b;\s*\bcomplete the existing goal first\b/i];
-
-// Patterns to detect Anthropic "max_runs_exceeded" (HTTP 403).
-// This occurs when the per-session LLM invocation quota is exhausted.
-// Retrying is pointless because each fresh-run attempt immediately fails with
-// the same 403 until the quota resets.  Matches both the JSON error type
-// ("max_runs_exceeded") and the human-readable message
-// ("Maximum LLM invocations exceeded").
-const MAX_RUNS_EXCEEDED_PATTERNS = [/\bmax_runs_exceeded\b/i, /Maximum LLM invocations exceeded/i];
-
-// Common authentication failure patterns shared across all harnesses.
-// Matches:
-//   - "Authentication failed (Request ID: ...)" — Anthropic/OpenAI direct auth error
-//   - `"error":"authentication_failed"` — Claude Code stream-JSON error field (e.g. 401 via AWF proxy)
-//   - "not logged in" — Claude Code message when no credentials are available
-const AUTHENTICATION_FAILED_PATTERNS = [/Authentication failed(?:\s*\(Request ID:[^)]+\))?/i, /"error"\s*:\s*"authentication_failed"/i, /not logged in/i];
+const errorPatterns = require("./harness_error_patterns.cjs");
 
 /**
- * @param {unknown} output
- * @returns {boolean}
+ * Validate a fresh AWF reflection before treating a native terminal 429 as an
+ * exhausted shared invocation budget. Missing or malformed evidence preserves
+ * the engine's existing retry policy.
+ * @param {{
+ *   nativeTerminalRateLimitError: boolean,
+ *   env?: NodeJS.ProcessEnv,
+ *   fetchReflect?: typeof fetchAWFReflect,
+ *   logger?: (message: string) => void,
+ * }} options
+ * @returns {Promise<{ invocationCount: number, maxRuns: number } | null>}
  */
-function isMaxRunsExceededError(output) {
-  const safeOutput = typeof output === "string" ? output : "";
-  return MAX_RUNS_EXCEEDED_PATTERNS.some(pattern => pattern.test(safeOutput));
-}
-
-/**
- * Determines if the collected output contains an authentication failed error.
- * @param {unknown} output
- * @returns {boolean}
- */
-function isAuthenticationFailedError(output) {
-  const safeOutput = typeof output === "string" ? output : "";
-  return AUTHENTICATION_FAILED_PATTERNS.some(pattern => pattern.test(safeOutput));
-}
-
-/**
- * Detect retry guard conditions that should stop harness retries immediately.
- * @param {unknown} output
- * @returns {{ aiCreditsExceeded: boolean, awfAPIProxyBlockingRequests: boolean, goalAlreadyActive: boolean, maxRunsExceeded: boolean }}
- */
-function detectNonRetryableHarnessGuard(output) {
-  const safeOutput = typeof output === "string" ? output : "";
-  return {
-    aiCreditsExceeded: AI_CREDITS_EXCEEDED_PATTERNS.some(pattern => pattern.test(safeOutput)),
-    awfAPIProxyBlockingRequests: AWF_API_PROXY_BLOCKING_REQUESTS_PATTERNS.some(pattern => pattern.test(safeOutput)),
-    goalAlreadyActive: GOAL_ALREADY_ACTIVE_PATTERNS.some(pattern => pattern.test(safeOutput)),
-    maxRunsExceeded: isMaxRunsExceededError(safeOutput),
-  };
+async function detectExhaustedAWFInvocationBudget({ nativeTerminalRateLimitError, env = process.env, fetchReflect = fetchAWFReflect, logger = () => {} }) {
+  if (!nativeTerminalRateLimitError || env.AWF_REFLECT_ENABLED !== "1") return null;
+  try {
+    const refreshed = await fetchReflect({ logger, timeoutMs: 3000, modelsTimeoutMs: 1000 });
+    if (!refreshed.ok) return null;
+    const runs = refreshed.reflectData?.runs;
+    if (!runs || typeof runs !== "object" || Array.isArray(runs) || runs.enabled !== true) return null;
+    const invocationCount = runs.invocation_count;
+    const maxRuns = runs.max_runs;
+    if (typeof maxRuns !== "number" || !Number.isSafeInteger(maxRuns) || maxRuns <= 0 || typeof invocationCount !== "number" || !Number.isSafeInteger(invocationCount) || invocationCount < maxRuns || runs.remaining_runs !== 0) return null;
+    return { invocationCount, maxRuns };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -93,16 +70,10 @@ function emitSoftTimeoutSignal(guard, context, harnessName, logFn) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    detectNonRetryableHarnessGuard,
-    AI_CREDITS_EXCEEDED_PATTERNS,
-    AWF_API_PROXY_BLOCKING_REQUESTS_PATTERNS,
-    GOAL_ALREADY_ACTIVE_PATTERNS,
-    MAX_RUNS_EXCEEDED_PATTERNS,
-    AUTHENTICATION_FAILED_PATTERNS,
-    isMaxRunsExceededError,
-    isAuthenticationFailedError,
+    ...errorPatterns,
     SOFT_TIMEOUT_BUFFER_MS,
     buildSoftTimeoutGuard,
+    detectExhaustedAWFInvocationBudget,
     emitSoftTimeoutSignal,
   };
 }

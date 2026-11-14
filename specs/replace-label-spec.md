@@ -7,11 +7,11 @@ sidebar:
 
 # replace-label Safe-Output Type Specification
 
-**Version**: 1.0.0  
+**Version**: 1.0.3
 **Status**: Candidate Recommendation  
 **Latest Version**: https://github.com/github/gh-aw/blob/main/specs/replace-label-spec.md  
 **Editors**: GitHub gh-aw Team (GitHub, Inc.)  
-**Publication Date**: 2026-06-20
+**Publication Date**: 2026-09-12
 
 ---
 
@@ -161,7 +161,7 @@ safe-outputs:
 | `allowed-remove` | `string[]` | `[]` (any) | Glob patterns for labels the agent is permitted to remove. When empty or absent, no remove restriction applies. |
 | `blocked` | `string[]` | `[]` (none) | Glob patterns that are unconditionally prohibited for both add and remove operations. Applied after allowlist checks. |
 | `max` | `integer` or GHA expression | `5` | Maximum number of `replace-label` operations permitted in a single workflow run. Supports GitHub Actions expressions (e.g., `${{ inputs.max_labels }}`). |
-| `target` | `"triggering"` \| `"*"` \| integer | `"triggering"` | Determines which issue/PR may be targeted. `"triggering"` restricts to the event item; `"*"` permits any item (requires `item_number` in message); an integer pins to a specific item number. |
+| `target` | `"triggering"` \| `"*"` \| integer | `"triggering"` | Determines which issue/PR may be targeted. `"triggering"` restricts to the event item; `"*"` permits an `item_number` from the message, or falls back to the event item when absent; an integer pins to a specific item number. |
 | `target-repo` | `string` | (current repo) | Default target repository in `owner/repo` format for cross-repository operations. |
 | `allowed-repos` | `string[]` | `[]` | Additional repositories the agent may target, beyond `target-repo`. |
 | `github-token` | `string` | (workflow default) | GitHub token or GitHub Actions expression for authentication. Overrides the workflow-level token for this type only. |
@@ -196,7 +196,7 @@ AI agents emit `replace_label` messages as part of the safe-outputs protocol. Th
 |-------|------|----------|------------|-------------|
 | `label_to_remove` | `string` | Yes | 128 characters | Name of the label to remove from the target item. The label need not currently be present on the item (see §5.3.4). |
 | `label_to_add` | `string` | Yes | 128 characters | Name of the label to add to the target item. The label need not pre-exist in the repository (see §5.4). |
-| `item_number` | `integer` or temporary-ID `string` | No | — | Issue or pull request number to target. When absent, falls back to the triggering item derived from the GitHub Actions event context. May be a temporary-ID string resolved by the gh-aw temporary-ID framework. |
+| `item_number` | `integer` or temporary-ID `string` | No | — | Issue or pull request number to target when `target: "*"` is configured. When absent, falls back to the triggering item derived from the GitHub Actions event context. May be a temporary-ID string resolved by the gh-aw temporary-ID framework. |
 | `repo` | `string` | No | 256 characters | Target repository in `owner/repo` format. Overrides the configured `target-repo` for this message only. Must satisfy the `allowed-repos` configuration constraint. |
 
 **RL-004**: A conforming implementation MUST reject any `replace_label` message in which `label_to_remove` is absent, empty after trimming, or exceeds 128 characters.
@@ -209,7 +209,7 @@ AI agents emit `replace_label` messages as part of the safe-outputs protocol. Th
 
 #### 4.2.2 Aliased Item Number Fields
 
-For compatibility with agents that follow other safe-output conventions, the handler MUST also accept the following field names as aliases for `item_number`:
+With `target: "*"`, the handler MUST also accept the following field names as aliases for `item_number`:
 
 - `issue_number`
 - `pr_number`
@@ -315,34 +315,31 @@ Messages that fail schema validation MUST be rejected with a structured error lo
 
 #### 5.3.2 Item Number Resolution
 
-**RL-016**: The target item number is resolved as follows, in priority order:
+**RL-016**: The target item number MUST be resolved from the configured `target` mode before considering agent-supplied fields. Omitted `target` MUST be interpreted as `"triggering"`.
 
-1. The item number resolved from any temporary-ID field (`item_number`, `issue_number`, `pr_number`, `pull_number`) via the gh-aw temporary-ID framework.
-2. A literal numeric value from the same aliased fields.
-3. The triggering issue number from `github.event.issue.number`.
-4. The triggering pull request number from `github.event.pull_request.number`.
-
-**RL-017**: When no item number can be resolved through any of the four mechanisms above, the message MUST be rejected with the error "No issue/PR number available".
+**RL-017**: When no item number can be resolved for the configured target mode, the message MUST be rejected with the error "No issue/PR number available".
 
 #### 5.3.3 Target Mode Enforcement
 
-**RL-018**: When `target` is set to `"triggering"`, the resolved item number MUST equal the triggering item's number. A message specifying a different `item_number` MUST be rejected.
+**RL-018**: When `target` is set to `"triggering"` or omitted, the handler MUST use the triggering item's number and MUST ignore agent-supplied item-number fields.
 
-**RL-019**: When `target` is set to an explicit integer, the resolved item number MUST equal that integer. Messages specifying a different number MUST be rejected.
+**RL-019**: When `target` is set to an explicit integer, the handler MUST use that integer and MUST ignore agent-supplied item-number fields.
 
-**RL-020**: When `target` is set to `"*"`, any item number is permitted, subject to repository constraints.
+**RL-020**: Only when `target` is set to `"*"` MAY the handler resolve an item number from `item_number`, `issue_number`, `pr_number`, or `pull_number`, subject to repository constraints. If no agent-supplied number is present, the handler MAY fall back to the triggering item.
+
+**RL-020a**: The privileged handler MUST enforce RL-016 and RL-018 through RL-020 at runtime.
 
 ### 5.4 Stage 4: Label Validation
 
-**RL-021**: The implementation MUST evaluate `label_to_remove` against `allowed-remove` (if non-empty) and `blocked` (if non-empty). The evaluation order is:
+**RL-021**: The implementation MUST evaluate `label_to_remove` against `blocked` and `allowed-remove` (if non-empty), in this order:
 
-1. If `allowed-remove` is non-empty, `label_to_remove` MUST match at least one pattern. Failure → reject.
-2. If `blocked` is non-empty, `label_to_remove` MUST NOT match any pattern. Match → reject.
+1. If `blocked` is non-empty, `label_to_remove` MUST NOT match any pattern. A match MUST reject the label before any allowlist permit is considered.
+2. If `allowed-remove` is non-empty, `label_to_remove` MUST match at least one pattern. Failure → reject.
 
-**RL-022**: The implementation MUST evaluate `label_to_add` against `allowed-add` (if non-empty) and `blocked` (if non-empty). The evaluation order is:
+**RL-022**: The implementation MUST evaluate `label_to_add` against `blocked` and `allowed-add` (if non-empty), in this order:
 
-1. If `allowed-add` is non-empty, `label_to_add` MUST match at least one pattern. Failure → reject.
-2. If `blocked` is non-empty, `label_to_add` MUST NOT match any pattern. Match → reject.
+1. If `blocked` is non-empty, `label_to_add` MUST NOT match any pattern. A match MUST reject the label before any allowlist permit is considered.
+2. If `allowed-add` is non-empty, `label_to_add` MUST match at least one pattern. Failure → reject.
 
 **RL-023**: Label validation failures MUST be reported as warnings and the message MUST be skipped. The workflow run MUST NOT be marked as failed solely due to a label validation rejection.
 
@@ -437,17 +434,17 @@ In the Octokit client this is `githubClient.rest.issues.setLabels(params)`.
 
 ### 7.1 Error Categories
 
-| Category | Code | Behavior |
-|----------|------|----------|
-| Schema validation failure | `SCHEMA_INVALID` | Skip message with warning; do not fail run |
-| Count gate exceeded | `MAX_EXCEEDED` | Skip message with warning; do not fail run |
-| Target resolution failure | `TARGET_UNRESOLVABLE` | Skip message with warning; do not fail run |
-| Repository not in allowlist | `REPO_NOT_ALLOWED` | Skip message with warning; do not fail run |
-| Label validation failure | `LABEL_BLOCKED` or `LABEL_NOT_ALLOWED` | Skip message with warning; do not fail run |
-| Gate check (required-labels) | `GATE_REQUIRED_LABELS` | Skip message (skipped=true); do not fail run |
-| Gate check (title prefix) | `GATE_TITLE_PREFIX` | Skip message (skipped=true); do not fail run |
-| REST setLabels failure | `SETLABELS_FAILED` | Return hard error; message fails |
-| Rate-limit exhausted after retries | `RATE_LIMIT_EXHAUSTED` | Return hard error; message fails |
+| Category | Code | Owning stage | Behavior |
+|----------|------|---------------|----------|
+| Schema validation failure | `SCHEMA_INVALID` | 5.1 — Schema Validation | Skip message with warning; do not fail run |
+| Count gate exceeded | `MAX_EXCEEDED` | 5.2 — Count Gate Check | Skip message with warning; do not fail run |
+| Target resolution failure | `TARGET_UNRESOLVABLE` | 5.3 — Target Resolution | Skip message with warning; do not fail run |
+| Repository not in allowlist | `REPO_NOT_ALLOWED` | 5.3 — Target Resolution | Skip message with warning; do not fail run |
+| Label validation failure | `LABEL_BLOCKED` or `LABEL_NOT_ALLOWED` | 5.4 — Label Validation | Skip message with warning; do not fail run |
+| Gate check (required-labels) | `GATE_REQUIRED_LABELS` | 5.5 — Gate Checks | Skip message (`skipped=true`); do not fail run |
+| Gate check (title prefix) | `GATE_TITLE_PREFIX` | 5.5 — Gate Checks | Skip message (`skipped=true`); do not fail run |
+| REST setLabels failure | `SETLABELS_FAILED` | 5.8 — REST Label Update | Return hard error; message fails |
+| Rate-limit exhausted after retries | `RATE_LIMIT_EXHAUSTED` | 5.8 — REST Label Update | Return hard error; message fails |
 
 **RL-044**: A conforming implementation MUST NOT mark the workflow run as failed for soft-skip errors (schema invalid, count gate, target unresolvable, repo not allowed, label validation failure, gate check failures). These errors MUST be surfaced as workflow warnings only.
 
@@ -456,6 +453,10 @@ In the Octokit client this is `githubClient.rest.issues.setLabels(params)`.
 ### 7.2 REST Call Failure
 
 **RL-046**: When the `setLabels` REST call fails (e.g., HTTP 422 for an invalid label name), the implementation MUST log a `core.error()` entry and MUST return `{ success: false, error: <message> }`. For HTTP-level failures the call is all-or-nothing — either all label changes are applied or none are. For HTTP 200 responses, see §7.4 for partial-success response handling.
+
+**RL-046a**: If `setLabels` returns HTTP 404, the implementation MUST treat the request as rejected because the authoritative labeling target or repository is no longer reachable.
+
+**RL-046b**: If `setLabels` returns HTTP 5xx, times out, or fails with a transport error, the implementation MUST treat the condition as transient and retry according to the retry policy in §7.3. If retries are exhausted, the implementation MUST return `{ success: false, error: <message> }` without reporting a successful replacement.
 
 ### 7.3 Rate-Limit Retry Policy
 
@@ -485,6 +486,8 @@ A partial-success condition arises when the `setLabels` REST call returns HTTP 2
 Label allowlists and blocklists are the primary mechanism preventing AI agents from performing unintended or malicious label transitions. For example, a `blocked: ["~*"]` pattern would prohibit any label whose name begins with `~`, while `blocked: ["*[bot]"]` would prohibit adding bot-created labels.
 
 **RL-049**: Allowlist and blocklist evaluation MUST be performed server-side (in the JavaScript handler executing within GitHub Actions), not by the AI agent. Agents MUST NOT be trusted to self-enforce label restrictions.
+
+**RL-049a**: A conforming implementation MUST re-check `label_to_add` against the current server-side allowlist and blocklist state immediately before invoking `PUT /repos/{owner}/{repo}/issues/{issue_number}/labels`. If the label is blocked or no longer allowed at that point, the implementation MUST reject the message without calling the write API.
 
 ### 8.2 Cross-Repository Restrictions
 
@@ -518,6 +521,12 @@ Staged mode provides a mechanism for operators to audit AI agent label-transitio
 
 **RL-056**: When `staged: true`, the implementation MUST NOT call any write API endpoint. Read-only API calls performed during Stage 5 gate checks MAY proceed in staged mode.
 
+The staged-mode preview SHOULD identify the `label_to_add` value that would be revalidated before the write call so operators can compare previewed transitions against protected-label policy before disabling staged mode.
+
+### 8.7 Sync Notes
+
+The REST failure and retry semantics in [Section 7](#7-error-handling) are mirrored by the `replace_label` outcome-evaluation rules in [`safe-output-outcome-evaluation.md` Section 30](safe-output-outcome-evaluation.md#30-replace_label). Changes to `404`, `5xx`, or `429` handling in either document SHOULD be reviewed against the other document in the same change.
+
 ---
 
 ## 9. Compliance Testing
@@ -549,7 +558,16 @@ For outcome evaluation compliance (verifying that the `replace_label` outcome ev
 - **T-RL-012**: Verify that the default max of 5 is enforced when `max` is absent from configuration.
 - **T-RL-013**: Verify that a GHA expression in `max` is resolved at runtime.
 
-#### 9.2.3 Label Validation Tests
+#### 9.2.3 Target Authorization Tests
+
+- **T-RL-014**: Verify that an omitted `target` ignores a conflicting agent-supplied item number and uses the triggering item.
+- **T-RL-015**: Verify that `target: "triggering"` ignores a conflicting agent-supplied item number.
+- **T-RL-016**: Verify that a fixed numeric target ignores a conflicting agent-supplied item number.
+- **T-RL-017**: Verify that a fixed numeric target is used when the message omits an item number.
+- **T-RL-018**: Verify that `target: "*"` accepts an agent-supplied item number.
+- **T-RL-019**: Verify that the handler rejects the message when no target item number can be resolved.
+
+#### 9.2.4 Label Validation Tests
 
 The normative compliance fixtures for the allowlist and blocklist edge cases in
 this subsection live in `specs/replace-label-compliance/rl-002-allowlist-enforcement.yaml`
@@ -561,39 +579,61 @@ and `specs/replace-label-compliance/rl-003-blocklist-ordering.yaml`.
 - **T-RL-023**: Verify that `label_to_add` matching a `blocked` pattern is rejected even when it also matches `allowed-add`.
 - **T-RL-024**: Verify that `label_to_remove` matching a `blocked` pattern is rejected.
 - **T-RL-025**: Verify that `label_to_remove` is accepted when `allowed-remove` is empty.
+- **T-RL-026**: Verify that `label_to_add` is rechecked against current blocklist state immediately before `setLabels`.
 
-#### 9.2.4 Gate Check Tests
+Fixture linkage check (2026-08-01):
+
+- [x] T-RL-020 covered by `specs/replace-label-compliance/rl-001-glob-semantics.yaml`
+- [x] T-RL-021 covered by `specs/replace-label-compliance/rl-001-glob-semantics.yaml`
+- [x] T-RL-022 covered by `specs/replace-label-compliance/rl-001-glob-semantics.yaml`
+- [x] T-RL-023 covered by `specs/replace-label-compliance/rl-001-glob-semantics.yaml` and `specs/replace-label-compliance/rl-003-blocklist-ordering.yaml`
+- [x] T-RL-024 covered by `specs/replace-label-compliance/rl-003-blocklist-ordering.yaml`
+- [x] T-RL-025 covered by `specs/replace-label-compliance/rl-002-allowlist-enforcement.yaml`
+
+Error-category fixture: `specs/replace-label-compliance/rl-004-error-categories.yaml` records one scenario for each §7.1 category, including its owning stage and result. `TestFormalReplaceLabelErrorCategoryFixture` checks that the fixture remains complete and its stage assignments match this table.
+
+#### 9.2.5 Gate Check Tests
 
 - **T-RL-030**: Verify that an item satisfying all `required-labels` proceeds to the mutation stage.
 - **T-RL-031**: Verify that an item missing a required label is skipped (`skipped: true`) without failing.
 - **T-RL-032**: Verify that an item with a title matching `required-title-prefix` proceeds.
 - **T-RL-033**: Verify that an item whose title does not match `required-title-prefix` is skipped without failing.
 
-#### 9.2.5 Label Set Computation Tests
+#### 9.2.6 Label Set Computation Tests
 
 - **T-RL-040**: Verify that when `label_to_remove` is on the item, the computed new label set excludes it and includes `label_to_add`.
 - **T-RL-041**: Verify that when `label_to_add` is passed to `setLabels` and the label does not exist in the repository, the call fails with a hard error.
 - **T-RL-044**: Verify that when `label_to_remove` is not on the item, the computed new label set adds `label_to_add` without removing any label.
+- **T-RL-045**: Verify that the handler derives current labels from the REST response when `label_to_remove` is absent.
 
-#### 9.2.6 REST setLabels Tests
+#### 9.2.7 REST setLabels Tests
 
+- **T-RL-037**: Verify that transient `setLabels` failures exhaust the retry policy and return a hard error.
+- **T-RL-046a**: Verify that an HTTP 404 response is rejected without retrying and logs a hard error.
+- **T-RL-046b**: Verify that HTTP 5xx and transport failures are retried and may succeed.
 - **T-RL-050**: Verify that `setLabels` is called with the correct `owner`, `repo`, `issue_number`, and `labels` array.
 - **T-RL-051**: Verify that the updated label list returned by `setLabels` is logged.
 - **T-RL-052**: Verify that a `setLabels` failure produces a hard error result with `success: false`.
 - **T-RL-053**: Verify that `label_to_add` always appears exactly once in the `labels` array.
-- **T-RL-054**: Verify that rate-limit responses trigger retry behavior.
+- **T-RL-054**: Verify that primary (HTTP 429) and secondary (HTTP 403 with `Retry-After`) rate-limit responses trigger retry behavior.
 
-#### 9.2.7 Staged Mode Tests
+#### 9.2.8 Staged Mode Tests
 
 - **T-RL-060**: Verify that no write API call is made when `staged: true`.
 - **T-RL-061**: Verify that the preview log entry includes the correct label names, item number, and repository.
 - **T-RL-062**: Verify that staged mode returns `{ success: true, staged: true }`.
 
-#### 9.2.8 Cross-Repository Tests
+#### 9.2.9 Cross-Repository Tests
 
 - **T-RL-070**: Verify that a message with a `repo` in `allowed-repos` is accepted.
 - **T-RL-071**: Verify that a message with a `repo` not in `allowed-repos` is rejected.
 - **T-RL-072**: Verify that `target-repo` is used as the default when `repo` is absent from the message.
+
+#### 9.2.10 Partial-Success Response Tests
+
+- **T-RL-057**: Verify that the returned `setLabels` response contains `label_to_add` and omits the removed label.
+- **T-RL-058**: Verify that a partial-success response is rejected with a hard error.
+- **T-RL-059**: Verify that partial success uses the existing `SETLABELS_FAILED` category and introduces no new error code.
 
 ### 9.3 Compliance Checklist
 
@@ -608,18 +648,89 @@ and `specs/replace-label-compliance/rl-003-blocklist-ordering.yaml`.
 | RL-007 String sanitization | T-RL-006 | 1 | Required |
 | RL-010 Count gate enforcement | T-RL-010, T-RL-011 | 1 | Required |
 | RL-012 Default max = 5 | T-RL-012 | 1 | Required |
-| RL-017 No item number error | T-RL-006 | 1 | Required |
+| RL-016 Target mode precedence | T-RL-014 – T-RL-018 | 1 | Required |
+| RL-017 No item number error | T-RL-019 | 1 | Required |
+| RL-018 Triggering target authorization | T-RL-014, T-RL-015 | 1 | Required |
+| RL-019 Fixed target authorization | T-RL-016, T-RL-017 | 1 | Required |
+| RL-020 Wildcard target authorization | T-RL-018 | 1 | Required |
 | RL-024 required-labels gate | T-RL-030, T-RL-031 | 1 | Required |
 | RL-025 required-title-prefix gate | T-RL-032, T-RL-033 | 1 | Required |
 | RL-027 Staged mode no writes | T-RL-060 | 1 | Required |
 | RL-029 Label set computation | T-RL-040 | 1 | Required |
 | RL-034 Missing label_to_remove proceeds | T-RL-044 | 1 | Required |
 | RL-036 Single REST setLabels call | T-RL-050 | 1 | Required |
-| RL-037 Rate-limit retry on REST call | T-RL-054 | 2 | Recommended |
+| RL-037 Rate-limit retry on REST call | T-RL-054 | 1 | Required |
 | RL-041 label_to_add in labels array | T-RL-053 | 1 | Required |
 | RL-043 Atomic REST operation | T-RL-050 | 1 | Required |
+| RL-057 Verify returned labels | T-RL-057 | 1 | Required |
+| RL-058 Reject partial success | T-RL-058 | 1 | Required |
+| RL-059 Reuse SETLABELS_FAILED category | T-RL-059 | 1 | Required |
 | RL-050 Cross-repo restrictions | T-RL-070 – T-RL-072 | 1 | Required |
 | RL-052 setLabels fails for missing label | T-RL-041 | 1 | Required |
+| RL-049a Recheck blocklist before write | T-RL-026 | 1 | Required |
+| RL-033 Use current REST response for label state | T-RL-045 | 1 | Required |
+
+### 9.4 Normative MUST Coverage Index (§§5–8)
+
+Each MUST-level requirement is mapped to a compliance test ID or an explicit
+evidence gap. Test IDs identify the expected conformance case; the evidence table
+in [`specs/replace-label-compliance/README.md`](replace-label-compliance/README.md)
+records the implementation test or remaining gap.
+
+| Requirement | Test ID(s) or documented gap |
+|---|---|
+| §5 ordered processing pipeline | `replace_label.test.cjs`: “executes the label pipeline in order and stops before writes on a gate skip.” |
+| RL-008 | T-RL-001–006; `TestFormalSchemaRequiredFields` |
+| RL-009 | `TestFormalReplaceLabelP3_ValidationConfigFields`; **gap:** common-pipeline invocation is not directly tested. |
+| RL-010 | T-RL-010–011; `TestFormalCountGate` |
+| RL-011 | **Gap:** expression resolution for `max` is not directly tested. |
+| RL-012 | T-RL-012; `TestFormalReplaceLabelP3_DefaultMaxFive` |
+| RL-013 | T-RL-070–072; `TestFormalCrossRepoRestriction` |
+| RL-014 | **Gap:** malformed `owner/repo` rejection is not directly tested. |
+| RL-015 | T-RL-070–072; `TestFormalCrossRepoRestriction` |
+| RL-016 | T-RL-014–018; `TestFormalReplaceLabelP15_TargetModeEnforcement` |
+| RL-017 | T-RL-019 |
+| RL-018 | T-RL-014–015 |
+| RL-019 | T-RL-016–017 |
+| RL-020 | T-RL-018; `TestFormalItemNumberAliases` |
+| RL-020a | T-RL-014–019; `TestFormalReplaceLabelP15_TargetModeEnforcement` |
+| RL-021 | T-RL-023–024; `TestFormalBlocklistOrdering`, `TestFormalBlocklistSymmetry` |
+| RL-022 | T-RL-020–023; `TestFormalBlocklistOrdering`, `TestFormalBlocklistSymmetry` |
+| RL-023 | `replace_label.test.cjs`: warning-only assertions for target resolution, repository rejection, label validation, and count/gate skips. |
+| RL-024 | T-RL-030–031; `TestFormalRequiredLabelsGate` |
+| RL-025 | T-RL-032–033; `TestFormalTitlePrefixGate` |
+| RL-026 | T-RL-030–033; handler tests for skipped gate results |
+| RL-027 | T-RL-060–061; **gap:** the staged-preview log text is not asserted directly. |
+| RL-028 | T-RL-062; `TestFormalReplaceLabelP9_StagedHandlerResult` |
+| RL-029 | T-RL-040; `TestFormalLabelSetComputation` |
+| RL-033 | T-RL-045; `replace_label.test.cjs` uses a mocked current REST response. |
+| RL-034 | T-RL-044; `TestFormalReplaceLabelP11_IdempotentMissingRemove` |
+| RL-036 | T-RL-050; `TestFormalSingleRESTCall` |
+| RL-037 | T-RL-054 covers 403/429; `replace_label.test.cjs` retries 5xx and transport timeout, and verifies hard failure after exhaustion. |
+| RL-038 | T-RL-051; `replace_label.test.cjs`: “asserts success logs, complete result fields, and execution-state metadata.” |
+| RL-039 | `replace_label.test.cjs`: “asserts success logs, complete result fields, and execution-state metadata” checks the exact success-result fields. |
+| RL-040 | `replace_label.test.cjs`: “asserts success logs, complete result fields, and execution-state metadata” checks before/after metadata. |
+| RL-041 | T-RL-040, T-RL-050; `TestFormalLabelSetComputation` |
+| RL-042 | T-RL-053; `TestFormalAddDeduplication` |
+| RL-043 | T-RL-050; **gap:** GitHub's server-side atomicity guarantee is not locally testable. |
+| RL-044 | `replace_label.test.cjs` asserts warning output and no `core.error()` for missing fields, count, target/repository rejection, label validation, and gate skips. |
+| RL-045 | `replace_label.test.cjs` asserts `core.error()` for REST failure, 404, retry exhaustion, and failed postconditions. |
+| RL-046 | T-RL-052; `TestFormalHardErrorOnRESTFail` |
+| RL-046a | `replace_label.test.cjs`: “T-RL-046a rejects an HTTP 404 without retrying and logs a hard error.” |
+| RL-046b | `replace_label.test.cjs`: “T-RL-046b retries” and “T-RL-037 returns a hard error after transient retries are exhausted.” |
+| RL-048 | T-RL-054; handler test covers 403 and 429 retries. |
+| RL-057 | `TestFormalPostSetLabelsAddPresent`, `TestFormalPostSetLabelsRemoveAbsent` |
+| RL-058 | `TestFormalPartialSuccessRejected` |
+| RL-059 | `TestFormalPartialSuccessNoNewErrorCode` |
+| RL-049 | T-RL-020–025; `TestFormalBlocklistOrdering` |
+| RL-049a | `TestFormalBlockedLabelAddedViaReplaceLabelMidBlocklistChange_NoWriteAPI` |
+| RL-050 | T-RL-070–072; `TestFormalCrossRepoRestriction` |
+| RL-051 | **Gap:** cross-repository token permission is not checked by a focused conformance test. |
+| RL-052 | T-RL-041; handler test for nonexistent `label_to_add` |
+| RL-053 | T-RL-030–031; **gap:** no test substitutes agent-provided label state for the REST response. |
+| RL-054 | **Gap:** the minimum `issues: write` token scope is not covered by a focused conformance test. |
+| RL-055 | **Gap:** dedicated per-type token use for narrower permissions is not covered by a conformance test. |
+| RL-056 | T-RL-060; `replace_label.test.cjs` asserts staged mode never calls `setLabels`. |
 
 ---
 
@@ -679,6 +790,7 @@ With `staged: true` in the configuration:
 safe-outputs:
   replace-label:
     staged: true
+    target: "*"
     allowed-add: ["done"]
     allowed-remove: ["in-progress"]
 ```
@@ -706,6 +818,7 @@ The message is rejected with `{ success: false }`. The label must be created in 
 ```yaml
 safe-outputs:
   replace-label:
+    target: "*"
     target-repo: "owner/infra"
     allowed-repos: ["owner/infra", "owner/platform"]
     allowed-add: ["deployed"]
@@ -775,6 +888,15 @@ The message is skipped. The workflow run is not marked as failed.
 ---
 
 ## Change Log
+
+### Version 1.0.3 (Revision) — 2026-11-05
+
+- Added owning stages to every §7.1 error category and mapped them to the executable error-category fixture.
+
+### Version 1.0.2 (Revision) — 2026-09-12
+
+- Clarified that configured target modes take precedence over agent-supplied item numbers.
+- Added T-RL-014 through T-RL-018 target authorization tests.
 
 ### Version 1.0.1 (Revision) — 2026-06-22
 

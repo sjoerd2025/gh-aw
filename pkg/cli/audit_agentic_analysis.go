@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/scanfindings"
 	"github.com/github/gh-aw/pkg/timeutil"
 	"github.com/github/gh-aw/pkg/workflow"
 )
@@ -98,82 +99,95 @@ func mergeMCPToolUsageInfo(toolUsage []ToolUsageInfo, mcpToolUsage *MCPToolUsage
 	if mcpToolUsage == nil {
 		return toolUsage
 	}
+	toolStats := cloneToolUsageStats(toolUsage)
+	if len(mcpToolUsage.Summary) > 0 {
+		mergeMCPToolUsageSummaries(toolStats, mcpToolUsage.Summary)
+	} else {
+		mergeMCPToolUsageCalls(toolStats, mcpToolUsage.ToolCalls)
+	}
+	return sortedToolUsageStats(toolStats)
+}
 
+func cloneToolUsageStats(toolUsage []ToolUsageInfo) map[string]*ToolUsageInfo {
 	toolStats := make(map[string]*ToolUsageInfo)
 	for _, info := range toolUsage {
 		cloned := info
 		toolStats[info.Name] = &cloned
 	}
+	return toolStats
+}
 
-	addOrUpdateToolUsage := func(name string, callCount, maxInputSize, maxOutputSize int, maxDuration string) {
-		normalizedName := strings.TrimSpace(name)
-		if normalizedName == "" {
-			return
-		}
-		displayKey := workflow.PrettifyToolName(normalizedName)
-		if existing, exists := toolStats[displayKey]; exists {
-			existing.CallCount += callCount
-			if maxInputSize > existing.MaxInputSize {
-				existing.MaxInputSize = maxInputSize
-			}
-			if maxOutputSize > existing.MaxOutputSize {
-				existing.MaxOutputSize = maxOutputSize
-			}
-			if maxDuration != "" {
-				maxDurationValue := parseDurationString(maxDuration)
-				if existing.MaxDuration == "" {
-					existing.MaxDuration = maxDuration
-				} else {
-					existingMaxDurationValue := parseDurationString(existing.MaxDuration)
-					if maxDurationValue > existingMaxDurationValue {
-						existing.MaxDuration = maxDuration
-					}
-				}
-			}
-			return
-		}
+func addOrUpdateToolUsage(toolStats map[string]*ToolUsageInfo, name string, callCount, maxInputSize, maxOutputSize int, maxDuration string) {
+	normalizedName := strings.TrimSpace(name)
+	if normalizedName == "" {
+		return
+	}
+	displayKey := workflow.PrettifyToolName(normalizedName)
+	if existing, exists := toolStats[displayKey]; exists {
+		updateExistingToolUsage(existing, callCount, maxInputSize, maxOutputSize, maxDuration)
+		return
+	}
+	toolStats[displayKey] = &ToolUsageInfo{
+		Name:          displayKey,
+		CallCount:     callCount,
+		MaxInputSize:  maxInputSize,
+		MaxOutputSize: maxOutputSize,
+		MaxDuration:   maxDuration,
+	}
+}
 
-		toolStats[displayKey] = &ToolUsageInfo{
-			Name:          displayKey,
-			CallCount:     callCount,
-			MaxInputSize:  maxInputSize,
-			MaxOutputSize: maxOutputSize,
-			MaxDuration:   maxDuration,
+func updateExistingToolUsage(existing *ToolUsageInfo, callCount, maxInputSize, maxOutputSize int, maxDuration string) {
+	existing.CallCount += callCount
+	if maxInputSize > existing.MaxInputSize {
+		existing.MaxInputSize = maxInputSize
+	}
+	if maxOutputSize > existing.MaxOutputSize {
+		existing.MaxOutputSize = maxOutputSize
+	}
+	if maxDuration == "" {
+		return
+	}
+	maxDurationValue := parseDurationString(maxDuration)
+	if existing.MaxDuration == "" || maxDurationValue > parseDurationString(existing.MaxDuration) {
+		existing.MaxDuration = maxDuration
+	}
+}
+
+func mergeMCPToolUsageSummaries(toolStats map[string]*ToolUsageInfo, summaries []MCPToolSummary) {
+	for _, summary := range summaries {
+		toolSummary := summary
+		toolSummary.syncFieldsFromBase()
+		switch {
+		case toolSummary.ServerName != "" && toolSummary.ToolName != "":
+			addOrUpdateToolUsage(toolStats, toolSummary.ServerName+"."+toolSummary.ToolName, toolSummary.CallCount, toolSummary.MaxInputSize, toolSummary.MaxOutputSize, toolSummary.MaxDuration)
+		case toolSummary.ToolName != "":
+			addOrUpdateToolUsage(toolStats, toolSummary.ToolName, toolSummary.CallCount, toolSummary.MaxInputSize, toolSummary.MaxOutputSize, toolSummary.MaxDuration)
 		}
 	}
+}
 
-	if len(mcpToolUsage.Summary) > 0 {
-		for _, summary := range mcpToolUsage.Summary {
-			switch {
-			case summary.ServerName != "" && summary.ToolName != "":
-				addOrUpdateToolUsage(summary.ServerName+"."+summary.ToolName, summary.CallCount, summary.MaxInputSize, summary.MaxOutputSize, summary.MaxDuration)
-			case summary.ToolName != "":
-				addOrUpdateToolUsage(summary.ToolName, summary.CallCount, summary.MaxInputSize, summary.MaxOutputSize, summary.MaxDuration)
-			}
-		}
-	} else {
-		for _, call := range mcpToolUsage.ToolCalls {
-			switch {
-			case call.ServerName != "" && call.ToolName != "":
-				addOrUpdateToolUsage(call.ServerName+"."+call.ToolName, 1, call.InputSize, call.OutputSize, call.Duration)
-			case call.ToolName != "":
-				addOrUpdateToolUsage(call.ToolName, 1, call.InputSize, call.OutputSize, call.Duration)
-			}
+func mergeMCPToolUsageCalls(toolStats map[string]*ToolUsageInfo, calls []MCPToolCall) {
+	for _, call := range calls {
+		switch {
+		case call.ServerName != "" && call.ToolName != "":
+			addOrUpdateToolUsage(toolStats, call.ServerName+"."+call.ToolName, 1, call.InputSize, call.OutputSize, call.Duration)
+		case call.ToolName != "":
+			addOrUpdateToolUsage(toolStats, call.ToolName, 1, call.InputSize, call.OutputSize, call.Duration)
 		}
 	}
+}
 
+func sortedToolUsageStats(toolStats map[string]*ToolUsageInfo) []ToolUsageInfo {
 	mergedToolUsage := make([]ToolUsageInfo, 0, len(toolStats))
 	for _, info := range toolStats {
 		mergedToolUsage = append(mergedToolUsage, *info)
 	}
-
 	slices.SortFunc(mergedToolUsage, func(a, b ToolUsageInfo) int {
 		if a.CallCount != b.CallCount {
 			return b.CallCount - a.CallCount
 		}
 		return strings.Compare(a.Name, b.Name)
 	})
-
 	return mergedToolUsage
 }
 
@@ -190,7 +204,7 @@ func deriveRunAgenticAnalysis(processedRun ProcessedRun, metrics LogMetrics) (*A
 	}
 
 	toolUsage := buildToolUsageInfo(metrics)
-	createdItems := extractCreatedItemsFromManifest(processedRun.Run.LogsPath)
+	createdItems := resolveCreatedItems(processedRun.Run.LogsPath, processedRun.SafeOutputs)
 	metricsData := MetricsData{
 		TokenUsage:    processedRun.Run.TokenUsage,
 		ActionMinutes: processedRun.Run.ActionMinutes,
@@ -316,6 +330,18 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 	frictionEvents := len(processedRun.MissingTools) + len(processedRun.MCPFailures) + len(processedRun.MissingData)
 	writeCount := len(createdItems) + processedRun.Run.SafeItemsCount
 
+	assessments = appendResourceHeavyAssessment(assessments, processedRun, metrics, domain, fingerprint, toolTypes, writeCount)
+	assessments = appendOverkillAssessment(assessments, metrics, domain, fingerprint, toolTypes)
+	assessments = appendPoorControlAssessment(assessments, domain, fingerprint, frictionEvents, writeCount)
+	assessments = appendPartiallyReducibleAssessment(assessments, metrics, fingerprint)
+	assessments = appendModelDowngradeAssessment(assessments, domain, fingerprint, processedRun.ModelRouting)
+	assessments = appendDelegatedContextAssessment(assessments, awContext)
+
+	auditAgenticLog.Printf("Built %d agentic assessments", len(assessments))
+	return assessments
+}
+
+func appendResourceHeavyAssessment(assessments []AgenticAssessment, processedRun ProcessedRun, metrics MetricsData, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint, toolTypes, writeCount int) []AgenticAssessment {
 	if fingerprint.ResourceProfile == "heavy" {
 		severity := "medium"
 		if metrics.Turns >= 14 || toolTypes >= 7 || processedRun.Run.Duration >= 20*time.Minute {
@@ -329,7 +355,10 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 			Recommendation: "Compare this run to similar successful runs and trim unnecessary turns, tools, or write actions.",
 		})
 	}
+	return assessments
+}
 
+func appendOverkillAssessment(assessments []AgenticAssessment, metrics MetricsData, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint, toolTypes int) []AgenticAssessment {
 	if (domain.Name == "triage" || domain.Name == "repo_maintenance" || domain.Name == "issue_response") && fingerprint.ResourceProfile == "lean" && fingerprint.ExecutionStyle == "directed" && fingerprint.ToolBreadth == "narrow" {
 		assessments = append(assessments, AgenticAssessment{
 			Kind:           "overkill_for_agentic",
@@ -339,7 +368,10 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 			Recommendation: "Consider whether a scripted rule or deterministic workflow step could replace this agentic path.",
 		})
 	}
+	return assessments
+}
 
+func appendPoorControlAssessment(assessments []AgenticAssessment, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint, frictionEvents, writeCount int) []AgenticAssessment {
 	if frictionEvents >= 3 || (frictionEvents > 0 && writeCount >= 3) || ((domain.Name == "triage" || domain.Name == "repo_maintenance" || domain.Name == "issue_response") && fingerprint.ExecutionStyle == "exploratory") {
 		severity := "medium"
 		if frictionEvents >= 4 || (frictionEvents > 0 && fingerprint.ActuationStyle == "write_heavy") {
@@ -353,7 +385,10 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 			Recommendation: "Tighten instructions, reduce unnecessary tools, or delay write actions until the workflow has stronger evidence.",
 		})
 	}
+	return assessments
+}
 
+func appendPartiallyReducibleAssessment(assessments []AgenticAssessment, metrics MetricsData, fingerprint *BehaviorFingerprint) []AgenticAssessment {
 	// Partially reducible: the workflow has a low agentic fraction, meaning
 	// many turns are data-gathering that could be moved to deterministic steps:
 	// or post-steps: in the frontmatter. Only flag when there's substantive work
@@ -373,21 +408,74 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 			Recommendation: "Move data-fetching work to frontmatter steps: (pre-agent) writing to /tmp/gh-aw/agent/ or post-steps: (post-agent) to reduce inference cost. See the DeterministicOps guide.",
 		})
 	}
+	return assessments
+}
 
-	// Model downgrade suggestion: the run uses a heavy resource profile but
-	// the task domain is simple enough that a smaller model would likely suffice.
-	if fingerprint.ResourceProfile != "lean" &&
-		(domain.Name == "triage" || domain.Name == "repo_maintenance" || domain.Name == "issue_response") &&
-		fingerprint.ActuationStyle != "write_heavy" {
-		assessments = append(assessments, AgenticAssessment{
+const modelRoutingDocsURL = "https://github.github.com/gh-aw/reference/model-routing/"
+
+// perTaskRoutingChange covers each way a workflow can set its model because
+// audit cannot tell which form the workflow uses.
+const perTaskRoutingChange = "change engine.model (if set) or the top-level model to router; with an engine.model-routing block, set its mode: auto instead. To cap routing at the lowest level, use router/economy (mode: economy) instead."
+
+func appendModelDowngradeAssessment(assessments []AgenticAssessment, domain *TaskDomainInfo, fingerprint *BehaviorFingerprint, routing *ModelRoutingSummary) []AgenticAssessment {
+	// Per-task routing suggestion: the run uses a non-lean resource profile but
+	// the task domain is routine enough that the router's classifier would
+	// likely pick the economy level for it.
+	if fingerprint.ResourceProfile == "lean" ||
+		(domain.Name != "triage" && domain.Name != "repo_maintenance" && domain.Name != "issue_response") ||
+		fingerprint.ActuationStyle == "write_heavy" {
+		return assessments
+	}
+	evidence := fmt.Sprintf("domain=%s resource_profile=%s actuation=%s", domain.Name, fingerprint.ResourceProfile, fingerprint.ActuationStyle)
+	level := confirmedModelRoutingLevel(routing)
+	switch {
+	case level == "economy":
+		auditAgenticLog.Print("Skipping model downgrade assessment: run was already routed at economy")
+		return assessments
+	case level != "" && routing.ObjectiveMode == "auto":
+		// The classifier chose this level for the task; the domain heuristic
+		// is weaker evidence and must not overrule it.
+		auditAgenticLog.Printf("Skipping model downgrade assessment: auto routing selected %s for this task", level)
+		return assessments
+	case level != "" && (routing.ObjectiveMode == "balanced" || routing.ObjectiveMode == "robust"):
+		return append(assessments, AgenticAssessment{
 			Kind:           "model_downgrade_available",
 			Severity:       "low",
-			Summary:        fmt.Sprintf("This %s run may not need a frontier model. A smaller model (e.g. gpt-4.1-mini, claude-haiku-4-5) could handle the task at lower cost.", domain.Label),
-			Evidence:       fmt.Sprintf("domain=%s resource_profile=%s actuation=%s", domain.Name, fingerprint.ResourceProfile, fingerprint.ActuationStyle),
-			Recommendation: "Try engine.model: gpt-4.1-mini or claude-haiku-4-5 in the workflow frontmatter.",
+			Summary:        fmt.Sprintf("This %s run was routed at a fixed %s level; when the router's classifier picks the level per task, routine work like this usually runs at the economy level for lower cost.", domain.Label, routing.ObjectiveMode),
+			Evidence:       fmt.Sprintf("%s routing_objective_mode=%s routing_mode=%s", evidence, routing.ObjectiveMode, level),
+			Recommendation: "Let the router pick the level for each task: " + perTaskRoutingChange + " See " + modelRoutingDocsURL,
+		})
+	default:
+		return append(assessments, AgenticAssessment{
+			Kind:           "model_downgrade_available",
+			Severity:       "low",
+			Summary:        fmt.Sprintf("This %s run may not need a high-capability model. Per-task model routing lets the router's classifier pick the level for each task, usually economy for routine work like this, at lower cost.", domain.Label),
+			Evidence:       evidence,
+			Recommendation: "Route each task with model: router: " + perTaskRoutingChange + " Workflows eligible for default routing can instead omit the model. See " + modelRoutingDocsURL,
 		})
 	}
+}
 
+// confirmedModelRoutingLevel returns the routing level recorded by a successful
+// selection, or "" when the evidence is missing, incomplete, or ambiguous. The
+// level comes only from the selection mode; requested modes such as auto, model
+// names, and outcome-only records are never treated as a selected level.
+func confirmedModelRoutingLevel(routing *ModelRoutingSummary) string {
+	if routing == nil || routing.Status != "selected" || routing.Failure != nil {
+		return ""
+	}
+	if routing.SelectedModel == "" && routing.SelectedID == "" {
+		return ""
+	}
+	switch routing.Mode {
+	case "economy", "balanced", "robust":
+		return routing.Mode
+	default:
+		return ""
+	}
+}
+
+func appendDelegatedContextAssessment(assessments []AgenticAssessment, awContext *AwContext) []AgenticAssessment {
 	if awContext != nil {
 		assessments = append(assessments, AgenticAssessment{
 			Kind:           "delegated_context_present",
@@ -397,39 +485,45 @@ func buildAgenticAssessments(processedRun ProcessedRun, metrics MetricsData, too
 			Recommendation: "Use this context when comparing downstream runs so follow-up workflows are evaluated as part of one task chain.",
 		})
 	}
-
-	auditAgenticLog.Printf("Built %d agentic assessments", len(assessments))
 	return assessments
 }
 
-func generateAgenticAssessmentFindings(assessments []AgenticAssessment) []Finding {
-	findings := make([]Finding, 0, len(assessments))
+func generateAgenticAssessmentFindings(assessments []AgenticAssessment) []AuditFinding {
+	findings := make([]AuditFinding, 0, len(assessments))
 	for _, assessment := range assessments {
 		category := "agentic"
 		impact := "Review recommended"
+		var code AuditFindingCode
 		switch assessment.Kind {
 		case "resource_heavy_for_domain":
+			code = AuditFindingAgenticResourceHeavy
 			category = "performance"
 			impact = "Higher cost and latency than a comparable well-behaved run"
 		case "overkill_for_agentic":
+			code = AuditFindingAgenticOverkill
 			category = "optimization"
 			impact = "A deterministic implementation may be cheaper and easier to govern"
 		case "poor_agentic_control":
+			code = AuditFindingAgenticPoorControl
 			category = "agentic"
 			impact = "Broad or weakly controlled behavior can reduce trust even when the run succeeds"
 		case "partially_reducible":
+			code = AuditFindingAgenticPartiallyReducible
 			category = "optimization"
 			impact = "Moving data-gathering turns to deterministic steps reduces inference cost"
 		case "model_downgrade_available":
+			code = AuditFindingAgenticModelDowngrade
 			category = "optimization"
-			impact = "A smaller model could reduce per-run cost significantly for this task domain"
+			impact = "Per-task model routing could reduce per-run cost for this task domain"
 		case "delegated_context_present":
+			code = AuditFindingAgenticDelegatedContext
 			category = "coordination"
 			impact = "Context continuity improves downstream debugging and auditability"
 		}
-		findings = append(findings, Finding{
+		findings = append(findings, AuditFinding{
+			Code:        code,
 			Category:    category,
-			Severity:    assessment.Severity,
+			Severity:    scanfindings.ParseSeverity(assessment.Severity),
 			Title:       prettifyAssessmentKind(assessment.Kind),
 			Description: assessment.Summary,
 			Impact:      impact,

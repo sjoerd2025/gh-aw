@@ -9,6 +9,7 @@ import (
 
 // TestAwInfoBackwardCompatibility verifies that AwInfo can parse both old and new field names
 func TestAwInfoBackwardCompatibility(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name                    string
 		jsonData                string
@@ -84,6 +85,7 @@ func TestAwInfoBackwardCompatibility(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			var info AwInfo
 			err := json.Unmarshal([]byte(tt.jsonData), &info)
 			if err != nil {
@@ -111,8 +113,81 @@ func TestAwInfoBackwardCompatibility(t *testing.T) {
 	}
 }
 
+func TestAwInfoNumericIDs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		jsonData       string
+		expectedRunID  NumericID
+		expectedNumber NumericID
+	}{
+		{
+			name:           "numbers",
+			jsonData:       `{"run_id":123456789,"run_number":42}`,
+			expectedRunID:  123456789,
+			expectedNumber: 42,
+		},
+		{
+			name:           "numeric strings",
+			jsonData:       `{"run_id":"123456789","run_number":"42"}`,
+			expectedRunID:  123456789,
+			expectedNumber: 42,
+		},
+		{
+			name:           "null values",
+			jsonData:       `{"run_id":null,"run_number":null}`,
+			expectedRunID:  0,
+			expectedNumber: 0,
+		},
+		{
+			name:           "empty strings",
+			jsonData:       `{"run_id":"","run_number":""}`,
+			expectedRunID:  0,
+			expectedNumber: 0,
+		},
+		{
+			name:           "missing values",
+			jsonData:       `{"engine_id":"copilot"}`,
+			expectedRunID:  0,
+			expectedNumber: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var info AwInfo
+			if err := json.Unmarshal([]byte(tt.jsonData), &info); err != nil {
+				t.Fatalf("Failed to unmarshal JSON: %v", err)
+			}
+			if info.RunID != tt.expectedRunID {
+				t.Errorf("RunID = %d, want %d", info.RunID, tt.expectedRunID)
+			}
+			if info.RunNumber != tt.expectedNumber {
+				t.Errorf("RunNumber = %d, want %d", info.RunNumber, tt.expectedNumber)
+			}
+		})
+	}
+}
+
+func TestNumericIDRejectsInvalidValues(t *testing.T) {
+	t.Parallel()
+
+	for _, jsonData := range []string{`"not-a-number"`, `9223372036854775808`, `true`, `1.5`, `{}`} {
+		t.Run(jsonData, func(t *testing.T) {
+			t.Parallel()
+			var id NumericID
+			if err := json.Unmarshal([]byte(jsonData), &id); err == nil {
+				t.Errorf("Expected %s to be rejected", jsonData)
+			}
+		})
+	}
+}
+
 // TestAwInfoMarshaling verifies that AwInfo can be marshaled correctly
 func TestAwInfoMarshaling(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		info             AwInfo
@@ -160,6 +235,7 @@ func TestAwInfoMarshaling(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			data, err := json.Marshal(tt.info)
 			if err != nil {
 				t.Fatalf("Failed to marshal AwInfo: %v", err)

@@ -26,14 +26,26 @@ func filterActionableDomains(domains []string) []string {
 }
 
 // generateFindings creates key findings from workflow run data
-func generateFindings(processedRun ProcessedRun, metrics MetricsData, errors []ErrorInfo) []Finding {
+func generateFindings(processedRun ProcessedRun, metrics MetricsData, errors []ValidationIssue) []AuditFinding {
 	auditReportLog.Printf("Generating findings: errors=%d, conclusion=%s", len(errors), processedRun.Run.Conclusion)
 	findings := appendFailureAndTimeoutFindings(nil, processedRun, metrics, errors)
+	findings = append(findings, generateModelAvailabilityFindings(processedRun.Run)...)
+	detectionFindings := generateThreatDetectionFindings(processedRun)
+	findings = append(findings, detectionFindings...)
+	findings = append(findings, generateEngineStepFailureFindings(processedRun)...)
+	findings = append(findings, generateSafeOutputsBlockedFindings(processedRun)...)
 	findings = append(findings, generatePerformanceFindings(metrics)...)
 	findings = append(findings, generateErrorVolumeFindings(errors)...)
 	findings = append(findings, generateToolingFindings(processedRun)...)
 	findings = append(findings, generateFirewallFindings(processedRun)...)
-	findings = append(findings, generateSuccessFindings(processedRun.Run, metrics, errors)...)
+	findings = append(findings, generateSubagentModelFindings(processedRun.TokenUsage)...)
+	findings = append(findings, generateSubagentModelUnavailableFindings(processedRun.Run.LogsPath)...)
+	if len(detectionFindings) == 0 {
+		findings = append(findings, generateSuccessFindings(processedRun.Run, metrics, errors)...)
+	}
+	for i := range findings {
+		findings[i].PlaybookURL = auditFindingPlaybookURL(findings[i].Code)
+	}
 	return findings
 }
 
@@ -48,22 +60,44 @@ func findFailedAgentJob(jobDetails []JobInfoWithDuration) (JobInfoWithDuration, 
 }
 
 // generateRecommendations creates actionable recommendations based on findings
-func generateRecommendations(processedRun ProcessedRun, metrics MetricsData, findings []Finding) []Recommendation {
+func generateRecommendations(processedRun ProcessedRun, metrics MetricsData, findings []AuditFinding) []Recommendation {
 	auditReportLog.Printf("Generating recommendations: findings_count=%d, workflow_conclusion=%s", len(findings), processedRun.Run.Conclusion)
 	var recommendations []Recommendation
 	hasCriticalFindings, hasHighCostFindings, hasManyTurns := analyzeRecommendationInputs(findings)
 	recommendations = appendFailureRecommendations(recommendations, processedRun.Run, hasCriticalFindings)
+	recommendations = appendModelAvailabilityRecommendations(recommendations, findings)
+	for _, finding := range findings {
+		if finding.Code == AuditFindingDetectionJobFailed || finding.Code == AuditFindingThreatDetected {
+			recommendations = append(recommendations, Recommendation{
+				Priority: "high",
+				Action:   "Review threat detection results and resolve detection errors before trusting agent output",
+				Reason:   "Actions success does not establish successful threat detection",
+				Example:  "Inspect the detection job logs with 'gh aw audit <run-id>'",
+			})
+			break
+		}
+	}
 	recommendations = appendCostRecommendations(recommendations, hasHighCostFindings)
 	recommendations = appendIterationRecommendations(recommendations, hasManyTurns)
 	recommendations = appendToolingRecommendations(recommendations, processedRun)
+	recommendations = appendSafeOutputsBlockedRecommendations(recommendations, findings)
+	if metrics.SubagentFailureCount > 0 {
+		recommendations = append(recommendations, Recommendation{
+			Priority: "high",
+			Action:   "Review failed sub-agent invocations and verify recovery",
+			Reason:   "A successful parent conclusion does not establish completion of failed delegated work",
+			Example:  "Inspect subagent_failed findings and session evidence for retries or parent fallback",
+		})
+	}
 	recommendations = appendSuccessRecommendations(recommendations, processedRun.Run)
 	return recommendations
 }
 
-func appendFailureAndTimeoutFindings(findings []Finding, processedRun ProcessedRun, metrics MetricsData, errors []ErrorInfo) []Finding {
+func appendFailureAndTimeoutFindings(findings []AuditFinding, processedRun ProcessedRun, metrics MetricsData, errors []ValidationIssue) []AuditFinding {
 	run := processedRun.Run
 	if run.Conclusion == "failure" {
-		findings = append(findings, Finding{
+		findings = append(findings, AuditFinding{
+			Code:        AuditFindingWorkflowFailed,
 			Category:    "error",
 			Severity:    "critical",
 			Title:       "Workflow Failed",
@@ -72,7 +106,8 @@ func appendFailureAndTimeoutFindings(findings []Finding, processedRun ProcessedR
 		})
 	}
 	if run.Conclusion == "timed_out" {
-		findings = append(findings, Finding{
+		findings = append(findings, AuditFinding{
+			Code:        AuditFindingWorkflowTimeout,
 			Category:    "performance",
 			Severity:    "high",
 			Title:       "Workflow Timeout",
@@ -83,7 +118,7 @@ func appendFailureAndTimeoutFindings(findings []Finding, processedRun ProcessedR
 	return findings
 }
 
-func buildFailureFindingDescription(run WorkflowRun, jobDetails []JobInfoWithDuration, metrics MetricsData, errors []ErrorInfo) string {
+func buildFailureFindingDescription(run WorkflowRun, jobDetails []JobInfoWithDuration, metrics MetricsData, errors []ValidationIssue) string {
 	if metrics.ErrorCount == 0 && len(errors) == 0 {
 		if agentJob, ok := findFailedAgentJob(jobDetails); ok {
 			return fmt.Sprintf(
@@ -109,13 +144,18 @@ func buildFailureFindingDescription(run WorkflowRun, jobDetails []JobInfoWithDur
 	}
 
 	const maxErrMsgLen = 200
-	return desc + ": " + stringutil.Truncate(errors[0].Message, maxErrMsgLen)
+	// Range avoids direct indexing while preserving the first error.
+	for _, issue := range errors {
+		return desc + ": " + stringutil.Truncate(issue.Message, maxErrMsgLen)
+	}
+	return desc
 }
 
-func generatePerformanceFindings(metrics MetricsData) []Finding {
-	var findings []Finding
+func generatePerformanceFindings(metrics MetricsData) []AuditFinding {
+	var findings []AuditFinding
 	if metrics.TokenUsage > 50000 {
-		findings = append(findings, Finding{
+		findings = append(findings, AuditFinding{
+			Code:        AuditFindingHighTokenUsage,
 			Category:    "performance",
 			Severity:    "medium",
 			Title:       "High Token Usage",
@@ -124,7 +164,8 @@ func generatePerformanceFindings(metrics MetricsData) []Finding {
 		})
 	}
 	if metrics.Turns > 10 {
-		findings = append(findings, Finding{
+		findings = append(findings, AuditFinding{
+			Code:        AuditFindingManyIterations,
 			Category:    "performance",
 			Severity:    "medium",
 			Title:       "Many Iterations",
@@ -135,11 +176,12 @@ func generatePerformanceFindings(metrics MetricsData) []Finding {
 	return findings
 }
 
-func generateErrorVolumeFindings(errors []ErrorInfo) []Finding {
+func generateErrorVolumeFindings(errors []ValidationIssue) []AuditFinding {
 	if len(errors) <= 5 {
 		return nil
 	}
-	return []Finding{{
+	return []AuditFinding{{
+		Code:        AuditFindingMultipleErrors,
 		Category:    "error",
 		Severity:    "high",
 		Title:       "Multiple Errors",
@@ -148,13 +190,14 @@ func generateErrorVolumeFindings(errors []ErrorInfo) []Finding {
 	}}
 }
 
-func generateToolingFindings(processedRun ProcessedRun) []Finding {
-	var findings []Finding
+func generateToolingFindings(processedRun ProcessedRun) []AuditFinding {
+	var findings []AuditFinding
 	if len(processedRun.MCPFailures) > 0 {
 		serverNames := sliceutil.Map(processedRun.MCPFailures, func(failure MCPFailureReport) string {
 			return failure.ServerName
 		})
-		findings = append(findings, Finding{
+		findings = append(findings, AuditFinding{
+			Code:        AuditFindingMCPServerFailures,
 			Category:    "tooling",
 			Severity:    "high",
 			Title:       "MCP Server Failures",
@@ -163,7 +206,8 @@ func generateToolingFindings(processedRun ProcessedRun) []Finding {
 		})
 	}
 	if len(processedRun.MissingTools) > 0 {
-		findings = append(findings, Finding{
+		findings = append(findings, AuditFinding{
+			Code:        AuditFindingToolsNotAvailable,
 			Category:    "tooling",
 			Severity:    "medium",
 			Title:       "Tools Not Available",
@@ -185,12 +229,13 @@ func buildMissingToolsFindingDescription(missingTools []MissingToolReport) strin
 	return desc
 }
 
-func generateFirewallFindings(processedRun ProcessedRun) []Finding {
+func generateFirewallFindings(processedRun ProcessedRun) []AuditFinding {
 	if processedRun.FirewallAnalysis == nil || processedRun.FirewallAnalysis.BlockedRequests == 0 {
 		return nil
 	}
 	blockedDomains := filterActionableDomains(processedRun.FirewallAnalysis.GetBlockedDomains())
-	return []Finding{{
+	return []AuditFinding{{
+		Code:        AuditFindingBlockedNetworkRequests,
 		Category:    "network",
 		Severity:    "medium",
 		Title:       "Blocked Network Requests",
@@ -202,7 +247,10 @@ func generateFirewallFindings(processedRun ProcessedRun) []Finding {
 func buildBlockedNetworkFindingDescription(blockedRequests int, blockedDomains []string) string {
 	switch {
 	case len(blockedDomains) == 1:
-		return "Agent attempted to access blocked domain: " + blockedDomains[0]
+		// Range avoids direct indexing while preserving the only domain.
+		for _, domain := range blockedDomains {
+			return "Agent attempted to access blocked domain: " + domain
+		}
 	case len(blockedDomains) > 1 && len(blockedDomains) <= 3:
 		return "Agent attempted to access blocked domains: " + strings.Join(blockedDomains, ", ")
 	case len(blockedDomains) > 3:
@@ -214,22 +262,38 @@ func buildBlockedNetworkFindingDescription(blockedRequests int, blockedDomains [
 	default:
 		return fmt.Sprintf("%d network request(s) were blocked by firewall", blockedRequests)
 	}
+	return fmt.Sprintf("%d network request(s) were blocked by firewall", blockedRequests)
 }
 
-func generateSuccessFindings(run WorkflowRun, metrics MetricsData, errors []ErrorInfo) []Finding {
+func generateSuccessFindings(run WorkflowRun, metrics MetricsData, errors []ValidationIssue) []AuditFinding {
 	if run.Conclusion != "success" || len(errors) > 0 {
 		return nil
 	}
-	return []Finding{{
+	finding := AuditFinding{
+		Code:        AuditFindingWorkflowSucceeded,
 		Category:    "success",
 		Severity:    "info",
 		Title:       "Workflow Completed Successfully",
-		Description: fmt.Sprintf("Completed in %d turns with no errors", metrics.Turns),
+		Description: fmt.Sprintf("Completed in %d turns with no reported workflow errors", metrics.Turns),
 		Impact:      "No action needed",
-	}}
+	}
+	switch {
+	case metrics.ErrorCount > 0 && metrics.SubagentFailureCount > 0:
+		finding.Title = "Parent Workflow Completed Successfully"
+		finding.Description = fmt.Sprintf("Parent workflow completed in %d turns with %d reported error(s), but %d sub-agent invocation(s) failed", metrics.Turns, metrics.ErrorCount, metrics.SubagentFailureCount)
+		finding.Impact = "Review reported errors despite the successful workflow conclusion; parent success does not establish recovery or completion of failed delegated work; review sub-agent failures"
+	case metrics.ErrorCount > 0:
+		finding.Description = fmt.Sprintf("Workflow completed in %d turns with %d reported error(s)", metrics.Turns, metrics.ErrorCount)
+		finding.Impact = "Review reported errors despite the successful workflow conclusion"
+	case metrics.SubagentFailureCount > 0:
+		finding.Title = "Parent Workflow Completed Successfully"
+		finding.Description = fmt.Sprintf("Parent workflow completed in %d turns, but %d sub-agent invocation(s) failed", metrics.Turns, metrics.SubagentFailureCount)
+		finding.Impact = "Parent success does not establish recovery or completion of failed delegated work; review sub-agent failures"
+	}
+	return []AuditFinding{finding}
 }
 
-func analyzeRecommendationInputs(findings []Finding) (hasCriticalFindings, hasHighCostFindings, hasManyTurns bool) {
+func analyzeRecommendationInputs(findings []AuditFinding) (hasCriticalFindings, hasHighCostFindings, hasManyTurns bool) {
 	for _, finding := range findings {
 		if finding.Severity == "critical" {
 			hasCriticalFindings = true
@@ -282,11 +346,17 @@ func appendIterationRecommendations(recommendations []Recommendation, hasManyTur
 
 func appendToolingRecommendations(recommendations []Recommendation, processedRun ProcessedRun) []Recommendation {
 	if len(processedRun.MissingTools) > 0 {
+		var firstMissingTool string
+		// Range avoids direct indexing while preserving the first missing tool.
+		for _, missingTool := range processedRun.MissingTools {
+			firstMissingTool = missingTool.Tool
+			break
+		}
 		recommendations = append(recommendations, Recommendation{
 			Priority: "medium",
 			Action:   "Add missing tools to workflow configuration",
 			Reason:   "Missing tools limit agent capabilities and may cause failures",
-			Example:  "Add tools configuration for: " + processedRun.MissingTools[0].Tool,
+			Example:  "Add tools configuration for: " + firstMissingTool,
 		})
 	}
 	if len(processedRun.MCPFailures) > 0 {
@@ -347,10 +417,10 @@ func generatePerformanceMetrics(processedRun ProcessedRun, metrics MetricsData, 
 
 	// Find most used tool
 	if len(toolUsage) > 0 {
-		mostUsed := toolUsage[0]
-		for i := 1; i < len(toolUsage); i++ {
-			if toolUsage[i].CallCount > mostUsed.CallCount {
-				mostUsed = toolUsage[i]
+		var mostUsed ToolUsageInfo
+		for _, tool := range toolUsage {
+			if tool.CallCount > mostUsed.CallCount {
+				mostUsed = tool
 			}
 		}
 		pm.MostUsedTool = fmt.Sprintf("%s (%d calls)", mostUsed.Name, mostUsed.CallCount)

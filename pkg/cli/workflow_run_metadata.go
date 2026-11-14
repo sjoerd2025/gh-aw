@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,21 +38,26 @@ func fetchWorkflowRunMetadata(ctx context.Context, runID int64, owner, repo, hos
 }
 
 func buildWorkflowRunMetadataArgs(runID int64, owner, repo, hostname string) []string {
+	args := buildWorkflowRunAPIArgs(runID, owner, repo, hostname)
+	return append(args, "--jq", "{databaseId: .id, number: .run_number, url: .html_url, status: .status, conclusion: .conclusion, workflowName: .name, workflowPath: .path, createdAt: .created_at, startedAt: .run_started_at, updatedAt: .updated_at, event: .event, headBranch: .head_branch, headSha: .head_sha, displayTitle: .display_title, attempt: .run_attempt, repository: .repository.full_name, actor: .actor.login}")
+}
+
+func buildWorkflowRunAPIArgs(runID int64, owner, repo, hostname string) []string {
 	endpoint := fmt.Sprintf("repos/{owner}/{repo}/actions/runs/%d", runID)
 	if owner != "" && repo != "" {
 		endpoint = fmt.Sprintf("repos/%s/%s/actions/runs/%d", owner, repo, runID)
 	}
 	args := []string{"api"}
-	if hostname != "" && hostname != "github.com" {
+	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
-	return append(args, endpoint, "--jq", "{databaseId: .id, number: .run_number, url: .html_url, status: .status, conclusion: .conclusion, workflowName: .name, workflowPath: .path, createdAt: .created_at, startedAt: .run_started_at, updatedAt: .updated_at, event: .event, headBranch: .head_branch, headSha: .head_sha, displayTitle: .display_title}")
+	return append(args, endpoint)
 }
 
 func classifyWorkflowRunMetadataError(runID int64, err error, output []byte) error {
 	outputStr := string(output)
 	if errorutil.IsNotFoundError(err) ||
-		errorutil.IsNotFoundError(errors.New(outputStr)) ||
+		errorutil.IsNotFoundOutput(outputStr) ||
 		strings.Contains(outputStr, "Could not resolve") {
 		return fmt.Errorf("workflow run %d not found. Please verify the run ID is correct and that you have access to the repository", runID)
 	}
@@ -98,7 +102,7 @@ func resolveWorkflowDisplayName(ctx context.Context, workflowPath, owner, repo, 
 	}
 
 	args := []string{"api"}
-	if hostname != "" && hostname != "github.com" {
+	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
 	args = append(args, endpoint, "--jq", ".name")

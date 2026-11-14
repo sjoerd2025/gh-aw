@@ -48,6 +48,13 @@ for arg in "$@"; do
     esac
 done
 
+AUTH_CURL_ARGS=()
+if [ -n "${GH_TOKEN:-}" ]; then
+    AUTHORIZATION_HEADER="Authorization: Bearer "
+    AUTHORIZATION_HEADER+="$GH_TOKEN"
+    AUTH_CURL_ARGS=(-H "$AUTHORIZATION_HEADER")
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -83,6 +90,49 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+create_install_directory_without_symlinks() {
+    local directory="$HOME"
+    local component
+    local -a components=(.local share gh extensions gh-aw)
+
+    if [ ! -d "$directory" ]; then
+        print_error "Installation root is not a directory: '$directory'."
+        return 1
+    fi
+
+    for component in "${components[@]}"; do
+        directory="$directory/$component"
+        if [ -L "$directory" ]; then
+            print_error "Cannot install gh-aw through a symlinked path component: '$directory'."
+            return 1
+        fi
+        if [ -e "$directory" ]; then
+            if [ ! -d "$directory" ]; then
+                print_error "Installation path component is not a directory: '$directory'."
+                return 1
+            fi
+        else
+            if ! mkdir -- "$directory"; then
+                print_error "Failed to create installation directory: '$directory'."
+                return 1
+            fi
+            if [ -L "$directory" ] || [ ! -d "$directory" ]; then
+                print_error "Installation path is not a real directory: '$directory'."
+                return 1
+            fi
+        fi
+    done
+}
+
+append_github_output() {
+    local value="$1"
+    if [ -L "${GITHUB_OUTPUT:-}" ]; then
+        print_error "Refusing to append to a symlinked GITHUB_OUTPUT file."
+        return 1
+    fi
+    printf '%s\n' "$value" >> "${GITHUB_OUTPUT}"
+}
+
 # Check if HOME is set
 if [ -z "$HOME" ]; then
     print_error "HOME environment variable is not set. Cannot determine installation directory."
@@ -97,19 +147,19 @@ fi
 
 # Check if sha256sum or shasum is available (for checksum verification)
 HAS_CHECKSUM_TOOL=false
-CHECKSUM_CMD=""
+CHECKSUM_CMD=()
 if command -v sha256sum &> /dev/null; then
     HAS_CHECKSUM_TOOL=true
-    CHECKSUM_CMD="sha256sum"
+    CHECKSUM_CMD=(sha256sum)
 elif command -v shasum &> /dev/null; then
     HAS_CHECKSUM_TOOL=true
-    CHECKSUM_CMD="shasum -a 256"
+    CHECKSUM_CMD=(shasum -a 256)
 fi
 
 if [ "$SKIP_CHECKSUM" = false ] && [ "$HAS_CHECKSUM_TOOL" = false ]; then
-    print_warning "Neither sha256sum nor shasum is available. Checksum verification will be skipped."
-    print_warning "To suppress this warning, use --skip-checksum flag."
-    SKIP_CHECKSUM=true
+    print_error "Neither sha256sum nor shasum is available. Cannot verify binary integrity."
+    print_info "Install sha256sum or shasum and retry."
+    exit 1
 fi
 
 # Determine OS and architecture
@@ -187,8 +237,184 @@ else
     print_info "Using specified version: $VERSION"
 fi
 
+compare_semver() {
+    local candidate="$1"
+    local current="$2"
+    local candidate_part current_part
+    local candidate_parts current_parts
+    local i
+
+    IFS=. read -r -a candidate_parts <<< "${candidate#v}"
+    IFS=. read -r -a current_parts <<< "${current#v}"
+    candidate_parts[2]="${candidate_parts[2]%%+*}"
+    current_parts[2]="${current_parts[2]%%+*}"
+    for i in 0 1 2; do
+        candidate_part="${candidate_parts[$i]}"
+        current_part="${current_parts[$i]}"
+        if [ "${#candidate_part}" -gt "${#current_part}" ]; then
+            return 0
+        elif [ "${#candidate_part}" -lt "${#current_part}" ]; then
+            return 1
+        elif [[ "$candidate_part" > "$current_part" ]]; then
+            return 0
+        elif [[ "$candidate_part" < "$current_part" ]]; then
+            return 1
+        fi
+    done
+    return 1
+}
+
+if [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)$ ]]; then
+    CHANNEL_MAJOR="${BASH_REMATCH[1]}"
+    BEST_TAG=""
+    PAGE=1
+    PER_PAGE=100
+
+    while :; do
+        RELEASES_URL="https://api.github.com/repos/$REPO/releases?per_page=$PER_PAGE&page=$PAGE"
+        RELEASES_CURL_ARGS=(-sLf --connect-timeout 15 --max-time 30 -H "Accept: application/vnd.github+json" -H "User-Agent: gh-aw-install-gh-aw.sh" -H "X-GitHub-Api-Version: 2022-11-28")
+        RELEASES_CURL_ARGS+=("${AUTH_CURL_ARGS[@]}")
+        if ! RELEASES_RESPONSE=$(curl "${RELEASES_CURL_ARGS[@]}" "$RELEASES_URL"); then
+            print_error "Failed to resolve stable releases for version channel $VERSION from GitHub API."
+            exit 1
+        fi
+
+        RELEASE_RECORDS=$(printf '%s\n' "$RELEASES_RESPONSE" | awk '
+            function parse_field(    value) {
+                value = field
+                if (match(value, /^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+                    value = substr(value, 1, RLENGTH)
+                    sub(/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"/, "", value)
+                    sub(/"$/, "", value)
+                    release_tag = value
+                } else if (match(value, /^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*(true|false)/)) {
+                    sub(/^[[:space:]]*"draft"[[:space:]]*:[[:space:]]*/, "", value)
+                    sub(/[[:space:]]+$/, "", value)
+                    release_draft = value
+                } else if (match(value, /^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*(true|false)/)) {
+                    sub(/^[[:space:]]*"prerelease"[[:space:]]*:[[:space:]]*/, "", value)
+                    sub(/[[:space:]]+$/, "", value)
+                    release_prerelease = value
+                }
+            }
+            function emit_release() {
+                if (release_tag != "" && release_draft != "" && release_prerelease != "") {
+                    print release_tag, release_draft, release_prerelease
+                }
+            }
+            {
+                for (i = 1; i <= length($0); i++) {
+                    char = substr($0, i, 1)
+                    if (in_string) {
+                        field = field char
+                        if (escaped) {
+                            escaped = 0
+                        } else if (char == "\\") {
+                            escaped = 1
+                        } else if (char == "\"") {
+                            in_string = 0
+                        }
+                        continue
+                    }
+
+                    if (char == "\"" && depth > 0) {
+                        field = field char
+                        in_string = 1
+                        continue
+                    }
+
+                    if (depth == 1 && array_depth == object_array_depth && char == ",") {
+                        parse_field()
+                        field = ""
+                        continue
+                    }
+                    if (depth == 1 && array_depth == object_array_depth && char == "}") {
+                        parse_field()
+                        emit_release()
+                        depth--
+                        field = ""
+                        release_tag = ""
+                        release_draft = ""
+                        release_prerelease = ""
+                        continue
+                    }
+
+                    if (depth > 0) {
+                        field = field char
+                    }
+                    if (char == "{") {
+                        if (depth == 0) {
+                            object_array_depth = array_depth
+                            field = ""
+                            release_tag = ""
+                            release_draft = ""
+                            release_prerelease = ""
+                        }
+                        depth++
+                    } else if (char == "}") {
+                        depth--
+                    } else if (char == "[") {
+                        array_depth++
+                    } else if (char == "]") {
+                        array_depth--
+                    }
+                }
+            }
+        ')
+        PAGE_RELEASE_COUNT=$(printf '%s\n' "$RELEASE_RECORDS" | awk 'NF { count++ } END { print count+0 }')
+
+        while IFS=' ' read -r release_tag draft prerelease; do
+            [ -n "$release_tag" ] || continue
+            if [ "$draft" != false ] || [ "$prerelease" != false ]; then
+                continue
+            fi
+            if [[ "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] &&
+                [ "${BASH_REMATCH[1]}" = "$CHANNEL_MAJOR" ]; then
+                if [ -z "$BEST_TAG" ] || compare_semver "$release_tag" "$BEST_TAG"; then
+                    BEST_TAG="$release_tag"
+                fi
+            fi
+        done <<< "$RELEASE_RECORDS"
+
+        if [ "$PAGE_RELEASE_COUNT" -lt "$PER_PAGE" ]; then
+            break
+        fi
+        PAGE=$((PAGE + 1))
+    done
+
+    if [ -z "$BEST_TAG" ]; then
+        print_error "No stable release found for version channel $VERSION."
+        exit 1
+    fi
+    print_info "Resolved version channel $VERSION to $BEST_TAG"
+    VERSION="$BEST_TAG"
+fi
+
+cleanup_install() {
+    if [ -n "${GH_INSTALL_LOG_DIR:-}" ]; then
+        rm -rf -- "$GH_INSTALL_LOG_DIR"
+    fi
+    if [ -n "${STAGING_DIR:-}" ]; then
+        rm -rf -- "$STAGING_DIR"
+    fi
+}
+GH_INSTALL_LOG_DIR=""
+STAGING_DIR=""
+trap cleanup_install EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Try gh extension install if requested (and gh is available)
 if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
+    if ! GH_INSTALL_LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gh-aw-install-log.XXXXXX"); then
+        print_error "Failed to create temporary gh extension install log directory."
+        exit 1
+    fi
+    if [ -L "$GH_INSTALL_LOG_DIR" ] || [ ! -d "$GH_INSTALL_LOG_DIR" ]; then
+        print_error "Refusing to use an invalid gh extension install log directory."
+        exit 1
+    fi
+    GH_INSTALL_LOG="$GH_INSTALL_LOG_DIR/gh-install.log"
     print_info "Attempting to install gh-aw using 'gh extension install'..."
 
     # On Windows, `gh extension install` has been observed to hang for the full
@@ -207,11 +433,11 @@ if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
     install_result=0
     if [ -n "$VERSION" ] && [ "$VERSION" != "latest" ]; then
         # shellcheck disable=SC2086  # GH_INSTALL_CMD_TIMEOUT is intentionally unquoted
-        $GH_INSTALL_CMD_TIMEOUT gh extension install "$REPO" --force --pin "$VERSION" 2>&1 | tee /tmp/gh-install.log
+        $GH_INSTALL_CMD_TIMEOUT gh extension install "$REPO" --force --pin "$VERSION" 2>&1 | tee "$GH_INSTALL_LOG"
         install_result=${PIPESTATUS[0]}
     else
         # shellcheck disable=SC2086  # GH_INSTALL_CMD_TIMEOUT is intentionally unquoted
-        $GH_INSTALL_CMD_TIMEOUT gh extension install "$REPO" --force 2>&1 | tee /tmp/gh-install.log
+        $GH_INSTALL_CMD_TIMEOUT gh extension install "$REPO" --force 2>&1 | tee "$GH_INSTALL_LOG"
         install_result=${PIPESTATUS[0]}
     fi
 
@@ -234,7 +460,8 @@ if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
                 print_info "Falling back to manual installation..."
             else
                 # Verify the installed version matches the requested version (if specific version was requested)
-                if [ "$VERSION" != "latest" ] && [ "$INSTALLED_VERSION" != "$VERSION" ]; then
+                REQUESTED_VERSION="${VERSION%%+*}"
+                if [ "$VERSION" != "latest" ] && [ "$INSTALLED_VERSION" != "$REQUESTED_VERSION" ]; then
                     print_warning "Version mismatch: requested $VERSION but gh extension install installed $INSTALLED_VERSION"
                     print_info "Falling back to manual installation to install the correct version..."
                 else
@@ -242,8 +469,8 @@ if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
                     print_info "Installed version: $INSTALLED_VERSION"
                     
                     # Set output for GitHub Actions
-                    if [ -n "${GITHUB_OUTPUT}" ]; then
-                        echo "installed_version=${INSTALLED_VERSION}" >> "${GITHUB_OUTPUT}"
+                    if [ -n "${GITHUB_OUTPUT:-}" ]; then
+                        append_github_output "installed_version=${INSTALLED_VERSION}"
                     fi
                     
                     exit 0
@@ -255,9 +482,6 @@ if [ "$TRY_GH_INSTALL" = true ] && command -v gh &> /dev/null; then
         fi
     else
         print_warning "gh extension install failed, falling back to manual installation..."
-        if [ -f /tmp/gh-install.log ]; then
-            cat /tmp/gh-install.log
-        fi
     fi
 elif [ "$TRY_GH_INSTALL" = true ]; then
     print_info "gh CLI not available, proceeding with manual installation..."
@@ -281,7 +505,7 @@ LATEST_TAG=""
 FALLBACK_DOWNLOAD_URL=""
 FALLBACK_CHECKSUMS_URL=""
 if [ "$VERSION" = "latest" ]; then
-    if LATEST_RELEASE_RESPONSE=$(curl -sLf --connect-timeout 15 --max-time 30 "https://api.github.com/repos/$REPO/releases/latest"); then
+    if LATEST_RELEASE_RESPONSE=$(curl -sLf --connect-timeout 15 --max-time 30 "${AUTH_CURL_ARGS[@]}" "https://api.github.com/repos/$REPO/releases/latest"); then
         LATEST_TAG=$(printf '%s' "$LATEST_RELEASE_RESPONSE" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
     else
         print_warning "Failed to resolve latest release tag from GitHub API."
@@ -300,21 +524,29 @@ fi
 
 INSTALL_DIR="$HOME/.local/share/gh/extensions/gh-aw"
 BINARY_PATH="$INSTALL_DIR/$BINARY_NAME"
-CHECKSUMS_PATH="$INSTALL_DIR/checksums.txt"
 
 print_info "Download URL: $DOWNLOAD_URL"
 print_info "Installation directory: $INSTALL_DIR"
 
-# Create the installation directory if it doesn't exist
-if [ ! -d "$INSTALL_DIR" ]; then
-    print_info "Creating installation directory..."
-    mkdir -p "$INSTALL_DIR"
+if ! create_install_directory_without_symlinks; then
+    exit 1
 fi
 
 # Check if binary already exists
-if [ -f "$BINARY_PATH" ]; then
-    print_warning "Binary '$BINARY_PATH' already exists. It will be overwritten."
+if [ -e "$BINARY_PATH" ] || [ -L "$BINARY_PATH" ]; then
+    print_warning "Binary '$BINARY_PATH' already exists. It will be replaced after verification."
 fi
+
+if ! STAGING_DIR=$(mktemp -d "$INSTALL_DIR/.gh-aw-install.XXXXXX"); then
+    print_error "Failed to create temporary installation directory in '$INSTALL_DIR'."
+    exit 1
+fi
+if [ -L "$STAGING_DIR" ] || [ ! -d "$STAGING_DIR" ]; then
+    print_error "Refusing to use an invalid installation staging directory."
+    exit 1
+fi
+STAGED_BINARY_PATH="$STAGING_DIR/$BINARY_NAME"
+CHECKSUMS_PATH="$STAGING_DIR/checksums.txt"
 
 # Download the binary with retry logic
 print_info "Downloading gh-aw binary..."
@@ -325,7 +557,7 @@ download_binary_with_retry() {
     local delay="$RETRY_DELAY"
 
     for attempt in $(seq 1 $MAX_RETRIES); do
-        if curl -L -f --connect-timeout 15 --max-time 120 -o "$BINARY_PATH" "$url"; then
+        if curl "${AUTH_CURL_ARGS[@]}" -L -f --connect-timeout 15 --max-time 120 -o "$STAGED_BINARY_PATH" "$url"; then
             print_success "Binary downloaded successfully"
             return 0
         fi
@@ -336,6 +568,14 @@ download_binary_with_retry() {
             delay=$((delay * 2))
         fi
     done
+
+    if [ "${#AUTH_CURL_ARGS[@]}" -gt 0 ]; then
+        print_warning "Authenticated download failed; retrying binary download without authentication."
+        if curl -L -f --connect-timeout 15 --max-time 120 -o "$STAGED_BINARY_PATH" "$url"; then
+            print_success "Binary downloaded successfully"
+            return 0
+        fi
+    fi
 
     return 1
 }
@@ -360,71 +600,104 @@ fi
 # Download and verify checksums if not skipped
 if [ "$SKIP_CHECKSUM" = false ]; then
     print_info "Downloading checksums file..."
-    CHECKSUMS_DOWNLOADED=false
-    
-    for attempt in $(seq 1 $MAX_RETRIES); do
-        if curl -L -f --connect-timeout 15 --max-time 60 -o "$CHECKSUMS_PATH" "$CHECKSUMS_URL" 2>/dev/null; then
-            CHECKSUMS_DOWNLOADED=true
-            print_success "Checksums file downloaded successfully"
-            break
-        else
-            if [ "$attempt" -eq "$MAX_RETRIES" ]; then
-                print_warning "Failed to download checksums file after $MAX_RETRIES attempts"
-                print_warning "Checksum verification will be skipped for this version."
-                print_info "This may occur for older releases that don't include checksums."
-                break
-            else
+    download_checksums_with_retry() {
+        local url="$1"
+        for attempt in $(seq 1 $MAX_RETRIES); do
+            if curl "${AUTH_CURL_ARGS[@]}" -L -f --connect-timeout 15 --max-time 60 -o "$CHECKSUMS_PATH" "$url" 2>/dev/null; then
+                print_success "Checksums file downloaded successfully"
+                return 0
+            fi
+            if [ "$attempt" -lt "$MAX_RETRIES" ]; then
                 print_warning "Checksum download attempt $attempt failed. Retrying in 2s..."
                 sleep 2
             fi
-        fi
-    done
-    
-    # Verify checksum if we downloaded it successfully
-    if [ "$CHECKSUMS_DOWNLOADED" = true ]; then
-        print_info "Verifying binary checksum..."
-        
-        # Determine the expected filename in the checksums file
-        EXPECTED_FILENAME="$PLATFORM"
-        if [ "$OS_NAME" = "windows" ]; then
-            EXPECTED_FILENAME="${PLATFORM}.exe"
-        fi
-        
-        # Extract the expected checksum from the checksums file (exact filename match on field 2)
-        EXPECTED_CHECKSUM=$(awk -v f="$EXPECTED_FILENAME" '$2 == f {print $1}' "$CHECKSUMS_PATH")
-        
-        if [ -z "$EXPECTED_CHECKSUM" ]; then
-            print_warning "Checksum for $EXPECTED_FILENAME not found in checksums file"
-            print_warning "Checksum verification will be skipped."
-        else
-            # Compute the actual checksum of the downloaded binary
-            ACTUAL_CHECKSUM=$($CHECKSUM_CMD "$BINARY_PATH" | awk '{print $1}')
-            
-            if [ "$ACTUAL_CHECKSUM" = "$EXPECTED_CHECKSUM" ]; then
-                print_success "Checksum verification passed!"
-                print_info "Expected: $EXPECTED_CHECKSUM"
-                print_info "Actual:   $ACTUAL_CHECKSUM"
-            else
-                print_error "Checksum verification failed!"
-                print_error "Expected: $EXPECTED_CHECKSUM"
-                print_error "Actual:   $ACTUAL_CHECKSUM"
-                print_error "The downloaded binary may be corrupted or tampered with."
-                print_info "To skip checksum verification, use: ./install-gh-aw.sh $VERSION --skip-checksum"
-                rm -f "$BINARY_PATH"
-                exit 1
+        done
+        if [ "${#AUTH_CURL_ARGS[@]}" -gt 0 ]; then
+            print_warning "Authenticated download failed; retrying checksums download without authentication."
+            if curl -L -f --connect-timeout 15 --max-time 60 -o "$CHECKSUMS_PATH" "$url" 2>/dev/null; then
+                print_success "Checksums file downloaded successfully"
+                return 0
             fi
         fi
-        
-        # Clean up checksums file
-        rm -f "$CHECKSUMS_PATH"
+        return 1
+    }
+
+    if ! download_checksums_with_retry "$CHECKSUMS_URL"; then
+        if [ -n "$FALLBACK_CHECKSUMS_URL" ] && [ "$CHECKSUMS_URL" != "$FALLBACK_CHECKSUMS_URL" ]; then
+            print_warning "Failed to download checksums from latest redirect URL. Retrying with resolved tag URL ($LATEST_TAG)."
+            CHECKSUMS_URL="$FALLBACK_CHECKSUMS_URL"
+            if download_checksums_with_retry "$CHECKSUMS_URL"; then
+                CHECKSUMS_DOWNLOADED=true
+            else
+                CHECKSUMS_DOWNLOADED=false
+            fi
+        else
+            CHECKSUMS_DOWNLOADED=false
+        fi
+        if [ "$CHECKSUMS_DOWNLOADED" = false ]; then
+            print_error "Failed to download checksums file after $MAX_RETRIES attempts"
+            print_error "Cannot verify binary integrity. Installation aborted."
+            print_info "Check that $CHECKSUMS_URL is available and retry."
+            print_info "For older releases without checksums.txt, prefer a release with checksums or explicitly use --skip-checksum (disables integrity verification; corrupted or tampered binaries may be executed)."
+            exit 1
+        fi
     fi
+
+    print_info "Verifying binary checksum..."
+
+    EXPECTED_FILENAME="$PLATFORM"
+    if [ "$OS_NAME" = "windows" ]; then
+        EXPECTED_FILENAME="${PLATFORM}.exe"
+    fi
+
+    # Require exactly one well-formed SHA256 entry for the exact release asset.
+    if ! EXPECTED_CHECKSUM=$(awk -v f="$EXPECTED_FILENAME" '
+        $2 == f {
+            count++
+            if (NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-fA-F]+$/) {
+                invalid = 1
+            }
+            checksum = tolower($1)
+        }
+        END {
+            if (count != 1 || invalid) {
+                exit 1
+            }
+            print checksum
+        }
+    ' "$CHECKSUMS_PATH"); then
+        print_error "Missing or malformed checksum for $EXPECTED_FILENAME in checksums file."
+        print_error "Cannot verify binary integrity. Installation aborted."
+        print_info "Use a release with exactly one valid SHA256 checksum for $EXPECTED_FILENAME."
+        exit 1
+    fi
+
+    if ! CHECKSUM_OUTPUT=$("${CHECKSUM_CMD[@]}" "$STAGED_BINARY_PATH"); then
+        print_error "Failed to compute binary checksum. Installation aborted."
+        exit 1
+    fi
+    ACTUAL_CHECKSUM=$(printf '%s\n' "$CHECKSUM_OUTPUT" | awk '{print tolower($1)}')
+
+    if [[ "$ACTUAL_CHECKSUM" =~ ^[0-9a-f]{64}$ ]] && [ "$ACTUAL_CHECKSUM" = "$EXPECTED_CHECKSUM" ]; then
+        print_success "Checksum verification passed!"
+        print_info "Expected: $EXPECTED_CHECKSUM"
+        print_info "Actual:   $ACTUAL_CHECKSUM"
+    else
+        print_error "Checksum verification failed!"
+        print_error "Expected: $EXPECTED_CHECKSUM"
+        print_error "Actual:   $ACTUAL_CHECKSUM"
+        print_error "The downloaded binary may be corrupted or tampered with. Installation aborted."
+        exit 1
+    fi
+
+    rm -f "$CHECKSUMS_PATH"
 else
     print_warning "Checksum verification skipped (--skip-checksum flag used)"
 fi
 
 # Make it executable
 print_info "Making binary executable..."
-chmod +x "$BINARY_PATH"
+chmod +x "$STAGED_BINARY_PATH"
 
 # On Windows, executing a freshly downloaded binary may stall while Windows Defender
 # scans it.  Wrap verification calls with a timeout so the script doesn't hang.
@@ -437,16 +710,26 @@ fi
 # Verify the binary
 print_info "Verifying binary..."
 # shellcheck disable=SC2086
-if $BINARY_EXEC_TIMEOUT "$BINARY_PATH" --help > /dev/null 2>&1; then
+if $BINARY_EXEC_TIMEOUT "$STAGED_BINARY_PATH" --help > /dev/null 2>&1; then
     print_success "Binary is working correctly!"
 else
     if [ "$OS_NAME" = "windows" ]; then
         print_warning "Binary verification timed out — Windows Defender may still be scanning the binary."
-        print_warning "Installation is complete. Verify manually with: '$BINARY_PATH' --help"
+        print_warning "After installation completes, verify manually with: '$BINARY_PATH' --help"
     else
         print_error "Binary verification failed. The downloaded file may be corrupted or incompatible."
         exit 1
     fi
+fi
+
+if [ -d "$BINARY_PATH" ]; then
+    print_error "Cannot install gh-aw: '$BINARY_PATH' is a directory."
+    exit 1
+fi
+
+if ! mv -f -- "$STAGED_BINARY_PATH" "$BINARY_PATH"; then
+    print_error "Failed to replace gh-aw at '$BINARY_PATH'."
+    exit 1
 fi
 
 # Show file info
@@ -470,5 +753,5 @@ $BINARY_EXEC_TIMEOUT "$BINARY_PATH" version || print_warning "Version check time
 
 # Set output for GitHub Actions
 if [ -n "${GITHUB_OUTPUT}" ]; then
-    echo "installed_version=${VERSION}" >> "${GITHUB_OUTPUT}"
+    append_github_output "installed_version=${VERSION}"
 fi

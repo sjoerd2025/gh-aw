@@ -7,7 +7,11 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
+const { getSetupTimeoutMs } = require("./child_process_timeouts.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+
+const GIT_COMMAND_TIMEOUT_MS = getSetupTimeoutMs("gitBranch");
+const GH_COMMAND_TIMEOUT_MS = getSetupTimeoutMs("outcomeGh");
 
 function parseManifestEntries(entriesJSON = process.env.GH_AW_CHECKOUT_MANIFEST_ENTRIES || "[]") {
   let parsed;
@@ -36,6 +40,21 @@ function readManifestEntriesFromEnv() {
       token: process.env[`GH_AW_CHECKOUT_TOKEN_${i}`] || "",
     });
   }
+  const dynamicIndexes = process.env.GH_AW_DYNAMIC_CHECKOUT_INDEXES;
+  if (dynamicIndexes) {
+    const runnerTemp = process.env.RUNNER_TEMP;
+    if (!runnerTemp) throw new Error("RUNNER_TEMP is required to read runtime checkout plans");
+    for (const index of dynamicIndexes.split(",")) {
+      if (!/^\d+$/.test(index)) throw new Error("Runtime checkout manifest index must be a non-negative integer");
+      const planPath = path.join(runnerTemp, "gh-aw", "dynamic-checkouts", `${index}.json`);
+      try {
+        const plan = parseManifestEntries(fs.readFileSync(planPath, "utf8"));
+        entries.push(...plan);
+      } catch (error) {
+        throw new Error("Unable to read runtime checkouts for the checkout manifest", { cause: error });
+      }
+    }
+  }
   return entries;
 }
 
@@ -56,8 +75,8 @@ function resolveDefaultBranch(repository, checkoutPath, options = {}) {
       try {
         return execFileSync("gh", args, {
           encoding: "utf8",
-          env: { ...process.env, ...(execOptions.env || {}) },
           ...execOptions,
+          env: { ...process.env, ...(execOptions.env || {}) },
         });
       } catch (err) {
         throw new Error(`Failed to run gh ${args.join(" ")}: ${getErrorMessage(err)}`, { cause: err });
@@ -70,6 +89,7 @@ function resolveDefaultBranch(repository, checkoutPath, options = {}) {
     try {
       const output = runGit(["-C", repoPath, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], {
         stdio: ["ignore", "pipe", "pipe"],
+        timeout: GIT_COMMAND_TIMEOUT_MS,
       });
       defaultBranch = output.trim().replace(/^origin\//, "");
       core.debug(`build_checkout_manifest: git resolved default branch for ${repository}: ${defaultBranch}`);
@@ -83,6 +103,7 @@ function resolveDefaultBranch(repository, checkoutPath, options = {}) {
       const checkoutToken = options.checkoutToken || "";
       const ghExecOptions = {
         stdio: ["ignore", "pipe", "pipe"],
+        timeout: GH_COMMAND_TIMEOUT_MS,
       };
       if (checkoutToken !== "") {
         ghExecOptions.env = { GH_TOKEN: checkoutToken };
@@ -113,7 +134,7 @@ function buildCheckoutManifest(entries, options = {}) {
   try {
     fs.mkdirSync(manifestDir, { recursive: true });
   } catch (err) {
-    throw new Error(`Failed to create directory ${manifestDir}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to create directory ${manifestDir}: ${getErrorMessage(err)}`, { cause: err });
   }
   const manifestPath = path.join(manifestDir, "checkout-manifest.json");
   const manifest = {};
@@ -130,12 +151,14 @@ function buildCheckoutManifest(entries, options = {}) {
       continue;
     }
     const checkoutPath = String(entry.path || "");
-    const defaultBranch = resolveDefaultBranch(repository, checkoutPath, {
-      workspace: options.workspace,
-      runGit,
-      runGH,
-      checkoutToken: entry.token || "",
-    });
+    const defaultBranch =
+      entry.default_branch ||
+      resolveDefaultBranch(repository, checkoutPath, {
+        workspace: options.workspace,
+        runGit,
+        runGH,
+        checkoutToken: entry.token || "",
+      });
     manifest[repository.toLowerCase()] = {
       repository,
       path: checkoutPath,
@@ -147,7 +170,7 @@ function buildCheckoutManifest(entries, options = {}) {
   try {
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
   } catch (err) {
-    throw new Error(`Failed to write file ${manifestPath}: ${String(err)}`, { cause: err });
+    throw new Error(`Failed to write file ${manifestPath}: ${getErrorMessage(err)}`, { cause: err });
   }
   core.info(`checkout-manifest written to ${manifestPath}`);
   return { manifestPath, manifest };

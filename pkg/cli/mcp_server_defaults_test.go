@@ -4,6 +4,7 @@ package cli
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -12,9 +13,23 @@ import (
 // TestMCPToolElicitationDefaults verifies that MCP tools have appropriate
 // elicitation defaults configured according to SEP-1024.
 func TestMCPToolElicitationDefaults(t *testing.T) {
+	t.Run("compile workflows input describes array syntax", func(t *testing.T) {
+		schema, err := GenerateSchema[compileArgs]()
+		if err != nil {
+			t.Fatalf("Failed to generate schema: %v", err)
+		}
+		workflows, ok := schema.Properties["workflows"]
+		if !ok {
+			t.Fatal("Expected 'workflows' property to exist")
+		}
+		if !strings.Contains(workflows.Description, `["workflow.md"]`) {
+			t.Errorf("workflows description = %q, want array example", workflows.Description)
+		}
+	})
+
 	t.Run("compile tool has strict default", func(t *testing.T) {
 		type compileArgs struct {
-			Workflows  []string `json:"workflows,omitempty" jsonschema:"Workflow files to compile (empty for all)"`
+			Workflows  []string `json:"workflows,omitempty" jsonschema:"Workflow files to compile as an array (e.g., [\"workflow.md\"]) (empty for all)"`
 			Strict     bool     `json:"strict,omitempty" jsonschema:"Override frontmatter to enforce strict mode validation for all workflows"`
 			Zizmor     bool     `json:"zizmor,omitempty" jsonschema:"Run zizmor security scanner on generated .lock.yml files"`
 			Poutine    bool     `json:"poutine,omitempty" jsonschema:"Run poutine security scanner on generated .lock.yml files"`
@@ -76,7 +91,7 @@ func TestMCPToolElicitationDefaults(t *testing.T) {
 		if err := AddSchemaDefault(schema, "max_tokens", 12000); err != nil {
 			t.Fatalf("Failed to add max_tokens default: %v", err)
 		}
-		if err := AddSchemaDefault(schema, "artifacts", []string{"usage"}); err != nil {
+		if err := AddSchemaDefault(schema, "artifacts", []string{"info"}); err != nil {
 			t.Fatalf("Failed to add artifacts default: %v", err)
 		}
 
@@ -136,8 +151,8 @@ func TestMCPToolElicitationDefaults(t *testing.T) {
 		if err := json.Unmarshal(artifactsProp.Default, &artifactsDefault); err != nil {
 			t.Fatalf("Failed to unmarshal artifacts default: %v", err)
 		}
-		if len(artifactsDefault) != 1 || artifactsDefault[0] != "usage" {
-			t.Errorf("Expected artifacts default to be [usage], got %v", artifactsDefault)
+		if len(artifactsDefault) != 1 || artifactsDefault[0] != "info" {
+			t.Errorf("Expected artifacts default to be [info], got %v", artifactsDefault)
 		}
 	})
 

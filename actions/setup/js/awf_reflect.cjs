@@ -19,22 +19,43 @@ require("./shim.cjs");
 
 const fs = require("fs");
 const path = require("path");
+const net = require("net");
+const tls = require("tls");
 const { withRetry, sleep } = require("./error_recovery.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { AWF_REFLECT_OUTPUT_PATH } = require("./awf_reflect_paths.cjs");
+const { qualifyModelForMultiProvider, isCopilotProviderName } = require("./copilot_sdk_multi_provider.cjs");
+
+function parseReflectTimeoutMs(value) {
+  const rawValue = String(value || "").trim();
+  if (!/^\d+$/.test(rawValue)) {
+    return 60000;
+  }
+  const timeoutMs = Number(rawValue);
+  return Number.isSafeInteger(timeoutMs) ? timeoutMs : 60000;
+}
 
 // AWF API proxy management endpoint for discovering configured LLM providers and available models.
 // The api-proxy sidecar exposes /reflect on its management port (port 10000) inside the AWF
 // Docker network. From the agent container, the proxy is reachable via the "api-proxy" hostname.
 const AWF_API_PROXY_REFLECT_URL = "http://api-proxy:10000/reflect";
-// Path inside the agent container where the reflect payload is persisted. The directory is
-// co-located with other AWF firewall observability data so it is included in the agent artifact.
-const AWF_REFLECT_OUTPUT_PATH = "/tmp/gh-aw/sandbox/firewall/awf-reflect.json";
 // Milliseconds to wait for the /reflect endpoint before giving up.
-const AWF_REFLECT_TIMEOUT_MS = 60000;
+const AWF_REFLECT_TIMEOUT_MS = parseReflectTimeoutMs(process.env.GH_AW_REFLECT_TIMEOUT_MS);
 // Milliseconds to wait for each models_url fallback fetch (shorter than the main reflect timeout).
 const AWF_MODELS_URL_TIMEOUT_MS = 3000;
+// Milliseconds to wait for an api-proxy provider listener to accept a real TCP connection.
+const AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS = 15000;
+// Delay between provider-listener readiness probes.
+const AWF_PROVIDER_LISTENER_READY_RETRY_MS = 250;
+// Per-attempt connect timeout while probing provider listener readiness.
+const AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS = 2000;
 // Maximum attempts for models_url fallback fetches when the proxy is not yet ready.
 const AWF_MODELS_URL_MAX_ATTEMPTS = 5;
+// HTTP statuses treated as transient and worth retrying for models_url fallback fetches.
+// 503 covers the api-proxy not yet being ready; 429 covers transient model-catalog throttling
+// (see https://github.com/github/gh-aw/issues/52782 — an unresolved 429 previously caused
+// alias resolution to be skipped and an unresolved alias to reach the API proxy).
+const AWF_MODELS_URL_RETRYABLE_STATUSES = new Set([503, 429]);
 // Base delay between models_url fallback retries. Uses exponential backoff.
 const AWF_MODELS_URL_RETRY_BASE_MS = 250;
 // Cap for exponential backoff delay between retries.
@@ -61,6 +82,14 @@ const REFLECT_PROVIDER_ANTHROPIC = "anthropic";
 /**
  * @typedef {{
  *   endpoints?: ReflectEndpoint[],
+ *   runs?: { enabled?: boolean, max_runs?: number, invocation_count?: number, remaining_runs?: number },
+ *   routing?: {
+ *     status?: string,
+ *     failure_code?: string,
+ *     mode?: string,
+ *     selection?: { id?: string },
+ *     router?: { version?: string },
+ *   },
  * }} ReflectData
  */
 
@@ -70,6 +99,48 @@ const REFLECT_PROVIDER_ALIASES = {
   openai: new Set(["openai"]),
   anthropic: new Set(["anthropic"]),
 };
+
+const DEFAULT_API_PROXY_HOST_BRIDGE = "host.docker.internal";
+
+/**
+ * Detect the sbx HOSTALIASES mapping that makes `api-proxy` resolve to localhost.
+ * In that topology AWF creates a localhost bridge only for the management
+ * /reflect port, so provider traffic for ports such as 10002 must use the
+ * host-side Docker gateway name instead.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {(path: string, encoding: BufferEncoding) => string} [readFileSync]
+ * @returns {boolean}
+ */
+function hasAPIProxyLocalhostAlias(env = process.env, readFileSync = fs.readFileSync) {
+  const hostAliasesPath = env.HOSTALIASES;
+  if (!hostAliasesPath) return false;
+  try {
+    const aliases = readFileSync(hostAliasesPath, "utf8");
+    return aliases.split(/\r?\n/).some(line => {
+      const trimmed = line.replace(/#.*/, "").trim();
+      if (!trimmed) return false;
+      const parts = trimmed.split(/\s+/);
+      return parts[0] === "api-proxy" && (parts[1] === "localhost" || parts[1] === "127.0.0.1");
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rewrite api-proxy URLs for sbx HOSTALIASES bridge mode.
+ *
+ * @param {string} url
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {(path: string, encoding: BufferEncoding) => string} [readFileSync]
+ * @returns {string}
+ */
+function rewriteAPIProxyURLForHostBridge(url, env = process.env, readFileSync = fs.readFileSync) {
+  if (!hasAPIProxyLocalhostAlias(env, readFileSync)) return url;
+  const bridgeHost = env.GH_AW_API_PROXY_HOST_BRIDGE || DEFAULT_API_PROXY_HOST_BRIDGE;
+  return url.replace(/^(https?:\/\/)api-proxy(?=[:/]|$)/i, `$1${bridgeHost}`);
+}
 
 // Default logger used by fetchAWFReflect when no logger is provided via options.
 // All lines are prefixed with "[awf-reflect]" for easy grepping in combined logs.
@@ -126,6 +197,24 @@ function extractModelIds(json) {
 }
 
 /**
+ * Extract a `retry-after` header (if present) from a fetch Response so it can be attached
+ * to a retryable error for `withRetry`'s Retry-After handling (see `getRetryAfterMs` in
+ * error_recovery.cjs). Only the `retry-after` header is needed: `withRetry` only consults
+ * it for HTTP 429 responses, which is the only retryable status here that carries one.
+ *
+ * @param {{ headers?: { get?: (name: string) => string|null } }} res - fetch Response-like object
+ * @returns {Record<string, string>|undefined}
+ */
+function extractRetryAfterHeader(res) {
+  try {
+    const retryAfter = res?.headers?.get?.("retry-after");
+    return retryAfter != null ? { "retry-after": retryAfter } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Fetch model IDs from a single models_url endpoint via HTTP GET.
  * Used as a fallback when the api-proxy's startup model-fetch returned null.
  * The api-proxy injects the correct auth headers when forwarding the request.
@@ -136,6 +225,7 @@ function extractModelIds(json) {
  * @returns {Promise<string[]|null>}
  */
 async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
+  const requestUrl = rewriteAPIProxyURLForHostBridge(modelsUrl);
   let isInitialProbeDelayed = false;
   try {
     const modelsHost = new URL(modelsUrl).hostname.toLowerCase();
@@ -164,9 +254,9 @@ async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
     shouldRetry: error => {
       const original = error?.originalError || error;
       const status = original?.status ?? original?.response?.status ?? null;
-      const shouldRetry = status === 503;
+      const shouldRetry = AWF_MODELS_URL_RETRYABLE_STATUSES.has(status);
       if (shouldRetry && attemptCounter < AWF_MODELS_URL_MAX_ATTEMPTS) {
-        logger(`awf-reflect: models fetch returned 503 for ${modelsUrl}; retrying (attempt ${attemptCounter + 1}/${AWF_MODELS_URL_MAX_ATTEMPTS})`);
+        logger(`awf-reflect: models fetch returned ${status} for ${modelsUrl}; retrying (attempt ${attemptCounter + 1}/${AWF_MODELS_URL_MAX_ATTEMPTS})`);
       }
       return shouldRetry;
     },
@@ -182,12 +272,17 @@ async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
           ac.abort();
         }, timeoutMs);
         try {
-          const res = await fetch(modelsUrl, { signal: ac.signal });
+          const res = await fetch(requestUrl, { signal: ac.signal });
           if (!res.ok) {
-            if (res.status === 503) {
-              const err = Object.assign(new Error(`models fetch returned 503 for ${modelsUrl}`), { status: 503 });
+            if (AWF_MODELS_URL_RETRYABLE_STATUSES.has(res.status)) {
+              const err = Object.assign(new Error(`models fetch returned ${res.status} for ${modelsUrl}`), {
+                status: res.status,
+                headers: extractRetryAfterHeader(res),
+              });
               throw err;
             }
+            // Permanent 4xx/5xx responses (e.g. 400, 401, 403) are not retried — the
+            // caller falls back to treating this endpoint as having no models.
             logger(`awf-reflect: models fetch returned ${res.status} for ${modelsUrl}`);
             return null;
           }
@@ -204,7 +299,7 @@ async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
           /** @type {any} */
           const e = err;
           const status = e?.status ?? e?.response?.status ?? null;
-          if (status === 503) {
+          if (AWF_MODELS_URL_RETRYABLE_STATUSES.has(status)) {
             throw e;
           }
           logger(`awf-reflect: models fetch error for ${modelsUrl}: ${getErrorMessage(err)}`);
@@ -221,8 +316,8 @@ async function fetchModelsFromUrl(modelsUrl, timeoutMs, logger) {
     const e = err;
     const original = e?.originalError || e;
     const status = original?.status ?? original?.response?.status ?? null;
-    if (status === 503) {
-      logger(`awf-reflect: models fetch returned 503 for ${modelsUrl}`);
+    if (AWF_MODELS_URL_RETRYABLE_STATUSES.has(status)) {
+      logger(`awf-reflect: models fetch returned ${status} for ${modelsUrl}`);
       return null;
     }
     logger(`awf-reflect: models fetch error for ${modelsUrl}: ${getErrorMessage(err)}`);
@@ -259,9 +354,11 @@ async function enrichReflectModels(reflectData, timeoutMs, logger) {
 /**
  * Fetch the AWF API proxy /reflect endpoint and persist the response to disk.
  *
- * The /reflect endpoint is exposed by the api-proxy sidecar on each started provider port.
- * The active provider's gateway port should be used rather than a hardcoded port, since
- * port 10000 (the OpenAI sidecar) is only started when OpenAI credentials are configured.
+ * The /reflect endpoint is exposed by the api-proxy sidecar on every provider listener.
+ * AWF binds each provider listener (including port 10000, the OpenAI listener) even when
+ * that provider has no inference credentials, and every listener serves the same aggregate
+ * reflection before rejecting unconfigured inference, so the default port 10000 works for
+ * any configured provider without an OpenAI key.
  * This information is saved to AWF_REFLECT_OUTPUT_PATH so the post-run GitHub Actions step
  * (awf_reflect_summary.cjs) can include it in the step summary without requiring the
  * containers to still be running.
@@ -287,8 +384,8 @@ async function enrichReflectModels(reflectData, timeoutMs, logger) {
  *   reflectUrl: string,
  *   outputPath: string,
  *   bytesWritten?: number,
- *   reflectData?: object,
- *   reason?: "unexpected_status"|"timeout"|"request_failed",
+ *   reflectData?: ReflectData,
+ *   reason?: "disabled"|"unexpected_status"|"timeout"|"request_failed",
  *   status?: number,
  *   error?: string,
  * }>}
@@ -300,6 +397,11 @@ async function fetchAWFReflect(options) {
   const modelsTimeoutMs = options && options.modelsTimeoutMs != null ? options.modelsTimeoutMs : AWF_MODELS_URL_TIMEOUT_MS;
   const logger = (options && options.logger) || DEFAULT_REFLECT_LOGGER;
   const writeFile = (options && options.writeFileSync) || fs.writeFileSync;
+
+  if (process.env.GH_AW_SKIP_REFLECT === "true") {
+    logger("awf-reflect: disabled by GH_AW_SKIP_REFLECT");
+    return { ok: false, reflectUrl, outputPath, reason: "disabled" };
+  }
 
   logger(`awf-reflect: fetching ${reflectUrl} (timeout=${timeoutMs}ms)`);
 
@@ -323,6 +425,7 @@ async function fetchAWFReflect(options) {
         status: res.status,
       };
     }
+
     /** @type {any} */
     const reflectData = await res.json();
     // Attempt to fill in null models for configured providers by fetching directly
@@ -330,14 +433,21 @@ async function fetchAWFReflect(options) {
     // forwarding these requests, so this succeeds without needing the raw API keys.
     await enrichReflectModels(reflectData, modelsTimeoutMs, logger);
     const enrichedBody = JSON.stringify(reflectData);
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    writeFile(outputPath, enrichedBody, { encoding: "utf8" });
-    logger(`awf-reflect: saved ${enrichedBody.length}B to ${outputPath}`);
+    let bytesWritten;
+    try {
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+      writeFile(outputPath, enrichedBody, { encoding: "utf8" });
+      bytesWritten = enrichedBody.length;
+      logger(`awf-reflect: saved ${enrichedBody.length}B to ${outputPath}`);
+    } catch (persistErr) {
+      const persistError = /** @type {Error} */ persistErr;
+      logger(`awf-reflect: unable to persist reflect payload to ${outputPath}: ${persistError.message}`);
+    }
     return {
       ok: true,
       reflectUrl,
       outputPath,
-      bytesWritten: enrichedBody.length,
+      ...(bytesWritten != null ? { bytesWritten } : {}),
       reflectData,
     };
   } catch (err) {
@@ -365,6 +475,113 @@ async function fetchAWFReflect(options) {
 }
 
 /**
+ * Wait until a provider listener (e.g. http://api-proxy:10002) accepts a real TCP
+ * connection, or time out.
+ *
+ * This guards against startup races where /reflect is available but a per-provider
+ * listener has not yet bound/started accepting connections.
+ *
+ * For "https:" baseUrls, the probe performs a full TLS handshake (via `tls.connect`) rather
+ * than a bare TCP connect, since a raw TCP accept can succeed well before the TLS listener
+ * is actually able to negotiate a secure session and serve requests.
+ *
+ * @param {{
+ *   baseUrl: string,
+ *   timeoutMs?: number,
+ *   retryDelayMs?: number,
+ *   perAttemptTimeoutMs?: number,
+ *   logger?: (msg: string) => void,
+ *   connectImpl?: (opts: { host: string, port: number }) => import("net").Socket,
+ * }} options - `connectImpl`, when provided, overrides the default connect implementation for
+ *   both http:// and https:// baseUrls (test-only hook). The readiness event awaited is still
+ *   derived from the baseUrl's protocol: for `https:` baseUrls the returned socket must emit
+ *   `"secureConnect"` (not `"connect"`) to be treated as ready, matching the real `tls.connect`
+ *   behavior; for `http:` baseUrls it must emit `"connect"`.
+ * @returns {Promise<{ ok: true } | { ok: false, reason: "invalid_base_url" | "timeout", error: string }>}
+ */
+async function waitForProviderListenerReady(options) {
+  const logger = options?.logger ?? DEFAULT_REFLECT_LOGGER;
+  const timeoutMs = options?.timeoutMs ?? AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS;
+  const retryDelayMs = options?.retryDelayMs ?? AWF_PROVIDER_LISTENER_READY_RETRY_MS;
+  const perAttemptTimeoutMsRaw = options?.perAttemptTimeoutMs ?? AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS;
+  const perAttemptTimeoutMs = Number.isFinite(perAttemptTimeoutMsRaw) && perAttemptTimeoutMsRaw > 0 ? perAttemptTimeoutMsRaw : AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS;
+  const baseUrl = String(options?.baseUrl ?? "").trim();
+  if (!baseUrl) {
+    return { ok: false, reason: "invalid_base_url", error: "baseUrl is empty" };
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return { ok: false, reason: "invalid_base_url", error: `invalid baseUrl: ${baseUrl}` };
+  }
+  const host = parsed.hostname;
+  const port = parsed.port ? Number.parseInt(parsed.port, 10) : parsed.protocol === "https:" ? 443 : 80;
+  if (!host || !Number.isFinite(port) || port <= 0) {
+    return { ok: false, reason: "invalid_base_url", error: `baseUrl missing host/port: ${baseUrl}` };
+  }
+  // For https:// providers, a bare TCP accept does not prove the listener can complete a TLS
+  // handshake. Probe with tls.connect and wait for "secureConnect" so the readiness gate lines
+  // up with the actual failure mode (handshake/startup errors), not just an open port.
+  const isHttps = parsed.protocol === "https:";
+  const readyEvent = isHttps ? "secureConnect" : "connect";
+  const connectImpl = options?.connectImpl ?? (isHttps ? opts => tls.connect({ ...opts, servername: opts.host }) : opts => net.connect(opts));
+
+  logger(`awf-reflect: waiting for provider listener readiness at ${host}:${port} (timeout=${timeoutMs}ms)`);
+  const startedAt = Date.now();
+  let lastError = "connection not ready";
+  while (Date.now() - startedAt < timeoutMs) {
+    const remainingBudgetMs = timeoutMs - (Date.now() - startedAt);
+    const attemptTimeoutMs = Math.max(1, Math.min(perAttemptTimeoutMs, remainingBudgetMs));
+    const ready = await new Promise(resolve => {
+      const socket = connectImpl({ host, port });
+      let settled = false;
+      const settle = value => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      let timer;
+      const clear = () => clearTimeout(timer);
+      timer = setTimeout(() => {
+        clear();
+        lastError = `connect attempt timed out after ${attemptTimeoutMs}ms`;
+        settle(false);
+        socket.destroy();
+      }, attemptTimeoutMs);
+      socket.once(readyEvent, () => {
+        clear();
+        // Settle as ready before tearing down the socket, and keep the "error" listener
+        // installed: destroy() can surface a late/trailing error (e.g. an abrupt RST), and an
+        // EventEmitter with no "error" listener would throw and terminate the process. The
+        // handler below ignores errors once the probe is settled.
+        settle(true);
+        socket.destroy();
+      });
+      socket.once("error", err => {
+        if (settled) return;
+        clear();
+        lastError = getErrorMessage(err);
+        socket.destroy();
+        settle(false);
+      });
+    });
+    if (ready) {
+      logger(`awf-reflect: provider listener is accepting connections at ${host}:${port}`);
+      return { ok: true };
+    }
+    const remainingAfterAttemptMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingAfterAttemptMs <= 0) {
+      break;
+    }
+    await sleep(Math.min(retryDelayMs, remainingAfterAttemptMs));
+  }
+  logger(`awf-reflect: provider listener readiness timed out for ${host}:${port} (${lastError})`);
+  return { ok: false, reason: "timeout", error: lastError };
+}
+
+/**
  * Returns true when the model name matches well-known Anthropic naming patterns:
  * "claude-*" prefix, or "-opus", "-haiku", or "-sonnet" as a segment or suffix.
  *
@@ -388,6 +605,7 @@ function isOpenAIModelName(model) {
 
 /**
  * Look up a model entry in the models.json catalog, case-insensitively.
+ * Exact model IDs take precedence over the base-model fallback for `-utility` variants.
  *
  * @param {any} modelsJson
  * @param {string} modelName
@@ -396,6 +614,7 @@ function isOpenAIModelName(model) {
  */
 function getCatalogModelEntry(modelsJson, modelName, providerName) {
   const model = String(modelName || "")
+    .split("?")[0]
     .toLowerCase()
     .trim();
   const provider = String(providerName || "")
@@ -416,17 +635,26 @@ function getCatalogModelEntry(modelsJson, modelName, providerName) {
             .trim() === provider
       )
     : Object.entries(providers);
+  const modelEntriesByProvider = [];
   for (const [, providerData] of providerEntries) {
     const models = providerData && typeof providerData === "object" ? providerData.models : null;
     if (!models || typeof models !== "object" || Array.isArray(models)) continue;
+    const modelEntriesByName = new Map();
     for (const [catalogModel, catalogEntry] of Object.entries(models)) {
-      if (
-        String(catalogModel || "")
-          .toLowerCase()
-          .trim() === model
-      ) {
-        return catalogEntry && typeof catalogEntry === "object" && !Array.isArray(catalogEntry) ? catalogEntry : null;
-      }
+      const normalizedCatalogModel = String(catalogModel || "")
+        .toLowerCase()
+        .trim();
+      if (!modelEntriesByName.has(normalizedCatalogModel)) modelEntriesByName.set(normalizedCatalogModel, catalogEntry);
+    }
+    modelEntriesByProvider.push(modelEntriesByName);
+  }
+  const lookupModelNames = [model];
+  if (model.endsWith("-utility")) lookupModelNames.push(model.slice(0, -"-utility".length));
+  for (const lookupModelName of lookupModelNames) {
+    for (const modelEntriesByName of modelEntriesByProvider) {
+      if (!modelEntriesByName.has(lookupModelName)) continue;
+      const catalogEntry = modelEntriesByName.get(lookupModelName);
+      return catalogEntry && typeof catalogEntry === "object" && !Array.isArray(catalogEntry) ? catalogEntry : null;
     }
   }
   return null;
@@ -494,7 +722,8 @@ function inferProviderTypeForModel(endpointProvider, modelName, catalogEntryOrMo
  * Resolution order:
  *   1. For Anthropic provider types: undefined (wireApi ignored by SDK).
  *   2. `models.json` explicit `wire_api`/`wireApi`.
- *   3. Heuristic default for OpenAI/Azure-compatible models: "completions".
+ *   3. Heuristic default for GPT-5+ models: "responses".
+ *   4. Default for other OpenAI/Azure-compatible models: "completions".
  *
  * @param {"openai" | "azure" | "anthropic"} providerType
  * @param {string} modelName
@@ -520,6 +749,9 @@ function inferWireApiForModel(providerType, modelName, catalogEntryOrModelsJson)
   if (normalizedWireApi === "responses" || normalizedWireApi === "completions") {
     return /** @type {"responses" | "completions"} */ normalizedWireApi;
   }
+  if (/^gpt-(?:[5-9]|\d{2,})(?:[.-]|$)/i.test(model.split("?")[0])) {
+    return "responses";
+  }
   return "completions";
 }
 
@@ -534,15 +766,41 @@ function inferWireApiForModel(providerType, modelName, catalogEntryOrModelsJson)
 function endpointBaseUrl(endpoint) {
   if (typeof endpoint.models_url === "string" && endpoint.models_url) {
     try {
-      return new URL(endpoint.models_url).origin;
+      return rewriteAPIProxyURLForHostBridge(new URL(endpoint.models_url).origin);
     } catch {
       // fall through to port-based construction
     }
   }
   if (endpoint.port != null) {
-    return `http://api-proxy:${String(endpoint.port)}`;
+    return rewriteAPIProxyURLForHostBridge(`http://api-proxy:${String(endpoint.port)}`);
   }
   return "";
+}
+
+/**
+ * Derive a base URL (origin + path prefix, with any trailing `/models` segment
+ * stripped) from a `models_url` value, applying the same api-proxy ->
+ * host.docker.internal HOSTALIASES bridge rewrite as `endpointBaseUrl`.
+ *
+ * Harnesses that need a base URL for chat-completions requests (rather than
+ * the models-listing endpoint) should use this instead of deriving the
+ * base URL from `models_url` inline, so the api-proxy hostname rewrite is
+ * never accidentally skipped.
+ *
+ * @param {string} modelsUrl
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {(path: string, encoding: BufferEncoding) => string} [readFileSync]
+ * @returns {string}
+ */
+function deriveBaseUrlFromModelsURL(modelsUrl, env = process.env, readFileSync = fs.readFileSync) {
+  let parsed;
+  try {
+    parsed = new URL(modelsUrl);
+  } catch (error) {
+    throw new Error(`Invalid models URL: ${modelsUrl}`, { cause: error });
+  }
+  const basePath = parsed.pathname.replace(/\/models\/?$/i, "");
+  return rewriteAPIProxyURLForHostBridge(`${parsed.origin}${basePath}`, env, readFileSync);
 }
 
 /**
@@ -600,21 +858,105 @@ function resolveProviderEndpointFromReflect(options) {
 }
 
 /**
+ * Check that fresh reflection selects a configured endpoint authenticated by provider-specific OIDC.
+ *
+ * @param {any} reflectData
+ * @param {string} provider
+ * @returns {boolean}
+ */
+function hasOIDCProviderEndpoint(reflectData, provider, authProvider) {
+  const endpoints = Array.isArray(reflectData?.endpoints) ? reflectData.endpoints : [];
+  const resolved = resolveProviderEndpointFromReflect({ provider, reflectData, logger: () => {} });
+  const aliases = REFLECT_PROVIDER_ALIASES[normalizeReflectProviderName(provider)] || new Set([normalizeReflectProviderName(provider)]);
+  const endpoint = endpoints.find(
+    candidate => candidate?.configured === true && aliases.has(normalizeReflectProviderName(candidate.provider)) && normalizeReflectProviderName(candidate.provider) === normalizeReflectProviderName(resolved?.endpointProvider)
+  );
+  return Boolean(endpoint && endpoint.auth_type === `github-oidc/${authProvider}`);
+}
+
+function hasAzureOIDCProviderEndpoint(reflectData, provider) {
+  return hasOIDCProviderEndpoint(reflectData, provider, "azure");
+}
+
+/**
+ * Resolve the OpenAI-compatible chat endpoint for a configured provider.
+ *
+ * Goose requires the endpoint origin and request path in separate environment
+ * variables. The models URL is the authoritative source for provider-specific
+ * path prefixes such as OpenAI's `/v1` and Copilot's versionless API.
+ *
+ * @param {{
+ *   provider?: string,
+ *   reflectData: ReflectData | null | undefined,
+ *   logger?: (msg: string) => void,
+ *   env?: NodeJS.ProcessEnv,
+ *   readFileSync?: (path: string, encoding: BufferEncoding) => string,
+ * }} options
+ * @returns {{ provider: string, endpointProvider: string, host: string, basePath: string } | null}
+ */
+function resolveOpenAICompatibleEndpointFromReflect(options) {
+  const logger = (options && options.logger) || DEFAULT_REFLECT_LOGGER;
+  const provider = normalizeReflectProviderName(options?.provider);
+  if (!provider) {
+    logger("awf-reflect: provider is required for OpenAI-compatible endpoint resolution");
+    return null;
+  }
+
+  const endpointCandidates = Array.isArray(options?.reflectData?.endpoints) ? options.reflectData.endpoints : [];
+  const aliases = REFLECT_PROVIDER_ALIASES[provider] || new Set([provider]);
+  const endpoint = endpointCandidates.find(ep => {
+    if (!ep || ep.configured !== true || typeof ep.provider !== "string") return false;
+    return aliases.has(normalizeReflectProviderName(ep.provider));
+  });
+  if (!endpoint) {
+    logger(`awf-reflect: no configured endpoint found for provider=${provider}`);
+    return null;
+  }
+
+  const endpointURL = endpoint.models_url;
+  if (typeof endpointURL !== "string" || !endpointURL) {
+    logger(`awf-reflect: configured provider=${provider} has no models URL`);
+    return null;
+  }
+
+  try {
+    const parsed = new URL(endpointURL);
+    let path = parsed.pathname.replace(/\/+$/, "");
+    if (!/\/models$/i.test(path)) {
+      logger(`awf-reflect: models URL for provider=${provider} does not end in /models`);
+      return null;
+    }
+    path = path.replace(/\/models$/i, "/chat/completions");
+    const basePath = path.replace(/^\/+/, "");
+    const endpointProvider = String(endpoint.provider);
+    const host = rewriteAPIProxyURLForHostBridge(parsed.origin, options?.env, options?.readFileSync);
+    logger(`awf-reflect: provider=${provider} mapped to endpoint provider=${endpointProvider} host=${host} basePath=${basePath}`);
+    return { provider, endpointProvider, host, basePath };
+  } catch {
+    logger(`awf-reflect: invalid endpoint URL for provider=${provider}`);
+    return null;
+  }
+}
+
+/**
  * Resolve multi-provider BYOK configuration from AWF /reflect data.
  *
  * Returns `null` when no configured endpoints are present or the data is
  * unavailable.
  *
- * Each endpoint becomes a `NamedProviderConfig` (using the endpoint's `provider`
- * field as the stable name) and every model advertised by that endpoint becomes a
- * `ProviderModelConfig` tuple `{ id, provider }` referencing it.  Callers can
- * derive provider-qualified selection ids as `"<providerName>/<modelId>"` if needed.
+ * Copilot endpoints become separate responses and completions providers. Other
+ * endpoints retain a single provider. Models reference their inferred wire API.
  *
  * The primary model is the first model that matches `options.model` (if set),
- * otherwise the first model across all providers.
+ * otherwise (only when no model is configured) the first model across all providers.
+ * A configured model that matches no model is never replaced by another model: the
+ * result has an empty `model` and `configuredModelNotFound: true` so the caller fails.
+ * A valid `options.wireApi` routes only the configured Copilot model; it never
+ * changes the wire API used by the other models. The primary model is qualified.
  *
  * @param {{
  *   model?: string,
+ *   wireApi?: string,
  *   reflectData: ReflectData | null | undefined,
  *   modelsJson?: object | null,
  *   logger?: (msg: string) => void,
@@ -623,6 +965,7 @@ function resolveProviderEndpointFromReflect(options) {
  *   model: string,
  *   providers: Array<{ name: string, type: "openai" | "azure" | "anthropic", baseUrl: string, wireApi?: "completions" | "responses" }>,
  *   models: Array<{ id: string, provider: string }>,
+ *   configuredModelNotFound?: boolean,
  * } | null}
  */
 function resolveMultiProviderFromReflect(options) {
@@ -653,6 +996,11 @@ function resolveMultiProviderFromReflect(options) {
   // provider label (e.g. two "copilot" entries at different ports).
   /** @type {Map<string, number>} */
   const providerNameCount = new Map();
+  const configuredWireApi = String(options?.wireApi || "")
+    .toLowerCase()
+    .trim();
+  let configuredModelMapped = false;
+  let mappedConfiguredModel = "";
 
   for (const endpoint of endpoints) {
     const baseUrl = endpointBaseUrl(endpoint);
@@ -668,18 +1016,62 @@ function resolveMultiProviderFromReflect(options) {
     }
 
     // Ensure unique provider names by appending a suffix when the same name appears twice.
-    const existing = providerNameCount.get(rawProviderName) ?? 0;
-    providerNameCount.set(rawProviderName, existing + 1);
-    const providerName = existing === 0 ? rawProviderName : `${rawProviderName}-${existing}`;
+    const isCopilot = isCopilotProviderName(rawProviderName);
+    const stableProviderName = isCopilot ? "copilot" : rawProviderName;
+    const existing = providerNameCount.get(stableProviderName) ?? 0;
+    providerNameCount.set(stableProviderName, existing + 1);
+    const suffix = existing === 0 ? "" : `-${existing}`;
+    const providerName = `${stableProviderName}${suffix}`;
 
     const endpointModels = Array.isArray(endpoint.models) ? endpoint.models.filter(m => typeof m === "string" && m.trim().length > 0) : [];
 
-    // Infer provider type and wire API using the configured model if available,
-    // otherwise fall back to the first model.
-    // For multi-model providers (e.g. Copilot), different models may have different wire APIs,
-    // so we prefer the configured model to ensure the correct wireApi is selected.
+    if (isCopilot) {
+      /** @type {Array<"responses" | "completions">} */
+      const wireApis = ["responses", "completions"];
+      for (const wireApi of wireApis) {
+        providers.push({ name: `copilot-${wireApi}${suffix}`, type: "openai", baseUrl, wireApi });
+      }
+      // Routing metadata uses model_id (not id); HTTP paths exclude ws:/responses.
+      const routingModels = Array.isArray(endpoint.routing_models) ? endpoint.routing_models : Array.isArray(rd.routing_models) ? rd.routing_models : [];
+      for (const modelId of endpointModels) {
+        const catalogEntry = getCatalogModelEntry(options?.modelsJson ?? null, modelId, "github-copilot");
+        let wireApi = inferWireApiForModel("openai", modelId, catalogEntry);
+        const metadata = routingModels.find(model => model?.model_id === modelId);
+        const supported = metadata?.supported_endpoints;
+        if (Array.isArray(supported)) {
+          const responses = supported.includes("/responses");
+          const completions = supported.includes("/chat/completions");
+          if (!responses && !completions) {
+            logger(`sdk-mode(multi): skipping Copilot model="${modelId}" with no supported SDK wire API`);
+            continue;
+          }
+          if (responses !== completions) wireApi = responses ? "responses" : "completions";
+        }
+        const matchesConfigured = configuredModel === modelId || configuredModel === `copilot/${modelId}` || ["responses", "completions"].some(api => configuredModel === `copilot-${api}${suffix}/${modelId}`);
+        if (!configuredModelMapped && matchesConfigured) {
+          configuredModelMapped = true;
+          const qualifiedWireApi = wireApis.find(api => configuredModel === `copilot-${api}${suffix}/${modelId}`);
+          if (qualifiedWireApi && (!Array.isArray(supported) || supported.includes(qualifiedWireApi === "responses" ? "/responses" : "/chat/completions"))) {
+            wireApi = qualifiedWireApi;
+          }
+          if (configuredWireApi === "responses" || configuredWireApi === "completions") {
+            const requestedEndpoint = configuredWireApi === "responses" ? "/responses" : "/chat/completions";
+            if (Array.isArray(supported) && !supported.includes(requestedEndpoint)) {
+              throw new Error(`Model endpoint mismatch: model "${modelId}" with COPILOT_PROVIDER_WIRE_API=${configuredWireApi} requires ${requestedEndpoint}; supported endpoints: ${supported.join(", ")}`);
+            }
+            wireApi = configuredWireApi;
+          }
+          mappedConfiguredModel = `copilot-${wireApi}${suffix}/${modelId}`;
+        }
+        models.push({ id: modelId, provider: `copilot-${wireApi}${suffix}` });
+      }
+      logger(`sdk-mode(multi): split provider="${providerName}" into responses/completions modelCount=${endpointModels.length} baseUrl="${baseUrl}"`);
+      continue;
+    }
+
+    // Other endpoints retain their provider-wide inference.
     const firstModel = endpointModels.length > 0 ? endpointModels[0] : "";
-    const modelForInference = configuredModel && endpointModels.includes(configuredModel) ? configuredModel : firstModel;
+    const modelForInference = endpointModels.find(modelId => configuredModel === modelId || configuredModel === `${providerName}/${modelId}`) || firstModel;
     const catalogProviderName = rawProviderName.toLowerCase() === "copilot" ? "github-copilot" : rawProviderName;
     const catalogEntry = modelForInference ? getCatalogModelEntry(options?.modelsJson ?? null, modelForInference, catalogProviderName) : null;
     const providerType = inferProviderTypeForModel(rawProviderName, modelForInference, catalogEntry);
@@ -707,20 +1099,33 @@ function resolveMultiProviderFromReflect(options) {
     return null;
   }
 
-  // Determine the primary model: prefer the configured model if it appears in the model list;
-  // otherwise fall back to the first model across all providers.
-  let primaryModel = "";
-  if (configuredModel) {
-    const match = models.find(m => m.id === configuredModel);
-    if (match) primaryModel = match.id;
+  // Determine the primary model: use the configured model if it appears in the model list.
+  // Only when no model is configured fall back to the first model across all providers;
+  // a configured model that is not found is never silently replaced by another model.
+  let primaryModel = qualifyModelForMultiProvider(configuredModel, { providers, models }) || mappedConfiguredModel;
+  if (!primaryModel && configuredModel && models.length > 0) {
+    // Provisional diagnostic: the caller may still refresh /reflect, so this wording must not
+    // match the unsupported-model classifier (agent_error_patterns.cjs MODEL_NOT_SUPPORTED_PATTERN).
+    logger(`sdk-mode(multi): no awf-reflect endpoint lists the configured model "${configuredModel}"; not selecting a different model`);
+    return { model: "", providers, models, configuredModelNotFound: true };
   }
   if (!primaryModel && models.length > 0) {
-    primaryModel = models[0].id;
+    primaryModel = `${models[0].provider}/${models[0].id}`;
   }
 
   if (!primaryModel) {
     logger("sdk-mode(multi): no models found in awf-reflect endpoints; cannot build multi-provider config");
     return null;
+  }
+
+  const primaryProviderName = models.find(m => `${m.provider}/${m.id}` === primaryModel)?.provider;
+  const primaryProvider = providers.find(p => p.name === primaryProviderName);
+  const wireApi = String(options?.wireApi || "")
+    .toLowerCase()
+    .trim();
+  if (primaryProvider && !primaryProvider.name.startsWith("copilot-") && primaryProvider.type !== "anthropic" && (wireApi === "responses" || wireApi === "completions")) {
+    primaryProvider.wireApi = wireApi;
+    logger(`sdk-mode(multi): primary provider="${primaryProvider.name}" wireApi="${wireApi}" selected from configured wire API`);
   }
 
   logger(`sdk-mode(multi): resolved ${providers.length} providers, ${models.length} models (primary model: ${primaryModel})`);
@@ -734,18 +1139,32 @@ if (typeof module !== "undefined" && module.exports) {
     AWF_REFLECT_TIMEOUT_MS,
     AWF_MODELS_URL_TIMEOUT_MS,
     AWF_MODELS_URL_MAX_ATTEMPTS,
+    AWF_MODELS_URL_RETRYABLE_STATUSES,
     AWF_MODELS_URL_RETRY_BASE_MS,
     AWF_MODELS_URL_RETRY_MAX_MS,
+    AWF_PROVIDER_LISTENER_READY_TIMEOUT_MS,
+    AWF_PROVIDER_LISTENER_READY_RETRY_MS,
+    AWF_PROVIDER_LISTENER_READY_PROBE_TIMEOUT_MS,
+    DEFAULT_API_PROXY_HOST_BRIDGE,
     GEMINI_MODEL_NAME_PREFIX,
+    parseReflectTimeoutMs,
     enrichReflectModels,
     extractModelIds,
     fetchAWFReflect,
     fetchModelsFromUrl,
+    waitForProviderListenerReady,
     getCatalogModelEntry,
+    hasAPIProxyLocalhostAlias,
     inferProviderTypeForModel,
     inferWireApiForModel,
+    deriveBaseUrlFromModelsURL,
     normalizeReflectProviderName,
+    REFLECT_PROVIDER_ALIASES,
+    resolveOpenAICompatibleEndpointFromReflect,
     resolveProviderEndpointFromReflect,
+    hasAzureOIDCProviderEndpoint,
+    hasOIDCProviderEndpoint,
     resolveMultiProviderFromReflect,
+    rewriteAPIProxyURLForHostBridge,
   };
 }

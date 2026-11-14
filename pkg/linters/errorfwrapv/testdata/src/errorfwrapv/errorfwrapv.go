@@ -48,6 +48,12 @@ func GoodIndexedWidthWrap(err error) error {
 	return fmt.Errorf("%[2]*[1]w", err, 10)
 }
 
+// GoodIndexedDynamicWidthWrap uses an explicit index for the dynamic width and
+// wraps the following argument with %w.
+func GoodIndexedDynamicWidthWrap(width int, err error) error {
+	return fmt.Errorf("%[1]*w", width, err)
+}
+
 // BadIndexedWidthNoW uses indexed width and value but does not wrap the error.
 func BadIndexedWidthNoW(err error) error {
 	return fmt.Errorf("%[2]*[1]s", err, 10) // want `fmt\.Errorf passes an error argument without %w`
@@ -86,6 +92,28 @@ func GoodNonErrorVerb(name string) error {
 // GoodMixedVerbs uses %w for the error and %v for a non-error.
 func GoodMixedVerbs(name string, err error) error {
 	return fmt.Errorf("operation %v failed: %w", name, err)
+}
+
+// BadConcatVWrap builds its format string via string concatenation of literals.
+// The trailing error argument is formatted with %v instead of %w.
+func BadConcatVWrap(err error) error {
+	return fmt.Errorf("context: %d\n"+ // want `fmt\.Errorf formats an error argument with %v`
+		"Original error: %v", 42, err)
+}
+
+// GoodConcatWWrap builds its format string via string concatenation of literals
+// and correctly wraps the trailing error with %w.
+func GoodConcatWWrap(err error) error {
+	return fmt.Errorf("context: %d\n"+
+		"Original error: %w", 42, err)
+}
+
+// OpaqueConcatVWrap builds its format string with a caller-supplied opaque prefix;
+// because the format string contains non-literal components, it cannot be safely analyzed.
+func OpaqueConcatVWrap(prefix string, err error) error {
+	return fmt.Errorf(prefix+"\n\n"+
+		"context: %d\n"+
+		"Original error: %v", 42, err)
 }
 
 // SuppressedByNolint is intentionally suppressed.

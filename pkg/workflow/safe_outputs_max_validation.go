@@ -55,6 +55,8 @@ func checkMaxField(toolName string, maxPtr *string) error {
 // This function uses direct struct field access instead of reflection for performance;
 // it is on the hot path and called on every compilation. The field ordering matches
 // the sorted safeOutputFieldMapping keys for deterministic error reporting.
+//
+//nolint:largefunc // Direct field access intentionally keeps all safe-output max checks together.
 func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 	if config == nil {
 		return nil
@@ -78,6 +80,11 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 	}
 	if config.AddReviewer != nil {
 		if err := checkMaxField("add_reviewer", config.AddReviewer.Max); err != nil {
+			return err
+		}
+	}
+	if config.AddSecurityAdvisoryComment != nil {
+		if err := checkMaxField("add_security_advisory_comment", config.AddSecurityAdvisoryComment.Max); err != nil {
 			return err
 		}
 	}
@@ -142,6 +149,9 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 		}
 	}
 	if config.CreateIssues != nil {
+		if config.CreateIssues.artifactSizeParseError != nil {
+			return config.CreateIssues.artifactSizeParseError
+		}
 		if err := checkMaxField("create_issue", config.CreateIssues.Max); err != nil {
 			return err
 		}
@@ -163,6 +173,11 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 	}
 	if config.CreatePullRequests != nil {
 		if err := checkMaxField("create_pull_request", config.CreatePullRequests.Max); err != nil {
+			return err
+		}
+	}
+	if config.CreateSecurityAdvisory != nil {
+		if err := checkMaxField("create_security_advisory", config.CreateSecurityAdvisory.Max); err != nil {
 			return err
 		}
 	}
@@ -190,6 +205,12 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 		if err := checkMaxField("mark_pull_request_as_ready_for_review", config.MarkPullRequestAsReadyForReview.Max); err != nil {
 			return err
 		}
+
+	}
+	if config.ApproveWorkflowRun != nil {
+		if err := checkMaxField("approve_workflow_run", config.ApproveWorkflowRun.Max); err != nil {
+			return err
+		}
 	}
 	if config.MergePullRequest != nil {
 		if err := checkMaxField("merge_pull_request", config.MergePullRequest.Max); err != nil {
@@ -197,12 +218,12 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 		}
 	}
 	if config.MissingData != nil {
-		if err := checkMaxField("missing_data", config.MissingData.Max); err != nil {
+		if err := checkMaxField("report_missing_data", config.MissingData.Max); err != nil {
 			return err
 		}
 	}
 	if config.MissingTool != nil {
-		if err := checkMaxField("missing_tool", config.MissingTool.Max); err != nil {
+		if err := checkMaxField("report_missing_tool", config.MissingTool.Max); err != nil {
 			return err
 		}
 	}
@@ -218,6 +239,11 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 	}
 	if config.RemoveLabels != nil {
 		if err := checkMaxField("remove_labels", config.RemoveLabels.Max); err != nil {
+			return err
+		}
+	}
+	if config.ReportIncomplete != nil {
+		if err := checkMaxField("report_incomplete", config.ReportIncomplete.Max); err != nil {
 			return err
 		}
 	}
@@ -262,6 +288,9 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 		}
 	}
 	if config.UpdateIssues != nil {
+		if config.UpdateIssues.artifactSizeParseError != nil {
+			return config.UpdateIssues.artifactSizeParseError
+		}
 		if err := checkMaxField("update_issue", config.UpdateIssues.Max); err != nil {
 			return err
 		}
@@ -288,6 +317,11 @@ func validateSafeOutputsMax(config *SafeOutputsConfig) error {
 	}
 	if config.UploadAssets != nil {
 		if err := checkMaxField("upload_asset", config.UploadAssets.Max); err != nil {
+			return err
+		}
+	}
+	if config.UploadCodeCoverage != nil {
+		if err := checkMaxField("upload_code_coverage", config.UploadCodeCoverage.Max); err != nil {
 			return err
 		}
 	}

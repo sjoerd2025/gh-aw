@@ -3,6 +3,11 @@
 package workflow
 
 import (
+	"maps"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -84,7 +89,7 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				AddComments: &AddCommentsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
-					Discussions:          ptrBool(true),
+					Discussions:          new(true),
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
@@ -98,7 +103,7 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				AddComments: &AddCommentsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
-					Discussions:          ptrBool(false),
+					Discussions:          new(false),
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
@@ -111,7 +116,7 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			safeOutputs: &SafeOutputsConfig{
 				AddComments: &AddCommentsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
-					PullRequests:         ptrBool(false),
+					PullRequests:         new(false),
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
@@ -119,7 +124,7 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 		},
 		{
-			name: "add-comment with issues:false - no issues permission and no discussions by default",
+			name: "add-comment with issues:false - read permission for PR target author lookup",
 			safeOutputs: &SafeOutputsConfig{
 				AddComments: &AddCommentsConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
@@ -127,14 +132,27 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
+				PermissionIssues:       PermissionRead,
 				PermissionPullRequests: PermissionWrite,
 			},
 		},
 		{
-			name: "hide-comment default - includes discussions permission",
+			name: "hide-comment default - excludes discussions permission",
 			safeOutputs: &SafeOutputsConfig{
 				HideComment: &HideCommentConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+				},
+			},
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionIssues: PermissionWrite,
+			},
+		},
+		{
+			name: "hide-comment with discussions:true - includes discussions permission",
+			safeOutputs: &SafeOutputsConfig{
+				HideComment: &HideCommentConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+					Discussions:          ptrBool(true),
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
@@ -167,6 +185,30 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 		},
 		{
+			name: "add-labels with pull-requests:false - no pull-requests permission",
+			safeOutputs: &SafeOutputsConfig{
+				AddLabels: &AddLabelsConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("5")},
+					PullRequests:         ptrBool(false),
+				},
+			},
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionIssues: PermissionWrite,
+			},
+		},
+		{
+			name: "add-labels with issues:false - no issues permission",
+			safeOutputs: &SafeOutputsConfig{
+				AddLabels: &AddLabelsConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("5")},
+					Issues:               ptrBool(false),
+				},
+			},
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionPullRequests: PermissionWrite,
+			},
+		},
+		{
 			name: "remove-labels only - no discussions permission",
 			safeOutputs: &SafeOutputsConfig{
 				RemoveLabels: &RemoveLabelsConfig{
@@ -175,6 +217,30 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 			expected: map[PermissionScope]PermissionLevel{
 				PermissionIssues:       PermissionWrite,
+				PermissionPullRequests: PermissionWrite,
+			},
+		},
+		{
+			name: "remove-labels with pull-requests:false - no pull-requests permission",
+			safeOutputs: &SafeOutputsConfig{
+				RemoveLabels: &RemoveLabelsConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("2")},
+					PullRequests:         ptrBool(false),
+				},
+			},
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionIssues: PermissionWrite,
+			},
+		},
+		{
+			name: "remove-labels with issues:false - no issues permission",
+			safeOutputs: &SafeOutputsConfig{
+				RemoveLabels: &RemoveLabelsConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("2")},
+					Issues:               ptrBool(false),
+				},
+			},
+			expected: map[PermissionScope]PermissionLevel{
 				PermissionPullRequests: PermissionWrite,
 			},
 		},
@@ -255,20 +321,19 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 		},
 		{
-			name: "push-to-pull-request-branch default fallback - requires pull-requests write and administration read",
+			name: "push-to-pull-request-branch default fallback - requires pull-requests write",
 			safeOutputs: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{},
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
-				PermissionContents:       PermissionWrite,
-				PermissionPullRequests:   PermissionWrite,
-				PermissionAdministration: PermissionRead,
+				PermissionContents:     PermissionWrite,
+				PermissionPullRequests: PermissionWrite,
 			},
 		},
 		{
-			name: "push-to-pull-request-branch with fallback-as-pull-request false - no pull-requests permission but administration read",
+			name: "push-to-pull-request-branch with fallback-as-pull-request false - requires pull-requests read",
 			safeOutputs: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
 					BaseSafeOutputConfig:  BaseSafeOutputConfig{},
@@ -276,8 +341,8 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
-				PermissionContents:       PermissionWrite,
-				PermissionAdministration: PermissionRead,
+				PermissionContents:     PermissionWrite,
+				PermissionPullRequests: PermissionRead,
 			},
 		},
 		{
@@ -294,7 +359,7 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 		},
 		{
-			name: "push-to-pull-request-branch with check-branch-protection explicit true - includes administration read",
+			name: "push-to-pull-request-branch with check-branch-protection explicit true - no administration permission",
 			safeOutputs: &SafeOutputsConfig{
 				PushToPullRequestBranch: &PushToPullRequestBranchConfig{
 					BaseSafeOutputConfig:  BaseSafeOutputConfig{},
@@ -302,9 +367,8 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 				},
 			},
 			expected: map[PermissionScope]PermissionLevel{
-				PermissionContents:       PermissionWrite,
-				PermissionPullRequests:   PermissionWrite,
-				PermissionAdministration: PermissionRead,
+				PermissionContents:     PermissionWrite,
+				PermissionPullRequests: PermissionWrite,
 			},
 		},
 		{
@@ -385,6 +449,32 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 			expected: map[PermissionScope]PermissionLevel{
 				PermissionActions: PermissionWrite,
+			},
+		},
+		{
+			name: "approve-workflow-run with comment enabled requires actions write and pull-requests write",
+			safeOutputs: &SafeOutputsConfig{
+				ApproveWorkflowRun: &ApproveWorkflowRunConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+					Comment:              true,
+				},
+			},
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionActions:      PermissionWrite,
+				PermissionPullRequests: PermissionWrite,
+			},
+		},
+		{
+			name: "approve-workflow-run with comment disabled requires actions write and pull-requests read",
+			safeOutputs: &SafeOutputsConfig{
+				ApproveWorkflowRun: &ApproveWorkflowRunConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
+					Comment:              false,
+				},
+			},
+			expected: map[PermissionScope]PermissionLevel{
+				PermissionActions:      PermissionWrite,
+				PermissionPullRequests: PermissionRead,
 			},
 		},
 		{
@@ -469,7 +559,7 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			},
 		},
 		{
-			name: "merge-pull-request requires contents write and pull-requests write",
+			name: "merge-pull-request without configured checks requires checks read for branch policy",
 			safeOutputs: &SafeOutputsConfig{
 				MergePullRequest: &MergePullRequestConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Max: strPtr("1")},
@@ -478,6 +568,7 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			expected: map[PermissionScope]PermissionLevel{
 				PermissionContents:     PermissionWrite,
 				PermissionPullRequests: PermissionWrite,
+				PermissionChecks:       PermissionRead,
 			},
 		},
 		{
@@ -525,6 +616,350 @@ func TestComputePermissionsForSafeOutputs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCompileMergePullRequestCheckPermissions(t *testing.T) {
+	for _, app := range []string{"", "global", "per-handler"} {
+		for _, checks := range []string{"", "    required-checks: [ci/test]\n"} {
+			policy := "branch-only"
+			if checks != "" {
+				policy = "configured-checks"
+			}
+			t.Run(app+"/"+policy, func(t *testing.T) {
+				appConfig := "github-app:\n      app-id: ${{ vars.APP_ID }}\n      private-key: ${{ secrets.APP_PRIVATE_KEY }}\n"
+				globalApp, handlerApp := "", ""
+				switch app {
+				case "global":
+					globalApp = "  " + strings.ReplaceAll(appConfig, "\n      ", "\n    ")
+				case "per-handler":
+					handlerApp = "    " + appConfig
+				}
+				content := "---\non: issues\nengine: copilot\nsafe-outputs:\n" +
+					globalApp + "  merge-pull-request:\n    allowed-base-branches: [agent-work/*]\n    max: 1\n" + checks + handlerApp + "---\n\nTest workflow.\n"
+				testFile := filepath.Join(t.TempDir(), "merge-permissions.md")
+				require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
+				compiler := NewCompiler(WithVersion("1.0.0"))
+				data, err := compiler.ParseWorkflowFile(testFile)
+				require.NoError(t, err)
+				compiled, _, _, err := compiler.generateYAML(data, testFile)
+				require.NoError(t, err)
+				job := extractJobSection(compiled, "safe_outputs")
+				assert.Contains(t, job, "checks: read")
+				assert.NotContains(t, job, "checks: write")
+				if app != "" {
+					stepID := "safe-outputs-app-token"
+					if app == "per-handler" {
+						stepID = "merge-pull-request-app-token"
+					}
+					step := compiledStepBlockForTest(job, stepID)
+					require.NotEmpty(t, step)
+					assert.Contains(t, step, "permission-checks: read")
+					assert.NotContains(t, step, "permission-checks: write")
+				}
+				if app == "per-handler" {
+					appPermissions := computePermissionsForSafeOutputs(data.SafeOutputs, true)
+					assert.NotContains(t, appPermissions.permissions, PermissionChecks)
+				}
+			})
+		}
+	}
+}
+
+func TestComputePermissionsForSafeOutputsExcludesPerHandlerAppsFromGlobalAppToken(t *testing.T) {
+	safeOutputs := &SafeOutputsConfig{
+		AddComments: &AddCommentsConfig{
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Max:       strPtr("1"),
+				GitHubApp: &GitHubAppConfig{AppID: "issue-app", PrivateKey: "issue-key"},
+			},
+		},
+		DispatchWorkflow: &DispatchWorkflowConfig{
+			Workflows: []string{"downstream.yml"},
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Max: strPtr("1"),
+			},
+		},
+	}
+
+	perms := computePermissionsForSafeOutputs(safeOutputs, true)
+	require.NotNil(t, perms)
+	assert.Equal(t, PermissionWrite, perms.permissions[PermissionActions])
+	assert.Equal(t, PermissionRead, perms.permissions[PermissionIssues])
+}
+
+func TestComputePermissionsForSafeOutputsExcludesHandlerTokensFromGlobalAppToken(t *testing.T) {
+	safeOutputs := &SafeOutputsConfig{
+		GitHubApp: &GitHubAppConfig{AppID: "global-app", PrivateKey: "global-key"},
+		DispatchWorkflow: &DispatchWorkflowConfig{
+			Workflows: []string{"downstream.yml"},
+			BaseSafeOutputConfig: BaseSafeOutputConfig{
+				Max:         strPtr("1"),
+				GitHubToken: "${{ secrets.GITHUB_TOKEN }}",
+			},
+		},
+	}
+
+	appPermissions := computePermissionsForSafeOutputs(safeOutputs, true)
+	require.NotNil(t, appPermissions)
+	assert.NotContains(t, appPermissions.permissions, PermissionActions)
+
+	jobPermissions := computePermissionsForSafeOutputs(safeOutputs, false)
+	require.NotNil(t, jobPermissions)
+	assert.Equal(t, PermissionWrite, jobPermissions.permissions[PermissionActions])
+}
+
+func TestComputePermissionsForSafeOutputsDispatchRepositoryAppSplit(t *testing.T) {
+	safeOutputs := &SafeOutputsConfig{
+		DispatchRepository: &DispatchRepositoryConfig{
+			Tools: map[string]*DispatchRepositoryToolConfig{
+				"with-app": {
+					Workflow:   "ci.yml",
+					EventType:  "ci_trigger",
+					Repository: "github/gh-aw",
+					GitHubApp:  &GitHubAppConfig{AppID: "dispatch-app", PrivateKey: "dispatch-key"},
+				},
+				"without-app": {
+					Workflow:   "ci.yml",
+					EventType:  "ci_trigger",
+					Repository: "github/gh-aw",
+				},
+			},
+		},
+	}
+
+	perms := computePermissionsForSafeOutputs(safeOutputs, true)
+	require.NotNil(t, perms)
+	assert.Equal(t, PermissionWrite, perms.permissions[PermissionContents])
+}
+
+func TestComputePermissionsForSafeOutputsDispatchRepositoryGitHubTokenSplit(t *testing.T) {
+	safeOutputs := &SafeOutputsConfig{
+		DispatchRepository: &DispatchRepositoryConfig{
+			Tools: map[string]*DispatchRepositoryToolConfig{
+				"with-token": {
+					Workflow:    "ci.yml",
+					EventType:   "ci_trigger",
+					Repository:  "github/gh-aw",
+					GitHubToken: "${{ secrets.DISPATCH_PAT }}",
+				},
+			},
+		},
+	}
+
+	// A per-tool github-token override means the handler authenticates with its own
+	// credential at runtime (dispatch_repository.cjs), so it must not also contribute
+	// contents: write to the global safe-outputs App mint.
+	appPermissions := computeDispatchRepositoryPermissions(safeOutputs, true)
+	assert.Nil(t, appPermissions)
+
+	jobPermissions := computeDispatchRepositoryPermissions(safeOutputs, false)
+	require.NotNil(t, jobPermissions)
+	assert.Equal(t, PermissionWrite, jobPermissions.permissions[PermissionContents])
+}
+
+func TestComputePermissionsForSafeOutputsDispatchRepositoryMixedGitHubTokenConfig(t *testing.T) {
+	safeOutputs := &SafeOutputsConfig{
+		DispatchRepository: &DispatchRepositoryConfig{
+			Tools: map[string]*DispatchRepositoryToolConfig{
+				"with-token": {
+					Workflow:    "ci.yml",
+					EventType:   "ci_trigger",
+					Repository:  "github/gh-aw",
+					GitHubToken: "${{ secrets.DISPATCH_PAT }}",
+				},
+				"without-token": {
+					Workflow:   "ci.yml",
+					EventType:  "ci_trigger",
+					Repository: "github/gh-aw",
+				},
+			},
+		},
+	}
+
+	appPermissions := computeDispatchRepositoryPermissions(safeOutputs, true)
+	require.NotNil(t, appPermissions)
+	assert.Equal(t, PermissionWrite, appPermissions.permissions[PermissionContents])
+
+	jobPermissions := computeDispatchRepositoryPermissions(safeOutputs, false)
+	require.NotNil(t, jobPermissions)
+	assert.Equal(t, PermissionWrite, jobPermissions.permissions[PermissionContents])
+}
+
+func TestComputePermissionsForSafeOutputsExcludesParsedPerHandlerApps(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "parsed-safe-outputs.md")
+	content := `---
+on: issues
+safe-outputs:
+  github-app:
+    app-id: ${{ vars.GLOBAL_APP_ID }}
+    private-key: ${{ secrets.GLOBAL_APP_PRIVATE_KEY }}
+  add-comment:
+    github-app:
+      app-id: ${{ vars.ISSUE_APP_ID }}
+      private-key: ${{ secrets.ISSUE_APP_PRIVATE_KEY }}
+    pull-requests: false
+  report-incomplete:
+    github-app:
+      app-id: ${{ vars.INCOMPLETE_APP_ID }}
+      private-key: ${{ secrets.INCOMPLETE_APP_PRIVATE_KEY }}
+  dispatch-repository:
+    trigger-ci:
+      workflow: ci.yml
+      event_type: ci_trigger
+      repository: github/gh-aw
+---
+
+Test workflow.
+`
+	require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
+
+	workflowData, err := compiler.ParseWorkflowFile(testFile)
+	require.NoError(t, err)
+	require.NotNil(t, getHandlerGitHubApp(workflowData.SafeOutputs, "AddComments"))
+
+	perms := computePermissionsForSafeOutputs(workflowData.SafeOutputs, true)
+	require.NotNil(t, perms)
+	assert.Equal(t, PermissionRead, perms.permissions[PermissionIssues])
+	assert.NotContains(t, perms.permissions, PermissionPullRequests)
+	assert.Equal(t, PermissionWrite, perms.permissions[PermissionContents])
+}
+
+func TestMentionResolutionPermissionsIncludeIssuesReadForPullRequestOnlyComments(t *testing.T) {
+	issues := false
+	pullRequests := true
+	safeOutputs := &SafeOutputsConfig{
+		AddComments: &AddCommentsConfig{Issues: &issues, PullRequests: &pullRequests},
+		Mentions:    &MentionsConfig{AllowedTeams: []string{"my-org/my-team"}},
+	}
+
+	jobPermissions := computePermissionsForSafeOutputs(safeOutputs, true)
+	require.Equal(t, PermissionRead, jobPermissions.permissions[PermissionIssues])
+	assert.Equal(t, PermissionWrite, jobPermissions.permissions[PermissionPullRequests])
+
+	mentionTokenPermissions := buildMentionResolutionPermissions(safeOutputs)
+	assert.Equal(t, PermissionRead, mentionTokenPermissions.permissions[PermissionIssues])
+	assert.Equal(t, PermissionRead, mentionTokenPermissions.permissions[PermissionPullRequests])
+	assert.Equal(t, PermissionRead, mentionTokenPermissions.permissions[PermissionMembers])
+}
+
+func TestBuildPreambleTokenStepsExcludesParsedPerHandlerApps(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "parsed-safe-outputs.md")
+	content := `---
+on: issues
+safe-outputs:
+  github-app:
+    app-id: ${{ vars.GLOBAL_APP_ID }}
+    private-key: ${{ secrets.GLOBAL_APP_PRIVATE_KEY }}
+  add-comment:
+    github-app:
+      app-id: ${{ vars.ISSUE_APP_ID }}
+      private-key: ${{ secrets.ISSUE_APP_PRIVATE_KEY }}
+    pull-requests: false
+  report-incomplete:
+    github-app:
+      app-id: ${{ vars.INCOMPLETE_APP_ID }}
+      private-key: ${{ secrets.INCOMPLETE_APP_PRIVATE_KEY }}
+  dispatch-repository:
+    trigger-ci:
+      workflow: ci.yml
+      event_type: ci_trigger
+      repository: github/gh-aw
+---
+
+Test workflow.
+`
+	require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
+
+	workflowData, err := compiler.ParseWorkflowFile(testFile)
+	require.NoError(t, err)
+
+	steps := compiler.buildPreambleTokenSteps(workflowData, map[string]string{})
+	joined := strings.Join(steps, "")
+	assert.Contains(t, joined, "permission-contents: write")
+	assert.NotContains(t, joined, "permission-issues: write")
+	assert.NotContains(t, joined, "permission-pull-requests: write")
+}
+
+func TestGenerateYAMLDoesNotReintroduceParsedPerHandlerPermissions(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "parsed-safe-outputs.md")
+	content := `---
+on: issues
+safe-outputs:
+  github-app:
+    app-id: ${{ vars.GLOBAL_APP_ID }}
+    private-key: ${{ secrets.GLOBAL_APP_PRIVATE_KEY }}
+  add-comment:
+    github-app:
+      app-id: ${{ vars.ISSUE_APP_ID }}
+      private-key: ${{ secrets.ISSUE_APP_PRIVATE_KEY }}
+    pull-requests: false
+  report-incomplete:
+    github-app:
+      app-id: ${{ vars.INCOMPLETE_APP_ID }}
+      private-key: ${{ secrets.INCOMPLETE_APP_PRIVATE_KEY }}
+  dispatch-repository:
+    trigger-ci:
+      workflow: ci.yml
+      event_type: ci_trigger
+      repository: github/gh-aw
+engine: copilot
+---
+
+Test workflow.
+`
+	require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
+
+	workflowData, err := compiler.ParseWorkflowFile(testFile)
+	require.NoError(t, err)
+
+	yamlContent, _, _, err := compiler.generateYAML(workflowData, testFile)
+	require.NoError(t, err)
+	require.NotNil(t, workflowData.SafeOutputs.AddComments)
+	require.NotNil(t, workflowData.SafeOutputs.AddComments.GitHubApp)
+	require.Equal(t, "${{ vars.ISSUE_APP_ID }}", workflowData.SafeOutputs.AddComments.GitHubApp.AppID)
+	require.NotNil(t, workflowData.SafeOutputs.ReportIncomplete)
+	require.NotNil(t, workflowData.SafeOutputs.ReportIncomplete.GitHubApp)
+	require.Equal(t, "${{ vars.INCOMPLETE_APP_ID }}", workflowData.SafeOutputs.ReportIncomplete.GitHubApp.AppID)
+	globalStep := compiledLastStepBlockForTest(yamlContent, "safe-outputs-app-token")
+	require.NotEmpty(t, globalStep)
+	assert.Contains(t, globalStep, "permission-contents: write")
+	assert.NotContains(t, globalStep, "permission-issues: write")
+	assert.NotContains(t, globalStep, "permission-pull-requests: write")
+
+	steps := compiler.buildPreambleTokenSteps(workflowData, map[string]string{})
+	joined := strings.Join(steps, "")
+	assert.Contains(t, joined, "permission-contents: write")
+	assert.NotContains(t, joined, "permission-issues: write")
+	assert.NotContains(t, joined, "permission-pull-requests: write")
+}
+
+func compiledStepBlockForTest(compiled, stepID string) string {
+	marker := "id: " + stepID
+	start := strings.Index(compiled, marker)
+	if start == -1 {
+		return ""
+	}
+	rest := compiled[start:]
+	next := strings.Index(rest[len(marker):], "\n      - name: ")
+	if next == -1 {
+		return rest
+	}
+	return rest[:len(marker)+next]
+}
+
+func compiledLastStepBlockForTest(compiled, stepID string) string {
+	marker := "id: " + stepID
+	start := strings.LastIndex(compiled, marker)
+	if start == -1 {
+		return ""
+	}
+	return compiledStepBlockForTest(compiled[start:], stepID)
 }
 
 func TestComputePermissionsForSafeOutputs_NoOpAndMissingTool(t *testing.T) {
@@ -782,6 +1217,26 @@ func TestComputePermissionsForSafeOutputs_Checkout(t *testing.T) {
 	}
 }
 
+func TestComputePermissionsForSafeOutputs_CheckoutDoesNotDowngradeContentsWrite(t *testing.T) {
+	// create-pull-request contributes contents: write; a checkout step in safe-outputs.steps
+	// must not downgrade that to contents: read.
+	safeOutputs := &SafeOutputsConfig{
+		CreatePullRequests: &CreatePullRequestsConfig{},
+		Steps: []any{
+			map[string]any{
+				"uses": "actions/checkout@v4",
+				"with": map[string]any{"repository": "example/target"},
+			},
+		},
+	}
+	permissions := ComputePermissionsForSafeOutputs(safeOutputs)
+	require.NotNil(t, permissions)
+
+	level, exists := permissions.Get(PermissionContents)
+	assert.True(t, exists, "Expected contents permission to be set")
+	assert.Equal(t, PermissionWrite, level, "Checkout auto-detection must not downgrade contents: write to contents: read")
+}
+
 func TestComputePermissionsForSafeOutputs_Staged(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -789,14 +1244,14 @@ func TestComputePermissionsForSafeOutputs_Staged(t *testing.T) {
 		expected    map[PermissionScope]PermissionLevel
 	}{
 		{
-			name: "global staged=true - no permissions for any handler",
+			name: "global staged=true - only discussion lookup permissions",
 			safeOutputs: &SafeOutputsConfig{
 				Staged:            templatableBoolPtr("true"),
 				CreateIssues:      &CreateIssuesConfig{},
 				CreateDiscussions: &CreateDiscussionsConfig{},
 				AddLabels:         &AddLabelsConfig{},
 			},
-			expected: map[PermissionScope]PermissionLevel{},
+			expected: map[PermissionScope]PermissionLevel{PermissionDiscussions: PermissionRead},
 		},
 		{
 			name: "per-handler staged=true - staged handler contributes no permissions",
@@ -813,7 +1268,7 @@ func TestComputePermissionsForSafeOutputs_Staged(t *testing.T) {
 			},
 		},
 		{
-			name: "all handlers per-handler staged - no permissions",
+			name: "all handlers per-handler staged - only discussion lookup permissions",
 			safeOutputs: &SafeOutputsConfig{
 				CreateIssues: &CreateIssuesConfig{
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: templatableBoolPtr("true")},
@@ -822,7 +1277,7 @@ func TestComputePermissionsForSafeOutputs_Staged(t *testing.T) {
 					BaseSafeOutputConfig: BaseSafeOutputConfig{Staged: templatableBoolPtr("true")},
 				},
 			},
-			expected: map[PermissionScope]PermissionLevel{},
+			expected: map[PermissionScope]PermissionLevel{PermissionDiscussions: PermissionRead},
 		},
 		{
 			name: "global staged=true overrides per-handler staged=false",
@@ -864,7 +1319,7 @@ func TestComputePermissionsForSafeOutputs_Staged(t *testing.T) {
 				CreatePullRequestReviewComments: &CreatePullRequestReviewCommentsConfig{},
 				SubmitPullRequestReview:         &SubmitPullRequestReviewConfig{},
 			},
-			expected: map[PermissionScope]PermissionLevel{},
+			expected: map[PermissionScope]PermissionLevel{PermissionPullRequests: PermissionRead},
 		},
 		{
 			name: "pr review operations - one staged, one not",
@@ -902,8 +1357,231 @@ func TestComputePermissionsForSafeOutputs_Staged(t *testing.T) {
 	}
 }
 
-// TestComputePermissionsForSafeOutputs_StagedYAMLRendering validates that fully-staged
-// safe output configurations produce explicit "permissions: {}" in YAML rendering,
+func TestComputePermissionsForSafeOutputs_StagedReads(t *testing.T) {
+	handlers := []struct {
+		key         string
+		unfiltered  map[PermissionScope]PermissionLevel
+		filterScope PermissionScope
+	}{
+		{key: "add-labels", filterScope: PermissionIssues},
+		{key: "remove-labels", filterScope: PermissionIssues},
+		{key: "update-issue", filterScope: PermissionIssues},
+		{key: "update-pull-request", filterScope: PermissionIssues},
+		{key: "assign-to-agent", filterScope: PermissionIssues},
+		{key: "assign-to-user", filterScope: PermissionIssues},
+		{key: "unassign-from-user", filterScope: PermissionIssues},
+		{key: "assign-milestone", unfiltered: map[PermissionScope]PermissionLevel{PermissionIssues: PermissionRead}},
+		{key: "add-reviewer", filterScope: PermissionIssues},
+		{key: "create-pull-request-review-comment", unfiltered: map[PermissionScope]PermissionLevel{PermissionPullRequests: PermissionRead}, filterScope: PermissionIssues},
+		{key: "reply-to-pull-request-review-comment", filterScope: PermissionIssues},
+		{key: "dismiss-pull-request-review", filterScope: PermissionIssues},
+		{key: "submit-pull-request-review", unfiltered: map[PermissionScope]PermissionLevel{PermissionPullRequests: PermissionRead}, filterScope: PermissionIssues},
+		{key: "set-issue-type", filterScope: PermissionIssues},
+		{key: "set-issue-field", filterScope: PermissionIssues},
+		{key: "close-issue", unfiltered: map[PermissionScope]PermissionLevel{PermissionIssues: PermissionRead}},
+		{key: "link-sub-issue", unfiltered: map[PermissionScope]PermissionLevel{PermissionIssues: PermissionRead}},
+		{key: "replace-label", unfiltered: map[PermissionScope]PermissionLevel{PermissionIssues: PermissionRead}},
+		{key: "close-pull-request", unfiltered: map[PermissionScope]PermissionLevel{PermissionPullRequests: PermissionRead}},
+		{key: "close-discussion", unfiltered: map[PermissionScope]PermissionLevel{PermissionDiscussions: PermissionRead}},
+		{key: "create-discussion", unfiltered: map[PermissionScope]PermissionLevel{PermissionDiscussions: PermissionRead}},
+		{key: "create-project-status-update", unfiltered: map[PermissionScope]PermissionLevel{PermissionOrganizationProj: PermissionRead}},
+		{key: "add-comment", unfiltered: map[PermissionScope]PermissionLevel{PermissionIssues: PermissionRead}, filterScope: PermissionIssues},
+		{key: "hide-comment", unfiltered: map[PermissionScope]PermissionLevel{PermissionIssues: PermissionRead, PermissionPullRequests: PermissionRead}},
+		{key: "resolve-pull-request-review-thread", unfiltered: map[PermissionScope]PermissionLevel{PermissionPullRequests: PermissionRead}, filterScope: PermissionIssues},
+		{key: "mark-pull-request-as-ready-for-review", unfiltered: map[PermissionScope]PermissionLevel{PermissionPullRequests: PermissionRead}, filterScope: PermissionIssues},
+		{key: "merge-pull-request", unfiltered: map[PermissionScope]PermissionLevel{
+			PermissionPullRequests: PermissionRead, PermissionContents: PermissionRead, PermissionChecks: PermissionRead, PermissionAdministration: PermissionRead,
+		}},
+	}
+	filters := []struct {
+		name   string
+		config map[string]any
+	}{
+		{name: "no filters", config: map[string]any{}},
+		{name: "required labels", config: map[string]any{"required-labels": []any{"needs-triage"}}},
+		{name: "required title prefix", config: map[string]any{"required-title-prefix": "[triage]"}},
+	}
+	for _, handler := range handlers {
+		for _, filter := range filters {
+			for _, globalStaged := range []bool{true, false} {
+				staging := "per-handler staged"
+				if globalStaged {
+					staging = "globally staged"
+				}
+				t.Run(handler.key+"/"+filter.name+"/"+staging, func(t *testing.T) {
+					safeOutputs := SafeOutputsConfigFromKeys([]string{handler.key})
+					descriptor, ok := getSafeOutputHandlerByKey(handler.key)
+					require.True(t, ok)
+					field, ok := safeOutputPointerFieldValue(safeOutputs, descriptor.StructField)
+					require.True(t, ok)
+					if globalStaged {
+						safeOutputs.Staged = templatableBoolPtr("true")
+					} else {
+						field.Elem().FieldByName("Staged").Set(reflect.ValueOf(templatableBoolPtr("true")))
+					}
+					filterConfigured := false
+					if labels := field.Elem().FieldByName("RequiredLabels"); labels.IsValid() && filter.config["required-labels"] != nil {
+						labels.Set(reflect.ValueOf([]string{"needs-triage"}))
+						filterConfigured = true
+					}
+					if title := field.Elem().FieldByName("RequiredTitlePrefix"); title.IsValid() && filter.config["required-title-prefix"] != nil {
+						title.SetString("[triage]")
+						filterConfigured = true
+					}
+					expected := map[PermissionScope]PermissionLevel{}
+					maps.Copy(expected, handler.unfiltered)
+					if filterConfigured && handler.filterScope != "" {
+						expected[handler.filterScope] = PermissionRead
+					}
+					permissions := ComputePermissionsForSafeOutputs(safeOutputs)
+					assert.Equal(t, expected, permissions.permissions)
+					appPermissions := computeSafeOutputHandlerPermissions(safeOutputs, descriptor)
+					if len(expected) == 0 {
+						assert.Nil(t, appPermissions)
+					} else {
+						require.NotNil(t, appPermissions)
+						assert.Equal(t, expected, appPermissions.permissions)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestComputePermissionsForSafeOutputs_StagedReadsPreserveWrite(t *testing.T) {
+	safeOutputs := &SafeOutputsConfig{
+		CreateIssues: &CreateIssuesConfig{},
+		RemoveLabels: &RemoveLabelsConfig{
+			BaseSafeOutputConfig:   BaseSafeOutputConfig{Staged: templatableBoolPtr("true")},
+			SafeOutputFilterConfig: SafeOutputFilterConfig{RequiredLabels: []string{"needs-triage"}},
+		},
+	}
+	assert.Equal(t, map[PermissionScope]PermissionLevel{PermissionIssues: PermissionWrite},
+		ComputePermissionsForSafeOutputs(safeOutputs).permissions)
+}
+
+func TestComputePermissionsForSafeOutputs_StagedAddCommentDiscussionOnly(t *testing.T) {
+	for _, globalStaged := range []bool{true, false} {
+		safeOutputs := &SafeOutputsConfig{
+			AddComments: &AddCommentsConfig{
+				SafeOutputFilterConfig: SafeOutputFilterConfig{
+					RequiredLabels:      []string{"needs-triage"},
+					RequiredTitlePrefix: "[triage]",
+				},
+				Issues:       ptrBool(false),
+				PullRequests: ptrBool(false),
+				Discussions:  ptrBool(true),
+			},
+		}
+		if globalStaged {
+			safeOutputs.Staged = templatableBoolPtr("true")
+		} else {
+			safeOutputs.AddComments.Staged = templatableBoolPtr("true")
+		}
+		assert.Empty(t, ComputePermissionsForSafeOutputs(safeOutputs).permissions)
+		handler, ok := getSafeOutputHandlerByKey("add-comment")
+		require.True(t, ok)
+		assert.Nil(t, computeSafeOutputHandlerPermissions(safeOutputs, handler))
+	}
+}
+
+func TestCompileStagedHandlerReadPermissions(t *testing.T) {
+	handlers := []struct {
+		key    string
+		config string
+		scopes []PermissionScope
+	}{
+		{key: "remove-labels", config: "    allowed: [needs-triage]\n    required-labels: [needs-triage]\n", scopes: []PermissionScope{PermissionIssues}},
+		{key: "set-issue-type", config: "    required-labels: [needs-triage]\n    required-title-prefix: '[triage]'\n", scopes: []PermissionScope{PermissionIssues}},
+		{key: "add-comment", config: "    required-labels: [needs-triage]\n", scopes: []PermissionScope{PermissionIssues}},
+		{key: "create-discussion", config: "    category: General\n", scopes: []PermissionScope{PermissionDiscussions}},
+		{key: "create-project-status-update", config: "    project: https://github.com/orgs/test-org/projects/1\n", scopes: []PermissionScope{PermissionOrganizationProj}},
+		{key: "create-pull-request-review-comment", scopes: []PermissionScope{PermissionPullRequests}},
+		{key: "submit-pull-request-review", scopes: []PermissionScope{PermissionPullRequests}},
+		{key: "hide-comment", scopes: []PermissionScope{PermissionIssues, PermissionPullRequests}},
+		{key: "hide-comment", config: "    discussions: true\n", scopes: []PermissionScope{PermissionIssues, PermissionPullRequests, PermissionDiscussions}},
+	}
+	for _, handler := range handlers {
+		for _, app := range []string{"", "global", "per-handler"} {
+			if handler.key == "hide-comment" && app == "per-handler" {
+				continue // hide-comment does not expose per-handler github-app configuration.
+			}
+			for _, globalStaged := range []bool{true, false} {
+				staging := "per-handler"
+				if globalStaged {
+					staging = "global"
+				}
+				t.Run(handler.key+"/"+app+"/"+staging, func(t *testing.T) {
+					appConfig := "github-app:\n      app-id: ${{ vars.APP_ID }}\n      private-key: ${{ secrets.APP_PRIVATE_KEY }}\n"
+					globalApp, handlerApp := "", ""
+					switch app {
+					case "global":
+						globalApp = "  " + strings.ReplaceAll(appConfig, "\n      ", "\n    ")
+					case "per-handler":
+						handlerApp = "    " + appConfig
+					}
+					globalFlag, handlerFlag := "", "    staged: true\n"
+					if globalStaged {
+						globalFlag, handlerFlag = "  staged: true\n", ""
+					}
+					content := "---\non: issues\nengine: copilot\nsafe-outputs:\n  missing-tool: false\n  missing-data: false\n  report-incomplete: false\n" + globalFlag +
+						globalApp + "  " + handler.key + ":\n" + handler.config + handlerFlag +
+						handlerApp + "---\n\nTest workflow.\n"
+					testFile := filepath.Join(t.TempDir(), "staged-handler.md")
+					require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
+					compiler := NewCompiler(WithVersion("1.0.0"))
+					data, err := compiler.ParseWorkflowFile(testFile)
+					require.NoError(t, err)
+					if app == "per-handler" {
+						descriptor, ok := getSafeOutputHandlerByKey(handler.key)
+						require.True(t, ok)
+						require.NotNil(t, getHandlerGitHubApp(data.SafeOutputs, descriptor.StructField))
+					}
+					compiled, _, _, err := compiler.generateYAML(data, testFile)
+					require.NoError(t, err)
+					job := extractJobSection(compiled, "safe_outputs")
+					assert.Contains(t, job, "id: process_safe_outputs")
+					for _, scope := range handler.scopes {
+						if scope != PermissionOrganizationProj {
+							assert.Contains(t, job, string(scope)+": read")
+						}
+					}
+					assert.NotContains(t, job, ": write")
+					if handler.key == "set-issue-type" {
+						config := extractHandlerConfig(t, compiled)["set_issue_type"]
+						assert.Equal(t, []any{"needs-triage"}, config["required_labels"])
+						assert.Equal(t, "[triage]", config["required_title_prefix"])
+					}
+					if app != "" {
+						stepID := "safe-outputs-app-token"
+						if app == "per-handler" {
+							stepID = handler.key + "-app-token"
+						}
+						step := compiledStepBlockForTest(job, stepID)
+						require.NotEmpty(t, step)
+						for _, scope := range handler.scopes {
+							assert.Contains(t, step, "permission-"+string(scope)+": read")
+						}
+						assert.NotContains(t, step, ": write")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCompileHideCommentRejectsUnsupportedFilters(t *testing.T) {
+	for _, filter := range []string{"required-labels: [needs-triage]", "required-title-prefix: '[triage]'"} {
+		testFile := filepath.Join(t.TempDir(), "hide-comment.md")
+		content := "---\non: issues\nsafe-outputs:\n  hide-comment:\n    " + filter + "\n---\n\nTest workflow.\n"
+		require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
+		_, err := NewCompiler().ParseWorkflowFile(testFile)
+		require.ErrorContains(t, err, "Unknown property")
+	}
+}
+
+// TestComputePermissionsForSafeOutputs_StagedYAMLRendering validates that staged
+// safe output configurations without reads produce explicit "permissions: {}" in YAML rendering,
 // rather than an empty string that would cause the job to inherit workflow-level permissions.
 func TestComputePermissionsForSafeOutputs_StagedYAMLRendering(t *testing.T) {
 	tests := []struct {
@@ -946,4 +1624,144 @@ func TestComputePermissionsForSafeOutputs_StagedYAMLRendering(t *testing.T) {
 			assert.Equal(t, tt.expectedRendered, rendered, "Fully-staged safe-outputs must render explicit empty permissions block")
 		})
 	}
+}
+
+func TestValidateAddLabelsPermissions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		safeOutputs *SafeOutputsConfig
+		wantErr     bool
+	}{
+		{
+			name:        "nil config - no error",
+			safeOutputs: nil,
+			wantErr:     false,
+		},
+		{
+			name: "add-labels not configured - no error",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			wantErr: false,
+		},
+		{
+			name: "both nil (defaults) - no error",
+			safeOutputs: &SafeOutputsConfig{
+				AddLabels: &AddLabelsConfig{},
+			},
+			wantErr: false,
+		},
+		{
+			name: "issues:false, pull-requests:true - no error",
+			safeOutputs: &SafeOutputsConfig{
+				AddLabels: &AddLabelsConfig{Issues: ptrBool(false), PullRequests: ptrBool(true)},
+			},
+			wantErr: false,
+		},
+		{
+			name: "issues:true, pull-requests:false - no error",
+			safeOutputs: &SafeOutputsConfig{
+				AddLabels: &AddLabelsConfig{Issues: ptrBool(true), PullRequests: ptrBool(false)},
+			},
+			wantErr: false,
+		},
+		{
+			name: "both issues:false and pull-requests:false - error",
+			safeOutputs: &SafeOutputsConfig{
+				AddLabels: &AddLabelsConfig{Issues: ptrBool(false), PullRequests: ptrBool(false)},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateAddLabelsPermissions(tt.safeOutputs)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "at least one of 'issues' or 'pull-requests' must be enabled")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateRemoveLabelsPermissions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		safeOutputs *SafeOutputsConfig
+		wantErr     bool
+	}{
+		{name: "nil config - no error", safeOutputs: nil},
+		{
+			name:        "both nil (defaults) - no error",
+			safeOutputs: &SafeOutputsConfig{RemoveLabels: &RemoveLabelsConfig{}},
+		},
+		{
+			name:        "issues:false, pull-requests:true - no error",
+			safeOutputs: &SafeOutputsConfig{RemoveLabels: &RemoveLabelsConfig{Issues: ptrBool(false), PullRequests: ptrBool(true)}},
+		},
+		{
+			name:        "issues:true, pull-requests:false - no error",
+			safeOutputs: &SafeOutputsConfig{RemoveLabels: &RemoveLabelsConfig{Issues: ptrBool(true), PullRequests: ptrBool(false)}},
+		},
+		{
+			name:        "both issues:false and pull-requests:false - error",
+			safeOutputs: &SafeOutputsConfig{RemoveLabels: &RemoveLabelsConfig{Issues: ptrBool(false), PullRequests: ptrBool(false)}},
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateRemoveLabelsPermissions(tt.safeOutputs)
+			if tt.wantErr {
+				require.ErrorContains(t, err, "safe-outputs.remove-labels: at least one of 'issues' or 'pull-requests' must be enabled")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestCompileRemoveLabelsRejectsAllPermissionsDisabled(t *testing.T) {
+	t.Parallel()
+	testFile := filepath.Join(t.TempDir(), "test.md")
+	content := `---
+on: issues
+strict: false
+safe-outputs:
+  remove-labels:
+    issues: false
+    pull-requests: false
+---
+Test workflow
+`
+	require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
+
+	err := NewCompiler(WithVersion("1.0.0")).CompileWorkflow(testFile)
+	require.ErrorContains(t, err, "safe-outputs.remove-labels: at least one of 'issues' or 'pull-requests' must be enabled")
+}
+
+func TestCompileRemoveLabelsRejectsMalformedPermissionsConfig(t *testing.T) {
+	t.Parallel()
+	testFile := filepath.Join(t.TempDir(), "test.md")
+	content := `---
+on: issues
+strict: false
+safe-outputs:
+  remove-labels:
+    pull-requests: nope
+---
+Test workflow
+`
+	require.NoError(t, os.WriteFile(testFile, []byte(content), 0600))
+
+	err := NewCompiler(WithVersion("1.0.0")).CompileWorkflow(testFile)
+	require.ErrorContains(t, err, "expected null or boolean")
 }

@@ -3,7 +3,8 @@ private: true
 emoji: "🧪"
 name: Smoke Temporary ID
 description: Test temporary ID functionality for issue chaining and cross-references
-on: 
+on:
+  schedule: every 2 days
   slash_command:
     name: smoke-temporary-id
     strategy: centralized
@@ -16,10 +17,12 @@ on:
   reaction: "eyes"
   status-comment: true
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
-engine: copilot
+engine: pi
+model: copilot/gpt-5
 strict: true
 network:
   allowed:
@@ -37,6 +40,7 @@ safe-outputs:
   link-sub-issue:
     max: 3
   add-comment:
+    target: "*"
     max: 2
     hide-older-comments: true
   messages:
@@ -49,6 +53,7 @@ timeout-minutes: 10
 imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
 experiments:
@@ -56,7 +61,7 @@ experiments:
     variants: [single_agent, sub_agents]
     description: "Test whether decomposing issue creation into sub-agents reduces cost"
     hypothesis: "H0: no change in AI credit count. H1: sub-agents reduce AI credit count by 15-25% and improve success rate."
-    metric: effective_token_count
+    metric: aic
     secondary_metrics: [run_duration_seconds, issue_creation_success_rate]
     guardrail_metrics:
       - name: all_issues_created
@@ -74,6 +79,9 @@ evals:
   - id: sub_agent_strategy_goal_met
     question: Does the agent output show that the objective for experiment sub_agent_strategy was successfully completed?
 
+sandbox:
+  agent:
+    id: awf
 ---
 
 # Smoke Test: Temporary ID Functionality
@@ -170,7 +178,7 @@ Regardless of strategy, add a comment to the parent issue summarizing test resul
 ```json
 {
   "type": "add_comment",
-  "issue_number": "aw_test01",
+  "item_number": "aw_test01",
   "body": "## Test Results\n\n✅ Parent issue created with temporary ID `aw_test01`\n✅ Sub-issue 1 created with temporary ID `aw_test02` and linked to parent\n✅ Sub-issue 2 created with temporary ID `aw_test03` and linked to parent\n✅ Cross-references resolved correctly\n\n**Validation**: Check that:\n1. All temporary ID references (#aw_*) in issue bodies are replaced with actual issue numbers (#123)\n2. Sub-issues show parent relationship in GitHub UI\n3. Parent issue shows sub-issues in task list\n\nTemporary ID format validated: `aw_[A-Za-z0-9]{3,8}`"
 }
 ```

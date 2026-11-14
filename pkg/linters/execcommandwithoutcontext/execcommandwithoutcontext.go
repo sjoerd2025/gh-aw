@@ -7,12 +7,11 @@ package execcommandwithoutcontext
 import (
 	"fmt"
 	"go/ast"
-	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
@@ -22,26 +21,17 @@ import (
 var pkgLog = logger.New("linters:execcommandwithoutcontext")
 
 // Analyzer is the exec-command-without-context analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "execcommandwithoutcontext",
-	Doc:      "reports exec.Command calls inside context-receiving functions where exec.CommandContext should be used to propagate cancellation",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/execcommandwithoutcontext",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("execcommandwithoutcontext", "reports exec.Command calls inside context-receiving functions where exec.CommandContext should be used to propagate cancellation", run)
 
 func run(pass *analysis.Pass) (any, error) {
-	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
-
 	insp, err := astutil.Inspector(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -84,11 +74,9 @@ func checkExecCommandCall(pass *analysis.Pass, cur inspector.Cursor, generatedFi
 			continue
 		}
 		pkgLog.Printf("flagging exec.Command without context at %s", pos)
-		pass.Report(analysis.Diagnostic{
-			Pos:     call.Pos(),
-			End:     call.End(),
-			Message: fmt.Sprintf("use exec.CommandContext(%s, ...) instead of exec.Command to propagate context cancellation", ctxParamName),
-			SuggestedFixes: []analysis.SuggestedFix{
+		var fixes []analysis.SuggestedFix
+		if !astutil.HasOverlappingComment(pass.Files, call.Pos(), call.End()) {
+			fixes = []analysis.SuggestedFix{
 				{
 					Message: fmt.Sprintf("Replace exec.Command with exec.CommandContext(%s, ...)", ctxParamName),
 					TextEdits: []analysis.TextEdit{
@@ -104,32 +92,27 @@ func checkExecCommandCall(pass *analysis.Pass, cur inspector.Cursor, generatedFi
 						},
 					},
 				},
-			},
+			}
+		}
+		pass.Report(analysis.Diagnostic{
+			Pos:            call.Pos(),
+			End:            call.End(),
+			Message:        fmt.Sprintf("use exec.CommandContext(%s, ...) instead of exec.Command to propagate context cancellation", ctxParamName),
+			SuggestedFixes: fixes,
 		})
 		break
 	}
 }
 
 // execCommandSelector reports the selector expression for calls to
-// exec.Command from os/exec.
+// exec.Command from os/exec. A parenthesized callee such as
+// (exec.Command)(name) is also recognized.
 func execCommandSelector(pass *analysis.Pass, call *ast.CallExpr) (*ast.SelectorExpr, bool) {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Command" {
 		return nil, false
 	}
-	ident, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return nil, false
-	}
-	obj := pass.TypesInfo.ObjectOf(ident)
-	if obj == nil {
-		return nil, false
-	}
-	pkgName, ok := obj.(*types.PkgName)
-	if !ok {
-		return nil, false
-	}
-	if pkgName.Imported().Path() != "os/exec" {
+	if !astutil.IsPkgSelector(pass, sel, "os/exec") {
 		return nil, false
 	}
 	return sel, true

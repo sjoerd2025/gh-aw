@@ -7,7 +7,82 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/github/gh-aw/pkg/parser"
+	"github.com/stretchr/testify/require"
 )
+
+func TestProcessImportsWithWorkflowSpec_PreservesFormatting(t *testing.T) {
+	localDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(localDir, "local.md"), []byte("# Local\n"), 0644))
+	workflow := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: "v1"},
+		WorkflowPath: ".github/workflows/test.md",
+	}
+	for _, tt := range []struct {
+		name    string
+		imports string
+		rewrite bool
+	}{
+		{"unchanged", "  - local.md # keep local\n  - uses: other/repo/shared.md@abc123 # pinned", false},
+		{"plain", "  - shared/config.md # shared/config.md stays in this comment", true},
+		{"single quoted", "  - 'shared/config.md' # keep quotes", true},
+		{"double quoted", "  - \"shared/config.md\" # keep quotes", true},
+		{"uses", "  - uses: shared/config.md # explanation\n    with:\n      path: shared/config.md", true},
+		{"path", "  - path: shared/config.md\n    inputs:\n      value: shared/config.md", true},
+		{"aw", "  aw:\n    - shared/config.md # explanation\n  other: [shared/config.md]", true},
+		{"flow", "  [shared/config.md, 'shared/config.md'] # keep flow style", true},
+		{"unrelated anchor", "  - shared/config.md\n  - uses: other/repo/shared.md@abc123\n    with:\n      value: *config", true},
+		{"unicode columns", "  [{with: {label: café}, uses: shared/config.md}]", true},
+		{"mixed", "  - local.md # keep local\n  - shared/config.md # rewrite only this\n  - uses: other/repo/shared.md@abc123 # pinned", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "---\n# Keep field order\nengine: copilot\non: workflow_dispatch # trigger\nconfig: &config shared/config.md\nimports:\n" +
+				tt.imports + "\n# Keep this too\npermissions: {contents: read}\n---\n\n# Test\n\n  Body stays unchanged.  \n"
+			expected := content
+			if tt.rewrite {
+				start := strings.Index(content, "imports:\n")
+				prefix, rest := content[:start], content[start:]
+				count := 1
+				if tt.name == "flow" {
+					count = 2
+				}
+				expected = prefix + strings.Replace(rest, "shared/config.md", "owner/repo/.github/workflows/shared/config.md@sha", count)
+			}
+			for _, newline := range []string{"\n", "\r\n"} {
+				actual, err := processImportsWithWorkflowSpec(strings.ReplaceAll(content, "\n", newline), workflow, "sha", localDir, false)
+				require.NoError(t, err)
+				require.Equal(t, strings.ReplaceAll(expected, "\n", newline), actual)
+			}
+		})
+	}
+}
+
+func TestProcessImportsWithWorkflowSpec_FormattingFallback(t *testing.T) {
+	workflow := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: "v1"},
+		WorkflowPath: ".github/workflows/test.md",
+	}
+	for _, imports := range []string{
+		"  - >-\n    shared/config.md",
+		"  - &shared shared/config.md\n  - *shared",
+		"  - shared/config.md\n  - <<: {uses: shared/config.md}",
+	} {
+		t.Run(imports, func(t *testing.T) {
+			content := "---\nimports:\n" + imports + "\n---\n\n# Test\n"
+			actual, err := processImportsWithWorkflowSpec(content, workflow, "sha", "", false)
+			require.NoError(t, err)
+			parsed, err := parser.ExtractFrontmatterFromContent(actual)
+			require.NoError(t, err)
+			for _, entry := range parsed.Frontmatter["imports"].([]any) {
+				if object, ok := entry.(map[string]any); ok {
+					entry = object["uses"]
+				}
+				require.Equal(t, "owner/repo/.github/workflows/shared/config.md@sha", entry)
+			}
+		})
+	}
+}
 
 func TestProcessIncludesWithWorkflowSpec_NewSyntax(t *testing.T) {
 	// Test with new {{#import}} syntax
@@ -794,6 +869,61 @@ Test content.
 	}
 }
 
+// TestProcessImportsWithWorkflowSpec_ObjectFormPreserved tests that object-form
+// import entries (using "uses"/"with" or "path"/"inputs") are preserved rather
+// than silently dropped when the imports field is rewritten to workflowspec
+// format. This is a regression test for: gh aw update replaces valid workflow
+// imports with `imports: []` when the only entries are object-form.
+func TestProcessImportsWithWorkflowSpec_ObjectFormPreserved(t *testing.T) {
+	content := `---
+engine: copilot
+imports:
+  - uses: shared/control.md
+    with:
+      role: orchestrator
+      rollout_mode: ${{ vars.CENTRAL_AGENTIC_OPS_DEPENDABOT_MODE || 'preview' }}
+      review_repo: ${{ vars.CENTRAL_AGENTIC_OPS_DEPENDABOT_REVIEW_REPO || '' }}
+---
+
+# Test Workflow
+
+Test content.
+`
+
+	workflow := &WorkflowSpec{
+		RepoSpec: RepoSpec{
+			RepoSlug: "github/gh-aw",
+			Version:  "main",
+		},
+		WorkflowPath: ".github/workflows/dependabot.md",
+	}
+
+	commitSHA := "abc123def456"
+
+	result, err := processImportsWithWorkflowSpec(content, workflow, commitSHA, "", false)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	// The imports field must NOT be replaced with an empty array.
+	if strings.Contains(result, "imports: []") {
+		t.Fatalf("Expected imports to be preserved, but got empty imports array:\n%s", result)
+	}
+
+	// The uses path should be rewritten to workflowspec format.
+	expectedUses := "uses: github/gh-aw/.github/workflows/shared/control.md@abc123def456"
+	if !strings.Contains(result, expectedUses) {
+		t.Errorf("Expected result to contain '%s'\nGot:\n%s", expectedUses, result)
+	}
+
+	// The "with" subfields must be preserved.
+	for _, expected := range []string{"role: orchestrator", "rollout_mode:", "review_repo:"} {
+		if !strings.Contains(result, expected) {
+			t.Errorf("Expected result to contain '%s'\nGot:\n%s", expected, result)
+		}
+	}
+}
+
 // TestProcessImportsWithWorkflowSpec_PreservesLocalRelativePaths tests that when
 // localWorkflowDir is provided and import files exist on disk, the relative paths
 // are kept as-is and NOT rewritten to cross-repo workflowspec references.
@@ -847,6 +977,68 @@ imports:
 	// Cross-repo refs must NOT appear
 	if strings.Contains(result, "github/identity-core") {
 		t.Errorf("Cross-repo ref should NOT appear when local file exists, got:\n%s", result)
+	}
+}
+
+func TestProcessImportsWithWorkflowSpec_UnchangedImportsPreserveFormatting(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "shared"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "shared/local.md"), []byte("# Local\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	workflow := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "owner/repo"},
+		WorkflowPath: ".github/workflows/test.md",
+	}
+	for _, tt := range []struct {
+		name    string
+		imports string
+	}{
+		{"local list", "  - shared/local.md\n  - owner/repo/shared/remote.md@abc123\n"},
+		{"object form", "  aw:\n    - uses: shared/local.md\n      with:\n        role: reviewer\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "---\n# Keep this setup note\nname: Example\nimports:\n" + tt.imports +
+				"description: |\n  Keep this block's indentation.\n# Optional import:\n#   - shared/optional.md\n---\n\n# Body\n"
+			got, err := processImportsWithWorkflowSpec(content, workflow, "abc123", dir, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != content {
+				t.Errorf("unchanged imports must preserve the workflow byte-for-byte:\nwant:\n%s\ngot:\n%s", content, got)
+			}
+		})
+	}
+}
+
+func TestProcessImportsWithWorkflowSpec_RewritePreservesUnrelatedFrontmatter(t *testing.T) {
+	content := `---
+# Keep this setup note
+description: |
+  Preserve this block's indentation.
+name: Example
+imports:
+  - shared/team-config.md
+engine: copilot
+---
+
+# Body
+`
+	workflow := &WorkflowSpec{
+		RepoSpec:     RepoSpec{RepoSlug: "owner/repo", Version: "v1"},
+		WorkflowPath: ".github/workflows/example.md",
+	}
+
+	got, err := processImportsWithWorkflowSpec(content, workflow, "v1", t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(content, "shared/team-config.md", "owner/repo/.github/workflows/shared/team-config.md@v1", 1)
+	if got != want {
+		t.Errorf("rewriting an import must preserve unrelated frontmatter formatting:\nwant:\n%s\ngot:\n%s", want, got)
 	}
 }
 

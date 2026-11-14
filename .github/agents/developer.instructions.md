@@ -5,7 +5,45 @@ applyTo: "**/*"
 
 # Developer Instructions
 
-Guidelines, patterns, and standards for GitHub Agentic Workflows.
+Use for gh-aw code changes. Load the relevant local skill before implementation;
+the sections below are detailed reference, not mandatory startup context.
+
+## Execution contract
+
+1. Inspect existing patterns; keep changes scoped and preserve behavior.
+2. Load `.github/skills/developer/SKILL.md` for validation and capitalization.
+   Run `make fmt` after Go changes; use focused tests while iterating.
+   Before intermediate saves run `make agent-report-progress-no-test`; before
+   the final save run `make agent-report-progress` once, then commit/push.
+3. Use these `.github/skills/<name>/SKILL.md` references by task:
+   `developer-code-organization` for file boundaries, engine separation, WASM
+   stubs and strings; `developer-internals` for validation, YAML, schemas,
+   messages and MCP logs; `developer-security` for injection, shell and supply
+   chain; `developer-release` for changesets and breaking CLI changes.
+4. Put tests beside implementation. Reuse shared helpers; preserve schema,
+   engine and safe-output contracts. Never move agent writes into conclusion.
+5. For console output load `console-rendering`; for error wording load
+   `error-messages`; for recovery load `error-recovery-patterns`.
+6. For workflow changes load `agentic-workflows`; run `make recompile` after
+   workflow Markdown edits and include generated locks. Never dispatch for
+   validation without the explicit authorization and live gates in
+   `.github/aw/debug-agentic-workflow.md`.
+7. For instruction/skill edits load `prompt-token-efficiency`: pack objective,
+   constraints, routes, verification and stop conditions within 7,500 UTF-8
+   bytes, including metadata. Run `make check-instruction-prefixes`.
+8. Before a PR, search closed attempts with 2-4 topic keywords. Inspect prior
+   descriptions, reviews, timelines and closure causes before repeating work;
+   include links, causes and differences in `## Prior Attempts`. With two or
+   more closed PRs on the topic, never open a third without human review:
+   summarize on the originating issue, apply `copilot-retry-blocked`, and wait
+   for maintainer approval or label removal.
+9. Report failures and unavailable checks explicitly. Passing compilation is
+   not proof of runtime behavior; do not broaden permissions to force success.
+10. For complex requests, specify input path/format, trigger, success threshold,
+    output destination and scope. Release changes use the linked release skill;
+    never merge changes to the reusable `.github/workflows/dev.md` harness.
+
+<!-- instruction-prefix-end -->
 
 ---
 
@@ -55,25 +93,7 @@ graph TD
 
 Validates workflow configs before compilation. Centralized in `validation.go`, or domain-specific in dedicated files.
 
-### Validation Flow
-
-```mermaid
-graph TD
-    A[Workflow YAML] --> B[Parser]
-    B --> C[Validation System]
-    C --> D[Centralized Validation]
-    C --> E[Domain-Specific Validation]
-    D --> F[validation.go]
-    E --> G[strict_mode_validation.go]
-    E --> H[pip.go]
-    E --> I[npm.go]
-    F --> J{Valid?}
-    G --> J
-    H --> J
-    I --> J
-    J -->|Yes| K[Compiler]
-    J -->|No| L[Error Report]
-```
+Workflow YAML → parser → validation (centralized + domain-specific) → compiler on pass, error report on fail.
 
 ### Centralized Validation: `pkg/workflow/validation.go`
 
@@ -142,20 +162,6 @@ graph TD
 ## String Processing
 
 ### Sanitize vs Normalize
-
-```mermaid
-graph TD
-    A[Need String Processing?] --> B{Security Concern?}
-    B -->|Yes| C[Sanitize]
-    B -->|No| D{Consistency Needed?}
-    C --> E[sanitizeGitHubLabel]
-    C --> F[sanitizeGitHubBranch]
-    C --> G[sanitizeGitHubIssueTitle]
-    D -->|Yes| H[Normalize]
-    D -->|No| I[Use As-Is]
-    H --> J[normalizeWhitespace]
-    H --> K[normalizeLineEndings]
-```
 
 **Sanitize** — fix chars that break security or GitHub API:
 - `sanitizeGitHubLabel()` — label requirements (no emoji, length limits)
@@ -229,17 +235,6 @@ safe_outputs:
 ---
 
 ## Custom GitHub Actions
-
-### Architecture
-
-```mermaid
-graph LR
-    MD[Workflow .md] --> Compiler
-    Compiler --> YAML[.lock.yml]
-    YAML --> GHA[GitHub Actions Runner]
-    GHA --> Actions[Custom Actions]
-    Actions --> API[GitHub API]
-```
 
 ### Build System
 
@@ -335,20 +330,6 @@ make update-golden  # only when intentionally changing output
 
 Persistent, git-backed storage across workflow runs. State lives in dedicated git branches with auto-sync.
 
-### Architecture Overview
-
-```mermaid
-graph TD
-    A[Agent Job Start] --> B[Clone memory/{id} branch]
-    B --> C[Agent reads/writes files]
-    C --> D[Upload artifact: repo-memory-{id}]
-    D --> E[Push Repo Memory Job]
-    E --> F[Download artifact]
-    F --> G[Validate files]
-    G --> H[Commit to memory/{id}]
-    H --> I[Push to repository]
-```
-
 ### Path Conventions
 
 | Pattern | Format | Example | Purpose |
@@ -359,10 +340,10 @@ graph TD
 
 ### Data Flow
 
-1. Clone `memory/{id}` branch
+1. Agent job clones `memory/{id}` branch
 2. Agent reads/writes files
-3. Upload directory as artifact
-4. Download artifact, validate constraints
+3. Upload directory as artifact `repo-memory-{id}`
+4. Push Repo Memory job downloads artifact, validates constraints
 5. Commit and push to `memory/{id}`
 
 ### Key Configuration

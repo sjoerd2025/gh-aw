@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -21,15 +22,31 @@ var auditExpandedLog = logger.New("cli:audit_expanded")
 
 // AuditEngineConfig represents the engine configuration extracted from aw_info.json
 type AuditEngineConfig struct {
-	EngineID        string   `json:"engine_id" console:"header:Engine ID"`
-	EngineName      string   `json:"engine_name,omitempty" console:"header:Engine Name,omitempty"`
-	Model           string   `json:"model,omitempty" console:"header:Model,omitempty"`
-	Version         string   `json:"version,omitempty" console:"header:Version,omitempty"`
-	CLIVersion      string   `json:"cli_version,omitempty" console:"header:CLI Version,omitempty"`
-	FirewallVersion string   `json:"firewall_version,omitempty" console:"header:Firewall Version,omitempty"`
-	MCPServers      []string `json:"mcp_servers,omitempty"`
-	TriggerEvent    string   `json:"trigger_event,omitempty" console:"header:Trigger Event,omitempty"`
-	Repository      string   `json:"repository,omitempty" console:"header:Repository,omitempty"`
+	EngineID           string                      `json:"engine_id" console:"header:Engine ID"`
+	EngineName         string                      `json:"engine_name,omitempty" console:"header:Engine Name,omitempty"`
+	Model              string                      `json:"model,omitempty" console:"header:Model,omitempty"`
+	RequestedModel     string                      `json:"requested_model,omitempty" console:"header:Requested Model,omitempty"`
+	ModelEffort        string                      `json:"model_effort,omitempty" console:"header:Model Effort,omitempty"`
+	ModelRoutingStatus string                      `json:"model_routing_status,omitempty" console:"header:Model Routing,omitempty"`
+	HarnessOutcome     *AuditHarnessRoutingOutcome `json:"harness_outcome,omitempty" console:"header:Harness Outcome,omitempty"`
+	RoutingWarning     string                      `json:"routing_warning,omitempty" console:"header:Routing Warning,omitempty"`
+	Version            string                      `json:"version,omitempty" console:"header:Version,omitempty"`
+	CLIVersion         string                      `json:"cli_version,omitempty" console:"header:CLI Version,omitempty"`
+	FirewallVersion    string                      `json:"firewall_version,omitempty" console:"header:Firewall Version,omitempty"`
+	MCPServers         []string                    `json:"mcp_servers,omitempty"`
+	TriggerEvent       string                      `json:"trigger_event,omitempty" console:"header:Trigger Event,omitempty"`
+	Repository         string                      `json:"repository,omitempty" console:"header:Repository,omitempty"`
+	DryRun             bool                        `json:"dry_run" console:"header:Dry Run"`
+}
+
+type AuditHarnessRoutingOutcome struct {
+	Status            string `json:"status,omitempty"`
+	WireModel         string `json:"wire_model,omitempty"`
+	EffectiveEndpoint string `json:"effective_endpoint,omitempty"`
+	SelectedEndpoint  string `json:"selected_endpoint,omitempty"`
+	Effort            string `json:"effort,omitempty"`
+	AppliedEffort     string `json:"applied_effort,omitempty"`
+	FailureCode       string `json:"failure_code,omitempty"`
 }
 
 // PromptAnalysis represents analysis of the input prompt
@@ -88,14 +105,65 @@ type MCPServerHealth struct {
 
 // MCPServerHealthDetail represents health details for a single MCP server
 type MCPServerHealthDetail struct {
-	ServerName   string  `json:"server_name" console:"header:Server"`
+	MCPServerStatsBase
 	RequestCount int     `json:"request_count" console:"header:Requests"`
-	ToolCalls    int     `json:"tool_calls" console:"header:Tool Calls"`
-	ErrorCount   int     `json:"error_count" console:"header:Errors"`
-	ErrorRate    float64 `json:"error_rate"`
+	ErrorRate    float64 `json:"error_rate"` // Percentage (0–100)
 	ErrorRateStr string  `json:"error_rate_str" console:"header:Error Rate"`
 	AvgLatency   string  `json:"avg_latency" console:"header:Avg Latency"`
 	Status       string  `json:"status" console:"header:Status"`
+}
+
+// MarshalJSON preserves the MCP server health detail JSON schema while sharing the
+// per-server stat fields with the other MCP server report types.
+func (d MCPServerHealthDetail) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ServerName   string  `json:"server_name"`
+		RequestCount int     `json:"request_count"`
+		ToolCalls    int     `json:"tool_calls"`
+		ErrorCount   int     `json:"error_count"`
+		ErrorRate    float64 `json:"error_rate"`
+		ErrorRateStr string  `json:"error_rate_str"`
+		AvgLatency   string  `json:"avg_latency"`
+		Status       string  `json:"status"`
+	}{
+		ServerName:   d.ServerName,
+		RequestCount: d.RequestCount,
+		ToolCalls:    d.ToolCallCount,
+		ErrorCount:   d.ErrorCount,
+		ErrorRate:    d.ErrorRate,
+		ErrorRateStr: d.ErrorRateStr,
+		AvgLatency:   d.AvgLatency,
+		Status:       d.Status,
+	})
+}
+
+// UnmarshalJSON is the counterpart to MarshalJSON, mapping the legacy
+// "tool_calls" wire key back into the embedded MCPServerStatsBase.
+func (d *MCPServerHealthDetail) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		ServerName   string  `json:"server_name"`
+		RequestCount int     `json:"request_count"`
+		ToolCalls    int     `json:"tool_calls"`
+		ErrorCount   int     `json:"error_count"`
+		ErrorRate    float64 `json:"error_rate"`
+		ErrorRateStr string  `json:"error_rate_str"`
+		AvgLatency   string  `json:"avg_latency"`
+		Status       string  `json:"status"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	d.MCPServerStatsBase = MCPServerStatsBase{
+		ServerName:    aux.ServerName,
+		ToolCallCount: aux.ToolCalls,
+		ErrorCount:    aux.ErrorCount,
+	}
+	d.RequestCount = aux.RequestCount
+	d.ErrorRate = aux.ErrorRate
+	d.ErrorRateStr = aux.ErrorRateStr
+	d.AvgLatency = aux.AvgLatency
+	d.Status = aux.Status
+	return nil
 }
 
 // MCPSlowestToolCall represents a slow tool call for surfacing in the audit
@@ -109,8 +177,10 @@ type MCPSlowestToolCall struct {
 // The activation artifact may or may not have been flattened to the root directory.
 func findAwInfoPath(logsPath string) string {
 	candidates := []string{
+		filepath.Join(logsPath, "runtime", "aw_info.json"),
 		filepath.Join(logsPath, "aw_info.json"),
 		filepath.Join(logsPath, "activation", "aw_info.json"),
+		filepath.Join(logsPath, "agent", "aw_info.json"),
 	}
 	for _, p := range candidates {
 		if fileutil.FileExists(p) {
@@ -125,37 +195,47 @@ func extractEngineConfigWithInferredEngine(logsPath, inferredEngineID string) *A
 		return nil
 	}
 
-	awInfoPath := findAwInfoPath(logsPath)
-	if awInfoPath == "" {
+	awInfo := loadAwInfoForEngineConfig(logsPath)
+	if awInfo == nil {
 		auditExpandedLog.Printf("aw_info.json not found in %s", logsPath)
+		var config *AuditEngineConfig
 		if inferredEngineID != "" {
 			registry := workflow.GetGlobalEngineRegistry()
 			if engine, err := registry.GetEngine(inferredEngineID); err == nil {
 				auditExpandedLog.Printf("Inferred engine config without aw_info.json: engine=%s", inferredEngineID)
-				return &AuditEngineConfig{
+				config = &AuditEngineConfig{
 					EngineID:   inferredEngineID,
 					EngineName: engine.GetDisplayName(),
 				}
 			}
 		}
-		return nil
-	}
-	awInfo, err := parseAwInfo(awInfoPath, false)
-	if err != nil || awInfo == nil {
-		auditExpandedLog.Printf("Failed to parse aw_info.json for engine config: %v", err)
-		return nil
+		if config == nil {
+			config = &AuditEngineConfig{}
+		}
+		addHarnessRoutingOutcome(config, nil, logsPath)
+		if config.EngineID == "" && config.HarnessOutcome == nil {
+			return nil
+		}
+		return config
 	}
 
+	routing := analyzeModelRouting(logsPath)
+	attribution := resolveEffectiveModelAttribution(logsPath, awInfo, routing, nil)
 	config := &AuditEngineConfig{
-		EngineID:        awInfo.EngineID,
-		EngineName:      awInfo.EngineName,
-		Model:           awInfo.Model,
-		Version:         awInfo.Version,
-		CLIVersion:      awInfo.CLIVersion,
-		FirewallVersion: awInfo.GetFirewallVersion(),
-		TriggerEvent:    awInfo.EventName,
-		Repository:      awInfo.Repository,
+		EngineID:           awInfo.EngineID,
+		EngineName:         awInfo.EngineName,
+		Model:              attribution.Model,
+		RequestedModel:     attribution.RequestedModel,
+		ModelEffort:        attribution.Effort,
+		ModelRoutingStatus: attribution.RoutingStatus,
+		Version:            awInfo.Version,
+		CLIVersion:         awInfo.CLIVersion,
+		FirewallVersion:    awInfo.GetFirewallVersion(),
+		TriggerEvent:       awInfo.EventName,
+		Repository:         awInfo.Repository,
+		DryRun:             awInfo.DryRun,
 	}
+	addHarnessRoutingOutcome(config, awInfo, logsPath)
 
 	// Extract MCP server names from aw_info.json steps metadata
 	if mcpNames, ok := extractMCPServerNamesFromAwInfo(logsPath); ok {
@@ -165,6 +245,116 @@ func extractEngineConfigWithInferredEngine(logsPath, inferredEngineID string) *A
 	auditExpandedLog.Printf("Extracted engine config: engine=%s, model=%s, mcp_servers=%d",
 		config.EngineID, config.Model, len(config.MCPServers))
 	return config
+}
+
+func addHarnessRoutingOutcome(config *AuditEngineConfig, awInfo *AwInfo, logsPath string) {
+	sessionRouting, _, err := readSessionModelRouting(logsPath)
+	var outcome *sessionModelRoutingOutcome
+	if err == nil && sessionRouting != nil {
+		outcome = sessionRouting.Outcome
+	}
+	if outcome == nil {
+		outcome = readHarnessRoutingOutcomeArtifact(logsPath)
+	}
+	if outcome == nil {
+		return
+	}
+	config.HarnessOutcome = &AuditHarnessRoutingOutcome{
+		Status:            outcome.Status,
+		WireModel:         outcome.WireModel,
+		EffectiveEndpoint: outcome.EffectiveEndpoint,
+		SelectedEndpoint:  outcome.SelectedEndpoint,
+		Effort:            outcome.Effort,
+		AppliedEffort:     outcome.AppliedEffort,
+		FailureCode:       outcome.FailureCode,
+	}
+	var routing *AwInfoModelRouting
+	if awInfo != nil {
+		routing = awInfo.ModelRouting
+	}
+	if err == nil && sessionRouting != nil {
+		if workflowInfo := sessionRouting.WorkflowInfo; workflowInfo != nil && workflowInfo.ModelRouting != nil {
+			data := workflowInfo.ModelRouting
+			routing = &AwInfoModelRouting{
+				Status: data.Status, WireModel: data.WireModel, Endpoint: data.EffectiveEndpoint,
+				SelectedEndpoint: data.SelectedEndpoint, Effort: data.Effort,
+				AppliedEffort: data.AppliedEffort, FailureCode: data.FailureCode,
+			}
+		}
+	}
+	if (&sessionModelRoutingAttribution{Outcome: outcome}).outcomeDisagreesWith(routing) {
+		config.RoutingWarning = "Harness routing outcome disagrees with runner-written model routing metadata."
+	}
+}
+
+func readHarnessRoutingOutcomeArtifact(logsPath string) *sessionModelRoutingOutcome {
+	if logsPath == "" {
+		return nil
+	}
+	path := filepath.Join(logsPath, "agent", "awf-routing-outcome.json")
+	if err := validateSubagentSessionSource(path); err != nil {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, (64<<10)+1))
+	if err != nil || len(content) > 64<<10 {
+		return nil
+	}
+	var artifact struct {
+		Status            string `json:"status"`
+		WireModel         string `json:"wire_model"`
+		Endpoint          string `json:"endpoint"`
+		EffectiveEndpoint string `json:"effective_endpoint"`
+		SelectedEndpoint  string `json:"selected_endpoint"`
+		Effort            string `json:"effort"`
+		AppliedEffort     string `json:"applied_effort"`
+		FailureCode       string `json:"failure_code"`
+	}
+	if err := json.Unmarshal(content, &artifact); err != nil {
+		return nil
+	}
+	return &sessionModelRoutingOutcome{
+		Status: artifact.Status, WireModel: artifact.WireModel,
+		EffectiveEndpoint: firstNonEmpty(artifact.EffectiveEndpoint, artifact.Endpoint),
+		SelectedEndpoint:  artifact.SelectedEndpoint, Effort: artifact.Effort,
+		AppliedEffort: artifact.AppliedEffort, FailureCode: artifact.FailureCode,
+	}
+}
+
+func loadAwInfoForEngineConfig(logsPath string) *AwInfo {
+	if awInfoPath := findAwInfoPath(logsPath); awInfoPath != "" {
+		awInfo, err := parseAwInfo(awInfoPath, false)
+		if err != nil || awInfo == nil {
+			auditExpandedLog.Printf("Failed to parse aw_info.json for engine config: %v", err)
+			return nil
+		}
+		clearUntrustedAgentRoutingMetadata(logsPath, awInfoPath, awInfo)
+		return awInfo
+	}
+	sessionRouting, found, err := readSessionModelRouting(logsPath)
+	if err != nil {
+		auditExpandedLog.Printf("Failed to read unified session workflow metadata: %v", err)
+	}
+	if found {
+		return sessionRouting.awInfo()
+	}
+	return nil
+}
+
+func clearUntrustedAgentRoutingMetadata(logsPath, awInfoPath string, awInfo *AwInfo) {
+	if awInfo != nil && filepath.Clean(awInfoPath) == filepath.Join(logsPath, "agent", "aw_info.json") {
+		if awInfo.ModelRouting != nil || awInfo.ModelSelection != nil {
+			awInfo.Model = ""
+			awInfo.RequestedModel = ""
+		}
+		awInfo.ModelRouting = nil
+		awInfo.ModelSelection = nil
+		awInfo.ModelConfig = nil
+	}
 }
 
 func inferFallbackLogMetrics(logsPath string) (LogMetrics, string) {
@@ -310,40 +500,7 @@ func buildSessionAnalysis(processedRun ProcessedRun, metrics LogMetrics) *Sessio
 		session.AvgTurnDuration = timeutil.FormatDuration(avgTurnDuration)
 	}
 
-	// Time Between Turns (TBT): prefer precise per-turn timestamps from log metrics;
-	// fall back to wall-time / turns when timestamps are unavailable.
-	// TBT measures the gap between consecutive LLM API calls (tool execution overhead).
-	// Anthropic's prompt cache TTL is 5 minutes — if TBT exceeds this, cache entries
-	// expire and every turn incurs full prompt re-processing costs.
-	const anthropicCacheTTL = 5 * time.Minute
-	if metrics.AvgTimeBetweenTurns > 0 {
-		session.AvgTimeBetweenTurns = timeutil.FormatDuration(metrics.AvgTimeBetweenTurns)
-		if metrics.MaxTimeBetweenTurns > 0 {
-			session.MaxTimeBetweenTurns = timeutil.FormatDuration(metrics.MaxTimeBetweenTurns)
-		}
-		// Warn when the maximum observed TBT exceeds the Anthropic cache TTL.
-		if metrics.MaxTimeBetweenTurns > anthropicCacheTTL {
-			session.CacheWarning = fmt.Sprintf(
-				"Max TBT (%s) exceeds Anthropic 5-min cache TTL — prompt cache will expire between turns, increasing cost",
-				timeutil.FormatDuration(metrics.MaxTimeBetweenTurns),
-			)
-		} else if metrics.AvgTimeBetweenTurns > anthropicCacheTTL {
-			session.CacheWarning = fmt.Sprintf(
-				"Avg TBT (%s) exceeds Anthropic 5-min cache TTL — prompt cache likely expiring between turns",
-				timeutil.FormatDuration(metrics.AvgTimeBetweenTurns),
-			)
-		}
-	} else if metrics.Turns > 1 && run.Duration > 0 {
-		// Fallback: estimate TBT from wall time over turns-1 intervals.
-		avgTBT := run.Duration / time.Duration(metrics.Turns-1)
-		session.AvgTimeBetweenTurns = timeutil.FormatDuration(avgTBT) + " (estimated)"
-		if avgTBT > anthropicCacheTTL {
-			session.CacheWarning = fmt.Sprintf(
-				"Estimated avg TBT (%s) exceeds Anthropic 5-min cache TTL — prompt cache likely expiring between turns",
-				timeutil.FormatDuration(avgTBT),
-			)
-		}
-	}
+	setSessionTurnTiming(session, run.Duration, metrics)
 
 	// Tokens per minute
 	if metrics.TokenUsage > 0 && run.Duration > 0 {
@@ -369,6 +526,36 @@ func buildSessionAnalysis(processedRun ProcessedRun, metrics LogMetrics) *Sessio
 	auditExpandedLog.Printf("Built session analysis: turns=%d, wall_time=%s, avg_tbt=%s, max_tbt=%s, timeout=%v",
 		session.TurnCount, session.WallTime, session.AvgTimeBetweenTurns, session.MaxTimeBetweenTurns, session.TimeoutDetected)
 	return session
+}
+
+func setSessionTurnTiming(session *SessionAnalysis, runDuration time.Duration, metrics LogMetrics) {
+	const anthropicCacheTTL = 5 * time.Minute
+	if metrics.AvgTimeBetweenTurns > 0 {
+		session.AvgTimeBetweenTurns = timeutil.FormatDuration(metrics.AvgTimeBetweenTurns)
+		if metrics.MaxTimeBetweenTurns > 0 {
+			session.MaxTimeBetweenTurns = timeutil.FormatDuration(metrics.MaxTimeBetweenTurns)
+		}
+		if metrics.MaxTimeBetweenTurns > anthropicCacheTTL {
+			session.CacheWarning = fmt.Sprintf(
+				"Max TBT (%s) exceeds Anthropic 5-min cache TTL — prompt cache will expire between turns, increasing cost",
+				timeutil.FormatDuration(metrics.MaxTimeBetweenTurns),
+			)
+		} else if metrics.AvgTimeBetweenTurns > anthropicCacheTTL {
+			session.CacheWarning = fmt.Sprintf(
+				"Avg TBT (%s) exceeds Anthropic 5-min cache TTL — prompt cache likely expiring between turns",
+				timeutil.FormatDuration(metrics.AvgTimeBetweenTurns),
+			)
+		}
+	} else if metrics.Turns > 1 && runDuration > 0 {
+		avgTBT := runDuration / time.Duration(metrics.Turns-1)
+		session.AvgTimeBetweenTurns = timeutil.FormatDuration(avgTBT) + " (estimated)"
+		if avgTBT > anthropicCacheTTL {
+			session.CacheWarning = fmt.Sprintf(
+				"Estimated avg TBT (%s) exceeds Anthropic 5-min cache TTL — prompt cache likely expiring between turns",
+				timeutil.FormatDuration(avgTBT),
+			)
+		}
+	}
 }
 
 // buildSafeOutputSummary creates a summary of safe output items by type
@@ -484,36 +671,55 @@ func buildMCPServerHealth(mcpToolUsage *MCPToolUsageData, mcpFailures []MCPFailu
 
 	// Process server statistics from mcpToolUsage
 	if mcpToolUsage != nil {
-		for _, server := range mcpToolUsage.Servers {
-			health.TotalRequests += server.RequestCount
-			health.TotalErrors += server.ErrorCount
-
-			errorRate := safePercent(server.ErrorCount, server.RequestCount)
-
-			status := "✅ healthy"
-			if _, isFailed := failedServers[server.ServerName]; isFailed {
-				status = "❌ failed"
-			} else if errorRate > 10 {
-				status = "⚠️ degraded"
-			}
-
-			health.Servers = append(health.Servers, MCPServerHealthDetail{
-				ServerName:   server.ServerName,
-				RequestCount: server.RequestCount,
-				ToolCalls:    server.ToolCallCount,
-				ErrorCount:   server.ErrorCount,
-				ErrorRate:    errorRate,
-				ErrorRateStr: fmt.Sprintf("%.1f%%", errorRate),
-				AvgLatency:   server.AvgDuration,
-				Status:       status,
-			})
-		}
+		appendMCPServerDetails(health, mcpToolUsage, failedServers)
 
 		// Build slowest tool calls from individual call records (top 5)
 		health.SlowestCalls = buildSlowestToolCalls(mcpToolUsage.ToolCalls, 5)
 	}
 
 	// Add failed servers that don't appear in stats
+	appendMissingFailedServers(health, failedServers)
+
+	finalizeMCPServerHealth(health)
+
+	auditExpandedLog.Printf("Built MCP server health: %s, total_requests=%d, error_rate=%.1f%%",
+		health.Summary, health.TotalRequests, health.ErrorRate)
+	return health
+}
+
+// appendMCPServerDetails adds per-server health details from gateway metrics and
+// accumulates request/error totals.
+func appendMCPServerDetails(health *MCPServerHealth, mcpToolUsage *MCPToolUsageData, failedServers map[string]struct{}) {
+	for _, server := range mcpToolUsage.Servers {
+		health.TotalRequests += server.RequestCount
+		health.TotalErrors += server.ErrorCount
+
+		errorRate := safePercent(server.ErrorCount, server.RequestCount)
+
+		status := "✅ healthy"
+		if _, isFailed := failedServers[server.ServerName]; isFailed {
+			status = "❌ failed"
+		} else if errorRate > 10 {
+			status = "⚠️ degraded"
+		}
+
+		health.Servers = append(health.Servers, MCPServerHealthDetail{
+			MCPServerStatsBase: MCPServerStatsBase{
+				ServerName:    server.ServerName,
+				ToolCallCount: server.ToolCallCount,
+				ErrorCount:    server.ErrorCount,
+			},
+			RequestCount: server.RequestCount,
+			ErrorRate:    errorRate,
+			ErrorRateStr: fmt.Sprintf("%.1f%%", errorRate),
+			AvgLatency:   server.AvgDuration,
+			Status:       status,
+		})
+	}
+}
+
+// appendMissingFailedServers adds failed servers that have no gateway statistics.
+func appendMissingFailedServers(health *MCPServerHealth, failedServers map[string]struct{}) {
 	for serverName := range failedServers {
 		found := false
 		for _, s := range health.Servers {
@@ -524,12 +730,15 @@ func buildMCPServerHealth(mcpToolUsage *MCPToolUsageData, mcpFailures []MCPFailu
 		}
 		if !found {
 			health.Servers = append(health.Servers, MCPServerHealthDetail{
-				ServerName: serverName,
-				Status:     "❌ failed",
+				MCPServerStatsBase: MCPServerStatsBase{ServerName: serverName},
+				Status:             "❌ failed",
 			})
 		}
 	}
+}
 
+// finalizeMCPServerHealth computes the health rollups, sorts servers and builds the summary.
+func finalizeMCPServerHealth(health *MCPServerHealth) {
 	health.TotalServers = len(health.Servers)
 
 	// Count servers by status for accurate summary
@@ -559,10 +768,6 @@ func buildMCPServerHealth(mcpToolUsage *MCPToolUsageData, mcpFailures []MCPFailu
 	// Build summary string
 	health.Summary = fmt.Sprintf("%d server(s), %d healthy, %d degraded, %d failed",
 		health.TotalServers, health.HealthySvrs, health.DegradedSvrs, health.FailedSvrs)
-
-	auditExpandedLog.Printf("Built MCP server health: %s, total_requests=%d, error_rate=%.1f%%",
-		health.Summary, health.TotalRequests, health.ErrorRate)
-	return health
 }
 
 // buildSlowestToolCalls extracts the N slowest tool calls from the call records

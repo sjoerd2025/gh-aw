@@ -1,18 +1,51 @@
 package workflow
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var concurrencyLog = logger.New("workflow:concurrency")
+
+// generateSafeOutputsConcurrencyConfig serializes comment-memory read/merge/write
+// across workflows hosted in the same Actions repository. Targets and memory IDs
+// can be selected by agent outputs, so narrower compile-time keys are unsafe.
+// Actions concurrency does not coordinate writers hosted in other repositories.
+func generateSafeOutputsConcurrencyConfig(data *WorkflowData) (string, error) {
+	group := data.SafeOutputs.ConcurrencyGroup
+	if data.CommentMemoryConfig != nil {
+		const commentMemoryGroup = "gh-aw-comment-memory"
+		if group != "" && group != commentMemoryGroup {
+			return "", errors.New("safe-outputs.concurrency-group cannot be combined with tools.comment-memory: remove concurrency-group to use the shared comment-memory writer group")
+		}
+		group = commentMemoryGroup
+		config := fmt.Sprintf("concurrency:\n  group: %q\n  cancel-in-progress: false", group)
+		if isGroupConcurrencyQueueEnabled(data) {
+			config += "\n  queue: max"
+		}
+		return config, nil
+	}
+	if group == "" {
+		return "", nil
+	}
+	return fmt.Sprintf("concurrency:\n  group: %q\n  cancel-in-progress: false", group), nil
+}
 
 // GenerateConcurrencyConfig generates the concurrency configuration for a workflow
 // based on its trigger types and characteristics.
 func GenerateConcurrencyConfig(workflowData *WorkflowData, isCommandTrigger bool) string {
 	concurrencyLog.Printf("Generating concurrency config: isCommandTrigger=%v", isCommandTrigger)
+	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Durable != nil {
+		concurrencyConfig := fmt.Sprintf("concurrency:\n  group: \"gh-aw-durable-%s\"\n  cancel-in-progress: false", durableWorkflowID(workflowData))
+		if isGroupConcurrencyQueueEnabled(workflowData) {
+			concurrencyConfig += "\n  queue: max"
+		}
+		return concurrencyConfig
+	}
 
 	// Don't override if already set
 	if workflowData.Concurrency != "" {
@@ -22,6 +55,10 @@ func GenerateConcurrencyConfig(workflowData *WorkflowData, isCommandTrigger bool
 
 	// Build concurrency group keys using the original workflow-specific logic
 	keys := buildConcurrencyGroupKeys(workflowData, isCommandTrigger)
+	if isCommandTrigger && shouldEnableCancelInProgress(workflowData, true) {
+		// Keep PR updates isolated from queued command and manual runs.
+		keys = append(keys, "${{ github.event_name == 'pull_request' && 'pull_request' || 'command' }}")
+	}
 	groupValue := strings.Join(keys, "-")
 	concurrencyLog.Printf("Built concurrency group: %s", groupValue)
 
@@ -29,9 +66,23 @@ func GenerateConcurrencyConfig(workflowData *WorkflowData, isCommandTrigger bool
 	concurrencyConfig := fmt.Sprintf("concurrency:\n  group: \"%s\"", groupValue)
 
 	// Add cancel-in-progress if appropriate
-	if shouldEnableCancelInProgress(workflowData, isCommandTrigger) {
+	cancelInProgress := shouldEnableCancelInProgress(workflowData, isCommandTrigger)
+	if cancelInProgress {
 		concurrencyLog.Print("Enabling cancel-in-progress for concurrency group")
-		concurrencyConfig += "\n  cancel-in-progress: true"
+		if isCommandTrigger {
+			concurrencyConfig += "\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}"
+			// GitHub Actions only accepts literal single/max values for queue.
+			// Omit it for mixed triggers so the default single queue remains
+			// compatible with cancellation on pull_request events.
+		} else {
+			concurrencyConfig += "\n  cancel-in-progress: true"
+		}
+	} else if isGroupConcurrencyQueueEnabled(workflowData) {
+		// queue: max cannot be combined with cancel-in-progress: true, so only add it
+		// when cancellation is not enabled. This ensures back-to-back triggers (e.g.
+		// push events) are queued sequentially instead of displacing pending runs.
+		concurrencyLog.Print("Enabling queue: max for top-level concurrency group")
+		concurrencyConfig += "\n  queue: max"
 	}
 
 	return concurrencyConfig
@@ -175,7 +226,7 @@ func isSlashCommandWorkflow(on string) bool {
 // inserted between the primary identifiers and the tail, providing a stable per-item
 // key for manual workflow_dispatch runs triggered via the label trigger shorthand.
 func entityConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumber bool) string {
-	parts := make([]string, 0, safeAllocationCapacity(len(primaryParts), len(tailParts), 1))
+	parts := make([]string, 0, typeutil.SafeAllocationCapacity(len(primaryParts), len(tailParts), 1))
 	parts = append(parts, primaryParts...)
 	if hasItemNumber {
 		parts = append(parts, "inputs.item_number")
@@ -190,7 +241,7 @@ func entityConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumb
 // When contains(github.actor, '[bot]') is true, the expression short-circuits to
 // github.run_id so that bot-triggered runs never share a group with human runs.
 func botIsolatedConcurrencyKey(primaryParts []string, tailParts []string, hasItemNumber bool) string {
-	parts := make([]string, 0, safeAllocationCapacity(len(primaryParts), len(tailParts), 2))
+	parts := make([]string, 0, typeutil.SafeAllocationCapacity(len(primaryParts), len(tailParts), 2))
 	// Prepend the bot-actor isolation check: bot runs always get a unique key
 	parts = append(parts, "contains(github.actor, '[bot]') && github.run_id")
 	parts = append(parts, primaryParts...)
@@ -275,16 +326,31 @@ func buildConcurrencyGroupKeys(workflowData *WorkflowData, isCommandTrigger bool
 	}
 
 	if isCommandTrigger || isSlashCommandWorkflow(workflowData.On) {
-		// For command/slash_command workflows: use issue/PR number; fall back to run_id when
-		// neither is available (e.g. manual workflow_dispatch of the outer workflow).
-		// When bot risk is detected, prepend the bot-actor isolation check.
-		concurrencyLog.Print("Building concurrency key for command/slash_command workflow")
-		if botRisk {
-			keys = append(keys, "${{ contains(github.actor, '[bot]') && github.run_id || github.event.issue.number || github.event.pull_request.number || github.run_id }}")
-		} else {
-			keys = append(keys, "${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}")
-		}
-	} else if isPullRequestWorkflow(workflowData.On) && isIssueWorkflow(workflowData.On) {
+		keys = append(keys, commandConcurrencyKey(botRisk))
+	} else {
+		keys = appendEntityConcurrencyGroupKey(keys, workflowData, entityKey)
+	}
+
+	// For label-triggered workflows, different labels must not share a group.
+	if hasItemNumber {
+		keys = append(keys, "${{ github.event.label.name || github.run_id }}")
+	}
+
+	return keys
+}
+
+func commandConcurrencyKey(botRisk bool) string {
+	// Manual dispatches without an issue/PR number fall back to run_id.
+	concurrencyLog.Print("Building concurrency key for command/slash_command workflow")
+	if botRisk {
+		return "${{ contains(github.actor, '[bot]') && github.run_id || github.event.issue.number || github.event.pull_request.number || github.run_id }}"
+	}
+	return "${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}"
+}
+
+func appendEntityConcurrencyGroupKey(keys []string, workflowData *WorkflowData, entityKey func([]string, []string) string) []string {
+	hasItemNumber := workflowData.HasDispatchItemNumber
+	if isPullRequestWorkflow(workflowData.On) && isIssueWorkflow(workflowData.On) {
 		// Mixed workflows with both issue and PR triggers
 		concurrencyLog.Print("Building concurrency key for mixed PR+issue workflow")
 		keys = append(keys, entityKey(
@@ -333,25 +399,21 @@ func buildConcurrencyGroupKeys(workflowData *WorkflowData, isCommandTrigger bool
 		keys = append(keys, "${{ github.ref || github.run_id }}")
 	}
 
-	// For label-triggered workflows (label trigger shorthand or label_command), include
-	// github.event.label.name as an additional segment so that runs triggered by different
-	// labels do not share a concurrency group. Without this, adding multiple labels to the
-	// same PR/issue simultaneously (which fires one labeled event per label) would cause all
-	// matching workflow runs to share a group, and with cancel-in-progress enabled the last
-	// surviving run could be for a different label than the workflow expects.
-	if hasItemNumber {
-		keys = append(keys, "${{ github.event.label.name || github.run_id }}")
-	}
-
 	return keys
 }
 
 // shouldEnableCancelInProgress determines if cancel-in-progress should be enabled
 func shouldEnableCancelInProgress(workflowData *WorkflowData, isCommandTrigger bool) bool {
-	// Never enable cancellation for command workflows
-	if isCommandTrigger {
-		concurrencyLog.Print("cancel-in-progress disabled: command trigger workflow")
+	// A cancelled writer can still have an in-flight API update. Do not have a
+	// newer trigger cancel a workflow while it holds the comment-memory group.
+	if workflowData.CommentMemoryConfig != nil {
 		return false
+	}
+	if isCommandTrigger {
+		// Expanded command events include PR comments, not necessarily a PR trigger.
+		_, commandPR := workflowData.CommandOtherEvents["pull_request"]
+		_, labelCommandPR := workflowData.LabelCommandOtherEvents["pull_request"]
+		return commandPR || labelCommandPR
 	}
 
 	// Enable cancellation for pull request workflows (including mixed workflows)

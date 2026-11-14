@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -44,7 +45,7 @@ func TestInitRepository_WithMCP(t *testing.T) {
 	}
 
 	// Call the function with MCP flag (no campaign agent)
-	err = InitRepository(InitOptions{Verbose: false, Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
+	err = InitRepository(InitOptions{Verbose: false, Engine: "copilot", Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
 	if err != nil {
 		t.Fatalf("InitRepository(, false, false, false, nil) with MCP returned error: %v", err)
 	}
@@ -105,10 +106,11 @@ func TestInitRepository_WithMCP(t *testing.T) {
 		if server.Command != "gh" {
 			t.Errorf("Expected command to be 'gh', got %s", server.Command)
 		}
-		if len(server.Args) != 2 || server.Args[0] != "aw" || server.Args[1] != "mcp-server" {
-			t.Errorf("Expected args to be ['aw', 'mcp-server'], got %v", server.Args)
+		expectedArgs := []string{"aw", "mcp-server", "--allow-write-tools"}
+		if !reflect.DeepEqual(server.Args, expectedArgs) {
+			t.Errorf("Expected args to be %v, got %v", expectedArgs, server.Args)
 		}
-		expectedTools := []string{"compile", "audit", "logs", "inspect", "status", "audit-diff"}
+		expectedTools := []string{"compile", "audit", "logs", "inspect", "status", "audit-diff", "work-queue", "health"}
 		if len(server.Tools) != len(expectedTools) {
 			t.Errorf("Expected %d tools, got %d (%v)", len(expectedTools), len(server.Tools), server.Tools)
 		}
@@ -144,13 +146,13 @@ func TestInitRepository_MCP_Idempotent(t *testing.T) {
 	}
 
 	// Call the function first time with MCP
-	err = InitRepository(InitOptions{Verbose: false, Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
+	err = InitRepository(InitOptions{Verbose: false, Engine: "copilot", Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
 	if err != nil {
 		t.Fatalf("InitRepository(, false, false, false, nil) with MCP returned error on first call: %v", err)
 	}
 
 	// Call the function second time with MCP
-	err = InitRepository(InitOptions{Verbose: false, Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
+	err = InitRepository(InitOptions{Verbose: false, Engine: "copilot", Skill: true, Agent: true, MCP: true, CodespaceRepos: []string{}, CodespaceEnabled: false, Completions: false, CreatePR: false, RootCmd: nil})
 	if err != nil {
 		t.Fatalf("InitRepository(, false, false, false, nil) with MCP returned error on second call: %v", err)
 	}

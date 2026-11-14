@@ -14,7 +14,7 @@
 // # Validation Pattern: Schema Validation with Caching
 //
 // Schema validation uses a singleton pattern for efficiency:
-//   - sync.Once ensures schema is compiled only once
+//   - syncutil.OnceLoader ensures schema is compiled only once
 //   - Schema is embedded in the binary as githubWorkflowSchema
 //   - Cached compiled schema is reused across all validations
 //   - YAML is parsed directly and validated without JSON conversion
@@ -42,37 +42,33 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/goccy/go-yaml"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/syncutil"
+	"github.com/github/gh-aw/pkg/workflow/actionslanguageservice"
 )
 
 var schemaValidationLog = logger.New("workflow:schema_validation")
 
 // Cached compiled schema to avoid recompiling on every validation
-var (
-	compiledSchemaOnce sync.Once
-	compiledSchema     *jsonschema.Schema
-	schemaCompileError error
-)
+var compiledSchemaLoader syncutil.OnceLoader[*jsonschema.Schema]
 
 // getCompiledSchema returns the compiled GitHub Actions schema, compiling it once and caching
 func getCompiledSchema() (*jsonschema.Schema, error) {
-	compiledSchemaOnce.Do(func() {
+	return compiledSchemaLoader.Get(func() (*jsonschema.Schema, error) {
 		schemaValidationLog.Print("Compiling GitHub Actions schema (first time)")
-		compiledSchema, schemaCompileError = compileSchema(
+		schema, err := compileSchema(
 			githubWorkflowSchema,
 			"https://json.schemastore.org/github-workflow.json",
 		)
-		if schemaCompileError == nil {
+		if err == nil {
 			schemaValidationLog.Print("GitHub Actions schema compiled successfully")
 		}
+		return schema, err
 	})
-
-	return compiledSchema, schemaCompileError
 }
 
 // validateGitHubActionsSchema validates the generated YAML content against the GitHub Actions workflow schema
@@ -86,7 +82,10 @@ func (c *Compiler) validateGitHubActionsSchema(yamlContent string) error {
 		return fmt.Errorf("failed to parse YAML for schema validation: %w", err)
 	}
 
-	return c.validateGitHubActionsSchemaFromParsed(workflowData)
+	if err := c.validateGitHubActionsSchemaFromParsed(workflowData); err != nil {
+		return err
+	}
+	return actionslanguageservice.ValidateWorkflowWithCacheMode("workflow.yml", yamlContent)
 }
 
 // validateGitHubActionsSchemaFromParsed validates pre-parsed workflow data against the
@@ -172,7 +171,7 @@ func getFieldExample(fieldPath string, err error) string {
 		"concurrency":     "Example: concurrency: production or concurrency:\\n  group: ${{ github.workflow }}\\n  cancel-in-progress: true",
 		"env":             "Example: env:\\n  NODE_ENV: production",
 		"tools":           "Example: tools:\\n  github:\\n    allowed: [list_issues]",
-		"steps":           "Example: steps:\\n  - name: Checkout\\n    uses: actions/checkout@v6",
+		"steps":           "Example: steps:\\n  - name: Checkout\\n    uses: actions/checkout@v7",
 		"jobs":            "Example: jobs:\\n  build:\\n    runs-on: ubuntu-latest\\n    steps:\\n      - run: echo 'hello'",
 		"strategy":        "Example: strategy:\\n  matrix:\\n    os: [ubuntu-latest, windows-latest]",
 		"container":       "Example: container: node:20 or container:\\n  image: node:20\\n  options: --user root",
@@ -184,7 +183,7 @@ func getFieldExample(fieldPath string, err error) string {
 		"outputs":         "Example: outputs:\\n  build-id: ${{ steps.build.outputs.id }}",
 		"needs":           "Example: needs: build or needs: [build, test]",
 		"uses":            "Example: uses: ./.github/workflows/reusable.yml",
-		"with":            "Example: with:\\n  node-version: '20'",
+		"with":            "Example: with:\\n  node-version: '24'",
 		"secrets":         "Example: secrets:\\n  token: ${{ secrets.GITHUB_TOKEN }}",
 	}
 

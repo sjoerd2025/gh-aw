@@ -3,8 +3,9 @@
 package cli_test
 
 import (
-	"context"
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,6 +16,7 @@ import (
 // TestSpec_PublicAPI_ValidateWorkflowName validates the documented behavior.
 // Spec: empty names and names with invalid characters return errors.
 func TestSpec_PublicAPI_ValidateWorkflowName(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		input   string
@@ -39,9 +41,69 @@ func TestSpec_PublicAPI_ValidateWorkflowName(t *testing.T) {
 	}
 }
 
+// TestSpec_Types_WorkflowRunFlags validates the documented embedded flag layout
+// and its flat JSON compatibility contract.
+func TestSpec_Types_WorkflowRunFlags(t *testing.T) {
+	t.Parallel()
+	opts := cli.RunOptions{WorkflowRunFlags: cli.WorkflowRunFlags{
+		Verbose: true, EngineOverride: "copilot", RepoOverride: "owner/repo",
+		RefOverride: "main", AutoMergePRs: true, Push: true, DryRun: true, Approve: true,
+	}}
+	assert.True(t, opts.Verbose, "embedded WorkflowRunFlags fields should remain promoted")
+	assert.Equal(t, "owner/repo", opts.RepoOverride, "embedded repository override should remain promoted")
+
+	encoded, err := json.Marshal(opts)
+	require.NoError(t, err, "RunOptions should serialize with embedded WorkflowRunFlags")
+	assert.NotContains(t, string(encoded), "WorkflowRunFlags", "JSON should remain flat rather than nesting the embedded type")
+	assert.Contains(t, string(encoded), "RepoOverride", "flat JSON should contain embedded flag fields")
+
+	interactive := cli.RunWorkflowOptions{WorkflowRunFlags: cli.WorkflowRunFlags{DryRun: true}, WorkflowName: "example"}
+	assert.True(t, interactive.DryRun, "RunWorkflowOptions should promote embedded workflow flags")
+}
+
+// TestSpec_PublicAPI_RPCMessageEntryEffectiveType validates legacy precedence and v2 event fallback.
+func TestSpec_PublicAPI_RPCMessageEntryEffectiveType(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		entry cli.RPCMessageEntry
+		want  string
+	}{
+		{name: "legacy type takes precedence", entry: cli.RPCMessageEntry{Type: "REQUEST", Event: "rpc_response"}, want: "REQUEST"},
+		{name: "v2 request event is normalized", entry: cli.RPCMessageEntry{Event: "rpc_request"}, want: "REQUEST"},
+		{name: "v2 response event is normalized", entry: cli.RPCMessageEntry{Event: "rpc_response"}, want: "RESPONSE"},
+		{name: "v2 filtered event is normalized", entry: cli.RPCMessageEntry{Event: "difc_filtered"}, want: "DIFC_FILTERED"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.entry.EffectiveType(), "EffectiveType should honor the documented compatibility rule")
+		})
+	}
+}
+
+// TestSpec_PublicAPI_AwInfoGetFirewallVersion validates the documented field-name migration fallback.
+func TestSpec_PublicAPI_AwInfoGetFirewallVersion(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		info cli.AwInfo
+		want string
+	}{
+		{name: "new field is preferred", info: cli.AwInfo{AwfVersion: "new", FirewallVersion: "legacy"}, want: "new"},
+		{name: "legacy field remains supported", info: cli.AwInfo{FirewallVersion: "legacy"}, want: "legacy"},
+		{name: "both absent returns empty", info: cli.AwInfo{}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.info.GetFirewallVersion(), "GetFirewallVersion should follow documented precedence")
+		})
+	}
+}
+
 // TestSpec_PublicAPI_IsCommitSHA validates that IsCommitSHA returns true only for 40-char hex strings.
 // Spec: "Returns true if the string is a full Git commit SHA"
 func TestSpec_PublicAPI_IsCommitSHA(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		version string
@@ -66,13 +128,6 @@ func TestSpec_PublicAPI_IsCommitSHA(t *testing.T) {
 	}
 }
 
-// TestSpec_PublicAPI_GetVersion validates that GetVersion returns a non-empty string.
-// Spec: "Returns the current CLI version"
-func TestSpec_PublicAPI_GetVersion(t *testing.T) {
-	version := cli.GetVersion()
-	assert.NotEmpty(t, version, "GetVersion should return a non-empty version string")
-}
-
 // TestSpec_PublicAPI_SetVersionInfo validates that SetVersionInfo stores the version returned by GetVersion.
 // Spec: "Sets the version at startup"
 func TestSpec_PublicAPI_SetVersionInfo(t *testing.T) {
@@ -86,6 +141,7 @@ func TestSpec_PublicAPI_SetVersionInfo(t *testing.T) {
 // TestSpec_PublicAPI_IsRunningInCI validates that IsRunningInCI returns a bool without panicking.
 // Spec: "Detects CI environment"
 func TestSpec_PublicAPI_IsRunningInCI(t *testing.T) {
+	t.Parallel()
 	result := cli.IsRunningInCI()
 	_ = result // result is environment-dependent; ensure no panic
 }
@@ -93,6 +149,7 @@ func TestSpec_PublicAPI_IsRunningInCI(t *testing.T) {
 // TestSpec_Types_ShellType validates the documented ShellType string alias and its constants.
 // Spec: ShellType string alias with values "bash", "zsh", "fish", "powershell", "unknown"
 func TestSpec_Types_ShellType(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, cli.ShellBash, cli.ShellType("bash"), "ShellBash constant should be \"bash\"")
 	assert.Equal(t, cli.ShellZsh, cli.ShellType("zsh"), "ShellZsh constant should be \"zsh\"")
 	assert.Equal(t, cli.ShellFish, cli.ShellType("fish"), "ShellFish constant should be \"fish\"")
@@ -100,9 +157,111 @@ func TestSpec_Types_ShellType(t *testing.T) {
 	assert.Equal(t, cli.ShellUnknown, cli.ShellType("unknown"), "ShellUnknown constant should be \"unknown\"")
 }
 
+// TestSpec_Constants_CheckState validates the documented normalized CI state values.
+func TestSpec_Constants_CheckState(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		actual   cli.CheckState
+		expected cli.CheckState
+	}{
+		{name: "failed", actual: cli.CheckStateFailed, expected: "failed"},
+		{name: "pending", actual: cli.CheckStatePending, expected: "pending"},
+		{name: "no checks", actual: cli.CheckStateNoChecks, expected: "no_checks"},
+		{name: "policy blocked", actual: cli.CheckStatePolicyBlocked, expected: "policy_blocked"},
+		{name: "success", actual: cli.CheckStateSuccess, expected: "success"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, tt.actual, "CheckState constant %q should match the README specification", tt.name)
+		})
+	}
+}
+
+// TestSpec_Constants_DockerImages validates the documented default scanner images.
+func TestSpec_Constants_DockerImages(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, "ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d", cli.ZizmorImage, "ZizmorImage should match the README specification")
+	assert.Equal(t, "ghcr.io/boostsecurityio/poutine:1.1.6@sha256:722a8e0999b583c1540fe2974e691032b2d9d21b9256a17965132b6bfd0081b0", cli.PoutineImage, "PoutineImage should match the README specification")
+	assert.Equal(t, "rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667", cli.ActionlintImage, "ActionlintImage should match the README specification")
+	assert.Equal(t, "ghcr.io/vigilant-llc/runner-guard:3.1.5@sha256:2df426ef96d21f1622e05b21329f26bd263fc46110609cefb6afe43457613ac0", cli.RunnerGuardImage, "RunnerGuardImage should match the README specification")
+}
+
+// TestSpec_Constants_TimelineEvents validates the documented timeline source and kind values.
+func TestSpec_Constants_TimelineEvents(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, cli.TimelineSourceGateway, cli.TimelineEventSource("gateway"), "gateway source should match the README specification")
+	assert.Equal(t, cli.TimelineSourceFirewall, cli.TimelineEventSource("firewall"), "firewall source should match the README specification")
+	assert.Equal(t, cli.TimelineSourceAgent, cli.TimelineEventSource("agent"), "agent source should match the README specification")
+	assert.Equal(t, cli.TimelineKindToolCall, cli.TimelineEventKind("tool_call"), "tool-call kind should match the README specification")
+	assert.Equal(t, cli.TimelineKindDIFCFiltered, cli.TimelineEventKind("difc_filtered"), "DIFC kind should match the README specification")
+	assert.Equal(t, cli.TimelineKindGuardPolicyBlocked, cli.TimelineEventKind("guard_blocked"), "guard-policy kind should match the README specification")
+	assert.Equal(t, cli.TimelineKindNetworkAllowed, cli.TimelineEventKind("net_allowed"), "allowed-network kind should match the README specification")
+	assert.Equal(t, cli.TimelineKindNetworkBlocked, cli.TimelineEventKind("net_blocked"), "blocked-network kind should match the README specification")
+	assert.Equal(t, cli.TimelineKindAgentTurn, cli.TimelineEventKind("agent_turn"), "agent-turn kind should match the README specification")
+	assert.Equal(t, cli.TimelineKindAgentToolStart, cli.TimelineEventKind("agent_tool_start"), "agent tool-start kind should match the README specification")
+	assert.Equal(t, cli.TimelineKindAgentToolDone, cli.TimelineEventKind("agent_tool_done"), "agent tool-done kind should match the README specification")
+}
+
+// TestSpec_Constants_ArtifactSets validates the documented artifact-set values.
+func TestSpec_Constants_ArtifactSets(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		actual   cli.ArtifactSet
+		expected cli.ArtifactSet
+	}{
+		{name: "activation", actual: cli.ArtifactSetActivation, expected: "activation"},
+		{name: "agent", actual: cli.ArtifactSetAgent, expected: "agent"},
+		{name: "all", actual: cli.ArtifactSetAll, expected: "all"},
+		{name: "detection", actual: cli.ArtifactSetDetection, expected: "detection"},
+		{name: "evals", actual: cli.ArtifactSetEvals, expected: "evals"},
+		{name: "experiment", actual: cli.ArtifactSetExperiment, expected: "experiment"},
+		{name: "firewall", actual: cli.ArtifactSetFirewall, expected: "firewall"},
+		{name: "github api", actual: cli.ArtifactSetGitHubAPI, expected: "github-api"},
+		{name: "mcp", actual: cli.ArtifactSetMCP, expected: "mcp"},
+		{name: "usage", actual: cli.ArtifactSetUsage, expected: "usage"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, tt.actual, "ArtifactSet constant %q should match the README specification", tt.name)
+		})
+	}
+}
+
+// TestSpec_Constants_LogFetchingLimits validates the documented batching,
+// concurrency, retention, and cooldown values.
+func TestSpec_Constants_LogFetchingLimits(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, 100, cli.BatchSize, "BatchSize should match the README specification")
+	assert.Equal(t, 100, cli.BatchSizeForAllWorkflows, "BatchSizeForAllWorkflows should match the README specification")
+	assert.Equal(t, 90, cli.GitHubActionsRetentionDays, "GitHubActionsRetentionDays should match the README specification")
+	assert.Equal(t, 10, cli.MaxConcurrentDownloads, "MaxConcurrentDownloads should match the README specification")
+	assert.Equal(t, 500*time.Millisecond, cli.APICallCooldown, "APICallCooldown should match the README specification")
+}
+
+// TestSpec_Errors_SentinelsExist validates the two documented sentinel errors.
+func TestSpec_Errors_SentinelsExist(t *testing.T) {
+	t.Parallel()
+	require.Error(t, cli.ErrInterrupted, "ErrInterrupted should be an exported sentinel error")
+	require.Error(t, cli.ErrNoArtifacts, "ErrNoArtifacts should be an exported sentinel error")
+}
+
+// TestSpec_Constants_WorkflowIDExplanation validates the documented workflow-ID explanation.
+func TestSpec_Constants_WorkflowIDExplanation(t *testing.T) {
+	t.Parallel()
+	assert.Contains(t, cli.WorkflowIDExplanation, "basename", "workflow-ID explanation should describe the Markdown filename basename")
+	assert.Contains(t, cli.WorkflowIDExplanation, ".md extension", "workflow-ID explanation should describe removal of the .md extension")
+}
+
 // TestSpec_PublicAPI_DetectShell validates DetectShell returns one of the documented ShellType values.
 // Spec: "Detects the user's current shell"
 func TestSpec_PublicAPI_DetectShell(t *testing.T) {
+	t.Parallel()
 	shell := cli.DetectShell()
 	validShells := []cli.ShellType{cli.ShellBash, cli.ShellZsh, cli.ShellFish, cli.ShellPowerShell, cli.ShellUnknown}
 	assert.Contains(t, validShells, shell, "DetectShell should return one of the documented ShellType values")
@@ -111,6 +270,7 @@ func TestSpec_PublicAPI_DetectShell(t *testing.T) {
 // TestSpec_PublicAPI_ValidEngineNames validates the documented function returns a non-empty list.
 // Spec: "Returns the supported engine names for shell completion"
 func TestSpec_PublicAPI_ValidEngineNames(t *testing.T) {
+	t.Parallel()
 	engines := cli.ValidEngineNames()
 	assert.NotEmpty(t, engines, "ValidEngineNames should return at least one engine name")
 	for _, name := range engines {
@@ -121,6 +281,7 @@ func TestSpec_PublicAPI_ValidEngineNames(t *testing.T) {
 // TestSpec_PublicAPI_ValidArtifactSetNames validates the documented function returns known artifact sets.
 // Spec: "Returns the valid artifact set name strings"
 func TestSpec_PublicAPI_ValidArtifactSetNames(t *testing.T) {
+	t.Parallel()
 	names := cli.ValidArtifactSetNames()
 	assert.NotEmpty(t, names, "ValidArtifactSetNames should return a non-empty list")
 	assert.Contains(t, names, "all", "ValidArtifactSetNames should include \"all\"")
@@ -129,6 +290,7 @@ func TestSpec_PublicAPI_ValidArtifactSetNames(t *testing.T) {
 // TestSpec_PublicAPI_ValidateArtifactSets validates known and unknown artifact sets.
 // Spec: "Validates that all provided artifact set names are known"
 func TestSpec_PublicAPI_ValidateArtifactSets(t *testing.T) {
+	t.Parallel()
 	t.Run("known artifact set returns no error", func(t *testing.T) {
 		err := cli.ValidateArtifactSets([]string{"all"})
 		require.NoError(t, err, "ValidateArtifactSets should not error for known set \"all\"")
@@ -148,6 +310,7 @@ func TestSpec_PublicAPI_ValidateArtifactSets(t *testing.T) {
 // TestSpec_PublicAPI_ExtractWorkflowDescription validates extraction of the description field.
 // Spec: "Extracts the description field from workflow markdown content"
 func TestSpec_PublicAPI_ExtractWorkflowDescription(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		content  string
@@ -181,6 +344,7 @@ func TestSpec_PublicAPI_ExtractWorkflowDescription(t *testing.T) {
 // TestSpec_PublicAPI_ExtractWorkflowEngine validates extraction of the engine field.
 // Spec: "Extracts the engine field from workflow markdown content"
 func TestSpec_PublicAPI_ExtractWorkflowEngine(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		content  string
@@ -209,6 +373,7 @@ func TestSpec_PublicAPI_ExtractWorkflowEngine(t *testing.T) {
 // TestSpec_PublicAPI_ExtractWorkflowPrivate validates extraction of the private flag.
 // Spec: "Returns true if the workflow is marked private"
 func TestSpec_PublicAPI_ExtractWorkflowPrivate(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		content  string
@@ -239,29 +404,6 @@ func TestSpec_PublicAPI_ExtractWorkflowPrivate(t *testing.T) {
 	}
 }
 
-// TestSpec_DesignDecision_StderrDiagnostics verifies the documented design constraint.
-// Spec: "All diagnostic output MUST go to stderr ... Structured output (JSON, hashes, graphs) goes to stdout."
-func TestSpec_DesignDecision_StderrDiagnostics(t *testing.T) {
-	require.NotNil(t, t, "design constraint: functions returning structured data use return values, not stdout")
-	engines := cli.ValidEngineNames()
-	assert.NotEmpty(t, engines, "ValidEngineNames returns data via return value, not stdout")
-	names := cli.ValidArtifactSetNames()
-	assert.NotEmpty(t, names, "ValidArtifactSetNames returns data via return value, not stdout")
-}
-
-// TestSpec_PublicAPI_GetAllCodemods validates that GetAllCodemods returns at least one codemod.
-// Spec: "Returns all available codemods"
-func TestSpec_PublicAPI_GetAllCodemods(t *testing.T) {
-	codemods := cli.GetAllCodemods()
-	require.NotEmpty(t, codemods, "GetAllCodemods should return at least one codemod")
-	for _, c := range codemods {
-		assert.NotEmpty(t, c.ID, "each Codemod should have a non-empty ID")
-		assert.NotEmpty(t, c.Name, "each Codemod should have a non-empty Name")
-		assert.NotEmpty(t, c.Description, "each Codemod should have a non-empty Description")
-		assert.NotNil(t, c.Apply, "each Codemod should have a non-nil Apply function")
-	}
-}
-
 // TestSpec_PublicAPI_ResolveArtifactFilter validates that ResolveArtifactFilter expands aliases.
 // Spec: "Expands artifact set aliases to concrete artifact names"
 func TestSpec_PublicAPI_ResolveArtifactFilter(t *testing.T) {
@@ -287,67 +429,6 @@ func TestSpec_PublicAPI_ResolveArtifactFilter(t *testing.T) {
 			break
 		}
 	})
-}
-
-// TestSpec_PublicAPI_GroupRunsByWorkflow validates that a flat slice of runs is grouped by workflow name.
-// Spec: "Groups a flat slice of runs by workflow name"
-func TestSpec_PublicAPI_GroupRunsByWorkflow(t *testing.T) {
-	runs := []cli.WorkflowRun{
-		{WorkflowName: "workflow-a"},
-		{WorkflowName: "workflow-b"},
-		{WorkflowName: "workflow-a"},
-	}
-	grouped := cli.GroupRunsByWorkflow(runs)
-	assert.Len(t, grouped, 2, "should produce two groups for two distinct workflow names")
-	assert.Len(t, grouped["workflow-a"], 2, "workflow-a group should contain two runs")
-	assert.Len(t, grouped["workflow-b"], 1, "workflow-b group should contain one run")
-}
-
-// TestSpec_PublicAPI_ValidateWorkflowIntent validates the documented validation rules.
-// Spec: "Validates the workflow intent string"
-func TestSpec_PublicAPI_ValidateWorkflowIntent(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		wantErr bool
-	}{
-		{
-			name:    "empty string returns error",
-			input:   "",
-			wantErr: true,
-		},
-		{
-			name:    "whitespace-only string returns error",
-			input:   "   ",
-			wantErr: true,
-		},
-		{
-			name:    "string shorter than 20 characters returns error",
-			input:   "too short",
-			wantErr: true,
-		},
-		{
-			name:    "string of exactly 20 characters is valid",
-			input:   "twelve chars here!!!",
-			wantErr: false,
-		},
-		{
-			name:    "string longer than 20 characters is valid",
-			input:   "This is a sufficiently long workflow intent description",
-			wantErr: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := cli.ValidateWorkflowIntent(tt.input)
-			if tt.wantErr {
-				assert.Error(t, err, "ValidateWorkflowIntent(%q) should return error", tt.input)
-			} else {
-				require.NoError(t, err, "ValidateWorkflowIntent(%q) should not return error", tt.input)
-			}
-		})
-	}
 }
 
 // TestSpec_PublicAPI_UpdateFieldInFrontmatter validates the documented frontmatter field update.
@@ -508,29 +589,6 @@ func TestSpec_PublicAPI_CalculateWorkflowHealth(t *testing.T) {
 		assert.False(t, health.BelowThresh, "BelowThresh should be false when all runs succeed")
 		assert.Equal(t, 4, health.SuccessCount, "SuccessCount should count all successful runs")
 	})
-}
-
-// TestSpec_PublicAPI_IsDockerAvailable validates that IsDockerAvailable returns a bool without panicking.
-// Spec: "Returns true if the Docker daemon is reachable"
-func TestSpec_PublicAPI_IsDockerAvailable(t *testing.T) {
-	result := cli.IsDockerAvailable(context.Background())
-	_ = result // environment-dependent; spec contract: returns bool without panic
-}
-
-// TestSpec_PublicAPI_IsDockerImageAvailable validates that IsDockerImageAvailable returns false
-// for an image that cannot be present locally.
-// Spec: "Returns true if a Docker image is present locally"
-func TestSpec_PublicAPI_IsDockerImageAvailable(t *testing.T) {
-	result := cli.IsDockerImageAvailable(context.Background(), "this-image-does-not-exist-xyzzy:never")
-	assert.False(t, result, "non-existent image should not be available locally")
-}
-
-// TestSpec_PublicAPI_IsDockerImageDownloading validates that IsDockerImageDownloading returns false
-// for an image that cannot be downloading.
-// Spec: "Returns true if an image pull is in progress"
-func TestSpec_PublicAPI_IsDockerImageDownloading(t *testing.T) {
-	result := cli.IsDockerImageDownloading("this-image-does-not-exist-xyzzy:never")
-	assert.False(t, result, "non-existent image should not be currently downloading")
 }
 
 // TestSpec_PublicAPI_CalculateHealthSummary validates the aggregate health computation documented in the spec.

@@ -8,13 +8,14 @@
  *
  * @param {string} owner - Repository owner
  * @param {string} repo - Repository name
+ * @param {{ runId?: number, serverUrl?: string }} [ctx] - GitHub Actions context (defaults to the global `context`)
  * @returns {{workflowName: string, workflowId: string, runId: number, runUrl: string}} Workflow metadata
  */
-function getWorkflowMetadata(owner, repo) {
+function getWorkflowMetadata(owner, repo, ctx = context) {
   const workflowName = process.env.GH_AW_WORKFLOW_NAME || "Workflow";
   const workflowId = process.env.GH_AW_WORKFLOW_ID || "";
-  const runId = context.runId ?? 0;
-  const runUrl = buildWorkflowRunUrl({ runId, serverUrl: context.serverUrl }, { owner, repo });
+  const runId = ctx.runId ?? 0;
+  const runUrl = buildWorkflowRunUrl({ runId, serverUrl: ctx.serverUrl }, { owner, repo });
 
   return { workflowName, workflowId, runId, runUrl };
 }
@@ -46,7 +47,24 @@ function buildWorkflowRunUrl(ctx, workflowRepo) {
   return `${server}/${owner}/${repo}/actions/runs/${ctx.runId}`;
 }
 
+/**
+ * Human-readable descriptions for GitHub event types, used in comment messages.
+ * Shared by handlers that describe the triggering event (e.g. "issue", "pull request").
+ * @type {Record<string, string>}
+ */
+const EVENT_TYPE_DESCRIPTIONS = {
+  issues: "issue",
+  pull_request: "pull request",
+  pull_request_comment: "pull request comment",
+  pull_request_review: "pull request review",
+  issue_comment: "issue comment",
+  pull_request_review_comment: "pull request review comment",
+  discussion: "discussion",
+  discussion_comment: "discussion comment",
+};
+
 module.exports = {
   getWorkflowMetadata,
   buildWorkflowRunUrl,
+  EVENT_TYPE_DESCRIPTIONS,
 };

@@ -3,10 +3,11 @@ private: true
 emoji: "🔬"
 name: Daily Formal Spec Verifier
 description: >
-  Picks one specification from specs/ daily, formalizes its properties using
-  Lean/F*/Z3/Coq/TLA+ notation (as a reasoning methodology, no runtime dependency),
-  and generates a Go testify unit-test suite covering all inferred behaviors.
-  Results are published as a GitHub issue.
+  Picks one specification from specs/ daily, incrementally adopts executable
+  TLA+/TLC or Koka models where appropriate, and generates a Go testify unit-test
+  suite covering the inferred behaviors. Other formal notation stays illustrative.
+  Results are delivered as a validated test-suite pull request.
+intent: Keep specification-derived implementation tests grounded in reproducible evidence while incrementally adopting executable models where they add value.
 on:
   schedule: daily
   workflow_dispatch:
@@ -22,19 +23,24 @@ engine:
 max-tool-denials: 3
 strict: true
 timeout-minutes: 25
+runs-on: ubuntu-24.04
+
+network:
+  allowed: [defaults, go]
 
 imports:
-  - uses: shared/daily-issue-base.md
-    with:
-      title-prefix: "[formal-spec] "
-      expires: 7d
-      labels: [automation, formal-verification, testing, specifications]
-      assignees: [copilot]
+  - shared/tla-plus.md
+  - shared/koka.md
+  - shared/lock-safe-pull-request.md
+  - shared/activation-app.md
+  - shared/reporting.md
   - shared/otlp.md
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
+    mounts:
+      - "/opt/gh-aw/formal-check:/opt/gh-aw/formal-check:ro"
 tools:
   cli-proxy: true
   github:
@@ -47,14 +53,51 @@ tools:
     max-file-size: 65536
   edit: null
   bash:
+    - "gofmt -w:*"
+    - "go test:*"
     - "find specs -type f -name \"*.md\" | sort"
+    - "cat /tmp/gh-aw/cache-memory/formal-spec-verifier/rotation.json"
     - "cat specs/*.md"
     - "find . -name \"*_test.go\" -path \"*/pkg/*\" | head -20"
     - "cat pkg/workflow/*.go | head -200"
     - "cat pkg/cli/*.go"
-    - "sed *"
+    - "find specs -type f -name \"*.tla\""
+    - "find specs -type f -name \"*.kk\""
+    - "sha256sum *"
+    - "node /opt/gh-aw/formal-check/formal_spec_check.cjs:*"
+
+steps:
+    - name: Validate fixture-based TLA+ installer
+      run: bash .github/scripts/install_tla_runtime_test.sh
+    - name: Stage verified Formal checker
+      if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo install -d -m 0755 /opt/gh-aw/formal-check
+        sudo install -m 0444 "$GITHUB_WORKSPACE/.github/scripts/formal_spec_check.cjs" /opt/gh-aw/formal-check/formal_spec_check.cjs
+        printf '%s  %s\n' a66fed02c32af32390cffdccc6850cd28cfb454f74748b0e4842e3c87f0a6770 /opt/gh-aw/formal-check/formal_spec_check.cjs | sha256sum --check --strict
+        node -e 'process.stdout.write(JSON.stringify({ workspace: process.env.GITHUB_WORKSPACE }) + "\n")' | sudo tee /opt/gh-aw/formal-check/workspace.json > /dev/null
+        sudo chmod 0444 /opt/gh-aw/formal-check/workspace.json
+        # runner-guard:ignore RGS-018 -- Default-branch checker is SHA-256 verified before execution; AWF mounts its directory read-only.
+
+post-steps:
+  - name: Upload formal verification evidence
+    if: always()
+    uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+    with:
+      name: formal-spec-verifier-${{ github.run_id }}-${{ github.run_attempt }}
+      path: /tmp/gh-aw/agent/formal-spec-verifier/
+      retention-days: 14
+      if-no-files-found: ignore
 
 safe-outputs:
+  create-pull-request:
+    exclude-lock-yml: true
+    title-prefix: "[formal-spec] "
+    expires: 7d
+    labels: [automation, formal-verification, testing, specifications]
+    max: 1
   mentions: false
   allowed-github-references: []
   max-bot-mentions: 1
@@ -66,12 +109,35 @@ features:
 
 # Daily Formal Spec Verifier 🔬
 
+Use only commands listed under `tools.bash`, one standalone command per call. Pipelines are permitted only when the complete pipeline is explicitly allowlisted. Do not append commands, redirections, or subshells to an allowed command. If a required operation is blocked, stop and report it instead of probing command variants.
+
+On the first tool denial, stop that operation and use a known permitted alternative:
+native file inspection for source and notes, or a standalone command below. Do not
+retry `go version`, `git log`, Python, or another ungranted discovery command.
+A workflow tool denial is not a GitHub authentication error; do not request new
+credentials or broader permissions. If a required capability has no permitted
+alternative, call `report_incomplete` before exhausting the three-denial budget.
+
+| Operation | Permitted standalone invocation |
+|---|---|
+| Read source or prior notes | Built-in file inspection tools, using the full path |
+| Check existing work | `gh pr list --state open --search "formal-spec" --json number,title` |
+| Format the generated test | `gofmt -w pkg/workflow/example_formal_test.go` (use the actual test path) |
+| Run focused tests | `go test ./pkg/workflow -run '^TestSelectedSpec' -count=1` (use the actual package and selector) |
+| Run a bounded formal check | `node /opt/gh-aw/formal-check/formal_spec_check.cjs sany specs/example.md Model.tla` (see the model contract below) |
+| Inspect formal-check evidence | Built-in file inspection on the exact `evidence.json` path printed by the helper |
+
 You are a formal methods expert and Go test engineer. Your mission is to:
 
 1. Select one specification file from `specs/` that has not been recently processed.
-2. Analyze it using formal verification reasoning (Lean 4 / F* / Z3 / Coq / TLA+ methodologies — as a notation and reasoning discipline, **not** as code to be executed).
+2. Choose the most appropriate method for its properties: optionally execute TLA+/TLC or Koka models, or keep formal notation illustrative when executable modeling adds no value.
 3. Generate a complete Go testify unit-test suite from the inferred formal model.
-4. Publish the formalization + test suite as a GitHub issue.
+4. Add and validate the test suite in the relevant package and publish a pull request with the formalization and any executable-model evidence.
+
+Follow the imported formal-methods guidance. Both pinned toolchains are prepared
+before the agent starts; their availability does not require using both on every
+spec. Keep the Go test suite mandatory, and migrate models one selected spec at
+a time rather than converting the specification corpus.
 
 ---
 
@@ -90,7 +156,7 @@ Schema:
 ```
 
 - On first run (file missing): initialize `{ "last_index": 0, "processed": [], "last_run": "" }`.
-- Run `find specs -type f -name '*.md' | sort` to get the full list.
+- Run exactly `find specs -type f -name "*.md" | sort` to get the full list. Run it separately from the cache read; do not add `head`, `wc`, `cd`, or other shell commands to it.
 - Select the spec at `(last_index + 1) % len(specs)` that is **not** in `processed` from the last 14 days.
 - If all specs were processed within the last 14 days, reset `processed` to `[]` and start from `last_index 0`.
 
@@ -121,14 +187,21 @@ Before analyzing the selected spec, check for existing notes from previous runs:
 ```
 
 If a note file exists for the selected spec, read it and use the prior predicate list as a starting point, extending or refining it rather than starting from scratch. If no prior notes exist, proceed fresh.
+Use built-in file inspection tools for note files; do not combine note and cache reads with shell commands.
+
+Reuse the note's model paths and verification mode when present, but rerun checks
+against current sources. Legacy notes without verification metadata remain valid
+notation-only entries; missing metadata is not evidence of a prior model pass.
 
 ---
 
 ## Step 2 — Read and Parse the Specification
 
-Read the selected spec file in full with `bash`.
+Read the selected spec file in full with built-in file inspection tools (or an allowed standalone `cat specs/*.md` command for a top-level spec). Do not combine reads or pipe them through `head`.
 
-Use built-in file inspection tools only for read-only analysis when bash output is insufficient. Do not modify repository files.
+Use built-in file inspection tools for analysis when bash output is insufficient.
+Modify only the selected specification's focused test suite, directly required
+test helpers, and its executable model/configuration when justified.
 
 Extract:
 
@@ -143,22 +216,120 @@ Extract:
 
 ---
 
-## Step 3 — Formalize Using Verification Language Notation
+## Step 3 — Choose the Appropriate Formal Method
 
 Produce a **Formal Model** section using the most appropriate notation(s) from:
 
 | Notation | Best for |
 |---|---|
-| **TLA+** | State machines, distributed protocols, temporal logic |
+| **TLA+ / TLC** | State machines, distributed protocols, temporal logic, bounded state-space exploration |
+| **Koka** | Typed functional models, explicit effects, deterministic handlers, tested transition behavior |
 | **Z3 / SMT-LIB** | Arithmetic constraints, solver-verified predicates |
 | **Lean 4 / Coq** | Type-theoretic proofs, inductive data types, lemmas |
 | **F\*** | Stateful effectful programs, pre/post contracts |
 
 Rules:
-- Use **pseudo-notation** clearly marked as illustrative (no actual compilation required).
+- Keep Lean, Coq, F*, and Z3/SMT-LIB **pseudo-notation** clearly marked as illustrative; no runtime is installed for them.
+- Prefer an existing runnable model for the selected spec. Use TLA+/TLC for temporal or concurrency properties and Koka for type/effect boundaries or handler behavior. Use both only for distinct complementary properties.
+- Staying notation-only is valid when executable modeling is disproportionate or adds no useful coverage; record the reason. Do not convert existing TLA+ temporal checks to Koka or claim Koka exhausts executions.
 - Annotate each predicate with the source sentence or paragraph from the spec.
 - Keep the formalization compact: prefer 5–15 top-level predicates / lemmas.
 - Map every formal predicate to a testable Go behavior.
+
+### Optional executable models and gradual adoption
+
+Inspect the selected spec's existing `.tla`/`.cfg` or `.kk` files and documented
+verification wrapper. Preserve tool compatibility, expected negative controls,
+and finite bounds. This workflow permits only the bounded formal-check helper
+below, not arbitrary repository wrappers or direct tool commands. If an existing
+model cannot use this contract without changing its semantics, keep it unchanged
+and report the incompatibility. Never run the whole corpus or download another tool.
+
+If no suitable model exists and modeling adds value, add a small model under
+`specs/formal/<spec-slug>/`, where the slug derives from the complete selected
+spec path relative to `specs/` (replace `/` with `-` and remove `.md`). The helper
+rejects colliding slugs (for example `a/b.md` and `a-b.md`); report those as
+incompatible rather than sharing a model directory. Commit
+the `.tla`/`.cfg` or `.kk` sources with the Go tests. Do not add markdown files
+there that would enter the spec rotation, port production code to Koka, or
+introduce a Koka dependency into the Go application's build.
+
+Use `node /opt/gh-aw/formal-check/formal_spec_check.cjs` with one operation per call:
+
+```text
+node /opt/gh-aw/formal-check/formal_spec_check.cjs sany specs/<selected-spec>.md Model.tla
+node /opt/gh-aw/formal-check/formal_spec_check.cjs tlc specs/<selected-spec>.md Model.tla Model.cfg
+node /opt/gh-aw/formal-check/formal_spec_check.cjs koka specs/<selected-spec>.md main.kk
+```
+
+Replace the specification path and model basenames with actual files. The helper
+derives `<spec-slug>` from the complete selected spec path, accepts models only
+under `specs/formal/<spec-slug>/`, and rejects path traversal, symlinks, unknown
+operations, and extra arguments. Do not edit the helper. Models needing different
+paths or unsupported flags must be reported as incompatible, not run through an
+ungranted `cd`, `timeout`, interpreter, or wrapper.
+
+The default-branch setup verifies the staged helper's checksum and records the
+workspace in its adjacent read-only configuration. AWF binds the entire helper
+directory read-only; the allowlist does not grant the checkout copy. This protects
+the helper/configuration, not mutable model, toolchain, or budget files.
+
+The helper supports single-file models only. TLA+ `INSTANCE` and local `EXTENDS`
+dependencies are unsupported; the only allowed `EXTENDS` modules are the pinned
+standard modules Naturals, Integers, Reals, Sequences, FiniteSets, Bags, TLC, TLCExt,
+and Randomization. Koka models must not contain `import`, `extern`, or `include`
+tokens (even in comments/strings). Report other dependency contracts as
+incompatible before running. Validated model/configuration bytes are hashed and
+copied into a fresh inputs directory; execution uses those copies, not the
+mutable checkout, so neighboring files cannot shadow pinned standard modules.
+
+The helper uses only the pinned tool paths from shared setup. It runs from the
+fresh inputs directory, creates fresh evidence/build directories under
+`/tmp/gh-aw/agent/formal-spec-verifier/<spec-slug>/`, and captures tool versions,
+source hashes, exact arguments, raw process statuses, validation statuses, and bounded, redacted stdout/stderr
+previews in each run's `evidence.json`. Use built-in file inspection on the exact
+`evidence.json` path printed by the helper, not a shell glob over slug directories.
+Each child gets a fixed system toolchain `PATH`, locale, and timezone, plus fresh
+`HOME` and `TMPDIR` directories; no agent credentials or runtime hooks are inherited.
+Child output capture uses a 64 KiB `maxBuffer`; excessive output fails the check.
+Persisted previews are limited to 8 KiB per stream with truncation flags, and known
+sensitive inherited values are redacted from previews and process errors. Raw logs
+are not persisted. This environment cleanup is not filesystem isolation; do not
+read credentials or other agent files from models. The helper enforces
+`timeout --kill-after=30s`, at most 2 minutes per compilation or TLC invocation,
+30 seconds per Koka executable, and a shared **8-minute total** formal-check
+budget. TLC uses 2 workers and a 2 GiB Java heap. Leave at least 10 minutes for Go
+tests and delivery; narrow the model before starting if these limits cannot fit.
+The helper reserves the entire remaining shared budget before starting children
+and refunds unused time only after confirmed child completion. An interrupted
+check or uncertain child termination conservatively exhausts the remaining
+budget. Live lock owners cause an explicit wait message; dead owners are
+recovered without deleting lock generations or refunding interrupted work.
+Never remove or edit budget/lock files; report exhaustion instead.
+
+For TLA+, run SANY and the documented TLC configuration, retaining exhaustion
+status, checked invariants/temporal properties, state counts, and counterexamples.
+For Koka, compile from the model's directory with the build directory and output
+executable under the transient results path, then execute its assertions and
+deterministic handlers. Include an intentional negative control for new models
+and check its expected diagnostic/verdict, not just a nonzero exit code. Confirm
+Koka's native C compiler/header availability through the helper's compile
+validation status and captured diagnostic previews. Do not run `which`, compiler
+version probes, or header-discovery commands; report a failed compile instead.
+Simulate external effects with deterministic handlers; do not use live GitHub
+mutations, services, or credentials as model fixtures.
+
+Record source/config hashes, tool versions, exact commands, exit statuses,
+bounds, verdicts, and the helper's bounded, redacted output previews in that results directory.
+Do not treat a truncated preview as complete evidence; narrow the model or report
+the evidence limitation. Link
+the `formal-spec-verifier-<run_id>-<run_attempt>` artifact and summarize evidence
+in the PR's Formal Model and Usage sections. Distinguish expected negative
+controls from genuine violations, timeouts, parse errors, and tooling failures.
+Once an executable check is attempted, an unexpected failure is
+`report_incomplete`, never a silent fallback to a passing notation-only result.
+An exhausted finite TLC model is not an unbounded proof; Koka compilation and
+passing assertions do not prove temporal properties or verify the Go code.
 
 ---
 
@@ -175,27 +346,29 @@ Produce a complete Go test file that:
 - Includes a leading comment block that references the specification file and lists the formal predicates the tests encode.
 - All assertions include a descriptive message string.
 
-Use existing types, functions, and interfaces from the codebase where possible (read relevant `.go` files in `pkg/` with bash). When no concrete implementation exists yet, write the test against a **minimal stub interface** at the top of the test file, clearly marked `// stub — replace with real implementation`.
+Use existing types, functions, and interfaces from the codebase (read relevant `.go` files in `pkg/`). Do not deliver placeholder stub interfaces or tests that merely test their own fake implementation. If no concrete implementation exists, report that blocker with `report_incomplete`.
 
 ---
 
-## Step 5 — Create Issue
+## Step 5 — Validate and Create a Pull Request
 
-Create exactly one issue using the `create_issue` safe output.
+Write the complete test file into its package, run `gofmt` and focused `go test` selectors,
+and commit locally. Create exactly one pull request using `create_pull_request` with
+`title`, `body`, and the committed local `branch`.
 
 ### Output Contract (Required)
 
-1. Draft the title and body locally first if needed, but emit exactly one final `create_issue` safe output only after the full payload is complete.
-2. Do **not** use `bash`, `cli-proxy`, or the `safeoutputs` CLI to create the issue or inspect the tool schema. Emit the safe output directly with `title` and `body` arguments.
-3. Do **not** use `python3`, `node`, `jq`, or any other scripting runtime to construct or validate the issue payload — build the body string inline and emit the safe output directly.
-4. Never retry `create_issue` with empty, placeholder, or partial arguments.
-5. If the quality checks below cannot be met, emit `report_incomplete` directly as a safe output instead of `create_issue`.
+1. Draft the title and body locally first if needed, but emit exactly one final `create_pull_request` only after implementation and validation are complete.
+2. Use the configured safe-output transport. With `cli-proxy`, invoke `safeoutputs create_pull_request '<JSON>'` with a complete JSON object containing `title`, `body`, and `branch`. Inside JSON strings, encode newlines as `\n`, double quotes as `\"`, backslashes as `\\`, and apostrophes as `\u0027`; Unicode can remain literal. If a direct safe-output tool is exposed instead, call it with the same arguments.
+3. Do **not** use `python3`, `node`, `jq`, or any other scripting runtime to construct or validate the pull request payload — build the body string inline. Do not redirect it to a file.
+4. Never retry `create_pull_request` with empty, placeholder, or partial arguments.
+5. If the quality checks below cannot be met, emit `report_incomplete` through the same transport. With `cli-proxy`, use `safeoutputs report_incomplete '{"reason":"<concrete blocker>"}'`; never substitute a prose-only failure report.
 
-### Issue format
+### Pull request format
 
 Title: `[formal-spec] <SpecFileName> — Formal model & test suite — <YYYY-MM-DD>`
 
-Use `###` or lower for all headers in your report. Never use `#` (h1) or `##` (h2) — these are reserved for the issue title rendered by GitHub.
+Use `###` or lower for all headers in your report. Never use `#` (h1) or `##` (h2) — these are reserved for the pull request title rendered by GitHub.
 
 Wrap long sections (>5 items, detailed lists, raw data) in `<details><summary><b>Section Name</b></summary>` blocks to keep the report scannable.
 
@@ -210,14 +383,18 @@ One-paragraph description of the spec and what was formalized.
 
 - **File**: `specs/<name>.md`
 - **Focus area**: <component or protocol>
-- **Formal notation used**: <TLA+ / Lean 4 / Z3 / F* / mixed>
+- **Formal notation used**: <TLA+ / Koka / Lean 4 / Z3 / F* / mixed>
 
 ### Formal Model
 
 <details>
-<summary><b>Predicates and invariants (illustrative notation)</b></summary>
+<summary><b>Predicates, invariants, and verification evidence</b></summary>
 
-<one predicate / lemma block per invariant>
+<one predicate / lemma block per invariant; distinguish illustrative notation,
+TLC model checking, and Koka type/effect checking plus behavioral assertions>
+
+<selected method and rationale, committed model paths when applicable,
+observed bounded verdicts and artifact reference, or notation-only reason>
 
 </details>
 
@@ -241,9 +418,9 @@ One-paragraph description of the spec and what was formalized.
 
 ### Usage
 
-1. Copy the test file to the appropriate package directory.
-2. Replace any `// stub` interfaces with real implementations.
-3. Run: `go test ./... -run Formal`
+1. Identify the committed test file in its package directory.
+2. Describe the real implementation APIs exercised.
+3. Include the exact focused `go test` command and observed result.
 
 ### Context
 
@@ -254,19 +431,19 @@ One-paragraph description of the spec and what was formalized.
 
 ### Output quality bar
 
-Before emitting `create_issue`, verify the body:
+Before emitting `create_pull_request`, verify the body and committed tests:
 - Contains all required sections (`Summary`, `Specification`, `Formal Model`, `Behavioral Coverage Map`, `Generated Test Suite`, `Usage`, `Context`).
 - Has at least 5 rows in the Behavioral Coverage Map.
-- The generated test file has no obvious syntax errors — **visual review only**: scan for mismatched braces, missing imports, and undefined identifiers. Do **not** run `go build`, `go test`, `go version`, `python3`, `node`, `jq`, or any compiler or runtime to verify.
+- The generated test file is formatted and its focused Go tests passed against real implementation APIs.
 - Is at least 1200 characters long.
 
-If these checks cannot be met, emit `report_incomplete` directly as a safe output instead of `create_issue`.
+If these checks cannot be met, emit `report_incomplete` instead of an unvalidated pull request.
 
 ---
 
 ## Step 6 — Persist Rotation State
 
-After `create_issue` succeeds, write updated `rotation.json` to
+After `create_pull_request` is staged successfully, write updated `rotation.json` to
 `/tmp/gh-aw/cache-memory/formal-spec-verifier/rotation.json`:
 
 - Increment `last_index`.
@@ -290,7 +467,11 @@ Write `/tmp/gh-aw/repo-memory/default/formal-spec-verifier/<spec-slug>.md`:
 # Formal Notes: <SpecFileName>
 
 **Last formalized**: <YYYY-MM-DD-HH-MM-SS>
-**Notation**: <TLA+ / Lean 4 / Z3 / F* / mixed>
+**Notation**: <TLA+ / Koka / Lean 4 / Z3 / F* / mixed>
+**Verification mode**: <notation-only / tlc / koka / tlc+koka>
+**Model paths**: <committed source/config paths, or none>
+**Checked source hashes**: <hashes from this run, or not applicable>
+**Verdict and evidence**: <bounded verdicts and artifact reference, or not attempted>
 **Issue**: #<number>
 
 ## Predicates
@@ -318,14 +499,17 @@ Write `/tmp/gh-aw/repo-memory/default/formal-spec-verifier/<spec-slug>.md`:
 Read `/tmp/gh-aw/repo-memory/default/formal-spec-verifier/notes-index.json` (or initialize
 `{"specs": {}}` if absent), add or update the entry for the selected spec, and write the
 file back.
+Preserve existing fields and add `verification_mode`, `model_paths`,
+`source_hashes`, and `last_verdict` for this run. This lets later rotations
+incrementally reuse validated models without treating old notes as current proof.
 
 ---
 
 ## Constraints
 
-- **No runtime dependency on Lean, F*, Z3, Coq, or TLA+.** All formal notation is illustrative only — embedded as quoted blocks in the issue body.
+- **Lean, F*, Z3, and Coq remain notation-only.** TLA+/TLC and Koka are optional executable checks using the preinstalled pinned tools; never install or upgrade tools from the agent.
 - **No network calls** beyond what the tools provide.
 - **Keep the prompt-body loop tight**: read the spec once, formalize once, write the test file once.
 - Use `noop` with a brief explanation if no spec can be selected (e.g. all were processed today).
-- **Before finishing, confirm you called exactly one terminal safe output:** `create_issue`, `report_incomplete`, or `noop`.
-- **Tool budget awareness**: If you are approaching the tool call limit, emit a partial result immediately rather than continuing to gather more data. Use this priority order: (1) if the formalization and test suite sections are both substantially complete (at least 5 predicates and 3 test functions), emit a partial `create_issue` with what is available; (2) otherwise, emit `report_incomplete` immediately.
+- **Before finishing, confirm you called exactly one terminal safe output:** `create_pull_request`, `report_incomplete`, or `noop`.
+- **Tool budget awareness**: Reserve time for focused validation and delivery. If the quality bar or validation cannot be completed, emit `report_incomplete`; never publish a partial or unvalidated test suite.

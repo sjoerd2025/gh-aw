@@ -24,7 +24,38 @@ func TestDockerImagePredownload(t *testing.T) {
 		expectedImages []string
 		manifestImages []string
 		expectStep     bool
+		pullPolicy     string
 	}{
+		{
+			name: "Local-only policy reaches agent download step",
+			frontmatter: `---
+on: issues
+engine: claude
+docker-image-pull-policy: never
+tools:
+  github:
+---
+
+# Test
+Test workflow.`,
+			expectStep: true,
+			pullPolicy: "never",
+		},
+		{
+			name: "Explicit always policy reaches agent download step",
+			frontmatter: `---
+on: issues
+engine: claude
+docker-image-pull-policy: always
+tools:
+  github:
+---
+
+# Test
+Test workflow.`,
+			expectStep: true,
+			pullPolicy: "always",
+		},
 		{
 			name: "GitHub tool generates image download step",
 			frontmatter: `---
@@ -135,6 +166,13 @@ Test workflow - safe outputs MCP server without GitHub tool.`,
 
 			// If we expect a step, verify the images are present
 			if tt.expectStep {
+				for _, policy := range []string{"always", "never"} {
+					got := strings.Contains(string(yaml), "GH_AW_DOCKER_IMAGE_PULL_POLICY: "+policy)
+					want := tt.pullPolicy == policy
+					if got != want {
+						t.Errorf("download policy %q present = %v, want %v", policy, got, want)
+					}
+				}
 				// Verify the script call is present
 				if !strings.Contains(string(yaml), "bash \"${RUNNER_TEMP}/gh-aw/actions/download_docker_images.sh\"") {
 					t.Error("Expected to find 'bash \"${RUNNER_TEMP}/gh-aw/actions/download_docker_images.sh\"' script call in generated YAML")
@@ -223,5 +261,44 @@ Test workflow.`
 	// Verify the download step comes before setup step
 	if downloadPos > setupPos {
 		t.Errorf("Expected 'Download container images' to come before 'Start MCP Gateway', but found it after")
+	}
+}
+
+func TestMCPGatewayDockerCommandMatchesPredownloadImage(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "gateway-image-pin-test")
+	testFile := filepath.Join(tmpDir, "test-workflow.md")
+	workflow := "---\non: issues\nengine: claude\ntools:\n  github:\n---\n# Test\nTest workflow."
+	if err := os.WriteFile(testFile, []byte(workflow), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewCompiler().CompileWorkflow(testFile); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(stringutil.MarkdownToLockFile(testFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	image := resolveContainerImage(constants.DefaultMCPGatewayContainer+":"+string(constants.DefaultMCPGatewayVersion), nil)
+	if !strings.Contains(image, "@sha256:") {
+		t.Fatalf("Default gateway image is not pinned: %s", image)
+	}
+	for _, prefix := range []string{
+		"export MCP_GATEWAY_DOCKER_COMMAND=",
+		`bash "${RUNNER_TEMP}/gh-aw/actions/download_docker_images.sh"`,
+	} {
+		found := false
+		for _, line := range strings.Split(string(content), "\n") {
+			if strings.Contains(line, prefix) {
+				found = true
+				if !strings.Contains(line, image) {
+					t.Errorf("%s does not use pinned image %s: %s", prefix, image, line)
+				}
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Missing %s in compiled lock", prefix)
+		}
 	}
 }

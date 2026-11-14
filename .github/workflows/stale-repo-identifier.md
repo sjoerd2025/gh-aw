@@ -13,6 +13,7 @@ on:
   schedule: "15 9 1 * *"  # Monthly on the 1st at ~9 AM UTC (offset to avoid thundering herd)
 
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
@@ -21,11 +22,13 @@ permissions:
 concurrency:
   job-discriminator: ${{ inputs.organization || github.run_id }}
 
-engine: copilot
+engine: pi
+model: copilot/gpt-5.6-luna
 strict: true
 timeout-minutes: 45
 
 imports:
+  - shared/mcp-pagination.md
   - shared/github-guard-policy.md
   - uses: shared/daily-audit-charts.md
     with:
@@ -33,6 +36,7 @@ imports:
   - ../skills/jqschema/SKILL.md
 
   - shared/otlp.md
+  - shared/reporting.md
 network:
   allowed:
     - defaults
@@ -86,7 +90,7 @@ env:
 steps:
   - name: Run stale-repos
     id: stale-repos
-    uses: github/stale-repos@v9.0.16
+    uses: github/stale-repos@v9.1.1
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ORGANIZATION: ${{ env.ORGANIZATION }}

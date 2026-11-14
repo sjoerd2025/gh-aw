@@ -24,11 +24,168 @@ const workflowCallRepo = "${{ steps.resolve-host-repo.outputs.target_repo }}"
 // Uses target_checkout_ref (job.workflow_sha) for immutable pinning to the exact executing revision.
 const workflowCallRef = "${{ steps.resolve-host-repo.outputs.target_checkout_ref }}"
 
+// pullRequestActivationRef pins activation-time runtime imports and skills to base
+// branch content for pull request events, while preserving existing checkout refs
+// for non-PR events in mixed-trigger workflows.
+const pullRequestActivationRef = "${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment') && github.event.pull_request != null && github.event.pull_request.base.sha || github.sha }}"
+
 // sameRepoCondition is the if: condition injected into the .github checkout step when
 // no custom activation token is configured. It restricts the checkout to same-repo
 // workflow_call invocations to prevent failures when GITHUB_TOKEN cannot read a private
 // callee repository in cross-repo scenarios.
 const sameRepoCondition = "steps.resolve-host-repo.outputs.target_repo == github.repository"
+
+func TestActivationArtifactUploadRunsAfterSuccessOrFailure(t *testing.T) {
+	compiler := NewCompiler()
+	job, err := compiler.buildActivationJob(&WorkflowData{Name: "Test Workflow"}, false, "", "test.lock.yml")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	steps := strings.Join(job.Steps, "")
+	uploadStep := extractWorkflowStepByName(t, steps, "Upload activation artifact")
+	assert.Contains(t, uploadStep, "if: success() || failure()")
+	assert.NotContains(t, uploadStep, "if: always()")
+	for _, filename := range []string{"system.txt", "user.txt", "prompt.txt", "prompt-literal-values.json"} {
+		assert.Contains(t, uploadStep, "/tmp/gh-aw/aw-prompts/"+filename)
+	}
+}
+
+func TestDynamicWorkflowsSavedWhenPRCheckoutDisabled(t *testing.T) {
+	enabled, disabled := true, false
+	engine := NewClaudeEngine()
+	engine.id = "dynamic-test"
+	compiler := NewCompiler()
+	require.NoError(t, compiler.engineRegistry.Register(engine))
+	data := &WorkflowData{
+		Name: "Dynamic workflows",
+		AI:   "dynamic-test",
+		EngineConfig: &EngineConfig{
+			ID:               "dynamic-test",
+			DynamicWorkflows: &enabled,
+		},
+		CheckoutConfigs: []*CheckoutConfig{{PullRequest: &disabled}},
+	}
+	job, err := compiler.buildActivationJob(data, false, "", "dynamic.lock.yml")
+	require.NoError(t, err)
+	steps := strings.Join(job.Steps, "")
+	save := extractWorkflowStepByName(t, steps, "Save agent config folders for base branch restoration")
+	assert.Contains(t, save, `GH_AW_AGENT_FOLDERS: ".agents .claude .github"`)
+	assert.Contains(t, extractWorkflowStepByName(t, steps, "Upload activation artifact"), "/tmp/gh-aw/base")
+	assert.Less(t, strings.Index(steps, "Save agent config folders for base branch restoration"), strings.Index(steps, "Upload activation artifact"))
+}
+
+func TestClaudeWorkflowsNotSavedWhenDynamicWorkflowsDisabled(t *testing.T) {
+	disabled := false
+	data := &WorkflowData{
+		Name: "Claude workflows",
+		AI:   "claude",
+		EngineConfig: &EngineConfig{
+			ID:               "claude",
+			DynamicWorkflows: &disabled,
+		},
+		CheckoutConfigs: []*CheckoutConfig{{PullRequest: &disabled}},
+	}
+	job, err := NewCompiler().buildActivationJob(data, false, "", "claude.lock.yml")
+	require.NoError(t, err)
+
+	assert.NotContains(t, strings.Join(job.Steps, ""), "Save agent config folders for base branch restoration")
+}
+
+func TestCopilotDynamicWorkflowsSnapshotWithPRCheckoutDisabled(t *testing.T) {
+	enabled, disabled := true, false
+	for _, tt := range []struct {
+		name    string
+		setting *bool
+		want    bool
+	}{
+		{name: "default"},
+		{name: "enabled", setting: &enabled, want: true},
+		{name: "disabled", setting: &disabled},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &WorkflowData{
+				Name: "Copilot workflows",
+				AI:   "copilot",
+				EngineConfig: &EngineConfig{
+					ID:               "copilot",
+					DynamicWorkflows: tt.setting,
+				},
+				CheckoutConfigs: []*CheckoutConfig{{PullRequest: &disabled}},
+			}
+			job, err := NewCompiler().buildActivationJob(data, false, "", "copilot.lock.yml")
+			require.NoError(t, err)
+			steps := strings.Join(job.Steps, "")
+			if tt.want {
+				save := extractWorkflowStepByName(t, steps, "Save agent config folders for base branch restoration")
+				assert.Contains(t, save, `GH_AW_AGENT_FOLDERS: ".agents .github"`)
+				assert.Contains(t, extractWorkflowStepByName(t, steps, "Upload activation artifact"), "/tmp/gh-aw/base")
+			} else {
+				assert.NotContains(t, steps, "Save agent config folders for base branch restoration")
+			}
+		})
+	}
+}
+
+func TestWorkQueueSnapshotIsPreparedAndUploaded(t *testing.T) {
+	compiler := NewCompiler()
+	data := &WorkflowData{
+		Name:  "Work Queue",
+		Tools: map[string]any{"work-queue": true},
+	}
+	job, err := compiler.buildActivationJob(data, false, "", "queue.lock.yml")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	steps := strings.Join(job.Steps, "")
+	snapshotStep := extractWorkflowStepByName(t, steps, "Snapshot work queue state")
+	assert.Contains(t, snapshotStep, "write_work_queue_snapshot.cjs")
+	uploadStep := extractWorkflowStepByName(t, steps, "Upload activation artifact")
+	assert.Contains(t, uploadStep, "/tmp/gh-aw/work-queue.snapshot.json")
+	assert.Contains(t, job.Permissions, "contents: read")
+	assert.Contains(t, job.Permissions, "actions: read")
+	assert.Equal(t, "${{ steps.work_queue_snapshot.outputs.work_queue_origin }}", job.Outputs["work_queue_origin"])
+}
+
+func TestWorkQueueWorkerActivationCanPublishOnlyTrustedBindingBeforeEffects(t *testing.T) {
+	data := &WorkflowData{Tools: map[string]any{"work-queue": map[string]any{"worker": true}}, StaleCheckDisabled: true}
+	require.NoError(t, validateWorkQueueConfiguration(data))
+	job, err := NewCompiler().buildActivationJob(data, false, "", "worker.lock.yml")
+	require.NoError(t, err)
+	assert.Contains(t, job.Permissions, "contents: write")
+	assert.Contains(t, job.Permissions, "actions: read")
+	assert.Contains(t, strings.Join(job.Steps, ""), `GH_AW_WORK_QUEUE_ROLE: "worker"`)
+}
+
+func TestActivationInfoArtifactUpload(t *testing.T) {
+	t.Run("uploads archived info artifact", func(t *testing.T) {
+		compiler := NewCompiler()
+		job, err := compiler.buildActivationJob(&WorkflowData{Name: "Test Workflow"}, false, "", "test.lock.yml")
+		require.NoError(t, err)
+		require.NotNil(t, job)
+
+		uploadStep := extractWorkflowStepByName(t, strings.Join(job.Steps, ""), "Upload info artifact")
+		assert.Contains(t, uploadStep, "if: success() || failure()")
+		assert.Contains(t, uploadStep, "name: info")
+		assert.Contains(t, uploadStep, "path: /tmp/gh-aw/aw_info.json")
+		assert.Contains(t, uploadStep, "if-no-files-found: ignore")
+		assert.NotContains(t, uploadStep, "skip-archive")
+		assert.NotContains(t, uploadStep, "unarchived-artifact")
+		assert.NotContains(t, uploadStep, "retention-days")
+	})
+
+	t.Run("uses GHES-compatible upload action", func(t *testing.T) {
+		compiler := NewCompiler()
+		compiler.SetGHESCompat(true)
+		compiler.configureGHESCompatibility()
+		job, err := compiler.buildActivationJob(&WorkflowData{Name: "Test Workflow"}, false, "", "test.lock.yml")
+		require.NoError(t, err)
+		require.NotNil(t, job)
+
+		uploadStep := extractWorkflowStepByName(t, strings.Join(job.Steps, ""), "Upload info artifact")
+		assert.Contains(t, uploadStep, "actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2")
+		assert.NotContains(t, uploadStep, "unarchived-artifact")
+	})
+}
 
 func TestGenerateCheckoutGitHubFolderForActivation_WorkflowCall(t *testing.T) {
 	tests := []struct {
@@ -73,6 +230,19 @@ func TestGenerateCheckoutGitHubFolderForActivation_WorkflowCall(t *testing.T) {
 			wantSameRepoCondition: true, // no custom token → restrict to same-repo only
 		},
 		{
+			name: "workflow_call mixed with pull_request pins pull_request activation checkout to base sha",
+			onSection: `"on":
+  pull_request:
+    types: [opened]
+  workflow_call:`,
+			wantRepository:        workflowCallRepo,
+			wantRef:               "${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment') && github.event.pull_request != null && github.event.pull_request.base.sha || steps.resolve-host-repo.outputs.target_checkout_ref }}",
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: true,
+		},
+		{
 			name: "workflow_call with inlined-imports - standard checkout without cross-repo expression",
 			onSection: `"on":
   workflow_call:`,
@@ -95,6 +265,68 @@ func TestGenerateCheckoutGitHubFolderForActivation_WorkflowCall(t *testing.T) {
 			wantPersistFalse:      true,
 			wantFetchDepth1:       true,
 			wantSameRepoCondition: false, // non-workflow_call trigger → no same-repo condition
+		},
+		{
+			name: "pull_request trigger pins activation checkout to base sha",
+			onSection: `"on":
+  pull_request:
+    types: [opened, ready_for_review, labeled]`,
+			wantRepository:        "",
+			wantRef:               pullRequestActivationRef,
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
+		},
+		{
+			name: "pull_request mixed with issue trigger pins only pull_request events to base sha",
+			onSection: `"on":
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]`,
+			wantRepository:        "",
+			wantRef:               pullRequestActivationRef,
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
+		},
+		{
+			name: "pull_request_review trigger pins activation checkout to base sha",
+			onSection: `"on":
+  pull_request_review:
+    types: [submitted]`,
+			wantRepository:        "",
+			wantRef:               pullRequestActivationRef,
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
+		},
+		{
+			name: "pull_request_review_comment trigger pins activation checkout to base sha",
+			onSection: `"on":
+  pull_request_review_comment:
+    types: [created]`,
+			wantRepository:        "",
+			wantRef:               pullRequestActivationRef,
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
+		},
+		{
+			name: "pull_request_target does not match pull_request base checkout pin",
+			onSection: `"on":
+  pull_request_target:
+    types: [opened]`,
+			wantRepository:        "",
+			wantRef:               "",
+			wantGitHubSparse:      true,
+			wantPersistFalse:      true,
+			wantFetchDepth1:       true,
+			wantSameRepoCondition: false,
 		},
 		{
 			name: "issue_comment only - no repository field",
@@ -813,6 +1045,45 @@ func TestGenerateCheckoutGitHubFolderForActivation_ActionsModeSetupPath(t *testi
 	}
 }
 
+func TestGenerateCheckoutGitHubFolderForActivation_LocalSkillSparseCheckout(t *testing.T) {
+	c := NewCompiler(WithVersion("dev"))
+	c.SetActionMode(ActionModeRelease)
+	data := &WorkflowData{
+		On: `"on":
+  issues:
+    types: [opened]`,
+		SkillReferences: []SkillReference{
+			{Skill: "skills/rig"},
+			{Skill: "./skills/another"},
+			{Skill: ".github/skills/infra"},
+			{Skill: "githubnext/skills@1f181b37d3fe5862ab590648f25a292e345b5de6"},
+		},
+	}
+
+	steps := c.generateCheckoutGitHubFolderForActivation(data)
+	combined := strings.Join(steps, "")
+
+	assert.Contains(t, combined, "\n            skills\n", "local skill dirs outside .github/.agents should be included in sparse checkout")
+	assert.Equal(t, 1, strings.Count(combined, "\n            skills\n"), "top-level local skill dir should not be duplicated")
+	assert.Contains(t, combined, "\n            .github\n", ".github remains in sparse checkout by default")
+}
+
+func TestLocalSkillSparseCheckoutTopLevelDirs(t *testing.T) {
+	data := &WorkflowData{
+		SkillReferences: []SkillReference{
+			{Skill: "skills/rig"},
+			{Skill: "./skills/another"},
+			{Skill: ".github/skills/infra"},
+			{Skill: "team-skills"},
+			{Skill: "skills/../bad"},
+			{Skill: "../outside"},
+			{Skill: "githubnext/skills@1f181b37d3fe5862ab590648f25a292e345b5de6"},
+		},
+	}
+
+	assert.Equal(t, []string{"skills", ".github", "team-skills"}, localSkillSparseCheckoutTopLevelDirs(data))
+}
+
 // TestGenerateGitHubFolderCheckoutStep_ExtraPaths verifies that extraPaths are
 // correctly appended to the sparse-checkout list.
 func TestGenerateGitHubFolderCheckoutStep_ExtraPaths(t *testing.T) {
@@ -942,6 +1213,7 @@ func TestCheckoutSameRepoGuardWithCustomToken(t *testing.T) {
 	tests := []struct {
 		name                  string
 		activationToken       string
+		activationApp         *GitHubAppConfig
 		onSection             string
 		wantSameRepoCondition bool
 	}{
@@ -958,6 +1230,34 @@ func TestCheckoutSameRepoGuardWithCustomToken(t *testing.T) {
 			onSection: `"on":
   workflow_call:`,
 			wantSameRepoCondition: true,
+		},
+		{
+			name:            "explicit GITHUB_TOKEN with workflow_call - same-repo guard present",
+			activationToken: "${{ secrets.GITHUB_TOKEN }}",
+			onSection: `"on":
+  workflow_call:`,
+			wantSameRepoCondition: true,
+		},
+		{
+			name: "GitHub App with ignore-if-missing and workflow_call - same-repo guard present",
+			activationApp: &GitHubAppConfig{
+				AppID:           "${{ vars.APP_ID }}",
+				PrivateKey:      "${{ secrets.APP_KEY }}",
+				IgnoreIfMissing: true,
+			},
+			onSection: `"on":
+  workflow_call:`,
+			wantSameRepoCondition: true,
+		},
+		{
+			name: "required GitHub App with workflow_call - no same-repo guard",
+			activationApp: &GitHubAppConfig{
+				AppID:      "${{ vars.APP_ID }}",
+				PrivateKey: "${{ secrets.APP_KEY }}",
+			},
+			onSection: `"on":
+  workflow_call:`,
+			wantSameRepoCondition: false,
 		},
 		{
 			name:            "default GITHUB_TOKEN without workflow_call - no same-repo guard",
@@ -977,6 +1277,7 @@ func TestCheckoutSameRepoGuardWithCustomToken(t *testing.T) {
 			data := &WorkflowData{
 				On:                    tt.onSection,
 				ActivationGitHubToken: tt.activationToken,
+				ActivationGitHubApp:   tt.activationApp,
 			}
 
 			result := c.generateCheckoutGitHubFolderForActivation(data)
@@ -1066,7 +1367,7 @@ func TestBuildActivationJobWrapsRepositoryStepErrors(t *testing.T) {
 	compiler := NewCompiler(WithVersion("dev"))
 	compiler.SetActionMode(ActionModeDev)
 
-	// Using the opencode engine with a malformed model (leading slash → empty provider prefix)
+	// Using the Pi engine with a malformed model (leading slash → empty provider prefix)
 	// causes computeActivationSanitizationDomains to return an error. NeedsTextOutput must
 	// be true so that addActivationTextOutputStep is reached and the error is triggered.
 	data := &WorkflowData{
@@ -1074,7 +1375,7 @@ func TestBuildActivationJobWrapsRepositoryStepErrors(t *testing.T) {
 		NeedsTextOutput: true,
 		Model:           "/bad-provider",
 		EngineConfig: &EngineConfig{
-			ID: "opencode",
+			ID: "pi",
 		},
 	}
 
@@ -1232,5 +1533,72 @@ func TestResolveSymlinkExtraPaths(t *testing.T) {
 			}
 		}
 		assert.Equal(t, 1, count, "already-present path should not be duplicated")
+	})
+}
+
+func TestActivationEventSet(t *testing.T) {
+	t.Run("string on value", func(t *testing.T) {
+		events, ok := activationEventSet("on: issues")
+		require.True(t, ok)
+		assert.Equal(t, map[string]struct{}{"issues": {}}, events)
+	})
+
+	t.Run("list on value", func(t *testing.T) {
+		events, ok := activationEventSet("on: [issues, pull_request]")
+		require.True(t, ok)
+		assert.Equal(t, map[string]struct{}{"issues": {}, "pull_request": {}}, events)
+	})
+
+	t.Run("map on value excludes metadata trigger fields", func(t *testing.T) {
+		onSection := "on:\n  issues:\n    types: [opened]\n  reaction: eyes\n  stop-after: +48h\n"
+		events, ok := activationEventSet(onSection)
+		require.True(t, ok)
+		assert.Equal(t, map[string]struct{}{"issues": {}}, events, "metadata fields like reaction/stop-after should be excluded")
+	})
+
+	t.Run("invalid yaml returns not ok", func(t *testing.T) {
+		events, ok := activationEventSet("on: [unterminated")
+		assert.False(t, ok)
+		assert.Empty(t, events)
+	})
+
+	t.Run("missing on key returns not ok", func(t *testing.T) {
+		events, ok := activationEventSet("permissions:\n  contents: read\n")
+		assert.False(t, ok)
+		assert.Empty(t, events)
+	})
+
+	t.Run("unsupported on value type returns not ok", func(t *testing.T) {
+		events, ok := activationEventSet("on: 5\n")
+		assert.False(t, ok)
+		assert.Empty(t, events)
+	})
+}
+
+func TestBuildCentralizedCommandOnSection(t *testing.T) {
+	t.Run("single event produces synthetic on section", func(t *testing.T) {
+		result := buildCentralizedCommandOnSection([]string{"issues"})
+		assert.Equal(t, "on:\n  issues:\n    types: [created]\n", result)
+	})
+
+	t.Run("pull_request_comment and issue_comment dedupe to issue_comment", func(t *testing.T) {
+		result := buildCentralizedCommandOnSection([]string{"pull_request_comment", "issue_comment"})
+		assert.Equal(t, "on:\n  issue_comment:\n    types: [created]\n", result)
+	})
+
+	t.Run("unknown identifiers produce empty on section", func(t *testing.T) {
+		result := buildCentralizedCommandOnSection([]string{"not-a-real-event"})
+		assert.Empty(t, result)
+	})
+
+	t.Run("empty input defaults to all comment events", func(t *testing.T) {
+		expected := "on:\n" +
+			"  issues:\n    types: [created]\n" +
+			"  issue_comment:\n    types: [created]\n" +
+			"  pull_request:\n    types: [created]\n" +
+			"  pull_request_review_comment:\n    types: [created]\n" +
+			"  discussion:\n    types: [created]\n" +
+			"  discussion_comment:\n    types: [created]\n"
+		assert.Equal(t, expected, buildCentralizedCommandOnSection(nil))
 	})
 }

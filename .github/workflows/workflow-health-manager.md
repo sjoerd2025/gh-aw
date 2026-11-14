@@ -7,7 +7,9 @@ permissions:
   issues: read
   pull-requests: read
   actions: read
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 tools:
   cli-proxy: true
   bash: [":*"]
@@ -56,9 +58,11 @@ pre-agent-steps:
       mkdir -p /tmp/gh-aw/agent
       METRICS_FILE="/tmp/gh-aw/repo-memory/default/metrics/latest.json"
       if [ -f "$METRICS_FILE" ]; then
-        jq '[.workflow_runs | to_entries[]
-             | select(.value.success_rate < 0.8)]
-            | sort_by(.value.success_rate) | .[0:20]' \
+        jq '[.workflows // {} | to_entries[]
+             | (.value.workflow_runs.executed //
+                ((.value.workflow_runs.successful // 0) + (.value.workflow_runs.failed // 0))) as $executed
+             | select($executed > 0 and (.value.workflow_runs.success_rate // 0) < 0.8)]
+            | sort_by(.value.workflow_runs.success_rate) | .[0:20]' \
           "$METRICS_FILE" > /tmp/gh-aw/agent/failing-workflows.json 2>/dev/null \
           || echo '[]' > /tmp/gh-aw/agent/failing-workflows.json
       else
@@ -112,8 +116,39 @@ As a meta-orchestrator for workflow health, you oversee the operational health o
 **Monitor workflow execution:**
 - Load shared metrics from: `/tmp/gh-aw/repo-memory/default/metrics/latest.json`
 - Use workflow_runs data for each workflow:
-  - Total runs, successful runs, failed runs
-  - Success rate (already calculated)
+  - Total, executed, successful, failed, skipped, and action-required runs
+  - Executed runs = successful + failed; skipped and action-required runs are reported separately
+  - Success rate = successful / executed; use unavailable when executed is zero
+- Use one metrics snapshot and its recorded collection window for each dashboard. State the
+  snapshot timestamp and window; do not infer a window from the filename or compare snapshots
+  with different or unknown windows.
+- For workflows included in execution-rate scoring (using activated runs only for command- and
+  mention-triggered workflows), assign tiers from the same execution metrics for every dashboard:
+  - Inactive: executed = 0
+  - Low-sample: executed = 1
+  - Healthy: executed >= 2 and success rate >= 80%
+  - Warning: executed >= 2 and success rate >= 60% but < 80%
+  - Critical: executed >= 2 and success rate < 60%
+- Treat missing or incomplete workflow metrics as unavailable, not inactive. Report tier counts
+  against the measured workflow count and separately report the executable inventory count;
+  verify the tier counts sum to the measured count.
+- These tiers are based only on the above execution metrics. Report compilation, timeout,
+  permissions, and other concerns as separate findings; do not mix them into an undocumented score.
+- Exclude workflows with zero executed runs from failure-rate scoring. Treat high skipped counts as
+  trigger-gating behavior and high action-required counts as approval gating, not execution failures.
+- Exclude command- and mention-triggered workflows (frontmatter `slash_command`, `command`, or
+  `mention`, for example `q`) from execution-rate scoring. They start a run for every issue,
+  comment, or discussion event and the generated `pre_activation`/`activation` jobs stop runs whose
+  body does not start with the command, so a low activated-run ratio with a very short average
+  runtime (roughly 5-30s) is designed behavior. Apply tiers only to their activated runs and label
+  the rest "command gating (expected)".
+- Compare tier counts or success rates with a prior dashboard only when the collection window,
+  measured workflow cohort, and tier definitions match. Otherwise label the comparison
+  non-comparable and do not describe the difference as a regression or recovery.
+- Re-verify any root cause carried over from `shared-alerts.md` or `workflow-health-latest.md` before
+  repeating it. If the note names a PR or issue as the pending fix and that PR/issue is already
+  merged or closed while the metric is unchanged, the attribution is stale: remove or replace it in
+  `shared-alerts.md` and re-diagnose from the workflow's trigger configuration and recent run logs.
 - Query recent workflow runs (past 7 days) for detailed error analysis
 - Track success/failure rates from metrics data
 - Identify workflows with:
@@ -171,16 +206,18 @@ As a meta-orchestrator for workflow health, you oversee the operational health o
 **Quality metrics:**
 - Use historical metrics for trend analysis:
   - Load daily metrics from: `/tmp/gh-aw/repo-memory/default/metrics/daily/`
-  - Calculate 7-day and 30-day success rate trends
+  - Calculate 7-day and 30-day success rates from the corresponding consecutive date-named daily
+    snapshots only when every required snapshot is present, complete, and uses the same metric
+    definitions and workflow cohort
+  - Aggregate successful and executed counts across snapshots before calculating each rate; do not
+    average daily percentages
+  - If snapshots are missing, incomplete, or incomparable, report the trend as unavailable and
+    identify the evidence gap. Use the actual date-named snapshots; do not assume a summary file exists
+    or treat the README's `/gh-aw/ai/summary.json` link as a metrics path.
   - Identify workflows with declining quality
-- Calculate workflow reliability score (0-100):
-  - Compilation success: +20 points
-  - Recent runs successful (from metrics): +30 points
-  - No timeout issues: +20 points
-  - Proper error handling: +15 points
-  - Up-to-date documentation: +15 points
-- Rank workflows by reliability
-- Track quality trends over time using historical metrics data
+- Use the execution-rate tiers defined above to rank workflow health. Rank separate operational
+  findings by severity and evidence; do not derive an additional weighted reliability score.
+- Track quality trends over time using comparable historical metrics data.
 
 ### 5. Proactive Maintenance
 
@@ -242,7 +279,7 @@ The Metrics Collector workflow runs daily and stores performance metrics in a st
 
 **Write to shared memory:**
 1. Save your current run's summary as `workflow-health-latest.md`:
-   - Workflow health scores and categories
+   - Workflow health tiers and categories
    - Critical issues (P0/P1) identified
    - Systemic problems detected
    - Issues created
@@ -252,6 +289,8 @@ The Metrics Collector workflow runs daily and stores performance metrics in a st
    - Workflows affecting multiple campaigns
    - Systemic issues requiring campaign-level attention
    - Health patterns that affect agent performance
+   - Remove or replace notes whose cited fix (PR/issue) is already merged or closed without the
+     metric improving, so later runs do not repeat a stale root cause
 
 **Format for memory files:**
 - Use markdown format only
@@ -274,7 +313,7 @@ Pre-computed data is available in `/tmp/gh-aw/agent/` and is the authoritative s
 ### Phase 2: Health Assessment (7 minutes)
 
 4. **Use pre-loaded metrics:**
-   - `/tmp/gh-aw/agent/failing-workflows.json` contains the top-20 workflows with <80% success rate (pre-filtered from `metrics/latest.json`). Use this as your starting point.
+   - `/tmp/gh-aw/agent/failing-workflows.json` contains the top-20 workflows with executed runs and <80% success rate (pre-filtered from `metrics/latest.json`). Use this as your starting point.
    - For trend analysis, load daily metrics directly: `/tmp/gh-aw/repo-memory/default/metrics/daily/*.json`
 
 5. **Query workflow runs:**
@@ -282,13 +321,10 @@ Pre-computed data is available in `/tmp/gh-aw/agent/` and is the authoritative s
    - Batch queries where possible (fetch multiple workflows in one `list_workflow_runs` call filtered by date)
    - Calculate success rate, track timeout issues, permission errors, tool failures
 
-6. **Calculate health scores:**
-   - For each workflow, compute reliability score
-   - Identify workflows in each category:
-     - Healthy (score ≥ 80)
-     - Warning (score 60-79)
-     - Critical (score < 60)
-     - Inactive (no recent runs)
+6. **Calculate health tiers:**
+   - Apply the exact execution-count and success-rate definitions above to the same snapshot.
+   - Report the measured workflow count, unavailable metrics count, and tier counts; do not
+     classify a missing metrics record as an inactive workflow.
 
 ### Phase 3: Dependency Analysis (3 minutes)
 
@@ -348,33 +384,53 @@ Pre-computed data is available in `/tmp/gh-aw/agent/` and is the authoritative s
 
 When a material delta exists, create or update a pinned issue with this structure. Otherwise call `noop`.
 
+Use `###` or lower for every heading in the generated issue; reserve h1/h2 for
+the platform-rendered title. Follow this order: overview → key metrics/issues →
+collapsible detailed findings → next actions or limitations. Keep the overall
+health counts and highest-priority issues visible. Put long issue lists, tables,
+logs, and evidence in `<details><summary><b>...</b></summary>...</details>`
+blocks. Use `- [ ]` for follow-up actions and format applicable workflow runs as
+`[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)`.
+
 ```markdown
-# Workflow Health Dashboard - [DATE]
+### Workflow Health Dashboard - [DATE]
 
-## Overview
-Total: X | Healthy: X (X%) | Warning: X (X%) | Critical: X (X%) | Inactive: X
+### Overview
+Inventory: X | Measured: X | Healthy: X | Warning: X | Critical: X | Low-sample: X | Inactive: X | Unavailable: X
 
-## Critical Issues 🚨
-### [Workflow Name] (Score: X/100) — P[0|1]
+### Key Metrics and Issues
+
+- **Highest-priority finding**: [brief P0/P1 issue and impact]
+- **Trend**: [brief health change or state that no material issue was found]
+
+<details>
+<summary><b>Detailed workflow findings and evidence</b></summary>
+
+### Critical Issues
+
+### [Workflow Name] (Success rate: X%, executed: N) — P[0|1]
 - **Status/Error:** [brief description]  **Impact:** [brief]  **Action:** Issue #XXX
 
-## Warnings ⚠️
-### [Workflow Name] (Score: X/100)
+### Warnings
+
+### [Workflow Name] (Success rate: X%, executed: N)
 - [Issue summary and action taken]
 
-## Systemic Issues
+### Systemic Issues
 - [Pattern] — X workflows affected — [Recommendation] — Issue #XXX
 
-## Recommendations
-**High:** [P0/P1 items]  **Medium:** [P2 items]  **Low:** [P3 items]
+</details>
 
-## Trends
-Health score: X/100 (↑/↓/→) | New failures: X | Fixed: X | Avg success: X%
+**Recommendations:** **High:** [P0/P1] · **Medium:** [P2] · **Low:** [P3]<br>
+**Trends:** [Comparable 7-day/30-day aggregate rates or unavailable with reason] · New failures X · Fixed X<br>
+**Actions taken:** Created X issues · Updated X · Closed X<br>
+**Last updated:** [TIMESTAMP]
 
-## Actions Taken
-Created X issues | Updated X | Closed X
+### Next Actions or Limitations
 
-> Last updated: [TIMESTAMP]
+- [ ] [Highest-priority P0/P1 action]
+- [ ] [Medium-priority maintenance or optimization]
+- [ ] [State any data coverage limitation]
 ```
 
 Execute all phases systematically and maintain a proactive approach to workflow health management.

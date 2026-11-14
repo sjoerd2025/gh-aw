@@ -16,6 +16,7 @@ import (
 )
 
 func TestValidateEngine(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		engine     string
@@ -80,7 +81,9 @@ func TestValidateEngine(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := validateEngine(tt.engine)
 
 			if tt.expectErr {
@@ -100,8 +103,10 @@ func TestValidateEngine(t *testing.T) {
 }
 
 func TestInitFunction(t *testing.T) {
+	t.Parallel()
 	// Test that init function doesn't panic
 	t.Run("init function executes without panic", func(t *testing.T) {
+		t.Parallel()
 		defer func() {
 			assert.Nil(t, recover(), "init() should not panic")
 		}()
@@ -137,6 +142,10 @@ func TestMainFunction(t *testing.T) {
 	})
 
 	t.Run("root command help", func(t *testing.T) {
+		t.Cleanup(func() {
+			require.NoError(t, rootCmd.Flags().Set("help", "false"))
+		})
+
 		// Capture output
 		oldStderr := os.Stderr
 		r, w, _ := os.Pipe()
@@ -438,6 +447,7 @@ func TestCommandErrorHandling(t *testing.T) {
 		err := rootCmd.Execute()
 
 		assert.Error(t, err, "invalid command should produce an error")
+		assert.ErrorContains(t, err, `unknown command "invalid-command" for "gh aw"`)
 
 		// With RunE and SilenceErrors, errors are returned but not automatically printed
 		// The main() function is responsible for formatting and printing errors

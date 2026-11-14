@@ -380,20 +380,23 @@ async function findExistingItemByContentId(github, projectId, contentId) {
 
   while (hasNextPage) {
     const result = await github.graphql(
-      `query($projectId: ID!, $after: String) {
-        node(id: $projectId) {
-          ... on ProjectV2 {
-            items(first: 100, after: $after) {
+      `query($contentId: ID!, $after: String) {
+        node(id: $contentId) {
+          ... on Issue {
+            projectItems(first: 100, after: $after) {
               nodes {
-                id
-                content {
-                  ... on Issue {
-                    id
-                  }
-                  ... on PullRequest {
-                    id
-                  }
-                }
+                ...ProjectItemProject
+              }
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+            }
+          }
+          ... on PullRequest {
+            projectItems(first: 100, after: $after) {
+              nodes {
+                ...ProjectItemProject
               }
               pageInfo {
                 hasNextPage
@@ -402,20 +405,27 @@ async function findExistingItemByContentId(github, projectId, contentId) {
             }
           }
         }
+      }
+      fragment ProjectItemProject on ProjectV2Item {
+        id
+        project { id }
       }`,
-      { projectId, after: endCursor }
+      { contentId, after: endCursor }
     );
 
-    if (!result?.node?.items) {
-      core.warning(`Project ${projectId} not found or inaccessible; stopping item search.`);
+    if (!result?.node) {
+      core.warning(`Content ${contentId} not found or inaccessible; stopping project item search.`);
       break;
     }
 
-    const found = result.node.items.nodes.find(item => item.content?.id === contentId);
+    const projectItems = result.node.projectItems;
+    if (!projectItems) break;
+
+    const found = projectItems.nodes.find(item => item.project?.id === projectId);
     if (found) return found;
 
-    hasNextPage = result.node.items.pageInfo.hasNextPage;
-    endCursor = result.node.items.pageInfo.endCursor;
+    hasNextPage = projectItems.pageInfo.hasNextPage;
+    endCursor = projectItems.pageInfo.endCursor;
   }
 
   return null;
@@ -426,7 +436,7 @@ async function findExistingItemByContentId(github, projectId, contentId) {
  * @param {string} fieldName - Field name from YAML
  * @param {unknown} fieldValue - Field value from YAML
  * @param {RegExp} datePattern - Pattern to validate date values (YYYY-MM-DD)
- * @returns {"DATE" | "TEXT" | "SINGLE_SELECT"}
+ * @returns {"DATE" | "TEXT" | "NUMBER" | "SINGLE_SELECT"}
  */
 function inferFieldDataType(fieldName, fieldValue, datePattern) {
   const isDateField = fieldName.toLowerCase().includes("date");
@@ -438,6 +448,9 @@ function inferFieldDataType(fieldName, fieldValue, datePattern) {
   }
   if (isTextField) {
     return "TEXT";
+  }
+  if (typeof fieldValue === "number" && Number.isFinite(fieldValue)) {
+    return "NUMBER";
   }
   return "SINGLE_SELECT";
 }
@@ -498,13 +511,40 @@ async function applyFieldUpdates(github, projectId, itemId, fields) {
     const expectedDataType = inferFieldDataType(fieldName, fieldValue, datePattern);
     const isDateField = fieldName.toLowerCase().includes("date");
     const isTextField = expectedDataType === "TEXT";
+    const isNumberField = expectedDataType === "NUMBER";
 
     if (checkFieldTypeMismatch(fieldName, field, expectedDataType)) {
       continue;
     }
 
     if (!field) {
-      if (isDateField) {
+      if (isNumberField) {
+        try {
+          field = (
+            await github.graphql(
+              `mutation($projectId: ID!, $name: String!, $dataType: ProjectV2CustomFieldType!) {
+                createProjectV2Field(input: {
+                  projectId: $projectId,
+                  name: $name,
+                  dataType: $dataType
+                }) {
+                  projectV2Field {
+                    ... on ProjectV2Field {
+                      id
+                      name
+                      dataType
+                    }
+                  }
+                }
+              }`,
+              { projectId, name: normalizedFieldName, dataType: "NUMBER" }
+            )
+          ).createProjectV2Field.projectV2Field;
+        } catch (createError) {
+          core.warning(`Failed to create number field "${fieldName}": ${getErrorMessage(createError)}`);
+          continue;
+        }
+      } else if (isDateField) {
         if (typeof fieldValue === "string" && datePattern.test(fieldValue)) {
           try {
             field = (
@@ -822,7 +862,8 @@ async function updateProject(output, temporaryIdMap = new Map(), githubClient = 
     // rather than attempting project resolution and falling back.
     if (viewerLogin === "github-actions[bot]") {
       throw new Error(
-        "GitHub Projects v2 operations require a PAT or GitHub App token with Projects access, but this run is authenticated as github-actions[bot] (default GITHUB_TOKEN). " +
+        `${ERR_CONFIG}: ` +
+          "GitHub Projects v2 operations require a PAT or GitHub App token with Projects access, but this run is authenticated as github-actions[bot] (default GITHUB_TOKEN). " +
           "Fix: set secrets.GH_AW_PROJECT_GITHUB_TOKEN (or configure safe-outputs.update-project.github-token) so the safe-outputs step uses that token for github-script."
       );
     }

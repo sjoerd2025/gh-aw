@@ -10,6 +10,8 @@ VERSION ?= $(shell git describe --tags --always --dirty)
 DOCKER_IMAGE=ghcr.io/github/gh-aw
 DOCKER_PLATFORMS=linux/amd64,linux/arm64
 BASE_REF ?= origin/main
+# Use the runtime's locked Prettier version from every working directory.
+PRETTIER := $(abspath actions/setup/js/node_modules/.bin/prettier)
 JS_IMPACTED_TEST_EXCLUDES=--exclude '**/*.integration.test.cjs' --exclude '**/frontmatter_hash_github_api.test.cjs'
 CI_WORKFLOW_FILE ?= ci.yml
 CI_COVERAGE_ARTIFACT_PATTERN ?= ci-integration-coverage-*
@@ -38,8 +40,18 @@ all: build
 
 # Build the binary, run make deps before this
 .PHONY: build
-build: sync-action-pins sync-action-scripts
+build: check-agent-local-settings sync-action-pins sync-action-scripts sync-compat sync-model-aliases
 	go build $(LDFLAGS) -o $(BINARY_NAME) ./cmd/gh-aw
+
+# Reject persisted local command approvals even if force-added or already tracked.
+.PHONY: check-agent-local-settings test-agent-local-settings
+check-agent-local-settings:
+	bash scripts/check-agent-local-settings.sh
+
+test-agent-local-settings: check-agent-local-settings
+	bash scripts/check-agent-local-settings_test.sh
+
+build-all build-linux build-darwin build-windows build-android build-wasm: check-agent-local-settings
 
 # Build for all platforms
 .PHONY: build-all
@@ -90,6 +102,11 @@ test: test-unit test-integration
 test-unit-all:
 	go test -v -parallel=4 -timeout=10m -run='^Test' ./... -short
 
+# Run concurrency-heavy package tests with the Go race detector
+.PHONY: test-race
+test-race:
+	go test -race -count=1 -short -parallel=4 -timeout=30m ./pkg/cli ./pkg/console ./pkg/parser ./pkg/workflow
+
 # Test impacted Go unit tests first for faster feedback (target budget: ~30s)
 .PHONY: test-unit
 test-unit:
@@ -111,6 +128,10 @@ update-golden:
 	go test -v ./pkg/console -run='^TestGolden_' -update
 
 # Wasm golden tests — compare wasm (string API) compiler output against golden files
+.PHONY: test-actions-parser-conformance
+test-actions-parser-conformance:
+	npm test --prefix pkg/workflow/actionslanguageservice/conformance
+
 .PHONY: test-wasm-golden
 test-wasm-golden:
 	@echo "Running wasm golden tests (Go string API path)..."
@@ -121,6 +142,20 @@ test-wasm-golden:
 update-wasm-golden:
 	@echo "Updating wasm golden test files..."
 	go test -v -timeout=5m -run='^TestWasmGolden_' ./pkg/workflow -update
+
+# Run model-routing golden tests without downloading source runs
+.PHONY: verify-model-routing-golden
+verify-model-routing-golden:
+	python3 scripts/test_model_routing_golden.py
+	go test ./pkg/cli -run '^TestModelRoutingGolden' -count=1
+
+# Update model-routing golden files from the committed fixtures
+.PHONY: update-model-routing-golden
+update-model-routing-golden:
+	@echo "Updating model-routing golden files..."
+	UPDATE_MODEL_ROUTING_GOLDEN=1 go test ./pkg/cli -run '^TestModelRoutingGolden' -count=1
+	@echo "Review changed model-routing golden files:"
+	@git status --short --untracked-files=all pkg/cli/testdata/model_routing_golden
 
 # Build wasm and run Node.js golden comparison test
 .PHONY: test-wasm
@@ -143,7 +178,15 @@ test-integration-mcp-other:
 
 .PHONY: test-integration-logs
 test-integration-logs:
-	go test -v -timeout=3m -tags 'integration' -run 'TestLogs|TestFirewall|TestNoStopTime|TestLocalWorkflow' ./pkg/cli
+	go test -v -timeout=3m -tags 'integration' -run 'TestLogs|TestFirewall|TestNoStopTime|TestLocalWorkflow' -skip 'TestLogsMultiTarget' ./pkg/cli
+
+.PHONY: test-harbor-conformance
+test-harbor-conformance:
+	go test -v -timeout=3m -tags 'integration harbor' -run '^TestHarborConformance$$' -count=1 ./pkg/cli
+
+.PHONY: test-integration-logs-multi-target-count
+test-integration-logs-multi-target-count:
+	go test -v -timeout=3m -tags 'integration' -run 'TestLogsMultiTarget' ./pkg/cli
 
 .PHONY: test-integration-workflow
 test-integration-workflow:
@@ -170,17 +213,20 @@ bench:
 	go test -bench=. -benchmem -benchtime=3x -run=^$$ ./pkg/... | tee bench_results.txt
 
 # Run only critical performance benchmarks for daily monitoring
+# Uses time-based -benchtime (not a fixed low iteration count) so that results are
+# averaged over many iterations and are far less sensitive to shared CI runner noise.
 .PHONY: bench-performance
+bench-performance: SHELL := /bin/bash -eu -o pipefail
 bench-performance:
 	@echo "Running critical performance benchmarks..."
 	@echo "This includes: CompileSimpleWorkflow, CompileComplexWorkflow, CompileMCPWorkflow,"
 	@echo "               CompileMemoryUsage, ParseWorkflow, Validation, YAMLGeneration"
 	@go test -bench='Benchmark(CompileSimpleWorkflow|CompileComplexWorkflow|CompileMCPWorkflow|CompileMemoryUsage|ParseWorkflow|Validation|YAMLGeneration)$$' \
-		-benchmem -benchtime=3x -run=^$$ ./pkg/workflow | tee bench_performance.txt
+		-benchmem -benchtime=2s -run=^$$ ./pkg/workflow | tee bench_performance.txt
 	@echo ""
 	@echo "Also running CLI helper benchmarks..."
-	@go test -bench='Benchmark(ExtractWorkflowNameFromFile|FindIncludesInContent)$$' \
-		-benchmem -benchtime=1s -run=^$$ ./pkg/cli >> bench_performance.txt
+	@go test -bench='Benchmark(ExtractWorkflowNameFromFile|FastParseTitleFromReader|FindIncludesInContent)$$' \
+		-benchmem -benchtime=2s -run=^$$ ./pkg/cli >> bench_performance.txt
 	@echo ""
 	@echo "Performance benchmark results saved to bench_performance.txt"
 
@@ -206,6 +252,7 @@ fuzz:
 	@echo "Running fuzz tests for 30 seconds..."
 	go test -fuzz=FuzzParseFrontmatter -fuzztime=30s ./pkg/parser/
 	go test -fuzz=FuzzExpressionParser -fuzztime=30s ./pkg/workflow/
+	go test -run='^$$' -fuzz=FuzzBashCommandParserModel -fuzztime=30s ./pkg/workflow/
 
 # Run security regression tests
 .PHONY: test-security
@@ -255,19 +302,20 @@ check-cjs-syntax:
 	@echo "✓ CommonJS runtime syntax validated"
 
 .PHONY: test-js
-test-js: build-js
+test-js: build-js test-workflow-tool-contracts
+	node --test scripts/pr-sous-chef.test.mjs
 	cd actions/setup/js && npm run test:js -- --no-file-parallelism
+	cd eslint-factory && npm test
 
 # Test impacted JavaScript unit tests only (excluding integration tests)
 .PHONY: test-impacted-js
-test-impacted-js: build-js
-	@BASE_COMMIT=$$(git merge-base $(BASE_REF) HEAD 2>/dev/null); \
+test-impacted-js: build-js test-workflow-tool-contracts
+	@BASE_COMMIT=$$(bash scripts/resolve-base-commit.sh --base-ref $(BASE_REF)); \
 	if [ -z "$$BASE_COMMIT" ]; then \
-		echo "Error: unable to determine merge-base from BASE_REF=$(BASE_REF)."; \
 		echo "Set BASE_REF explicitly, for example: make test-impacted-js BASE_REF=origin/main"; \
 		exit 1; \
 	fi; \
-	CHANGED_JS_FILES=$$(git diff --name-only --diff-filter=ACMR "$$BASE_COMMIT"..HEAD -- actions/setup/js eslint-factory | grep -E '\.(cjs|js|mjs|ts)$$' || true); \
+	CHANGED_JS_FILES=$$({ git diff --name-only --diff-filter=ACMR "$$BASE_COMMIT" -- actions/setup/js eslint-factory; git ls-files --others --exclude-standard -- actions/setup/js eslint-factory; } | sort -u | grep -E '\.(cjs|js|mjs|ts)$$' || true); \
 	if [ -z "$$CHANGED_JS_FILES" ]; then \
 		echo "No changed JavaScript/TypeScript files under actions/setup/js or eslint-factory; skipping impacted JS tests."; \
 		exit 0; \
@@ -287,13 +335,12 @@ test-impacted-js: build-js
 # Test impacted Go unit tests only (excluding integration tests)
 .PHONY: test-impacted-go
 test-impacted-go:
-	@BASE_COMMIT=$$(git merge-base $(BASE_REF) HEAD 2>/dev/null); \
+	@BASE_COMMIT=$$(bash scripts/resolve-base-commit.sh --base-ref $(BASE_REF)); \
 	if [ -z "$$BASE_COMMIT" ]; then \
-		echo "Error: unable to determine merge-base from BASE_REF=$(BASE_REF)."; \
 		echo "Set BASE_REF explicitly, for example: make test-impacted-go BASE_REF=origin/main"; \
 		exit 1; \
 	fi; \
-	CHANGED_GO_FILES=$$(git diff --name-only --diff-filter=ACMR "$$BASE_COMMIT"..HEAD | grep -E '\.go$$' || true); \
+	CHANGED_GO_FILES=$$({ git diff --name-only --diff-filter=ACDMR "$$BASE_COMMIT"; git ls-files --others --exclude-standard; } | sort -u | grep -E '\.go$$' | grep -v -E '(^|/)testdata/' || true); \
 	if [ -z "$$CHANGED_GO_FILES" ]; then \
 		echo "No changed Go files; skipping impacted Go tests."; \
 		exit 0; \
@@ -344,11 +391,22 @@ test-impacted-go:
 		CHANGED_GO_PACKAGES="$$COVERAGE_GO_PACKAGES"; \
 		echo "Running impacted Go unit tests from CI coverage correlation: $$CHANGED_GO_PACKAGES"; \
 	else \
-		CHANGED_GO_PACKAGES=$$(printf '%s\n' "$$CHANGED_GO_FILES" | while IFS= read -r file; do dirname "$$file"; done | sort -u | sed 's|^|./|'); \
+		CHANGED_GO_PACKAGES=$$(printf '%s\n' "$$CHANGED_GO_FILES" | while IFS= read -r file; do \
+			dir=$$(dirname "$$file"); \
+			if find "$$dir" -maxdepth 1 -type f -name '*.go' -print -quit 2>/dev/null | grep -q .; then \
+				printf './%s\n' "$$dir"; \
+			fi; \
+		done | sort -u); \
+		if [ -z "$$CHANGED_GO_PACKAGES" ]; then \
+			echo "No remaining Go packages for the changed files; skipping impacted Go tests."; \
+			exit 0; \
+		fi; \
 		echo "Running impacted Go unit tests in changed-file packages: $$CHANGED_GO_PACKAGES"; \
 	fi; \
 	SELECTED_GO_TESTS=""; \
-	if command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then \
+	if [ "$(CI_COVERAGE_ENABLED)" != "1" ]; then \
+		echo "CI timing correlation disabled; using local impacted-test sampling."; \
+	elif command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then \
 		UNIT_RUN_ID="$(CI_UNIT_RUN_ID)"; \
 		if [ -z "$$UNIT_RUN_ID" ]; then \
 			UNIT_RUN_ID=$$(gh run list --workflow "$(CI_UNIT_WORKFLOW_FILE)" --branch "$$COVERAGE_SOURCE_BRANCH" --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true); \
@@ -450,13 +508,19 @@ test-impacted-go:
 
 # Test both impacted JavaScript and Go unit tests
 .PHONY: test-impacted
-test-impacted: test-impacted-js test-impacted-go
+test-impacted:
+	@$(MAKE) --no-print-directory -j2 test-impacted-js test-impacted-go
 
 # Install JavaScript dependencies
 .PHONY: deps-js
 deps-js: check-node-version
 	cd actions/setup/js && npm ci
 	cd eslint-factory && npm ci
+
+# Verify every locked npm registry dependency through the public 1ES feed.
+.PHONY: check-npm-1es
+check-npm-1es: check-node-version
+	node scripts/check-npm-1es.mjs
 
 .PHONY: build-js
 build-js: deps-js
@@ -470,17 +534,80 @@ bundle-js:
 	@echo "✓ bundle-js tool built"
 	@echo "To bundle a JavaScript file: ./bundle-js <input-file> [output-file]"
 
-# Run Bash script tests (check-stale-lock-files, check-workflow-drift)
-.PHONY: test-scripts
-test-scripts: build
-	@echo "Running Bash script tests..."
-	bash scripts/check-stale-lock-files_test.sh
-	bash scripts/check-workflow-drift_test.sh ./$(BINARY_NAME)
-	@echo "✓ All Bash script tests passed"
+# Run workflow contracts in CJS CI even when impacted runtime tests are skipped.
+.PHONY: test-workflow-tool-contracts
+test-workflow-tool-contracts:
+	node --test scripts/workflow-tool-contracts.test.cjs scripts/code-scanning-fixer-selection.test.cjs scripts/cache-strategy-workflows.test.cjs scripts/dependabot-burner-selection.test.cjs
 
-# Test all code (Go, JavaScript, wasm golden, and shell scripts)
+# Run script tests (authentication probes, stale locks, workflow drift, and workflow purity).
+.PHONY: test-pageindex-workflow
+test-pageindex-workflow:
+	@set -eu; \
+	if ! command -v uv >/dev/null 2>&1; then \
+		echo "uv is required to run PageIndex workflow tests (requires pageindex==0.5.3)." >&2; \
+		exit 1; \
+	fi; \
+	tmp_dir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp_dir"' EXIT; \
+	uv venv --python 3.12 "$$tmp_dir/venv"; \
+	uv pip install --exclude-newer "$$(date -u -d '3 days ago' +%Y-%m-%dT%H:%M:%SZ)" --only-binary=:all: --python "$$tmp_dir/venv/bin/python" "pageindex==0.5.3"; \
+	"$$tmp_dir/venv/bin/python" scripts/test_pageindex_workflow.py
+
+.PHONY: test-scripts
+test-scripts: build test-workflow-tool-contracts test-agent-local-settings test-pageindex-workflow
+	@echo "Running script tests..."
+	node --test scripts/agy-authentication.test.cjs
+	node --test scripts/check-npm-1es.test.mjs
+	node --test scripts/release-workflows.test.cjs
+	node --test scripts/maintenance-workflows.test.cjs
+	node --test scripts/auditor-workflow.test.cjs
+	bash scripts/extract-workflow-frontmatter-keys_test.sh
+	bash scripts/check-stale-lock-files_test.sh
+	$(MAKE) --no-print-directory test-agent-dev-loop
+	bash scripts/check-skill-file-paths_test.sh
+	python3 -m unittest discover -s scripts -p 'test_check_instruction_prefixes.py'
+	bash scripts/check-safe-outputs-conformance_test.sh
+	bash scripts/resolve-base-commit_test.sh
+	bash scripts/pr-data-prefetch_test.sh
+	bash scripts/design-decision-gate-prefetch_test.sh
+	bash scripts/check-workflow-drift_test.sh ./$(BINARY_NAME)
+	bash scripts/check-cgo-cjs-workflow-purity_test.sh
+	bash scripts/update-threat-detect-pins_test.sh
+	bash scripts/update-release-pins_test.sh
+	bash scripts/update-copilot-version_test.sh
+	bash scripts/check-go-toolchain_test.sh
+	python3 scripts/test_super_linter_scope.py
+	python3 scripts/test_publish_safe_outputs_node.py
+	python3 scripts/test_pr_specification_reviewer.py
+	python3 scripts/test_archivx_analyzer.py
+	python3 scripts/test_parse_benchmark_results.py
+	bash actions/setup/sh/collect_usage_artifact_files_test.sh
+	bash actions/setup/sh/copy_gh_aw_binary_for_mcp_test.sh
+	bash actions/setup/sh/generate_git_patch_test.sh
+	bash actions/setup/sh/audit_pre_agent_workspace_test.sh
+	bash actions/setup/sh/commit_cache_memory_git_test.sh
+	bash actions/setup/sh/create_gh_aw_tmp_dir_test.sh
+	bash actions/setup/sh/download_docker_images_local_test.sh
+	bash actions/setup/sh/install_awf_binary_test.sh
+	bash actions/setup/sh/install_gh_cli_test.sh
+	bash actions/setup/sh/install_threat_detect_binary_test.sh
+	bash actions/setup/sh/release_integrity_test.sh
+	bash .github/scripts/install_tla_runtime_test.sh
+	bash actions/setup/sh/runtime_trust_inventory_test.sh
+	@echo "✓ All script tests passed"
+
+.PHONY: test-agent-dev-loop
+test-agent-dev-loop:
+	bash scripts/format-changed_test.sh
+	bash scripts/agent-report-progress_test.sh
+
+# Test all code and guidance (Go, JavaScript, wasm golden, shell scripts, and guidance contracts)
 .PHONY: test-all
-test-all: test test-js test-wasm-golden test-scripts
+test-all: test test-js test-wasm-golden test-scripts test-guidance
+
+.PHONY: test-guidance
+test-guidance:
+	python3 -m unittest discover -s .github/skills/agentic-workflows/tests -p 'test_*.py'
 
 # Run tests with coverage
 .PHONY: test-coverage
@@ -607,8 +734,8 @@ check-node-version:
 	@if ! command -v node >/dev/null 2>&1; then \
 		echo "Error: Node.js is not installed."; \
 		echo ""; \
-		echo "This project requires Node.js 20 or higher."; \
-		echo "Please install Node.js 20+ and try again."; \
+		echo "This project requires Node.js 24 or higher."; \
+		echo "Please install Node.js 24+ and try again."; \
 		echo ""; \
 		echo "For installation instructions, see:"; \
 		echo "  https://github.com/github/gh-aw/blob/main/CONTRIBUTING.md#prerequisites"; \
@@ -617,10 +744,10 @@ check-node-version:
 	NODE_VERSION=$$(node --version); \
 	NODE_VERSION_NUM=$$(echo "$$NODE_VERSION" | sed 's/v//'); \
 	NODE_MAJOR=$$(echo "$$NODE_VERSION_NUM" | cut -d. -f1); \
-	if [ "$$NODE_MAJOR" -lt 20 ]; then \
+	if [ "$$NODE_MAJOR" -lt 24 ]; then \
 		echo "Error: Node.js version $$NODE_VERSION is not supported."; \
 		echo ""; \
-		echo "This project requires Node.js 20 or higher."; \
+		echo "This project requires Node.js 24 or higher."; \
 		echo "Your current version: $$NODE_VERSION"; \
 		echo ""; \
 		echo "Please upgrade Node.js and try again."; \
@@ -645,7 +772,7 @@ tools: ## Install build-time tools declared in go.mod tool directives
 .PHONY: install-golangci-lint
 install-golangci-lint:
 	@echo "Installing golangci-lint binary..."
-	@GOLANGCI_LINT_VERSION="v2.12.2"; \
+	@GOLANGCI_LINT_VERSION="v2.15.0"; \
 	GOPATH=$$(go env GOPATH); \
 	GOOS=$$(go env GOOS); \
 	GOARCH=$$(go env GOARCH); \
@@ -699,6 +826,76 @@ install-golangci-lint:
 	echo "Error: Failed to download a valid golangci-lint archive from $$DOWNLOAD_URL after $$MAX_ATTEMPTS attempts"; \
 	exit 1
 
+# Install shellcheck binary
+# Downloads pre-built binary from GitHub releases
+.PHONY: install-shellcheck
+install-shellcheck:
+	@echo "Installing shellcheck binary..."
+	@SHELLCHECK_VERSION="v0.11.0"; \
+	GOPATH=$$(go env GOPATH); \
+	GOOS=$$(go env GOOS); \
+	GOARCH=$$(go env GOARCH); \
+	BINARY_NAME="shellcheck"; \
+	if [ "$$GOOS" = "windows" ]; then \
+		BINARY_NAME="shellcheck.exe"; \
+	fi; \
+	if [ -x "$$GOPATH/bin/$$BINARY_NAME" ]; then \
+		INSTALLED_VERSION=$$("$$GOPATH/bin/$$BINARY_NAME" --version 2>/dev/null | sed -n 's/^version: //p' | head -n1 || echo "unknown"); \
+		if [ "$$INSTALLED_VERSION" = "$${SHELLCHECK_VERSION#v}" ]; then \
+			echo "✓ shellcheck $$SHELLCHECK_VERSION already installed"; \
+			exit 0; \
+		fi; \
+	fi; \
+	case "$$GOOS/$$GOARCH" in \
+		linux/amd64) ASSET_NAME="shellcheck-$$SHELLCHECK_VERSION.linux.x86_64.tar.gz" ;; \
+		linux/arm64) ASSET_NAME="shellcheck-$$SHELLCHECK_VERSION.linux.aarch64.tar.gz" ;; \
+		darwin/amd64) ASSET_NAME="shellcheck-$$SHELLCHECK_VERSION.darwin.x86_64.tar.gz" ;; \
+		darwin/arm64) ASSET_NAME="shellcheck-$$SHELLCHECK_VERSION.darwin.aarch64.tar.gz" ;; \
+		windows/amd64) ASSET_NAME="shellcheck-$$SHELLCHECK_VERSION.zip" ;; \
+		*) echo "Error: shellcheck $$SHELLCHECK_VERSION is not supported on $$GOOS/$$GOARCH"; exit 1 ;; \
+	esac; \
+	DOWNLOAD_URL="https://github.com/koalaman/shellcheck/releases/download/$$SHELLCHECK_VERSION/$$ASSET_NAME"; \
+	TEMP_DIR=$$(mktemp -d); \
+	ARCHIVE="$$TEMP_DIR/$$ASSET_NAME"; \
+	EXTRACT_DIR="$$TEMP_DIR/extract"; \
+	MAX_ATTEMPTS=3; \
+	RETRY_DELAY=2; \
+	trap "rm -rf $$TEMP_DIR" EXIT; \
+	echo "Downloading shellcheck $$SHELLCHECK_VERSION for $$GOOS/$$GOARCH..."; \
+	for attempt in $$(seq 1 $$MAX_ATTEMPTS); do \
+		rm -f "$$ARCHIVE"; \
+		rm -rf "$$EXTRACT_DIR"; \
+		mkdir -p "$$EXTRACT_DIR"; \
+		if curl --fail --silent --show-error --location "$$DOWNLOAD_URL" -o "$$ARCHIVE"; then \
+			if [ "$$GOOS" = "windows" ]; then \
+				if unzip -q "$$ARCHIVE" -d "$$EXTRACT_DIR" && \
+					mkdir -p "$$GOPATH/bin" && \
+					mv "$$EXTRACT_DIR/$$BINARY_NAME" "$$GOPATH/bin/$$BINARY_NAME" && \
+					chmod +x "$$GOPATH/bin/$$BINARY_NAME"; then \
+					echo "✓ shellcheck $$SHELLCHECK_VERSION installed to $$GOPATH/bin/$$BINARY_NAME"; \
+					exit 0; \
+				fi; \
+			elif tar -tzf "$$ARCHIVE" >/dev/null 2>&1 && \
+				tar -xzf "$$ARCHIVE" -C "$$EXTRACT_DIR" && \
+				mkdir -p "$$GOPATH/bin" && \
+				mv "$$EXTRACT_DIR/shellcheck-$$SHELLCHECK_VERSION/$$BINARY_NAME" "$$GOPATH/bin/$$BINARY_NAME" && \
+				chmod +x "$$GOPATH/bin/$$BINARY_NAME"; then \
+				echo "✓ shellcheck $$SHELLCHECK_VERSION installed to $$GOPATH/bin/$$BINARY_NAME"; \
+				exit 0; \
+			fi; \
+			echo "Warning: Failed to extract or install shellcheck archive (attempt $$attempt/$$MAX_ATTEMPTS)"; \
+		else \
+			echo "Warning: Failed to download shellcheck archive (attempt $$attempt/$$MAX_ATTEMPTS)"; \
+		fi; \
+		if [ "$$attempt" -lt "$$MAX_ATTEMPTS" ]; then \
+			echo "Retrying shellcheck download in $$RETRY_DELAY seconds..."; \
+			sleep $$RETRY_DELAY; \
+			RETRY_DELAY=$$((RETRY_DELAY * 2)); \
+		fi; \
+	done; \
+	echo "Error: Failed to download a valid shellcheck archive from $$DOWNLOAD_URL after $$MAX_ATTEMPTS attempts"; \
+	exit 1
+
 # License compliance checking
 .PHONY: license-check
 license-check: ## Check dependency licenses for compliance
@@ -720,10 +917,12 @@ deps: check-node-version
 	go mod download
 	go mod tidy
 	cd actions/setup/js && npm ci
+	cd eslint-factory && npm ci
+	cd specs/otel && npm ci
 
 # Install development tools (including linter)
 .PHONY: deps-dev
-deps-dev: check-node-version deps tools install-golangci-lint download-github-actions-schema
+deps-dev: check-node-version deps tools install-golangci-lint install-shellcheck download-github-actions-schema
 	@echo "✓ Development dependencies installed"
 
 # Download GitHub Actions workflow schema for embedded validation
@@ -744,7 +943,7 @@ download-github-actions-schema:
 patch-github-actions-schema:
 	@echo "Patching GitHub Actions schema with custom permissions..."
 	@tmpfile=$$(mktemp) && \
-		jq '.definitions["permissions-event"].properties += {"copilot-requests": {"type": "string", "enum": ["write", "none"]}, "vulnerability-alerts": {"type": "string", "enum": ["read", "none"]}}' \
+		jq 'def append_missing($$items): reduce $$items[] as $$item (. ; if index($$item) then . else . + [$$item] end); def issue_types: [.properties.on.oneOf[] | select(.properties?.issues?.oneOf?) | .properties.issues.oneOf[] | select(.properties?.types?.items?.enum? and .properties?.types?.default?)]; if (issue_types | length) == 0 then error("issues types selector matched nothing") else . end | .definitions["permissions-event"].properties += {"copilot-requests": {"type": "string", "enum": ["write", "none"]}, "drives": {"$$ref": "#/definitions/permissions-level"}, "vulnerability-alerts": {"type": "string", "enum": ["read", "none"]}} | (.properties.on.oneOf[] | select(.properties?.issues?.oneOf?) | .properties.issues.oneOf[] | select(.properties?.types?).properties.types.items.enum) |= append_missing(["typed", "untyped", "field_added", "field_removed", "status_changed"]) | (.properties.on.oneOf[] | select(.properties?.issues?.oneOf?) | .properties.issues.oneOf[] | select(.properties?.types?).properties.types.default) |= append_missing(["typed", "untyped", "field_added", "field_removed", "status_changed"]) | if ([issue_types[] | select((.properties.types.items.enum | index("status_changed")) != null and (.properties.types.default | index("status_changed")) != null)] | length) != (issue_types | length) then error("issues types patch did not add status_changed") else . end' \
 			pkg/workflow/schemas/github-workflow.json > "$$tmpfile" && \
 		mv "$$tmpfile" pkg/workflow/schemas/github-workflow.json
 	@cd actions/setup/js && npm run format:schema >/dev/null 2>&1
@@ -837,6 +1036,15 @@ check-stale-lock-files:
 		bash scripts/check-stale-lock-files.sh; \
 	fi
 
+# Fast guard: fails when a skill references a backticked repo path that no longer exists.
+.PHONY: check-skill-file-paths
+check-skill-file-paths:
+	@bash scripts/check-skill-file-paths.sh
+
+.PHONY: check-instruction-prefixes
+check-instruction-prefixes:
+	@python3 scripts/check-instruction-prefixes.py
+
 # Check for drift between workflow markdown sources and generated lock files.
 # Compiles all .github/workflows/*.md files and fails if any .lock.yml would
 # change, reminding contributors to run 'make recompile' before committing.
@@ -870,9 +1078,14 @@ check-stale-schema-binary:
 		bash scripts/check-stale-schema-binary.sh --binary "./$(BINARY_NAME)"; \
 	fi
 
-# Format code
+# Format only branch changes, including staged, unstaged, and untracked files.
 .PHONY: fmt
-fmt: fmt-go fmt-cjs fmt-json
+fmt:
+	@BASE_REF="$(BASE_REF)" bash scripts/format-changed.sh
+
+# Explicit full-repository formatting (not part of the inner development loop).
+.PHONY: fmt-all
+fmt-all: fmt-go fmt-cjs fmt-json
 	@echo "✓ Code formatted successfully"
 
 .PHONY: fmt-go
@@ -886,8 +1099,8 @@ fmt-go:
 fmt-cjs:
 	@echo "→ Formatting JavaScript files..."
 	@cd actions/setup/js && npm run format:cjs --silent >/dev/null 2>&1
-	@cd eslint-factory && npx prettier --write '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../.prettierignore --log-level=error 2>&1
-	@npx prettier --write 'scripts/**/*.js' --ignore-path .prettierignore --log-level=error 2>&1
+	@cd eslint-factory && "$(PRETTIER)" --write '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../.prettierignore --log-level=error 2>&1
+	@"$(PRETTIER)" --write 'scripts/**/*.js' --ignore-path .prettierignore --log-level=error 2>&1
 	@echo "✓ JavaScript files formatted"
 
 # Format JSON files in pkg directory (excluding actions/setup/js, which is handled by npm script)
@@ -895,7 +1108,7 @@ fmt-cjs:
 fmt-json:
 	@echo "→ Formatting JSON files..."
 	@cd actions/setup/js && npm run format:pkg-json --silent >/dev/null 2>&1
-	@npx prettier --write 'pkg/cli/data/models.json' 'actions/setup/js/models.json' --ignore-path .prettierignore --log-level=error 2>&1
+	@"$(PRETTIER)" --write 'pkg/cli/data/models.json' 'actions/setup/js/models.json' --ignore-path .prettierignore --log-level=error 2>&1
 	@echo "✓ JSON files formatted"
 
 # Check formatting
@@ -912,8 +1125,8 @@ fmt-check:
 .PHONY: fmt-check-cjs
 fmt-check-cjs:
 	cd actions/setup/js && npm run lint:cjs
-	cd eslint-factory && npx prettier --check '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../.prettierignore
-	npx prettier --check 'scripts/**/*.js' --ignore-path .prettierignore
+	cd eslint-factory && "$(PRETTIER)" --check '**/*.cjs' '**/*.ts' '**/*.json' --ignore-path ../.prettierignore
+	"$(PRETTIER)" --check 'scripts/**/*.js' --ignore-path .prettierignore
 
 # Check JSON file formatting in pkg directory (excluding actions/setup/js, which is handled by npm script)
 .PHONY: fmt-check-json
@@ -941,6 +1154,16 @@ lint-cjs: fmt-check-cjs validate-cjs-syntax check-node-version
 lint-json: fmt-check-json
 	@echo "✓ JSON formatting validated"
 
+# Full-repository error-message audit (non-blocking report).
+# Reports pre-existing error-message violations across the repo so the debt can
+# be tracked as a metric over time. Always exits 0.
+.PHONY: lint-error-messages-report
+lint-error-messages-report:
+	@echo "Building custom linters..."
+	@env -u GOOS -u GOARCH go build -o /tmp/gh-aw-linters ./cmd/linters
+	@echo "Auditing error messages across $(LINTER_PACKAGES) (non-blocking)..."
+	@/tmp/gh-aw-linters -errormessage -errormessage.full-repo $(LINTER_PACKAGES) || true
+
 # Lint error messages for quality compliance
 .PHONY: lint-errors
 lint-errors:
@@ -953,7 +1176,7 @@ validate-model-alias-chains:
 	@node scripts/validate-model-alias-chains.js
 
 # Validate model_multipliers.json has no placeholder or null multipliers (R-REG-007)
-# See docs/src/content/docs/specs/effective-tokens-specification.md §Model Multiplier Registry
+# See docs/src/content/docs/specs/ai-credits-specification.md §Model Multiplier Registry
 .PHONY: validate-registry
 validate-registry:
 	@echo "Validating model_multipliers.json (R-REG-007: no placeholder or null multipliers)..."
@@ -965,9 +1188,18 @@ validate-registry:
 .PHONY: validate-otel-contract
 validate-otel-contract:
 	@echo "Validating gh-aw OpenTelemetry compatibility contract..."
+	@$(MAKE) --no-print-directory check-otel-attributes
 	@go test ./pkg/parser ./pkg/workflow -run 'TestValidateMainWorkflowFrontmatterWithSchemaAndLocation_OTLP(CustomAttributes|ResourceAttributes|GitHubAppImplicitOIDC)|TestInjectOTLPConfig|TestApplyTraceContextEnvToMap' -count=1
 	@cd actions/setup/js && npm run test:js -- otel_contract.test.cjs send_otlp_span.test.cjs --no-file-parallelism >/dev/null
 	@echo "✓ OpenTelemetry compatibility contract validated"
+
+.PHONY: check-otel-attributes
+check-otel-attributes:
+	@npm run check --prefix specs/otel
+
+.PHONY: generate-otel-attributes
+generate-otel-attributes:
+	npm run generate --prefix specs/otel
 
 MODELS_DEV_MODELS_JSON_URL ?= https://models.dev/catalog.json
 
@@ -1019,9 +1251,27 @@ lint-action-sh:
 	@echo "Checking action shell scripts for python/python3 invocations..."
 	@bash scripts/check-action-sh-no-python.sh
 
+# Run shellcheck on actions/setup/sh scripts at error severity
+.PHONY: shellcheck-setup-sh
+shellcheck-setup-sh:
+	@GOPATH=$$(go env GOPATH); \
+	GOOS=$$(go env GOOS); \
+	BINARY_NAME="shellcheck"; \
+	if [ "$$GOOS" = "windows" ]; then \
+		BINARY_NAME="shellcheck.exe"; \
+	fi; \
+	if command -v shellcheck >/dev/null 2>&1 || [ -x "$$GOPATH/bin/$$BINARY_NAME" ]; then \
+		echo "Running shellcheck on actions/setup/sh..."; \
+		PATH="$$GOPATH/bin:$$PATH" shellcheck --severity=error actions/setup/sh/*.sh; \
+		echo "✓ shellcheck passed"; \
+	else \
+		echo "shellcheck is not installed. Run 'make deps-dev' to install dependencies."; \
+		exit 1; \
+	fi
+
 # Validate all project files
 .PHONY: lint
-lint: check-stale-lock-files fmt-check fmt-check-json lint-cjs golint validate-model-alias-chains lint-action-sh check-stale-schema-binary
+lint: check-stale-lock-files check-skill-file-paths check-instruction-prefixes fmt-check fmt-check-json lint-cjs golint validate-model-alias-chains lint-action-sh shellcheck-setup-sh check-stale-schema-binary check-otel-attributes
 	@echo "✓ All validations passed"
 
 # Install the binary locally
@@ -1035,10 +1285,22 @@ install: build
 generate-schema-docs:
 	node scripts/generate-schema-docs.js
 
+.PHONY: session-schemas check-session-schemas
+session-schemas:
+	cd actions/setup/js && npm run schema:session
+
+check-session-schemas:
+	cd actions/setup/js && npm run schema:session:check
+
 # Generate agent factory documentation page
 .PHONY: generate-agent-factory
 generate-agent-factory:
 	node scripts/generate-agent-factory.js
+
+# Generate llms.txt at repository root from .github/aw/*.md
+.PHONY: generate-llms-txt
+generate-llms-txt:
+	node scripts/generate-llms-txt.js
 
 # Build slides with Marp
 .PHONY: build-slides
@@ -1082,6 +1344,12 @@ test-docs-remark:
 	@node docs/src/lib/remark/inlineMarkdownInHtml.test.js
 	@echo "✓ Docs remark plugin unit tests passed"
 
+.PHONY: test-docs-wizard-model
+test-docs-wizard-model:
+	@echo "Running AW wizard data model unit tests..."
+	@node docs/src/lib/wizard/model.test.js
+	@echo "✓ AW wizard data model unit tests passed"
+
 # Sync templates from .github to pkg/cli/templates
 # Sync action pins from .github/aw to pkg/actionpins/data and pkg/workflow/data
 .PHONY: sync-action-pins
@@ -1095,6 +1363,13 @@ sync-action-pins:
 		echo "⚠ Warning: .github/aw/actions-lock.json does not exist yet"; \
 	fi
 
+# Sync built-in model aliases from pkg/workflow/data to the setup action, where the
+# shared model resolver loads them at run time (see resolve_model_alias.cjs)
+.PHONY: sync-model-aliases
+sync-model-aliases:
+	@cp pkg/workflow/data/model_aliases.json actions/setup/js/model_aliases.json
+	@echo "✓ Built-in model aliases synced to actions/setup/js/model_aliases.json"
+
 # Sync action scripts
 .PHONY: sync-action-scripts
 sync-action-scripts:
@@ -1105,6 +1380,16 @@ sync-action-scripts:
 	@cp install-gh-aw.ps1 actions/setup-cli/install.ps1
 	@echo "✓ Action scripts synced successfully"
 
+# Sync max-agent in the latest compat.json interval with DefaultCopilotVersion
+.PHONY: sync-compat
+sync-compat:
+	@bash scripts/sync-compat.sh
+
+# Check that compat.json is in sync with DefaultCopilotVersion (CI gate)
+.PHONY: check-stale-compat
+check-stale-compat:
+	@bash scripts/sync-compat.sh --check
+
 # Sync install-gh-aw.sh SHA/hash constants in pkg/cli/copilot_setup.go
 .PHONY: sync-install-script-hashes
 sync-install-script-hashes:
@@ -1112,9 +1397,22 @@ sync-install-script-hashes:
 	@bash scripts/update-install-script-hashes.sh
 	@echo "✓ Install script hashes synced successfully"
 
+# Generate structured CLI output schemas
+.PHONY: schemas
+schemas: build
+	@set -eu; \
+	for schema in audit logs logs-jsonl; do \
+		target="schemas/$$schema.schema.json"; \
+		tmp=$$(mktemp "$$target.tmp.XXXXXX"); \
+		trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+		./$(BINARY_NAME) json-schema "$$schema" > "$$tmp"; \
+		mv "$$tmp" "$$target"; \
+		trap - EXIT HUP INT TERM; \
+	done
+
 # Recompile all workflow files
 .PHONY: recompile
-recompile: build
+recompile: schemas
 	./$(BINARY_NAME) init --codespaces ""
 	./$(BINARY_NAME) compile --validate --verbose --purge --schedule-seed github/gh-aw
 #	./$(BINARY_NAME) compile --dir pkg/cli/workflows --validate --verbose --purge
@@ -1126,7 +1424,7 @@ compile-cli-workflows:
 		echo "./$(BINARY_NAME) not found; building it first..."; \
 		$(MAKE) build; \
 	fi
-	@TMP_WORKFLOWS_DIR=$$(mktemp -d); \
+	@set -e; TMP_WORKFLOWS_DIR=$$(mktemp -d); \
 	trap 'rm -rf "$$TMP_WORKFLOWS_DIR"' EXIT; \
 	cp -R pkg/cli/workflows "$$TMP_WORKFLOWS_DIR/workflows"; \
 	WORKFLOWS=$$(find "$$TMP_WORKFLOWS_DIR/workflows" -maxdepth 1 -type f -name '*.lock.yml' | sed 's/\.lock\.yml$$/.md/' | sort | tr '\n' ' '); \
@@ -1134,7 +1432,11 @@ compile-cli-workflows:
 		echo "No workflow files found in pkg/cli/workflows"; \
 		exit 1; \
 	fi; \
-	./$(BINARY_NAME) compile --fix --no-check-update $$WORKFLOWS
+	./$(BINARY_NAME) compile --fix --no-check-update $$WORKFLOWS; \
+	mkdir -p "$$TMP_WORKFLOWS_DIR/.github/workflows"; \
+	cp -R .github/workflows/connectors "$$TMP_WORKFLOWS_DIR/.github/workflows/connectors"; \
+	cp pkg/cli/workflows/*-golden.md "$$TMP_WORKFLOWS_DIR/.github/workflows/"; \
+	./$(BINARY_NAME) compile --validate --strict --no-emit --no-check-update "$$TMP_WORKFLOWS_DIR"/.github/workflows/*-golden.md
 
 # Apply automatic fixes to workflow files
 .PHONY: fix
@@ -1153,6 +1455,23 @@ update: build
 	$(MAKE) sync-action-pins
 	$(MAKE) sync-install-script-hashes
 	$(MAKE) build
+
+# Update the reviewed threat-detect release pins and generated workflows
+.PHONY: update-threat-detect-pins
+update-threat-detect-pins:
+	@if [ -z "$(THREAT_DETECT_VERSION)" ]; then \
+		echo "Usage: make update-threat-detect-pins THREAT_DETECT_VERSION=v0.5.2"; \
+		exit 1; \
+	fi
+	@if ! printf '%s\n' "$(THREAT_DETECT_VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "Error: THREAT_DETECT_VERSION must be a semantic release tag such as v0.5.2"; \
+		echo "Usage: make update-threat-detect-pins THREAT_DETECT_VERSION=v0.5.2"; \
+		exit 1; \
+	fi
+	bash scripts/update-threat-detect-pins.sh "$(THREAT_DETECT_VERSION)"
+	$(MAKE) fmt
+	$(MAKE) recompile
+	@echo "✓ Threat-detect pins updated; review pkg/constants/version_constants.go, pkg/constants/version_constants_test.go, and generated workflow locks together."
 
 # Run development server
 .PHONY: dev
@@ -1205,24 +1524,23 @@ sbom:
 	syft packages . -o cyclonedx-json=sbom.cdx.json
 	@echo "✓ SBOM files generated: sbom.spdx.json, sbom.cdx.json"
 
-# Agent should run this task before finishing its turns
+# Explicit repository-wide maintenance sweep, not an inner-loop gate.
 .PHONY: agent-finish
-agent-finish: deps-dev fmt lint build build-wasm test-all validate-otel-contract fix recompile dependabot generate-schema-docs generate-agent-factory security-scan
+agent-finish: deps-dev fmt-all lint build build-wasm test-all validate-otel-contract fix recompile dependabot generate-schema-docs generate-agent-factory generate-llms-txt security-scan
 	@echo "Agent finished tasks successfully."
 
-# Fast pre-PR gate — run before every intermediate report_progress call.
-# Skips test-unit for speed; use agent-report-progress for the final report_progress call.
-# stale-lock guard (fast, no binary) + build + fmt + lint + workflow drift check.
+# Fast intermediate gate: scoped formatting and compilation/vet, no test bodies.
+# Package-wide Go linters and workflow recompilation run only in the final gate.
 .PHONY: agent-report-progress-no-test
-agent-report-progress-no-test: check-stale-lock-files build fmt lint check-workflow-drift
-	@echo "Pre-PR validation passed (zero lint errors, lock files in sync). Safe to call report_progress."
+agent-report-progress-no-test:
+	@bash scripts/agent-report-progress.sh
 
-# Full pre-PR gate with tests — run once before the final report_progress call.
-# Includes formatting + lint validation to prevent lint-fix PR churn:
-# stale-lock guard (fast, no binary) + build + fmt + lint + test-unit + workflow drift check.
+# Change-scoped pre-PR gate with impacted tests — run once before the final
+# report_progress call. Independent lint and test groups run in parallel; full
+# workflow recompilation remains isolated because it temporarily rewrites files.
 .PHONY: agent-report-progress
-agent-report-progress: check-stale-lock-files build fmt lint test-unit check-workflow-drift
-	@echo "Pre-PR validation passed (zero lint errors, lock files in sync, tests pass). Safe to call report_progress."
+agent-report-progress:
+	@bash scripts/agent-report-progress.sh --with-tests
 
 # Extended pre-PR gate with lock-file-only linting.
 .PHONY: agent-report-progress-lint
@@ -1240,15 +1558,21 @@ help:
 	@echo "  test-unit        - Run impacted Go unit tests first (~$(TEST_UNIT_MAX_SECONDS)s budget); set TEST_UNIT_RUN_FULL=1 for full suite"
 	@echo "  test-unit-all    - Run full Go unit test suite"
 	@echo "  test-security    - Run security regression tests"
+	@echo "  check-agent-local-settings - Reject tracked Claude Code local permission settings"
+	@echo "  test-agent-local-settings - Test local settings secret-leak prevention"
 	@echo "  test-js          - Run JavaScript tests"
 	@echo "  test-impacted-js - Run impacted JavaScript unit tests for current branch changes"
 	@echo "  test-impacted-go - Run impacted Go unit tests for current branch changes"
 	@echo "  test-impacted    - Run impacted JavaScript and Go unit tests for current branch changes"
 	@echo "  test-scripts     - Run Bash script tests (check-stale-lock-files, check-workflow-drift)"
-	@echo "  test-all         - Run all tests (Go, JavaScript, wasm golden, and shell scripts)"
+	@echo "  check-npm-1es    - Verify locked npm package tarballs are available in the 1ES feed"
+	@echo "  test-all         - Run all tests (Go, JavaScript, wasm golden, shell scripts, and guidance contracts)"
+	@echo "  test-guidance    - Run agentic-workflows documentation contract tests"
 	@echo "  test-wasm-golden - Run wasm golden tests (Go string API path)"
 	@echo "  test-wasm        - Build wasm and run Node.js golden comparison test"
 	@echo "  update-wasm-golden - Regenerate wasm golden files from current compiler output"
+	@echo "  verify-model-routing-golden - Verify model-routing fixtures against expected outputs"
+	@echo "  update-model-routing-golden - Regenerate model-routing golden files from fixtures"
 	@echo "  test-coverage    - Run tests with coverage report"
 	@echo "  bench            - Run benchmarks for performance testing"
 	@echo "  bench-compare    - Run benchmarks with more iterations (for benchstat comparison)"
@@ -1270,11 +1594,13 @@ help:
 	@echo "  license-report   - Generate CSV license report"
 	@echo "  deps             - Install dependencies"
 	@echo "  deps-dev         - Install development dependencies (includes tools)"
-	@echo "  check-node-version - Check Node.js version (20 or higher required)"
+	@echo "  install-shellcheck - Install pinned shellcheck binary"
+	@echo "  check-node-version - Check Node.js version (24 or higher required)"
 	@echo "  golint           - Run golangci-lint (full repository scan)"
 	@echo "  golint-incremental - Run golangci-lint incrementally (only changed files, requires BASE_REF)"
 	@echo "  lint             - Run linter"
-	@echo "  fmt              - Format code"
+	@echo "  fmt              - Format branch changes (Go-only changes need no npm)"
+	@echo "  fmt-all          - Format the entire repository"
 	@echo "  fmt-cjs          - Format JavaScript/TypeScript/JSON files in actions/setup/js and eslint-factory"
 	@echo "  fmt-json         - Format JSON files in pkg directory (excluding actions/setup/js)"
 	@echo "  fmt-check        - Check code formatting"
@@ -1284,8 +1610,10 @@ help:
 	@echo "  validate-cjs-syntax - Syntax-check all non-test .cjs files (catches module-load SyntaxErrors)"
 	@echo "  lint-json        - Lint JSON files in pkg directory (excluding actions/setup/js)"
 	@echo "  lint-errors      - Lint error messages for quality compliance"
+	@echo "  lint-error-messages-report - Non-blocking full-repo error message audit"
 	@echo "  validate-otel-contract - Validate the gh-aw OpenTelemetry compatibility contract"
 	@echo "  lint-action-sh   - Lint action shell scripts for python/python3 invocations"
+	@echo "  shellcheck-setup-sh - Run shellcheck on actions/setup/sh scripts"
 	@echo "  check-file-sizes - Check Go file sizes and function counts (informational)"
 	@echo "  check-validator-sizes - Check *_validation.go files against the 768-line hard limit"
 	@echo "  security-scan    - Run all security scans (gosec, govulncheck)"
@@ -1297,19 +1625,28 @@ help:
 	@echo "  validate-workflows - Validate compiled workflow lock files (depends on build)"
 	@echo "  check-workflow-drift - Check for drift between .md sources and .lock.yml files (builds binary if missing)"
 	@echo "  check-stale-lock-files - Fast guard: detect modified .md files without regenerated .lock.yml (no binary needed)"
+	@echo "  check-skill-file-paths - Guard: reject invalid backticked repo paths in .github/skills/**/SKILL.md"
+	@echo "  check-instruction-prefixes - Guard: keep instruction execution contracts within 7500 UTF-8 bytes"
 	@echo "  check-stale-schema-binary - Guard: detect modified schema files under pkg/parser/schemas/ without a binary rebuild"
 	@echo "  install          - Install binary locally"
 	@echo "  sync-action-pins - Sync actions-lock.json from .github/aw to pkg/actionpins/data and pkg/workflow/data (runs automatically during build)"
+	@echo "  sync-model-aliases - Sync pkg/workflow/data/model_aliases.json to actions/setup/js/model_aliases.json (runs automatically during build)"
 	@echo "  sync-action-scripts - Sync install-gh-aw.sh and install-gh-aw.ps1 to actions/setup-cli/ (runs automatically during build)"
+	@echo "  sync-compat      - Sync max-agent in .github/aw/compat.json latest interval with DefaultCopilotVersion (runs automatically during build)"
+	@echo "  check-stale-compat - Guard: detect when compat.json max-agent is out of sync with DefaultCopilotVersion"
 	@echo "  sync-install-script-hashes - Update install-gh-aw.sh SHA and SHA256 constants in pkg/cli/copilot_setup.go (runs automatically during update)"
 	@echo "  update           - Update GitHub Actions and workflows, sync action pins, and rebuild binary"
+	@echo "  update-threat-detect-pins - Update reviewed threat-detect pins; set THREAT_DETECT_VERSION=vX.Y.Z"
 	@echo "  fix              - Apply automatic codemod-style fixes to workflow files (depends on build)"
 	@echo "  recompile        - Recompile all workflow files (runs init, depends on build)"
 	@echo "  merge-main       - Format, merge main, recompile workflows, and format again"
 	@echo "  compile-cli-workflows - Compile workflows in pkg/cli/workflows (builds binary if missing)"
 	@echo "  dependabot       - Generate Dependabot manifests for npm dependencies in workflows"
 	@echo "  generate-schema-docs - Generate frontmatter full reference documentation from JSON schema"
+	@echo "  session-schemas - Generate canonical and unified session JSON schemas from TypeScript declarations"
+	@echo "  check-session-schemas - Check generated session schemas for declaration drift"
 	@echo "  generate-agent-factory     - Generate agent factory documentation page"
+	@echo "  generate-llms-txt  - Generate llms.txt at repository root from .github/aw/*.md"
 	@echo "  build-slides     - Build slides with Marp to docs/public/slides/gh-aw.html"
 	@echo "  deps-docs        - Install Astro documentation dependencies"
 	@echo "  build-docs       - Build Astro documentation to docs/dist"
@@ -1318,8 +1655,8 @@ help:
 	@echo "  clean-docs       - Clean documentation artifacts (dist, node_modules, .astro)"
 
 	@echo "  agent-finish                - Complete validation sequence (build, test, fix, recompile, fmt, lint, security-scan)"
-	@echo "  agent-report-progress-no-test - Fast pre-PR gate (no test-unit): check-stale-lock-files + build + fmt + lint + check-workflow-drift"
-	@echo "  agent-report-progress       - Full pre-PR gate (final save only): same as above + test-unit"
+	@echo "  agent-report-progress-no-test - Fast scoped formatting and compile/vet gate; full Go lint and workflow drift deferred"
+	@echo "  agent-report-progress       - Change-scoped pre-PR gate with impacted Go tests"
 	@echo "  agent-report-progress-lint  - Full pre-PR gate + gh aw lint lock-file check"
 	@echo "  sbom             - Generate SBOM in SPDX and CycloneDX formats (requires syft)"
 	@echo "  help             - Show this help message"

@@ -20,11 +20,13 @@ var compileValidationLog = logger.New("cli:compile_validation")
 // CompileValidationOptions holds optional validation flags for workflow compilation.
 type CompileValidationOptions struct {
 	Verbose              bool
+	NoEmit               bool
 	RunZizmorPerFile     bool
 	RunPoutinePerFile    bool
 	RunActionlintPerFile bool
 	Strict               bool
 	ValidateActionSHAs   bool
+	FailOnWarnings       bool
 }
 
 // CompileWorkflowWithValidation compiles a workflow with always-on YAML validation for CLI usage
@@ -33,26 +35,7 @@ func CompileWorkflowWithValidation(ctx context.Context, compiler *workflow.Compi
 
 	compiler.SetContext(ctx)
 
-	// Set workflow identifier for schedule scattering (use repository-relative path for stability)
-	relPath, err := getRepositoryRelativePath(filePath)
-	if err != nil {
-		compileValidationLog.Printf("Warning: failed to get repository-relative path for %s: %v", filePath, err)
-		// Fallback to basename if we can't get relative path
-		relPath = filepath.Base(filePath)
-	}
-	compiler.SetWorkflowIdentifier(relPath)
-
-	// Set repository slug for this specific file (may differ from CWD's repo)
-	// Uses SetRepositorySlugIfUnlocked so that an explicit --schedule-seed flag is never overridden.
-	fileRepoSlug := getRepositorySlugFromRemoteForPath(filePath)
-	if fileRepoSlug != "" {
-		if compiler.IsRepositorySlugLocked() {
-			compileValidationLog.Printf("Repository slug from file remote (%s) ignored: overridden via --schedule-seed (%s)", fileRepoSlug, compiler.GetRepositorySlug())
-		} else {
-			compiler.SetRepositorySlugIfUnlocked(fileRepoSlug)
-			compileValidationLog.Printf("Repository slug for file set: %s", fileRepoSlug)
-		}
-	}
+	setWorkflowFileContext(compiler, filePath)
 
 	// Compile the workflow first
 	if err := compiler.CompileWorkflow(filePath); err != nil {
@@ -60,7 +43,11 @@ func CompileWorkflowWithValidation(ctx context.Context, compiler *workflow.Compi
 		return err
 	}
 
-	// Always validate that the generated lock file is valid YAML (CLI requirement)
+	if opts.NoEmit || compiler.IsNoEmit() {
+		return nil
+	}
+
+	// Validate emitted output only; no-emit compilation validates generated YAML in memory.
 	lockFile := stringutil.MarkdownToLockFile(filePath)
 	if _, err := os.Stat(lockFile); err != nil {
 		compileValidationLog.Print("Lock file not found, skipping validation (likely no-emit mode)")
@@ -87,6 +74,9 @@ func CompileWorkflowWithValidation(ctx context.Context, compiler *workflow.Compi
 		// Use the compiler's shared action cache to benefit from cached resolutions
 		actionCache := compiler.GetSharedActionCache()
 		if err := workflow.ValidateActionSHAsInLockFile(ctx, lockFile, actionCache, opts.Verbose); err != nil {
+			if opts.FailOnWarnings {
+				return fmt.Errorf("action SHA validation failed: %w", err)
+			}
 			// Action SHA validation warnings are non-fatal
 			compileValidationLog.Printf("Action SHA validation completed with warnings: %v", err)
 		}
@@ -130,7 +120,11 @@ func CompileWorkflowDataWithValidation(ctx context.Context, compiler *workflow.C
 		return err
 	}
 
-	// Always validate that the generated lock file is valid YAML (CLI requirement)
+	if opts.NoEmit || compiler.IsNoEmit() {
+		return nil
+	}
+
+	// Validate emitted output only; no-emit compilation validates generated YAML in memory.
 	lockFile := stringutil.MarkdownToLockFile(filePath)
 	if _, err := os.Stat(lockFile); err != nil {
 		compileValidationLog.Print("Lock file not found, skipping validation (likely no-emit mode)")
@@ -157,6 +151,9 @@ func CompileWorkflowDataWithValidation(ctx context.Context, compiler *workflow.C
 		// Use the compiler's shared action cache to benefit from cached resolutions
 		actionCache := compiler.GetSharedActionCache()
 		if err := workflow.ValidateActionSHAsInLockFile(ctx, lockFile, actionCache, opts.Verbose); err != nil {
+			if opts.FailOnWarnings {
+				return fmt.Errorf("action SHA validation failed: %w", err)
+			}
 			// Action SHA validation warnings are non-fatal
 			compileValidationLog.Printf("Action SHA validation completed with warnings: %v", err)
 		}
@@ -191,6 +188,24 @@ func CompileWorkflowDataWithValidation(ctx context.Context, compiler *workflow.C
 // This is extracted for faster testing without full compilation
 func validateCompileConfig(config CompileConfig) error {
 	compileValidationLog.Printf("Validating compile config: files=%d, dependabot=%v, purge=%v, workflowDir=%s", len(config.MarkdownFiles), config.Dependabot, config.Purge, config.WorkflowDir)
+
+	if err := validateDevelopmentCompileMode(config); err != nil {
+		return err
+	}
+	if err := workflow.ValidateEnvironmentOverride(config.EnvironmentOverride); err != nil {
+		return err
+	}
+	if config.ActionsLock {
+		if config.DryRun {
+			return errors.New("--actions-lock cannot be used with --dry-run: the extension performs repository-wide post-processing beyond emitted compiler files")
+		}
+		if config.NoEmit || config.ReadOnly {
+			return errors.New("--actions-lock cannot be used with --no-emit or --read-only")
+		}
+		if config.Watch {
+			return errors.New("--actions-lock cannot be used with --watch")
+		}
+	}
 
 	// Validate dependabot flag usage
 	if config.Dependabot {
@@ -247,22 +262,31 @@ func sanitizeValidationResults(results []ValidationResult) []ValidationResult {
 
 	compileValidationLog.Printf("Sanitizing validation results: workflow_count=%d", len(results))
 
-	sanitizeError := func(e CompileValidationError) CompileValidationError {
-		return CompileValidationError{
-			Type:    e.Type,
-			Message: stringutil.SanitizeErrorMessage(e.Message),
-			Line:    e.Line,
+	sanitizeError := func(e ValidationIssue) ValidationIssue {
+		e.Message = stringutil.SanitizeErrorMessage(e.Message)
+		if e.Script != nil {
+			script := *e.Script
+			script.JobID = stringutil.SanitizeErrorMessage(script.JobID)
+			script.StepID = stringutil.SanitizeErrorMessage(script.StepID)
+			script.StepName = stringutil.SanitizeErrorMessage(script.StepName)
+			script.Source = stringutil.SanitizeErrorMessage(script.Source)
+			script.Resource = stringutil.SanitizeErrorMessage(script.Resource)
+			e.Script = &script
 		}
+		return e
 	}
 
 	return sliceutil.Map(results, func(result ValidationResult) ValidationResult {
 		return ValidationResult{
-			Workflow:     result.Workflow,
-			Valid:        result.Valid,
-			CompiledFile: result.CompiledFile,
-			Errors:       sliceutil.Map(result.Errors, sanitizeError),
-			Warnings:     sliceutil.Map(result.Warnings, sanitizeError),
-			Labels:       result.Labels,
+			Scope:                result.Scope,
+			Workflow:             result.Workflow,
+			Valid:                result.Valid,
+			CompiledFile:         result.CompiledFile,
+			Errors:               sliceutil.Map(result.Errors, sanitizeError),
+			Warnings:             sliceutil.Map(result.Warnings, sanitizeError),
+			Labels:               result.Labels,
+			DryRun:               result.DryRun,
+			WebhookSubscriptions: result.WebhookSubscriptions,
 		}
 	})
 }

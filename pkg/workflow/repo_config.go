@@ -7,11 +7,13 @@
 // Configuration reference:
 //
 //		{
-//		  "ghes": true,               // enables GHES compatibility mode (artifact pins remain latest non-v3)
+//		  "ghes": true,               // enables GHES-compatible v3 artifact pins
 //		  "help_command": false,      // disables builtin centralized /help comment handler
+//		  "require_self_hosted_runners": true, // requires self-hosted runners for every generated job
+//		  "lock_file_logo": false,    // omits the ASCII logo from generated workflow headers
 //		  "utc": "-08:00", // project home UTC offset for rendered local times
 //		  "auto_upgrade": true, // set to true to generate agentic-auto-upgrade.yml with weekly schedule
-//		  "auto_upgrade": { "cron": "0 9 * * 1" }, // or object form: enable with custom cron (Monday 09:00 UTC)
+//		  "auto_upgrade": { "cron": "0 9 * * 1", "options": ["--pre-releases"] }, // or object form: configure schedule and upgrade options
 //		  "action_pins": {            // redirect action references to internal mirrors
 //		    "actions/checkout@v4": "acme-corp/checkout@v4"
 //		  },
@@ -49,10 +51,12 @@ import (
 
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/parser"
+	"github.com/github/gh-aw/pkg/workqueue"
 )
 
 var repoConfigLog = logger.New("workflow:repo_config")
 var repoConfigSecretNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var errWorkQueueConfig = errors.New("invalid global work_queue configuration")
 
 // RepoConfigFileName is the path of the repository-level configuration file
 // relative to the git root.
@@ -61,31 +65,6 @@ const RepoConfigFileName = ".github/workflows/aw.json"
 // DefaultActionFailureIssueExpiresHours is the default expiration (in hours)
 // for action failure issues created by the conclusion job.
 const DefaultActionFailureIssueExpiresHours = 24 * 7
-
-// RunsOnValue is a JSON-deserializable type for the runs_on field in aw.json.
-// It accepts either a single runner label string or an array of runner label strings.
-// When unmarshalled, a plain string is normalised to a single-element slice so the
-// rest of the code works with a uniform []string type.
-type RunsOnValue []string
-
-// UnmarshalJSON implements json.Unmarshaler, accepting either a JSON string or
-// a JSON array of strings for the runs_on field.
-func (r *RunsOnValue) UnmarshalJSON(data []byte) error {
-	// Try plain string first (runs_on: "ubuntu-latest")
-	var s string
-	if err := json.Unmarshal(data, &s); err == nil {
-		*r = RunsOnValue{s}
-		return nil
-	}
-
-	// Try array of strings (runs_on: ["self-hosted", "linux"])
-	var ss []string
-	if err := json.Unmarshal(data, &ss); err != nil {
-		return fmt.Errorf("runs_on must be a string or array of strings: %w", err)
-	}
-	*r = RunsOnValue(ss)
-	return nil
-}
 
 // MaintenanceConfig holds maintenance-workflow-specific settings from aw.json.
 type MaintenanceCompileConfig struct {
@@ -103,6 +82,15 @@ type MaintenanceConfig struct {
 	// ActionFailureIssueExpires configures expiration (in hours) for action
 	// failure issues opened by the conclusion job. Defaults to 168 (7 days).
 	ActionFailureIssueExpires int `json:"action_failure_issue_expires,omitempty"`
+
+	// ActionFailureIssueExpiresExplicit records whether action_failure_issue_expires
+	// was explicitly present in aw.json, as opposed to falling back to the
+	// implicit 168-hour default. This distinction matters because the implicit
+	// default must not, by itself, force generation of agentics-maintenance.yml
+	// (see scanWorkflowsForExpires); only an explicit opt-in does. Populated by
+	// the JSON loader below, not by json.Unmarshal (the field is unexported from
+	// the schema on purpose).
+	ActionFailureIssueExpiresExplicit bool `json:"-"`
 
 	// LabelTriggers controls all label-triggered jobs (disable_agentic_workflow,
 	// label_apply_safe_outputs, etc.).
@@ -124,6 +112,15 @@ var validDisabledMaintenanceJobs = map[string]string{
 	normalizeMaintenanceJobName("apply_safe_outputs"):             "apply_safe_outputs",
 	normalizeMaintenanceJobName("label_disable_agentic_workflow"): "label_disable_agentic_workflow",
 	normalizeMaintenanceJobName("label_apply_safe_outputs"):       "label_apply_safe_outputs",
+	normalizeMaintenanceJobName("run_operation"):                  "run_operation",
+	normalizeMaintenanceJobName("update_pull_request_branches"):   "update_pull_request_branches",
+	normalizeMaintenanceJobName("validate_workflows"):             "validate_workflows",
+	normalizeMaintenanceJobName("activity_report"):                "activity_report",
+	normalizeMaintenanceJobName("forecast_report"):                "forecast_report",
+	normalizeMaintenanceJobName("close_agentic_workflows_issues"): "close_agentic_workflows_issues",
+	normalizeMaintenanceJobName("create_labels"):                  "create_labels",
+	normalizeMaintenanceJobName("cleanup-cache-memory"):           "cleanup-cache-memory",
+	normalizeMaintenanceJobName("cleanup-stale-steering-issues"):  "cleanup-stale-steering-issues",
 }
 
 // IsLabelTriggerEnabled returns true only when label_triggers is explicitly set to true.
@@ -135,6 +132,8 @@ func (m *MaintenanceConfig) IsLabelTriggerEnabled() bool {
 	return *m.LabelTriggers
 }
 
+// normalizeMaintenanceJobName normalizes a maintenance job name for
+// case/whitespace-insensitive comparison, converting underscores to hyphens.
 func normalizeMaintenanceJobName(name string) string {
 	normalized := strings.ToLower(strings.TrimSpace(name))
 	return strings.ReplaceAll(normalized, "_", "-")
@@ -157,10 +156,36 @@ func (m *MaintenanceConfig) IsJobDisabled(jobName string) bool {
 
 // RepoConfig is the parsed representation of aw.json.
 type RepoConfig struct {
+	// ProtectedFiles configures repository-wide exceptions to safe-output file protection.
+	ProtectedFiles RepoProtectedFilesConfig
+
+	// Admission enables admission and conclusion_admission jobs for all workflows.
+	Admission bool
+
+	// GatewayDispatch enables experimental on.gateway-dispatch triggers requiring an approved server.
+	GatewayDispatch bool
+
+	// WorkQueue holds optional scheduling overrides, never identities or credentials.
+	WorkQueue json.RawMessage
+
+	// Strict enforces strict mode for every workflow compiled in the repository.
+	// The schema only permits true when this field is present.
+	Strict bool
+
 	// GHES enables GitHub Enterprise Server compatibility mode.
-	// When true, the compiler enables GHES compatibility behavior. Artifact actions
-	// continue to use latest non-v3 pins because v3 artifact actions are deprecated.
+	// When true, the compiler uses artifact action versions supported by GHES.
 	GHES bool
+
+	// RequireSelfHostedRunners requires every generated workflow job to select a
+	// self-hosted runner.
+	RequireSelfHostedRunners bool
+
+	// LockFileLogo controls the ASCII logo in generated workflow headers.
+	// When nil or true, the logo is enabled.
+	LockFileLogo *bool
+
+	// ArtifactRetentionDays overrides retention for all workflow artifacts.
+	ArtifactRetentionDays *TemplatableInt32
 
 	// UTC is the project's home UTC offset used for rendering local times in CLI output.
 	// The value must be a numeric UTC offset such as "+00:00" or "-08:00".
@@ -182,6 +207,10 @@ type RepoConfig struct {
 	// the default fuzzy weekly schedule. Requires AutoUpgrade to be true.
 	AutoUpgradeCron string
 
+	// AutoUpgradeOptions contains supported command-line options passed to
+	// gh aw upgrade by the agentic-auto-upgrade workflow.
+	AutoUpgradeOptions []string
+
 	// MaintenanceDisabled is true when maintenance has been explicitly set to false
 	// in aw.json, disabling agentic-maintenance generation and any features that
 	// depend on it (such as expires).
@@ -197,6 +226,9 @@ type RepoConfig struct {
 	// can use this to redirect actions to internal mirrors. Keys and values
 	// must use the format "owner/repo@ref".
 	ActionPins map[string]string
+	// ActionPinPrefixes maps source repository prefixes to mirror prefixes.
+	// Matching is performed after resolving the original action's SHA.
+	ActionPinPrefixes map[string]string
 
 	// ContainerPins maps container image references to replacement image
 	// targets. Enterprises running in a private cloud can use this to
@@ -205,6 +237,11 @@ type RepoConfig struct {
 	// with separate image ref and SHA-256 digest fields so that each
 	// component can be validated independently.
 	ContainerPins map[string]ContainerPinTarget
+}
+
+// RepoProtectedFilesConfig holds repository-root path globs exempt from file protection.
+type RepoProtectedFilesConfig struct {
+	Exclude []string `json:"exclude,omitempty"`
 }
 
 // ContainerPinTarget holds the replacement image reference for a container_pins
@@ -228,31 +265,66 @@ func (r *RepoConfig) IsAutoUpgradeEnabled() bool {
 	return *r.AutoUpgrade
 }
 
+// IsLockFileLogoEnabled reports whether generated workflow headers include the ASCII logo.
+func (r *RepoConfig) IsLockFileLogoEnabled() bool {
+	return r == nil || r.LockFileLogo == nil || *r.LockFileLogo
+}
+
+func shouldIncludeLockFileLogo(repoConfig *RepoConfig, noLogo ...bool) bool {
+	for _, omitLogo := range noLogo {
+		if omitLogo {
+			return false
+		}
+	}
+	return repoConfig.IsLockFileLogoEnabled()
+}
+
 // UnmarshalJSON implements json.Unmarshaler to handle the polymorphic maintenance
 // and auto_upgrade fields. maintenance can be either the boolean false (disable)
 // or a configuration object; auto_upgrade can be a boolean or an object with an
 // optional cron field.
-func (r *RepoConfig) UnmarshalJSON(data []byte) error {
+func (r *RepoConfig) UnmarshalJSON(data []byte) error { //nolint:largefunc // Polymorphic repository fields are decoded together.
 	// Use an intermediate struct with json.RawMessage to defer maintenance and
 	// auto_upgrade parsing.
 	var raw struct {
-		GHES          bool                          `json:"ghes,omitempty"`
-		HelpCommand   *bool                         `json:"help_command,omitempty"` // nil = use default (enabled)
-		UTC           string                        `json:"utc,omitempty"`
-		AutoUpgrade   json.RawMessage               `json:"auto_upgrade,omitempty"`
-		Maintenance   json.RawMessage               `json:"maintenance,omitempty"`
-		ActionPins    map[string]string             `json:"action_pins,omitempty"`
-		ContainerPins map[string]ContainerPinTarget `json:"container_pins,omitempty"`
+		ProtectedFiles           RepoProtectedFilesConfig      `json:"protected_files,omitzero"`
+		Admission                bool                          `json:"admission,omitempty"`
+		GatewayDispatch          bool                          `json:"gateway-dispatch,omitempty"`
+		Strict                   bool                          `json:"strict,omitempty"`
+		GHES                     bool                          `json:"ghes,omitempty"`
+		RequireSelfHostedRunners bool                          `json:"require_self_hosted_runners,omitempty"`
+		LockFileLogo             *bool                         `json:"lock_file_logo,omitempty"`
+		ArtifactRetentionDays    *TemplatableInt32             `json:"artifact_retention_days,omitempty"`
+		HelpCommand              *bool                         `json:"help_command,omitempty"` // nil = use default (enabled)
+		UTC                      string                        `json:"utc,omitempty"`
+		AutoUpgrade              json.RawMessage               `json:"auto_upgrade,omitempty"`
+		Maintenance              json.RawMessage               `json:"maintenance,omitempty"`
+		ActionPins               map[string]string             `json:"action_pins,omitempty"`
+		ActionPinPrefixes        map[string]string             `json:"action_pin_prefixes,omitempty"`
+		ContainerPins            map[string]ContainerPinTarget `json:"container_pins,omitempty"`
+		WorkQueue                json.RawMessage               `json:"work_queue,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
+	if _, err := workqueue.ParseSettings(raw.WorkQueue); err != nil {
+		return fmt.Errorf("%w: %w", errWorkQueueConfig, err)
+	}
 
+	r.GatewayDispatch = raw.GatewayDispatch
+	r.ProtectedFiles = raw.ProtectedFiles
+	r.Admission = raw.Admission
+	r.Strict = raw.Strict
 	r.GHES = raw.GHES
+	r.RequireSelfHostedRunners = raw.RequireSelfHostedRunners
+	r.LockFileLogo = raw.LockFileLogo
+	r.ArtifactRetentionDays = raw.ArtifactRetentionDays
 	r.HelpCommand = raw.HelpCommand
 	r.UTC = strings.TrimSpace(raw.UTC)
 	r.ActionPins = raw.ActionPins
+	r.ActionPinPrefixes = raw.ActionPinPrefixes
 	r.ContainerPins = raw.ContainerPins
+	r.WorkQueue = raw.WorkQueue
 
 	// Parse polymorphic auto_upgrade: boolean or { "cron": "..." } object.
 	if len(raw.AutoUpgrade) > 0 && string(raw.AutoUpgrade) != "null" {
@@ -260,16 +332,18 @@ func (r *RepoConfig) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(raw.AutoUpgrade, &b); err == nil {
 			r.AutoUpgrade = &b
 		} else {
-			// Object form: { "cron": "..." } — implies enabled.
+			// Object form: { "cron": "...", "options": [...] } — implies enabled.
 			var autoUpgradeObj struct {
-				Cron string `json:"cron,omitempty"`
+				Cron    string   `json:"cron,omitempty"`
+				Options []string `json:"options,omitempty"`
 			}
 			if err := json.Unmarshal(raw.AutoUpgrade, &autoUpgradeObj); err != nil {
-				return fmt.Errorf("invalid auto_upgrade configuration: %w", err)
+				return fmt.Errorf("auto_upgrade configuration is not recognized: %w. Expected a boolean or an object with 'cron' and 'options' fields, for example: {\"cron\": \"0 9 * * 1\", \"options\": [\"--pre-releases\"]}", err)
 			}
 			enabled := true
 			r.AutoUpgrade = &enabled
 			r.AutoUpgradeCron = strings.TrimSpace(autoUpgradeObj.Cron)
+			r.AutoUpgradeOptions = autoUpgradeObj.Options
 		}
 	}
 
@@ -288,9 +362,17 @@ func (r *RepoConfig) UnmarshalJSON(data []byte) error {
 	// Otherwise deserialise as an object with JSON annotations.
 	var mc MaintenanceConfig
 	if err := json.Unmarshal(raw.Maintenance, &mc); err != nil {
-		return fmt.Errorf("invalid maintenance configuration: %w", err)
+		return fmt.Errorf("maintenance configuration is not recognized: %w. Expected a boolean or a maintenance object, for example: {\"disabled_jobs\": []}", err)
 	}
-	repoConfigLog.Printf("Maintenance field parsed as object: runsOn=%v, issueExpires=%d", mc.RunsOn, mc.ActionFailureIssueExpires)
+	// Detect whether action_failure_issue_expires was explicitly present in the
+	// source JSON, distinct from falling back to the implicit 168-hour default.
+	var mcPresence map[string]json.RawMessage
+	if err := json.Unmarshal(raw.Maintenance, &mcPresence); err == nil {
+		if _, ok := mcPresence["action_failure_issue_expires"]; ok {
+			mc.ActionFailureIssueExpiresExplicit = true
+		}
+	}
+	repoConfigLog.Printf("Maintenance field parsed as object: runsOn=%v, issueExpires=%d, issueExpiresExplicit=%v", mc.RunsOn, mc.ActionFailureIssueExpires, mc.ActionFailureIssueExpiresExplicit)
 	r.Maintenance = &mc
 	return nil
 }
@@ -319,7 +401,16 @@ func LoadRepoConfig(gitRoot string) (*RepoConfig, error) {
 			repoConfigLog.Print("Repo config file not found, using defaults")
 			return &RepoConfig{}, nil
 		}
-		return nil, fmt.Errorf("failed to read %s: %w", RepoConfigFileName, err)
+		return nil, fmt.Errorf("could not read %s: %w. Check that the file exists and is readable", RepoConfigFileName, err)
+	}
+
+	var sections map[string]json.RawMessage
+	if json.Unmarshal(data, &sections) == nil {
+		if settings, configured := sections["work_queue"]; configured {
+			if _, err := workqueue.ParseSettings(settings); err != nil {
+				return nil, fmt.Errorf("%s: %w: %w", RepoConfigFileName, errWorkQueueConfig, err)
+			}
+		}
 	}
 
 	// Validate against the embedded JSON schema before deserialising.
@@ -330,7 +421,7 @@ func LoadRepoConfig(gitRoot string) (*RepoConfig, error) {
 	// Deserialise into typed structs via JSON annotations.
 	var cfg RepoConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse %s: %w", RepoConfigFileName, err)
+		return nil, fmt.Errorf("could not parse %s as JSON: %w. Check the file for syntax errors such as trailing commas or unquoted keys", RepoConfigFileName, err)
 	}
 	if err := validateRepoConfigValues(&cfg); err != nil {
 		return nil, err
@@ -344,17 +435,17 @@ func validateRepoConfigJSON(data []byte, filePath string) error {
 	repoConfigLog.Printf("Validating repo config JSON schema: %s (%d bytes)", filePath, len(data))
 	schema, err := parser.GetCompiledRepoConfigSchema()
 	if err != nil {
-		return fmt.Errorf("failed to compile repo config schema: %w", err)
+		return fmt.Errorf("could not compile the repo config schema: %w. This indicates a bug in gh-aw; please report it", err)
 	}
 
 	var doc any
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return fmt.Errorf("failed to parse %s as JSON: %w", filePath, err)
+		return fmt.Errorf("could not parse %s as JSON: %w. Check the file for syntax errors such as trailing commas or unquoted keys", filePath, err)
 	}
 
 	if err := schema.Validate(doc); err != nil {
 		repoConfigLog.Printf("Repo config schema validation failed: %v", err)
-		return fmt.Errorf("invalid %s: %w", RepoConfigFileName, err)
+		return fmt.Errorf("%s does not match the expected schema: %w. See the repo config documentation for the required fields", RepoConfigFileName, err)
 	}
 
 	repoConfigLog.Print("Repo config JSON schema validation passed")
@@ -368,13 +459,13 @@ func validateRepoConfigValues(cfg *RepoConfig) error {
 	if cfg.UTC != "" {
 		normalized, err := NormalizeUTCOffset(cfg.UTC)
 		if err != nil {
-			return fmt.Errorf("invalid %s: utc %w", RepoConfigFileName, err)
+			return fmt.Errorf("%s has an unsupported utc value: %w. Expected a UTC offset like \"+02:00\" or \"-05:00\"", RepoConfigFileName, err)
 		}
 		cfg.UTC = normalized
 	}
 	if cfg.AutoUpgradeCron != "" {
 		if err := validateCronExpression(cfg.AutoUpgradeCron); err != nil {
-			return fmt.Errorf("invalid %s: auto_upgrade.cron %w", RepoConfigFileName, err)
+			return fmt.Errorf("%s has an unsupported auto_upgrade.cron value: %w. Expected a 5-field cron expression, for example: \"0 9 * * 1\"", RepoConfigFileName, err)
 		}
 	}
 	if cfg.Maintenance != nil {
@@ -382,13 +473,13 @@ func validateRepoConfigValues(cfg *RepoConfig) error {
 		for _, jobName := range cfg.Maintenance.DisabledJobs {
 			normalizedJobName := normalizeMaintenanceJobName(jobName)
 			if normalizedJobName == "" {
-				return fmt.Errorf("invalid %s: maintenance.disabled_jobs entries must not be blank", RepoConfigFileName)
+				return fmt.Errorf("%s has a blank entry in maintenance.disabled_jobs. Expected a non-empty job name, for example: \"stale-issue-cleanup\"", RepoConfigFileName)
 			}
 			if _, ok := validDisabledMaintenanceJobs[normalizedJobName]; !ok {
-				return fmt.Errorf("invalid %s: maintenance.disabled_jobs contains unrecognized job %q (valid values: close-expired-entities, apply_safe_outputs, label_disable_agentic_workflow, label_apply_safe_outputs)", RepoConfigFileName, jobName)
+				return fmt.Errorf("%s references unrecognized maintenance.disabled_jobs entry %q. Valid values are: close-expired-entities, apply_safe_outputs, label_disable_agentic_workflow, label_apply_safe_outputs, run_operation, update_pull_request_branches, validate_workflows, activity_report, forecast_report, close_agentic_workflows_issues, create_labels, cleanup-cache-memory, cleanup-stale-steering-issues. Example:\nmaintenance:\n  disabled_jobs:\n    - close-expired-entities", RepoConfigFileName, jobName)
 			}
 			if previous, exists := seenDisabledJobs[normalizedJobName]; exists {
-				return fmt.Errorf("invalid %s: maintenance.disabled_jobs contains duplicate entries %q and %q after normalization", RepoConfigFileName, previous, jobName)
+				return fmt.Errorf("%s has duplicate maintenance.disabled_jobs entries %q and %q after normalization. Expected each job to be listed once. Example:\nmaintenance:\n  disabled_jobs:\n    - close-expired-entities", RepoConfigFileName, previous, jobName)
 			}
 			seenDisabledJobs[normalizedJobName] = jobName
 		}
@@ -400,40 +491,9 @@ func validateRepoConfigValues(cfg *RepoConfig) error {
 	compileCfg := cfg.Maintenance.Compile
 	secretName := compileCfg.CreatePullRequestGitHubToken
 	if secretName != "" && !repoConfigSecretNamePattern.MatchString(secretName) {
-		return fmt.Errorf("invalid %s: maintenance.compile.create_pull_request_github_token must match %s", RepoConfigFileName, repoConfigSecretNamePattern.String())
+		return fmt.Errorf("%s has an unsupported maintenance.compile.create_pull_request_github_token value. Expected a secret name matching %s, for example: \"MY_PAT_TOKEN\"", RepoConfigFileName, repoConfigSecretNamePattern.String())
 	}
 	return nil
-}
-
-// FormatRunsOn serialises a RunsOnValue to a YAML-compatible string that can
-// be inlined directly after "runs-on: " in a generated workflow.
-//
-//   - empty / nil  → defaultRunsOn is returned
-//   - single label → the label string (e.g. "ubuntu-latest")
-//   - multiple labels → JSON-encoded flow sequence, e.g. ["self-hosted","linux"]
-//
-// For multi-label values json.Marshal is used so that any characters that are
-// special in YAML or JSON (quotes, backslashes, …) are properly escaped.
-// The schema already forbids newlines and control characters, providing a
-// defence-in-depth against YAML injection.
-func FormatRunsOn(runsOn RunsOnValue, defaultRunsOn string) string {
-	if len(runsOn) == 0 {
-		return defaultRunsOn
-	}
-	if len(runsOn) == 1 {
-		if runsOn[0] == "" {
-			return defaultRunsOn
-		}
-		return runsOn[0]
-	}
-	// Multiple labels: use json.Marshal to produce a properly-escaped YAML
-	// flow sequence.  A JSON array is valid YAML flow sequence notation.
-	encoded, err := json.Marshal([]string(runsOn))
-	if err != nil {
-		// []string marshalling never fails; fall back to the default just in case.
-		return defaultRunsOn
-	}
-	return string(encoded)
 }
 
 // ActionFailureIssueExpiresHours returns the configured action failure issue
@@ -443,6 +503,14 @@ func (r *RepoConfig) ActionFailureIssueExpiresHours() int {
 		return r.Maintenance.ActionFailureIssueExpires
 	}
 	return DefaultActionFailureIssueExpiresHours
+}
+
+// IsActionFailureIssueExpiresExplicit returns true when aw.json explicitly sets
+// maintenance.action_failure_issue_expires, as opposed to relying on the
+// implicit 168-hour default. Only an explicit value is treated as an opt-in
+// trigger for generating agentics-maintenance.yml.
+func (r *RepoConfig) IsActionFailureIssueExpiresExplicit() bool {
+	return r != nil && r.Maintenance != nil && r.Maintenance.ActionFailureIssueExpiresExplicit
 }
 
 // cronFieldRange describes the allowed numeric range for a cron field.
@@ -466,10 +534,10 @@ var cronFieldRanges = []cronFieldRange{
 func validateCronExpression(expr string) error {
 	fields := strings.Split(expr, " ")
 	if len(fields) != 5 {
-		return fmt.Errorf("must have exactly 5 fields (got %d)", len(fields))
+		return fmt.Errorf("cron expression should have exactly 5 fields, got %d. Example: \"0 9 * * 1\"", len(fields))
 	}
 	for i, field := range fields {
-		r := cronFieldRanges[i]
+		r := cronFieldRanges[i] //nolint:uncheckedsliceindex // Five input fields and five field ranges.
 		if err := validateCronField(field, r.min, r.max); err != nil {
 			return fmt.Errorf("field %d (%s): %w", i+1, r.name, err)
 		}
@@ -495,7 +563,7 @@ func validateCronPart(part string, min, max int) error {
 	if hasStep {
 		sv, err := strconv.Atoi(step)
 		if err != nil || sv < 1 {
-			return fmt.Errorf("invalid step value %q (must be a positive integer)", step)
+			return fmt.Errorf("cron step value %q should be a positive integer. Example: \"*/5\"", step)
 		}
 	}
 	part = base
@@ -509,7 +577,7 @@ func validateCronPart(part string, min, max int) error {
 		loN, err1 := strconv.Atoi(lo)
 		hiN, err2 := strconv.Atoi(hi)
 		if err1 != nil || err2 != nil {
-			return fmt.Errorf("invalid range %q", part)
+			return fmt.Errorf("cron range %q should be two integers separated by a hyphen. Example: \"1-5\"", part)
 		}
 		if loN < min || hiN > max || loN > hiN {
 			return fmt.Errorf("range %d-%d out of bounds [%d-%d]", loN, hiN, min, max)
@@ -520,7 +588,7 @@ func validateCronPart(part string, min, max int) error {
 	// Plain integer.
 	n, err := strconv.Atoi(part)
 	if err != nil {
-		return fmt.Errorf("invalid value %q", part)
+		return fmt.Errorf("cron value %q should be an integer. Example: \"5\"", part)
 	}
 	if n < min || n > max {
 		return fmt.Errorf("value %d out of bounds [%d-%d]", n, min, max)

@@ -221,6 +221,34 @@ describe("create_agent_session.cjs", () => {
   });
 
   describe("error handling", () => {
+    it.each([
+      [401, false],
+      [401, true],
+      [403, false],
+      [403, true],
+      [500, false],
+      [500, true],
+      [undefined, false],
+    ])("uses structured HTTP status %s (response-only: %s) despite authentication digits in the request ID", async (status, responseOnly) => {
+      mockGithub.request.mockRejectedValueOnce(
+        Object.assign(new Error(""), {
+          ...(responseOnly ? {} : { status }),
+          response: { status, headers: { "x-github-request-id": "C401:C403:C404:6553A7F0" } },
+        })
+      );
+
+      const handler = await createAgentSessionModule.main({ base: "main" });
+      const result = await handler({ type: "create_agent_session", body: "Test task" });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("request ID C401:C403:C404:");
+      if (status === 401 || status === 403) {
+        expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("authentication/permission error"));
+      } else {
+        expect(mockCore.error).toHaveBeenCalledExactlyOnceWith(`Error creating agent session: ${result.error}`);
+      }
+    });
+
     it("should return failure when REST API fails with auth error", async () => {
       mockGithub.request.mockRejectedValueOnce(new Error("permission denied (403)"));
 
@@ -253,8 +281,8 @@ describe("create_agent_session.cjs", () => {
     });
   });
 
-  describe("module-level getters", () => {
-    it("getCreateAgentSessionNumber() returns first successful session id", async () => {
+  describe("per-handler accessors", () => {
+    it("getSessionNumber() returns first successful session id", async () => {
       mockGithub.request.mockResolvedValue({
         data: {
           id: "uuid-task-42",
@@ -266,10 +294,10 @@ describe("create_agent_session.cjs", () => {
       const handler = await createAgentSessionModule.main({ base: "main" });
       await handler({ type: "create_agent_session", body: "Task 1" });
 
-      expect(createAgentSessionModule.getCreateAgentSessionNumber()).toBe("uuid-task-42");
+      expect(handler.getSessionNumber()).toBe("uuid-task-42");
     });
 
-    it("getCreateAgentSessionUrl() returns first successful session URL", async () => {
+    it("getSessionUrl() returns first successful session URL", async () => {
       const expectedUrl = "https://github.com/test-owner/test-repo/copilot/tasks/uuid-task-42";
       mockGithub.request.mockResolvedValue({
         data: {
@@ -282,21 +310,21 @@ describe("create_agent_session.cjs", () => {
       const handler = await createAgentSessionModule.main({ base: "main" });
       await handler({ type: "create_agent_session", body: "Task 1" });
 
-      expect(createAgentSessionModule.getCreateAgentSessionUrl()).toBe(expectedUrl);
+      expect(handler.getSessionUrl()).toBe(expectedUrl);
     });
 
-    it("getCreateAgentSessionNumber() returns empty string when no sessions created", async () => {
-      await createAgentSessionModule.main({ base: "main" });
-      expect(createAgentSessionModule.getCreateAgentSessionNumber()).toBe("");
+    it("getSessionNumber() returns empty string when no sessions created", async () => {
+      const handler = await createAgentSessionModule.main({ base: "main" });
+      expect(handler.getSessionNumber()).toBe("");
     });
 
-    it("getCreateAgentSessionUrl() returns empty string when no sessions created", async () => {
-      await createAgentSessionModule.main({ base: "main" });
-      expect(createAgentSessionModule.getCreateAgentSessionUrl()).toBe("");
+    it("getSessionUrl() returns empty string when no sessions created", async () => {
+      const handler = await createAgentSessionModule.main({ base: "main" });
+      expect(handler.getSessionUrl()).toBe("");
     });
   });
 
-  describe("writeCreateAgentSessionSummary()", () => {
+  describe("writeSummary()", () => {
     it("should write summary with successful sessions", async () => {
       mockGithub.request.mockResolvedValue({
         data: {
@@ -308,15 +336,15 @@ describe("create_agent_session.cjs", () => {
 
       const handler = await createAgentSessionModule.main({ base: "main" });
       await handler({ type: "create_agent_session", body: "Task 1" });
-      await createAgentSessionModule.writeCreateAgentSessionSummary();
+      await handler.writeSummary();
 
       expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("Agent Sessions"));
       expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("uuid-task-42"));
     });
 
     it("should not write summary when no results", async () => {
-      await createAgentSessionModule.main({ base: "main" });
-      await createAgentSessionModule.writeCreateAgentSessionSummary();
+      const handler = await createAgentSessionModule.main({ base: "main" });
+      await handler.writeSummary();
 
       expect(mockCore.summary.addRaw).not.toHaveBeenCalled();
     });
@@ -326,9 +354,48 @@ describe("create_agent_session.cjs", () => {
 
       const handler = await createAgentSessionModule.main({ base: "main" });
       await handler({ type: "create_agent_session", body: "Task 1" });
-      await createAgentSessionModule.writeCreateAgentSessionSummary();
+      await handler.writeSummary();
 
       expect(mockCore.summary.addRaw).toHaveBeenCalledWith(expect.stringContaining("❌ Failed"));
+    });
+  });
+
+  describe("concurrency safety - independent main() invocations", () => {
+    it("should not cross-contaminate results between two concurrently-processed handler instances", async () => {
+      mockGithub.request.mockResolvedValueOnce({
+        data: {
+          id: "session-A",
+          html_url: "https://github.com/test-owner/test-repo/copilot/tasks/session-A",
+          state: "queued",
+        },
+      });
+
+      const mockTokenClient = { request: vi.fn() };
+      mockTokenClient.request.mockResolvedValueOnce({
+        data: {
+          id: "session-B",
+          html_url: "https://github.com/test-owner/test-repo/copilot/tasks/session-B",
+          state: "queued",
+        },
+      });
+      mockGetOctokit.mockReturnValueOnce(mockTokenClient);
+
+      // Two independent handler instances created from separate main() invocations.
+      const handlerA = await createAgentSessionModule.main({ base: "main" });
+      const handlerB = await createAgentSessionModule.main({ base: "main", "github-token": "handler-b-token" });
+
+      // Interleave processing to simulate concurrent/parallel dispatch.
+      const resultA = await handlerA({ type: "create_agent_session", body: "Task A" });
+      const resultB = await handlerB({ type: "create_agent_session", body: "Task B" });
+
+      expect(resultA.id).toBe("session-A");
+      expect(resultB.id).toBe("session-B");
+
+      // Each handler's accessors must only reflect its own results.
+      expect(handlerA.getSessionNumber()).toBe("session-A");
+      expect(handlerB.getSessionNumber()).toBe("session-B");
+      expect(handlerA.getSessionUrl()).toContain("session-A");
+      expect(handlerB.getSessionUrl()).toContain("session-B");
     });
   });
 

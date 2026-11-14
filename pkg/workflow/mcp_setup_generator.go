@@ -4,7 +4,7 @@
 //
 // This file generates the complete setup sequence for MCP servers in GitHub Actions
 // workflows. It orchestrates the initialization of all MCP tools including built-in
-// servers (GitHub, Playwright, safe-outputs, mcp-scripts) and custom HTTP/stdio
+// servers (GitHub, safe-outputs, mcp-scripts) and custom HTTP/stdio
 // MCP servers.
 //
 // Key responsibilities:
@@ -64,23 +64,26 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var mcpSetupGeneratorLog = logger.New("workflow:mcp_setup_generator")
 
 // generateMCPSetup generates the MCP server configuration setup
-func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any, engine CodingAgentEngine, workflowData *WorkflowData) error {
+func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any, engine CodingAgentEngine, workflowData *WorkflowData) error { //nolint:largefunc // Existing setup orchestration preserves step ordering.
 	mcpSetupGeneratorLog.Print("Generating MCP server configuration setup")
 	if workflowData == nil {
 		return nil
 	}
 
 	mcpTools := collectMCPTools(workflowData)
+	tools = toolsWithEnclaveGitHubIssues(tools, workflowData)
 
 	// Populate dispatch-workflow file mappings before generating config
 	// This ensures workflow_files is available in the config.json
@@ -107,12 +110,22 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 
 	// Collect all Docker images that will be used and generate download step
 	dockerImages := collectDockerImages(tools, workflowData, c.actionMode)
-	generateDownloadDockerImagesStep(yaml, dockerImages)
+	generateDownloadDockerImagesStep(yaml, dockerImages, dockerImagePullPolicy(workflowData))
 
 	// If no MCP tools, skip setup unless the engine still needs MCP gateway/config bootstrap.
 	// Codex with AWF firewall enabled requires MCP config generation to set its OpenAI proxy
 	// provider, even when no MCP tools are configured (e.g. threat-detection jobs).
 	needsSetupWithoutMCPTools := len(mcpTools) == 0 && engine.GetID() == "codex" && isFirewallEnabled(workflowData)
+	if codex, ok := engine.(*CodexEngine); ok {
+		step, err := codex.renderConfigurationStep(workflowData, mcpTools, len(mcpTools) == 0 && !needsSetupWithoutMCPTools)
+		if err != nil {
+			return err
+		}
+		for _, line := range step {
+			yaml.WriteString(line)
+			yaml.WriteByte('\n')
+		}
+	}
 	if len(mcpTools) == 0 && !needsSetupWithoutMCPTools {
 		mcpSetupGeneratorLog.Print("No MCP tools configured, skipping MCP setup")
 		return nil
@@ -137,6 +150,52 @@ func (c *Compiler) generateMCPSetup(yaml *strings.Builder, tools map[string]any,
 	return generateMCPGatewaySetup(yaml, tools, mcpTools, engine, workflowData, hasAgenticWorkflows, workflowData.SafeOutputsInputEnvVars)
 }
 
+func toolsWithEnclaveGitHubIssues(tools map[string]any, workflowData *WorkflowData) map[string]any {
+	if !enclaveGitHubDelegationEnabled(workflowData) {
+		return tools
+	}
+	updated := make(map[string]any, typeutil.SafeAllocationCapacity(len(tools), 1))
+	maps.Copy(updated, tools)
+	if githubToolRaw, hasGitHub := tools["github"]; hasGitHub && githubToolRaw == false {
+		return updated
+	}
+	githubTool, ok := tools["github"].(map[string]any)
+	if !ok {
+		githubTool = nil
+	}
+	githubConfig := make(map[string]any, len(githubTool))
+	maps.Copy(githubConfig, githubTool)
+	if allowed, ok := githubConfig["allowed"].([]any); ok {
+		for _, tool := range []string{"list_issues", "issue_read"} {
+			if !slices.Contains(allowed, any(tool)) {
+				githubConfig["allowed"] = append(allowed, tool)
+			}
+		}
+	} else if allowed, ok := githubConfig["allowed"].([]string); ok {
+		for _, tool := range []string{"list_issues", "issue_read"} {
+			if !slices.Contains(allowed, tool) {
+				githubConfig["allowed"] = append(allowed, tool)
+			}
+		}
+	} else if toolsets, ok := githubConfig["toolsets"].([]any); ok {
+		if !slices.Contains(toolsets, "issues") {
+			githubConfig["toolsets"] = append(toolsets, "issues")
+		}
+	} else if toolsets, ok := githubConfig["toolsets"].([]string); ok {
+		if !slices.Contains(toolsets, "issues") {
+			githubConfig["toolsets"] = append(toolsets, "issues")
+		}
+	} else if toolsets, ok := githubConfig["toolsets"].(string); ok {
+		if !slices.Contains(strings.Split(toolsets, ","), "issues") {
+			githubConfig["toolsets"] = toolsets + ",issues"
+		}
+	} else {
+		githubConfig["toolsets"] = []any{"issues"}
+	}
+	updated["github"] = githubConfig
+	return updated
+}
+
 func collectMCPTools(workflowData *WorkflowData) []string {
 	var mcpTools []string
 	for toolName, toolValue := range workflowData.Tools {
@@ -147,12 +206,7 @@ func collectMCPTools(workflowData *WorkflowData) []string {
 			mcpSetupGeneratorLog.Print("Skipping GitHub MCP server registration: tools.github.mode is gh-proxy")
 			continue
 		}
-		if toolName == "github" || toolName == "playwright" || toolName == "cache-memory" || toolName == "agentic-workflows" {
-			// Playwright in CLI mode is not an MCP server; skip it here.
-			if toolName == "playwright" && isPlaywrightCLIMode(workflowData.Tools) {
-				mcpSetupGeneratorLog.Print("Skipping playwright MCP registration: tools.playwright.mode is cli")
-				continue
-			}
+		if toolName == "github" || toolName == "cache-memory" || toolName == "agentic-workflows" || toolName == "work-queue" {
 			mcpTools = append(mcpTools, toolName)
 			continue
 		}
@@ -165,8 +219,17 @@ func collectMCPTools(workflowData *WorkflowData) []string {
 	if HasSafeOutputsEnabled(workflowData.SafeOutputs) {
 		mcpTools = append(mcpTools, "safe-outputs")
 	}
+	if workflowData.RepoMemoryConfig.ledgerEntry() != nil {
+		mcpTools = append(mcpTools, "ledger")
+	}
 	if IsMCPScriptsEnabled(workflowData.MCPScripts) {
 		mcpTools = append(mcpTools, "mcp-scripts")
+	}
+	if enclavesEnabled(workflowData) {
+		mcpTools = append(mcpTools, enclaveMCPServerName)
+	}
+	if enclaveGitHubDelegationEnabled(workflowData) && !slices.Contains(mcpTools, "github") {
+		mcpTools = append(mcpTools, "github")
 	}
 	return mcpTools
 }

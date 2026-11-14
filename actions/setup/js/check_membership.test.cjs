@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createRequire } from "module";
+
+const realRequire = createRequire(import.meta.url);
 
 describe("check_membership.cjs", () => {
   let mockCore;
@@ -54,6 +57,7 @@ describe("check_membership.cjs", () => {
     delete global.context;
     delete process.env.GH_AW_REQUIRED_ROLES;
     delete process.env.GH_AW_ALLOWED_BOTS;
+    delete process.env.GH_AW_COPILOT_BOT_NAMES;
   });
 
   const runScript = async () => {
@@ -95,6 +99,9 @@ describe("check_membership.cjs", () => {
             await mockCore.summary.addRaw(`${reason}\n${remediation}`).write();
           },
         };
+      }
+      if (modulePath === "./error_recovery.cjs") {
+        return realRequire(modulePath);
       }
       throw new Error(`Module not found: ${modulePath}`);
     };
@@ -241,6 +248,99 @@ describe("check_membership.cjs", () => {
       expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).not.toHaveBeenCalled();
       expect(mockCore.setOutput).toHaveBeenCalledWith("result", "fork_pull_request");
     });
+
+    it("should retry a transient pull request provenance failure", async () => {
+      vi.useFakeTimers();
+      try {
+        mockContext.eventName = "workflow_dispatch";
+        mockContext.actor = "github-actions[bot]";
+        mockContext.payload = {
+          inputs: {
+            aw_context: JSON.stringify({
+              command_name: "triage",
+              actor: "octocat",
+              item_type: "pull_request",
+              item_number: "42",
+            }),
+          },
+        };
+        process.env.GH_AW_REQUIRED_ROLES = "write";
+        const apiError = Object.assign(new Error("Internal Server Error"), { status: 500 });
+        mockGithub.rest.pulls.get.mockRejectedValueOnce(apiError).mockResolvedValue({
+          data: {
+            head: { repo: { full_name: "testorg/testrepo" } },
+            base: { repo: { full_name: "testorg/testrepo" } },
+          },
+        });
+        mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValue({
+          data: { permission: "write" },
+        });
+
+        const runPromise = runScript();
+        await vi.runAllTimersAsync();
+        await runPromise;
+
+        expect(mockGithub.rest.pulls.get).toHaveBeenCalledTimes(2);
+        expect(mockCore.setOutput).toHaveBeenCalledWith("result", "authorized");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("should not retry a permanent pull request provenance failure", async () => {
+      mockContext.eventName = "workflow_dispatch";
+      mockContext.actor = "github-actions[bot]";
+      mockContext.payload = {
+        inputs: {
+          aw_context: JSON.stringify({
+            command_name: "triage",
+            actor: "octocat",
+            item_type: "pull_request",
+            item_number: "42",
+          }),
+        },
+      };
+      process.env.GH_AW_REQUIRED_ROLES = "write";
+      const apiError = Object.assign(new Error("Not Found"), { status: 404 });
+      mockGithub.rest.pulls.get.mockRejectedValue(apiError);
+
+      await runScript();
+
+      expect(mockGithub.rest.pulls.get).toHaveBeenCalledTimes(1);
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "api_error");
+    });
+
+    it("should fail closed after exhausting transient provenance retries", async () => {
+      vi.useFakeTimers();
+      try {
+        mockContext.eventName = "workflow_dispatch";
+        mockContext.actor = "github-actions[bot]";
+        mockContext.payload = {
+          inputs: {
+            aw_context: JSON.stringify({
+              command_name: "triage",
+              actor: "octocat",
+              item_type: "pull_request",
+              item_number: "42",
+            }),
+          },
+        };
+        process.env.GH_AW_REQUIRED_ROLES = "write";
+        const apiError = Object.assign(new Error("Internal Server Error"), { status: 500 });
+        mockGithub.rest.pulls.get.mockRejectedValue(apiError);
+
+        const runPromise = runScript();
+        await vi.runAllTimersAsync();
+        await runPromise;
+
+        expect(mockGithub.rest.pulls.get).toHaveBeenCalledTimes(4);
+        expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+        expect(mockCore.setOutput).toHaveBeenCalledWith("result", "api_error");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("configuration validation", () => {
@@ -365,6 +465,188 @@ describe("check_membership.cjs", () => {
       expect(mockCore.setOutput).toHaveBeenCalledWith("result", "confused_deputy");
     });
 
+    it.each(["pull_request", "pull_request_target"])("should authorize an active allowlisted bot when actor differs from PR author (%s synchronize event)", async eventName => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-fixup-bot[bot]";
+      mockContext.actor = "my-fixup-bot[bot]";
+      mockContext.eventName = eventName;
+      mockContext.payload = {
+        action: "synchronize",
+        pull_request: {
+          user: { login: "human-author" },
+          head: { repo: { id: 123, full_name: "testorg/testrepo" } },
+          base: { repo: { id: 123, full_name: "testorg/testrepo" } },
+        },
+      };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValueOnce({ data: { permission: "write" } }).mockResolvedValueOnce({ data: { permission: "none" } });
+
+      await runScript();
+
+      expect(mockCore.info).toHaveBeenCalledWith(`Evaluating allowlisted bot synchronization for actor 'my-fixup-bot[bot]' on ${eventName}: PR author 'human-author', same repository: true, Dependabot: false`);
+      expect(mockCore.info).toHaveBeenCalledWith("PR author 'human-author' is trusted; checking whether bot 'my-fixup-bot[bot]' is active");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "true");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "authorized_bot");
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("result", "confused_deputy");
+    });
+
+    it("should authorize allowlisted Copilot synchronizing a trusted author's same-repository PR after a conclusive missing-collaborator lookup", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "copilot-swe-agent,Copilot,copilot,@app/copilot-swe-agent";
+      process.env.GH_AW_COPILOT_BOT_NAMES = "copilot-swe-agent,Copilot,copilot,@app/copilot-swe-agent";
+      mockContext.actor = "Copilot";
+      mockContext.eventName = "pull_request";
+      mockContext.payload = {
+        action: "synchronize",
+        pull_request: {
+          user: { login: "human-author" },
+          head: { repo: { id: 123, full_name: "testorg/testrepo" } },
+          base: { repo: { id: 123, full_name: "testorg/testrepo" } },
+        },
+      };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel
+        .mockResolvedValueOnce({ data: { permission: "write" } })
+        .mockRejectedValueOnce({ status: 404, message: "Not Found" })
+        .mockRejectedValueOnce({ status: 404, message: "Not Found" });
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "authorized_bot");
+      expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).toHaveBeenCalledTimes(3);
+      expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).toHaveBeenCalledWith({ owner: "testorg", repo: "testrepo", username: "human-author" });
+    });
+
+    it("should deny allowlisted Copilot synchronizing a fork PR before bot authorization", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "Copilot";
+      mockContext.actor = "Copilot";
+      mockContext.eventName = "pull_request";
+      mockContext.payload = {
+        action: "synchronize",
+        pull_request: {
+          user: { login: "fork-author" },
+          head: { repo: { id: 456, full_name: "fork/repo" } },
+          base: { repo: { id: 123, full_name: "testorg/testrepo" } },
+        },
+      };
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "confused_deputy");
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("result", "authorized_bot");
+      expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).not.toHaveBeenCalled();
+    });
+
+    it.each(["pull_request", "pull_request_target"])("should deny an active allowlisted bot when synchronizing a cross-repository PR (%s event)", async eventName => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-fixup-bot[bot]";
+      mockContext.actor = "my-fixup-bot";
+      mockContext.eventName = eventName;
+      mockContext.payload = {
+        action: "synchronize",
+        pull_request: {
+          user: { login: "attacker" },
+          head: { repo: { id: 456, full_name: "attacker/fork" } },
+          base: { repo: { id: 123, full_name: "testorg/testrepo" } },
+        },
+      };
+      await runScript();
+
+      expect(mockCore.info).toHaveBeenCalledWith(`Evaluating allowlisted bot synchronization for actor 'my-fixup-bot' on ${eventName}: PR author 'attacker', same repository: false, Dependabot: false`);
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "confused_deputy");
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("result", "authorized_bot");
+    });
+
+    it("should deny an active allowlisted bot when the same-repository PR author lacks the required role", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-fixup-bot[bot]";
+      mockContext.actor = "my-fixup-bot[bot]";
+      mockContext.eventName = "pull_request_target";
+      mockContext.payload = {
+        action: "synchronize",
+        pull_request: {
+          user: { login: "untrusted-author" },
+          head: { repo: { id: 123, full_name: "testorg/testrepo" } },
+          base: { repo: { id: 123, full_name: "testorg/testrepo" } },
+        },
+      };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValueOnce({ data: { permission: "read" } });
+
+      await runScript();
+
+      expect(mockCore.info).toHaveBeenCalledWith("PR author 'untrusted-author' is not trusted; continuing with confused-deputy validation");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "confused_deputy");
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("result", "authorized_bot");
+    });
+
+    it("should deny an active allowlisted bot when the PR head repository is unavailable", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-fixup-bot[bot]";
+      mockContext.actor = "my-fixup-bot[bot]";
+      mockContext.eventName = "pull_request_target";
+      mockContext.payload = {
+        action: "synchronize",
+        pull_request: {
+          user: { login: "attacker" },
+          head: { repo: null },
+        },
+      };
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "confused_deputy");
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("result", "authorized_bot");
+    });
+
+    it("should compare same-repository PR names case-insensitively", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-fixup-bot[bot]";
+      mockContext.actor = "my-fixup-bot[bot]";
+      mockContext.eventName = "pull_request";
+      mockContext.payload = {
+        action: "synchronize",
+        pull_request: {
+          user: { login: "human-author" },
+          head: { repo: { full_name: "TestOrg/TestRepo" } },
+        },
+      };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValueOnce({ data: { permission: "write" } }).mockResolvedValueOnce({ data: { permission: "none" } });
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "true");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "authorized_bot");
+    });
+
+    it.each(["pull_request", "pull_request_target"])("should deny allowlisted dependabot when actor differs from PR author (%s synchronize event)", async eventName => {
+      process.env.GH_AW_ALLOWED_BOTS = "dependabot[bot]";
+      mockContext.actor = "dependabot[bot]";
+      mockContext.eventName = eventName;
+      mockContext.payload = { action: "synchronize", pull_request: { user: { login: "attacker" } } };
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "confused_deputy");
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("result", "authorized_bot");
+    });
+
+    it("should deny an inactive allowlisted bot when actor differs from PR author", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-fixup-bot[bot]";
+      mockContext.actor = "my-fixup-bot[bot]";
+      mockContext.eventName = "pull_request_target";
+      mockContext.payload = {
+        action: "synchronize",
+        pull_request: {
+          user: { login: "human-author" },
+          head: { repo: { id: 123, full_name: "testorg/testrepo" } },
+          base: { repo: { id: 123, full_name: "testorg/testrepo" } },
+        },
+      };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValueOnce({ data: { permission: "write" } }).mockRejectedValue({ status: 404, message: "Not Found" });
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "bot_not_active");
+      expect(mockCore.setOutput).not.toHaveBeenCalledWith("result", "authorized_bot");
+    });
+
     it("should allow access when actor matches PR author (genuine dependabot PR synchronize)", async () => {
       mockContext.actor = "dependabot[bot]";
       mockContext.eventName = "pull_request";
@@ -381,6 +663,7 @@ describe("check_membership.cjs", () => {
     });
 
     it("should deny access when actor differs from comment author (issue_comment event)", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "dependabot[bot]";
       mockContext.actor = "dependabot[bot]";
       mockContext.eventName = "issue_comment";
       mockContext.payload = { comment: { user: { login: "attacker" } } };
@@ -653,22 +936,43 @@ describe("check_membership.cjs", () => {
       expect(mockCore.setOutput).toHaveBeenCalledWith("result", "insufficient_permissions");
     });
 
-    it("should authorize a bot in the allowlist when permission check returns an API error (e.g. GitHub App not a user)", async () => {
-      process.env.GH_AW_ALLOWED_BOTS = "Copilot";
-      mockContext.actor = "Copilot";
+    it.each(["Copilot", "Copilot[bot]", "copilot-swe-agent", "copilot-swe-agent[bot]", "copilot", "copilot[bot]", "@app/copilot-swe-agent", "@app/copilot-swe-agent[bot]"])(
+      "should authorize explicitly allowlisted Copilot alias %s after a conclusive missing-collaborator lookup on a PR",
+      async actor => {
+        process.env.GH_AW_ALLOWED_BOTS = "copilot-swe-agent,Copilot,copilot,@app/copilot-swe-agent";
+        process.env.GH_AW_COPILOT_BOT_NAMES = "copilot-swe-agent,Copilot,copilot,@app/copilot-swe-agent";
+        mockContext.actor = actor;
+        mockContext.eventName = "pull_request";
+        mockContext.payload = { action: "opened", pull_request: { user: { login: actor } } };
+        mockGithub.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue({ status: 404, message: "Not Found" });
 
-      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValueOnce({ data: { permission: "none" } }); // bot status check (Copilot[bot] form) → active
+        await runScript();
+
+        expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "true");
+        expect(mockCore.setOutput).toHaveBeenCalledWith("result", "authorized_bot");
+        expect(mockCore.setOutput).toHaveBeenCalledWith("user_permission", "bot");
+        expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).toHaveBeenCalledTimes(2);
+      }
+    );
+
+    it("should deny a Copilot alias when the collaborator lookup fails transiently", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "copilot-swe-agent,Copilot,copilot,@app/copilot-swe-agent";
+      process.env.GH_AW_COPILOT_BOT_NAMES = "copilot-swe-agent,Copilot,copilot,@app/copilot-swe-agent";
+      mockContext.actor = "copilot";
+      mockContext.eventName = "pull_request";
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue({ status: 503, message: "Service Unavailable" });
 
       await runScript();
 
-      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "true");
-      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "authorized_bot");
-      expect(mockCore.setOutput).toHaveBeenCalledWith("user_permission", "bot");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "bot_not_active");
+      expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).toHaveBeenCalledTimes(1);
     });
 
-    it("should return bot_not_active when permission check returns API error and bot is not installed", async () => {
-      process.env.GH_AW_ALLOWED_BOTS = "Copilot";
-      mockContext.actor = "Copilot";
+    it("should still require an installation check for other Copilot-like actors", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "copilot-imposter";
+      process.env.GH_AW_COPILOT_BOT_NAMES = "copilot-swe-agent,Copilot,copilot,@app/copilot-swe-agent";
+      mockContext.actor = "copilot-imposter[bot]";
 
       const notFoundError = { status: 404, message: "Not Found" };
       mockGithub.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue(notFoundError); // all bot status checks → 404
@@ -677,6 +981,7 @@ describe("check_membership.cjs", () => {
 
       expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
       expect(mockCore.setOutput).toHaveBeenCalledWith("result", "bot_not_active");
+      expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).toHaveBeenCalledTimes(2);
     });
 
     it("should return api_error when permission check fails and actor is not in allowed bots list", async () => {
@@ -808,6 +1113,140 @@ describe("check_membership.cjs", () => {
 
       // Non-404 bot status failure → bot_not_active (not a fallthrough to roles)
       expect(mockCore.warning).toHaveBeenCalledWith(expect.stringMatching(/Failed to check bot status/));
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "bot_not_active");
+    });
+  });
+
+  describe.each(["projects_v2_item", "code_scanning_alert", "dependabot_alert"])("webhook relay %s role checks", event => {
+    it.each([
+      ["read", "read", false],
+      ["read", "triage", false],
+      ["write", "write", true],
+      ["write", "maintain", true],
+      ["admin", "admin", true],
+    ])("checks the dispatch actor with permission %s and role %s", async (permission, role, authorized) => {
+      process.env.GH_AW_REQUIRED_ROLES = "admin,maintainer,write";
+      process.env.GH_AW_ALLOWED_BOTS = "cao-gateway";
+      mockContext.eventName = "repository_dispatch";
+      mockContext.actor = "dispatch-user";
+      mockContext.payload = {
+        action: "gh-aw-webhook-test",
+        sender: { login: "cao-gateway[bot]" },
+        client_payload: {
+          schema_version: 2,
+          actor: "cao-gateway[bot]",
+          aw_context: {
+            webhook: {
+              event,
+              deliveries: [{ delivery_id: "test-delivery", payload: { sender: { login: "admin-user" }, role: "admin" } }],
+            },
+          },
+        },
+      };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValue({ data: { permission, role_name: role } });
+
+      await runScript();
+
+      expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).toHaveBeenCalledExactlyOnceWith({
+        owner: "testorg",
+        repo: "testrepo",
+        username: "dispatch-user",
+      });
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", String(authorized));
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", authorized ? "authorized" : "insufficient_permissions");
+    });
+  });
+
+  describe("repository_dispatch GitHub App actors", () => {
+    beforeEach(() => {
+      process.env.GH_AW_REQUIRED_ROLES = "admin,maintainer,write";
+      mockContext.eventName = "repository_dispatch";
+      mockContext.actor = "my-app[bot]";
+    });
+
+    it("should authorize an allowlisted App even when it is not listed as a collaborator", async () => {
+      // GitHub Apps are never repository collaborators, so both lookups return 404. Posting a
+      // repository_dispatch already requires contents: write, so the allowlisted App is trusted.
+      process.env.GH_AW_ALLOWED_BOTS = "my-app";
+
+      const notFoundError = { status: 404, message: "Not Found" };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue(notFoundError);
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "true");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "authorized_bot");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("user_permission", "bot");
+    });
+
+    it("should still deny an App that is not in the allowlist", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "some-other-app";
+
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValue({ data: { permission: "none" } });
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "insufficient_permissions");
+    });
+
+    it("should not authorize a dispatch from actor or sender claims in the relay envelope", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-app";
+      mockContext.actor = "untrusted-user";
+      mockContext.payload = {
+        sender: { login: "my-app[bot]" },
+        client_payload: {
+          actor: "my-app[bot]",
+          payload: { sender: { login: "my-app[bot]" } },
+        },
+      };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockResolvedValue({ data: { permission: "none" } });
+
+      await runScript();
+
+      expect(mockGithub.rest.repos.getCollaboratorPermissionLevel).toHaveBeenCalledWith({
+        owner: "testorg",
+        repo: "testrepo",
+        username: "untrusted-user",
+      });
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "insufficient_permissions");
+    });
+
+    it("should keep requiring installation for allowlisted bots on other events", async () => {
+      mockContext.eventName = "issues";
+      process.env.GH_AW_ALLOWED_BOTS = "my-app";
+
+      const notFoundError = { status: 404, message: "Not Found" };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue(notFoundError);
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "bot_not_active");
+    });
+
+    it("should not authorize an allowlisted App when the installation lookup fails transiently", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-app";
+
+      const serverError = { status: 500, message: "Internal Server Error" };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue(serverError);
+
+      await runScript();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
+      expect(mockCore.setOutput).toHaveBeenCalledWith("result", "bot_not_active");
+    });
+
+    it("should not authorize an allowlisted App when the lookup fails with an empty error message", async () => {
+      process.env.GH_AW_ALLOWED_BOTS = "my-app";
+
+      const emptyMessageError = { status: 500, message: "" };
+      mockGithub.rest.repos.getCollaboratorPermissionLevel.mockRejectedValue(emptyMessageError);
+
+      await runScript();
+
       expect(mockCore.setOutput).toHaveBeenCalledWith("is_team_member", "false");
       expect(mockCore.setOutput).toHaveBeenCalledWith("result", "bot_not_active");
     });

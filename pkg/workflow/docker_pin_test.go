@@ -19,6 +19,12 @@ func TestApplyContainerPins(t *testing.T) {
 	defaultFirewallAgentPin, ok := getEmbeddedContainerPin(defaultFirewallAgentImage)
 	require.True(t, ok, "embedded pin must exist for %s", defaultFirewallAgentImage)
 
+	nodeLtsAlpinePin, ok := getEmbeddedContainerPin("node:lts-alpine")
+	require.True(t, ok, "embedded pin must exist for node:lts-alpine")
+
+	ghAwNodePin, ok := getEmbeddedContainerPin(constants.DefaultGhAwNodeImage)
+	require.True(t, ok, "embedded pin must exist for %s", constants.DefaultGhAwNodeImage)
+
 	tests := []struct {
 		name            string
 		images          []string
@@ -37,8 +43,8 @@ func TestApplyContainerPins(t *testing.T) {
 			name:            "embedded pin used when cache is absent",
 			images:          []string{"node:lts-alpine"},
 			pins:            nil,
-			expectedRefs:    []string{"node:lts-alpine@sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526ab682fa5bf14"},
-			expectedDigests: []string{"sha256:2bdb65ed1dab192432bc31c95f94155ca5ad7fc1392fb7eb7526ab682fa5bf14"},
+			expectedRefs:    []string{nodeLtsAlpinePin.PinnedImage},
+			expectedDigests: []string{nodeLtsAlpinePin.Digest},
 		},
 		{
 			name:            "embedded firewall pin used when cache is absent",
@@ -51,8 +57,8 @@ func TestApplyContainerPins(t *testing.T) {
 			name:            "embedded gh-aw-node pin used when cache is absent",
 			images:          []string{constants.DefaultGhAwNodeImage},
 			pins:            nil,
-			expectedRefs:    []string{"ghcr.io/github/gh-aw-node@sha256:a8082161d7dceda14b68f32eb39d0eaa96b825d07f5895b096afab9d9e0c7748"},
-			expectedDigests: []string{"sha256:a8082161d7dceda14b68f32eb39d0eaa96b825d07f5895b096afab9d9e0c7748"},
+			expectedRefs:    []string{ghAwNodePin.PinnedImage},
+			expectedDigests: []string{ghAwNodePin.Digest},
 		},
 		{
 			name:   "pinned image replaced with digest reference",
@@ -160,6 +166,144 @@ func TestCollectDockerImages_StoresInWorkflowData(t *testing.T) {
 	assert.Len(t, workflowData.DockerImagePins, len(workflowData.DockerImages), "pin count should match image count")
 }
 
+// TestCollectDockerImages_SandboxAgentImagesAndProjectMappings verifies that the
+// closed AWF manifest is authoritative while project container_pins continue to
+// transform non-AWF workflow containers.
+func TestCollectDockerImages_SandboxAgentImagesAndProjectMappings(t *testing.T) {
+	pinnedSquid := "registry.example.com/approved/squid:v0.28.4@sha256:" + strings.Repeat("a", 64)
+	pinnedAgent := "registry.example.com/approved/agent:v0.28.4@sha256:" + strings.Repeat("b", 64)
+	pinnedAPIProxy := "registry.example.com/approved/api-proxy:v0.28.4@sha256:" + strings.Repeat("c", 64)
+	mappedAlpine := "mirror.example.com/alpine:latest@sha256:" + strings.Repeat("d", 64)
+	mappedSquid := "mirror.example.com/squid:0.28.4@sha256:" + strings.Repeat("e", 64)
+
+	workflowData := &WorkflowData{
+		AI: "claude",
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{
+				Enabled: true,
+				Version: "0.28.4",
+			},
+		},
+		SandboxConfig: &SandboxConfig{
+			Agent: &AgentSandboxConfig{
+				Images: map[string]string{
+					awfImageRoleSquid:    pinnedSquid,
+					awfImageRoleAgent:    pinnedAgent,
+					awfImageRoleAPIProxy: pinnedAPIProxy,
+				},
+			},
+		},
+		ContainerPinMappings: map[string]string{
+			constants.DefaultFirewallRegistry + "/squid:0.28.4": mappedSquid,
+			constants.DefaultAlpineImage:                        mappedAlpine,
+		},
+	}
+
+	require.NoError(t, validateSandboxAgentImages(workflowData))
+	images := collectDockerImages(map[string]any{"agentic-workflows": map[string]any{}}, workflowData, ActionModeRelease)
+
+	assert.Contains(t, images, pinnedSquid, "sandbox.agent.images squid override should be used for pre-pull")
+	assert.Contains(t, images, pinnedAgent, "sandbox.agent.images agent override should be used for pre-pull")
+	assert.Contains(t, images, pinnedAPIProxy, "sandbox.agent.images apiProxy override should be used for pre-pull")
+	assert.Contains(t, images, mappedAlpine, "non-AWF container should still use the project mapping")
+	assert.NotContains(t, images, mappedSquid, "project mapping must not replace an authoritative AWF manifest role")
+	assert.NotContains(t, images, constants.DefaultFirewallRegistry+"/squid:0.28.4", "default squid image should not be collected when overridden")
+	assert.NotContains(t, images, constants.DefaultFirewallRegistry+"/agent:0.28.4", "default agent image should not be collected when overridden")
+	assert.Contains(t, workflowData.DockerImagePins, GHAWManifestContainer{Image: pinnedSquid})
+	assert.Contains(t, workflowData.DockerImagePins, GHAWManifestContainer{Image: pinnedAgent})
+	assert.Contains(t, workflowData.DockerImagePins, GHAWManifestContainer{Image: pinnedAPIProxy})
+	assert.Contains(t, workflowData.DockerImagePins, GHAWManifestContainer{Image: mappedAlpine})
+}
+
+func TestCollectDockerImages_ManifestAndMappedContainerReferenceCollision(t *testing.T) {
+	pinnedSquid := "registry.example.com/shared/image:v0.28.4@sha256:" + strings.Repeat("a", 64)
+	mappedMCP := "mirror.example.com/mcp/image:v0.28.4@sha256:" + strings.Repeat("b", 64)
+	workflowData := &WorkflowData{
+		AI: "claude",
+		NetworkPermissions: &NetworkPermissions{
+			Firewall: &FirewallConfig{Enabled: true, Version: "0.28.4"},
+		},
+		SandboxConfig: &SandboxConfig{
+			Agent: &AgentSandboxConfig{
+				Images: map[string]string{
+					awfImageRoleSquid:    pinnedSquid,
+					awfImageRoleAgent:    testPinnedAgent,
+					awfImageRoleAPIProxy: testPinnedAPIProxy,
+				},
+			},
+		},
+		ContainerPinMappings: map[string]string{pinnedSquid: mappedMCP},
+	}
+	tools := map[string]any{
+		"custom": map[string]any{
+			"type":      "stdio",
+			"container": pinnedSquid,
+		},
+	}
+
+	images := collectDockerImages(tools, workflowData, ActionModeRelease)
+
+	assert.Contains(t, images, pinnedSquid, "AWF must predownload its authoritative manifest reference")
+	assert.Contains(t, images, mappedMCP, "the colliding non-AWF container must still use its project mapping")
+	assert.Contains(t, workflowData.DockerImagePins, GHAWManifestContainer{Image: pinnedSquid})
+	assert.Contains(t, workflowData.DockerImagePins, GHAWManifestContainer{Image: mappedMCP})
+}
+
+func TestCollectDockerImages_EnabledOptionalAWFRoles(t *testing.T) {
+	newData := func() *WorkflowData {
+		return &WorkflowData{
+			AI: "claude",
+			NetworkPermissions: &NetworkPermissions{
+				Firewall: &FirewallConfig{Enabled: true, Version: "0.28.4"},
+			},
+		}
+	}
+
+	t.Run("enclaves include the selected executor and shared MCP server", func(t *testing.T) {
+		data := newData()
+		data.Enclaves = EnclavesConfig{&EnclaveConfig{Script: &ScriptEnclaveConfig{}}}
+
+		images := collectDockerImages(nil, data, ActionModeRelease)
+
+		assert.Contains(t, images, resolveContainerImage(defaultAWFImageForRole(awfImageRoleEnclaveScript, "0.28.4"), data))
+		assert.Contains(t, images, resolveContainerImage(defaultAWFImageForRole(awfImageRoleEnclaveMcpServer, "0.28.4"), data))
+	})
+
+	t.Run("raw DIFC proxy configuration includes the CLI proxy sidecar", func(t *testing.T) {
+		data := newData()
+		data.SandboxConfig = &SandboxConfig{
+			Agent: &AgentSandboxConfig{Args: []string{"--difc-proxy-host=awmg-mcpg:18443"}},
+		}
+
+		images := collectDockerImages(nil, data, ActionModeRelease)
+
+		assert.Contains(t, images, resolveContainerImage(defaultAWFImageForRole(awfImageRoleCliProxy, "0.28.4"), data))
+	})
+
+	t.Run("legacy DNS-over-HTTPS includes the DoH sidecar", func(t *testing.T) {
+		data := newData()
+		data.SandboxConfig = &SandboxConfig{
+			Agent: &AgentSandboxConfig{
+				Runtime: AgentRuntimeDockerSudoIptables,
+				Args:    []string{"--dns-over-https=https://dns.google/dns-query"},
+			},
+		}
+
+		images := collectDockerImages(nil, data, ActionModeRelease)
+
+		assert.Contains(t, images, resolveContainerImage(defaultAWFImageForRole(awfImageRoleDohProxy, "0.28.4"), data))
+	})
+
+	t.Run("DinD pre-staging includes its helper image", func(t *testing.T) {
+		data := newData()
+		data.NetworkPermissions.Firewall.Args = []string{"--dind-pre-stage-dirs"}
+
+		images := collectDockerImages(nil, data, ActionModeRelease)
+
+		assert.Contains(t, images, resolveContainerImage(defaultAWFImageForRole(awfImageRoleDindStaging, "0.28.4"), data))
+	})
+}
+
 // TestCollectDockerImages_SafeOutputsAddsGhAwNodeImage verifies that enabling
 // safe-outputs adds the published gh-aw-node container to the default Docker pull
 // list and manifest data, while not falling back to node:lts-alpine.
@@ -175,13 +319,15 @@ func TestCollectDockerImages_SafeOutputsAddsGhAwNodeImage(t *testing.T) {
 	images := collectDockerImages(map[string]any{}, workflowData, ActionModeRelease)
 
 	pinnedGhAwNodeImage := resolveContainerImage(constants.DefaultGhAwNodeImage, nil)
+	ghAwNodePin, ok := getEmbeddedContainerPin(constants.DefaultGhAwNodeImage)
+	require.True(t, ok, "embedded pin must exist for %s", constants.DefaultGhAwNodeImage)
 	assert.Contains(t, images, pinnedGhAwNodeImage,
 		"safe-outputs should add the gh-aw-node container image to the Docker pull list")
 	require.NotEmpty(t, workflowData.DockerImagePins, "DockerImagePins should be populated")
 	assert.Contains(t, workflowData.DockerImagePins, GHAWManifestContainer{
 		Image:       constants.DefaultGhAwNodeImage,
-		Digest:      "sha256:a8082161d7dceda14b68f32eb39d0eaa96b825d07f5895b096afab9d9e0c7748",
-		PinnedImage: pinnedGhAwNodeImage,
+		Digest:      ghAwNodePin.Digest,
+		PinnedImage: ghAwNodePin.PinnedImage,
 	}, "safe-outputs should add gh-aw-node to manifest container pins")
 
 	for _, img := range images {
@@ -252,6 +398,17 @@ func TestApplyContainerPins_ContainerPinMappings(t *testing.T) {
 			"image not in mappings should be returned unchanged")
 	})
 
+	t.Run("digest-pinned non-AWF image is still eligible for mapping", func(t *testing.T) {
+		source := "ghcr.io/owner/image:v1@sha256:" + digest
+		mapped := "registry.acme.com/image:v1@sha256:" + strings.Repeat("a", 64)
+		workflowData := &WorkflowData{
+			ContainerPinMappings: map[string]string{source: mapped},
+		}
+		refs, _ := applyContainerPins([]string{source}, workflowData)
+		require.Len(t, refs, 1)
+		assert.Equal(t, mapped, refs[0])
+	})
+
 	t.Run("nil ContainerPinMappings leaves images unchanged", func(t *testing.T) {
 		workflowData := &WorkflowData{}
 		refs, _ := applyContainerPins([]string{"ghcr.io/owner/image:v1"}, workflowData)
@@ -287,17 +444,28 @@ func TestCollectDockerImages_DefaultAlpineContainerPinMapping(t *testing.T) {
 }
 
 // TestResolveGatewayContainerFromMappings verifies that resolveGatewayContainerFromMappings
-// applies the container_pins redirect and strips the digest for MCP Gateway compatibility.
+// applies the container_pins redirect without discarding the digest.
 func TestResolveGatewayContainerFromMappings(t *testing.T) {
 	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-	t.Run("mapped image has digest stripped for gateway", func(t *testing.T) {
+	t.Run("mapped image preserves digest for gateway", func(t *testing.T) {
 		mappings := map[string]string{
 			"ghcr.io/owner/image:v1": "registry.acme.com/image:v1@sha256:" + digest,
 		}
 		got := resolveGatewayContainerFromMappings("ghcr.io/owner/image:v1", mappings)
-		assert.Equal(t, "registry.acme.com/image:v1", got,
-			"digest should be stripped from mapped image for MCP Gateway compatibility")
+		assert.Equal(t, "registry.acme.com/image:v1@sha256:"+digest, got)
+	})
+
+	t.Run("digest-only mapping preserves digest", func(t *testing.T) {
+		mapped := "registry.acme.com/image@sha256:" + digest
+		mappings := map[string]string{"ghcr.io/owner/image:v1": mapped}
+		assert.Equal(t, mapped, resolveGatewayContainerFromMappings("ghcr.io/owner/image:v1", mappings))
+	})
+
+	t.Run("unmapped pinned image preserves digest", func(t *testing.T) {
+		image := "ghcr.io/owner/image@sha256:" + digest
+		mappings := map[string]string{"other.io/image:v1": "registry.acme.com/image:v1@sha256:" + digest}
+		assert.Equal(t, image, resolveGatewayContainerFromMappings(image, mappings))
 	})
 
 	t.Run("unmapped image passes through unchanged", func(t *testing.T) {
@@ -311,6 +479,29 @@ func TestResolveGatewayContainerFromMappings(t *testing.T) {
 	t.Run("nil mappings returns image unchanged", func(t *testing.T) {
 		got := resolveGatewayContainerFromMappings("ghcr.io/owner/image:v1", nil)
 		assert.Equal(t, "ghcr.io/owner/image:v1", got)
+	})
+}
+
+func TestResolveMCPGatewayContainerImagePreservesDigest(t *testing.T) {
+	image := "example.com/server:v1"
+	pinned := image + "@sha256:" + strings.Repeat("a", 64)
+	t.Run("explicit digest", func(t *testing.T) {
+		assert.Equal(t, pinned, resolveMCPGatewayContainerImage(pinned, nil))
+	})
+	t.Run("cached digest", func(t *testing.T) {
+		cache := NewActionCache(t.TempDir())
+		cache.SetContainerPin(image, "sha256:"+strings.Repeat("a", 64), pinned)
+		assert.Equal(t, pinned, resolveMCPGatewayContainerImage(image, &WorkflowData{ActionCache: cache}))
+	})
+	t.Run("embedded digest", func(t *testing.T) {
+		pin, ok := getEmbeddedContainerPin(constants.DefaultGhAwNodeImage)
+		require.True(t, ok)
+		require.Contains(t, pin.PinnedImage, "@sha256:")
+		assert.Equal(t, pin.PinnedImage, resolveMCPGatewayContainerImage(constants.DefaultGhAwNodeImage, nil))
+	})
+	t.Run("mapped digest", func(t *testing.T) {
+		data := &WorkflowData{ContainerPinMappings: map[string]string{image: pinned}}
+		assert.Equal(t, pinned, resolveMCPGatewayContainerImage(image, data))
 	})
 }
 

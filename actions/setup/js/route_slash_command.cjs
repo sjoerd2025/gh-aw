@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 // @safe-outputs-exempt SEC-004 — event body text is read only for slash-command parsing; outbound /help comments are built from internal metadata.
+const { renderSizedReport } = require("./report_size.cjs");
 
 const { REACTION_MAP } = require("./add_reaction.cjs");
 const { createOrReuseStatusComment } = require("./add_workflow_run_comment.cjs");
@@ -38,7 +39,7 @@ async function appendRoutingSummary(existingCommands, selectedCommand) {
     }
     await summary.write({ overwrite: false });
   } catch (error) {
-    core.warning(`Failed to write centralized routing details to step summary: ${String(error)}`);
+    core.warning(`Failed to write centralized routing details to step summary: ${getErrorMessage(error)}`);
   }
 }
 
@@ -103,7 +104,7 @@ async function resolveIssueBackedPRHeadRef() {
     }
     return normalizeDispatchRef(headRef);
   } catch (error) {
-    core.warning(`Failed to resolve PR head ref for #${pullNumber}: ${String(error)}`);
+    core.warning(`Failed to resolve PR head ref for #${pullNumber}: ${getErrorMessage(error)}`);
     return "";
   }
 }
@@ -159,6 +160,10 @@ function normalizeReaction(reaction) {
 
 function maintainsStatusComment(route) {
   return route?.status_comment === true;
+}
+
+function routeEmoji(route) {
+  return typeof route?.emoji === "string" ? route.emoji : "";
 }
 
 /**
@@ -298,15 +303,16 @@ async function addImmediateReaction(reaction) {
         return;
     }
   } catch (error) {
-    core.warning(`Immediate reaction '${normalized}' failed: ${String(error)}`);
+    core.warning(`Immediate reaction '${normalized}' failed: ${getErrorMessage(error)}`);
   }
 }
 
-async function addImmediateStatusComment() {
+async function addImmediateStatusComment(workflowEmoji) {
   try {
     const comment = await createOrReuseStatusComment({
       ...context,
       nonFatalStatusCommentErrors: true,
+      workflowEmoji,
     });
     if (!comment?.id) {
       return null;
@@ -317,7 +323,7 @@ async function addImmediateStatusComment() {
       ...(comment.repo?.owner && comment.repo?.repo ? { status_comment_repo: `${comment.repo.owner}/${comment.repo.repo}` } : {}),
     };
   } catch (error) {
-    core.warning(`Immediate status comment failed: ${String(error)}`);
+    core.warning(`Immediate status comment failed: ${getErrorMessage(error)}`);
     return null;
   }
 }
@@ -398,7 +404,7 @@ async function dispatchWorkflow(workflowId, ref, inputs) {
       core.info(`Skipping workflow '${workflowId}' because it is disabled.`);
       return { dispatched: false };
     }
-    throw new Error(`Failed to dispatch workflow '${workflowId}' on ref '${ref}': ${String(error)}`, { cause: error });
+    throw new Error(`Failed to dispatch workflow '${workflowId}' on ref '${ref}': ${getErrorMessage(error)}`, { cause: error });
   }
 }
 
@@ -408,8 +414,9 @@ async function dispatchWorkflow(workflowId, ref, inputs) {
  * @param {string} eventName
  * @param {string} workflowId
  * @param {string|undefined} runUrl
+ * @param {string|undefined} workflowEmoji
  */
-async function updateStatusCommentWithDispatch(statusCommentContext, eventName, workflowId, runUrl) {
+async function updateStatusCommentWithDispatch(statusCommentContext, eventName, workflowId, runUrl, workflowEmoji) {
   if (!statusCommentContext?.status_comment_id) {
     return;
   }
@@ -432,9 +439,10 @@ async function updateStatusCommentWithDispatch(statusCommentContext, eventName, 
         },
       },
       nonFatalStatusCommentErrors: true,
+      workflowEmoji,
     });
   } catch (error) {
-    core.warning(`Failed to update immediate status comment with dispatched run details: ${String(error)}`);
+    core.warning(`Failed to update immediate status comment with dispatched run details: ${getErrorMessage(error)}`);
   }
 }
 
@@ -477,45 +485,28 @@ function parseHelpCommandsMetadata() {
       })
       .sort((left, right) => left.command.localeCompare(right.command));
   } catch (error) {
-    core.warning(`Failed to parse GH_AW_HELP_COMMANDS metadata: ${String(error)}`);
+    core.warning(`Failed to parse GH_AW_HELP_COMMANDS metadata: ${getErrorMessage(error)}`);
     return [];
   }
 }
 
-/**
- * Regex matching bare GitHub @mentions outside inline code spans.
- * Captures the preceding non-word character (p1) and the username (p2).
- */
-const GITHUB_MENTION_RE = /(^|[^\w`])@([A-Za-z0-9](?:[A-Za-z0-9_-]{0,37}[A-Za-z0-9])?)/g;
-
-/**
- * Neutralizes bare @mentions in a description string so they do not trigger
- * GitHub notifications. Wraps matched mentions in backticks.
- * @param {string} description
- * @returns {string}
- */
-function neutralizeDescriptionMentions(description) {
-  return description.replace(GITHUB_MENTION_RE, (_, p1, p2) => `${p1}\`@${p2}\``);
-}
-
-function buildCommandBulletLine(entry) {
-  const desc = entry.description ? neutralizeDescriptionMentions(entry.description) : "";
-  const suffix = desc ? ` — ${desc}` : "";
-  const commandText = `\`/${entry.command}\``;
-  if (entry.source_file) {
+/** @returns {import("./report_ast.cjs").ReportBlock[]} */
+function buildCommandBullet(entry, label = false) {
+  /** @type {import("./report_ast.cjs").ReportInline} */
+  const command = { type: "code", value: label ? entry.command : `/${entry.command}`, agentTainted: false };
+  /** @type {import("./report_ast.cjs").ReportInline[]} */
+  const children = [];
+  if (!label && entry.source_file) {
     const owner = context.repo.owner;
     const repo = context.repo.repo;
     const githubServer = process.env.GITHUB_SERVER_URL || "https://github.com";
     const sourceUrl = `${githubServer}/${owner}/${repo}/blob/HEAD/.github/workflows/${entry.source_file}.md`;
-    return `- [${commandText}](${sourceUrl})${suffix}`;
+    children.push({ type: "link", url: sourceUrl, children: [command] });
+  } else {
+    children.push(command);
   }
-  return `- ${commandText}${suffix}`;
-}
-
-function buildLabelBulletLine(entry) {
-  const desc = entry.description ? neutralizeDescriptionMentions(entry.description) : "";
-  const suffix = desc ? ` — ${desc}` : "";
-  return `- \`${entry.command}\`${suffix}`;
+  if (entry.description) children.push({ type: "text", value: ` — ${entry.description}`, agentTainted: false });
+  return [{ type: "paragraph", children }];
 }
 
 function buildHelpCommentBody(helpCommands) {
@@ -526,38 +517,34 @@ function buildHelpCommentBody(helpCommands) {
   const decentralized = helpCommands.filter(entry => entry.decentralized && !centralizedNames.has(entry.command));
   const labels = helpCommands.filter(entry => entry.label);
 
-  const lines = ["### Agentic Workflow Commands", "", "**Centralized slash commands**"];
-  if (centralized.length === 0) {
-    lines.push("- _None_");
-  } else {
-    for (const entry of centralized) {
-      lines.push(buildCommandBulletLine(entry));
-    }
-  }
-
-  lines.push("", "**Non-centralized slash commands**");
-  if (decentralized.length === 0) {
-    lines.push("- _None_");
-  } else {
-    for (const entry of decentralized) {
-      lines.push(buildCommandBulletLine(entry));
-    }
-  }
-
-  lines.push("", "**Label commands**");
-  if (labels.length === 0) {
-    lines.push("- _None_");
-  } else {
-    for (const entry of labels) {
-      lines.push(buildLabelBulletLine(entry));
-    }
+  /** @type {import("./report_ast.cjs").ReportBlock[]} */
+  const children = [{ type: "heading", level: 3, children: [{ type: "text", value: "Agentic Workflow Commands", agentTainted: false }] }];
+  for (const [title, entries, label] of [
+    ["Centralized slash commands", centralized, false],
+    ["Non-centralized slash commands", decentralized, false],
+    ["Label commands", labels, true],
+  ]) {
+    children.push(
+      { type: "paragraph", children: [{ type: "strong", children: [{ type: "text", value: title, agentTainted: false }] }] },
+      {
+        type: "list",
+        ordered: false,
+        items: entries.length ? entries.map(entry => buildCommandBullet(entry, label)) : [[{ type: "paragraph", children: [{ type: "emphasis", children: [{ type: "text", value: "None", agentTainted: false }] }] }]],
+      }
+    );
   }
 
   const docsUrl = (process.env.GH_AW_SLASH_COMMAND_DOCS_URL || "").trim();
   if (docsUrl) {
-    lines.push("", `Learn more: [Slash command documentation](${docsUrl})`);
+    children.push({
+      type: "paragraph",
+      children: [
+        { type: "text", value: "Learn more: ", agentTainted: false },
+        { type: "link", url: docsUrl, children: [{ type: "text", value: "Slash command documentation", agentTainted: false }] },
+      ],
+    });
   }
-  return lines.join("\n");
+  return renderSizedReport({ type: "report", title: "Agentic Workflow Commands", children }).body;
 }
 
 async function postBuiltinHelpComment(commentBody) {
@@ -600,7 +587,7 @@ async function postBuiltinHelpComment(commentBody) {
     core.warning(`Unable to post builtin /help response for event '${context.eventName}'.`);
     return false;
   } catch (error) {
-    core.warning(`Failed to post builtin /help comment: ${String(error)}`);
+    core.warning(`Failed to post builtin /help comment: ${getErrorMessage(error)}`);
     return false;
   }
 }
@@ -632,14 +619,14 @@ function isDisabledWorkflowDispatchError(error) {
 }
 
 /**
- * @param {Record<string, Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>>} slashRouteMap
+ * @param {Record<string, Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, emoji?: unknown, status_comment?: unknown}>>} slashRouteMap
  * @param {string} actualCommand
- * @returns {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>}
+ * @returns {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, emoji?: unknown, status_comment?: unknown}>}
  */
 function resolveMatchingSlashRoutes(slashRouteMap, actualCommand) {
-  /** @type {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>} */
+  /** @type {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, emoji?: unknown, status_comment?: unknown}>} */
   const specificRoutes = [];
-  /** @type {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, status_comment?: unknown}>} */
+  /** @type {Array<{workflow?: unknown, events?: unknown, ai_reaction?: unknown, emoji?: unknown, status_comment?: unknown}>} */
   const catchAllRoutes = [];
   const seen = new Set();
 
@@ -656,7 +643,7 @@ function resolveMatchingSlashRoutes(slashRouteMap, actualCommand) {
     for (const route of configuredRoutes) {
       // Keep the de-duplication key explicit so routes that differ only by
       // status-comment behavior remain distinct dispatch targets.
-      const key = JSON.stringify([route?.workflow ?? "", route?.ai_reaction ?? "", route?.status_comment === true, Array.isArray(route?.events) ? route.events : []]);
+      const key = JSON.stringify([route?.workflow ?? "", route?.ai_reaction ?? "", route?.emoji ?? "", route?.status_comment === true, Array.isArray(route?.events) ? route.events : []]);
       if (seen.has(key)) {
         continue;
       }
@@ -721,6 +708,12 @@ async function main() {
       core.info(`Adding immediate '${immediateReaction}' reaction for label '${labelName}'.`);
       await addImmediateReaction(immediateReaction);
     }
+    /** @type {any} */
+    let statusCommentContext = null;
+    if (routes.some(maintainsStatusComment)) {
+      core.info(`Adding immediate status comment for label '${labelName}'.`);
+      statusCommentContext = await addImmediateStatusComment(firstNonEmptyString(routes.filter(maintainsStatusComment).map(routeEmoji)));
+    }
     for (const route of routes) {
       const workflowID = toWorkflowDispatchID(route);
       if (!workflowID) {
@@ -732,6 +725,7 @@ async function main() {
         ...buildAwContext(),
         command_name: "",
         ...(routeReaction ? { desired_ai_reaction: routeReaction } : {}),
+        ...(maintainsStatusComment(route) && statusCommentContext ? statusCommentContext : {}),
       };
       core.info(`Dispatching workflow '${workflowID}' for label '${labelName}'.`);
       const dispatched = await dispatchWorkflow(workflowID, ref, {
@@ -739,6 +733,9 @@ async function main() {
       });
       if (dispatched.dispatched) {
         core.info(`Dispatched '${workflowID}' for label '${labelName}'`);
+        if (maintainsStatusComment(route) && statusCommentContext) {
+          await updateStatusCommentWithDispatch(statusCommentContext, identifier, workflowID, dispatched.run_url, routeEmoji(route));
+        }
       }
     }
     core.info(`Completed decentralized label routing for '${labelName}'.`);
@@ -784,7 +781,7 @@ async function main() {
   let statusCommentContext = null;
   if (routes.some(maintainsStatusComment)) {
     core.info(`Adding immediate status comment for '/${commandName}'.`);
-    statusCommentContext = await addImmediateStatusComment();
+    statusCommentContext = await addImmediateStatusComment(firstNonEmptyString(routes.filter(maintainsStatusComment).map(routeEmoji)));
   }
 
   core.info(`Dispatch ref resolved to '${ref}'.`);
@@ -808,7 +805,7 @@ async function main() {
     if (dispatched.dispatched) {
       core.info(`Dispatched '${workflowID}' for '/${commandName}'`);
       if (maintainsStatusComment(route) && statusCommentContext) {
-        await updateStatusCommentWithDispatch(statusCommentContext, identifier, workflowID, dispatched.run_url);
+        await updateStatusCommentWithDispatch(statusCommentContext, identifier, workflowID, dispatched.run_url, routeEmoji(route));
       }
     }
   }

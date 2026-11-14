@@ -60,7 +60,7 @@ When template patterns are detected:
 2. A **warning log** is generated summarizing the defense-in-depth approach
 
 Example warning message:
-```
+```text
 Template-like syntax detected and escaped. This is a defense-in-depth measure 
 to prevent potential template injection if content is processed by downstream 
 template engines. GitHub's markdown rendering does not evaluate template syntax.
@@ -122,7 +122,7 @@ All 233 tests pass, including 17 new tests specifically for template delimiter n
 ### After Fix
 - All template delimiters explicitly detected and escaped
 - Defense-in-depth protection against template injection
-- Clear logging when template patterns are detected
+- Logging when template patterns are detected
 - Documented security measure with test coverage
 
 ## Usage

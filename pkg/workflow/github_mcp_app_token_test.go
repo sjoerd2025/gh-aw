@@ -119,6 +119,59 @@ Test workflow with GitHub MCP app token minting.
 	assert.Contains(t, lockContent, "GITHUB_MCP_SERVER_TOKEN: ${{ steps.github-mcp-app-token.outputs.token }}", "Should use agent job step token for GitHub MCP Server")
 }
 
+func TestGitHubMCPAppTokenForCLIProxyDoesNotChangeSafeOutputsAuth(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+	markdown := `---
+on: issues
+permissions:
+  contents: read
+  pull-requests: read
+strict: false
+tools:
+  github:
+    mode: gh-proxy
+    github-app:
+      client-id: ${{ vars.SOURCE_APP_ID }}
+      private-key: ${{ secrets.SOURCE_APP_PRIVATE_KEY }}
+      owner: example-org
+      repositories: [private-source-repo]
+safe-outputs:
+  github-token: ${{ secrets.SAFE_OUTPUTS_TOKEN }}
+  create-pull-request:
+    allowed-files: ["docs/**/*.md"]
+---
+
+Test that gh-proxy uses the GitHub App token while safe outputs retain their own credential.
+`
+
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "gh-proxy-app-token.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(markdown), 0600))
+	require.NoError(t, compiler.CompileWorkflow(testFile))
+
+	lockFile := strings.TrimSuffix(testFile, ".md") + ".lock.yml"
+	content, err := os.ReadFile(lockFile)
+	require.NoError(t, err)
+	lockContent := string(content)
+
+	appMintIndex := strings.Index(lockContent, "id: github-mcp-app-token")
+	proxyIndex := strings.Index(lockContent, "name: Start CLI Proxy")
+	require.NotEqual(t, -1, appMintIndex, "compiled workflow should mint the GitHub App token")
+	require.NotEqual(t, -1, proxyIndex, "compiled workflow should start the CLI proxy")
+	assert.Less(t, appMintIndex, proxyIndex, "the App token must be minted before the proxy starts")
+
+	agentJobEnd := strings.Index(lockContent, "\n  safe_outputs:")
+	require.NotEqual(t, -1, agentJobEnd, "compiled workflow should include a safe_outputs job")
+	agentJob := lockContent[:agentJobEnd]
+	assert.Contains(t, agentJob, "GH_TOKEN: ${{ steps.github-mcp-app-token.outputs.token }}")
+
+	safeOutputsJob := lockContent[agentJobEnd:]
+	assert.Contains(t, safeOutputsJob, "github-token: ${{ secrets.SAFE_OUTPUTS_TOKEN }}",
+		"safe outputs should use their separately configured credential")
+	assert.NotContains(t, safeOutputsJob, "steps.github-mcp-app-token.outputs.token",
+		"the source App token must not be used by safe outputs")
+}
+
 // TestGitHubMCPAppTokenAndGitHubTokenMutuallyExclusive tests that setting both app and github-token is rejected
 func TestGitHubMCPAppTokenAndGitHubTokenMutuallyExclusive(t *testing.T) {
 	compiler := NewCompiler(WithVersion("1.0.0"))
@@ -129,7 +182,7 @@ permissions:
   contents: read
 tools:
   github:
-    mode: local
+    mode: gh-proxy
     github-token: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
     github-app:
       app-id: ${{ vars.APP_ID }}
@@ -274,6 +327,9 @@ permissions:
   contents: read
   issues: read
 strict: false
+safe-outputs:
+  noop: {}
+  report-incomplete: {}
 tools:
   github:
     mode: local
@@ -311,6 +367,20 @@ Test that determine-automatic-lockdown is generated even when app is configured.
 	// Guard policy env vars must reference the lockdown step outputs
 	assert.Contains(t, lockContent, "GITHUB_MCP_GUARD_MIN_INTEGRITY: ${{ steps.determine-automatic-lockdown.outputs.min_integrity }}", "Guard min-integrity env var should reference lockdown step output")
 	assert.Contains(t, lockContent, "GITHUB_MCP_GUARD_REPOS: ${{ steps.determine-automatic-lockdown.outputs.repos }}", "Guard repos env var should reference lockdown step output")
+	githubMCPIndex := strings.Index(lockContent, `"github": {`)
+	require.NotEqual(t, -1, githubMCPIndex, "GitHub MCP server should be configured")
+	githubMCPConfig := lockContent[githubMCPIndex:]
+	assert.Contains(t, githubMCPConfig, `"allow-only"`, "GitHub MCP server should include an automatic allow-only guard policy")
+	assert.Contains(t, githubMCPConfig, `"min-integrity": "$GITHUB_MCP_GUARD_MIN_INTEGRITY"`, "GitHub guard policy should use automatic min-integrity output")
+	assert.Contains(t, githubMCPConfig, `"repos": "$GITHUB_MCP_GUARD_REPOS"`, "GitHub guard policy should use automatic repos output")
+
+	safeOutputsMCPIndex := strings.Index(lockContent, `"safeoutputs": {`)
+	require.NotEqual(t, -1, safeOutputsMCPIndex, "safeoutputs MCP server should be configured")
+	safeOutputsMCPConfig := lockContent[safeOutputsMCPIndex:]
+	assert.Contains(t, safeOutputsMCPConfig, `"write-sink"`, "safeoutputs MCP server should include a write-sink guard policy")
+	assert.Contains(t, safeOutputsMCPConfig, `"accept": [`, "safeoutputs write-sink policy should include accept list")
+	assert.Contains(t, safeOutputsMCPConfig, `"*"`, "safeoutputs write-sink policy should accept all runtime safe-output sink labels")
+	assert.Contains(t, safeOutputsMCPConfig, `"sink-visibility": "${GH_AW_SINK_VISIBILITY}"`, "safeoutputs write-sink policy should use runtime sink visibility")
 
 	// App token should still be minted (now in agent job) and consumed via step output
 	assert.Contains(t, lockContent, "id: github-mcp-app-token", "GitHub App token step should still be generated")
@@ -417,6 +487,7 @@ tools:
       permissions:
         members: read
         organization-administration: read
+        secret-scanning-alerts: read
 ---
 
 # Test Workflow
@@ -447,6 +518,53 @@ Test extra org-level permissions in GitHub App token.
 	// Verify that the extra org-level permissions from github-app.permissions are included
 	assert.Contains(t, lockContent, "permission-members: read", "Should include extra members permission from github-app.permissions")
 	assert.Contains(t, lockContent, "permission-organization-administration: read", "Should include extra organization-administration permission from github-app.permissions")
+	assert.Contains(t, lockContent, "permission-secret-scanning-alerts: read", "Should include extra secret-scanning-alerts permission from github-app.permissions")
+}
+
+// TestGitHubMCPAppTokenWithSecretScanningAlertsNoneOmitted tests that
+// secret-scanning-alerts: none under tools.github.github-app.permissions is omitted
+// from create-github-app-token inputs because the action does not accept "none"
+// for that permission.
+func TestGitHubMCPAppTokenWithSecretScanningAlertsNoneOmitted(t *testing.T) {
+	compiler := NewCompiler(WithVersion("1.0.0"))
+
+	markdown := `---
+on: issues
+permissions:
+  contents: read
+strict: false
+tools:
+  github:
+    mode: local
+    github-app:
+      app-id: ${{ vars.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      repositories: ["*"]
+      permissions:
+        members: read
+        secret-scanning-alerts: none
+---
+
+# Test Workflow
+
+Test extra secret-scanning-alerts none behavior in GitHub App token.
+`
+
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "test.md")
+	err := os.WriteFile(testFile, []byte(markdown), 0644)
+	require.NoError(t, err, "Failed to write test file")
+
+	err = compiler.CompileWorkflow(testFile)
+	require.NoError(t, err, "Failed to compile workflow")
+
+	lockFile := strings.TrimSuffix(testFile, ".md") + ".lock.yml"
+	content, err := os.ReadFile(lockFile)
+	require.NoError(t, err, "Failed to read lock file")
+	lockContent := string(content)
+
+	assert.Contains(t, lockContent, "permission-members: read", "Should include other app permissions")
+	assert.NotContains(t, lockContent, "permission-secret-scanning-alerts:", "secret-scanning-alerts: none should be omitted")
 }
 
 // TestGitHubMCPAppTokenExtraPermissionsOverrideJobLevel tests that extra permissions

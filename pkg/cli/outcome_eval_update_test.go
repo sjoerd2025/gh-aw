@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,7 +14,7 @@ func TestEvalUpdateIssueRetained(t *testing.T) {
 	t.Cleanup(func() {
 		outcomeUpdateGHAPIGet = old
 	})
-	outcomeUpdateGHAPIGet = func(endpoint string, repo string) (map[string]any, error) {
+	outcomeUpdateGHAPIGet = func(_ context.Context, endpoint string, repo string) (map[string]any, error) {
 		return map[string]any{
 			"title": "New title",
 			"body":  "New body",
@@ -28,7 +29,7 @@ func TestEvalUpdateIssueRetained(t *testing.T) {
 		}, nil
 	}
 
-	report := evalUpdateIssue(CreatedItemReport{
+	report := evalUpdateIssue(context.Background(), CreatedItemReport{
 		Type:   "update_issue",
 		Number: 12,
 		Repo:   "owner/repo",
@@ -48,7 +49,6 @@ func TestEvalUpdateIssueRetained(t *testing.T) {
 		},
 	}, "owner/repo")
 
-	assert.Equal(t, OutcomeAccepted, report.Result)
 	assert.Equal(t, OutcomeStatusAccepted, report.OutcomeStatus)
 	assert.Equal(t, EvidenceMedium, report.EvidenceStrength)
 	assert.Equal(t, "state_retained", report.Signal)
@@ -59,7 +59,7 @@ func TestEvalUpdateIssueReverted(t *testing.T) {
 	t.Cleanup(func() {
 		outcomeUpdateGHAPIGet = old
 	})
-	outcomeUpdateGHAPIGet = func(endpoint string, repo string) (map[string]any, error) {
+	outcomeUpdateGHAPIGet = func(_ context.Context, endpoint string, repo string) (map[string]any, error) {
 		return map[string]any{
 			"title": "Old title",
 			"body":  "Old body",
@@ -67,7 +67,7 @@ func TestEvalUpdateIssueReverted(t *testing.T) {
 		}, nil
 	}
 
-	report := evalUpdateIssue(CreatedItemReport{
+	report := evalUpdateIssue(context.Background(), CreatedItemReport{
 		Type:   "update_issue",
 		Number: 12,
 		Repo:   "owner/repo",
@@ -83,7 +83,6 @@ func TestEvalUpdateIssueReverted(t *testing.T) {
 		},
 	}, "owner/repo")
 
-	assert.Equal(t, OutcomeRejected, report.Result)
 	assert.Equal(t, OutcomeStatusRejected, report.OutcomeStatus)
 	assert.Equal(t, EvidenceStrong, report.EvidenceStrength)
 	assert.Equal(t, "state_reverted", report.Signal)
@@ -94,7 +93,7 @@ func TestEvalUpdatePullRequestRetainedAndMerged(t *testing.T) {
 	t.Cleanup(func() {
 		outcomeUpdateGHAPIGet = old
 	})
-	outcomeUpdateGHAPIGet = func(endpoint string, repo string) (map[string]any, error) {
+	outcomeUpdateGHAPIGet = func(_ context.Context, endpoint string, repo string) (map[string]any, error) {
 		return map[string]any{
 			"title":  "New title",
 			"body":   "New body",
@@ -106,7 +105,7 @@ func TestEvalUpdatePullRequestRetainedAndMerged(t *testing.T) {
 		}, nil
 	}
 
-	report := evalUpdatePullRequest(CreatedItemReport{
+	report := evalUpdatePullRequest(context.Background(), CreatedItemReport{
 		Type:   "update_pull_request",
 		Number: 42,
 		Repo:   "owner/repo",
@@ -128,7 +127,6 @@ func TestEvalUpdatePullRequestRetainedAndMerged(t *testing.T) {
 		},
 	}, "owner/repo")
 
-	assert.Equal(t, OutcomeAccepted, report.Result)
 	assert.Equal(t, OutcomeStatusAccepted, report.OutcomeStatus)
 	assert.Equal(t, EvidenceStrong, report.EvidenceStrength)
 	assert.Equal(t, "state_retained_and_merged", report.Signal)
@@ -139,7 +137,7 @@ func TestEvalUpdatePullRequestReplaced(t *testing.T) {
 	t.Cleanup(func() {
 		outcomeUpdateGHAPIGet = old
 	})
-	outcomeUpdateGHAPIGet = func(endpoint string, repo string) (map[string]any, error) {
+	outcomeUpdateGHAPIGet = func(_ context.Context, endpoint string, repo string) (map[string]any, error) {
 		return map[string]any{
 			"title":  "Maintainer rewrite",
 			"body":   "Reworked body",
@@ -151,7 +149,7 @@ func TestEvalUpdatePullRequestReplaced(t *testing.T) {
 		}, nil
 	}
 
-	report := evalUpdatePullRequest(CreatedItemReport{
+	report := evalUpdatePullRequest(context.Background(), CreatedItemReport{
 		Type:   "update_pull_request",
 		Number: 42,
 		Repo:   "owner/repo",
@@ -173,20 +171,18 @@ func TestEvalUpdatePullRequestReplaced(t *testing.T) {
 		},
 	}, "owner/repo")
 
-	assert.Equal(t, OutcomeRejected, report.Result)
 	assert.Equal(t, OutcomeStatusRejected, report.OutcomeStatus)
 	assert.Equal(t, EvidenceStrong, report.EvidenceStrength)
 	assert.Equal(t, "state_replaced", report.Signal)
 }
 
 func TestEvalRetainedUpdateMissingExecutionStateUsesEvidenceNone(t *testing.T) {
-	report := evalUpdateIssue(CreatedItemReport{
+	report := evalUpdateIssue(context.Background(), CreatedItemReport{
 		Type:   "update_issue",
 		Number: 12,
 		Repo:   "owner/repo",
 	}, "owner/repo")
 
-	assert.Equal(t, OutcomeUnknown, report.Result)
 	assert.Equal(t, OutcomeStatusUnknown, report.OutcomeStatus)
 	assert.Equal(t, EvidenceNone, report.EvidenceStrength)
 	assert.Equal(t, "missing_execution_state", report.Signal)
@@ -197,7 +193,7 @@ func TestEvalReplaceLabelRetained(t *testing.T) {
 	t.Cleanup(func() {
 		outcomeUpdateGHAPIGet = old
 	})
-	outcomeUpdateGHAPIGet = func(endpoint string, repo string) (map[string]any, error) {
+	outcomeUpdateGHAPIGet = func(_ context.Context, endpoint string, repo string) (map[string]any, error) {
 		return map[string]any{
 			"labels": []any{
 				map[string]any{"name": "triage"},
@@ -206,7 +202,7 @@ func TestEvalReplaceLabelRetained(t *testing.T) {
 		}, nil
 	}
 
-	report := evalReplaceLabel(CreatedItemReport{
+	report := evalReplaceLabel(context.Background(), CreatedItemReport{
 		Type:   "replace_label",
 		Number: 12,
 		Repo:   "owner/repo",
@@ -218,7 +214,6 @@ func TestEvalReplaceLabelRetained(t *testing.T) {
 		},
 	}, "owner/repo")
 
-	assert.Equal(t, OutcomeAccepted, report.Result)
 	assert.Equal(t, OutcomeStatusAccepted, report.OutcomeStatus)
 	assert.Equal(t, EvidenceMedium, report.EvidenceStrength)
 	assert.Equal(t, "state_retained", report.Signal)
@@ -233,7 +228,7 @@ func TestEvalReplaceLabelRetainedWithExtraLabel(t *testing.T) {
 	t.Cleanup(func() {
 		outcomeUpdateGHAPIGet = old
 	})
-	outcomeUpdateGHAPIGet = func(endpoint string, repo string) (map[string]any, error) {
+	outcomeUpdateGHAPIGet = func(_ context.Context, endpoint string, repo string) (map[string]any, error) {
 		return map[string]any{
 			"labels": []any{
 				map[string]any{"name": "done"},
@@ -242,7 +237,7 @@ func TestEvalReplaceLabelRetainedWithExtraLabel(t *testing.T) {
 		}, nil
 	}
 
-	report := evalReplaceLabel(CreatedItemReport{
+	report := evalReplaceLabel(context.Background(), CreatedItemReport{
 		Type:   "replace_label",
 		Number: 12,
 		Repo:   "owner/repo",
@@ -254,7 +249,6 @@ func TestEvalReplaceLabelRetainedWithExtraLabel(t *testing.T) {
 		},
 	}, "owner/repo")
 
-	assert.Equal(t, OutcomeAccepted, report.Result)
 	assert.Equal(t, OutcomeStatusAccepted, report.OutcomeStatus)
 	assert.Equal(t, EvidenceMedium, report.EvidenceStrength)
 	assert.Equal(t, "state_retained", report.Signal)
@@ -268,7 +262,7 @@ func TestEvalReplaceLabelReverted(t *testing.T) {
 	t.Cleanup(func() {
 		outcomeUpdateGHAPIGet = old
 	})
-	outcomeUpdateGHAPIGet = func(endpoint string, repo string) (map[string]any, error) {
+	outcomeUpdateGHAPIGet = func(_ context.Context, endpoint string, repo string) (map[string]any, error) {
 		return map[string]any{
 			"labels": []any{
 				map[string]any{"name": "in-progress"},
@@ -276,7 +270,7 @@ func TestEvalReplaceLabelReverted(t *testing.T) {
 		}, nil
 	}
 
-	report := evalReplaceLabel(CreatedItemReport{
+	report := evalReplaceLabel(context.Background(), CreatedItemReport{
 		Type:   "replace_label",
 		Number: 12,
 		Repo:   "owner/repo",
@@ -288,7 +282,6 @@ func TestEvalReplaceLabelReverted(t *testing.T) {
 		},
 	}, "owner/repo")
 
-	assert.Equal(t, OutcomeRejected, report.Result)
 	assert.Equal(t, OutcomeStatusRejected, report.OutcomeStatus)
 	assert.Equal(t, EvidenceStrong, report.EvidenceStrength)
 	assert.Equal(t, "state_reverted", report.Signal)

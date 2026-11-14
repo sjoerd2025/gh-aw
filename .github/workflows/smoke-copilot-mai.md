@@ -1,8 +1,9 @@
 ---
 private: true
 emoji: "⚡"
-description: "Smoke test for MAI-Code-1-Flash (mai-code-1-flash-picker) — pricing: $0.75/M input, $0.075/M cached, $4.50/M output"
+description: "Smoke test for MAI-Code-1.1-Flash (mai-code-1.1-flash) — pricing: $0.20/M input, $0.02/M cached, $1.20/M output"
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-copilot-mai
     strategy: centralized
@@ -19,10 +20,16 @@ permissions:
   issues: read
   pull-requests: read
 name: Smoke Copilot MAI
-model: mai-code-1-flash-picker
+model: mai-code-1.1-flash
 engine:
   id: copilot
   bare: true
+imports:
+  - shared/smoke-test-brevity.md
+  - shared/reporting.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: copilot-events
 network:
   allowed:
     - defaults
@@ -33,6 +40,13 @@ tools:
   github:
     mode: gh-proxy
     toolsets: [default]
+evals:
+  - id: commit_summary_grounding
+    question: When commits are returned, is the two-to-four-sentence thematic summary grounded in the retrieved last-24-hour commit messages? Return UNKNOWN when the commit list is empty or retrieval failed.
+  - id: empty_commit_report
+    question: When a successful query returns no commits, does the requested issue state No commits in the last 24h rather than inventing activity? Return UNKNOWN when commits are returned or retrieval failed.
+  - id: retrieval_status
+    question: Does the requested issue's bash test status reflect whether the commit query actually succeeded rather than treating a failed query as an empty successful result?
 safe-outputs:
   create-issue:
     expires: 2h
@@ -46,11 +60,12 @@ safe-outputs:
 timeout-minutes: 10
 features:
   gh-aw-detection: false
+sandbox:
+  agent:
+    id: awf
 ---
 
-# Smoke Test: MAI-Code-1-Flash Commit Summary
-
-**IMPORTANT: Keep all outputs extremely short and concise.**
+# Smoke Test: MAI-Code-1.1-Flash Commit Summary
 
 ## Task
 
@@ -69,7 +84,7 @@ Retrieve and summarize commit messages from the last 24h in `${{ github.reposito
 
 ## Output
 
-**Create an issue** titled **"Smoke Test: MAI-Code-1-Flash - ${{ github.run_id }}"** with:
+**Create an issue** titled **"Smoke Test: MAI-Code-1.1-Flash - ${{ github.run_id }}"** with:
 - The commit list (or "No commits in the last 24h" if empty)
 - The summary
 - ✅ or ❌ for the bash tool test

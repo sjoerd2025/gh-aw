@@ -10,6 +10,7 @@ const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_help
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
+const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "submit_pull_request_review";
@@ -43,6 +44,18 @@ async function main(config = {}) {
   const supersedeOlderReviews = parseBoolTemplatable(config.supersede_older_reviews, false);
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const githubClient = await createAuthenticatedGitHubClient(config);
+  const footerContext = {
+    workflowName: process.env.GH_AW_WORKFLOW_NAME || "Workflow",
+    runUrl: buildWorkflowRunUrl(context, context.repo),
+    workflowSource: process.env.GH_AW_WORKFLOW_SOURCE || "",
+    workflowSourceURL: process.env.GH_AW_WORKFLOW_SOURCE_URL || "",
+    triggeringIssueNumber: context.payload?.issue?.number && !context.payload?.issue?.pull_request ? context.payload.issue.number : undefined,
+    triggeringPRNumber: context.payload?.pull_request?.number || (context.payload?.issue?.pull_request ? context.payload.issue.number : undefined),
+    triggeringDiscussionNumber: context.payload?.discussion?.number,
+    bodyFooter: config.body_footer,
+  };
+  if (registry) registry.setDefaultFooterContext(footerContext);
+  else if (legacyBuffer) legacyBuffer.setFooterContext(footerContext);
 
   const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
   const requiredTitlePrefix = config.required_title_prefix || "";
@@ -95,6 +108,7 @@ async function main(config = {}) {
   }
 
   let processedCount = 0;
+  const reviewTargets = new Set();
 
   /**
    * Message handler that stores review metadata
@@ -102,7 +116,7 @@ async function main(config = {}) {
    * @param {Object} resolvedTemporaryIds - Map of temporary IDs
    * @returns {Promise<Object>} Result with success status
    */
-  return async function handleSubmitPRReview(message, resolvedTemporaryIds) {
+  async function handleSubmitPRReview(message, resolvedTemporaryIds) {
     if (processedCount >= maxCount) {
       core.warning(`Skipping submit_pull_request_review: max count of ${maxCount} reached`);
       return {
@@ -149,7 +163,14 @@ async function main(config = {}) {
       return await handleWithRegistry(message, event, body);
     }
     return await handleWithLegacyBuffer(message, event, body);
+  }
+
+  handleSubmitPRReview.getReviewTarget = message => {
+    const target = resolveTarget({ targetConfig, item: message, context, itemType: "PR review", supportsPR: false, supportsIssue: false });
+    const repository = resolveAndValidateRepo(message, defaultTargetRepo, allowedRepos, "PR review");
+    return target.success && target.number && repository.success ? { repo: repository.repo, pull_request_number: target.number } : null;
   };
+  return handleSubmitPRReview;
 
   /**
    * Registry path: resolve target PR first, then obtain a per-PR buffer and store metadata.
@@ -167,6 +188,11 @@ async function main(config = {}) {
       supportsPR: false,
       supportsIssue: false,
     });
+
+    if (!targetResult.success && targetResult.shouldFail === false) {
+      core.warning(`Could not resolve PR for review: ${targetResult.error}`);
+      return { success: false, skipped: true, reason: targetResult.error, error: targetResult.error };
+    }
 
     if (!targetResult.success || !targetResult.number) {
       const errMsg = (targetResult.success === false ? targetResult.error : undefined) || "Could not determine target PR";
@@ -192,7 +218,8 @@ async function main(config = {}) {
     const filterResult = await checkRequiredFilter(githubClient, repoParts, prNum, requiredLabels, requiredTitlePrefix, "submit_pr_review");
     if (filterResult) return filterResult;
 
-    if (buffer.hasReviewMetadata()) {
+    const reviewTarget = `${repo}#${prNum}`;
+    if (reviewTargets.has(reviewTarget)) {
       const errMsg = `PR ${repo}#${prNum} already has a pending review submission. Only one submit_pull_request_review per PR per run is allowed; use target: "*" with max: 1 so each PR gets its own invocation.`;
       core.warning(`submit_pull_request_review: ${errMsg}`);
       return { success: false, error: errMsg };
@@ -200,6 +227,7 @@ async function main(config = {}) {
 
     core.info(`Setting review metadata for ${repo}#${prNum}: event=${event}, bodyLength=${body.length}`);
     buffer.setReviewMetadata(body, event);
+    reviewTargets.add(reviewTarget);
 
     if (!buffer.getReviewContext()) {
       await setReviewContextOnBuffer(buffer, prNum, repo, repoParts, message);

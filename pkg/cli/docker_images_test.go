@@ -5,10 +5,22 @@ package cli
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func useDockerFallback(t *testing.T) {
+	t.Helper()
+	t.Setenv("PATH", t.TempDir())
+}
 
 func TestCheckAndPrepareDockerImages_NoToolsRequested(t *testing.T) {
 	// Reset state before test
@@ -22,6 +34,7 @@ func TestCheckAndPrepareDockerImages_NoToolsRequested(t *testing.T) {
 }
 
 func TestCheckAndPrepareDockerImages_ImageAlreadyDownloading(t *testing.T) {
+	useDockerFallback(t)
 	// Reset state before test
 	ResetDockerPullState()
 
@@ -46,6 +59,88 @@ func TestCheckAndPrepareDockerImages_ImageAlreadyDownloading(t *testing.T) {
 
 	// Clean up
 	ResetDockerPullState()
+}
+
+func TestCheckAndPrepareDockerImagesPullHonorsProbeCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Docker pull test requires a POSIX shell")
+	}
+	ResetDockerPullState()
+	t.Cleanup(ResetDockerPullState)
+
+	dockerDir := t.TempDir()
+	markerPath := filepath.Join(t.TempDir(), "pull-status")
+	dockerPath := filepath.Join(dockerDir, "docker")
+	dockerScript := `#!/bin/sh
+case "$1" in
+  info) exit 0 ;;
+  image) exit 1 ;;
+  pull)
+    printf 'started\n' >> "$DOCKER_TEST_MARKER"
+    exec /bin/sleep 10
+    printf 'complete\n' >> "$DOCKER_TEST_MARKER"
+    exit 0 ;;
+esac
+exit 1
+`
+	require.NoError(t, os.WriteFile(dockerPath, []byte(dockerScript), 0o755))
+	t.Setenv("PATH", dockerDir)
+	t.Setenv("DOCKER_TEST_MARKER", markerPath)
+
+	probeCtx, cancel := context.WithCancel(t.Context())
+	err := CheckAndPrepareDockerImagesWithDetachedDownloads(probeCtx, DockerImagesOptions{Zizmor: true})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Started downloading")
+	require.Eventually(t, func() bool {
+		status, readErr := os.ReadFile(markerPath)
+		return readErr == nil && strings.Contains(string(status), "started")
+	}, time.Second, 10*time.Millisecond)
+	cancel()
+
+	require.Eventually(t, func() bool {
+		_, readErr := os.ReadFile(markerPath)
+		return readErr == nil && !IsDockerImageDownloading(ZizmorImage)
+	}, time.Second, 10*time.Millisecond)
+	status, err := os.ReadFile(markerPath)
+	require.NoError(t, err)
+	assert.NotContains(t, string(status), "complete")
+	assert.False(t, IsDockerImageDownloading(ZizmorImage))
+}
+
+func TestCheckAndPrepareDockerImagesSecondProbeHonorsDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Docker probe test requires a POSIX shell")
+	}
+	ResetDockerPullState()
+	t.Cleanup(ResetDockerPullState)
+
+	dockerDir := t.TempDir()
+	markerPath := filepath.Join(t.TempDir(), "first-inspection")
+	dockerScript := `#!/bin/sh
+case "$1" in
+  info) exit 0 ;;
+  image)
+    if [ -f "$DOCKER_TEST_MARKER" ]; then
+      exec /bin/sleep 2
+    fi
+    printf 'inspected\n' > "$DOCKER_TEST_MARKER"
+    exit 1 ;;
+esac
+exit 1
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dockerDir, "docker"), []byte(dockerScript), 0o755))
+	t.Setenv("PATH", dockerDir)
+	t.Setenv("DOCKER_TEST_MARKER", markerPath)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := CheckAndPrepareDockerImagesWithDetachedDownloads(ctx, DockerImagesOptions{Zizmor: true})
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), time.Second)
+	assert.FileExists(t, markerPath)
+	assert.False(t, IsDockerImageDownloading(ZizmorImage))
 }
 
 func TestDockerImageDownloadState(t *testing.T) {
@@ -91,6 +186,7 @@ func TestResetDockerPullState(t *testing.T) {
 }
 
 func TestDockerImageConstants(t *testing.T) {
+	t.Parallel()
 	// Verify constants are defined correctly
 	if ZizmorImage == "" {
 		t.Error("ZizmorImage constant should not be empty")
@@ -113,6 +209,9 @@ func TestDockerImageConstants(t *testing.T) {
 	if GrantImage == "" {
 		t.Error("GrantImage constant should not be empty")
 	}
+	if ShellcheckImage == "" {
+		t.Error("ShellcheckImage constant should not be empty")
+	}
 
 	// Verify they are docker image references
 	expectedImages := map[string]string{
@@ -123,6 +222,7 @@ func TestDockerImageConstants(t *testing.T) {
 		"syft":         SyftImage,
 		"grype":        GrypeImage,
 		"grant":        GrantImage,
+		"shellcheck":   ShellcheckImage,
 	}
 
 	for name, image := range expectedImages {
@@ -132,7 +232,26 @@ func TestDockerImageConstants(t *testing.T) {
 	}
 }
 
+func TestScannerImageReleasePins(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name, got, want string
+	}{
+		{"syft", SyftImage, "anchore/syft:v1.57.1@sha256:03215d0e98b661d0ecbc8575dbc14d65be1743b5de5df6410aecb7e80f95b060"},
+		{"grype", GrypeImage, "anchore/grype:v0.121.3@sha256:13113eeceab017260370cf540e1d25442c59665fd07d1b09b66d63bb0c282887"},
+		{"grant", GrantImage, "anchore/grant:v0.7.1@sha256:9ccd7c26dc48ce87cd9350e29fa8da5eaaedfabb3bc2e56f6b1ce3e9e7adc4b6"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Fatalf("%s image = %q, want %q", tt.name, tt.got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCheckAndPrepareDockerImages_MultipleImages(t *testing.T) {
+	useDockerFallback(t)
 	// Reset state before test
 	ResetDockerPullState()
 
@@ -164,6 +283,7 @@ func TestCheckAndPrepareDockerImages_MultipleImages(t *testing.T) {
 }
 
 func TestCheckAndPrepareDockerImages_RetryMessageFormat(t *testing.T) {
+	useDockerFallback(t)
 	// Reset state before test
 	ResetDockerPullState()
 
@@ -198,6 +318,7 @@ func TestCheckAndPrepareDockerImages_RetryMessageFormat(t *testing.T) {
 }
 
 func TestCheckAndPrepareDockerImages_StartedDownloadingMessage(t *testing.T) {
+	useDockerFallback(t)
 	// Reset state before test
 	ResetDockerPullState()
 
@@ -224,6 +345,7 @@ func TestCheckAndPrepareDockerImages_StartedDownloadingMessage(t *testing.T) {
 }
 
 func TestCheckAndPrepareDockerImages_ImageAlreadyAvailable(t *testing.T) {
+	useDockerFallback(t)
 	// Reset state before test
 	ResetDockerPullState()
 
@@ -280,28 +402,6 @@ func TestMockImageAvailability(t *testing.T) {
 
 	// Clean up
 	ResetDockerPullState()
-}
-
-func TestNormalizeDockerContext_NilContextReturnsTODO(t *testing.T) {
-	//nolint:staticcheck // Intentionally validating nil context normalization behavior.
-	ctx := normalizeDockerContext(nil)
-
-	if ctx == nil {
-		t.Fatal("Expected nil context to be replaced")
-	}
-
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("Expected replacement context to be active, got err: %v", err)
-	}
-}
-
-func TestNormalizeDockerContext_PreservesNonNilContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	if normalizeDockerContext(ctx) != ctx {
-		t.Fatal("Expected non-nil context to be preserved")
-	}
 }
 
 func TestIsDockerAvailable_NilContext(t *testing.T) {
@@ -635,6 +735,7 @@ func TestStartDockerImageDownload_NilContext(t *testing.T) {
 }
 
 func TestCheckAndPrepareDockerImages_DockerUnavailable(t *testing.T) {
+	useDockerFallback(t)
 	// Reset state before test
 	ResetDockerPullState()
 
@@ -647,32 +748,14 @@ func TestCheckAndPrepareDockerImages_DockerUnavailable(t *testing.T) {
 		t.Fatal("Expected error when Docker is unavailable, got nil")
 	}
 
-	errMsg := err.Error()
-	if !strings.Contains(errMsg, "docker is not available") {
-		t.Errorf("Expected error to mention 'docker is not available', got: %s", errMsg)
-	}
-	if !strings.Contains(errMsg, "cannot connect to Docker daemon") {
-		t.Errorf("Expected error to mention 'cannot connect to Docker daemon', got: %s", errMsg)
-	}
-	if !strings.Contains(errMsg, "zizmor") {
-		t.Errorf("Expected error to mention 'zizmor', got: %s", errMsg)
-	}
-	if strings.Contains(errMsg, "being downloaded") {
-		t.Errorf("Expected error NOT to say 'being downloaded' when Docker is unavailable, got: %s", errMsg)
-	}
-	// Error message should use parameter syntax, not CLI flag syntax
-	if strings.Contains(errMsg, "--zizmor") {
-		t.Errorf("Expected error NOT to use CLI flag syntax '--zizmor', got: %s", errMsg)
-	}
-	if !strings.Contains(errMsg, "zizmor: false") {
-		t.Errorf("Expected error to suggest 'zizmor: false', got: %s", errMsg)
-	}
+	assert.Equal(t, "Docker is unavailable; Docker-based static analysis will be skipped.", err.Error())
 
 	// Clean up
 	ResetDockerPullState()
 }
 
 func TestCheckAndPrepareDockerImages_DockerUnavailable_MultipleTools(t *testing.T) {
+	useDockerFallback(t)
 	// Reset state before test
 	ResetDockerPullState()
 
@@ -685,27 +768,7 @@ func TestCheckAndPrepareDockerImages_DockerUnavailable_MultipleTools(t *testing.
 		t.Fatal("Expected error when Docker is unavailable, got nil")
 	}
 
-	errMsg := err.Error()
-	if !strings.Contains(errMsg, "docker is not available") {
-		t.Errorf("Expected error to mention 'docker is not available', got: %s", errMsg)
-	}
-	// Both tools should be mentioned
-	if !strings.Contains(errMsg, "zizmor") {
-		t.Errorf("Expected error to mention 'zizmor', got: %s", errMsg)
-	}
-	if !strings.Contains(errMsg, "actionlint") {
-		t.Errorf("Expected error to mention 'actionlint', got: %s", errMsg)
-	}
-	// Error message should use parameter syntax, not CLI flag syntax
-	if strings.Contains(errMsg, "--zizmor") || strings.Contains(errMsg, "--actionlint") {
-		t.Errorf("Expected error NOT to use CLI flag syntax, got: %s", errMsg)
-	}
-	if !strings.Contains(errMsg, "zizmor: false") {
-		t.Errorf("Expected error to suggest 'zizmor: false', got: %s", errMsg)
-	}
-	if !strings.Contains(errMsg, "actionlint: false") {
-		t.Errorf("Expected error to suggest 'actionlint: false', got: %s", errMsg)
-	}
+	assert.Equal(t, "Docker is unavailable; Docker-based static analysis will be skipped.", err.Error())
 
 	// Clean up
 	ResetDockerPullState()
@@ -746,9 +809,83 @@ func TestIsDockerAvailable_MockFalse(t *testing.T) {
 	ResetDockerPullState()
 }
 
+func TestDockerMissingReportsOnce(t *testing.T) {
+	useDockerFallback(t)
+	ResetDockerPullState()
+	t.Cleanup(ResetDockerPullState)
+
+	stdout, stderr := captureOutput(t, func() error {
+		var wg sync.WaitGroup
+		for range 10 {
+			wg.Go(func() {
+				assert.False(t, IsDockerAvailable(context.Background()))
+				assert.False(t, IsDockerImageAvailable(context.Background(), ZizmorImage))
+			})
+		}
+		wg.Wait()
+		for range 2 {
+			err := CheckAndPrepareDockerImages(context.Background(), DockerImagesOptions{Zizmor: true, Grant: true})
+			var unavailable *DockerUnavailableError
+			require.ErrorAs(t, err, &unavailable)
+			assert.Equal(t, dockerUnavailableMessage, unavailable.Message)
+
+			started, join := StartDockerImageDownload(context.Background(), ZizmorImage)
+			assert.False(t, started, "missing Docker must not start a retrying download")
+			require.ErrorAs(t, join(), &unavailable)
+			assert.False(t, IsDockerImageDownloading(ZizmorImage))
+		}
+		return nil
+	})
+	assert.Empty(t, stdout, "informational output must not pollute JSON stdout")
+	assert.Equal(t, 1, strings.Count(stderr, "Docker is not installed; Docker-based features are unavailable."))
+	assert.NotContains(t, stderr, "Retry")
+	assert.NotContains(t, stderr, "Error")
+}
+
+func TestIsDockerAvailableInstalled(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test binary uses a POSIX shell")
+	}
+	for _, exitCode := range []string{"0", "1"} {
+		t.Run("exit_"+exitCode, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "docker"), []byte("#!/bin/sh\nexit "+exitCode+"\n"), 0o755))
+			t.Setenv("PATH", dir)
+			ResetDockerPullState()
+			t.Cleanup(ResetDockerPullState)
+			stdout, stderr := captureOutput(t, func() error {
+				assert.Equal(t, exitCode == "0", IsDockerAvailable(context.Background()))
+				return nil
+			})
+			assert.Empty(t, stdout)
+			assert.NotContains(t, stderr, "Docker is not installed")
+		})
+	}
+}
+
+func TestPrepareDockerImagesMissingBeforeDownload(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test binary uses a POSIX shell")
+	}
+	dir := t.TempDir()
+	docker := filepath.Join(dir, "docker")
+	require.NoError(t, os.WriteFile(docker, []byte("#!/bin/sh\n/bin/rm \"$0\"\n"), 0o755))
+	t.Setenv("PATH", dir)
+	ResetDockerPullState()
+	t.Cleanup(ResetDockerPullState)
+
+	err := CheckAndPrepareDockerImages(context.Background(), DockerImagesOptions{Zizmor: true})
+	var unavailable *DockerUnavailableError
+	require.ErrorAs(t, err, &unavailable)
+	assert.NotContains(t, err.Error(), "being downloaded")
+	assert.False(t, IsDockerImageDownloading(ZizmorImage))
+}
+
 func TestCheckAndPrepareDockerImages_DockerUnavailable_ReturnsTypedError(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 	// Reset state before test
 	ResetDockerPullState()
+	t.Cleanup(ResetDockerPullState)
 	SetMockDockerAvailable(false)
 
 	err := CheckAndPrepareDockerImages(context.Background(), DockerImagesOptions{Actionlint: true})
@@ -768,6 +905,7 @@ func TestCheckAndPrepareDockerImages_DockerUnavailable_ReturnsTypedError(t *test
 }
 
 func TestCheckAndPrepareDockerImages_RunnerGuardImageDownloading(t *testing.T) {
+	useDockerFallback(t)
 	// Reset state before test
 	ResetDockerPullState()
 

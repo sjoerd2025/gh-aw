@@ -10,11 +10,9 @@ permissions:
   pull-requests: read
   issues: read
 
-sandbox:
-  agent:
-    sudo: false
 
 engine: codex
+model: copilot/gpt-6.1-sol
 strict: true
 network:
   allowed:
@@ -22,6 +20,7 @@ network:
     - github
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   bash: ["*"]
@@ -39,7 +38,13 @@ timeout-minutes: 30
 checkout:
   - fetch-depth: 1
     current: true
-
+evals:
+  - id: uncovered-fields-only
+    question: When demo patches are proposed, does each demonstrate a top-level schema field shown to be uncovered by the workflow scan? Return UNKNOWN when no demo patches are proposed.
+  - id: demo-only-patches
+    question: Are proposed changes confined to new schema-demos/schema-demo-*.md files? Return UNKNOWN when no patches are proposed.
+  - id: full-coverage-noop
+    question: When the scan shows all schema fields are covered, does the agent request noop? Return UNKNOWN when uncovered fields remain or scan results are unavailable.
 ---
 
 # Schema Feature Coverage Checker

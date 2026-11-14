@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 describe("parse_pi_log.cjs", () => {
   let mockCore;
-  let parsePiLog, transformPiEntries, isPiV3Schema, transformPiV3Entries, computePiV3Stats;
+  let parsePiLog, transformPiEntries, isPiV3Schema, transformPiV3Entries, computePiV3Stats, normalizePiToolName;
 
   beforeEach(async () => {
     mockCore = {
@@ -25,6 +25,7 @@ describe("parse_pi_log.cjs", () => {
     isPiV3Schema = module.isPiV3Schema;
     transformPiV3Entries = module.transformPiV3Entries;
     computePiV3Stats = module.computePiV3Stats;
+    normalizePiToolName = module.normalizePiToolName;
   });
 
   afterEach(() => {
@@ -111,10 +112,10 @@ describe("parse_pi_log.cjs", () => {
 
       const result = parsePiLog(logContent);
 
-      const resultEntry = result.logEntries && result.logEntries.find(e => e.type === "result");
+      const resultEntry = result.logEntries && result.logEntries.find(e => e.type === "session.result");
       expect(resultEntry).toBeDefined();
-      expect(resultEntry.num_turns).toBe(2);
-      expect(resultEntry.usage).toEqual({ input_tokens: 500, output_tokens: 200 });
+      expect(resultEntry.data.numTurns).toBe(2);
+      expect(resultEntry.data.usage).toEqual({ input_tokens: 500, output_tokens: 200 });
     });
   });
 
@@ -188,14 +189,14 @@ describe("parse_pi_log.cjs", () => {
       expect(entries[0].message.content[0].is_error).toBe(true);
     });
 
-    it("should skip empty assistant content", () => {
+    it("should retain empty and whitespace-only assistant content", () => {
       const raw = [
         { type: "assistant", content: "", delta: false },
         { type: "assistant", content: "   ", delta: false },
       ];
       const entries = transformPiEntries(raw);
 
-      expect(entries).toHaveLength(0);
+      expect(entries.map(e => e.message.content[0].text)).toEqual(["", "   "]);
     });
 
     it("should ignore unknown event types", () => {
@@ -258,16 +259,16 @@ describe("parse_pi_log.cjs", () => {
 
       expect(result.markdown).toContain("Let me list the files.");
       expect(result.markdown).toContain("All done.");
-      expect(result.markdown).toContain("bash");
-      expect(result.markdown).toContain("gpt-5.4");
+      expect(result.markdown).toContain("`ls`");
+      expect(result.logEntries.find(e => e.type === "assistant.message").message.model).toBe("gpt-5.4");
       // The conversation must not be empty for a real v3 log.
       expect(result.markdown.length).toBeGreaterThan(0);
     });
 
     it("emits each tool_use before its paired tool_result in a v3 turn", () => {
       const entries = transformPiV3Entries(v3Lines);
-      const toolUseIdx = entries.findIndex(e => e.type === "assistant" && e.message.content[0].type === "tool_use" && e.message.content[0].id === "call_1");
-      const toolResultIdx = entries.findIndex(e => e.type === "user" && e.message.content[0].type === "tool_result" && e.message.content[0].tool_use_id === "call_1");
+      const toolUseIdx = entries.findIndex(e => e.type === "tool.execution_start" && e.data.toolCallId === "call_1");
+      const toolResultIdx = entries.findIndex(e => e.type === "tool.execution_complete" && e.data.toolCallId === "call_1");
 
       expect(toolUseIdx).toBeGreaterThanOrEqual(0);
       expect(toolResultIdx).toBeGreaterThan(toolUseIdx);
@@ -284,11 +285,11 @@ describe("parse_pi_log.cjs", () => {
 
     it("includes a normalized v3 result entry for OTEL enrichment", () => {
       const result = parsePiLog(v3Log);
-      const resultEntry = result.logEntries && result.logEntries.find(e => e.type === "result");
+      const resultEntry = result.logEntries && result.logEntries.find(e => e.type === "session.result");
 
       expect(resultEntry).toBeDefined();
-      expect(resultEntry.num_turns).toBe(2);
-      expect(resultEntry.usage).toEqual({ input_tokens: 2200, output_tokens: 55 });
+      expect(resultEntry.data.numTurns).toBe(2);
+      expect(resultEntry.data.usage).toEqual({ input_tokens: 2200, output_tokens: 55, total_tokens: 2255 });
     });
 
     it("marks failed tool results as errors", () => {
@@ -297,11 +298,62 @@ describe("parse_pi_log.cjs", () => {
         { type: "tool_execution_end", toolCallId: "t1", isError: true, result: { content: [{ type: "text", text: "boom" }] } },
         { type: "turn_end", message: { role: "assistant", model: "m", content: [{ type: "toolCall", id: "t1", name: "bash", arguments: {} }], usage: { input: 1, output: 1 } } },
       ]);
-      const toolResult = entries.find(e => e.type === "user" && e.message.content[0].type === "tool_result");
+      const toolResult = entries.find(e => e.type === "tool.execution_complete");
 
       expect(toolResult).toBeDefined();
-      expect(toolResult.message.content[0].is_error).toBe(true);
-      expect(toolResult.message.content[0].content).toContain("boom");
+      expect(toolResult.data.success).toBe(false);
+      expect(toolResult.data.output).toEqual({ content: [{ type: "text", text: "boom" }] });
+    });
+
+    it("surfaces a provider-level errorMessage from an empty-content turn_end (e.g. model_not_supported)", () => {
+      // Reproduces a real failed run: the provider request itself fails (HTTP 400), so
+      // turn_end carries content: [] with no assistant text or tool calls — the only trace
+      // of the failure is the top-level errorMessage on the turn_end message.
+      const failedTurnLines = [
+        { type: "session", version: 3, id: "s1" },
+        { type: "agent_start" },
+        { type: "turn_start" },
+        {
+          type: "turn_end",
+          message: {
+            role: "assistant",
+            model: "auto",
+            content: [],
+            stopReason: "error",
+            usage: { input: 0, output: 0 },
+            errorMessage: '400: {"message":"The requested model is not supported.","code":"model_not_supported","param":"model","type":"invalid_request_error"}',
+          },
+          toolResults: [],
+        },
+        { type: "agent_end", messages: [], willRetry: false },
+        { type: "agent_settled" },
+      ];
+      const failedLog = failedTurnLines.map(l => JSON.stringify(l)).join("\n");
+
+      const stats = computePiV3Stats(failedTurnLines);
+      expect(stats.errors).toEqual([expect.stringContaining("model_not_supported")]);
+
+      const result = parsePiLog(failedLog);
+      expect(result.markdown).toContain("model_not_supported");
+
+      const resultEntry = result.logEntries.find(e => e.type === "session.result");
+      expect(resultEntry.data.errors).toEqual([expect.stringContaining("model_not_supported")]);
+    });
+  });
+
+  describe("normalizePiToolName", () => {
+    it("maps lowercase bash to Bash", () => {
+      expect(normalizePiToolName("bash")).toBe("Bash");
+    });
+
+    it("maps uppercase and mixed-case bash variants to Bash", () => {
+      expect(normalizePiToolName("BASH")).toBe("Bash");
+      expect(normalizePiToolName("Bash")).toBe("Bash");
+    });
+
+    it("passes through non-bash tool names unchanged", () => {
+      expect(normalizePiToolName("str_replace_editor")).toBe("str_replace_editor");
+      expect(normalizePiToolName("read")).toBe("read");
     });
   });
 });

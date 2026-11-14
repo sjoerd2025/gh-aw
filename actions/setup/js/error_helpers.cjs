@@ -13,6 +13,18 @@ function isHtmlContent(str) {
 }
 
 /**
+ * Extract a structured HTTP status without parsing diagnostic text.
+ * @param {unknown} error - The error value to inspect
+ * @returns {number | undefined} The HTTP status, when available
+ */
+function getErrorStatus(error) {
+  // prettier-ignore
+  const errorAsAny = /** @type {any} */ (error);
+  const status = errorAsAny?.status ?? errorAsAny?.response?.status;
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+}
+
+/**
  * Safely extract an error message from an unknown error value.
  * Handles Error instances, objects with message properties, and other values.
  *
@@ -29,8 +41,8 @@ function getErrorMessage(error) {
   let message;
   if (error instanceof Error) {
     message = error.message;
-  } else if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
-    message = error.message;
+  } else if (error && typeof error === "object" && "message" in error) {
+    message = typeof error.message === "string" ? error.message : String(error.message);
   } else {
     message = String(error);
   }
@@ -38,6 +50,15 @@ function getErrorMessage(error) {
   if (isHtmlContent(message)) {
     const status = errorAsAny != null && typeof errorAsAny.status === "number" ? errorAsAny.status : null;
     return status != null ? `GitHub returned an unexpected HTML response (HTTP ${status})` : "GitHub returned an unexpected HTML response";
+  }
+
+  if (!message.trim()) {
+    const status = getErrorStatus(error);
+    const requestId = errorAsAny?.response?.headers?.["x-github-request-id"];
+    const context = [];
+    if (status != null) context.push(`HTTP ${status}`);
+    if (typeof requestId === "string" && /^[A-Za-z0-9:-]{1,128}$/.test(requestId)) context.push(`request ID ${requestId}`);
+    return context.length ? `GitHub API request failed (${context.join("; ")})` : "Unknown error";
   }
 
   return message;
@@ -80,4 +101,16 @@ function isRateLimitError(error) {
   return /\bapi rate limit\b|\brate limit exceeded\b/i.test(errorMessage);
 }
 
-module.exports = { getErrorMessage, isHtmlContent, isLockedError, isRateLimitError };
+/**
+ * Check for an Undici connection timeout by code or message.
+ * @param {unknown} error - The error value to check
+ * @returns {boolean} True if the error is a connection timeout
+ */
+function isConnectTimeoutError(error) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  return ("code" in error && error.code === "UND_ERR_CONNECT_TIMEOUT") || ("message" in error && error.message === "Connect Timeout Error");
+}
+
+module.exports = { getErrorMessage, getErrorStatus, isHtmlContent, isLockedError, isRateLimitError, isConnectTimeoutError };

@@ -71,6 +71,20 @@ func extractAPITargetHost(workflowData *WorkflowData, envVar string) string {
 	return host
 }
 
+// extractAPIProxyTargetHost returns the target host format expected by the
+// effective AWF version, preserving an explicit http:// scheme when supported.
+func extractAPIProxyTargetHost(workflowData *WorkflowData, envVar string, firewallConfig *FirewallConfig) string {
+	host := extractAPITargetHost(workflowData, envVar)
+	if host == "" || !awfSupportsHTTPAPITargets(firewallConfig) {
+		return host
+	}
+
+	if strings.HasPrefix(workflowData.EngineConfig.Env[envVar], "http://") {
+		return "http://" + host
+	}
+	return host
+}
+
 // extractAPIBasePath extracts the path component from a custom API base URL in engine.env.
 // Returns the path prefix (e.g., "/serving-endpoints") or empty string if no path is present.
 // Root-only paths ("/") and empty paths return empty string.
@@ -115,7 +129,7 @@ func extractAPIBasePath(workflowData *WorkflowData, envVar string) string {
 // extractAPITargetAuthHeader extracts the authHeader value from the sandbox.agent.targets
 // frontmatter section for a given provider (e.g. "openai" or "anthropic"). It reads:
 //
-//	sandbox.agent.targets.<provider>.authHeader
+//	sandbox.agent.targets.<provider>.auth-header
 //
 // Returns the header name string (e.g. "api-key") or empty string if not configured.
 func extractAPITargetAuthHeader(workflowData *WorkflowData, provider string) string {
@@ -149,15 +163,19 @@ func extractCopilotTargetConfig(workflowData *WorkflowData) *AgentAPIProxyTarget
 // GetCopilotAPITarget returns the effective Copilot API target hostname, checking in order:
 //  1. engine.api-target (explicit, takes precedence)
 //  2. GITHUB_COPILOT_BASE_URL in engine.env (implicit, derived from the configured Copilot base URL)
+//  3. COPILOT_PROVIDER_BASE_URL in engine.env when it is a literal URL (BYOK self-hosted target)
 //
 // This mirrors the pattern used by other engines:
 //   - Codex:    OPENAI_BASE_URL     → --openai-api-target
 //   - Claude:   ANTHROPIC_BASE_URL  → --anthropic-api-target
 //   - Copilot:  GITHUB_COPILOT_BASE_URL → --copilot-api-target (fallback when api-target not set)
-//   - Antigravity:   ANTIGRAVITY_API_BASE_URL → --antigravity-api-target (default: generativelanguage.googleapis.com)
 //
-// Returns empty string if neither source is configured.
+// Returns empty string if no usable source is configured.
 func GetCopilotAPITarget(workflowData *WorkflowData) string {
+	return resolveCopilotAPITarget(workflowData, false)
+}
+
+func resolveCopilotAPITarget(workflowData *WorkflowData, preserveProviderHTTP bool) string {
 	awfHelpersLog.Print("Getting Copilot API target")
 	// Explicit engine.api-target takes precedence.
 	if workflowData != nil && workflowData.EngineConfig != nil && workflowData.EngineConfig.APITarget != "" {
@@ -167,7 +185,40 @@ func GetCopilotAPITarget(workflowData *WorkflowData) string {
 
 	// Fallback: derive from the well-known GITHUB_COPILOT_BASE_URL env var.
 	awfHelpersLog.Print("No explicit api-target, deriving Copilot API target from GITHUB_COPILOT_BASE_URL")
-	return extractAPITargetHost(workflowData, "GITHUB_COPILOT_BASE_URL")
+	if target := extractAPITargetHost(workflowData, "GITHUB_COPILOT_BASE_URL"); target != "" {
+		return target
+	}
+
+	// Final fallback: derive from a literal BYOK provider URL so AWF's api-proxy preserves
+	// non-default hosts and ports for self-hosted OpenAI-compatible backends such as Ollama.
+	awfHelpersLog.Print("No GITHUB_COPILOT_BASE_URL, deriving Copilot API target from literal COPILOT_PROVIDER_BASE_URL")
+	target := extractLiteralEngineEnvHost(workflowData, constants.CopilotProviderBaseURL)
+	if target == "" {
+		return ""
+	}
+	if preserveProviderHTTP && strings.HasPrefix(workflowData.EngineConfig.Env[constants.CopilotProviderBaseURL], "http://") {
+		return "http://" + target
+	}
+	return target
+}
+
+// isCopilotBYOKMode returns true when Copilot execution is configured to use BYOK routing.
+// BYOK mode is active when either:
+//   - a non-GitHub model-provider gateway is in use (only when sandbox/firewall is enabled), or
+//   - COPILOT_PROVIDER_BASE_URL is present in engine.env with a non-empty value.
+//
+// Note that this intentionally checks whether BYOK routing is configured, not whether
+// a literal hostname can be extracted. Literal host extraction is handled separately by
+// GetCopilotAPITarget().
+func isCopilotBYOKMode(workflowData *WorkflowData, sandboxEnabled bool) bool {
+	providerOverrideBYOK := resolveEngineLLMProvider(workflowData, LLMProviderGitHub) != LLMProviderGitHub && sandboxEnabled
+	return providerOverrideBYOK || engineEnvHasNonEmptyValue(workflowData, constants.CopilotProviderBaseURL)
+}
+
+// isCopilotCustomConfig returns true when Copilot is configured away from the default
+// GitHub-hosted setup via BYOK routing and/or explicit Copilot API target overrides.
+func isCopilotCustomConfig(workflowData *WorkflowData) bool {
+	return isCopilotBYOKMode(workflowData, isFirewallEnabled(workflowData)) || GetCopilotAPITarget(workflowData) != ""
 }
 
 func extractLiteralEngineEnvHost(workflowData *WorkflowData, envVar string) string {
@@ -216,44 +267,10 @@ func GetCopilotAllowlistTargets(workflowData *WorkflowData) []string {
 	return targets
 }
 
-// DefaultAntigravityAPITarget is the default Antigravity API endpoint hostname.
-// AWF's proxy sidecar needs this target to forward Antigravity API requests, since
-// unlike OpenAI/Anthropic/Copilot, the proxy has no built-in default handler for Antigravity.
-const DefaultAntigravityAPITarget = "generativelanguage.googleapis.com"
-
 // DefaultGeminiAPITarget is the default Gemini API endpoint hostname.
-// Deprecated: Use DefaultAntigravityAPITarget. This constant is kept for backward compatibility.
-const DefaultGeminiAPITarget = DefaultAntigravityAPITarget
-
-// GetAntigravityAPITarget returns the effective Antigravity API target hostname for the LLM gateway proxy.
-// Unlike other engines where AWF has built-in default routing, Antigravity requires an explicit target.
-//
-// Resolution order:
-//  1. ANTIGRAVITY_API_BASE_URL in engine.env (custom endpoint)
-//  2. Default: generativelanguage.googleapis.com (when engine is "antigravity")
-//
-// Returns empty string if the engine is not Antigravity and no custom ANTIGRAVITY_API_BASE_URL is configured.
-func GetAntigravityAPITarget(workflowData *WorkflowData, engineName string) string {
-	awfHelpersLog.Printf("Getting Antigravity API target for engine: %s", engineName)
-	// Check for custom ANTIGRAVITY_API_BASE_URL in engine.env
-	if customTarget := extractAPITargetHost(workflowData, "ANTIGRAVITY_API_BASE_URL"); customTarget != "" {
-		awfHelpersLog.Printf("Using custom Antigravity API target from ANTIGRAVITY_API_BASE_URL: %s", customTarget)
-		return customTarget
-	}
-
-	// Default to the standard Antigravity API endpoint when engine is Antigravity
-	if engineName == "antigravity" {
-		awfHelpersLog.Printf("Using default Antigravity API target: %s", DefaultAntigravityAPITarget)
-		return DefaultAntigravityAPITarget
-	}
-
-	awfHelpersLog.Print("No Antigravity API target configured (engine is not antigravity and no custom URL)")
-	return ""
-}
+const DefaultGeminiAPITarget = "generativelanguage.googleapis.com"
 
 // GetGeminiAPITarget returns the effective Gemini API target hostname for the LLM gateway proxy.
-// Deprecated: Use GetAntigravityAPITarget for new Antigravity engine workflows.
-// This function is retained for backward compatibility with existing Gemini engine workflows.
 //
 // Resolution order:
 //  1. GEMINI_API_BASE_URL in engine.env (custom endpoint)
@@ -262,6 +279,11 @@ func GetAntigravityAPITarget(workflowData *WorkflowData, engineName string) stri
 // Returns empty string if the engine is not Gemini and no custom GEMINI_API_BASE_URL is configured.
 func GetGeminiAPITarget(workflowData *WorkflowData, engineName string) string {
 	awfHelpersLog.Printf("Getting Gemini API target for engine: %s", engineName)
+	if engineName == string(constants.AgyEngine) {
+		if customTarget := extractAPITargetHost(workflowData, "GOOGLE_GEMINI_BASE_URL"); customTarget != "" {
+			return customTarget
+		}
+	}
 	// Check for custom GEMINI_API_BASE_URL in engine.env
 	if customTarget := extractAPITargetHost(workflowData, "GEMINI_API_BASE_URL"); customTarget != "" {
 		awfHelpersLog.Printf("Using custom Gemini API target from GEMINI_API_BASE_URL: %s", customTarget)
@@ -269,7 +291,7 @@ func GetGeminiAPITarget(workflowData *WorkflowData, engineName string) string {
 	}
 
 	// Default to the standard Gemini API endpoint when engine is Gemini
-	if engineName == "gemini" {
+	if engineName == "gemini" || engineName == string(constants.AgyEngine) {
 		awfHelpersLog.Printf("Using default Gemini API target: %s", DefaultGeminiAPITarget)
 		return DefaultGeminiAPITarget
 	}
@@ -297,7 +319,14 @@ func getEngineAPIHosts(data *WorkflowData, engine CodingAgentEngine) []string {
 		return []string{data.EngineConfig.APITarget}
 	}
 
-	switch engine.(type) {
+	switch typedEngine := engine.(type) {
+	case *BehaviorDefinedEngine:
+		if typedEngine.behavior().SecretStrategy == behaviorSecretStrategyGeminiAPIKey {
+			return []string{GetGeminiAPITarget(data, engine.GetID())}
+		}
+		// Preserve unknown-host behavior for other strategies: declarative network
+		// defaults include installation/infrastructure hosts, not just inference.
+		return nil
 	case *CopilotEngine:
 		// Return the full set of known Copilot inference endpoints so that any variant
 		// (enterprise, business, individual, or the routing hub) is covered.
@@ -308,13 +337,27 @@ func getEngineAPIHosts(data *WorkflowData, engine CodingAgentEngine) []string {
 			"api.individual.githubcopilot.com",
 		}
 	case *ClaudeEngine:
+		if NewClaudeEngine().ResolveLLMProvider(data) == LLMProviderGitHub {
+			return getEngineAPIHosts(data, NewCopilotEngine())
+		}
 		return []string{"api.anthropic.com"}
 	case *CodexEngine:
+		if NewCodexEngine().ResolveLLMProvider(data) == LLMProviderGitHub {
+			return []string{
+				"api.enterprise.githubcopilot.com",
+				"api.githubcopilot.com",
+				"api.business.githubcopilot.com",
+				"api.individual.githubcopilot.com",
+			}
+		}
+		if target := extractAPITargetHost(data, "OPENAI_BASE_URL"); target != "" {
+			return []string{target}
+		}
 		return []string{"api.openai.com"}
 	case *GeminiEngine:
 		return []string{DefaultGeminiAPITarget}
-	case *AntigravityEngine:
-		return []string{DefaultAntigravityAPITarget}
+	case *AgyEngine:
+		return []string{GetGeminiAPITarget(data, engine.GetID())}
 	default:
 		// Custom or unknown engine — no known API hosts without explicit api-target.
 		return nil

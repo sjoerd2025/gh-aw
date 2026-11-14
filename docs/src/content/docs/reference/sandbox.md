@@ -22,9 +22,9 @@ Configure the coding agent sandbox type to control how the AI engine is isolated
 sandbox:
   agent: awf
 
-# Disable coding agent sandbox - requires an operator-authored justification
+# Disable coding agent sandbox - requires an explicit feature flag
 features:
-  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+  dangerously-disable-sandbox-agent: true
 sandbox:
   agent: false
 
@@ -37,23 +37,46 @@ If `sandbox` is not specified in your workflow, it defaults to `sandbox.agent: a
 
 **Disabling Coding Agent Sandbox**
 
-Setting `sandbox.agent: false` disables the agent firewall while keeping the MCP gateway enabled. This removes a trust boundary and should only be used when strictly necessary.
+Setting `sandbox.agent: false` disables the agent firewall while keeping the MCP gateway enabled. This removes a trust boundary and is only supported when `strict: false`.
 
-To disable the agent sandbox, you **must** add `features.dangerously-disable-sandbox-agent` with a literal justification string of at least 20 characters. The justification must explain why the trust boundary is being removed and is stored for diagnostics and audit. The following values are rejected by the compiler:
-
-- Boolean `true` — no longer accepted as a legacy shorthand
-- Expressions such as `${{ inputs.reason }}` — must be a static literal
-- Strings shorter than 20 characters after trimming whitespace
+To disable the agent sandbox, you **must** set `features.dangerously-disable-sandbox-agent: true`. Missing, false, and non-boolean values are rejected by the compiler.
 
 ```yaml wrap
 features:
-  dangerously-disable-sandbox-agent: "controlled environment with no internet access"
+  dangerously-disable-sandbox-agent: true
 sandbox:
   agent: false
+strict: false
 ```
 
 > [!WARNING]
-> Disabling the agent sandbox removes a security trust boundary. The `dangerously-disable-sandbox-agent` value is a permanent, reviewable record of why this workflow runs without the agent firewall. Write a reason that will be meaningful to future reviewers.
+> Disabling the agent sandbox removes a security trust boundary and is always rejected in strict mode. Only use this opt-out in controlled environments where the agent can be trusted with direct network access.
+
+### Runtime Profiles
+
+`sandbox.agent.runtime` is the single selector for the sandbox security and topology profile. Each value resolves to one supported combination of container runtime, AWF privileges, and host access:
+
+| Runtime | Effective behavior |
+| --- | --- |
+| `docker` (default) | Default Docker runtime, rootless AWF, network isolation |
+| `docker-sudo-iptables` | Docker with privileged AWF, legacy `iptables` networking, and host/service access |
+| `cloud-hypervisor` | Preview KVM runtime with its required privileged launcher |
+| `nvx` | Fail-closed preview NVX one-shot microVM; requires explicit configuration and a Linux x86_64 KVM host |
+
+Omitting `runtime` is equivalent to `runtime: docker`, which keeps the secure default.
+
+Privileged profiles invoke the system-installed AWF binary and preserve exported runner variables by name, including on `sudo-rs` hosts that ignore `sudo -E`. AWF's agent credential exclusions still apply; preserving the launcher environment does not grant those credentials to the agent.
+
+The `nvx` runtime never falls back to another runtime. It requires a workload-specific guest layer, the AWF release's provenance bundle and manifest, and all three security opt-ins. The compiler checks the host and verifies the offline attestation before starting AWF. See [Agent Runtime Selection](/gh-aw/reference/agent-runtimes/#nvx-preview) for the complete configuration and compatibility requirements.
+
+```yaml wrap
+sandbox:
+  agent:
+    runtime: docker-sudo-iptables
+    allow-host-ports: [9000]
+```
+
+The compiler derives every privilege the selected runtime needs. Unsupported combinations, such as `allow-host-ports` outside `docker-sudo-iptables`, fail at compile time. See [Agent Runtimes](/gh-aw/reference/agent-runtimes/) for runner prerequisites.
 
 ### MCP Gateway (Experimental)
 
@@ -66,7 +89,7 @@ features:
 sandbox:
   mcp:
     port: 8080
-    api-key: "${{ secrets.MCP_GATEWAY_API_KEY }}"
+    agent-id: "${{ secrets.MCP_GATEWAY_AGENT_ID }}"
 ```
 
 ### Combined Configuration
@@ -101,6 +124,12 @@ network:
     - "api.example.com"
 ```
 
+#### Custom CA certificate for the API proxy
+
+Set `sandbox.agent.ca-cert` to a host path containing a PEM CA certificate to trust it when verifying upstream TLS connections through AWF's API proxy. The file is bind-mounted read-only into the API proxy sidecar. This setting requires AWF v0.28.10 or later.
+
+This setting applies to the agent job. The detection job runs separately; see [Private CA certificates in Threat detection](/gh-aw/reference/threat-detection/#private-ca-certificates) for its CA inheritance and provisioning behavior.
+
 #### Filesystem Access
 
 AWF makes the host filesystem visible inside the container with appropriate permissions:
@@ -117,6 +146,33 @@ All host binaries are available without explicit mounts: system utilities, `gh`,
 
 > [!WARNING]
 > Docker socket is hidden for security. Agents cannot spawn containers.
+
+#### Host Service Ports (`services:`)
+
+The AWF sandbox reaches GitHub Actions `services:` containers through `--allow-host-service-ports`, which resolves each service's actual (possibly dynamically assigned) host port at runtime. This mechanism, and the explicit `allow-host-ports` escape hatch below, both require `sandbox.agent.runtime: docker-sudo-iptables`: the default (strict) runtime profile does not provide a route to host services, even when host-access flags are combined.
+
+```yaml wrap
+sandbox:
+  agent:
+    runtime: docker-sudo-iptables
+
+services:
+  postgres:
+    image: postgres:18
+    ports:
+      - 5432:5432
+```
+
+For host daemons that are not declared in `services:`, add an explicit allowlist (also `docker-sudo-iptables` only):
+
+```yaml wrap
+sandbox:
+  agent:
+    runtime: docker-sudo-iptables
+    allow-host-ports: [9000]
+```
+
+Use `allow-host-ports` only for ports that cannot be represented by `services:`. The compiler rejects values outside the TCP port range `1` through `65535`, and rejects ports AWF always blocks as dangerous (e.g. `22`, `3306`, `5432`, `6379`, `9200`) — reach those through `services:` instead.
 
 #### Environment Variables
 
@@ -145,6 +201,107 @@ jobs:
 Use `go build` or `python3` - both are available.
 ```
 
+#### Memory Limit (`sandbox.agent.memory`)
+
+By default, AWF uses its own built-in memory limit for the agent container. Set `sandbox.agent.memory` to override this limit on large-memory runners:
+
+```yaml wrap
+sandbox:
+  agent:
+    memory: 8g
+```
+
+Valid values are a positive integer followed by a unit: `b`, `k`, `m`, or `g` (case-insensitive). Examples: `512m`, `4g`, `8g`, `1024m`.
+
+When omitted, AWF's own default memory limit applies. Specifying an invalid format (e.g., `48gb` or `48`) is rejected at compile time.
+
+> [!NOTE]
+> Exit code 137 means the process received `SIGKILL`. A memory limit can be one cause, but verify with logs before changing `memory`. If you increase `memory`, leave headroom for the runner OS and other processes.
+
+#### Release integrity (`sandbox.agent.checksums-sha256`)
+
+To download an AWF version not covered by the setup action's built-in pins, set its version and checksum-manifest digest together:
+
+```yaml wrap
+sandbox:
+  agent:
+    version: v0.28.62
+    checksums-sha256: "0b03f6ea5b638356a799fa541ade4fd7902a6ac8d7c3f0252ee09d8259a4ce8f"
+```
+
+The example pins v0.28.62; change both fields for another release. `checksums-sha256` authenticates the release's **`checksums.txt` manifest**, which supplies digests for the Node bundle and platform binaries. It is not an individual binary or container-image digest.
+
+The value must contain exactly 64 lowercase hexadecimal characters from an independently trusted channel. The version must be a literal semantic release tag, with an optional `v` prefix. Missing versions, `latest`, expressions, disabled sandboxes, and custom `command` installers are rejected when a pin is supplied. Without a supplied pin, only releases covered by the setup action's built-in pins can be downloaded.
+
+The version and pin propagate to AWF installations in agent, threat-detection, and eval jobs. A mismatch fails installation before execution; a bundle integrity failure cannot fall back to a binary. Container-image pins and guest attestations remain separate controls. For the Copilot CLI, use [`engine.checksums-sha256`](/gh-aw/reference/engines/copilot/#copilot-release-checksum-pins).
+
+#### Model fallback (`sandbox.agent.model-fallback`)
+
+AWF's API proxy resolves unrecognized model selections against its built-in model catalog and may rewrite them. Set `model-fallback: false` to pass the configured model through to the provider verbatim:
+
+```yaml wrap
+sandbox:
+  agent:
+    model-fallback: false
+```
+
+This is required for providers whose model identifiers are not in the built-in catalog (BYOK Azure OpenAI deployment names, self-hosted routers), where rewriting causes HTTP 404 `model_not_found`. When an [`OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` custom endpoint](/gh-aw/reference/engines/#custom-api-endpoints-via-environment-variables) is configured in `engine.env`, model fallback is disabled automatically; set this field explicitly to override that default.
+
+#### Token steering (`sandbox.agent.token-steering`)
+
+This setting controls AWF's budget notices, which warn the agent when the run's AI credits or time are nearly spent. Notices are on by default; steering never changes the provider or model. To turn the notices off for a workflow:
+
+```yaml wrap
+sandbox:
+  agent:
+    token-steering: false
+```
+
+With notices on, AWF adds a notice to the next eligible model request after the run crosses 80, 90, 95 or 99% of its AI-credit budget or its runtime deadline. With AWF releases after v0.29.11, each conversation in the run, sub-agents included, gets the latest notice once rather than every notice: if several thresholds pass before its next request, only the newest is sent. The notice states how much budget or time is left, then says what to do, and a further notice comes when about five requests' worth of credits, or about five minutes, remain. On those releases, notices stay on when [`max-ai-credits: -1`](/gh-aw/reference/frontmatter/#ai-credits-guardrail-max-ai-credits) removes the budget, unless `token-steering: false` is set: time notices use the agent deadline and credit notices use AWF's hard cap. The hard cap is 10,000 AI credits by default; the runner operator can change it with `AWF_AI_CREDITS_HARD_CAP` (gh-aw does not set it), and AWF clamps any larger budget to it. Up to AWF v0.29.11, notices are on only when gh-aw enables them in the AWF config, which it does for every workflow with a credit budget. This setting does not apply to threat-detection runs, whose notices always follow these defaults.
+
+Runtime notices need an agent deadline, which gh-aw sends with AWF v0.28.51 or newer on runtimes other than Cloud Hypervisor and NVX:
+
+- **Literal `timeout-minutes`** (for example `timeout-minutes: 30`): the AWF config gets `container.agentTimeout` set to that value.
+- **Expression timeout**, including the default that workflows without `timeout-minutes` compile to (`${{ fromJSON(vars.GH_AW_DEFAULT_TIMEOUT_MINUTES || '20') }}`): the agent step gets the step timeout in `GH_AW_ENGINE_STEP_TIMEOUT_MINUTES`, and `awf` receives it at run time as `--agent-timeout`. The AWF config has no `agentTimeout`.
+- **AWF older than v0.28.51**: neither is emitted, so no runtime notices are sent. Cloud Hypervisor and NVX keep their existing `container.agentTimeout` on every AWF version.
+
+The deadline is never shorter than the agent step timeout, and AWF counts it from agent start, after the step has started. The GitHub Actions step timeout therefore fires before AWF's deadline (AWF exit code 124), so a notice whose next eligible model request would come after the step timeout is never delivered. The threat-detection run uses its own job timeout. Delivered notices are listed in `gh aw audit` and `gh aw logs --json` (see [Artifacts](/gh-aw/reference/artifacts/)); when the unified session cannot be read, these outputs report `steering_notices_unavailable: true` instead of an empty list.
+
+#### Custom infrastructure images (`sandbox.agent.images`)
+
+Self-hosted and air-gapped deployments can mirror, scan, approve, and preload every privileged image AWF launches. Set `sandbox.agent.images` to select digest-pinned replacements for AWF's infrastructure images (requires AWF v0.28.4 or newer):
+
+```yaml wrap
+sandbox:
+  agent:
+    version: v0.28.4
+    images:
+      squid: registry.example.com/approved/squid:v0.28.4@sha256:<64-hex-digest>
+      agent: registry.example.com/approved/agent:v0.28.4@sha256:<64-hex-digest>
+      api-proxy: registry.example.com/approved/api-proxy:v0.28.4@sha256:<64-hex-digest>
+```
+
+The compiler emits the manifest as `container.images` in the generated AWF configuration.
+
+Supported image roles: `squid`, `agent`, `api-proxy`, `router`, `cli-proxy`, `build-tools`, `doh-proxy`, `enclave-script`, `enclave-agent`, `enclave-mcp-server`, and `dind-staging`.
+
+Rules enforced at compile time:
+
+- Every value must be a literal, registry-qualified reference with both a tag and an immutable digest: `registry/repository:tag@sha256:<64 lowercase hex characters>`. Expressions (`${{ ... }}`), environment interpolation, and any other dynamic value are rejected, so no runtime input can influence an infrastructure image.
+- Unknown roles are rejected.
+- The manifest must cover every role required by the enabled features: `squid`, `agent`, and `api-proxy` are always required; `router` is required when [`engine.model-routing`](/gh-aw/reference/model-routing/) is set; `cli-proxy` is required with [`tools.github.mode: gh-proxy`](/gh-aw/reference/tools/), the `integrity-reactions` feature, or raw `--difc-proxy-host` AWF arguments; `build-tools` is required with [`runner.topology: arc-dind`](/gh-aw/reference/self-hosted-runners/); `doh-proxy` is required when legacy-security raw AWF arguments enable `--dns-over-https`; `dind-staging` is required when raw AWF arguments enable `--dind-pre-stage-dirs`, `--dind-stage-engine-binary-path`, or `--dind-stage-engine-binary-target-path`; `enclave-script` and `enclave-agent` are required for their corresponding [enclave](/gh-aw/experimental/enclaves/) executors, and `enclave-mcp-server` is required whenever any enclave is enabled. AWF fails closed rather than falling back to a default, so an incomplete manifest is a compile error.
+- The manifest cannot be combined with controls that select a different effective image: SSL bump, per-enclave `image` overrides, and AWF arguments such as `--image-tag`, `--image-registry`, `--agent-image`, `--build-local`, `--sysroot-image`, and `--dind-staging-image`. The compiler-owned `container.imageTag` is suppressed when the manifest is set.
+
+Omit the field to keep AWF's default role references and gh-aw's existing digest-pin resolution.
+
+> [!NOTE]
+> AWF does not accept registry credentials in configuration. The Docker daemon on the runner must already be authenticated to the registry hosting these images.
+
+> [!NOTE]
+> Repository-level `.github/workflows/aw.json` `container_pins` mappings already participate in AWF predownload and lock metadata by redirecting AWF's default references. They do not configure the role references AWF resolves at runtime. `sandbox.agent.images` is the authoritative per-workflow runtime manifest and matching predownload set.
+>
+> `container_pins` never redirects an AWF role supplied by `sandbox.agent.images`: each manifest reference is already a complete, digest-pinned literal, so gh-aw pre-pulls and records it in lock metadata unchanged. Mappings continue to transform non-AWF workflow containers, and they continue to transform default AWF predownload references when `sandbox.agent.images` is omitted.
+
 #### Copilot BYOK request customization (`sandbox.agent.targets.copilot`)
 
 When routing Copilot through a BYOK-compatible upstream behind the AWF proxy, you can attach custom headers, extra request body fields, and an explicit session identifier on upstream requests:
@@ -154,37 +311,24 @@ sandbox:
   agent:
     targets:
       copilot:
-        extraHeaders:
+        extra-headers:
           x-openrouter-title: my-workflow
           http-referer: https://github.com/${{ github.repository }}
-        extraBodyFields:
+        extra-body-fields:
           custom-field: custom-value
-        sessionId: ${{ github.run_id }}
+        session-id: ${{ github.run_id }}
 ```
 
-Use this for OpenAI-compatible proxies and gateways that expect additional request metadata. `sessionId` is opt-in only; gh-aw does not derive it automatically.
+Use this for OpenAI-compatible proxies and gateways that expect additional request metadata. `session-id` is opt-in only; gh-aw does not derive it automatically.
 
 > [!NOTE]
-> Set `sessionId` only when your upstream expects a session identifier. Some strict OpenAI-compatible providers reject unknown `session_id` fields, so automatic injection would be unsafe.
+> Set `session-id` only when your upstream expects a session identifier. Some strict OpenAI-compatible providers reject unknown `session_id` fields, so automatic injection would be unsafe.
 
 #### Go cache paths in AWF (`GOMODCACHE` / `GOCACHE`)
 
-When using `actions/setup-go` in AWF, pin Go cache paths explicitly so restore behavior is predictable:
+Runner-home cache directories may not be writable inside AWF. Set `GOMODCACHE` and `GOCACHE` to explicit writable paths in workflow-level `env` or `engine.env`, and make the cache's `path` match. Environment variables written to `$GITHUB_ENV` in a custom setup job do not carry over to the agent job.
 
-```yaml wrap
-jobs:
-  setup:
-    steps:
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-          cache: false
-      - run: |
-          echo "GOMODCACHE=$HOME/go/pkg/mod" >> "$GITHUB_ENV"
-          echo "GOCACHE=$HOME/.cache/go-build" >> "$GITHUB_ENV"
-```
-
-Then cache those paths via top-level `cache:` (see [Frontmatter cache configuration](/gh-aw/reference/frontmatter/)). Keep cache keys scoped to trusted contexts and avoid sharing writeable keys between untrusted and protected runs.
+See [Go cache configuration](/gh-aw/reference/faq/#how-should-i-configure-go-caches-safely-in-agentic-workflows) for separate module and build caches, checksum verification, trust scopes, and a pre-build artifact handoff.
 
 ## MCP Gateway
 
@@ -367,7 +511,7 @@ jobs:
 Review the failing tests and apply a fix. Build artifacts are pre-cached.
 ```
 
-## Related Documentation
+## Learn More
 
 - [Network Permissions](/gh-aw/reference/network/) - Configure network access controls
 - [AI Engines](/gh-aw/reference/engines/) - Engine-specific configuration

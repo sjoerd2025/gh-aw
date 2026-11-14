@@ -25,6 +25,7 @@ const HANDLER_TYPE = "replace_label";
 const { matchesSimpleGlob } = require("./glob_pattern_helpers.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
+const { hardenUnicodeText } = require("./sanitize_content_core.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { resolveSafeOutputIssueTarget } = require("./temporary_id.cjs");
@@ -32,6 +33,18 @@ const { attachExecutionState, fetchIssueState, normalizeLabelNames } = require("
 const { createCountGatedHandler } = require("./handler_scaffold.cjs");
 const { withRetry, RATE_LIMIT_RETRY_CONFIG } = require("./error_recovery.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
+const { resolveTarget } = require("./safe_output_helpers.cjs");
+
+const POLICY_REJECTION_ERROR_NAME = "ReplaceLabelPolicyRejectionError";
+const SET_LABELS_RETRY_CONFIG = {
+  ...RATE_LIMIT_RETRY_CONFIG,
+  shouldRetry: error => {
+    const status = error?.response?.status ?? error?.status ?? null;
+    const retryableHttpStatus = typeof status === "number" && status >= 500 && status < 600;
+    const retryableTransportError = status == null && RATE_LIMIT_RETRY_CONFIG.shouldRetry(error);
+    return error?.name !== POLICY_REJECTION_ERROR_NAME && (retryableHttpStatus || retryableTransportError || RATE_LIMIT_RETRY_CONFIG.shouldRetry(error));
+  },
+};
 
 /**
  * Validate a single label against blocked and allowed-list patterns.
@@ -45,8 +58,18 @@ const { resolveInvocationContext } = require("./invocation_context_helpers.cjs")
  * @returns {{valid: true} | {valid: false, error: string}}
  */
 function validateSingleLabel(labelName, allowedPatterns, blockedPatterns, fieldName) {
+  const normalizedLabelName = hardenUnicodeText(labelName);
   if (blockedPatterns.length > 0) {
-    const isBlocked = blockedPatterns.some(pattern => matchesSimpleGlob(labelName, pattern));
+    const isBlocked = blockedPatterns.some(pattern => {
+      if (matchesSimpleGlob(labelName, pattern)) return true;
+      // Only asterisks present in the original pattern are glob operators.
+      const normalizedPattern = pattern
+        .split("*")
+        .map(part => hardenUnicodeText(part).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join(".*");
+      // eslint-disable-next-line gh-aw-custom/require-escaped-regexp-interpolation -- literal fragments are escaped before joining the original wildcard operators
+      return !!normalizedLabelName && !!normalizedPattern && new RegExp(`^${normalizedPattern}$`, "i").test(normalizedLabelName);
+    });
     if (isBlocked) {
       return { valid: false, error: `${fieldName} "${labelName}" matches a blocked pattern` };
     }
@@ -68,23 +91,27 @@ function validateSingleLabel(labelName, allowedPatterns, blockedPatterns, fieldN
 const main = createCountGatedHandler({
   handlerType: HANDLER_TYPE,
   setup: async (config, maxCount, isStaged) => {
-    const blockedPatterns = config.blocked || [];
+    const target = config.target || "triggering";
+    const currentAllowedAdd = () => (Array.isArray(config.allowed_add) ? config.allowed_add : []);
+    const currentAllowedRemove = () => (Array.isArray(config.allowed_remove) ? config.allowed_remove : []);
+    const currentBlockedPatterns = () => (Array.isArray(config.blocked) ? config.blocked : []);
     const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
     const requiredTitlePrefix = config.required_title_prefix || "";
     const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
     const githubClient = await createAuthenticatedGitHubClient(config);
 
     // Config keys use snake_case (set by the Go handler config builder)
-    const configAllowedAdd = Array.isArray(config.allowed_add) ? config.allowed_add : [];
-    const configAllowedRemove = Array.isArray(config.allowed_remove) ? config.allowed_remove : [];
+    const initialAllowedAdd = currentAllowedAdd();
+    const initialAllowedRemove = currentAllowedRemove();
+    const initialBlockedPatterns = currentBlockedPatterns();
     /** @type {{from: string, to: string}[]} */
     const configAllowedTransitions = Array.isArray(config.allowed_transitions) ? config.allowed_transitions : [];
 
     core.info(`Replace label configuration: max=${maxCount}`);
     if (configAllowedTransitions.length > 0) core.info(`Allowed transitions: ${configAllowedTransitions.map(t => `"${t.from}" → "${t.to}"`).join(", ")}`);
-    if (configAllowedAdd.length > 0) core.info(`Allowed labels to add: ${configAllowedAdd.join(", ")}`);
-    if (configAllowedRemove.length > 0) core.info(`Allowed labels to remove: ${configAllowedRemove.join(", ")}`);
-    if (blockedPatterns.length > 0) core.info(`Blocked patterns: ${blockedPatterns.join(", ")}`);
+    if (initialAllowedAdd.length > 0) core.info(`Allowed labels to add: ${initialAllowedAdd.join(", ")}`);
+    if (initialAllowedRemove.length > 0) core.info(`Allowed labels to remove: ${initialAllowedRemove.join(", ")}`);
+    if (initialBlockedPatterns.length > 0) core.info(`Blocked patterns: ${initialBlockedPatterns.join(", ")}`);
     if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
     if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
     core.info(`Default target repo: ${defaultTargetRepo}`);
@@ -106,19 +133,40 @@ const main = createCountGatedHandler({
       const { repo: itemRepo, repoParts } = repoResult;
       core.info(`Target repository: ${itemRepo}`);
 
-      // Determine target issue/PR number
-      const targetResult = resolveSafeOutputIssueTarget({ message, resolvedTemporaryIds, repoParts, handlerType: HANDLER_TYPE });
-      if (!targetResult.success) return targetResult;
-      const effectiveContext = resolveInvocationContext(context);
-      const itemNumber = targetResult.number ?? effectiveContext.eventPayload?.issue?.number ?? effectiveContext.eventPayload?.pull_request?.number;
+      let itemNumber;
+      let contextType;
 
-      if (!itemNumber || Number.isNaN(Number(itemNumber))) {
-        const error = "No issue/PR number available";
+      if (target === "*") {
+        const effectiveContext = resolveInvocationContext(context);
+        const triggeringItemNumber = effectiveContext.eventPayload?.issue?.number ?? effectiveContext.eventPayload?.pull_request?.number;
+        const targetResult = resolveSafeOutputIssueTarget({ message, resolvedTemporaryIds, repoParts, handlerType: HANDLER_TYPE });
+        if (!targetResult.success) return targetResult;
+        itemNumber = targetResult.number ?? triggeringItemNumber;
+        contextType = effectiveContext.eventPayload?.pull_request ? "pull request" : "issue";
+      } else if (target === "triggering") {
+        const targetResult = resolveTarget({ targetConfig: target, item: message, context, itemType: HANDLER_TYPE, supportsPR: true });
+        if (!targetResult.success) {
+          if (targetResult.shouldFail === false) {
+            core.warning(targetResult.error);
+            return { success: false, skipped: true, reason: targetResult.error, error: targetResult.error };
+          }
+          return targetResult;
+        }
+        itemNumber = targetResult.number;
+        contextType = targetResult.contextType;
+      } else {
+        const effectiveContext = resolveInvocationContext(context);
+        itemNumber = Number(target);
+        contextType = effectiveContext.eventPayload?.pull_request ? "pull request" : "issue";
+      }
+
+      itemNumber = Number(itemNumber);
+      if (!Number.isInteger(itemNumber) || itemNumber <= 0) {
+        const error = target !== "*" && target !== "triggering" ? "Invalid issue/PR number" : "No issue/PR number available";
         core.warning(error);
         return { success: false, error };
       }
 
-      const contextType = effectiveContext.eventPayload?.pull_request ? "pull request" : "issue";
       const labelToRemove = String(message.label_to_remove ?? "").trim();
       const labelToAdd = String(message.label_to_add ?? "").trim();
 
@@ -131,14 +179,14 @@ const main = createCountGatedHandler({
       }
 
       // Validate label_to_remove against blocked patterns and allowed-remove list
-      const removeValidation = validateSingleLabel(labelToRemove, configAllowedRemove, blockedPatterns, "label_to_remove");
+      const removeValidation = validateSingleLabel(labelToRemove, initialAllowedRemove, initialBlockedPatterns, "label_to_remove");
       if (!removeValidation.valid) {
         core.warning(`label_to_remove validation failed: ${removeValidation.error}`);
         return { success: false, error: removeValidation.error };
       }
 
       // Validate label_to_add against blocked patterns and allowed-add list
-      const addValidation = validateSingleLabel(labelToAdd, configAllowedAdd, blockedPatterns, "label_to_add");
+      const addValidation = validateSingleLabel(labelToAdd, initialAllowedAdd, initialBlockedPatterns, "label_to_add");
       if (!addValidation.valid) {
         core.warning(`label_to_add validation failed: ${addValidation.error}`);
         return { success: false, error: addValidation.error };
@@ -168,12 +216,12 @@ const main = createCountGatedHandler({
       if (requiredLabels.length > 0) {
         const itemLabels = (item.labels || []).map(/** @param {any} l */ l => (typeof l === "string" ? l : l.name || ""));
         if (!requiredLabels.every(r => itemLabels.includes(r))) {
-          core.info(`Skipping replace_label for ${contextType} #${itemNumber}: does not match required-labels filter (${requiredLabels.join(", ")})`);
+          core.warning(`Skipping replace_label for ${contextType} #${itemNumber}: does not match required-labels filter (${requiredLabels.join(", ")})`);
           return { success: false, skipped: true, error: "Item does not match required-labels filter" };
         }
       }
       if (requiredTitlePrefix && !item.title?.startsWith(requiredTitlePrefix)) {
-        core.info(`Skipping replace_label for ${contextType} #${itemNumber}: title does not start with required prefix "${requiredTitlePrefix}"`);
+        core.warning(`Skipping replace_label for ${contextType} #${itemNumber}: title does not start with required prefix "${requiredTitlePrefix}"`);
         return { success: false, skipped: true, error: "Item title does not start with required prefix" };
       }
 
@@ -196,30 +244,57 @@ const main = createCountGatedHandler({
       // Compute the new label set: current labels minus labelToRemove, plus labelToAdd (deduped).
       // If labelToRemove is not on the issue we still proceed — it simply won't appear in the set.
       const currentLabelNames = (item.labels || []).map(/** @param {any} l */ l => (typeof l === "string" ? l : l.name || "")).filter(Boolean);
-      const labelToRemoveIsPresent = currentLabelNames.includes(labelToRemove);
+      let labelToRemoveIsPresent = currentLabelNames.includes(labelToRemove);
       if (!labelToRemoveIsPresent) {
         core.info(`Label "${labelToRemove}" is not present on ${contextType} #${itemNumber} in ${itemRepo} — will only add "${labelToAdd}"`);
       }
-      const newLabelNames = [...new Set([...currentLabelNames.filter(n => n !== labelToRemove), labelToAdd])];
-
-      core.info(`Executing REST setLabels: remove="${labelToRemove}", add="${labelToAdd}" on ${contextType} #${itemNumber} in ${itemRepo}`);
-
-      const beforeState = await fetchIssueState(githubClient, repoParts, itemNumber);
 
       try {
+        let beforeState;
         const { data: updatedLabels } = await withRetry(
-          () =>
-            githubClient.rest.issues.setLabels({
+          async () => {
+            beforeState = await fetchIssueState(githubClient, repoParts, itemNumber);
+            const preWriteRemoveValidation = validateSingleLabel(labelToRemove, currentAllowedRemove(), currentBlockedPatterns(), "label_to_remove");
+            if (!preWriteRemoveValidation.valid) {
+              core.warning(`label_to_remove validation failed before setLabels: ${preWriteRemoveValidation.error}`);
+              const policyError = new Error(preWriteRemoveValidation.error);
+              policyError.name = POLICY_REJECTION_ERROR_NAME;
+              throw policyError;
+            }
+            const preWriteAddValidation = validateSingleLabel(labelToAdd, currentAllowedAdd(), currentBlockedPatterns(), "label_to_add");
+            if (!preWriteAddValidation.valid) {
+              core.warning(`label_to_add validation failed before setLabels: ${preWriteAddValidation.error}`);
+              const policyError = new Error(preWriteAddValidation.error);
+              policyError.name = POLICY_REJECTION_ERROR_NAME;
+              throw policyError;
+            }
+            const beforeWriteLabelNames = normalizeLabelNames(beforeState.labels);
+            labelToRemoveIsPresent = beforeWriteLabelNames.includes(labelToRemove);
+            const newLabelNames = [...new Set([...beforeWriteLabelNames.filter(n => n !== labelToRemove), labelToAdd])];
+
+            return githubClient.rest.issues.setLabels({
               owner: repoParts.owner,
               repo: repoParts.repo,
               issue_number: itemNumber,
               labels: newLabelNames,
-            }),
-          RATE_LIMIT_RETRY_CONFIG,
+            });
+          },
+          SET_LABELS_RETRY_CONFIG,
           `replace_label on ${contextType} #${itemNumber} in ${itemRepo}`
         );
 
         const updatedLabelNames = (updatedLabels || []).map((/** @param {any} l */ l) => l.name || "").filter(Boolean);
+
+        if (!updatedLabelNames.includes(labelToAdd)) {
+          const error = `replace_label: label_to_add ${JSON.stringify(labelToAdd)} not found in POST-setLabels response`;
+          core.error(error);
+          return { success: false, error };
+        }
+        if (labelToRemoveIsPresent && labelToRemove !== labelToAdd && updatedLabelNames.includes(labelToRemove)) {
+          const error = `replace_label: label_to_remove ${JSON.stringify(labelToRemove)} still present after setLabels call`;
+          core.error(error);
+          return { success: false, error };
+        }
 
         core.info(`Successfully replaced label "${labelToRemove}" → "${labelToAdd}" on ${contextType} #${itemNumber} in ${itemRepo}`);
         core.info(`Updated labels: ${JSON.stringify(updatedLabelNames)}`);

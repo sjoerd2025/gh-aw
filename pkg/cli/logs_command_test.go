@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,10 +14,11 @@ import (
 )
 
 func TestNewLogsCommand(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 
 	require.NotNil(t, cmd, "NewLogsCommand should not return nil")
-	assert.Equal(t, "logs [workflow]", cmd.Use, "Command use should be 'logs [workflow]'")
+	assert.Equal(t, "logs [workflow]...", cmd.Use, "Command use should show repeatable workflows")
 	assert.Equal(t, "Download and analyze agentic workflow logs and artifacts", cmd.Short, "Command short description should match")
 	assert.Contains(t, cmd.Long, "Download and analyze agentic workflow logs", "Command long description should contain expected text")
 	assert.Contains(t, cmd.Example, "logs --cache-before -1w", "Cache maintenance examples should use the cache-before flag name")
@@ -62,6 +64,8 @@ func TestNewLogsCommand(t *testing.T) {
 	assert.NotNil(t, afterRunIDFlag, "Should have 'after-run-id' flag")
 	beforeRunIDFlag := flags.Lookup("before-run-id")
 	assert.NotNil(t, beforeRunIDFlag, "Should have 'before-run-id' flag")
+	ignoreWorkflowRunsFlag := flags.Lookup("ignore-workflow-runs")
+	assert.NotNil(t, ignoreWorkflowRunsFlag, "Should have 'ignore-workflow-runs' flag")
 	lastFlag := flags.Lookup("last")
 	assert.NotNil(t, lastFlag, "Should have 'last' flag")
 	assert.Contains(t, lastFlag.Usage, "--count/-c", "--last usage should mention the canonical --count/-c flag")
@@ -73,6 +77,10 @@ func TestNewLogsCommand(t *testing.T) {
 	// Check parse flag
 	parseFlag := flags.Lookup("parse")
 	assert.NotNil(t, parseFlag, "Should have 'parse' flag")
+
+	// Check audit flag
+	auditFlag := flags.Lookup("audit")
+	assert.NotNil(t, auditFlag, "Should have 'audit' flag")
 
 	// Check json flag
 	jsonFlag := flags.Lookup("json")
@@ -93,9 +101,26 @@ func TestNewLogsCommand(t *testing.T) {
 	afterAliasFlag := flags.Lookup("after")
 	assert.NotNil(t, afterAliasFlag, "Should retain hidden 'after' alias")
 	assert.True(t, afterAliasFlag.Hidden, "'after' alias should be hidden from help output")
+
+	maxRateLimitFlag := flags.Lookup("max-github-api-rate-limit")
+	require.NotNil(t, maxRateLimitFlag, "Should have 'max-github-api-rate-limit' flag")
+	maxStorageFlag := flags.Lookup("max-storage")
+	require.NotNil(t, maxStorageFlag, "Should have 'max-storage' flag")
+	assert.NotContains(t, maxStorageFlag.Usage, "default:")
+	assert.Contains(t, maxStorageFlag.Usage, "0 = unlimited")
+	pruneOlderRunsFlag := flags.Lookup("prune-older-runs")
+	require.NotNil(t, pruneOlderRunsFlag, "Should have 'prune-older-runs' flag")
+	cachedJSONLFlag := flags.Lookup("cached-jsonl")
+	require.NotNil(t, cachedJSONLFlag, "Should have 'cached-jsonl' flag")
+	assert.Contains(t, cachedJSONLFlag.Usage, "cached logs JSONL")
+	assert.Nil(t, flags.Lookup("cached-logs"), "Should not have 'cached-logs' alias")
+	drain3WeightsFlag := flags.Lookup("drain3-weights")
+	require.NotNil(t, drain3WeightsFlag, "Should have 'drain3-weights' flag")
+	assert.Contains(t, drain3WeightsFlag.Usage, "existing Drain3 weights")
 }
 
 func TestLogsCommandFlagDefaults(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	flags := cmd.Flags()
 
@@ -112,6 +137,11 @@ func TestLogsCommandFlagDefaults(t *testing.T) {
 		{"before-run-id", "0"},
 		{"repo", ""},
 		{"artifacts", "[usage]"},
+		{"max-github-api-rate-limit", "0"},
+		{"max-storage", "1024"},
+		{"prune-older-runs", "false"},
+		{"cached-jsonl", ""},
+		{"drain3-weights", ""},
 	}
 
 	for _, tt := range tests {
@@ -123,11 +153,96 @@ func TestLogsCommandFlagDefaults(t *testing.T) {
 	}
 }
 
+func TestLogsCommandResourceBudgetFlags(t *testing.T) {
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("max-github-api-rate-limit", "-2000"))
+	require.NoError(t, cmd.Flags().Set("max-storage", "10240"))
+	require.NoError(t, cmd.Flags().Set("prune-older-runs", "true"))
+
+	opts, err := loadCommonLogsOptions(cmd)
+
+	require.NoError(t, err)
+	assert.Equal(t, -2000, opts.MaxGitHubAPIRateLimit)
+	assert.Equal(t, 10240, opts.MaxStorageMB)
+	assert.True(t, opts.PruneOlderRuns)
+}
+
+func TestLogsCommandStorageBudgetDefaultsAndOverrides(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		flag string
+		want int
+	}{
+		{name: "default", want: 1024},
+		{name: "unlimited", flag: "0", want: 0},
+		{name: "larger budget", flag: "2048", want: 2048},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cmd := NewLogsCommand()
+			if tt.flag != "" {
+				require.NoError(t, cmd.Flags().Set("max-storage", tt.flag))
+			}
+			opts, err := loadCommonLogsOptions(cmd)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, opts.MaxStorageMB)
+			assert.Equal(t, tt.flag != "", opts.MaxStorageMBSet)
+			assert.Equal(t, tt.want, normalizeLogsDownloadOptions(opts).MaxStorageMB)
+			stdinOpts, err := loadStdinLogsOptions(cmd)
+			require.NoError(t, err)
+			assert.Equal(t, tt.flag != "", stdinOpts.MaxStorageMBSet)
+			assert.Equal(t, tt.want, normalizeStdinLogsOptions(stdinOpts).MaxStorageMB)
+		})
+	}
+}
+
+func TestLogsCommandCachedJSONLOption(t *testing.T) {
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("cached-jsonl", "current.jsonl"))
+
+	opts, err := loadCommonLogsOptions(cmd)
+
+	require.NoError(t, err)
+	assert.Equal(t, "current.jsonl", opts.CachedJSONL)
+}
+
+func TestLogsCommandDrain3WeightsOption(t *testing.T) {
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("drain3-weights", "weights.json"))
+
+	opts, err := loadCommonLogsOptions(cmd)
+
+	require.NoError(t, err)
+	assert.Equal(t, "weights.json", opts.Drain3Weights)
+}
+
+func TestLogsCommandRejectsNegativeMaxStorage(t *testing.T) {
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("max-storage", "-1"))
+
+	_, err := loadCommonLogsOptions(cmd)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected a non-negative number of MB")
+}
+
+func TestLogsCommandRejectsRateLimitWithStdin(t *testing.T) {
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("max-github-api-rate-limit", "12000"))
+
+	err := runLogsCommandFromStdin(cmd, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires discovery mode")
+}
+
 func TestLogsCommandBooleanFlags(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	flags := cmd.Flags()
 
-	boolFlags := []string{"firewall", "no-firewall", "tool-graph", "parse", "json"}
+	boolFlags := []string{"firewall", "no-firewall", "tool-graph", "parse", "audit", "json"}
 
 	for _, flagName := range boolFlags {
 		t.Run(flagName, func(t *testing.T) {
@@ -138,7 +253,18 @@ func TestLogsCommandBooleanFlags(t *testing.T) {
 	}
 }
 
+func TestLogsCommandAuditFlag(t *testing.T) {
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("audit", "true"))
+
+	opts, err := loadCommonLogsOptions(cmd)
+
+	require.NoError(t, err)
+	assert.True(t, opts.Audit)
+}
+
 func TestLogsCommandStructure(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		commandCreator func() any
@@ -160,9 +286,10 @@ func TestLogsCommandStructure(t *testing.T) {
 }
 
 func TestLogsCommandArgs(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 
-	// Logs command accepts 0 or 1 argument (workflow is optional)
+	// Logs command accepts zero or more workflow arguments.
 	// Only test if Args validator is set
 	if cmd.Args != nil {
 		// Verify it accepts no arguments
@@ -172,10 +299,14 @@ func TestLogsCommandArgs(t *testing.T) {
 		// Verify it accepts 1 argument
 		err = cmd.Args(cmd, []string{"workflow1"})
 		require.NoError(t, err, "Should not error with 1 argument")
+
+		err = cmd.Args(cmd, []string{"workflow1", "workflow2"})
+		require.NoError(t, err, "Should not error with multiple arguments")
 	}
 }
 
 func TestLogsCommandMutuallyExclusiveFlags(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	flags := cmd.Flags()
 
@@ -192,6 +323,7 @@ func TestLogsCommandMutuallyExclusiveFlags(t *testing.T) {
 }
 
 func TestLogsCommandCountFlag(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	flags := cmd.Flags()
 
@@ -206,6 +338,7 @@ func TestLogsCommandCountFlag(t *testing.T) {
 }
 
 func TestLogsCommandDateFlags(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	flags := cmd.Flags()
 
@@ -227,6 +360,7 @@ func TestLogsCommandDateFlags(t *testing.T) {
 }
 
 func TestLogsCommandRunIDFilters(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	flags := cmd.Flags()
 
@@ -246,7 +380,30 @@ func TestLogsCommandRunIDFilters(t *testing.T) {
 	}
 }
 
+func TestLogsCommandIgnoreWorkflowRuns(t *testing.T) {
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("ignore-workflow-runs", "123,github/gh-aw/456,123"))
+
+	opts, err := loadCommonLogsOptions(cmd)
+
+	require.NoError(t, err)
+	assert.Equal(t, []int64{123, 456}, opts.IgnoreWorkflowRuns)
+}
+
+func TestLogsCommandRejectsInvalidIgnoredWorkflowRun(t *testing.T) {
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("ignore-workflow-runs", "github/gh-aw/not-a-run"))
+
+	_, err := loadCommonLogsOptions(cmd)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "github/gh-aw/not-a-run")
+	assert.Contains(t, err.Error(), "expected a positive run ID or slug/ID")
+	assert.Contains(t, err.Error(), "123 or github/gh-aw/123")
+}
+
 func TestLogsCommandOutputFlag(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	flags := cmd.Flags()
 
@@ -264,6 +421,7 @@ func TestLogsCommandOutputFlag(t *testing.T) {
 }
 
 func TestLogsCommandHelpText(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 
 	// Verify long description contains expected sections
@@ -281,6 +439,8 @@ func TestLogsCommandHelpText(t *testing.T) {
 	// Verify example field contains example commands
 	expectedExampleSections := []string{
 		"gh aw logs",
+		"logs workflow-a workflow-b",
+		"logs owner/repo/.github/workflows/workflow-a.yml",
 		"--safe-output noop",
 		"--safe-output report-incomplete",
 		"--artifacts all",
@@ -296,7 +456,189 @@ func TestLogsCommandHelpText(t *testing.T) {
 	assert.Contains(t, safeOutputFlag.Usage, "report-incomplete", "safe-output flag help should mention report-incomplete")
 }
 
+func TestSplitCrossRepoWorkflowTarget(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		input        string
+		expectedRepo string
+		expectedName string
+		expectedOK   bool
+	}{
+		{
+			name:         "workflow name",
+			input:        "owner/repo/workflow-name",
+			expectedRepo: "owner/repo",
+			expectedName: "workflow-name",
+			expectedOK:   true,
+		},
+		{
+			name:         "full workflow file path",
+			input:        "owner/repo/.github/workflows/workflow-name.yml",
+			expectedRepo: "owner/repo",
+			expectedName: ".github/workflows/workflow-name.yml",
+			expectedOK:   true,
+		},
+		{
+			name:         "enterprise host workflow path",
+			input:        "github.example.com/owner/repo/.github/workflows/workflow-name.yml",
+			expectedRepo: "github.example.com/owner/repo",
+			expectedName: ".github/workflows/workflow-name.yml",
+			expectedOK:   true,
+		},
+		{
+			name:       "local workflow path",
+			input:      ".github/workflows/workflow-name.md",
+			expectedOK: false,
+		},
+		{
+			name:       "bare workflow",
+			input:      "workflow-name",
+			expectedOK: false,
+		},
+		{
+			name:       "missing relative local workflow path",
+			input:      "./local/workflow.md",
+			expectedOK: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, name, ok := splitCrossRepoWorkflowTarget(tt.input)
+			assert.Equal(t, tt.expectedOK, ok)
+			assert.Equal(t, tt.expectedRepo, repo)
+			assert.Equal(t, tt.expectedName, name)
+		})
+	}
+}
+
+func TestResolveLogsWorkflowTargetCrossRepo(t *testing.T) {
+	t.Parallel()
+	cmd := NewLogsCommand()
+	target, err := resolveLogsWorkflowTarget(cmd, "other-org/other-repo/.github/workflows/daily-report.yml")
+	require.NoError(t, err)
+	assert.Equal(t, "other-org/other-repo", target.repoOverride)
+	assert.Equal(t, "daily-report", target.workflowName)
+}
+
+func TestResolveLogsWorkflowTargetCrossRepoUsesLocalResolution(t *testing.T) {
+	workflowsDir := filepath.Join(t.TempDir(), ".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowsDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(workflowsDir, "self-care-open-source-failures.md"),
+		[]byte("---\nname: SelfCare / Open Source Failures\n---\n"),
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(workflowsDir, "self-care-open-source-failures.lock.yml"),
+		[]byte("name: SelfCare / Open Source Failures\non: push\n"),
+		0o644,
+	))
+	t.Setenv("GITHUB_REPOSITORY", "githubnext/gh-aw-cao")
+	t.Setenv("GH_AW_WORKFLOWS_DIR", workflowsDir)
+
+	tests := []struct {
+		name         string
+		input        string
+		expectedRepo string
+		expectedName string
+	}{
+		{
+			name:         "workflow ID",
+			input:        "githubnext/gh-aw-cao/self-care-open-source-failures",
+			expectedRepo: "githubnext/gh-aw-cao",
+			expectedName: "SelfCare / Open Source Failures",
+		},
+		{
+			name:         "markdown filename",
+			input:        "githubnext/gh-aw-cao/self-care-open-source-failures.md",
+			expectedRepo: "githubnext/gh-aw-cao",
+			expectedName: "SelfCare / Open Source Failures",
+		},
+		{
+			name:         "lock filename",
+			input:        "githubnext/gh-aw-cao/self-care-open-source-failures.lock.yml",
+			expectedRepo: "githubnext/gh-aw-cao",
+			expectedName: "SelfCare / Open Source Failures",
+		},
+		{
+			name:         "full lock path",
+			input:        "githubnext/gh-aw-cao/.github/workflows/self-care-open-source-failures.lock.yml",
+			expectedRepo: "githubnext/gh-aw-cao",
+			expectedName: "SelfCare / Open Source Failures",
+		},
+		{
+			name:         "full workflow file path",
+			input:        "githubnext/gh-aw-cao/.github/workflows/self-care-open-source-failures.yml",
+			expectedRepo: "githubnext/gh-aw-cao",
+			expectedName: "SelfCare / Open Source Failures",
+		},
+		{
+			name:         "matching host full lock path",
+			input:        "github.com/githubnext/gh-aw-cao/.github/workflows/self-care-open-source-failures.lock.yml",
+			expectedRepo: "github.com/githubnext/gh-aw-cao",
+			expectedName: "SelfCare / Open Source Failures",
+		},
+		{
+			// A same-named repository on another host must not inherit the local
+			// workflow display name.
+			name:         "other host full lock path",
+			input:        "github.example.com/githubnext/gh-aw-cao/.github/workflows/self-care-open-source-failures.lock.yml",
+			expectedRepo: "github.example.com/githubnext/gh-aw-cao",
+			expectedName: "self-care-open-source-failures",
+		},
+		{
+			name:         "other host full workflow file path",
+			input:        "github.example.com/githubnext/gh-aw-cao/.github/workflows/self-care-open-source-failures.yml",
+			expectedRepo: "github.example.com/githubnext/gh-aw-cao",
+			expectedName: "self-care-open-source-failures",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := NewLogsCommand()
+			target, err := resolveLogsWorkflowTarget(cmd, tt.input)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedRepo, target.repoOverride)
+			assert.Equal(t, tt.expectedName, target.workflowName)
+		})
+	}
+
+	cmd := NewLogsCommand()
+	require.NoError(t, cmd.Flags().Set("repo", "githubnext/gh-aw-cao"))
+	target, err := resolveLogsWorkflowTarget(cmd, "self-care-open-source-failures.lock.yml")
+	require.NoError(t, err)
+	assert.Equal(t, "SelfCare / Open Source Failures", target.workflowName)
+}
+
+func TestResolveRemoteLogsWorkflowTargets(t *testing.T) {
+	t.Parallel()
+
+	targets := []logsWorkflowTarget{
+		{repoOverride: "githubnext/gh-aw-cao", workflowName: "uk-ai-advisory"},
+	}
+	fetchWorkflows := func(context.Context, string, bool) (map[string]*GitHubWorkflow, error) {
+		return map[string]*GitHubWorkflow{
+			"uk-ai-advisory": {
+				Name: "UK AI Advisory",
+				Path: ".github/workflows/uk-ai-advisory.lock.yml",
+			},
+		}, nil
+	}
+
+	resolved, targetErrors := resolveRemoteLogsWorkflowTargetsWithFetcher(
+		context.Background(), targets, false, fetchWorkflows,
+	)
+
+	require.Empty(t, targetErrors)
+	require.Len(t, resolved, 1)
+	assert.Equal(t, "UK AI Advisory", resolved[0].workflowName)
+	assert.Equal(t, "githubnext/gh-aw-cao", resolved[0].repoOverride)
+}
+
 func TestLogsCommandStdinFlag(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	flags := cmd.Flags()
 
@@ -308,6 +650,7 @@ func TestLogsCommandStdinFlag(t *testing.T) {
 }
 
 func TestLogsCommandStdinRejectsPositionalArgs(t *testing.T) {
+	t.Parallel()
 	cmd := NewLogsCommand()
 	cmd.SetArgs([]string{"my-workflow", "--stdin"})
 	// Suppress output so test output stays clean

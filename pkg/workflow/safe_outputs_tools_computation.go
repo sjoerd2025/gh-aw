@@ -7,11 +7,21 @@ var safeOutputsToolsComputationLog = logger.New("workflow:safe_outputs_tools_com
 // computeEnabledToolNames returns the set of predefined tool names that are enabled
 // by the workflow's SafeOutputsConfig. Dynamic tools (dispatch-workflow, custom jobs,
 // call-workflow) are excluded because they are generated separately.
+//
+//nolint:largefunc // Built-in tool enablement is kept as one exhaustive mapping.
 func computeEnabledToolNames(data *WorkflowData) map[string]struct {
 } {
 	enabledTools := make(map[string]struct {
 	})
 	if data.SafeOutputs == nil {
+		if data.LedgerConfig != nil && data.LedgerConfig.Enabled() {
+			if data.LedgerConfig.hasGeneralAppendTool() {
+				enabledTools["ledger_append"] = struct{}{}
+			}
+			if len(data.LedgerConfig.compactionEnabledLedgers()) > 0 {
+				enabledTools[ledgerRequestCompactionHandlerKey] = struct{}{}
+			}
+		}
 		safeOutputsToolsComputationLog.Print("No safe outputs configuration, returning empty tool set")
 		return enabledTools
 	}
@@ -19,6 +29,12 @@ func computeEnabledToolNames(data *WorkflowData) map[string]struct {
 	if data.SafeOutputs.CreateIssues != nil {
 		enabledTools["create_issue"] = struct {
 		}{}
+	}
+	if data.SafeOutputs.CreateSecurityAdvisory != nil {
+		enabledTools["create_security_advisory"] = struct{}{}
+	}
+	if data.SafeOutputs.AddSecurityAdvisoryComment != nil {
+		enabledTools["add_security_advisory_comment"] = struct{}{}
 	}
 	if data.SafeOutputs.CreateAgentSessions != nil {
 		enabledTools["create_agent_session"] = struct {
@@ -46,6 +62,10 @@ func computeEnabledToolNames(data *WorkflowData) map[string]struct {
 	}
 	if data.SafeOutputs.MarkPullRequestAsReadyForReview != nil {
 		enabledTools["mark_pull_request_as_ready_for_review"] = struct {
+		}{}
+	}
+	if data.SafeOutputs.ApproveWorkflowRun != nil {
+		enabledTools["approve_workflow_run"] = struct {
 		}{}
 	}
 	if data.SafeOutputs.DismissPullRequestReview != nil {
@@ -140,13 +160,20 @@ func computeEnabledToolNames(data *WorkflowData) map[string]struct {
 		enabledTools["upload_artifact"] = struct {
 		}{}
 	}
+	if data.SafeOutputs.UploadCodeCoverage != nil {
+		enabledTools["upload_code_coverage"] = struct {
+		}{}
+	}
 	if data.SafeOutputs.MissingTool != nil {
-		enabledTools["missing_tool"] = struct {
+		enabledTools["report_missing_tool"] = struct {
 		}{}
 	}
 	if data.SafeOutputs.MissingData != nil {
-		enabledTools["missing_data"] = struct {
+		enabledTools["report_missing_data"] = struct {
 		}{}
+	}
+	if data.SafeOutputs.ReportIncomplete != nil {
+		enabledTools["report_incomplete"] = struct{}{}
 	}
 	if data.SafeOutputs.UpdateRelease != nil {
 		enabledTools["update_release"] = struct {
@@ -189,6 +216,14 @@ func computeEnabledToolNames(data *WorkflowData) map[string]struct {
 	if data.RepoMemoryConfig != nil && len(data.RepoMemoryConfig.Memories) > 0 {
 		enabledTools["push_repo_memory"] = struct {
 		}{}
+	}
+	if data.LedgerConfig != nil && data.LedgerConfig.Enabled() {
+		if data.LedgerConfig.hasGeneralAppendTool() {
+			enabledTools["ledger_append"] = struct{}{}
+		}
+		if len(data.LedgerConfig.compactionEnabledLedgers()) > 0 {
+			enabledTools[ledgerRequestCompactionHandlerKey] = struct{}{}
+		}
 	}
 
 	safeOutputsToolsComputationLog.Printf("Computed %d enabled safe output tool names", len(enabledTools))

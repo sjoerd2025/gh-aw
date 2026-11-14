@@ -52,9 +52,11 @@ function isCrossRepoTarget(repoOwner, repoName) {
  *   empty commit when exactly 1 new commit was pushed, preventing accidental workflow-file
  *   modifications on multi-commit branches and reducing loop risk.
  * @param {string[]|string} [options.allowedRepos] - Allowed repository patterns for allowlist validation
+ * @param {() => void} [options.assertTransportUnchanged]
+ * @param {boolean} [options.requireExistingBranch=false] - Never recreate a deleted PR branch
  * @returns {Promise<{success: boolean, skipped?: boolean, error?: string}>}
  */
-async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMessage, newCommitCount, allowedRepos: allowedReposInput }) {
+async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMessage, newCommitCount, allowedRepos: allowedReposInput, assertTransportUnchanged, requireExistingBranch = false }) {
   const token = process.env.GH_AW_CI_TRIGGER_TOKEN;
 
   if (!token || !token.trim()) {
@@ -176,6 +178,7 @@ async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMes
         await exec.exec("git", ["reset", "--hard", "FETCH_HEAD"]);
         core.info(`Synced local branch with remote ${branchName}`);
       } catch (error) {
+        if (requireExistingBranch) throw error;
         // Non-fatal: if fetch/reset fails (e.g. branch not yet on remote), continue
         // with the local HEAD and attempt the push anyway.
         const syncErrorMessage = getErrorMessage(error);
@@ -207,6 +210,7 @@ async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMes
         try {
           core.info(`Attempting to create verified empty commit via GitHub API (createCommitOnBranch)`);
           const ciGithubClient = global.getOctokit(token.trim());
+          assertTransportUnchanged?.();
           const apiResult = await ciGithubClient.graphql(
             `mutation($input: CreateCommitOnBranchInput!) {
               createCommitOnBranch(input: $input) { commit { oid } }
@@ -236,6 +240,7 @@ async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMes
           }
           committedViaApi = true;
         } catch (apiError) {
+          assertTransportUnchanged?.();
           core.info(`GitHub API commit creation unavailable, falling back to git commit + push: ${getErrorMessage(apiError)}`);
         }
       }
@@ -247,11 +252,18 @@ async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMes
           await exec.exec("git", ["remote", "remove", "ci-trigger"]);
           core.info("Removed pre-existing ci-trigger remote");
         } catch {
-          // Remote doesn't exist yet, that's fine
+          // Remote doesn't exist yet — removal failure is ignored, that's fine.
         }
         await exec.exec("git", ["remote", "add", "ci-trigger", remoteUrl]);
         await exec.exec("git", ["commit", "--allow-empty", "-m", message]);
-        await exec.exec("git", ["push", "ci-trigger", branchName]);
+        await require("./work_queue_git_effects.cjs").assertGitPushAuthorized({ remote: "ci-trigger", branch: branchName });
+        assertTransportUnchanged?.();
+        const pushArgs = ["push"];
+        if (requireExistingBranch) {
+          if (!/^[0-9a-f]{40}$/i.test(expectedHeadOid)) throw new Error("Cannot resolve existing PR branch head; refusing CI trigger push");
+          pushArgs.push(`--force-with-lease=refs/heads/${branchName}:${expectedHeadOid}`);
+        }
+        await exec.exec("git", [...pushArgs, "ci-trigger", branchName]);
       }
 
       core.info(`Extra empty commit pushed to ${branchName} successfully`);
@@ -276,6 +288,7 @@ async function pushExtraEmptyCommit({ branchName, repoOwner, repoName, commitMes
       }
     }
   } catch (error) {
+    assertTransportUnchanged?.();
     const errorMessage = getErrorMessage(error);
     core.warning(`Failed to push extra empty commit: ${errorMessage}`);
 

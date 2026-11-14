@@ -1,8 +1,8 @@
 package workflow
 
 import (
-	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -29,191 +29,372 @@ import (
 // they stay in sync with GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG.
 func generateSafeOutputsConfig(data *WorkflowData) (string, error) {
 	if data.SafeOutputs == nil {
-		safeOutputsConfigLog.Print("No safe outputs configuration found, returning empty config")
-		return "", nil
+		if data.CommentMemoryConfig == nil && (data.LedgerConfig == nil || !data.LedgerConfig.Enabled()) {
+			safeOutputsConfigLog.Print("No safe outputs configuration found, returning empty config")
+			return "", nil
+		}
+		data.SafeOutputs = &SafeOutputsConfig{}
 	}
 	safeOutputsConfigLog.Print("Generating safe outputs configuration for workflow")
 
 	safeOutputsConfig := make(map[string]any)
+	addStandardHandlerConfigs(safeOutputsConfig, data)
+	if handlerConfig := buildCommentMemoryHandlerConfig(data.CommentMemoryConfig, data.SafeOutputs.Footer, data.SafeOutputs.BodyFooter); handlerConfig != nil {
+		delete(handlerConfig, "github-token")
+		safeOutputsConfig[commentMemoryHandlerKey] = handlerConfig
+	}
+
+	addSafeJobsConfig(safeOutputsConfig, data.SafeOutputs.Jobs)
+	if isWorkQueueParticipant(data) && len(data.SafeOutputs.Steps) > 0 {
+		safeOutputsConfig["raw_steps"] = map[string]any{"description": "Trusted Claim-scoped custom step preparation"}
+	}
+	addSafeScriptsConfig(safeOutputsConfig, data.SafeOutputs.Scripts)
+	if err := addSafeActionsConfig(safeOutputsConfig, data.SafeOutputs.Actions); err != nil {
+		return "", err
+	}
+	addMentionsConfig(safeOutputsConfig, data.SafeOutputs)
+	addPushRepoMemoryConfig(safeOutputsConfig, data.RepoMemoryConfig)
+	if ledgerConfig := buildLedgerMutationHandlerConfig(data.RepoMemoryConfig); ledgerConfig != nil {
+		safeOutputsConfig[ledgerMutationHandlerKey] = ledgerConfig
+		safeOutputsConfigLog.Print("Added ledger_mutation config so ledger audit entries are ingested")
+	}
+	addStandaloneLedgerConfigs(safeOutputsConfig, data.LedgerConfig)
+
+	if len(safeOutputsConfig) == 0 {
+		return "", nil
+	}
+	// Custom jobs listed in safe-outputs.needs are wired onto the later safe_outputs handler job,
+	// not automatically onto the agent job. Neutralize expressions for those jobs unless the
+	// agent already directly depends on them; the handler job's own config is unaffected.
+	unresolvableJobs := make([]string, 0, len(data.SafeOutputs.Needs))
+	for _, job := range data.SafeOutputs.Needs {
+		if !slices.Contains(data.AgentJobNeeds, job) {
+			unresolvableJobs = append(unresolvableJobs, job)
+		}
+	}
+	sanitizeAgentSafeOutputsConfig(safeOutputsConfig, unresolvableJobs)
+	configJSON, err := marshalSafeOutputsConfig(safeOutputsConfig)
+	if err != nil {
+		return "", fmt.Errorf("marshaling safe-outputs config: %w", err)
+	}
+	safeOutputsConfigLog.Printf("Safe outputs config generation complete: %d tool types configured", len(safeOutputsConfig))
+	return string(configJSON), nil
+}
+
+// addStandaloneLedgerConfigs adds the ledger_append and ledger_request_compaction configs for
+// standalone tools.ledger ledgers.
+func addStandaloneLedgerConfigs(safeOutputsConfig map[string]any, config *LedgerToolConfig) {
+	if config != nil && config.Enabled() {
+		ledgerConfigs := make([]map[string]any, 0, len(config.Ledgers))
+		for _, ledger := range config.Ledgers {
+			ledgerConfig := map[string]any{
+				"name":           ledger.Name,
+				"type":           ledger.Type,
+				"key":            ledger.Key,
+				"schema":         ledger.Schema,
+				"max_record_kb":  ledger.MaxRecordKB,
+				"max_segment_kb": ledger.MaxSegmentKB,
+				"max_patch_kb":   ledger.MaxPatchKB,
+			}
+			ledgerConfigs = append(ledgerConfigs, ledgerConfig)
+		}
+		safeOutputsConfig["ledger_append"] = map[string]any{"max": 100, "ledgers": ledgerConfigs}
+	}
+	if handlerConfig := buildLedgerRequestCompactionHandlerConfig(config); handlerConfig != nil {
+		safeOutputsConfig[ledgerRequestCompactionHandlerKey] = handlerConfig
+	}
+}
+
+// addStandardHandlerConfigs adds config for every registered standard safe-output
+// handler (same source as GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG) to safeOutputsConfig.
+func addStandardHandlerConfigs(safeOutputsConfig map[string]any, data *WorkflowData) {
 	engineManifestFiles, engineManifestPathPrefixes := getEngineAgentFileInfoFromWorkflowData(data)
 
-	// Standard handler configs — sourced from handlerRegistry (same as GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG)
 	for handlerName, builder := range handlerRegistry {
-		if handlerCfg := builder(data.SafeOutputs); handlerCfg != nil {
-			injectCurrentCheckoutPatchWorkspacePath(handlerName, handlerCfg, data)
-			injectCheckoutMapping(handlerName, handlerCfg, data)
-			excludeFiles := ParseStringArrayFromConfig(handlerCfg, "_protected_files_exclude", nil)
-			// Strip the internal sentinel key used by the handler manager for compile-time
-			// exclusion processing — it must not be forwarded to the runtime config.json.
-			delete(handlerCfg, "_protected_files_exclude")
-			if _, hasProtectedFiles := handlerCfg["protected_files"]; hasProtectedFiles {
-				fullManifestFiles := getAllManifestFiles(engineManifestFiles...)
-				fullPathPrefixes := getProtectedPathPrefixes(engineManifestPathPrefixes...)
-				handlerCfg["protected_files"] = sliceutil.Exclude(fullManifestFiles, excludeFiles...)
-				filteredPrefixes := sliceutil.Exclude(fullPathPrefixes, excludeFiles...)
-				if len(filteredPrefixes) > 0 {
-					handlerCfg["protected_path_prefixes"] = filteredPrefixes
-				} else {
-					delete(handlerCfg, "protected_path_prefixes")
-				}
-				// Compute which top-level dot-folder prefixes are excluded so the runtime
-				// dot-folder check can skip them.
-				if dotFolderExcludes := getDotFolderExcludes(excludeFiles); len(dotFolderExcludes) > 0 {
-					handlerCfg["protected_dot_folder_excludes"] = dotFolderExcludes
+		handlerCfg := builder(data.SafeOutputs)
+		if handlerCfg == nil {
+			continue
+		}
+		// Credentials are only needed by the safe_outputs job, never by the agent.
+		delete(handlerCfg, "github-token")
+		delete(handlerCfg, "head-github-token")
+		if tools, ok := handlerCfg["tools"].(map[string]any); ok {
+			for _, tool := range tools {
+				if toolConfig, ok := tool.(map[string]any); ok {
+					delete(toolConfig, "github-token")
 				}
 			}
-			if data.SafeOutputs != nil && data.SafeOutputs.DataEnabled && isDataSchemaEnabledType(handlerName) {
-				handlerCfg["data_enabled"] = true
-				if data.SafeOutputs.NormalizedDataSchema != nil {
-					handlerCfg["data_schema"] = data.SafeOutputs.NormalizedDataSchema
-				} else if strings.TrimSpace(data.SafeOutputs.DataSchemaExpression) != "" {
-					handlerCfg["data_schema"] = data.SafeOutputs.DataSchemaExpression
-				}
+		}
+		injectCurrentCheckoutPatchWorkspacePath(handlerName, handlerCfg, data)
+		injectCheckoutMapping(handlerName, handlerCfg, data)
+		excludeFiles := ParseStringArrayFromConfig(handlerCfg, "_protected_files_exclude", nil)
+		// Strip the internal sentinel key used by the handler manager for compile-time
+		// exclusion processing — it must not be forwarded to the runtime config.json.
+		delete(handlerCfg, "_protected_files_exclude")
+		if _, hasProtectedFiles := handlerCfg["protected_files"]; hasProtectedFiles {
+			excludeNames, excludePaths := splitProtectedFilesExcludes(excludeFiles)
+			excludePaths = append(excludePaths, data.RepoProtectedFilesExclude...)
+			fullManifestFiles := getAllManifestFiles(engineManifestFiles...)
+			fullPathPrefixes := getProtectedPathPrefixes(engineManifestPathPrefixes...)
+			handlerCfg["protected_files"] = sliceutil.Exclude(fullManifestFiles, excludeNames...)
+			if len(excludePaths) > 0 {
+				handlerCfg["protected_files_path_exclude"] = excludePaths
 			}
-			safeOutputsConfig[handlerName] = handlerCfg
+			filteredPrefixes := sliceutil.Exclude(fullPathPrefixes, excludeNames...)
+			if len(filteredPrefixes) > 0 {
+				handlerCfg["protected_path_prefixes"] = filteredPrefixes
+			} else {
+				delete(handlerCfg, "protected_path_prefixes")
+			}
+			// Compute which top-level dot-folder prefixes are excluded so the runtime
+			// dot-folder check can skip them.
+			if dotFolderExcludes := getDotFolderExcludes(excludeNames); len(dotFolderExcludes) > 0 {
+				handlerCfg["protected_dot_folder_excludes"] = dotFolderExcludes
+			}
+		}
+		if data.SafeOutputs != nil && data.SafeOutputs.DataEnabled && isDataSchemaEnabledType(handlerName) {
+			handlerCfg["data_enabled"] = true
+			if data.SafeOutputs.NormalizedDataSchema != nil {
+				handlerCfg["data_schema"] = data.SafeOutputs.NormalizedDataSchema
+			} else if strings.TrimSpace(data.SafeOutputs.DataSchemaExpression) != "" {
+				handlerCfg["data_schema"] = data.SafeOutputs.DataSchemaExpression
+			}
+		}
+		safeOutputsConfig[handlerName] = handlerCfg
+	}
+}
+
+func splitProtectedFilesExcludes(excludes []string) (names, paths []string) {
+	for _, exclude := range excludes {
+		if path, ok := strings.CutPrefix(exclude, "/"); ok {
+			paths = append(paths, path)
+		} else {
+			names = append(names, exclude)
 		}
 	}
+	return names, paths
+}
 
-	// Safe-jobs configuration: custom output types that run as separate GitHub Actions jobs.
-	// These are not standard handlers but must be in config.json so the ingestion step can
-	// validate and route those output types.
-	if len(data.SafeOutputs.Jobs) > 0 {
-		safeOutputsConfigLog.Printf("Processing %d safe job configurations", len(data.SafeOutputs.Jobs))
-		for jobName, jobConfig := range data.SafeOutputs.Jobs {
-			safeOutputsConfigLog.Printf("Generating config for safe job: %s", jobName)
-			safeJobConfig := map[string]any{}
-			if jobConfig.Description != "" {
-				safeJobConfig["description"] = jobConfig.Description
-			}
-			if jobConfig.Output != "" {
-				safeJobConfig["output"] = jobConfig.Output
-			}
-			if jobConfig.Max > 0 {
-				safeJobConfig["max"] = jobConfig.Max
-			}
-			if len(jobConfig.Inputs) > 0 {
-				inputsConfig := make(map[string]any)
-				for inputName, inputDef := range jobConfig.Inputs {
-					inputConfig := map[string]any{
-						"type":        inputDef.Type,
-						"description": inputDef.Description,
-						"required":    inputDef.Required,
-					}
-					if inputDef.Default != "" {
-						inputConfig["default"] = inputDef.Default
-					}
-					if len(inputDef.Options) > 0 {
-						inputConfig["options"] = inputDef.Options
-					}
-					inputsConfig[inputName] = inputConfig
-				}
-				safeJobConfig["inputs"] = inputsConfig
-			}
-			safeOutputsConfig[jobName] = safeJobConfig
-		}
-	}
-
-	// Safe-scripts configuration: script output types handled inline by the handler manager.
-	if len(data.SafeOutputs.Scripts) > 0 {
-		safeOutputsConfigLog.Printf("Processing %d safe script configurations", len(data.SafeOutputs.Scripts))
-		for scriptName, scriptConfig := range data.SafeOutputs.Scripts {
-			normalizedName := stringutil.NormalizeSafeOutputIdentifier(scriptName)
-			safeOutputsConfigLog.Printf("Generating config for safe script: %s (normalized: %s)", scriptName, normalizedName)
-			safeScriptConfigMap := map[string]any{}
-			if scriptConfig.Description != "" {
-				safeScriptConfigMap["description"] = scriptConfig.Description
-			}
-			if len(scriptConfig.Inputs) > 0 {
-				inputsConfig := make(map[string]any)
-				for inputName, inputDef := range scriptConfig.Inputs {
-					inputConfig := map[string]any{
-						"type":        inputDef.Type,
-						"description": inputDef.Description,
-						"required":    inputDef.Required,
-					}
-					if inputDef.Default != "" {
-						inputConfig["default"] = inputDef.Default
-					}
-					if len(inputDef.Options) > 0 {
-						inputConfig["options"] = inputDef.Options
-					}
-					inputsConfig[inputName] = inputConfig
-				}
-				safeScriptConfigMap["inputs"] = inputsConfig
-			}
-			safeOutputsConfig[normalizedName] = safeScriptConfigMap
-		}
-	}
-
-	// Safe-actions configuration: custom GitHub Actions exposed as safe output tools.
-	// The normalized action names are added as config keys so both MCP server implementations
-	// recognise them as enabled tools (the tool schema is already in tools.json via
-	// tools_meta.json; the MCP server just needs to see the name in config.json).
-	if len(data.SafeOutputs.Actions) > 0 {
-		safeOutputsConfigLog.Printf("Processing %d safe action configurations", len(data.SafeOutputs.Actions))
-		for actionName := range data.SafeOutputs.Actions {
-			normalizedName := stringutil.NormalizeSafeOutputIdentifier(actionName)
-			if _, exists := safeOutputsConfig[normalizedName]; exists {
-				return "", fmt.Errorf(
-					"safe-outputs action %q has a normalized name %q that conflicts with an existing safe outputs config entry; rename the action to avoid the conflict",
-					actionName,
-					normalizedName,
-				)
-			}
-			safeOutputsConfigLog.Printf("Adding safe action to config: %s (normalized: %s)", actionName, normalizedName)
-			safeOutputsConfig[normalizedName] = true
-		}
-	}
-
+// addMentionsConfig adds mentions and max-bot-mentions configuration (consumed by the
+// ingestion step, not by standard handlers) to safeOutputsConfig.
+func addMentionsConfig(safeOutputsConfig map[string]any, safeOutputs *SafeOutputsConfig) {
 	// Mentions configuration: controls which @mentions are allowed in AI output.
-	// This is consumed by the ingestion step, not by standard handlers.
-	if data.SafeOutputs.Mentions != nil {
-		mentionsConfig := buildMentionsHandlerConfig(data.SafeOutputs.Mentions)
+	if safeOutputs.Mentions != nil {
+		mentionsConfig := buildMentionsHandlerConfig(safeOutputs.Mentions)
 		if len(mentionsConfig) > 0 {
 			safeOutputsConfig["mentions"] = mentionsConfig
 		}
 	}
 
 	// Max bot mentions: limits bot trigger references (e.g. "fixes #123") in AI output.
-	// Consumed by the ingestion step as a global config knob.
 	// Store as integer when possible (matching original behavior), or as expression string.
-	if data.SafeOutputs.MaxBotMentions != nil {
-		v := *data.SafeOutputs.MaxBotMentions
-		if n := templatableIntValue(data.SafeOutputs.MaxBotMentions); n > 0 {
+	if safeOutputs.MaxBotMentions != nil {
+		v := *safeOutputs.MaxBotMentions
+		if n := templatableIntValue(safeOutputs.MaxBotMentions); n > 0 {
 			safeOutputsConfig["max_bot_mentions"] = n
 		} else if strings.HasPrefix(v, "${{") {
 			safeOutputsConfig["max_bot_mentions"] = v
 		}
 	}
+}
 
-	// Push-repo-memory configuration: enables the push_repo_memory MCP tool for early
-	// size validation during the agent session.
-	if data.RepoMemoryConfig != nil && len(data.RepoMemoryConfig.Memories) > 0 {
-		var memories []map[string]any
-		for _, memory := range data.RepoMemoryConfig.Memories {
-			memories = append(memories, map[string]any{
-				"id":             memory.ID,
-				"dir":            constants.TmpRepoMemoryDir + memory.ID,
-				"max_file_size":  memory.MaxFileSize,
-				"max_patch_size": memory.MaxPatchSize,
-				"max_file_count": memory.MaxFileCount,
-			})
-		}
-		safeOutputsConfig["push_repo_memory"] = map[string]any{
-			"memories": memories,
-		}
-		safeOutputsConfigLog.Printf("Added push_repo_memory config with %d memory entries", len(data.RepoMemoryConfig.Memories))
+// addSafeJobsConfig adds safe-jobs configuration (custom output types that run as
+// separate GitHub Actions jobs) to safeOutputsConfig. These are not standard handlers
+// but must be in config.json so the ingestion step can validate and route those output types.
+func addSafeJobsConfig(safeOutputsConfig map[string]any, jobs map[string]*SafeJobConfig) {
+	if len(jobs) == 0 {
+		return
 	}
+	safeOutputsConfigLog.Printf("Processing %d safe job configurations", len(jobs))
+	for jobName, jobConfig := range jobs {
+		safeOutputsConfigLog.Printf("Generating config for safe job: %s", jobName)
+		safeJobConfig := buildSafeToolConfigFields(jobConfig.Description, jobConfig.Max, jobConfig.Inputs)
+		safeJobConfig["supports_dependencies"] = false
+		if jobConfig.Output != "" {
+			safeJobConfig["output"] = jobConfig.Output
+		}
+		safeOutputsConfig[jobName] = safeJobConfig
+	}
+}
 
-	if len(safeOutputsConfig) == 0 {
-		return "", nil
+// addSafeScriptsConfig adds safe-scripts configuration (script output types handled
+// inline by the handler manager) to safeOutputsConfig.
+func addSafeScriptsConfig(safeOutputsConfig map[string]any, scripts map[string]*SafeScriptConfig) {
+	if len(scripts) == 0 {
+		return
 	}
-	configJSON, err := json.Marshal(safeOutputsConfig)
-	if err != nil {
-		return "", fmt.Errorf("marshaling safe-outputs config: %w", err)
+	safeOutputsConfigLog.Printf("Processing %d safe script configurations", len(scripts))
+	for scriptName, scriptConfig := range scripts {
+		normalizedName := stringutil.NormalizeSafeOutputIdentifier(scriptName)
+		safeOutputsConfigLog.Printf("Generating config for safe script: %s (normalized: %s)", scriptName, normalizedName)
+		safeOutputsConfig[normalizedName] = buildSafeToolConfigFields(scriptConfig.Description, scriptConfig.Max, scriptConfig.Inputs)
 	}
-	safeOutputsConfigLog.Printf("Safe outputs config generation complete: %d tool types configured", len(safeOutputsConfig))
-	return string(configJSON), nil
+	addConnectorThreatWarningPolicies(safeOutputsConfig, scripts)
+}
+
+func addConnectorThreatWarningPolicies(config map[string]any, scripts map[string]*SafeScriptConfig) {
+	for name, script := range scripts {
+		if script.connectorInputSchema == nil {
+			continue
+		}
+		normalizedName := stringutil.NormalizeSafeOutputIdentifier(name)
+		handler, ok := config[normalizedName].(map[string]any)
+		if !ok {
+			handler = map[string]any{}
+		}
+		handler["threat_warning_policy"] = "abort"
+		if field, ok := script.connectorInputSchema["x-gh-aw-temporary-id"].(string); ok {
+			handler["temporary_id_field"] = field
+		}
+		if files := connectorStagedFilePolicies(script.connectorInputSchema); len(files) != 0 {
+			handler["staged_files"] = files
+		}
+		if script.connectorOptions != nil {
+			handler["connector_operation"] = true
+			handler["max"] = script.connectorOptions.Max
+			if script.connectorOptions.Staged != nil {
+				staged := script.connectorOptions.Staged
+				if isExpression(staged.String()) {
+					// Only interpolate a canonical boolean into the JSON config.
+					// An arbitrary expression result must not inject policy fields.
+					handler["staged"] = "${{ format('{0}', " + stripExpressionWrapper(staged.String()) + ") == 'true' }}"
+				} else {
+					handler["staged"] = templatableBoolIsTrue(staged)
+				}
+			}
+		}
+		config[normalizedName] = handler
+	}
+}
+
+func connectorStagedFilePolicies(schema map[string]any) map[string]any {
+	result := map[string]any{}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		if schema != nil {
+			safeOutputsConfigLog.Printf("connector staging metadata has no object properties")
+		}
+		return result
+	}
+	for name, raw := range properties {
+		property, ok := raw.(map[string]any)
+		if ok && property["x-gh-aw-staged-file"] != nil {
+			result[name] = property["x-gh-aw-staged-file"]
+		}
+	}
+	return result
+}
+
+func buildSafeToolConfigFields(description string, max int, inputs map[string]*InputDefinition) map[string]any {
+	config := make(map[string]any)
+	if description != "" {
+		config["description"] = description
+	}
+	if max > 0 {
+		config["max"] = max
+	}
+	if inputsConfig := buildSafeOutputInputsConfig(inputs); inputsConfig != nil {
+		config["inputs"] = inputsConfig
+	}
+	return config
+}
+
+// buildSafeOutputInputsConfig converts safe-job/safe-script input definitions into
+// the map[string]any shape expected in config.json, or nil when there are none.
+func buildSafeOutputInputsConfig(inputs map[string]*InputDefinition) map[string]any {
+	if len(inputs) == 0 {
+		return nil
+	}
+	inputsConfig := make(map[string]any)
+	for inputName, inputDef := range inputs {
+		inputConfig := map[string]any{
+			"type":        inputDef.Type,
+			"description": inputDef.Description,
+			"required":    inputDef.Required,
+		}
+		if inputDef.Default != "" {
+			inputConfig["default"] = inputDef.Default
+		}
+		if len(inputDef.Options) > 0 {
+			inputConfig["options"] = inputDef.Options
+		}
+		if inputDef.MaxLength != nil {
+			inputConfig["maxLength"] = *inputDef.MaxLength
+		}
+		inputsConfig[inputName] = inputConfig
+	}
+	return inputsConfig
+}
+
+// addSafeActionsConfig adds safe-actions configuration (custom GitHub Actions exposed
+// as safe output tools) to safeOutputsConfig. The normalized action names are added as
+// config keys so both MCP server implementations recognise them as enabled tools (the
+// tool schema is already in tools.json via tools_meta.json; the MCP server just needs
+// to see the name in config.json).
+func addSafeActionsConfig(safeOutputsConfig map[string]any, actions map[string]*SafeOutputActionConfig) error {
+	if len(actions) == 0 {
+		return nil
+	}
+	safeOutputsConfigLog.Printf("Processing %d safe action configurations", len(actions))
+	for actionName := range actions {
+		normalizedName := stringutil.NormalizeSafeOutputIdentifier(actionName)
+		if _, exists := safeOutputsConfig[normalizedName]; exists {
+			return fmt.Errorf(
+				"safe-outputs action %q has a normalized name %q that conflicts with an existing safe outputs config entry; rename the action to avoid the conflict",
+				actionName,
+				normalizedName,
+			)
+		}
+		safeOutputsConfigLog.Printf("Adding safe action to config: %s (normalized: %s)", actionName, normalizedName)
+		safeOutputsConfig[normalizedName] = true
+	}
+	return nil
+}
+
+// addPushRepoMemoryConfig adds push_repo_memory configuration (enables the
+// push_repo_memory MCP tool for early size/eligibility validation during the agent
+// session) to safeOutputsConfig, when repo-memory is configured.
+func addPushRepoMemoryConfig(safeOutputsConfig map[string]any, repoMemoryConfig *RepoMemoryConfig) {
+	if repoMemoryConfig == nil || len(repoMemoryConfig.Memories) == 0 {
+		return
+	}
+	var memories []map[string]any
+	for _, memory := range repoMemoryConfig.Memories {
+		memoryConfig := map[string]any{
+			"id":             memory.ID,
+			"dir":            constants.TmpRepoMemoryDir + memory.ID,
+			"max_file_size":  memory.MaxFileSize,
+			"max_patch_size": memory.MaxPatchSize,
+			"max_file_count": memory.MaxFileCount,
+		}
+		if len(memory.AllowedExtensions) > 0 {
+			memoryConfig["allowed_extensions"] = memory.AllowedExtensions
+		}
+		if len(memory.FileGlob) > 0 {
+			memoryConfig["file_glob"] = strings.Join(memory.FileGlob, " ")
+		}
+		if memory.FormatJSON {
+			memoryConfig["format_json"] = true
+		}
+		if memory.Validation != nil {
+			validationConfig := map[string]any{}
+			if memory.Validation.Script != "" {
+				validationConfig["script"] = memory.Validation.Script
+				validationConfig["script_required"] = true
+			}
+			if len(memory.Validation.JSONSchemas) > 0 {
+				validationConfig["json_schemas"] = memory.Validation.JSONSchemas
+				validationConfig["json_schemas_required"] = true
+			}
+			validationConfig["timeout"] = memoryValidationTimeoutSeconds(memory.Validation)
+			memoryConfig["validation"] = validationConfig
+		}
+		memories = append(memories, memoryConfig)
+	}
+	safeOutputsConfig["push_repo_memory"] = map[string]any{
+		"memories": memories,
+	}
+	safeOutputsConfigLog.Printf("Added push_repo_memory config with %d memory entries", len(repoMemoryConfig.Memories))
 }
 
 func getEngineAgentFileInfoFromWorkflowData(data *WorkflowData) (manifestFiles []string, pathPrefixes []string) {
@@ -239,30 +420,11 @@ func getEngineAgentFileInfoFromWorkflowData(data *WorkflowData) (manifestFiles [
 	return provider.GetAgentManifestFiles(), provider.GetAgentManifestPathPrefixes()
 }
 
-// generateCustomJobToolDefinition creates an MCP tool definition for a custom safe-output job.
-// Returns a map representing the tool definition in MCP format with name, description, and inputSchema.
-func generateCustomJobToolDefinition(jobName string, jobConfig *SafeJobConfig) map[string]any {
-	safeOutputsConfigLog.Printf("Generating tool definition for custom job: %s", jobName)
-
-	description := jobConfig.Description
-	if description == "" {
-		description = fmt.Sprintf("Execute the %s custom job", jobName)
-	}
-
-	inputSchema := map[string]any{
-		"type":                 "object",
-		"properties":           make(map[string]any),
-		"additionalProperties": false,
-	}
-
+// populateCustomJobToolProperties fills properties (an MCP tool inputSchema.properties
+// map) from the given safe-job input definitions, returning the names of required inputs.
+func populateCustomJobToolProperties(properties map[string]any, inputs map[string]*InputDefinition) []string {
 	var requiredFields []string
-	properties, ok := inputSchema["properties"].(map[string]any)
-	if !ok {
-		properties = make(map[string]any)
-		inputSchema["properties"] = properties
-	}
-
-	for inputName, inputDef := range jobConfig.Inputs {
+	for inputName, inputDef := range inputs {
 		property := map[string]any{}
 
 		if inputDef.Description != "" {
@@ -283,6 +445,10 @@ func generateCustomJobToolDefinition(jobName string, jobConfig *SafeJobConfig) m
 			property["type"] = "string"
 		}
 
+		if inputDef.MaxLength != nil && (inputDef.Type == "" || inputDef.Type == "string") {
+			property["maxLength"] = *inputDef.MaxLength
+		}
+
 		if inputDef.Default != nil {
 			property["default"] = inputDef.Default
 		}
@@ -293,6 +459,31 @@ func generateCustomJobToolDefinition(jobName string, jobConfig *SafeJobConfig) m
 
 		properties[inputName] = property
 	}
+	return requiredFields
+}
+
+// generateCustomJobToolDefinition creates an MCP tool definition for a custom safe-output job.
+// Returns a map representing the tool definition in MCP format with name, description, and inputSchema.
+func generateCustomJobToolDefinition(jobName string, jobConfig *SafeJobConfig) map[string]any {
+	safeOutputsConfigLog.Printf("Generating tool definition for custom job: %s", jobName)
+
+	description := jobConfig.Description
+	if description == "" {
+		description = fmt.Sprintf("Execute the %s custom job", jobName)
+	}
+
+	inputSchema := map[string]any{
+		"type":                 "object",
+		"properties":           make(map[string]any),
+		"additionalProperties": false,
+	}
+
+	properties, ok := inputSchema["properties"].(map[string]any)
+	if !ok {
+		properties = make(map[string]any)
+		inputSchema["properties"] = properties
+	}
+	requiredFields := populateCustomJobToolProperties(properties, jobConfig.Inputs)
 
 	if len(requiredFields) > 0 {
 		sort.Strings(requiredFields)

@@ -2,21 +2,21 @@
 jobs:
   check_token_telemetry:
     runs-on: ubuntu-latest
-    needs: [agent]
+    needs: [agent, activation, detection]
     if: needs.agent.result == 'success'
     permissions:
       contents: read
     steps:
       - name: Download agent artifact
         id: download-agent
-        continue-on-error: true
-        uses: actions/download-artifact@v8.0.1
+        if: ${{ !contains(fromJSON('["kiro","cursor"]'), needs.activation.outputs.engine_id) }}
+        uses: actions/download-artifact@v8.0.2
         with:
           name: agent
           path: /tmp/gh-aw/
 
       - name: Assert token_usage.jsonl is non-empty
-        if: steps.download-agent.outcome == 'success'
+        if: steps.download-agent.outcome == 'success' && !contains(fromJSON('["kiro","cursor"]'), needs.activation.outputs.engine_id)
         run: |
           # The AWF firewall proxy writes token_usage.jsonl for every LLM API call.
           # If all token_usage.jsonl files are missing or empty, the emitter is broken.
@@ -40,12 +40,11 @@ jobs:
           if [ "${FOUND_NONEMPTY}" != "true" ]; then
             echo "::error::All token_usage.jsonl files are empty or missing after a successful agent run."
             echo "::error::The AWF firewall proxy token telemetry emitter may be broken."
-            echo "::error::See tracking issue: https://github.com/github/gh-aw/issues/42791"
             exit 1
           fi
 
       - name: Assert agent_usage.json has non-zero token counts
-        if: steps.download-agent.outcome == 'success'
+        if: steps.download-agent.outcome == 'success' && !contains(fromJSON('["kiro","cursor"]'), needs.activation.outputs.engine_id)
         run: |
           USAGE_FILE="/tmp/gh-aw/agent_usage.json"
           if [ ! -f "${USAGE_FILE}" ]; then
@@ -59,12 +58,20 @@ jobs:
             exit 1
           fi
           echo "OK: agent_usage.json reports ${INPUT_TOKENS} input tokens"
+
+      - name: Report engines without proxy token telemetry
+        if: contains(fromJSON('["kiro","cursor"]'), needs.activation.outputs.engine_id)
+        run: echo "::notice::This engine does not provide proxy token counts; token telemetry assertions are not applicable."
 ---
 <!--
 # Token Telemetry Check
 
 This shared workflow adds a `check_token_telemetry` job that runs after the `agent` job
-and asserts that AWF firewall proxy token telemetry is functioning correctly.
+and asserts that AWF firewall proxy token telemetry is functioning correctly
+for engines that provide proxy token counts, including Goose. Kiro and Cursor do not
+currently provide these counts, so the job reports that the assertions are
+not applicable without downloading the agent artifact, instead of treating missing
+proxy records as a regression. Artifact download failures remain fatal for supported engines.
 
 It guards against silent regressions in the `token_usage.jsonl` emitter, which feeds
 downstream token-cost and API-consumption audits.

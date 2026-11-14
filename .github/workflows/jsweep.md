@@ -15,13 +15,15 @@ engine:
 max-tool-denials: 3
 runtimes:
   node:
-    version: "20"
+    version: "24"
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [repos]
   edit:
   bash: ["*"]
@@ -39,10 +41,10 @@ lsp:
 steps:
   - name: Install Node.js dependencies
     working-directory: actions/setup/js
-    run: npm install
+    run: npm ci
 safe-outputs:
+  steer: false
   create-pull-request:
-    expires: 2d
     title-prefix: "[jsweep] "
     branch-prefix: "signed/"
     labels: [unbloat, automation]
@@ -55,9 +57,6 @@ timeout-minutes: 20
 strict: true
 
 
-sandbox:
-  agent:
-    sudo: false
 ---
 
 # jsweep - JavaScript Unbloater
@@ -102,7 +101,7 @@ fi
 {"cleaned_files":[{"file":"name.cjs","cleaned_at":"YYYY-MM-DD"}],"last_run":"YYYY-MM-DD","last_file":"name.cjs","cache_hit_history":[{"run_id":"123","date":"YYYY-MM-DD","status":"hit"}]}
 ```
 
-**On cold start** (state file missing): initialize to an empty `cleaned_files` list and note this as a cold start. Do not call `missing_data` — a cold start is expected on first run; simply proceed with an empty history.
+**On cold start** (state file missing): initialize to an empty `cleaned_files` list and note this as a cold start. Do not call `report_missing_data` — a cold start is expected on first run; simply proceed with an empty history.
 
 **Selecting the next file:**
 - Files to scan: `/home/runner/work/gh-aw/gh-aw/actions/setup/js/*.cjs`

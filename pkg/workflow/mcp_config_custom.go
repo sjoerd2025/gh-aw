@@ -54,27 +54,29 @@ func renderCustomMCPConfigWrapperWithContext(yaml *strings.Builder, toolName str
 //
 // For TOML output, GitHub Actions template expressions are rewritten to direct
 // ${VAR} references because Codex config expects shell-style environment
-// expansion. For JSON output, Copilot uses escaped \${VAR} passthrough syntax,
-// while non-Copilot engines use bash variable substitution to avoid embedding
-// secret expressions directly in the generated run block.
-func renderCustomMCPEnvVars(env map[string]string, tomlFormat, requiresCopilotFields bool) map[string]string {
+// expansion. For JSON output, both Copilot and non-Copilot engines use the
+// escaped \${VAR} passthrough syntax. The MCP gateway JSON config is written
+// inside an unquoted heredoc, so any unescaped ${VAR} reference would be
+// expanded by bash before the gateway sees it — splicing the raw secret bytes
+// into JSON text. A secret value containing a '"' or '\' character would
+// corrupt the JSON. Backslash-escaping (\${VAR}) prevents the heredoc from
+// expanding the variable; bash only strips the leading backslash, leaving the
+// literal ${VAR} string in the JSON, which the gateway then resolves safely
+// from its own environment (RGS-008 compliance).
+func renderCustomMCPEnvVars(env map[string]string, tomlFormat bool) map[string]string {
 	renderedEnv := make(map[string]string, len(env))
 	for envKey, envValue := range env {
 		if tomlFormat {
-			// Replace template expressions with environment variable references for TOML.
-			// For TOML, we use direct shell variable syntax without backslash.
-			envValue = strings.ReplaceAll(envValue, "${{ secrets.", "${")
-			envValue = strings.ReplaceAll(envValue, "${{ env.", "${")
+			secrets := ExtractSecretsFromValue(envValue)
+			envValue = replaceEnvExpressionsWithPrefixedEnvVars(envValue, "${")
+			envValue = ReplaceSecretsWithShellEnvVars(envValue, secrets)
 			envValue = strings.ReplaceAll(envValue, "${{ github.workspace }}", "${GITHUB_WORKSPACE}")
-			envValue = strings.ReplaceAll(envValue, " }}", "}")
-		} else if requiresCopilotFields {
-			// For Copilot, replace all template expressions with \${VAR} syntax.
-			envValue = ReplaceTemplateExpressionsWithEnvVars(envValue)
 		} else {
-			// For non-Copilot engines, replace secrets with ${VAR} bash expansion so
-			// they are never directly interpolated in the run block (RGS-008). The
-			// env vars are injected into the step env block by collectMCPEnvironmentVariables.
-			envValue = ReplaceSecretsWithBashVars(envValue)
+			// For both Copilot and non-Copilot JSON engines, replace all template
+			// expressions with \${VAR} passthrough syntax. This keeps raw secret values
+			// out of the heredoc (RGS-008) and produces valid JSON regardless of the
+			// characters contained in the secret at runtime.
+			envValue, _ = replaceMCPExpressions(envValue, true)
 		}
 		renderedEnv[envKey] = envValue
 	}
@@ -142,12 +144,14 @@ func determineMCPPropertyOrder(toolName string, mcpConfig *parser.RegistryMCPSer
 		return []string{"type", "container", "entrypoint", "entrypointArgs", "mounts", "command", "args", "tools", "env", "proxy-args", "registry", "required"}, true
 	case "http":
 		if renderer.Format == "toml" {
-			return []string{"url", "http_headers"}, true
+			// Forward-looking: production HTTP MCP callers currently use JSON;
+			// this TOML property order is not exercised by engine compilation.
+			return []string{"url", "ca_cert_file", "http_headers"}, true
 		}
 		if len(headerSecrets) > 0 {
-			return []string{"type", "url", "headers", "auth", "tools", "env", "required"}, true
+			return []string{"type", "url", "caCertFile", "headers", "auth", "tools", "env", "required"}, true
 		}
-		return []string{"type", "url", "headers", "auth", "tools", "required"}, true
+		return []string{"type", "url", "caCertFile", "headers", "auth", "tools", "required"}, true
 	default:
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Custom MCP server '%s' has unsupported type '%s'. Supported types: stdio, http", toolName, mcpConfig.Type)))
 		return nil, false
@@ -186,6 +190,8 @@ func shouldRenderMCPProperty(prop string, mcpConfig *parser.RegistryMCPServerCon
 		return len(mcpConfig.Env) > 0 || len(headerSecrets) > 0
 	case "url":
 		return mcpConfig.URL != ""
+	case "caCertFile", "ca_cert_file":
+		return mcpConfig.CACertFile != ""
 	case "headers", "http_headers":
 		return len(mcpConfig.Headers) > 0
 	case "auth":
@@ -211,7 +217,7 @@ func renderMCPProperties(yaml *strings.Builder, properties []string, mcpConfig *
 
 func renderMCPProperty(yaml *strings.Builder, property string, isLast bool, mcpConfig *parser.RegistryMCPServerConfig, renderer MCPConfigRenderer, headerSecrets map[string]string) {
 	switch property {
-	case "type", "container", "entrypoint", "command", "url", "registry", "required":
+	case "type", "container", "entrypoint", "command", "url", "registry", "required", "caCertFile", "ca_cert_file":
 		renderMCPScalarProperty(yaml, property, isLast, mcpConfig, renderer)
 	case "tools", "entrypointArgs", "mounts", "args", "proxy-args":
 		renderMCPArrayProperty(yaml, property, isLast, mcpConfig, renderer)
@@ -246,9 +252,15 @@ func renderMCPScalarProperty(yaml *strings.Builder, property string, isLast bool
 		if renderer.RewriteLocalhostToDocker {
 			urlValue = rewriteLocalhostToDockerHost(urlValue)
 		}
+		if renderer.Format == "json" {
+			urlValue, _ = replaceMCPExpressions(urlValue, false)
+		}
 		renderMCPStringScalar(yaml, renderer, "url", urlValue, isLast)
 	case "registry":
 		renderMCPStringScalar(yaml, renderer, "registry", mcpConfig.Registry, isLast)
+	case "caCertFile", "ca_cert_file":
+		value := replaceMCPCACertFileExpressions(mcpConfig.CACertFile)
+		renderMCPStringScalar(yaml, renderer, property, value, isLast)
 	case "required":
 		if renderer.Format == "json" && mcpConfig.Required != nil && !*mcpConfig.Required {
 			fmt.Fprintf(yaml, "%s\"required\": false%s\n", renderer.IndentLevel, renderMCPComma(isLast))
@@ -261,11 +273,14 @@ func renderMCPStringScalar(yaml *strings.Builder, renderer MCPConfigRenderer, ke
 		fmt.Fprintf(yaml, "%s%s = \"%s\"\n", renderer.IndentLevel, key, value)
 		return
 	}
+	if key != "caCertFile" && key != "ca_cert_file" {
+		value, _ = replaceMCPExpressions(value, false)
+	}
 	renderMCPJSONScalar(yaml, renderer, key, value, isLast)
 }
 
 func renderMCPJSONScalar(yaml *strings.Builder, renderer MCPConfigRenderer, key, value string, isLast bool) {
-	fmt.Fprintf(yaml, "%s\"%s\": \"%s\"%s\n", renderer.IndentLevel, key, value, renderMCPComma(isLast))
+	fmt.Fprintf(yaml, "%s\"%s\": %s%s\n", renderer.IndentLevel, key, marshalMCPHeredocString(normalizeMCPShellReferences(value)), renderMCPComma(isLast))
 }
 
 func renderMCPArrayProperty(yaml *strings.Builder, property string, isLast bool, mcpConfig *parser.RegistryMCPServerConfig, renderer MCPConfigRenderer) {
@@ -275,15 +290,15 @@ func renderMCPArrayProperty(yaml *strings.Builder, property string, isLast bool,
 		if len(values) == 0 {
 			values = []string{"*"}
 		}
-		renderMCPArray(yaml, renderer, "tools", values, isLast, false)
+		renderMCPArray(yaml, renderer, "tools", values, isLast, true)
 	case "entrypointArgs":
-		renderMCPArray(yaml, renderer, "entrypointArgs", mcpConfig.EntrypointArgs, isLast, renderer.RequiresCopilotFields)
+		renderMCPArray(yaml, renderer, "entrypointArgs", mcpConfig.EntrypointArgs, isLast, true)
 	case "mounts":
-		renderMCPArray(yaml, renderer, "mounts", mcpConfig.Mounts, isLast, renderer.RequiresCopilotFields)
+		renderMCPArray(yaml, renderer, "mounts", mcpConfig.Mounts, isLast, true)
 	case "args":
-		renderMCPArray(yaml, renderer, "args", mcpConfig.Args, isLast, false)
+		renderMCPArray(yaml, renderer, "args", mcpConfig.Args, isLast, true)
 	case "proxy-args":
-		renderMCPArray(yaml, renderer, "proxy-args", mcpConfig.ProxyArgs, isLast, false)
+		renderMCPArray(yaml, renderer, "proxy-args", mcpConfig.ProxyArgs, isLast, true)
 	}
 }
 
@@ -299,9 +314,9 @@ func renderMCPArray(yaml *strings.Builder, renderer MCPConfigRenderer, key strin
 	fmt.Fprintf(yaml, "%s\"%s\": [\n", renderer.IndentLevel, jsonKey)
 	for i, value := range values {
 		if replaceTemplates {
-			value = ReplaceTemplateExpressionsWithEnvVars(value)
+			value, _ = replaceMCPExpressions(value, false)
 		}
-		fmt.Fprintf(yaml, "%s  \"%s\"%s\n", renderer.IndentLevel, value, renderMCPComma(i == len(values)-1))
+		fmt.Fprintf(yaml, "%s  %s%s\n", renderer.IndentLevel, marshalMCPHeredocString(normalizeMCPShellReferences(value)), renderMCPComma(i == len(values)-1))
 	}
 	fmt.Fprintf(yaml, "%s]%s\n", renderer.IndentLevel, renderMCPComma(isLast))
 }
@@ -331,14 +346,31 @@ func renderMCPMapProperty(yaml *strings.Builder, property string, isLast bool, m
 	case "env":
 		renderMCPEnvMap(yaml, isLast, mcpConfig, renderer, headerSecrets)
 	case "http_headers":
-		writeTOMLInlineStringMapSection(yaml, renderer.IndentLevel, "http_headers", mcpConfig.Headers)
+		writeTOMLInlineStringMapSection(yaml, renderer.IndentLevel, "http_headers", renderCustomMCPHeadersTOML(mcpConfig.Headers, headerSecrets))
 	case "headers":
 		renderMCPHeadersMap(yaml, isLast, mcpConfig, renderer, headerSecrets)
 	}
 }
 
+// renderCustomMCPHeadersTOML normalizes HTTP MCP header values for TOML output.
+//
+// The TOML config is written inside an expanding heredoc in a `run:` block, so any
+// `${{ secrets.* }}` expression left in a header value would be interpolated into the
+// shell script source before execution, making the raw secret bytes part of the script
+// text (RGS-008). Rewriting the expression as a ${VAR} shell reference keeps the secret
+// out of the script: it is resolved by the shell from the step's `env:` mapping, which
+// already carries every secret referenced by HTTP MCP headers.
+func renderCustomMCPHeadersTOML(headers map[string]string, headerSecrets map[string]string) map[string]string {
+	renderedHeaders := make(map[string]string, len(headers))
+	for headerKey, headerValue := range headers {
+		headerValue = ReplaceSecretsWithShellEnvVars(headerValue, headerSecrets)
+		renderedHeaders[headerKey] = replaceEnvExpressionsWithPrefixedEnvVars(headerValue, "${")
+	}
+	return renderedHeaders
+}
+
 func renderMCPEnvMap(yaml *strings.Builder, isLast bool, mcpConfig *parser.RegistryMCPServerConfig, renderer MCPConfigRenderer, headerSecrets map[string]string) {
-	renderedEnv := renderCustomMCPEnvVars(mcpConfig.Env, renderer.Format == "toml", renderer.RequiresCopilotFields)
+	renderedEnv := renderCustomMCPEnvVars(mcpConfig.Env, renderer.Format == "toml")
 	if renderer.Format == "toml" {
 		writeTOMLInlineStringMapSection(yaml, renderer.IndentLevel, "env", renderedEnv)
 		return
@@ -348,18 +380,15 @@ func renderMCPEnvMap(yaml *strings.Builder, isLast bool, mcpConfig *parser.Regis
 			renderedEnv[varName] = "\\${" + varName + "}"
 		}
 	}
-	writeJSONStringMapSectionRaw(yaml, renderer.IndentLevel, "env", renderedEnv, !isLast)
+	writeJSONStringMapSectionWithEntries(yaml, renderer.IndentLevel, "env", renderedEnv, !isLast, writeMCPHeredocStringMapEntries)
 }
 
 func renderMCPHeadersMap(yaml *strings.Builder, isLast bool, mcpConfig *parser.RegistryMCPServerConfig, renderer MCPConfigRenderer, headerSecrets map[string]string) {
 	renderedHeaders := make(map[string]string, len(mcpConfig.Headers))
 	for headerKey, headerValue := range mcpConfig.Headers {
-		if len(headerSecrets) > 0 {
-			headerValue = ReplaceSecretsWithEnvVars(headerValue, headerSecrets)
-		}
-		renderedHeaders[headerKey] = headerValue
+		renderedHeaders[headerKey], _ = replaceMCPExpressions(headerValue, true)
 	}
-	writeJSONStringMapSectionRaw(yaml, renderer.IndentLevel, "headers", renderedHeaders, !isLast)
+	writeJSONStringMapSectionWithEntries(yaml, renderer.IndentLevel, "headers", renderedHeaders, !isLast, writeMCPHeredocStringMapEntries)
 }
 
 func renderMCPAuthProperty(yaml *strings.Builder, isLast bool, mcpConfig *parser.RegistryMCPServerConfig, renderer MCPConfigRenderer) {
@@ -421,6 +450,7 @@ func validateMCPKnownProperties(toolConfig map[string]any, toolName string) erro
 		"url":            {},
 		"headers":        {},
 		"auth":           {},
+		"ca-cert-file":   {},
 		"registry":       {},
 		"allowed":        {},
 		"toolsets":       {},
@@ -576,6 +606,10 @@ func getMCPConfig(toolConfig map[string]any, toolName string) (*parser.RegistryM
 		return nil, err
 	}
 	result.Type = mcpType
+	result.CACertFile, err = parser.ParseMCPCACertFile(toolConfig, result.Type, toolName)
+	if err != nil {
+		return nil, err
+	}
 
 	if registry, ok := config.GetString("registry"); ok {
 		result.Registry = registry

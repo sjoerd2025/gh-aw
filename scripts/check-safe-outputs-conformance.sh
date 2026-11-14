@@ -4,8 +4,8 @@ set +o histexpand
 # Safe Outputs Specification Conformance Checker
 # This script implements automated checks for the Safe Outputs specification
 # Specification: docs/src/content/docs/specs/safe-outputs-specification.md
-# Spec Version: 1.26.0 (2026-07-16)
-# Script Version: 1.26.0 (2026-07-20)
+# Spec Version: 1.29.21 (2026-11-08)
+# Script Version: 1.29.21 (2026-11-09)
 
 set -euo pipefail
 
@@ -67,7 +67,9 @@ check_privilege_separation() {
     # Find all compiled workflow files
     find .github/workflows -name "*.lock.yml" | while read -r workflow; do
         # Check if agent job has write permissions
-        if grep -A 50 "^jobs:" "$workflow" | grep -A 20 "^\s*agent:" | grep -qE "issues:\s*write|pull-requests:\s*write|contents:\s*write"; then
+        jobs_section=$(grep -A 50 "^jobs:" "$workflow" 2>/dev/null || true)
+        agent_section=$(grep -A 20 "^\s*agent:" <<< "$jobs_section" 2>/dev/null || true)
+        if grep -qE "issues:\s*write|pull-requests:\s*write|contents:\s*write" <<< "$agent_section"; then
             log_critical "SEC-001: Agent job in $workflow has write permissions"
             failed=1
         fi
@@ -86,7 +88,7 @@ check_validation_ordering() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test files
-        [[ "$handler" =~ test ]] && continue
+        [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         [[ "$handler" =~ parse ]] && continue
         [[ "$handler" =~ buffer ]] && continue
         
@@ -113,7 +115,7 @@ check_max_limits() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test and utility files
-        [[ "$handler" =~ (test|parse|buffer|factory) ]] && continue
+        [[ "$handler" =~ (test|parse|buffer|factory)|_checks\.cjs$ ]] && continue
         
         # Only check files that perform GitHub API operations
         if ! grep -q "octokit\." "$handler"; then
@@ -137,18 +139,21 @@ check_max_limits
 echo "Running SEC-004: Content Sanitization Required..."
 check_sanitization() {
     local failed=0
-    
-    for handler in actions/setup/js/*.cjs; do
+
+    for handler in actions/setup/js/{add_comment,create_issue,create_discussion,create_pull_request,update_issue,close_issue,close_discussion,close_pull_request,add_labels,remove_labels,create_check_run,approve_workflow_run,create_pr_review_comment,comment_memory,create_agent_session,assign_milestone,create_project,create_forecast_issue}.cjs; do
         # Skip test and utility files
-        [[ "$handler" =~ (test|parse|buffer) ]] && continue
+        [[ "$handler" =~ (test|parse|buffer)|_checks\.cjs$ ]] && continue
+        [ ! -f "$handler" ] && continue
 
         # Skip files with a documented SEC-004 exemption annotation
         if grep -q "@safe-outputs-exempt[[:space:]]\\+SEC-004" "$handler"; then
             continue
         fi
         
-        # Check if handler has body/content fields
-        if grep -q "\"body\"\|body:" "$handler"; then
+        # Only inspect handlers that process body/title/content fields for safe-output operations.
+        # Files with other operational roles (for example completion helpers) are exempt unless
+        # they explicitly process safe-output content.
+        if grep -qE '"body"|body:|"title"|title:|"content"|content:' "$handler"; then
             # Check for sanitization
             if ! grep -q "sanitize\|stripHTML\|escapeMarkdown\|cleanContent" "$handler"; then
                 log_medium "SEC-004: $handler has body field but no sanitization"
@@ -170,7 +175,7 @@ check_cross_repo() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test files
-        [[ "$handler" =~ test ]] && continue
+        [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         
         # Skip files with a documented SEC-005 exemption annotation
         if grep -q "@safe-outputs-exempt.*SEC-005" "$handler"; then
@@ -200,8 +205,13 @@ check_error_codes() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test files and non-safe-output modules
-        [[ "$handler" =~ test ]] && continue
+        [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         [[ "$handler" =~ (apm_unpack|run_apm_unpack|observability|generate_observability) ]] && continue
+
+        # Skip files with a documented USE-001 exemption annotation
+        if grep -q "@safe-outputs-exempt[[:space:]]\\+USE-001" "$handler"; then
+            continue
+        fi
         
         # Only check handlers that interact with GitHub via octokit or record safe output operations
         if ! grep -qE "octokit\.|safe_output|safeOutput|NDJSON" "$handler"; then
@@ -253,9 +263,14 @@ check_staged_mode() {
     
     for handler in actions/setup/js/*.cjs; do
         # Skip test files and non-safe-output modules
-        [[ "$handler" =~ test ]] && continue
+        [[ "$handler" =~ test|_checks\.cjs$ ]] && continue
         [[ "$handler" =~ (apm_unpack|run_apm_unpack|observability|generate_observability) ]] && continue
-        
+
+        # Skip files with a documented USE-003 exemption annotation
+        if grep -q "@safe-outputs-exempt[[:space:]]\\+USE-003" "$handler"; then
+            continue
+        fi
+
         # Only check handlers that explicitly reference the safe outputs staged mode env var
         if grep -q "GH_AW_SAFE_OUTPUTS_STAGED\|logStagedPreviewInfo\|generateStagedPreview" "$handler"; then
             # Check for emoji in preview
@@ -280,7 +295,8 @@ check_rfc2119() {
     
     # Check key sections have RFC 2119 keywords
     for section in "Security Architecture" "Configuration Semantics" "Execution Guarantees"; do
-        if ! grep -A 200 "## .*$section" "$spec_file" 2>/dev/null | grep -q "MUST\|SHALL\|SHOULD\|MAY"; then
+        section_text=$(grep -A 200 "## .*$section" "$spec_file" 2>/dev/null || true)
+        if ! grep -q "MUST\|SHALL\|SHOULD\|MAY" <<< "$section_text"; then
             log_medium "REQ-001: Section '$section' may lack RFC 2119 keywords"
             failed=1
         fi
@@ -298,13 +314,17 @@ check_type_completeness() {
     local spec_file="docs/src/content/docs/specs/safe-outputs-specification.md"
     local failed=0
     
-    # Extract type names
-    grep "^#### Type:" "$spec_file" 2>/dev/null | sed 's/^#### Type: //' | head -10 | while read -r type_name; do
+    # Extract type names. Process substitution keeps the loop in this shell so its failures reach the summary.
+    while read -r type_name; do
         sections_found=0
-        
+
+        # Bound each type at the next heading. A fixed line window truncates long types and also matches
+        # sibling types that share the name prefix, such as create_pull_request_review_comment.
+        type_section=$(awk -v name="$type_name" '$0 == "#### Type: " name {found=1; next} found && (/^###? / || /^#### Type: /) {exit} found' "$spec_file")
+
         # Check for required sections
         for section in "MCP Tool Schema" "Operational Semantics" "Configuration Parameters" "Security Requirements" "Required Permissions"; do
-            if grep -A 200 "^#### Type: $type_name" "$spec_file" 2>/dev/null | grep -q "**$section**"; then
+            if grep -q "**$section**" <<< "$type_section"; then
                 ((sections_found += 1))
             fi
         done
@@ -313,8 +333,8 @@ check_type_completeness() {
             log_medium "REQ-002: Type '$type_name' has only $sections_found/5 required sections"
             failed=1
         fi
-    done
-    
+    done < <(grep "^#### Type:" "$spec_file" 2>/dev/null | sed 's/^#### Type: //')
+
     if [ $failed -eq 0 ]; then
         log_pass "REQ-002: All safe output types have complete documentation"
     fi
@@ -330,7 +350,8 @@ check_verification_methods() {
     # Check key requirements have verification methods
     # Accept both bold (**Verification:**) and italic (*Verification*:) formats
     for req in "AR1" "AR2" "AR3" "SP1" "SP2" "SP3"; do
-        if ! grep -A 30 "\*\*Requirement $req:\|\*\*Property $req:" "$spec_file" 2>/dev/null | grep -qE "\*\*Verification\*\*:|\*Verification\*:|\*\*Formal Definition\*\*:|\*Formal Definition\*:"; then
+        req_section=$(grep -A 30 "\*\*Requirement $req:\|\*\*Property $req:" "$spec_file" 2>/dev/null || true)
+        if ! grep -qE "\*\*Verification\*\*:|\*Verification\*:|\*\*Formal Definition\*\*:|\*Formal Definition\*:" <<< "$req_section"; then
             log_low "REQ-003: Requirement $req may lack verification method"
             failed=1
         fi
@@ -422,6 +443,236 @@ check_schema_consistency() {
 }
 check_schema_consistency
 
+# IMP-004: Safe Output Config Schema Coverage
+check_safe_output_config_schema_coverage() {
+    local missing_properties
+
+    echo "Running IMP-004: Safe Output Config Schema Coverage..."
+
+    missing_properties=$(python3 - <<'PY'
+import json
+import re
+from pathlib import Path
+
+schema = json.loads(Path("pkg/parser/schemas/main_workflow_schema.json").read_text())
+structs = {}
+handler_fields = {}
+
+for path in Path("pkg/workflow").glob("*.go"):
+    if path.name.endswith("_test.go"):
+        continue
+    content = path.read_text()
+    for match in re.finditer(r"(?ms)^type\s+(\w+)\s+struct\s*\{(.*?)^\}", content):
+        structs[match.group(1)] = match.group(2)
+
+handlers = Path("pkg/workflow/safe_output_handlers.go").read_text()
+handler_key = None
+for line in handlers.splitlines():
+    key_match = re.search(r'Key:\s*"([^"]+)"', line)
+    if key_match:
+        handler_key = key_match.group(1)
+    field_match = re.search(r'StructField:\s*"([^"]+)"', line)
+    if field_match and handler_key:
+        handler_fields[field_match.group(1)] = handler_key
+
+compiler_populated_fields = {
+    "safe-outputs.call-workflow.workflow_files",
+    "safe-outputs.dispatch-workflow.workflow_files",
+    "safe-outputs.dispatch-workflow.aw_context_workflows",
+    "safe-outputs.dispatch-workflow.work_queue_workflows",
+}
+
+tool_configured_outputs = {"comment-memory"}
+
+
+def yaml_fields(struct_name):
+    for line in structs.get(struct_name, "").splitlines():
+        match = re.match(r'\s*(.*?)\s+`yaml:"([^"]+)"', line)
+        if not match:
+            continue
+        tag = match.group(2).split(",", 1)[0]
+        if tag == "-":
+            continue
+        yield tag, ",inline" in match.group(2)
+
+
+def properties(node):
+    result = {}
+    ref = node.get("$ref", "")
+    defs_prefix = "#/$defs/"
+    if ref.startswith(defs_prefix):
+        result.update(properties(schema["$defs"][ref[len(defs_prefix):]]))
+    for name, definition in node.get("properties", {}).items():
+        if name in result and result[name] != definition:
+            raise ValueError(f"conflicting schema definitions for property: {name}")
+        result[name] = definition
+    for alternative in ("allOf", "anyOf", "oneOf"):
+        for child in node.get(alternative, []):
+            for name, definition in properties(child).items():
+                if name in result and result[name] != definition:
+                    raise ValueError(f"conflicting schema definitions for property: {name}")
+                result[name] = definition
+    return result
+
+
+missing = []
+
+
+safe_outputs = properties(schema["properties"]["safe-outputs"])
+for line in structs["SafeOutputsConfig"].splitlines():
+    match = re.match(r'\s*(\w+)\s+\*?(\w+)\s+`yaml:"([^"]+)"', line)
+    if not match:
+        continue
+    struct_field, config_type, output_name = match.groups()
+    if struct_field not in handler_fields:
+        continue
+    output_name = output_name.split(",", 1)[0]
+    if output_name in tool_configured_outputs:
+        continue
+    output_schema = safe_outputs.get(output_name)
+    if output_schema is None:
+        missing.append(f"safe-outputs.{output_name}")
+        continue
+
+    output_properties = properties(output_schema)
+    for tag, inline in yaml_fields(config_type):
+        property_path = f"safe-outputs.{output_name}.{tag}"
+        if not inline and property_path not in compiler_populated_fields and tag not in output_properties:
+            missing.append(property_path)
+
+print("\n".join(sorted(set(missing))))
+PY
+)
+
+    if [ -n "$missing_properties" ]; then
+        while IFS= read -r property; do
+            log_high "IMP-004: Safe output config property is missing from schema: $property"
+        done <<< "$missing_properties"
+    else
+        log_pass "IMP-004: All safe output config properties are declared in the schema"
+    fi
+}
+check_safe_output_config_schema_coverage
+
+# IMP-005: Safe Output Target Authorization Coverage
+check_safe_output_target_authorization_coverage() {
+    local findings
+
+    echo "Running IMP-005: Safe Output Target Authorization Coverage..."
+
+    findings=$(python3 - <<'PY'
+import re
+from pathlib import Path
+
+spec_path = Path("docs/src/content/docs/specs/safe-outputs-specification.md")
+spec = spec_path.read_text()
+
+target_authorized_types = {
+    "add_comment": ("actions/setup/js/add_comment.cjs", "resolveTarget"),
+    "update_issue": ("actions/setup/js/update_issue.cjs", "resolveTarget"),
+    "close_issue": ("actions/setup/js/close_issue.cjs", "resolveTarget"),
+    "add_labels": ("actions/setup/js/add_labels.cjs", "resolveTarget"),
+    "remove_labels": ("actions/setup/js/remove_labels.cjs", "resolveTarget"),
+    "link_sub_issue": ("actions/setup/js/link_sub_issue.cjs", "resolveTarget"),
+    "close_pull_request": ("actions/setup/js/close_pull_request.cjs", "resolveTarget"),
+    "merge_pull_request": ("actions/setup/js/merge_pull_request.cjs", "resolveTarget"),
+    "mark_pull_request_as_ready_for_review": ("actions/setup/js/mark_pull_request_as_ready_for_review.cjs", "resolveTarget"),
+    "resolve_pull_request_review_thread": ("actions/setup/js/resolve_pr_review_thread.cjs", "reviewThreadTargetChecks"),
+    "add_reviewer": ("actions/setup/js/add_reviewer.cjs", "resolveTarget"),
+    "assign_milestone": ("actions/setup/js/assign_milestone.cjs", "resolveTarget"),
+    "assign_to_agent": ("actions/setup/js/assign_to_agent.cjs", "resolveTarget"),
+    "assign_to_user": ("actions/setup/js/assign_to_user.cjs", "resolveTarget"),
+    "unassign_from_user": ("actions/setup/js/unassign_from_user.cjs", "resolveTarget"),
+    "set_issue_type": ("actions/setup/js/set_issue_type.cjs", "resolveTarget"),
+    "set_issue_field": ("actions/setup/js/set_issue_field.cjs", "resolveTarget"),
+    "hide_comment": ("actions/setup/js/hide_comment.cjs", "commentParentTargetChecks"),
+}
+
+
+def type_section(type_name):
+    header = f"#### Type: {type_name}"
+    start = spec.find(header)
+    if start == -1:
+        return ""
+    rest = spec[start + len(header):]
+    next_section = rest.find("\n#### Type: ")
+    if next_section == -1:
+        return spec[start:]
+    return spec[start:start + len(header) + next_section]
+
+
+messages = []
+for type_name, (handler_path, enforcement_mode) in target_authorized_types.items():
+    section = type_section(type_name)
+    if not section:
+        messages.append(f"missing specification section for {type_name}")
+        continue
+    if "**Target Authorization**" not in section:
+        messages.append(f"missing Target Authorization section for {type_name}")
+        continue
+
+    prefix_match = re.search(r"\*\*([A-Z]+)-001\*\*", section)
+    if not prefix_match:
+        messages.append(f"missing numbered target authorization requirements for {type_name}")
+    else:
+        prefix = prefix_match.group(1)
+        for suffix in ("001", "002", "003", "004", "005"):
+            if f"**{prefix}-{suffix}**" not in section:
+                messages.append(f"missing {prefix}-{suffix} in {type_name} target authorization requirements")
+
+    for needle in ('target: "triggering"', 'target: "*"'):
+        if needle not in section:
+            messages.append(f"missing {needle} semantics in {type_name} target authorization requirements")
+
+    test_path = Path(f"pkg/workflow/safe_outputs_specification_{type_name}_test.go")
+    if not test_path.exists():
+        messages.append(f"missing specification regression test for {type_name}")
+
+    handler = Path(handler_path)
+    if not handler.exists():
+        messages.append(f"missing target-authorized handler {handler_path}")
+        continue
+    handler_text = handler.read_text()
+    if enforcement_mode == "resolveTarget":
+        if "resolveTarget" not in handler_text:
+            messages.append(f"{handler_path} does not use resolveTarget for runtime target authorization")
+    elif enforcement_mode == "reviewThreadTargetChecks":
+        for needle in ("resolveInvocationContext", "threadPRNumber", "triggeringPRNumber"):
+            if needle not in handler_text:
+                messages.append(f"{handler_path} missing {needle} review-thread target boundary check")
+    elif enforcement_mode == "commentParentTargetChecks":
+        for needle in ("resolvedComment.itemNumber", "resolvedComment.kind", "expectedKind"):
+            if needle not in handler_text:
+                messages.append(f"{handler_path} missing {needle} comment parent target boundary check")
+
+helper = Path("actions/setup/js/safe_output_helpers.cjs").read_text()
+helper_test = Path("actions/setup/js/safe_output_helpers.test.cjs").read_text()
+if "assertTargetAuthorizationInvariant" not in helper:
+    messages.append("safe_output_helpers.cjs missing fail-safe target authorization invariant assertion")
+for needle in (
+    "should ignore agent-supplied issue numbers for triggering targets",
+    "should ignore conflicting agent-supplied issue numbers for fixed targets",
+    "should ignore agent-supplied PR numbers for triggering targets",
+    "should ignore conflicting agent-supplied PR numbers for fixed targets",
+    "ERR_TARGET_AUTHORIZATION",
+):
+    if needle not in helper_test:
+        messages.append(f"safe_output_helpers.test.cjs missing regression coverage: {needle}")
+
+print("\n".join(sorted(set(messages))))
+PY
+)
+
+    if [ -n "$findings" ]; then
+        while IFS= read -r finding; do
+            log_high "IMP-005: Safe output target authorization conformance gap: $finding"
+        done <<< "$findings"
+    else
+        log_pass "IMP-005: Safe output target authorization is specified, tested, and enforced"
+    fi
+}
+check_safe_output_target_authorization_coverage
+
 # MCE-001: Tool Description Constraint Disclosure (Section 8.3 MCE2)
 echo "Running MCE-001: Tool Description Constraint Disclosure..."
 check_mce_constraint_disclosure() {
@@ -434,7 +685,8 @@ check_mce_constraint_disclosure() {
     fi
     
     # Per spec Section 8.3 MCE2: add_comment MUST surface its constraint limits in description
-    # Required: 65536 char limit, 10 mentions, 50 links (checks the combined tool JSON file)
+    # Required: 65536 char limit, 10 mentions, and the link limit (checks the combined tool JSON file).
+    # Since spec v1.29.9 the link limit is the configured max-links (default: 50) in agent content.
     if ! grep -iE "65536" "$tools_json" > /dev/null 2>&1; then
         log_medium "MCE-001: add_comment tool description may be missing 65536 character limit"
         failed=1
@@ -443,13 +695,14 @@ check_mce_constraint_disclosure() {
         log_medium "MCE-001: add_comment tool description may be missing 10 mention limit"
         failed=1
     fi
-    if ! grep -iE "50 link" "$tools_json" > /dev/null 2>&1; then
-        log_medium "MCE-001: add_comment tool description may be missing 50 link limit"
+    if ! grep -iE "50 link|max-links[^\"]*default: 50" "$tools_json" > /dev/null 2>&1; then
+        log_medium "MCE-001: add_comment tool description may be missing the link limit (configured max-links, default: 50)"
         failed=1
     fi
     
     # Verify add_comment description contains CONSTRAINTS or IMPORTANT keyword
-    if ! grep -A 5 '"add_comment"' "$tools_json" | grep -qE "CONSTRAINTS|IMPORTANT.*constraint|validation constraint"; then
+    add_comment_section=$(grep -A 5 '"add_comment"' "$tools_json" 2>/dev/null || true)
+    if ! grep -qE "CONSTRAINTS|IMPORTANT.*constraint|validation constraint" <<< "$add_comment_section"; then
         log_medium "MCE-001: add_comment tool description missing required CONSTRAINTS/IMPORTANT disclosure"
         failed=1
     fi
@@ -683,18 +936,10 @@ check_git_dir_exclusion() {
         return
     fi
 
-    # Check that .git is referenced in the context of exclusion or skip logic
-    if ! grep -qE "\.git|git_dir|skip.*\.git|exclude.*git|prune.*git" "$setup_script"; then
+    # Check that the setup script explicitly excludes .git from validation walks.
+    if ! grep -qE "\.git|not -path .*\.git|prune.*\.git|exclude.*git|skip.*\.git" "$setup_script"; then
         log_medium "CI-004: Setup script does not reference .git exclusion (CI5)"
         failed=1
-    fi
-
-    # Check compiled workflow lock files: cache-memory file validation should skip .git
-    if find .github/workflows -name "*.lock.yml" | xargs grep -l "cache-memory\|GH_AW_CACHE_MEMORY" 2>/dev/null | \
-        xargs grep -l "validate\|allowed.*ext\|file.*check" 2>/dev/null | \
-        xargs grep -qv "\.git\|skip.*git" 2>/dev/null; then
-        log_low "CI-004: Some cache-memory workflow lock files may not exclude .git in validation (CI5)"
-        # Not failing here — informational only as implementation details vary
     fi
 
     if [ $failed -eq 0 ]; then
@@ -923,10 +1168,29 @@ check_mce_core_error_handling() {
         failed=1
     fi
 
-    # Check that error messages from thrown plain objects are serialized with String()
+    # Check that error messages from thrown plain objects are serialized to a string
     # to prevent '[object Object]' appearing as the error message when non-Error
-    # instances are thrown by handler code.
-    if ! grep -qE 'String\(e\.message\)|String\(err\.message\)' "$core_file"; then
+    # instances are thrown by handler code. This can be done directly with String()
+    # or via the shared getErrorMessage() helper from error_helpers.cjs, as long as
+    # that helper itself guards against non-string `.message` values.
+    local helper_file="actions/setup/js/error_helpers.cjs"
+    local uses_string_directly=0
+    local uses_safe_helper=0
+
+    if grep -qE 'String\(e\.message\)|String\(err\.message\)' "$core_file"; then
+        uses_string_directly=1
+    fi
+
+    if grep -qE 'getErrorMessage' "$core_file" && [ -f "$helper_file" ]; then
+        # The helper must not fall back to stringifying the entire error object when
+        # the error has a non-string `.message` property — it must coerce the message
+        # value itself instead.
+        if grep -qzE 'message = typeof error\.message === "string" \? error\.message : String\(error\.message\)' "$helper_file"; then
+            uses_safe_helper=1
+        fi
+    fi
+
+    if [ $uses_string_directly -eq 0 ] && [ $uses_safe_helper -eq 0 ]; then
         log_high "MCE-006: MCP server core does not use String() for error message serialization — risk of '[object Object]' in responses (Section 8.2)"
         failed=1
     fi
@@ -1343,7 +1607,20 @@ check_wtd_reviewable_annotation() {
     fi
 
     # Check label string "agentic threat detected" (requirement 2)
-    if ! grep -q "agentic threat detected" "$footer_file"; then
+    # The footer may delegate to a centralised template (threat_detection_caution.md) or
+    # to threat_detection_warning.cjs, so accept those as equivalent evidence.
+    local label_found=0
+    if grep -q "agentic threat detected" "$footer_file" 2>/dev/null; then
+        label_found=1
+    elif grep -q "threat_detection_caution" "$footer_file" 2>/dev/null; then
+        local caution_template="actions/setup/md/threat_detection_caution.md"
+        if [ -f "$caution_template" ] && grep -q "agentic threat detected" "$caution_template" 2>/dev/null; then
+            label_found=1
+        elif [ -f "$threat_warning_file" ] && grep -q "agentic threat detected" "$threat_warning_file" 2>/dev/null; then
+            label_found=1
+        fi
+    fi
+    if [ $label_found -eq 0 ]; then
         log_critical "WTD-001: Footer generator missing 'agentic threat detected' label string (WTD1 requirement 2)"
         failed=1
     fi
@@ -1399,8 +1676,24 @@ check_wtd_convertible_fallback() {
             failed=1
         fi
 
-        # Check that the caution text is emitted in the fallback
-        if ! grep -q "agentic threat detected" "$push_handler"; then
+        # Check that the caution text is emitted in the fallback.
+        # The handler may delegate to messages_run_status.cjs via
+        # getDetectionWarningBlocks(), which renders the WTD1 caution template
+        # (threat_detection_caution.md) for threat_detected and the WTD1a
+        # engine-error template for tooling failures. Accept that chain as
+        # equivalent evidence.
+        local threat_label_found=0
+        if grep -q "agentic threat detected" "$push_handler" 2>/dev/null; then
+            threat_label_found=1
+        elif grep -q "getDetectionWarningBlocks" "$push_handler" 2>/dev/null; then
+            local threat_status_file="actions/setup/js/messages_run_status.cjs"
+            local threat_caution_template="actions/setup/md/threat_detection_caution.md"
+            if [ -f "$threat_status_file" ] && grep -q "threat_detection_caution.md" "$threat_status_file" 2>/dev/null &&
+                [ -f "$threat_caution_template" ] && grep -q "agentic threat detected" "$threat_caution_template" 2>/dev/null; then
+                threat_label_found=1
+            fi
+        fi
+        if [ $threat_label_found -eq 0 ]; then
             log_high "WTD-002: push_to_pull_request_branch fallback missing 'agentic threat detected' text (WTD2 / WTD1)"
             failed=1
         fi
@@ -1622,16 +1915,17 @@ check_create_check_run_handler() {
     # Per spec Section 7.3 dual-permission profile: checks:write without target,
     # adds pull-requests:read when target is configured.
     if [ -f "$handler_registry" ]; then
-        if ! grep -q "NewPermissionsContentsReadChecksWrite" "$handler_registry"; then
+        if ! grep -q "NewPermissionsChecksWrite()" "$handler_registry"; then
             log_critical "TYPE-008: create_check_run dual-permission profile missing checks:write base permission (Section 7.3 v1.23.0)"
             failed=1
         fi
-        if ! grep -q "NewPermissionsContentsReadChecksWritePRRead" "$handler_registry"; then
+        if ! grep -q "NewPermissionsChecksWritePRRead" "$handler_registry"; then
             log_high "TYPE-008: create_check_run dual-permission profile missing pull-requests:read when target configured (Section 7.3 v1.23.0)"
             failed=1
         fi
         # Verify the target-conditional branch exists in the registry
-        if ! grep -A 15 '"create-check-run"' "$handler_registry" | grep -q "Target"; then
+        create_check_run_section=$(grep -A 15 '"create-check-run"' "$handler_registry" 2>/dev/null || true)
+        if ! grep -q "Target" <<< "$create_check_run_section"; then
             log_high "TYPE-008: create_check_run permission builder does not branch on Target field (Section 7.3 v1.23.0)"
             failed=1
         fi
@@ -1686,7 +1980,7 @@ check_add_comment_discussions_optin() {
 
     # Check tool description discloses the opt-in requirement to the agent
     if [ -f "$tools_json" ]; then
-        if ! grep -iE "discussions.*opt.in|opt.in.*discussions|discussions.*false|not.*require.*discussions.*write|default.*not.*discussions" "$tools_json"; then
+        if ! grep -qiE "discussions.*opt.in|opt.in.*discussions|discussions.*false|not.*require.*discussions.*write|default.*not.*discussions" "$tools_json"; then
             log_medium "TYPE-009: Tool description in $tools_json may not disclose opt-in requirement for discussions:write (Section 7.1 v1.24.0)"
             failed=1
         fi
@@ -1734,7 +2028,8 @@ check_wildcard_target_requirements() {
     fi
 
     # Check that the validation error is returned early before recording the operation
-    if ! grep -A 3 "validateWildcardTargetRequirement" "$gateway_handler" | grep -q "return wildcardTargetValidationError"; then
+    wildcard_validation_section=$(grep -A 3 "validateWildcardTargetRequirement" "$gateway_handler" 2>/dev/null || true)
+    if ! grep -q "return wildcardTargetValidationError" <<< "$wildcard_validation_section"; then
         log_critical "TYPE-010: Wildcard target validation error is not returned early before recording (Section 7.0.1)"
         failed=1
     fi
@@ -1818,6 +2113,8 @@ check_fork_backed_pr_semantics() {
     # 4. head-github-app takes precedence over head-github-token when both are configured.
     # 5. Successful executions MUST record head_repo in the safe-output summary and manifest.
     # 6. push_to_pull_request_branch follow-up is limited to PRs whose head repo matches head-repo.
+    # 7. head_repo MUST be included whenever head-repo differs from target-repo, even when both
+    #    share the same owner/organization (Section 7.1 v1.29.5).
 
     if [ ! -f "$pr_handler" ]; then
         log_high "TYPE-012: create_pull_request handler missing: $pr_handler"
@@ -1841,12 +2138,26 @@ check_fork_backed_pr_semantics() {
             log_high "TYPE-012: create_pull_request handler does not record head_repo in summary/manifest (Section 7.1 v1.26.0 requirement 5)"
             failed=1
         fi
+
+        # Check head_repo is gated on full repo identity, not owner alone, so that
+        # same-organization forks (differing repo, same owner) still send head_repo (requirement 7)
+        if ! grep -qE "pushRepo\.toLowerCase\(\)\s*===\s*itemRepo\.toLowerCase\(\)" "$pr_handler"; then
+            log_high "TYPE-012: create_pull_request handler does not compare full repo identity before omitting head_repo, risking same-organization fork failures (Section 7.1 v1.29.5 requirement 7)"
+            failed=1
+        fi
     fi
 
     # Check push_to_pull_request_branch restricts to configured head-repo (requirement 6)
     if [ -f "$push_handler" ]; then
         if ! grep -qE "head.repo|headRepo|head_repo" "$push_handler"; then
             log_high "TYPE-012: push_to_pull_request_branch handler does not enforce head-repo restriction (Section 7.1 v1.26.0 requirement 6)"
+            failed=1
+        fi
+
+        # Check head_repo params are gated on full repo identity, not owner alone, so that
+        # same-organization forks (differing repo, same owner) still send head_repo (requirement 7)
+        if ! grep -qE "pushRepo\.toLowerCase\(\)\s*===\s*itemRepo\.toLowerCase\(\)" "$push_handler"; then
+            log_high "TYPE-012: push_to_pull_request_branch handler does not compare full repo identity before omitting head_repo, risking same-organization fork failures (Section 7.1 v1.29.5 requirement 7)"
             failed=1
         fi
     else
@@ -1866,10 +2177,1299 @@ check_fork_backed_pr_semantics() {
     fi
 
     if [ $failed -eq 0 ]; then
-        log_pass "TYPE-012: Fork-backed PR semantics implemented: allowlist, owner-qualified refs, head_repo provenance, and head-github-app precedence (Section 7.1 v1.26.0)"
+        log_pass "TYPE-012: Fork-backed PR semantics implemented: allowlist, owner-qualified refs, head_repo provenance (including same-organization forks), and head-github-app precedence (Section 7.1 v1.29.5)"
     fi
 }
 check_fork_backed_pr_semantics
+
+# TYPE-013: approve_workflow_run Handler Semantics (Section 7.3, v1.28.4)
+echo "Running TYPE-013: approve_workflow_run Handler Semantics..."
+check_approve_workflow_run_semantics() {
+    local handler="actions/setup/js/approve_workflow_run.cjs"
+    local manager="actions/setup/js/safe_output_handler_manager.cjs"
+    local failed=0
+
+    # Per spec Section 7.3 (approve_workflow_run, v1.28.4):
+    # 1. run_id MUST be validated as a positive safe integer.
+    # 2. Staged mode MUST preview without reading GitHub state or consuming max limit.
+    # 3. Eligibility requires event=pull_request, non-empty pull_requests, status=waiting.
+    # 4. Workflow filename MUST match an allowed-workflows pattern (yml/yaml equivalence).
+    # 5. Every associated pull request MUST be the triggering PR or explicitly allowed.
+    # 6. pull_request_target events and unapproved fork pull requests MUST be rejected.
+    # 7. Protected files on associated pull requests MUST block approval.
+    # 8. Live approvals MUST require an explicit external github-token or GitHub App token.
+    # 9. Handler MUST be classified as an Abort type for warn-mode threat-detection failures.
+
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-013: approve_workflow_run handler missing: $handler"
+        failed=1
+    else
+        if ! grep -qE "parsePositiveInt" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not validate run_id as a positive integer (Section 7.3 requirement 1)"
+            failed=1
+        fi
+
+        if ! grep -qE "isStagedMode|isStaged" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler missing staged-mode preview support (Section 7.3 requirement 2)"
+            failed=1
+        fi
+
+        if ! grep -qE "run\.event\s*!==\s*[\"']pull_request[\"']" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not verify event is pull_request (Section 7.3 requirement 3)"
+            failed=1
+        fi
+
+        if ! grep -qE "isAwaitingApproval|APPROVABLE_RUN_STATUSES|run\.status\s*!==\s*[\"']waiting[\"']" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not verify run status is waiting (Section 7.3 requirement 3)"
+            failed=1
+        fi
+
+        if ! grep -qE "isAllowedWorkflow|allowed_workflows" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not validate allowed-workflows (Section 7.3 requirement 4)"
+            failed=1
+        fi
+
+        if ! grep -qE "\.replace\(/\\\\\.yaml\\\$/i" "$handler"; then
+            log_medium "TYPE-013: approve_workflow_run handler may not normalize .yml/.yaml equivalence (Section 7.3 requirement 4)"
+            failed=1
+        fi
+
+        if ! grep -qE "allowed_pull_requests|allowedPullRequests|currentPullRequest" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not authorize pull requests against triggering/allowed set (Section 7.3 requirement 5)"
+            failed=1
+        fi
+
+        if ! grep -qE "pull_request_target" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not reject pull_request_target events (Section 7.3 requirement 6)"
+            failed=1
+        fi
+
+        if ! grep -qE "isHeadRepoAllowed|allowed_repos|allowedRepos|isForkPullRequest|config\.fork" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not reject fork pull requests unless allowed via allowed-repos (Section 7.3 requirement 6)"
+            failed=1
+        fi
+
+        if ! grep -qE "checkFileProtectionPostApply|getModifiedPullRequestFiles" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not check protected files before approval (Section 7.3 requirement 7)"
+            failed=1
+        fi
+
+        if ! grep -qE "github-token.*requires an external|requires an external github-token" "$handler"; then
+            log_high "TYPE-013: approve_workflow_run handler does not require an explicit external github-token/App token (Section 7.3 requirement 8)"
+            failed=1
+        fi
+    fi
+
+    if [ -f "$manager" ]; then
+        if ! grep -qE "THREAT_WARNING_ABORT_TYPES" "$manager" || ! sed -n '/THREAT_WARNING_ABORT_TYPES = new Set(\[/,/\]);/p' "$manager" | grep -q "approve_workflow_run"; then
+            log_high "TYPE-013: approve_workflow_run is not classified as an Abort type for warn-mode threat detection (Section 7.3 requirement 9)"
+            failed=1
+        fi
+    else
+        log_medium "TYPE-013: Safe output handler manager missing: $manager"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-013: approve_workflow_run implements run-id validation, staged preview, eligibility, workflow/PR authorization, fork rejection, protected-file checks, explicit credentials, and Abort classification (Section 7.3 v1.28.4)"
+    fi
+}
+check_approve_workflow_run_semantics
+
+# SEC-008: Mention Resolution Credential Confinement (Section 3.1 AR1, Section 9 T5)
+# Mention/team allowlist resolution MUST be deferred to the trusted safe_outputs job.
+# Ingestion MUST NOT perform privileged mention lookups or receive mention credentials.
+# The mention lookup token MUST come only from mentions.github-app, then
+# mentions.github-token, then github.token; app permissions MUST be read-only.
+echo "Running SEC-008: Mention Resolution Credential Confinement..."
+check_mention_credential_confinement() {
+    local ingestion="actions/setup/js/collect_ndjson_output.cjs"
+    local resolver="actions/setup/js/resolve_mentions_from_payload.cjs"
+    local steps_go="pkg/workflow/compiler_safe_outputs_steps.go"
+    local perms_go="pkg/workflow/safe_outputs_permissions.go"
+    local validation_go="pkg/workflow/github_app_permissions_validation.go"
+    local failed=0
+
+    if [ ! -f "$ingestion" ]; then
+        log_high "SEC-008: Safe-output ingestion script missing: $ingestion"
+        failed=1
+    else
+        if ! grep -qE "deferMentions" "$ingestion"; then
+            log_high "SEC-008: Ingestion does not defer mention filtering to the trusted safe_outputs job (Section 9 T5)"
+            failed=1
+        fi
+        if grep -qE "resolve_mentions(_from_payload)?\.cjs|resolveAllowedMentions|GH_AW_MENTIONS_GITHUB_TOKEN" "$ingestion"; then
+            log_critical "SEC-008: Ingestion performs privileged mention lookups or references mention credentials (Section 3.1 AR1)"
+            failed=1
+        fi
+    fi
+
+    if [ ! -f "$resolver" ]; then
+        log_high "SEC-008: Trusted mention resolver missing: $resolver"
+        failed=1
+    elif ! grep -qE "GH_AW_MENTIONS_GITHUB_TOKEN" "$resolver"; then
+        log_high "SEC-008: Mention resolver does not use the dedicated mention-resolution token (Section 9 T5)"
+        failed=1
+    fi
+
+    if [ ! -f "$steps_go" ]; then
+        log_high "SEC-008: Safe outputs step compiler missing: $steps_go"
+        failed=1
+    else
+        if ! grep -qE "GH_AW_MENTIONS_GITHUB_TOKEN" "$steps_go" || ! grep -qE "func safeOutputMentionsGitHubToken" "$steps_go"; then
+            log_high "SEC-008: Compiler does not emit a dedicated mention-resolution token in the safe_outputs job (Section 9 T5)"
+            failed=1
+        fi
+        # Token precedence: mentions.github-app -> mentions.github-token -> github.token (no safe-outputs.github-token inheritance)
+        local token_fn
+        token_fn=$(sed -n '/^func safeOutputMentionsGitHubToken/,/^}/p' "$steps_go")
+        if ! echo "$token_fn" | grep -q "safe-outputs-mentions-app-token" || ! echo "$token_fn" | grep -q "mentions.GitHubToken" || ! echo "$token_fn" | grep -q "github.token"; then
+            log_high "SEC-008: Mention token precedence (mentions.github-app → mentions.github-token → github.token) not implemented (Section 9 T5)"
+            failed=1
+        fi
+        if echo "$token_fn" | grep -qE "SafeOutputs\.GitHubToken|SafeOutputs\.GitHubApp|GH_AW_GITHUB_TOKEN"; then
+            log_critical "SEC-008: Mention token inherits safe-outputs write credentials (Section 9 T5)"
+            failed=1
+        fi
+    fi
+
+    if [ ! -f "$perms_go" ] || ! grep -qE "func buildMentionResolutionPermissions" "$perms_go"; then
+        log_medium "SEC-008: Mention-resolution GitHub App permission builder not found (issues: read / members: read) (Section 9 T5)"
+        failed=1
+    fi
+
+    if [ ! -f "$validation_go" ] || ! grep -qE "func validateMentionGitHubAppPermissionsReadOnly" "$validation_go"; then
+        log_high "SEC-008: Compiler does not reject non-read mention GitHub App permission overrides (Section 9 T5)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SEC-008: Mention resolution is deferred to safe_outputs with confined, read-only credentials (Section 3.1 AR1, Section 9 T5)"
+    fi
+}
+check_mention_credential_confinement
+
+# SEC-009: Work-Queue Claim Adapter Repository Authorization (Section 3.x cross-repository rules)
+# Declared Claim adapters MUST specify a fixed literal target-repo validated by
+# work_queue_claim_adapters.cjs; every selected repository MUST pass assertClaimAuthorized
+# before effects execute; rejection carries E004 with work_queue_effect_scope_denied.
+echo "Running SEC-009: Work-Queue Claim Adapter Repository Authorization..."
+check_claim_adapter_authorization() {
+    local adapters="actions/setup/js/work_queue_claim_adapters.cjs"
+    local finish="actions/setup/js/finish_work_queue_claim.cjs"
+    local failed=0
+
+    if [ ! -f "$adapters" ]; then
+        log_high "SEC-009: Claim adapter module missing: $adapters"
+        failed=1
+    else
+        if ! grep -qE "target-repo" "$adapters" || ! grep -qE "fixed repository scope" "$adapters"; then
+            log_high "SEC-009: Claim adapters do not require a fixed literal target-repo"
+            failed=1
+        fi
+        if ! grep -qE "assertClaimAuthorized\(" "$adapters"; then
+            log_high "SEC-009: Claim adapters do not authorize selected repositories via assertClaimAuthorized"
+            failed=1
+        fi
+    fi
+
+    if [ ! -f "$finish" ]; then
+        log_high "SEC-009: Claim authorization module missing: $finish"
+        failed=1
+    elif ! grep -qE "work_queue_effect_scope_denied.*E004" "$finish"; then
+        log_high "SEC-009: Repository allowlist rejection does not carry E004 with work_queue_effect_scope_denied"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SEC-009: Claim adapters use fixed target-repo scopes authorized via assertClaimAuthorized with E004 rejection"
+    fi
+}
+check_claim_adapter_authorization
+
+# TYPE-014: Protected-File Exact-Path Exclusions (Section 7 Protected-File Exclusions)
+# Exclude entries beginning with "/" MUST match only the exact repository-relative path;
+# exclusions MUST apply to both patch-time and post-apply checks; patch paths MUST be
+# decoded from Git C-style quoting; allowed-files MUST be evaluated independently.
+echo "Running TYPE-014: Protected-File Exact-Path Exclusions..."
+check_protected_file_exact_path_exclusions() {
+    local helpers="actions/setup/js/manifest_file_helpers.cjs"
+    local patch_paths="actions/setup/js/patch_path_helpers.cjs"
+    local config_go="pkg/workflow/safe_outputs_config_generation.go"
+    local failed=0
+
+    if [ ! -f "$config_go" ] || ! grep -qE "func splitProtectedFilesExcludes" "$config_go" || ! sed -n '/^func splitProtectedFilesExcludes/,/^}/p' "$config_go" | grep -qE 'CutPrefix\(exclude, "/"\)'; then
+        log_high "TYPE-014: Compiler does not split leading-slash exact-path exclusions from basename/prefix exclusions"
+        failed=1
+    fi
+
+    if [ ! -f "$helpers" ]; then
+        log_high "TYPE-014: File protection helpers missing: $helpers"
+        failed=1
+    else
+        local pre post
+        pre=$(sed -n '/^function checkFileProtection(/,/^}/p' "$helpers")
+        post=$(sed -n '/^function checkFileProtectionPostApply(/,/^}/p' "$helpers")
+        if ! echo "$pre" | grep -q "protected_files_path_exclude"; then
+            log_high "TYPE-014: Patch-time protected-file check does not apply exact-path exclusions"
+            failed=1
+        fi
+        if ! echo "$post" | grep -q "protected_files_path_exclude"; then
+            log_high "TYPE-014: Post-apply protected-file check does not apply exact-path exclusions"
+            failed=1
+        fi
+        # allowed-files must be evaluated before (independently of) protected-file exclusions
+        for fn_body in "$pre" "$post"; do
+            local allow_line excl_line
+            allow_line=$(echo "$fn_body" | grep -n "allowed_files" | head -1 | cut -d: -f1 || true)
+            excl_line=$(echo "$fn_body" | grep -n "protected_files_path_exclude" | head -1 | cut -d: -f1 || true)
+            if [ -z "$allow_line" ] || { [ -n "$excl_line" ] && [ "$allow_line" -gt "$excl_line" ]; }; then
+                log_high "TYPE-014: allowed-files is not evaluated independently of protected-file exclusions"
+                failed=1
+                break
+            fi
+        done
+        if ! grep -qE "require\(\"\./patch_path_helpers\.cjs\"\)" "$helpers"; then
+            log_high "TYPE-014: File protection helpers do not normalize patch paths via patch_path_helpers.cjs"
+            failed=1
+        fi
+    fi
+
+    if [ ! -f "$patch_paths" ] || ! grep -qE "function decodeGitQuotedPath" "$patch_paths"; then
+        log_high "TYPE-014: Git C-style quoted path decoding (including octal escapes) not implemented"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-014: Protected-file exact-path exclusions apply at patch-time and post-apply with independent allowed-files checks"
+    fi
+}
+check_protected_file_exact_path_exclusions
+
+# TYPE-015: resolve_pull_request_review_thread Operational Semantics (Section 7.3)
+# Node lookup MUST verify PullRequestReviewThread/PullRequestReviewComment; target, repo
+# allowlist, and label/title filters MUST be enforced before mutation; staged mode MUST NOT
+# call resolveReviewThread; comment-ID lookup MUST paginate; integration-permission
+# failures MUST be reported as skipped with github-token guidance.
+echo "Running TYPE-015: resolve_pull_request_review_thread Operational Semantics..."
+check_resolve_review_thread_semantics() {
+    local handler="actions/setup/js/resolve_pr_review_thread.cjs"
+    local failed=0
+
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-015: resolve_pull_request_review_thread handler missing: $handler"
+        return
+    fi
+
+    if ! grep -q "PullRequestReviewThread" "$handler" || ! grep -q "PullRequestReviewComment" "$handler" || ! grep -qE "__typename !== \"PullRequestReviewThread\"" "$handler"; then
+        log_high "TYPE-015: Handler does not verify thread_id node type (Operational Semantics 1)"
+        failed=1
+    fi
+
+    if ! grep -qE "hasNextPage" "$handler" || ! grep -qE "endCursor" "$handler"; then
+        log_high "TYPE-015: Comment-ID lookup does not follow GraphQL pagination cursors (Operational Semantics 4)"
+        failed=1
+    fi
+
+    local mutation_line staged_line repo_line filter_line
+    mutation_line=$(grep -n "await resolveReviewThreadAPI(" "$handler" | head -1 | cut -d: -f1 || true)
+    staged_line=$(grep -nE "if \(isStaged\)" "$handler" | head -1 | cut -d: -f1 || true)
+    repo_line=$(grep -nE "validateTargetRepo\(threadRepo" "$handler" | head -1 | cut -d: -f1 || true)
+    filter_line=$(grep -nE "await checkRequiredFilter\(" "$handler" | head -1 | cut -d: -f1 || true)
+
+    if [ -z "$mutation_line" ]; then
+        log_high "TYPE-015: Handler does not call the resolveReviewThread mutation (Operational Semantics 3)"
+        failed=1
+    else
+        if [ -z "$repo_line" ] || [ "$repo_line" -gt "$mutation_line" ]; then
+            log_high "TYPE-015: Repository allowlist is not enforced on the resolved thread's repository before mutation (Operational Semantics 2)"
+            failed=1
+        fi
+        if [ -z "$filter_line" ] || [ "$filter_line" -gt "$mutation_line" ]; then
+            log_high "TYPE-015: required-labels/required-title-prefix filters are not enforced before mutation (Operational Semantics 2)"
+            failed=1
+        fi
+        if [ -z "$staged_line" ] || [ "$staged_line" -gt "$mutation_line" ]; then
+            log_high "TYPE-015: Staged mode does not preview before calling resolveReviewThread (Operational Semantics 3)"
+            failed=1
+        fi
+    fi
+
+    if ! grep -q "Resource not accessible by integration" "$handler" || ! grep -qE "resolve-pull-request-review-thread\.github-token" "$handler"; then
+        log_medium "TYPE-015: Integration permission failures are not reported as skipped with github-token guidance (Operational Semantics 5)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-015: resolve_pull_request_review_thread verifies node type, enforces target/filters before mutation, paginates comment lookup, and handles staged/permission cases"
+    fi
+}
+check_resolve_review_thread_semantics
+
+# TYPE-016: add_comment Configurable Link Limit (Section 7.1 Enforced Constraints, Section 8.3 MCE5, v1.29.9)
+# safe-outputs.add-comment.max-links accepts a positive integer (default 50), counts URL
+# occurrences in agent content only (generated footer/metadata links excluded), and MUST be
+# enforced at both tool invocation (MCP server) and posting time (handler) with E008.
+echo "Running TYPE-016: add_comment Configurable Link Limit..."
+check_add_comment_max_links() {
+    local handler="actions/setup/js/add_comment.cjs"
+    local mcp_handlers="actions/setup/js/safe_outputs_handlers.cjs"
+    local helpers="actions/setup/js/comment_limit_helpers.cjs"
+    local schema="pkg/parser/schemas/main_workflow_schema.json"
+    local failed=0
+
+    if [ ! -f "$helpers" ] \
+        || ! grep -qE "function enforceCommentLimits\(body, \{[^}]*maxLinks = MAX_LINKS" "$helpers" \
+        || ! grep -qE "function enforceCommentLimits\(body, \{[^}]*linkBody = body" "$helpers" \
+        || ! grep -qE "function enforceCommentLimits\(body, \{[^}]*maxLength = MAX_COMMENT_LENGTH" "$helpers"; then
+        log_high "TYPE-016: enforceCommentLimits does not accept a configurable maxLinks and agent-only linkBody (generated links must be excluded)"
+        failed=1
+    elif ! grep -qE "E008: Comment contains .* links, maximum is \\\$\{maxLinks\}" "$helpers"; then
+        log_medium "TYPE-016: E008 link-limit error does not report the configured max-links value"
+        failed=1
+    fi
+
+    if [ ! -f "$handler" ] || ! grep -qE "enforceCommentLimits\(processedBody, \{ maxLinks, linkBody \}\)" "$handler"; then
+        log_high "TYPE-016: add_comment handler does not enforce max-links at posting time against agent content only"
+        failed=1
+    fi
+
+    if [ ! -f "$mcp_handlers" ] || ! grep -qE "enforceCommentLimits\(body, \{ maxLinks: addCommentConfig\.max_links" "$mcp_handlers"; then
+        log_high "TYPE-016: MCP server does not enforce configured max-links at tool invocation (Section 8.3 MCE4)"
+        failed=1
+    fi
+
+    if [ ! -f "$schema" ] || ! python3 - "$schema" <<'PYEOF' > /dev/null 2>&1
+import json, sys
+s = json.load(open(sys.argv[1]))
+v = s["properties"]["safe-outputs"]["properties"]["add-comment"]
+alts = [v] + v.get("oneOf", []) + v.get("anyOf", [])
+ml = next((a["properties"]["max-links"] for a in alts if "max-links" in a.get("properties", {})), None)
+sys.exit(0 if ml and ml.get("type") == "integer" and ml.get("minimum") == 1 else 1)
+PYEOF
+    then
+        log_medium "TYPE-016: Schema does not define safe-outputs.add-comment.max-links as a positive integer"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-016: add_comment max-links is configurable, excludes generated links, and is enforced at invocation and posting time"
+    fi
+}
+check_add_comment_max_links
+
+# TYPE-017: add_comment replace-older-comments (Section 7.1 Operational Semantics 8, v1.29.9)
+# replace-older-comments MUST NOT be combined with hide-older-comments; matching is limited
+# to comments by the authenticated identity (bot-only fallback) carrying the caller workflow
+# marker; discussions are excluded; staged mode MUST NOT perform the lookup or update.
+echo "Running TYPE-017: add_comment replace-older-comments..."
+check_add_comment_replace_older() {
+    local handler="actions/setup/js/add_comment.cjs"
+    local schema="pkg/parser/schemas/main_workflow_schema.json"
+    local failed=0
+
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-017: add_comment handler missing: $handler"
+        return
+    fi
+
+    if ! grep -qE "replace-older-comments cannot be combined with hide-older-comments" "$handler"; then
+        log_high "TYPE-017: Handler does not reject replace-older-comments combined with hide-older-comments"
+        failed=1
+    fi
+    if ! grep -qE 'required": \["hide-older-comments", "replace-older-comments"\]' "$schema" 2>/dev/null; then
+        log_medium "TYPE-017: Schema does not forbid combining hide-older-comments and replace-older-comments"
+        failed=1
+    fi
+
+    if ! grep -qE 'comment\.user\.login === authenticatedLogin : comment\.user\.type === "Bot"' "$handler"; then
+        log_high "TYPE-017: Replacement candidates are not restricted to the authenticated identity (bot-only fallback)"
+        failed=1
+    fi
+
+    if ! grep -qE "replaceOlderCommentsEnabled && .*!isDiscussion && \(callerWorkflowId \|\| workflowId\)" "$handler"; then
+        log_high "TYPE-017: Replacement is not limited to issue/PR comments with a caller/workflow ID marker"
+        failed=1
+    fi
+
+    local staged_line replace_line
+    staged_line=$(grep -nE "^\s*if \(isStaged\)" "$handler" | head -1 | cut -d: -f1 || true)
+    replace_line=$(grep -nE "if \(replaceOlderCommentsEnabled" "$handler" | head -1 | cut -d: -f1 || true)
+    if [ -z "$staged_line" ] || [ -z "$replace_line" ] || [ "$staged_line" -gt "$replace_line" ]; then
+        log_high "TYPE-017: Staged mode does not return before the replace-older-comments lookup/update"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-017: replace-older-comments is exclusive with hide-older-comments, identity/marker scoped, and skipped in staged mode"
+    fi
+}
+check_add_comment_replace_older
+
+# SCD-001: Signed Commit Delivery (Section 7.3 Signed Commit Delivery Requirements SCD-001..003, v1.29.9)
+# Stale-commit rebases MUST keep HEAD attached to the named delivery branch (no explicit
+# "HEAD" branch argument), and allowGitPushFallback: false MUST refuse unsigned pushes.
+echo "Running SCD-001: Signed Commit Delivery..."
+check_signed_commit_delivery() {
+    local helper="actions/setup/js/push_signed_commits.cjs"
+    local failed=0
+
+    if [ ! -f "$helper" ]; then
+        log_high "SCD-001: Signed delivery helper missing: $helper"
+        return
+    fi
+
+    local rebase_lines
+    rebase_lines=$(grep -E '\["rebase", "--onto"' "$helper" || true)
+    if [ -z "$rebase_lines" ]; then
+        log_medium "SCD-001: Could not locate stale-commit rebase in $helper"
+        failed=1
+    elif echo "$rebase_lines" | grep -qE '"HEAD"\]'; then
+        log_high "SCD-001: Rebase passes an explicit HEAD argument, detaching HEAD and leaving the named branch stale"
+        failed=1
+    fi
+
+    if ! grep -qE "allowGitPushFallback = true" "$helper" || [ "$(grep -cE 'if \(allowGitPushFallback === false\)' "$helper" || true)" -lt 1 ]; then
+        log_high "SCD-003: allowGitPushFallback: false is not honored to refuse unsigned git-push fallback"
+        failed=1
+    fi
+
+    if [ ! -f "actions/setup/js/push_signed_commits.test.cjs" ]; then
+        log_medium "SCD-001: Real-git conformance evidence (push_signed_commits.test.cjs) missing"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SCD-001: Signed delivery rebases keep HEAD attached and honor allowGitPushFallback: false"
+    fi
+}
+check_signed_commit_delivery
+
+# PTI-001: Patch and Bundle Transport Integrity (Section 7.3 PTI-001..007, v1.29.12)
+# Both PR handlers MUST resolve qualified transport paths, capture bytes with sha256 digest and
+# dev/inode identity via nonblocking no-follow opens, consume private read-only snapshots,
+# classify failures as ERR_TRANSPORT_INTEGRITY, reject that code before custom retry
+# classifiers, and dispose snapshots.
+echo "Running PTI-001: Patch and Bundle Transport Integrity..."
+check_transport_integrity() {
+    local ti="actions/setup/js/transport_integrity.cjs"
+    local resolver="actions/setup/js/resolve_transport_paths.cjs"
+    local recovery="actions/setup/js/error_recovery.cjs"
+    local failed=0
+
+    if [ ! -f "$ti" ] || [ ! -f "$resolver" ]; then
+        log_critical "PTI-001: Transport integrity modules missing ($ti, $resolver)"
+        return
+    fi
+
+    local h
+    for h in actions/setup/js/create_pull_request.cjs actions/setup/js/push_to_pull_request_branch.cjs; do
+        if ! grep -q 'require("./transport_integrity.cjs")' "$h" 2>/dev/null || ! grep -q 'require("./resolve_transport_paths.cjs")' "$h" 2>/dev/null; then
+            log_critical "PTI-001: $h does not use transport integrity guard and trusted path resolution"
+            failed=1
+        fi
+    done
+
+    if ! grep -qE "O_NOFOLLOW" "$ti" || ! grep -qE "O_NONBLOCK" "$ti"; then
+        log_high "PTI-001: Captures do not use nonblocking, no-follow opens (symlinks/FIFOs)"
+        failed=1
+    fi
+    if ! grep -qE 'createHash\("sha256"\)' "$ti" || ! grep -qE "stat\.ino !== identity\.ino" "$ti"; then
+        log_high "PTI-001: Captures do not bind content digest and device/inode identity"
+        failed=1
+    fi
+    if ! grep -qE "isFile\(\)" "$ti"; then
+        log_high "PTI-001: Nonregular transport artifacts are not rejected"
+        failed=1
+    fi
+
+    if ! grep -qE "mkdtempSync" "$ti" || ! grep -qE "mode: 0o400" "$ti"; then
+        log_high "PTI-002: Git does not consume private read-only snapshots"
+        failed=1
+    fi
+
+    if ! grep -qE 'this\.code = "ERR_TRANSPORT_INTEGRITY"' "$ti"; then
+        log_high "PTI-007: Integrity errors do not expose stable ERR_TRANSPORT_INTEGRITY classification"
+        failed=1
+    fi
+
+    # Allow the deadline guard, but keep integrity first and both guards short-circuiting.
+    local retry_guard='if \(error\?\.code === "ERR_TRANSPORT_INTEGRITY" \|\| (\(fullConfig\.deadline !== undefined && now\(\) >= fullConfig\.deadline\) \|\| )?!fullConfig\.shouldRetry\(error\)\) \{'
+    if [ ! -f "$recovery" ] || ! grep -qE "$retry_guard" "$recovery"; then
+        log_high "PTI-005: Retry loop does not reject integrity failures before invoking custom retry classifiers"
+        failed=1
+    fi
+
+    if ! grep -qE "function dispose\(\)" "$ti" || ! grep -qE "rmSync\(directory" "$ti"; then
+        log_high "PTI-006: Private snapshots are not disposed"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "PTI-001: Patch/bundle transport binds captured bytes, uses private snapshots, and fails permanently on integrity errors"
+    fi
+}
+check_transport_integrity
+
+# RCR-001: Runtime Repository-List Checkouts (Section 9.6.1 RCR8-RCR12, v1.29.10-1.29.12)
+# Only literal multi: true enables list expansion; single-mode selectors MUST resolve to one
+# repository; max-repos defaults to 10 and fails in full; private/internal targets require
+# allow-private-repos: true; runtime lists MUST NOT fetch LFS or submodules.
+echo "Running RCR-001: Runtime Repository-List Checkouts..."
+check_runtime_repository_checkouts() {
+    local parser="pkg/workflow/checkout_config_parser.go"
+    local runtime="actions/setup/js/checkout_dynamic.cjs"
+    local failed=0
+
+    if [ ! -f "$parser" ] || ! grep -qE "checkout\.multi must be a literal boolean" "$parser"; then
+        log_high "RCR-001: Compiler does not require checkout.multi to be a literal boolean (RCR8)"
+        failed=1
+    fi
+    if [ -f "$parser" ] && ! grep -qE "must select a single repository unless checkout\.multi is true" "$parser"; then
+        log_high "RCR-001: Single-mode repository selectors are not restricted to one repository (RCR8)"
+        failed=1
+    fi
+
+    if [ ! -f "$runtime" ]; then
+        log_high "RCR-001: Runtime checkout preparation missing: $runtime"
+        return
+    fi
+    if ! grep -qE 'GH_AW_DYNAMIC_MAX_REPOS \?\? "10"' "$runtime" || ! grep -qE "exceeding checkout\.max-repos" "$runtime"; then
+        log_high "RCR-001: max-repos (default 10) is not enforced before checkout (RCR9)"
+        failed=1
+    fi
+    if ! grep -qE "requires checkout\.allow-private-repos: true" "$runtime" || ! grep -qE "allow-private-repos must be a literal boolean" "$runtime"; then
+        log_critical "RCR-001: Private/internal runtime targets are not default-denied behind literal allow-private-repos (RCR9)"
+        failed=1
+    fi
+    if ! grep -qE "isPublic && \(data\.private \|\| data\.visibility !== \"public\"\)" "$runtime"; then
+        log_critical "RCR-001: Public hosting repositories are not prevented from checking out private/internal targets (RCR9)"
+        failed=1
+    fi
+    if ! grep -qE "submodules: false" "$runtime" || ! grep -qE "lfs: false" "$runtime" || ! grep -qE '"--no-recurse-submodules"' "$runtime"; then
+        log_high "RCR-001: Runtime lists do not hardcode lfs/submodules false and --no-recurse-submodules (RCR12)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "RCR-001: Runtime repository-list checkouts enforce explicit multi mode, bounded preflight, private opt-in, and no secondary fetches"
+    fi
+}
+check_runtime_repository_checkouts
+
+# BGO-001: Bundle Git Operations and Validation Baselines (Section 7.3 BGO-001..008, v1.29.13)
+# Bundle inspection MUST be offline (GIT_ALLOW_PROTOCOL="" + GIT_NO_LAZY_FETCH=1);
+# allow-full-history-fetch MUST be a literal boolean defaulting to false per handler and gate
+# prerequisite recovery with a no-byte-limit warning; allow-merged-base-baseline MUST be a
+# literal opt-in; optional discovery MUST be bounded (5s, 1 MiB, 100(+1) records, 4 REST calls,
+# retries disabled).
+echo "Running BGO-001: Bundle Git Operations and Validation Baselines..."
+check_bundle_git_operations() {
+    local helpers="actions/setup/js/git_helpers.cjs"
+    local push="actions/setup/js/push_to_pull_request_branch.cjs"
+    local create="actions/setup/js/create_pull_request.cjs"
+    local schema="pkg/parser/schemas/main_workflow_schema.json"
+    local failed=0
+
+    if [ ! -f "$helpers" ] || ! grep -qE 'GIT_ALLOW_PROTOCOL: "", GIT_NO_LAZY_FETCH: "1"' "$helpers"; then
+        log_critical "BGO-001: Bundle inspection does not deny all Git transports (GIT_ALLOW_PROTOCOL=\"\" and GIT_NO_LAZY_FETCH=1)"
+        failed=1
+    fi
+
+    if [ -f "$helpers" ]; then
+        if ! grep -qE "if \(allowFullHistoryFetch !== true\) throw" "$helpers"; then
+            log_critical "BGO-002: Bundle prerequisite recovery is not gated on literal allow-full-history-fetch: true"
+            failed=1
+        fi
+        if ! grep -qE "without a byte limit" "$helpers"; then
+            log_medium "BGO-002: Opted-in recovery does not warn that downloads have no byte limit"
+            failed=1
+        fi
+    fi
+
+    if ! grep -qE "config\.allow_full_history_fetch === true" "$create" 2>/dev/null || ! grep -qE "allowFullHistoryFetch: config\.allow_full_history_fetch === true" "$push" 2>/dev/null; then
+        log_high "BGO-002: Handlers do not scope allow-full-history-fetch to their own trusted configuration"
+        failed=1
+    fi
+
+    if [ ! -f "$schema" ] || ! python3 - "$schema" <<'PYEOF' > /dev/null 2>&1
+import json, sys
+s = json.load(open(sys.argv[1]))
+so = s["properties"]["safe-outputs"]["properties"]
+for key in ("create-pull-request", "push-to-pull-request-branch"):
+    v = so[key]
+    alts = [v] + v.get("oneOf", []) + v.get("anyOf", [])
+    p = next((a["properties"]["allow-full-history-fetch"] for a in alts if "allow-full-history-fetch" in a.get("properties", {})), None)
+    if not p or p.get("type") != "boolean" or p.get("default") is not False:
+        sys.exit(1)
+PYEOF
+    then
+        log_high "BGO-002: Schema does not define allow-full-history-fetch as a boolean defaulting to false for both PR handlers"
+        failed=1
+    fi
+
+    if [ ! -f "$push" ]; then
+        log_high "BGO-004: push_to_pull_request_branch handler missing: $push"
+        return
+    fi
+    if ! grep -qE "allowMergedBaseBaseline = config\.allow_merged_base_baseline === true" "$push"; then
+        log_high "BGO-004: Older-ancestor baseline discovery is not disabled by default behind literal allow-merged-base-baseline: true"
+        failed=1
+    fi
+    if ! grep -qE "MAX_BUNDLE_PARENT_COMPARISONS = 4;" "$push" || ! grep -qE "MAX_BUNDLE_HISTORY_COMMITS = 100;" "$push" || ! grep -qE "MAX_BUNDLE_HISTORY_COMMITS \+ 1" "$push"; then
+        log_high "BGO-005: Discovery is not bounded to 4 REST comparisons and 100 records with 101st-record overflow detection"
+        failed=1
+    fi
+    if ! grep -qE "BUNDLE_VALIDATION_TIMEOUT_MS = 5000;" "$push" || ! grep -qE "BUNDLE_VALIDATION_MAX_OUTPUT = 1024 \* 1024;" "$push"; then
+        log_high "BGO-005: Optional discovery commands lack the 5-second timeout and 1 MiB output limit"
+        failed=1
+    fi
+    if ! grep -qE "retries: 0, signal: AbortSignal\.timeout\(BUNDLE_VALIDATION_TIMEOUT_MS\)" "$push"; then
+        log_high "BGO-005: REST comparisons do not disable retries and enforce a 5-second abort deadline"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "BGO-001: Bundle Git operations are offline by default, recovery is literal opt-in, and baseline discovery is bounded"
+    fi
+}
+check_bundle_git_operations
+
+# SEC-010: Invocation-Context Dispatch Target Authorization (Section 3 Cross-Repository Validation, 2026-10-21)
+# When resolving a workflow_dispatch target repository, a non-empty GH_AW_ALLOWED_REPOS list
+# MUST remain authoritative. Only when it is empty MAY the resolver fall back to per-handler
+# allowed_repos entries and exact, trimmed, validated per-handler target-repo slugs (wildcards and
+# malformed values ignored). Targets outside the workflow repo and effective list MUST be rejected.
+echo "Running SEC-010: Invocation-Context Dispatch Target Authorization..."
+check_invocation_context_authorization() {
+    local resolver="actions/setup/js/invocation_context_helpers.cjs"
+    local repo_helpers="actions/setup/js/repo_helpers.cjs"
+    local failed=0
+
+    if [ ! -f "$resolver" ]; then
+        log_critical "SEC-010: Invocation-context resolver missing: $resolver"
+        return
+    fi
+
+    if ! grep -qE 'parseAllowedRepos\(process\.env\.GH_AW_ALLOWED_REPOS\)' "$resolver" || ! grep -qE 'if \(allowedRepos\.size === 0\)' "$resolver"; then
+        log_critical "SEC-010: GH_AW_ALLOWED_REPOS is not authoritative; handler configuration may extend a non-empty global allowlist"
+        failed=1
+    fi
+    if ! grep -qE 'isExactRepoSlug\(handlerTargetRepo\)' "$resolver"; then
+        log_high "SEC-010: Handler target-repo fallback values are not validated as exact repository slugs (wildcards must be ignored)"
+        failed=1
+    fi
+    if ! grep -qF 'const trimmed = value.trim();' "$resolver"; then
+        log_medium "SEC-010: Handler target-repo fallback values are not trimmed before validation"
+        failed=1
+    fi
+    if ! grep -qE 'validateTargetRepo\(targetRepoSlug, defaultRepo, allowedRepos\)' "$resolver" || ! grep -qE 'throw .*ERR_VALIDATION' "$resolver"; then
+        log_critical "SEC-010: workflow_dispatch target repositories outside the effective allowlist are not rejected"
+        failed=1
+    fi
+    if [ ! -f "$repo_helpers" ] || ! grep -qF '/^[A-Za-z0-9_-]+$/.test(repo.owner) && /^[A-Za-z0-9_.-]+$/.test(repo.repo)' "$repo_helpers"; then
+        log_medium "SEC-010: Exact fallback slug syntax does not match spec (owner: alphanumerics/-/_; repo: additionally dots)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SEC-010: Invocation-context dispatch targets honor authoritative global allowlist with exact handler target-repo fallback"
+    fi
+}
+check_invocation_context_authorization
+
+# RPT-001: Issue-Body Provenance and Mandatory Rendering Redaction (Section 9 Issue-body tree provenance, 2026-10-19)
+# Missing agentTainted provenance MUST be treated as agent-tainted; renderers MUST assert a private,
+# non-serializable redaction proof and recheck all strings (including the concrete title/body) before
+# publication; coarse content policies (redactReport) replace agent subtrees with "Content redacted."
+# and are exposed only as the internal `redact` builder option.
+echo "Running RPT-001: Issue-Body Provenance and Rendering Redaction..."
+check_report_provenance_redaction() {
+    local ast="actions/setup/js/report_ast.cjs"
+    local redaction="actions/setup/js/report_redaction.cjs"
+    local issue_report="actions/setup/js/issue_report.cjs"
+    local issue_body="actions/setup/js/issue_body.cjs"
+    local failed=0
+
+    for f in "$ast" "$redaction" "$issue_report" "$issue_body"; do
+        if [ ! -f "$f" ]; then
+            log_high "RPT-001: Issue report module missing: $f"
+            failed=1
+        fi
+    done
+    if [ $failed -ne 0 ]; then
+        return
+    fi
+
+    if ! grep -qE 'typeof node\.agentTainted !== "boolean"' "$ast"; then
+        log_high "RPT-001: Report normalization does not validate agentTainted provenance as a boolean"
+        failed=1
+    fi
+    if ! grep -qE 'const redactedReports = new WeakSet\(\)' "$ast" || ! grep -qE 'if \(!redactedReports\.has\(report\)\) throw' "$ast"; then
+        log_critical "RPT-001: Rendering assertion does not require a private, non-serializable redaction proof"
+        failed=1
+    fi
+    if ! awk '/^function assertRedactedReport/,/^}/' "$ast" | grep -q 'assertNoTaintedStrings(report)'; then
+        log_critical "RPT-001: assertRedactedReport does not recheck every string against current secret masks"
+        failed=1
+    fi
+    if ! awk '/^function renderReport/,/^}/' "$ast" | grep -q 'assertRedactedReport(redacted)' || ! awk '/^function renderReport/,/^}/' "$ast" | grep -q 'assertNoTaintedStrings(result)'; then
+        log_critical "RPT-001: renderReport does not assert redaction before serialization and recheck the concrete title/body"
+        failed=1
+    fi
+    if ! grep -qE 'if \(node\.agentTainted === false\) return false' "$redaction"; then
+        log_high "RPT-001: Coarse redaction does not treat missing provenance as agent-tainted"
+        failed=1
+    fi
+    if ! grep -qF '"Content redacted."' "$redaction"; then
+        log_medium "RPT-001: Coarse redaction does not use the fixed framework notice 'Content redacted.'"
+        failed=1
+    fi
+    if ! grep -qE 'redact \} = \{\}|, redact \}' "$issue_report" || ! grep -qE 'redactReport\(report, redact\)' "$issue_body"; then
+        log_medium "RPT-001: buildIssueReport/buildIssueBodyReport do not accept the optional internal 'redact' predicate"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "RPT-001: Report provenance defaults to tainted and rendering requires a rechecked redaction proof"
+    fi
+}
+check_report_provenance_redaction
+
+# RPT-002: Automatic Publication Size Redaction (Section 9 Automatic publication size redaction, 2026-10-19)
+# Bodies MUST be measured after rendering against 65,536 UTF-16 units; overflow replaces agent-origin
+# subtrees with "Content redacted to fit size limit." while markers, expiration, closing references,
+# and footers are never sliced. Protected-frame overflow MUST fail explicitly before an API write.
+# Fitting Markdown MUST remain unchanged. Supported body inputs accept up to 524,288 units.
+echo "Running RPT-002: Automatic Publication Size Redaction..."
+check_report_size_redaction() {
+    local size="actions/setup/js/report_size.cjs"
+    local tools_json="pkg/workflow/js/safe_outputs_tools.json"
+    local failed=0
+
+    if [ ! -f "$size" ]; then
+        log_high "RPT-002: Size-fitting module missing: $size"
+        return
+    fi
+    if ! grep -qE 'MAX_BODY_LENGTH = 65536;' "$size"; then
+        log_high "RPT-002: Publication size limit is not 65,536 units"
+        failed=1
+    fi
+    if ! grep -qF 'SIZE_NOTICE = "Content redacted to fit size limit.";' "$size"; then
+        log_medium "RPT-002: Size redaction does not use the framework notice 'Content redacted to fit size limit.'"
+        failed=1
+    fi
+    if ! grep -qE 'PROTECTED_TYPES = new Set\(\[.*"xml_marker".*"json_marker".*"expiration".*"closing_reference"' "$size" || ! grep -qE 'node\.agentTainted === false \|\| node\.sizeProtected' "$size"; then
+        log_critical "RPT-002: Markers, expiration, closing references, framework, or sizeProtected nodes may be size-redacted"
+        failed=1
+    fi
+    if ! grep -qE 'fitted\.body\.length <= maxLength' "$size" || ! grep -qE 'throw new Error\(`\$\{ERR_VALIDATION\}: .*protected' "$size"; then
+        log_critical "RPT-002: Final concrete length is not checked or protected-frame overflow does not fail explicitly"
+        failed=1
+    fi
+    if ! grep -qE 'prefix\.length \+ body\.length \+ suffix\.length <= maxLength\) return prefix \+ body \+ suffix' "$size"; then
+        log_medium "RPT-002: Markdown bodies that already fit are not preserved unchanged"
+        failed=1
+    fi
+    for h in add_comment create_pr_review_comment; do
+        if ! grep -qE 'fitMarkdownBody\(' "actions/setup/js/$h.cjs" 2>/dev/null; then
+            log_high "RPT-002: $h does not fit the concrete published body with fitMarkdownBody"
+            failed=1
+        fi
+    done
+    if ! grep -qE 'renderSizedReport\(' actions/setup/js/issue_body.cjs 2>/dev/null; then
+        log_high "RPT-002: Issue body publication does not use renderSizedReport"
+        failed=1
+    fi
+    if [ ! -f "$tools_json" ] || ! python3 - "$tools_json" <<'PYEOF' > /dev/null 2>&1
+import json, sys
+tools = {t["name"]: t for t in json.load(open(sys.argv[1]))}
+for name in ("add_comment", "create_issue"):
+    if tools[name]["inputSchema"]["properties"]["body"].get("maxLength") != 524288:
+        sys.exit(1)
+PYEOF
+    then
+        log_medium "RPT-002: add_comment/create_issue body inputs do not accept bounded 524,288-unit source bodies"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "RPT-002: Published bodies are fitted by concrete length with protected frames preserved"
+    fi
+}
+check_report_size_redaction
+
+# RPT-003: HTML and Code Fidelity (Section 9 HTML and code fidelity, Excluded Content, 2026-10-19)
+# Report text MUST remain escaped (no raw-HTML node). Backtick fence info strings MUST NOT contain
+# backticks. Only single-line <img> with unique src/alt/width/height/align MAY become image nodes;
+# sources MUST be credential-free HTTPS on the allowed-domain policy (no code-region exception,
+# data URIs rejected); dimensions 1..10000; align left/right/center; attributes HTML-escaped.
+echo "Running RPT-003: HTML and Code Fidelity..."
+check_report_html_code_fidelity() {
+    local md="actions/setup/js/report_markdown.cjs"
+    local ast="actions/setup/js/report_ast.cjs"
+    local failed=0
+
+    if [ ! -f "$md" ] || [ ! -f "$ast" ]; then
+        log_high "RPT-003: Report Markdown/AST modules missing"
+        return
+    fi
+    if grep -qE 'type: "html"|"raw_html"|type: "raw"' "$ast" "$md"; then
+        log_critical "RPT-003: Report AST introduces a raw-HTML node"
+        failed=1
+    fi
+    if ! grep -qF 'match[1][0] !== "`" || !match[2].includes("`")' "$md"; then
+        log_high "RPT-003: Backtick fence info strings may contain backticks"
+        failed=1
+    fi
+    if ! grep -qE '\(src\|alt\|width\|height\|align\)' "$md" || ! grep -qE 'if \(attributes\.has\(name\)\) return undefined' "$md"; then
+        log_high "RPT-003: <img> import does not restrict attributes to unique src/alt/width/height/align"
+        failed=1
+    fi
+    if ! grep -qE 'align !== "left" && align !== "right" && align !== "center"' "$md" || ! grep -qE 'dimension < 1 \|\| dimension > 10000' "$ast"; then
+        log_high "RPT-003: Image alignment or dimension bounds (1..10000) are not enforced"
+        failed=1
+    fi
+    if ! awk '/^function normalizeReportImage/,/^}/' "$ast" | grep -q 'normalizeReportAllowedURL(node.url)'; then
+        log_critical "RPT-003: Shared image normalizer does not enforce allowed-domain policy for all image provenances"
+        failed=1
+    fi
+    if ! grep -qE 'url\.protocol !== "https:" \|\| url\.username \|\| url\.password' "$ast"; then
+        log_critical "RPT-003: Report URLs are not restricted to credential-free HTTPS (data URIs must be rejected)"
+        failed=1
+    fi
+    if ! grep -qE 'function escapeHTMLAttribute' "$ast"; then
+        log_high "RPT-003: Image layout attributes are not HTML-attribute escaped on serialization"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "RPT-003: Report HTML stays escaped, code is literal, and image imports are policy-validated"
+    fi
+}
+check_report_html_code_fidelity
+
+# TYPE-018: merge_pull_request Hardened Policy Gates and Decision Audit (Section 7.3 merge_pull_request, 2026-11-02)
+# Spec requires: revision binding (merge API receives evaluated head SHA), individual
+# CHANGES_REQUESTED reviews block even without an approver allowlist, required-check-apps
+# producer binding (validated at compile time), final revalidation before execution or
+# staged preview, and a bounded, redacted merge-pull-request-decisions.jsonl audit artifact
+# whose persistence failures are surfaced separately without retrying the merge.
+echo "Running TYPE-018: merge_pull_request Hardened Policy Gates and Decision Audit..."
+check_merge_pull_request_hardening() {
+    local handler="actions/setup/js/merge_pull_request.cjs"
+    local manifest="actions/setup/js/safe_output_manifest.cjs"
+    local manager="actions/setup/js/safe_output_handler_manager.cjs"
+    local go_config="pkg/workflow/merge_pull_request.go"
+    local steps="pkg/workflow/compiler_safe_outputs_steps.go"
+    local failed=0
+
+    if [ ! -f "$handler" ]; then
+        log_high "TYPE-018: merge_pull_request handler missing: $handler"
+        return
+    fi
+
+    # Revision Binding: merge API MUST receive the evaluated head SHA as `sha`
+    if ! grep -qE 'sha: pr\.head\.sha' "$handler"; then
+        log_critical "TYPE-018: merge API call is not bound to the evaluated head SHA (Revision Binding)"
+        failed=1
+    fi
+
+    # Complete Review Evidence: any reviewer's latest CHANGES_REQUESTED MUST block merging
+    if ! grep -qE 'review\.state === "CHANGES_REQUESTED"' "$handler" || ! grep -qE 'blockingReviews' "$handler"; then
+        log_critical "TYPE-018: Individual CHANGES_REQUESTED reviews are not evaluated independently of the aggregate review decision"
+        failed=1
+    fi
+
+    # required-check-apps: observed check runs MUST match configured app IDs
+    if ! grep -qE 'requiredCheckApps\[run\.name\]' "$handler"; then
+        log_high "TYPE-018: required-check-apps app identity binding is not enforced for required check runs"
+        failed=1
+    fi
+    if [ ! -f "$go_config" ] || ! grep -q 'required-check-apps contains check' "$go_config" || ! grep -q 'must be a positive GitHub App ID' "$go_config"; then
+        log_high "TYPE-018: Compiler does not reject unknown required-check-apps names or invalid app IDs"
+        failed=1
+    fi
+
+    # Final Revalidation before execution or staged preview
+    if ! grep -qE 'phase = "revalidation"' "$handler" || ! grep -q 'revalidated_at' "$handler"; then
+        log_high "TYPE-018: Final policy revalidation before merge/staged preview not detected"
+        failed=1
+    fi
+
+    # Results carry data_trust: untrusted; staged preview returns staged: true without merging
+    if ! grep -q 'data_trust: "untrusted"' "$handler"; then
+        log_high "TYPE-018: merge_pull_request results do not carry data_trust: untrusted"
+        failed=1
+    fi
+
+    # Decision Audit: bounded, redacted, untrusted-marked JSONL record
+    if [ ! -f "$manifest" ] || ! grep -q 'merge-pull-request-decisions.jsonl' "$manifest"; then
+        log_high "TYPE-018: merge-pull-request-decisions.jsonl decision audit writer missing"
+        failed=1
+    else
+        if ! grep -q '65536' "$manifest"; then
+            log_high "TYPE-018: Merge decision audit records are not bounded to 64 KiB"
+            failed=1
+        fi
+        if ! sed -n '/^function writeMergePullRequestDecision/,/^}/p' "$manifest" | grep -q 'redactManifestValue'; then
+            log_critical "TYPE-018: Merge decision audit records are not secret-redacted before persistence"
+            failed=1
+        fi
+        if ! sed -n '/^function writeMergePullRequestDecision/,/^}/p' "$manifest" | grep -q 'data_trust: "untrusted"'; then
+            log_high "TYPE-018: Merge decision audit records do not retain the untrusted-data marker"
+            failed=1
+        fi
+    fi
+    if [ ! -f "$manager" ] || ! grep -q 'audit_failed: true' "$manager"; then
+        log_high "TYPE-018: Merge decision audit persistence failures are not surfaced separately from merge outcome"
+        failed=1
+    fi
+    if [ ! -f "$steps" ] || ! grep -q 'merge-pull-request-decisions.jsonl' "$steps"; then
+        log_high "TYPE-018: Merge decision audit file is not uploaded with the safe-output items artifact"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TYPE-018: merge_pull_request binds head SHA, blocks individual objections, enforces check producers, revalidates, and audits decisions"
+    fi
+}
+check_merge_pull_request_hardening
+
+# SEC-011: Resolved Issue Relationship Repository Authorization (Section 3 Resolved Issue Relationship Repositories, LSI-006, 2026-11-02)
+# For create_issue.blocked_by and link_sub_issue, each effective repository resolved after
+# temporary-ID resolution MUST match the default target-repo or allowed-repos before any API
+# access (mention lookups, issue reads, dependency or sub-issue mutation).
+echo "Running SEC-011: Resolved Issue Relationship Repository Authorization..."
+check_issue_relationship_authorization() {
+    local create_issue="actions/setup/js/create_issue.cjs"
+    local link_sub="actions/setup/js/link_sub_issue.cjs"
+    local failed=0
+
+    if [ ! -f "$create_issue" ]; then
+        log_high "SEC-011: create_issue handler missing: $create_issue"
+        failed=1
+    else
+        local auth_line mention_line
+        auth_line=$(grep -n 'resolveAndValidateRepo(blockedIssue' "$create_issue" | head -1 | cut -d: -f1)
+        mention_line=$(grep -n 'await resolveMentionsForItem(' "$create_issue" | head -1 | cut -d: -f1)
+        if [ -z "$auth_line" ]; then
+            log_critical "SEC-011: create_issue does not authorize resolved blocked_by repositories against target-repo/allowed-repos"
+            failed=1
+        elif [ -n "$mention_line" ] && [ "$auth_line" -gt "$mention_line" ]; then
+            log_critical "SEC-011: create_issue authorizes blocked_by repositories after per-item mention lookups (must precede all API access)"
+            failed=1
+        fi
+        if ! grep -q 'blocked_by_errors' "$create_issue"; then
+            log_medium "SEC-011: create_issue does not report best-effort blocked_by attachment failures via blocked_by_errors"
+            failed=1
+        fi
+    fi
+
+    if [ ! -f "$link_sub" ]; then
+        log_high "SEC-011: link_sub_issue handler missing: $link_sub"
+        failed=1
+    else
+        local effective_line read_line
+        effective_line=$(grep -n 'const effectiveRepoResult = resolveAndValidateRepo(' "$link_sub" | head -1 | cut -d: -f1)
+        read_line=$(grep -n 'githubClient\.rest\.issues\.get(' "$link_sub" | head -1 | cut -d: -f1)
+        if [ -z "$effective_line" ]; then
+            log_critical "SEC-011: link_sub_issue does not authorize the effective parent/sub-issue repository after temporary-ID resolution (LSI-006)"
+            failed=1
+        elif [ -n "$read_line" ] && [ "$effective_line" -gt "$read_line" ]; then
+            log_critical "SEC-011: link_sub_issue authorizes the effective repository after issue reads (LSI-006 requires authorization before any API access)"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SEC-011: Resolved issue relationship repositories are authorized before API access"
+    fi
+}
+check_issue_relationship_authorization
+
+# SEC-012: Handler Tokens and Global App Permissions (Section GP5b, v1.29.14)
+# Permissions used solely through a handler's own github-token or github-app MUST NOT contribute
+# to the global App mint. This also applies to individual
+# safe-outputs.dispatch-repository.<tool>.github-token overrides.
+echo "Running SEC-012: Handler Tokens and Global App Permissions..."
+check_handler_token_global_app_exclusion() {
+    local perms="pkg/workflow/safe_outputs_permissions.go"
+    local dispatch_handler="actions/setup/js/dispatch_repository.cjs"
+    local failed=0
+
+    if [ ! -f "$perms" ]; then
+        log_high "SEC-012: Safe outputs permission computation missing: $perms"
+        return
+    fi
+
+    # GP5b rule 1: handler github-token overrides are excluded from the global App mint
+    if ! grep -qE 'getHandlerGitHubToken\(safeOutputs, handler\.StructField\) != ""' "$perms"; then
+        log_high "SEC-012: Handler github-token overrides are not excluded from the global App mint (GP5b rule 1)"
+        failed=1
+    fi
+
+    # GP5b rule 1: dispatch-repository per-tool github-token overrides are excluded as well.
+    # Excluding them is only safe when the runtime handler actually authenticates each tool with
+    # its own per-tool credential (GP5b rule 4: an override alone MUST NOT remove permissions for
+    # an operation that still uses the global credential), so both sides are checked.
+    if ! sed -n '/^func computeDispatchRepositoryPermissions/,/^}/p' "$perms" | grep -qE 'tool\.GitHubToken != ""'; then
+        log_high "SEC-012: dispatch-repository.<tool>.github-token overrides still contribute to the global App mint (GP5b rule 1)"
+        failed=1
+    fi
+    if [ -f "$dispatch_handler" ] && ! grep -qE 'createAuthenticatedGitHubClient\(toolConfig' "$dispatch_handler"; then
+        log_high "SEC-012: dispatch_repository handler authenticates with the handler-level client and ignores per-tool github-token/github-app credentials; per-tool overrides cannot be excluded from the global App mint until they are used at runtime (GP5b rules 1 and 4)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SEC-012: Handler and dispatch-repository token overrides are excluded from the global App mint"
+    fi
+}
+check_handler_token_global_app_exclusion
+
+# WTD-004: Enforceable Pull Request Merge Gate (Section 10.5 WTD4, create_pull_request item 16, T-WTD-004..006, v1.29.17)
+# Detection caution or protected-files request-review MUST leave auto-merge disabled unless
+# enforceable approval policy is verified; a failed required REQUEST_CHANGES review MUST NOT be
+# downgraded to COMMENT, and independent-review guidance MUST be emitted.
+echo "Running WTD-004: Enforceable Pull Request Merge Gate..."
+check_wtd_auto_merge_gate() {
+    local handler="actions/setup/js/create_pull_request.cjs"
+    local failed=0
+
+    if [ ! -f "$handler" ]; then
+        log_high "WTD-004: create_pull_request handler missing: $handler"
+        return
+    fi
+
+    # WTD4: independent-review requirement must gate auto-merge enablement.
+    if ! grep -qE 'requiresIndependentReview\s*=' "$handler" ||
+        ! grep -qE 'autoMerge\s*&&\s*requiresIndependentReview' "$handler"; then
+        log_high "WTD-004: Auto-merge is not withheld when detection caution or protected files require independent review (WTD4)"
+        failed=1
+    fi
+
+    # T-WTD-005: never downgrade the only blocking review to COMMENT.
+    if grep -qE 'event:\s*"COMMENT"' "$handler"; then
+        log_high "WTD-004: create_pull_request may downgrade the required REQUEST_CHANGES review to COMMENT (T-WTD-005)"
+        failed=1
+    fi
+
+    # T-WTD-005/006: independent-review guidance must be emitted.
+    if ! grep -qi 'independent reviewer' "$handler"; then
+        log_medium "WTD-004: create_pull_request does not emit independent-review guidance when auto-merge is withheld (T-WTD-005/006)"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "WTD-004: Auto-merge is withheld for detection caution and independent-review requirements (WTD4)"
+    fi
+}
+check_wtd_auto_merge_gate
+
+# ART-001: Issue Artifacts (Section 7.3 create_issue artifacts, v1.29.18)
+# The unprivileged MCP backend MUST read artifacts[].path into UTF-8 content through guarded,
+# bounded reads before recording a body-only request; invalid UTF-8 and empty content MUST be
+# rejected; the privileged issue processor MUST NOT read agent-supplied paths.
+echo "Running ART-001: Issue Artifacts..."
+check_issue_artifacts() {
+    local artifacts="actions/setup/js/issue_artifacts.cjs"
+    local backend="actions/setup/js/safe_outputs_handlers.cjs"
+    local processor="actions/setup/js/create_issue.cjs"
+    local failed=0
+
+    if [ ! -f "$artifacts" ]; then
+        log_high "ART-001: Issue artifact helper missing: $artifacts"
+        return
+    fi
+
+    local resolver
+    resolver=$(sed -n '/^function resolveIssueArtifactPaths/,/^}/p' "$artifacts")
+    if [ -z "$resolver" ]; then
+        log_high "ART-001: resolveIssueArtifactPaths not found; artifacts[].path cannot be read by the MCP backend"
+        return
+    fi
+
+    # Shape/count validation before any file read, then guarded bounded reads.
+    if ! echo "$resolver" | grep -qE 'normalizeIssueArtifactInputs\(' || ! echo "$resolver" | grep -qE 'readGuardedFile\(.*maxSizeBytes'; then
+        log_high "ART-001: artifacts[].path reads are not preceded by input validation or are not guarded and size-bounded"
+        failed=1
+    fi
+
+    # UTF-8 and empty-content rejection.
+    if ! echo "$resolver" | grep -qE 'isUtf8\(' || ! echo "$resolver" | grep -qE '\.trim\(\)'; then
+        log_high "ART-001: artifacts[].path content is not validated as non-empty UTF-8"
+        failed=1
+    fi
+
+    # The unprivileged MCP backend must resolve paths before recording requests.
+    if [ ! -f "$backend" ] || ! grep -qE 'resolveIssueArtifactPaths\(' "$backend"; then
+        log_high "ART-001: Safe outputs MCP backend does not resolve artifacts[].path before recording requests"
+        failed=1
+    fi
+
+    # The privileged processor must never read agent-supplied paths.
+    if [ -f "$processor" ] && grep -qE 'resolveIssueArtifactPaths|readGuardedFile' "$processor"; then
+        log_critical "ART-001: Privileged create_issue processor reads agent-supplied artifact paths"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "ART-001: Issue artifact paths are read by the MCP backend with guarded, bounded UTF-8 reads"
+    fi
+}
+check_issue_artifacts
+
+# SOF-001: Owner-Only Safeoutputs File Writes (Section 9 safeoutputs backend identity, v1.29.19)
+# Generated safeoutputs config, tools, metadata, validation, and output files MUST use mode 0600
+# on creation and replacement/append, and writes MUST reject symbolic links (O_NOFOLLOW).
+echo "Running SOF-001: Owner-Only Safeoutputs File Writes..."
+check_safeoutputs_private_writes() {
+    local writer="actions/setup/js/create_files.cjs"
+    local appender="actions/setup/js/safe_outputs_append.cjs"
+    local tools_gen="actions/setup/js/generate_safe_outputs_tools.cjs"
+    local failed=0
+
+    local file
+    for file in "$writer" "$appender"; do
+        if [ ! -f "$file" ]; then
+            log_high "SOF-001: Safeoutputs writer missing: $file"
+            failed=1
+            continue
+        fi
+        if ! grep -q 'O_NOFOLLOW' "$file"; then
+            log_high "SOF-001: $file does not reject symbolic links with O_NOFOLLOW"
+            failed=1
+        fi
+        # 0600 on creation and fchmod to 0600 when replacing or appending to existing files.
+        if ! grep -qE 'openSync\(.*0o600' "$file" || ! grep -qE 'fchmodSync\(.*0o600' "$file"; then
+            log_high "SOF-001: $file does not enforce mode 0600 on both creation and replacement"
+            failed=1
+        fi
+    done
+
+    # tools.json, tools_meta.json and validation.json must go through the guarded writer.
+    if [ -f "$tools_gen" ]; then
+        if ! grep -qE 'require\("\./create_files\.cjs"\)' "$tools_gen" || grep -qE 'fs\.writeFileSync\(' "$tools_gen"; then
+            log_high "SOF-001: generate_safe_outputs_tools.cjs bypasses the owner-only no-follow writer"
+            failed=1
+        fi
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "SOF-001: Safeoutputs files are written owner-only (0600) with no-follow semantics"
+    fi
+}
+check_safeoutputs_private_writes
+
+# TID-001: Escaped Temporary-ID References (Section 7.3 create_issue Temporary ID Resolution, v1.29.20)
+# Ordinary, Markdown-escaped, and partially escaped references (#aw_x, \#aw_x, #aw\_x) MUST be
+# recognized; only backslashes immediately preceding # or _ are removed for lookup; unresolved
+# references stay unchanged; a valid prefix of a longer identifier MUST NOT be replaced.
+echo "Running TID-001: Escaped Temporary-ID References..."
+check_escaped_temporary_ids() {
+    local tid="actions/setup/js/temporary_id.cjs"
+    local failed=0
+
+    if [ ! -f "$tid" ]; then
+        log_high "TID-001: Temporary ID helper missing: $tid"
+        return
+    fi
+
+    local pattern
+    pattern=$(grep -E '^const TEMPORARY_ID_PATTERN\s*=' "$tid" || true)
+    if [ -z "$pattern" ]; then
+        log_high "TID-001: TEMPORARY_ID_PATTERN not defined in $tid"
+        return
+    fi
+
+    # Escaped hash and underscore forms must be matched.
+    if ! echo "$pattern" | grep -qF '\\?#' || ! echo "$pattern" | grep -qF 'aw\\?_'; then
+        log_high "TID-001: TEMPORARY_ID_PATTERN does not recognize Markdown-escaped '#' or '_' forms"
+        failed=1
+    fi
+
+    # Complete-identifier requirement: a negative lookahead must prevent prefix matches.
+    if ! echo "$pattern" | grep -qF '(?!'; then
+        log_high "TID-001: TEMPORARY_ID_PATTERN lacks a boundary lookahead and may replace valid prefixes"
+        failed=1
+    fi
+
+    # Normalization removes only escapes immediately preceding # or _.
+    if ! sed -n '/^function normalizeTemporaryId/,/^}/p' "$tid" | grep -qF '.replace(/\\([#_])/g'; then
+        log_high "TID-001: normalizeTemporaryId does not limit unescaping to backslashes before '#' or '_'"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "TID-001: Temporary-ID resolution recognizes escaped forms and requires complete identifiers"
+    fi
+}
+check_escaped_temporary_ids
+
+# DEC-001: Invocation Decision Skips (Section 7 noop Invocation Decision Skips, v1.29.21)
+# A deny aggregate MUST suppress the invocation without counting an attempt, append a noop only
+# when no terminal output exists, and diagnose append failures without failing. Requests MUST be
+# bounded to 400,000 UTF-8 bytes; secret matches MUST withhold questions with
+# sensitive_content_blocked; outcomes MUST be recorded as harness.decision evidence.
+echo "Running DEC-001: Invocation Decision Skips..."
+check_invocation_decision_skips() {
+    local decision="actions/setup/js/skip_if_decision.cjs"
+    local runner="actions/setup/js/harness_retry_runner.cjs"
+    local session="actions/setup/js/unified_session.cjs"
+    local failed=0
+
+    if [ ! -f "$decision" ]; then
+        log_high "DEC-001: skip-if-decision evaluator missing: $decision"
+        return
+    fi
+
+    # Conditional noop: only when no terminal output exists; failures diagnosed, not thrown.
+    local skip
+    skip=$(sed -n '/^function recordDecisionSkip/,/^}/p' "$decision")
+    if ! echo "$skip" | grep -qE 'if \(!hasTerminalSafeOutput\(' || ! echo "$skip" | grep -qE 'type: "noop"'; then
+        log_high "DEC-001: Decision skips do not append a noop conditionally on the absence of terminal outputs"
+        failed=1
+    fi
+    if ! echo "$skip" | grep -qE 'catch'; then
+        log_high "DEC-001: noop append failures are not diagnosed without failing the workflow"
+        failed=1
+    fi
+
+    # Request budget: 400,000 UTF-8 bytes (100,000 tokens x 4 bytes).
+    if ! grep -qE 'MAX_DECISION_INPUT_BYTES\s*=\s*(400000|400_000|100000 \* 4|100_000 \* 4)' "$decision"; then
+        log_high "DEC-001: Decision request budget is not bounded to 400,000 UTF-8 bytes"
+        failed=1
+    fi
+
+    # Secret screening withholds questions with sensitive_content_blocked.
+    if ! grep -q 'containsSensitiveContent' "$decision" || ! grep -q 'sensitive_content_blocked' "$decision"; then
+        log_high "DEC-001: Questions and file evidence are not screened for secrets before transmission"
+        failed=1
+    fi
+
+    # A deny suppresses the invocation before the attempt counter advances.
+    if [ -f "$runner" ]; then
+        if ! awk '/decision\.outcome === "deny"/{d=NR} /attempts = attempt \+ 1/{if(!a)a=NR} END{exit !(d && a && d < a)}' "$runner"; then
+            log_high "DEC-001: Denied invocations may be counted as executed attempts"
+            failed=1
+        fi
+    else
+        log_high "DEC-001: Harness retry runner missing: $runner"
+        failed=1
+    fi
+
+    # Decision evidence is recorded separately as harness.decision.
+    if [ ! -f "$session" ] || ! grep -q '"harness.decision"' "$session"; then
+        log_medium "DEC-001: Decision outcomes are not recorded as separate harness.decision unified-session evidence"
+        failed=1
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_pass "DEC-001: Invocation decision skips are bounded, screened, conditional, and separately recorded"
+    fi
+}
+check_invocation_decision_skips
 
 # Summary
 echo ""

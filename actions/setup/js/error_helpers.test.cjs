@@ -1,8 +1,46 @@
 import { describe, it, expect } from "vitest";
-import { getErrorMessage, isHtmlContent, isLockedError, isRateLimitError } from "./error_helpers.cjs";
+import { getErrorMessage, getErrorStatus, isHtmlContent, isLockedError, isRateLimitError, isConnectTimeoutError } from "./error_helpers.cjs";
 
 describe("error_helpers", () => {
+  describe("getErrorStatus", () => {
+    it.each([
+      [{ status: 500, response: { status: 404 } }, 500],
+      [{ response: { status: 403 } }, 403],
+      [{ message: "HTTP 404", response: { headers: { "x-github-request-id": "C401:C403:C404" } } }, undefined],
+      [{ status: "404" }, undefined],
+      [null, undefined],
+    ])("extracts only structured HTTP status from %j", (error, expected) => {
+      expect(getErrorStatus(error)).toBe(expected);
+    });
+  });
+
+  describe("isConnectTimeoutError", () => {
+    it.each([Object.assign(new Error("Connection failed"), { code: "UND_ERR_CONNECT_TIMEOUT" }), new Error("Connect Timeout Error"), { message: "Connect Timeout Error" }])("recognizes connection timeout %j", error => {
+      expect(isConnectTimeoutError(error)).toBe(true);
+    });
+
+    it.each([null, undefined, "Connect Timeout Error", 42, {}, new Error("Request timeout"), { code: "ETIMEDOUT" }])("rejects other error values %j", error => {
+      expect(isConnectTimeoutError(error)).toBe(false);
+    });
+  });
+
   describe("getErrorMessage", () => {
+    it("preserves HTTP and request identity when GitHub returns an empty message", () => {
+      const error = Object.assign(new Error(""), {
+        status: 500,
+        response: { headers: { "x-github-request-id": "0A40:E7329:1C84C:5A3DC:6AF34087", authorization: "not-for-logs" } },
+      });
+      expect(getErrorMessage(error)).toBe("GitHub API request failed (HTTP 500; request ID 0A40:E7329:1C84C:5A3DC:6AF34087)");
+    });
+
+    it("uses response status for whitespace messages without logging arbitrary headers", () => {
+      expect(getErrorMessage({ message: " \n", response: { status: 502, headers: { "x-github-request-id": "<secret>" } } })).toBe("GitHub API request failed (HTTP 502)");
+    });
+
+    it("provides a nonempty fallback without HTTP context", () => {
+      expect(getErrorMessage(new Error(""))).toBe("Unknown error");
+    });
+
     it("should extract message from Error instance", () => {
       const error = new Error("Test error message");
       expect(getErrorMessage(error)).toBe("Test error message");
@@ -15,7 +53,14 @@ describe("error_helpers", () => {
 
     it("should handle objects with non-string message property", () => {
       const error = { message: 123 };
-      expect(getErrorMessage(error)).toBe("[object Object]");
+      expect(getErrorMessage(error)).toBe("123");
+    });
+
+    it("should coerce a non-string, non-primitive message value to a string instead of stringifying the whole error object", () => {
+      const error = { message: ["reason", "x"] };
+      const result = getErrorMessage(error);
+      expect(result).not.toBe("[object Object]");
+      expect(result).toBe(String(error.message));
     });
 
     it("should convert string to string", () => {

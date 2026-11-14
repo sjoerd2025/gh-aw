@@ -74,17 +74,23 @@ if [ ! -d "$WORKFLOWS_DIR" ]; then
 fi
 
 collect_modified_files() {
-    # Explicit base ref compare (clean checkout safe, CI-friendly).
+    # Compare the merge-base to the current working tree so committed, staged,
+    # and unstaged branch changes are all covered.
     if [ -n "$BASE_REF" ]; then
         if git rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>&1; then
-            git diff --name-only "${BASE_REF}...HEAD" 2>/dev/null || true
-            return
+            merge_base=$(git merge-base "$BASE_REF" HEAD 2>/dev/null || true)
+            if [ -n "$merge_base" ]; then
+                git diff --name-only "$merge_base" 2>/dev/null || true
+                git ls-files --others --exclude-standard
+                return
+            fi
         fi
         echo -e "${YELLOW}WARN${NC}: --base-ref not found (${BASE_REF}); falling back to working-tree check." >&2
     fi
 
-    # Local contributor path: staged/unstaged vs HEAD.
+    # Local contributor path: staged/unstaged and untracked files vs HEAD.
     git diff --name-only HEAD 2>/dev/null || true
+    git ls-files --others --exclude-standard
 }
 
 all_modified=$(collect_modified_files)
@@ -92,11 +98,12 @@ all_modified=$(collect_modified_files)
 # Filter to .md files within the workflows directory.
 # Strip a leading "./" from WORKFLOWS_DIR for consistent prefix matching.
 # Exclude subdirectories whose files are compiled into parent workflow lock files
-# rather than producing their own lock file (e.g. shared/, and skill directories).
+# rather than producing their own lock file (shared/, connectors/, and skills/).
 workflows_prefix="${WORKFLOWS_DIR#./}"
 modified_mds=$(printf '%s\n' "$all_modified" \
     | grep "^${workflows_prefix}.*\.md$" \
     | grep -v "^${workflows_prefix}/shared/" \
+    | grep -v "^${workflows_prefix}/connectors/" \
     | grep -v "^${workflows_prefix}/skills/" \
     || true)
 
@@ -115,7 +122,7 @@ while IFS= read -r md; do
 
     if [ ! -f "$lock" ]; then
         missing_locks+=("$md")
-    elif ! printf '%s\n' "$all_modified" | grep -Fxq "$lock"; then
+    elif ! printf '%s\n' "$all_modified" | grep -Fx "$lock" >/dev/null; then
         stale_files+=("$md")
     fi
 done <<< "$modified_mds"

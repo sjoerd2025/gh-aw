@@ -315,6 +315,7 @@ func (s *interactivePTYSession) close(t *testing.T) {
 }
 
 func TestTuistoryAddWizardIntegration(t *testing.T) {
+	t.Parallel()
 	const launchTimeoutMs = 30000 // 30 seconds
 
 	if _, err := exec.LookPath("npx"); err != nil {
@@ -372,7 +373,7 @@ func TestTuistoryAddWizardIntegration(t *testing.T) {
 	enterOutput, err := runTuistory(t, "-s", sessionName, "press", "enter")
 	require.NoError(t, err, "Failed to press enter after repository slug. Output: %s", enterOutput)
 
-	waitForTuistoryText(t, sessionName, "Do you want to proceed with these changes?", 120000)
+	waitForTuistoryText(t, sessionName, "Do you want to create a pull request with these changes?", 120000)
 
 	cancelOutput, err := runTuistory(t, "-s", sessionName, "press", "ctrl", "c")
 	require.NoError(t, err, "Failed to send Ctrl+C to add-wizard session. Output: %s", cancelOutput)
@@ -392,6 +393,7 @@ func TestTuistoryAddWizardIntegration(t *testing.T) {
 }
 
 func TestTuistoryAddWizardManifestBootstrapRunsAfterEngineSelection(t *testing.T) {
+	t.Parallel()
 	setup := setupAddWizardManifestTuistoryTest(t)
 	defer func() {
 		_ = os.RemoveAll(setup.tempDir)

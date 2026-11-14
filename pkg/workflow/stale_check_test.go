@@ -15,6 +15,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestParseStaleCheckMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		on       any
+		disabled bool
+		full     bool
+	}{
+		{name: "missing"},
+		{name: "missing on section", on: "workflow_dispatch"},
+		{name: "enabled", on: map[string]any{"stale-check": true}},
+		{name: "disabled", on: map[string]any{"stale-check": false}, disabled: true},
+		{name: "full", on: map[string]any{"stale-check": "full"}, full: true},
+		{name: "other string", on: map[string]any{"stale-check": "true"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			disabled, full := ParseStaleCheckMode(map[string]any{"on": tt.on})
+			assert.Equal(t, tt.disabled, disabled)
+			assert.Equal(t, tt.full, full)
+		})
+	}
+}
+
 // TestStaleCheckInActivationJob tests that the frontmatter hash check step is correctly
 // added or omitted based on the on.stale-check flag.
 func TestStaleCheckInActivationJob(t *testing.T) {
@@ -97,6 +120,28 @@ Test workflow for full stale check step.
 			lockContent, err := os.ReadFile(lockFile)
 			require.NoError(t, err, "Lock file should be readable")
 			lockStr := string(lockContent)
+
+			activation := compiler.jobManager.jobs["activation"]
+			require.NotNil(t, activation, "Activation job should exist")
+			conclusion := compiler.jobManager.jobs["conclusion"]
+			require.NotNil(t, conclusion, "Conclusion job should exist")
+			conclusionSteps := strings.Join(conclusion.Steps, "")
+			staleOutput := "needs.activation.outputs.stale_lock_file_failed"
+			if tt.wantStep {
+				assert.Contains(t, activation.Outputs, "stale_lock_file_failed")
+				assert.Contains(t, conclusionSteps, "GH_AW_STALE_LOCK_FILE_FAILED: ${{ "+staleOutput+" }}")
+				assert.Contains(t, conclusion.If, staleOutput+" == 'true'")
+			} else {
+				assert.NotContains(t, activation.Outputs, "stale_lock_file_failed")
+				assert.NotContains(t, lockStr, staleOutput, "Disabled stale checks must not leave dangling output references")
+				assert.NotContains(t, conclusionSteps, "GH_AW_STALE_LOCK_FILE_FAILED:")
+			}
+			assert.Contains(t, conclusion.If, "always()")
+			assert.Contains(t, conclusion.If, "needs.agent.result != 'skipped'")
+			assert.Contains(t, conclusion.If, "needs.activation.outputs.lockdown_check_failed == 'true'")
+			assert.Contains(t, conclusion.If, "needs.activation.outputs.oauth_token_check_failed == 'true'")
+			assert.Contains(t, conclusionSteps, "GH_AW_LOCKDOWN_CHECK_FAILED:")
+			assert.Contains(t, conclusionSteps, "GH_AW_OAUTH_TOKEN_CHECK_FAILED:")
 
 			hasStep := strings.Contains(lockStr, "Check workflow lock file")
 			if tt.wantStep {

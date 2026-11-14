@@ -13,7 +13,7 @@ import os from "os";
  *
  * Tests verify that:
  * 1. Valid comments pass through successfully
- * 2. E006 error is returned for length violations (>65536 chars)
+ * 2. Large input is accepted for publication fitting; E006 rejects input over 524288 chars
  * 3. E007 error is returned for mention violations (>10 mentions)
  * 4. E008 error is returned for link violations (>50 links)
  * 5. Errors use MCP JSON-RPC error format with code -32602
@@ -94,6 +94,7 @@ describe("Safe Outputs MCP Server - add_comment Constraint Enforcement", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     // Clean up temp directory
     if (tempDir && fs.existsSync(tempDir)) {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -103,6 +104,104 @@ describe("Safe Outputs MCP Server - add_comment Constraint Enforcement", () => {
     delete process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH;
     delete process.env.GH_AW_SAFE_OUTPUTS_OUTPUT_PATH;
     delete process.env.GH_AW_SAFE_OUTPUTS_TOOLS_PATH;
+  });
+
+  describe("Triggering target validation", () => {
+    it.each(["schedule", "workflow_dispatch"])("accepts the temporary-ID parent summary on %s with explicit targeting", async eventName => {
+      vi.stubGlobal("context", { eventName, payload: {}, repo: { owner: "owner", repo: "repo" } });
+      const handlersModule = await import("./safe_outputs_handlers.cjs");
+      const appendModule = await import("./safe_outputs_append.cjs");
+      const handlers = handlersModule.createHandlers(server, appendModule.createAppendFunction(outputFile), {
+        "add-comment": { target: "*", max: 2 },
+      });
+      registerTool(server, {
+        ...JSON.parse(fs.readFileSync(toolsFile, "utf8"))[0],
+        handler: handlers.addCommentHandler,
+      });
+
+      const response = await handleRequest(server, {
+        jsonrpc: "2.0",
+        id: 22,
+        method: "tools/call",
+        params: { name: "add_comment", arguments: { body: "Temporary-ID smoke summary for the parent issue", item_number: "aw_test01" } },
+      });
+
+      expect(response.result.isError).not.toBe(true);
+      expect(JSON.parse(response.result.content[0].text).result).toBe("success");
+      expect(JSON.parse(fs.readFileSync(outputFile, "utf8").trim())).toMatchObject({ type: "add_comment", item_number: "aw_test01" });
+    });
+
+    it.each(["*", "42"])("should preserve explicit target %s without triggering context", async target => {
+      vi.stubGlobal("context", { eventName: "schedule", payload: {}, repo: { owner: "owner", repo: "repo" } });
+      const handlersModule = await import("./safe_outputs_handlers.cjs");
+      const appendModule = await import("./safe_outputs_append.cjs");
+      const handlers = handlersModule.createHandlers(server, appendModule.createAppendFunction(outputFile), {
+        "add-comment": { target },
+      });
+      registerTool(server, {
+        ...JSON.parse(fs.readFileSync(toolsFile, "utf8"))[0],
+        handler: handlers.addCommentHandler,
+      });
+
+      const response = await handleRequest(server, {
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: { name: "add_comment", arguments: { body: "Workflow results requiring a comment", item_number: 42 } },
+      });
+
+      expect(response.result.isError).not.toBe(true);
+      expect(JSON.parse(response.result.content[0].text).result).toBe("success");
+      expect(JSON.parse(fs.readFileSync(outputFile, "utf8").trim()).item_number).toBe(42);
+    });
+
+    it.each([
+      ["schedule", {}],
+      ["repository_dispatch", {}],
+      ["workflow_dispatch", { inputs: {} }],
+      ["workflow_dispatch", { inputs: { event_name: "issues" } }],
+      ["issues", { issue: {} }],
+      ["pull_request", { pull_request: {} }],
+      ["discussion_comment", { discussion: {} }],
+    ])("should return actionable MCP feedback for an unresolved %s target", async (eventName, payload) => {
+      vi.stubGlobal("context", { eventName, payload, repo: { owner: "owner", repo: "repo" } });
+
+      const response = await handleRequest(server, {
+        jsonrpc: "2.0",
+        id: 19,
+        method: "tools/call",
+        params: { name: "add_comment", arguments: { body: "Workflow results requiring a comment" } },
+      });
+
+      expect(response.result.isError).toBe(true);
+      const feedback = JSON.parse(response.result.content[0].text);
+      expect(feedback.result).toBe("error");
+      expect(feedback.error).toContain("cannot resolve");
+      expect(feedback.error).toContain('safe-outputs.add-comment.target to "*"');
+      expect(feedback.error).toContain("item_number");
+      expect(fs.existsSync(outputFile)).toBe(false);
+    });
+
+    it.each([
+      ["issues", { issue: { number: 42 } }],
+      ["pull_request", { pull_request: { number: 42 } }],
+      ["issue_comment", { issue: { number: 42, pull_request: {} } }],
+      ["discussion", { discussion: { number: 42 } }],
+      ["workflow_dispatch", { inputs: { aw_context: JSON.stringify({ event_type: "issues", item_type: "issue", item_number: 42 }) } }],
+    ])("should accept a resolvable %s triggering target", async (eventName, payload) => {
+      vi.stubGlobal("context", { eventName, payload, repo: { owner: "owner", repo: "repo" } });
+
+      const response = await handleRequest(server, {
+        jsonrpc: "2.0",
+        id: 20,
+        method: "tools/call",
+        params: { name: "add_comment", arguments: { body: "Workflow results requiring a comment" } },
+      });
+
+      expect(response.result.isError).not.toBe(true);
+      expect(JSON.parse(response.result.content[0].text).result).toBe("success");
+      expect(JSON.parse(fs.readFileSync(outputFile, "utf8").trim()).type).toBe("add_comment");
+    });
   });
 
   describe("Valid Comments", () => {
@@ -192,8 +291,32 @@ describe("Safe Outputs MCP Server - add_comment Constraint Enforcement", () => {
   });
 
   describe("E006: Comment Length Violations", () => {
+    it.each([
+      ["E007", Array.from({ length: 11 }, (_, index) => `@user${index}`).join(" ")],
+      ["E008", "https://example.com/repeated ".repeat(51)],
+    ])("rejects oversized source content with trailing %s violations before it can be fitted away", async (code, tail) => {
+      const response = await handleRequest(server, {
+        jsonrpc: "2.0",
+        id: 51,
+        method: "tools/call",
+        params: { name: "add_comment", arguments: { body: "x".repeat(100000) + "\n\n" + tail } },
+      });
+      expect(response.error.code).toBe(-32602);
+      expect(response.error.message).toContain(code);
+      expect(fs.existsSync(outputFile)).toBe(false);
+    });
+
+    it.each([65537, 70000, 524288])("accepts %s characters for automatic publication fitting", async length => {
+      vi.stubGlobal("context", { eventName: "pull_request", payload: { pull_request: { number: 42 } }, repo: { owner: "owner", repo: "repo" } });
+      const body = "a".repeat(length);
+      const response = await handleRequest(server, { jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "add_comment", arguments: { body } } });
+      expect(response).not.toHaveProperty("error");
+      expect(response.result.isError).not.toBe(true);
+      expect(JSON.parse(fs.readFileSync(outputFile, "utf8").trim()).body).toBe(body);
+    });
+
     it("should reject comment exceeding maximum length", async () => {
-      const longBody = "a".repeat(65537); // One character over limit
+      const longBody = "a".repeat(524289);
       const request = {
         jsonrpc: "2.0",
         id: 5,
@@ -213,12 +336,12 @@ describe("Safe Outputs MCP Server - add_comment Constraint Enforcement", () => {
       expect(response).toHaveProperty("error");
       expect(response.error.code).toBe(-32602); // Invalid params
       expect(response.error.message).toMatch(/E006/);
-      expect(response.error.message).toMatch(/65536/); // Max length
-      expect(response.error.message).toMatch(/65537/); // Actual length
+      expect(response.error.message).toMatch(/524288/);
+      expect(response.error.message).toMatch(/524289/);
     });
 
     it("should provide actionable error message for length violation", async () => {
-      const longBody = "a".repeat(70000);
+      const longBody = "a".repeat(600000);
       const request = {
         jsonrpc: "2.0",
         id: 6,
@@ -285,6 +408,32 @@ describe("Safe Outputs MCP Server - add_comment Constraint Enforcement", () => {
   });
 
   describe("E008: Link Count Violations", () => {
+    it.each(["max_links", "max-links"])("should enforce configured %s before recording output", async key => {
+      vi.stubGlobal("context", { eventName: "pull_request", payload: { pull_request: { number: 42 } }, repo: { owner: "owner", repo: "repo" } });
+      const handlersModule = await import("./safe_outputs_handlers.cjs");
+      const appendModule = await import("./safe_outputs_append.cjs");
+      const handlers = handlersModule.createHandlers(server, appendModule.createAppendFunction(outputFile), {
+        "add-comment": { [key]: 75 },
+      });
+      registerTool(server, {
+        ...JSON.parse(fs.readFileSync(toolsFile, "utf8"))[0],
+        handler: handlers.addCommentHandler,
+      });
+      const call = body =>
+        handleRequest(server, {
+          jsonrpc: "2.0",
+          id: 30,
+          method: "tools/call",
+          params: { name: "add_comment", arguments: { body } },
+        });
+      const accepted = await call("https://example.com/screenshot ".repeat(75));
+      expect(accepted.result.isError).not.toBe(true);
+      const rejected = await call("https://example.com/screenshot ".repeat(76));
+      expect(rejected.error.code).toBe(-32602);
+      expect(rejected.error.message).toMatch(/E008.*76.*maximum is 75/);
+      expect(fs.readFileSync(outputFile, "utf8").trim().split("\n")).toHaveLength(1);
+    });
+
     it("should reject comment with too many links", async () => {
       const links = Array.from({ length: 51 }, (_, i) => `https://example.com/${i}`).join(" ");
       const request = {
@@ -333,7 +482,7 @@ describe("Safe Outputs MCP Server - add_comment Constraint Enforcement", () => {
 
   describe("MCP Error Format Compliance", () => {
     it("should use JSON-RPC error format with code -32602", async () => {
-      const longBody = "a".repeat(70000);
+      const longBody = "a".repeat(524289);
       const request = {
         jsonrpc: "2.0",
         id: 11,
@@ -504,7 +653,7 @@ describe("Safe Outputs MCP Server - add_comment Constraint Enforcement", () => {
         params: {
           name: "add_comment",
           arguments: {
-            body: "a".repeat(70000),
+            body: "a".repeat(524289),
           },
         },
       };
@@ -520,7 +669,7 @@ describe("Safe Outputs MCP Server - add_comment Constraint Enforcement", () => {
             const entry = JSON.parse(line);
             // Should not have recorded the too-long body
             if (entry.type === "add_comment") {
-              expect(entry.body.length).toBeLessThanOrEqual(65536);
+              expect(entry.body.length).toBeLessThanOrEqual(524288);
             }
           });
         }

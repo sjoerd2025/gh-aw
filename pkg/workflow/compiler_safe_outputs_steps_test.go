@@ -15,13 +15,14 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 	fetchDepthZero := 0
 
 	tests := []struct {
-		name             string
-		safeOutputs      *SafeOutputsConfig
-		checkoutConfigs  []*CheckoutConfig
-		trialMode        bool
-		trialRepo        string
-		checkContains    []string
-		checkNotContains []string
+		name                string
+		safeOutputs         *SafeOutputsConfig
+		checkoutConfigs     []*CheckoutConfig
+		checkoutSkipDefault bool
+		trialMode           bool
+		trialRepo           string
+		checkContains       []string
+		checkNotContains    []string
 	}{
 		{
 			name: "create pull request only mirrors agent default checkout",
@@ -35,7 +36,7 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 				"persist-credentials: true",
 				"name: Configure Git credentials",
 				"configure_git_credentials.sh",
-				"GITHUB_REPOSITORY: ${{ github.repository }}",
+				"GH_AW_GIT_REPOSITORY: ${{ github.repository }}",
 			},
 			checkNotContains: []string{
 				// No checkout-time base ref or trusted-default-branch guard anymore;
@@ -111,6 +112,7 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 			},
 			checkContains: []string{
 				"repository: org/trial-repo",
+				`GH_AW_GIT_REPOSITORY: "org/trial-repo"`,
 			},
 		},
 		{
@@ -176,7 +178,7 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 				{Ref: "develop"},
 			},
 			checkContains: []string{
-				"ref: develop",
+				"ref: \"develop\"",
 			},
 		},
 		{
@@ -197,7 +199,7 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 				// Root workflow checkout is still present (the agent default checkout).
 				"name: Checkout repository",
 				// Subdirectory checkout is re-authenticated so the handler can push to it.
-				`git -C "a" remote set-url origin`,
+				`(cd -- "a" && GH_AW_GIT_REPOSITORY="${GH_AW_SUBREPO_0}" bash`,
 			},
 		},
 		{
@@ -258,6 +260,27 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 				"--filter=blob:none",
 			},
 		},
+		{
+			name: "target-only checkout (CheckoutSkipDefault) omits default checkout but keeps target repo",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					TargetRepoSlug: "org/target-repo",
+				},
+			},
+			checkoutConfigs: []*CheckoutConfig{
+				{
+					Repository: "org/target-repo",
+					Path:       "target-repo",
+				},
+			},
+			checkoutSkipDefault: true,
+			checkContains: []string{
+				"org/target-repo",
+			},
+			checkNotContains: []string{
+				"name: Checkout repository",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -271,9 +294,10 @@ func TestBuildSharedPRCheckoutSteps(t *testing.T) {
 			}
 
 			workflowData := &WorkflowData{
-				Name:            "Test Workflow",
-				SafeOutputs:     tt.safeOutputs,
-				CheckoutConfigs: tt.checkoutConfigs,
+				Name:                "Test Workflow",
+				SafeOutputs:         tt.safeOutputs,
+				CheckoutConfigs:     tt.checkoutConfigs,
+				CheckoutSkipDefault: tt.checkoutSkipDefault,
 			}
 
 			steps := compiler.buildSharedPRCheckoutSteps(workflowData)
@@ -370,6 +394,7 @@ func TestBuildHandlerManagerStep(t *testing.T) {
 				"id: process_safe_outputs",
 				"uses: actions/github-script@",
 				"GH_AW_AGENT_OUTPUT",
+				"GH_AW_GITHUB_TOKEN_SOURCE: ${{ secrets.GH_AW_GITHUB_TOKEN != '' && 'pat' || 'github_actions' }}",
 				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
 				"setupGlobals",
 				"process_safe_outputs.cjs",
@@ -393,6 +418,49 @@ func TestBuildHandlerManagerStep(t *testing.T) {
 			checkContains: []string{
 				"name: Process Safe Outputs",
 				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+		},
+		{
+			name: "handler manager with configured token source",
+			safeOutputs: &SafeOutputsConfig{
+				GitHubToken:  "${{ secrets.CUSTOM_TOKEN }}",
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			checkContains: []string{
+				`GH_AW_GITHUB_TOKEN_SOURCE: "unknown"`,
+			},
+		},
+		{
+			name: "handler manager with built-in secrets token source",
+			safeOutputs: &SafeOutputsConfig{
+				GitHubToken:  "${{ secrets.GITHUB_TOKEN }}",
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			checkContains: []string{
+				`GH_AW_GITHUB_TOKEN_SOURCE: "github_actions"`,
+			},
+		},
+		{
+			name: "handler manager with built-in context token source",
+			safeOutputs: &SafeOutputsConfig{
+				GitHubToken:  "${{ github.token }}",
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			checkContains: []string{
+				`GH_AW_GITHUB_TOKEN_SOURCE: "github_actions"`,
+			},
+		},
+		{
+			name: "handler manager with GitHub App token source",
+			safeOutputs: &SafeOutputsConfig{
+				GitHubApp: &GitHubAppConfig{
+					AppID:      "${{ vars.APP_ID }}",
+					PrivateKey: "${{ secrets.APP_PRIVATE_KEY }}",
+				},
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			checkContains: []string{
+				`GH_AW_GITHUB_TOKEN_SOURCE: "app"`,
 			},
 		},
 		{
@@ -583,5 +651,393 @@ func TestStepOrderInConsolidatedJob(t *testing.T) {
 	}
 	if gitConfigPos != -1 && handlerPos != -1 {
 		assert.Less(t, gitConfigPos, handlerPos, "Git config should come before handler")
+	}
+}
+
+// TestAddAppTokenMintingSteps tests GitHub App token minting step generation
+func TestAddAppTokenMintingSteps(t *testing.T) {
+	tests := []struct {
+		name             string
+		safeOutputs      *SafeOutputsConfig
+		checkContains    []string
+		checkNotContains []string
+		wantEmpty        bool
+	}{
+		{
+			name:      "nil safe outputs returns empty",
+			wantEmpty: true,
+		},
+		{
+			name: "no github-app configured returns empty",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			wantEmpty: true,
+		},
+		{
+			name: "per-handler github-app mints token step",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						GitHubApp: &GitHubAppConfig{
+							AppID:      "12345",
+							PrivateKey: "${{ secrets.APP_KEY }}",
+						},
+					},
+				},
+			},
+			checkContains: []string{
+				"id: create-issue-app-token",
+				"Generate GitHub App token (create-issue)",
+			},
+		},
+		{
+			name: "dispatch-repository tool with github-app mints token step",
+			safeOutputs: &SafeOutputsConfig{
+				DispatchRepository: &DispatchRepositoryConfig{
+					Tools: map[string]*DispatchRepositoryToolConfig{
+						"my-tool": {
+							GitHubApp: &GitHubAppConfig{
+								AppID:      "99999",
+								PrivateKey: "${{ secrets.TOOL_KEY }}",
+							},
+						},
+					},
+				},
+			},
+			checkContains: []string{
+				"Generate GitHub App token (dispatch-repository my-tool)",
+			},
+		},
+		{
+			name: "staged dispatch-repository tool is skipped",
+			safeOutputs: &SafeOutputsConfig{
+				DispatchRepository: &DispatchRepositoryConfig{
+					Tools: map[string]*DispatchRepositoryToolConfig{
+						"staged-tool": {
+							GitHubApp: &GitHubAppConfig{
+								AppID:      "99999",
+								PrivateKey: "${{ secrets.TOOL_KEY }}",
+							},
+							Staged: func() *TemplatableBool { v := TemplatableBool("true"); return &v }(),
+						},
+					},
+				},
+			},
+			wantEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			workflowData := &WorkflowData{
+				SafeOutputs: tt.safeOutputs,
+			}
+
+			steps := compiler.addAppTokenMintingSteps(workflowData)
+
+			if tt.wantEmpty {
+				assert.Empty(t, steps)
+				return
+			}
+
+			require.NotEmpty(t, steps)
+			stepsContent := strings.Join(steps, "")
+
+			for _, expected := range tt.checkContains {
+				assert.Contains(t, stepsContent, expected, "Expected to find: "+expected)
+			}
+			for _, notExpected := range tt.checkNotContains {
+				assert.NotContains(t, stepsContent, notExpected, "Expected NOT to find: "+notExpected)
+			}
+		})
+	}
+}
+
+// TestAddSafeOutputCoreEnvVars tests core environment variable generation
+func TestAddSafeOutputCoreEnvVars(t *testing.T) {
+	tests := []struct {
+		name             string
+		safeOutputs      *SafeOutputsConfig
+		checkContains    []string
+		checkNotContains []string
+	}{
+		{
+			name: "always includes agent output and comment id",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			checkContains: []string{
+				"GH_AW_AGENT_OUTPUT: ${{ steps.setup-agent-output-env.outputs.GH_AW_AGENT_OUTPUT }}",
+				"GH_AW_COMMENT_ID: ${{ needs.activation.outputs.comment_id }}",
+				"GITHUB_SERVER_URL: ${{ github.server_url }}",
+				"GITHUB_API_URL: ${{ github.api_url }}",
+			},
+		},
+		{
+			name: "allowed-domains are propagated",
+			safeOutputs: &SafeOutputsConfig{
+				AllowedDomains: []string{"example.com", "api.example.com"},
+				AddComments:    &AddCommentsConfig{},
+			},
+			checkContains: []string{
+				"GH_AW_ALLOWED_DOMAINS:",
+				"example.com",
+			},
+		},
+		{
+			name: "urls policy is propagated",
+			safeOutputs: &SafeOutputsConfig{
+				URLs:        SafeOutputsURLsPolicyAllowedOrCodeRegion,
+				AddComments: &AddCommentsConfig{},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_URLS:",
+			},
+		},
+		{
+			name: "custom safe jobs are included",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{},
+				Jobs: map[string]*SafeJobConfig{
+					"notify-slack": {Description: "Send Slack notification"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUT_JOBS:",
+			},
+		},
+		{
+			name: "without custom jobs does not include jobs env var",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			checkNotContains: []string{
+				"GH_AW_SAFE_OUTPUT_JOBS:",
+			},
+		},
+		{
+			name: "handler manager config env var is included",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			checkContains: []string{
+				"GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			workflowData := &WorkflowData{
+				Name:        "Test Workflow",
+				SafeOutputs: tt.safeOutputs,
+			}
+
+			var steps []string
+			err := compiler.addSafeOutputCoreEnvVars(&steps, workflowData)
+			require.NoError(t, err)
+			require.NotEmpty(t, steps)
+
+			stepsContent := strings.Join(steps, "")
+
+			for _, expected := range tt.checkContains {
+				assert.Contains(t, stepsContent, expected, "Expected to find: "+expected)
+			}
+			for _, notExpected := range tt.checkNotContains {
+				assert.NotContains(t, stepsContent, notExpected, "Expected NOT to find: "+notExpected)
+			}
+		})
+	}
+}
+
+// TestAddSafeOutputTokenEnvVars tests token-related environment variable generation
+func TestAddSafeOutputTokenEnvVars(t *testing.T) {
+	tests := []struct {
+		name             string
+		safeOutputs      *SafeOutputsConfig
+		checkContains    []string
+		checkNotContains []string
+	}{
+		{
+			name: "CI trigger token emitted for create-pull-request",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{},
+			},
+			checkContains: []string{
+				"GH_AW_CI_TRIGGER_TOKEN:",
+			},
+		},
+		{
+			name: "CI trigger token uses app token when configured",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					GithubTokenForExtraEmptyCommit: "app",
+				},
+			},
+			checkContains: []string{
+				"GH_AW_CI_TRIGGER_TOKEN: ${{ steps.safe-outputs-app-token.outputs.token || '' }}",
+			},
+		},
+		{
+			name: "project URL is emitted when configured",
+			safeOutputs: &SafeOutputsConfig{
+				UpdateProjects: &UpdateProjectConfig{
+					Project: "https://github.com/orgs/myorg/projects/1",
+				},
+			},
+			checkContains: []string{
+				"GH_AW_PROJECT_URL: \"https://github.com/orgs/myorg/projects/1\"",
+			},
+		},
+		{
+			name: "no project env vars without project config",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{},
+			},
+			checkNotContains: []string{
+				"GH_AW_PROJECT_URL",
+				"GH_AW_PROJECT_GITHUB_TOKEN",
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN_SOURCE:",
+			},
+		},
+		{
+			name: "assign-to-agent token is emitted when configured",
+			safeOutputs: &SafeOutputsConfig{
+				AssignToAgent: &AssignToAgentConfig{},
+			},
+			checkContains: []string{
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN:",
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN_SOURCE: " + getEffectiveCopilotCodingAgentGitHubTokenSource(""),
+			},
+		},
+		{
+			name: "assign-to-agent token emitted for create-issue with copilot assignee",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{
+					Assignees: []string{"copilot"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN:",
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN_SOURCE: " + getEffectiveCopilotCodingAgentGitHubTokenSource(""),
+			},
+		},
+		{
+			name: "assign-to-agent source emitted for create-pull-request with copilot assignee",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					Assignees: []string{"copilot"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN_SOURCE: " + getEffectiveCopilotCodingAgentGitHubTokenSource(""),
+			},
+		},
+		{
+			name: "explicit assignment token source takes precedence over create-issue and app credentials",
+			safeOutputs: &SafeOutputsConfig{
+				GitHubApp: &GitHubAppConfig{},
+				AssignToAgent: &AssignToAgentConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{GitHubToken: "${{ secrets.ASSIGNMENT_PAT }}"},
+				},
+				CreateIssues: &CreateIssuesConfig{
+					Assignees:            []string{"copilot"},
+					BaseSafeOutputConfig: BaseSafeOutputConfig{GitHubToken: "${{ secrets.ISSUE_PAT }}"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN: ${{ secrets.ASSIGNMENT_PAT }}",
+				`GH_AW_ASSIGN_TO_AGENT_TOKEN_SOURCE: "configured"`,
+			},
+			checkNotContains: []string{
+				"secrets.ISSUE_PAT",
+				"steps.safe-outputs-app-token",
+			},
+		},
+		{
+			name: "configured create-issue assignment source takes precedence over create-pull-request",
+			safeOutputs: &SafeOutputsConfig{
+				CreateIssues: &CreateIssuesConfig{
+					Assignees:            []string{"copilot"},
+					BaseSafeOutputConfig: BaseSafeOutputConfig{GitHubToken: "${{ secrets.ISSUE_PAT }}"},
+				},
+				CreatePullRequests: &CreatePullRequestsConfig{
+					Assignees: []string{"copilot"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN: ${{ secrets.ISSUE_PAT }}",
+				`GH_AW_ASSIGN_TO_AGENT_TOKEN_SOURCE: "configured"`,
+			},
+		},
+		{
+			name: "configured create-pull-request assignment source",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					Assignees:            []string{"copilot"},
+					BaseSafeOutputConfig: BaseSafeOutputConfig{GitHubToken: "${{ secrets.PR_PAT }}"},
+				},
+			},
+			checkContains: []string{
+				"GH_AW_ASSIGN_TO_AGENT_TOKEN: ${{ secrets.PR_PAT }}",
+				`GH_AW_ASSIGN_TO_AGENT_TOKEN_SOURCE: "configured"`,
+			},
+		},
+		{
+			name: "agent session token is emitted when create-agent-session is configured",
+			safeOutputs: &SafeOutputsConfig{
+				CreateAgentSessions: &CreateAgentSessionConfig{},
+			},
+			checkContains: []string{
+				"GH_AW_AGENT_SESSION_TOKEN:",
+			},
+		},
+		{
+			name: "GITHUB_TOKEN override emitted for create-pr with custom token",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{
+					BaseSafeOutputConfig: BaseSafeOutputConfig{
+						GitHubToken: "${{ secrets.MY_PAT }}",
+					},
+				},
+			},
+			checkContains: []string{
+				"GITHUB_TOKEN: ${{ secrets.MY_PAT }}",
+			},
+		},
+		{
+			name: "no GITHUB_TOKEN override without custom token",
+			safeOutputs: &SafeOutputsConfig{
+				CreatePullRequests: &CreatePullRequestsConfig{},
+			},
+			checkNotContains: []string{
+				"GITHUB_TOKEN:",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compiler := NewCompiler()
+			workflowData := &WorkflowData{
+				Name:        "Test Workflow",
+				SafeOutputs: tt.safeOutputs,
+			}
+
+			var steps []string
+			compiler.addSafeOutputTokenEnvVars(&steps, workflowData)
+
+			stepsContent := strings.Join(steps, "")
+
+			for _, expected := range tt.checkContains {
+				assert.Contains(t, stepsContent, expected, "Expected to find: "+expected)
+			}
+			for _, notExpected := range tt.checkNotContains {
+				assert.NotContains(t, stepsContent, notExpected, "Expected NOT to find: "+notExpected)
+			}
+		})
 	}
 }

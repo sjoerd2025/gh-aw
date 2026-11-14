@@ -8,6 +8,12 @@ on:
   label_command:
     name: cloclo
     strategy: decentralized
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to fix when dispatched by Issue Monster
+        required: false
+        type: string
   status-comment: true
 max-daily-ai-credits: 10000
 permissions:
@@ -17,31 +23,34 @@ permissions:
   discussions: read
   actions: read
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-cloclo
+  group: ${{ github.workflow }}-${{ github.ref }}-cloclo-${{ inputs.issue_number || 'command' }}
   cancel-in-progress: false
+  job-discriminator: ${{ inputs.issue_number || github.run_id }}
 max-turns: 100
 engine:
-  id: claude
+  id: codex
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: balanced
 imports:
+  - shared/pr-safe-output-defaults.md
   - ../skills/jqschema/SKILL.md
   - shared/mcp/serena-go.md
   - shared/reporting.md
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
+  - shared/graders.md
 tools:
   cli-proxy: true
   agentic-workflows:
   edit:
   playwright:
-    mode: cli
   bash: true
   cache-memory:
     key: cloclo-memory-${{ github.workflow }}
 safe-outputs:
   create-pull-request:
-    expires: 2d
+    draft: true
     title-prefix: "[cloclo] "
     labels: [automation, cloclo]
     excluded-files:
@@ -49,6 +58,7 @@ safe-outputs:
     protected-files: fallback-to-issue
   add-comment:
     max: 1
+    target: ${{ inputs.issue_number || 'triggering' }}
   messages:
     footer: "> 🎤 *Magnifique! Performance by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
     run-started: "🎵 Comme d'habitude! [{workflow_name}]({run_url}) takes the stage on this {event_type}..."
@@ -76,6 +86,18 @@ This workflow is triggered when:
   - Pull request bodies or comments
   - Discussion bodies or comments
 - An issue is labeled with "cloclo"
+- Issue Monster dispatches the workflow with an `issue_number` input
+
+{{#if github.event.inputs.issue_number}}
+## Dispatched Issue
+
+Fix issue #${{ github.event.inputs.issue_number }} in ${{ github.repository }}.
+Fetch the issue body and relevant comments before making changes. If the number
+does not identify an open issue (or identifies a pull request), call `noop` and stop.
+Create a pull request with the fix and include `Fixes #${{ github.event.inputs.issue_number }}`
+in its body. Post the required summary comment on this issue using `add-comment`
+with `item_number` set to the dispatched issue number.
+{{/if}}
 
 ## Current Context
 

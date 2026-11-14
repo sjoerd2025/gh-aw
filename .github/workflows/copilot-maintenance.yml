@@ -27,7 +27,7 @@ jobs:
     if: github.repository == 'github/gh-aw'
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # v4.2.2
         with:
           fetch-depth: 0  # Fetch all history for all branches
@@ -79,20 +79,13 @@ jobs:
           echo "Running copilot branch cleanup script..."
           ./scripts/delete-old-copilot-branches.sh
 
-      - name: Execute deletion commands
+      - name: Delete selected branches
         if: github.event.inputs.delete_branches == 'true' || github.event_name == 'schedule'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MAX_BRANCHES: ${{ github.event.inputs.max_branches || '10' }}
         run: |
-          echo "Executing deletion commands..."
-          ./scripts/delete-old-copilot-branches.sh | \
-            grep "git push origin --delete copilot/" | \
-            while read -r cmd; do
-              echo "Executing: $cmd"
-              eval "$cmd" || \
-                echo "Failed to delete branch (may already be deleted)"
-            done
+          ./scripts/delete-old-copilot-branches.sh --delete
           echo "✓ Copilot branch cleanup completed"
 
       - name: Preview mode notice

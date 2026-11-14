@@ -3,11 +3,28 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCacheMemoryPromptMissingDataContract(t *testing.T) {
+	for _, template := range []string{cacheMemoryPromptFile, cacheMemoryPromptMultiFile} {
+		t.Run(template, func(t *testing.T) {
+			content, err := os.ReadFile(filepath.Join("..", "..", "actions", "setup", "md", template))
+			require.NoError(t, err)
+			prompt := string(content)
+			assert.Contains(t, prompt, "If the workflow defines initialization, a full analysis, or another fallback for absent state, follow that path and do **not** call `report_missing_data`")
+			assert.Contains(t, prompt, "If the workflow requires cached input and provides no fallback, call `report_missing_data`")
+			assert.Contains(t, prompt, "`data_type: \"cache_memory\"` and `reason: \"cache_memory_miss\"`")
+			assert.Contains(t, prompt, "report unusable required data with `report_missing_data` unless the workflow explicitly defines recovery")
+			assert.NotContains(t, prompt, "If you look for data in the cache and do not find any, call")
+		})
+	}
+}
 
 func TestBuildCacheMemoryPromptSection_SingleDefaultCache(t *testing.T) {
 	config := &CacheMemoryConfig{
@@ -25,7 +42,7 @@ func TestBuildCacheMemoryPromptSection_SingleDefaultCache(t *testing.T) {
 	require.NotNil(t, section, "Should return a prompt section for single default cache")
 	assert.True(t, section.IsFile, "Should use template file for single default cache")
 	assert.Equal(t, cacheMemoryPromptFile, section.Content, "Should reference cache memory prompt file")
-	assert.Empty(t, section.ShellCondition, "Should have no shell condition")
+	assert.Empty(t, section.ConditionEnvVar, "Should have no condition")
 
 	// Verify environment variables
 	require.NotNil(t, section.EnvVars, "Should have environment variables")

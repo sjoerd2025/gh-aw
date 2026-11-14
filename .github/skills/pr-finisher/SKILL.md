@@ -23,8 +23,8 @@ A PR is merge-ready when **all three** are satisfied. Work them **concurrently**
 
 | Condition | Definition | Agent's signal |
 |---|---|---|
-| **Reviews** | Every unresolved in-scope review thread is addressed on its merits, replied to, and resolved, including GitHub Actions bot threads/comments (`github-actions[bot]`). Code changes alone do not satisfy this. | `copilot-review` skill + GraphQL `reviewThreads` |
-| **Checks** | Local `make fmt` / `make lint` / `make test-unit` / `make test` pass. Last-known CI runs reviewed at log level. | `make` targets locally; `gh pr checks` / `gh run view --log-failed` for prior runs |
+| **Reviews** | Every unresolved in-scope review thread is addressed on its merits, replied to, and resolved, including GitHub Actions bot threads/comments (`github-actions[bot]`). Code changes alone do not satisfy this. Threads where Copilot has already replied with a substantive answer must be resolved before delegating to `copilot-review`. | `copilot-review` skill + GraphQL `reviewThreads` |
+| **Checks** | Local formatting, lint, and impacted unit tests pass; broader tests run when required by affected code or prior CI failures. Last-known CI failures reviewed at log level. | `make` targets locally; `gh pr checks` / `gh run view --log-failed` for prior runs |
 | **Mergeable** | PR is OPEN, not draft, `mergeable: MERGEABLE`, not `BEHIND` if the repo requires up-to-date branches. | `gh pr view --json mergeable,mergeStateStatus,state,isDraft` |
 
 Because the agent cannot re-trigger CI, "Checks" is satisfied at the agent's level when **local validation passes and prior CI failures have been root-caused and fixed in the pushed commits**. Final green CI requires a human to re-trigger after the agent stops.
@@ -33,10 +33,12 @@ Top-level PR comments and review bodies are useful feedback but **not** a merge 
 
 ## Hard rules
 
+- **Autopilot mode**: Never ask for confirmation before taking action. Never prompt with "Should I proceed?", "Do you want me to…?", or any equivalent. Always act immediately and autonomously.
 - **Do not merge.** Never run `gh pr merge`, enable auto-merge, or enqueue. This skill stops at "ready for merge."
 - **Do not post stand-alone PR comments.** Only reply on existing review threads / comments that need a response. Do not ping reviewers or CODEOWNERS.
 - **Always disable pagers** for `gh`: prefix with `GH_PAGER=""` or pipe through `cat`. Without this, commands hang in non-interactive shells.
 - **Read PR state once per pass and reuse it.** Cache the initial `gh pr view` payload in a local snapshot file and use `jq` against that file until you perform an action that can change PR state (for example: push, update branch, resolve conflicts). Do not re-run overlapping `gh pr view` calls within the same unchanged turn sequence.
+- **Ignore platform-managed bot PRs by default.** Stop without updating PRs authored by `dependabot[bot]`, `app/dependabot`, `renovate[bot]`, or another unrecognized bot unless the user explicitly asks to handle that bot. Continue for trusted GitHub automation such as `app/github-copilot` and `github-actions[bot]`.
 - **Never wait for CI to re-run.** No `bash sleep`, no `gh run watch`, no `gh pr checks --watch`, no re-check loop after push. The agent's pushes will not trigger workflows; waiting is futile.
 - **Local validation is non-negotiable before each push.** Because CI will not re-run, the only correctness gate the agent gets is `make ...` locally. Treat a green local run as the bar.
 - **Commit and push every iteration that produces file changes.** Unpushed changes are not visible to the user.
@@ -69,15 +71,43 @@ The agent runs this once. There is no monitoring loop.
 ```bash
 mkdir -p /tmp/gh-aw/pr-finisher
 PR_SNAPSHOT=/tmp/gh-aw/pr-finisher/pr-state.json
-GH_PAGER="" gh pr view <number> --json state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,headRefOid,reviews,reviewThreads,comments > "$PR_SNAPSHOT"
+GH_PAGER="" gh pr view <number> --json author,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup,headRefOid,reviews,comments > "$PR_SNAPSHOT"
+GH_PAGER="" gh api graphql --paginate --slurp \
+  -f query='query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$pr){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:100){pageInfo{hasNextPage} nodes{author{login} authorAssociation body createdAt url}}}}}}}' \
+  -f owner=github -f repo=gh-aw -F pr=<number> \
+  > /tmp/gh-aw/pr-finisher/review-threads.json
+jq -s '.[0] + {reviewThreads: [.[1][] | .data.repository.pullRequest.reviewThreads.nodes[] | . + {comments: .comments.nodes, commentsPageInfo: .comments.pageInfo}]}' \
+  "$PR_SNAPSHOT" /tmp/gh-aw/pr-finisher/review-threads.json \
+  > "$PR_SNAPSHOT.tmp" && mv "$PR_SNAPSHOT.tmp" "$PR_SNAPSHOT"
 GH_PAGER="" gh pr checks <number>
 ```
 
-If merged/closed, report and stop. Otherwise classify each condition as ✅ / ❌ / ⏳ / ❓ using the snapshot file plus `gh pr checks`. The CI snapshot here is your **only** view of CI for this run — capture which checks failed and why before changing anything, because after you push it will be stale.
+`reviewThreads` is not a supported `gh pr view --json` field. The GraphQL data
+above is flattened into the snapshot shape used by `copilot-review`. If a thread's
+`commentsPageInfo.hasNextPage` is true, fetch its remaining comments before judging
+whether it is addressed. Do not treat truncated or failed reads as resolved feedback.
+
+If merged/closed, report and stop. Also stop if the author is a platform-managed dependency bot or another unrecognized bot, unless the user explicitly requested handling that bot-authored PR. This author gate is independent of reviewer eligibility. Otherwise classify each condition as ✅ / ❌ / ⏳ / ❓ using the snapshot file plus `gh pr checks`. The CI snapshot here is your **only** view of CI for this run — capture which checks failed and why before changing anything, because after you push it will be stale.
 
 ### 2. Address Reviews
 
-Delegate to the `copilot-review` skill and treat that delegation as mandatory, not optional. Insist on full handling of each unresolved in-scope thread (including `github-actions[bot]`): make change → run relevant local validation → commit → push → reply → resolve. A thread is not handled until reply + resolve both succeed.
+#### 2a. Resolve Copilot-answered threads
+
+Before delegating to `copilot-review`, find review threads where Copilot has already replied with a substantive answer but the thread has not yet been marked as resolved. Resolve those threads immediately — no code changes are needed for them.
+
+```bash
+# Identify unresolved threads that already have a Copilot reply
+jq '.reviewThreads[]? | select(.isResolved==false) | select(any(.comments[]?; .author.login == "app/github-copilot" or (.author.login | test("copilot"; "i"))))' "$PR_SNAPSHOT"
+```
+
+For each such thread:
+- Confirm the Copilot reply is substantive and actually addresses the concern (not merely an acknowledgment or partial response).
+- If the reply fully addresses the concern, resolve the thread.
+- If the reply is incomplete or the concern is not satisfied, treat the thread as still open and address it in step 2b below.
+
+#### 2b. Address remaining unresolved threads
+
+Delegate to the `copilot-review` skill and treat that delegation as mandatory, not optional. Insist on full handling of each remaining unresolved in-scope thread (including `github-actions[bot]`): make change → run relevant local validation → commit → push → reply → resolve. A thread is not handled until reply + resolve both succeed.
 
 Before editing, reuse the triage snapshot instead of fetching the same PR again:
 
@@ -100,15 +130,24 @@ jq '{state,isDraft,mergeable,mergeStateStatus,reviewDecision,headRefOid}' "$PR_S
 
 ### 4. Address Checks (local + prior CI)
 
-**Local validation** — the agent's only correctness signal. Run in order; fix at each step before moving on:
+**Local validation** — the agent's only correctness signal. Batch related review,
+mergeability, and CI fixes before the final gate. Use focused tests while editing;
+do not repeat the full gate for each thread or run both standalone `test-unit` and
+the progress gate on the same unchanged files. Run in order; fix failures before
+moving on:
 
 ```bash
 make fmt
 make lint
-make test-unit
-make test
-make recompile
+make agent-report-progress
 ```
+
+The progress gate includes impacted `test-unit` coverage and workflow drift checks.
+Run `make test` when the affected code or a prior failing CI job requires its
+broader coverage, not on every no-change finisher pass. Run `make recompile` after
+workflow markdown changes. If nothing changed and all blockers are already
+addressed, reuse prior validation only when its recorded SHA matches the current
+`headRefOid`, and stop instead of repeating validation or producing an empty commit.
 
 If a `make test` fix changes wasm compiler output, or wasm golden tests fail:
 
@@ -117,6 +156,18 @@ make update-wasm-golden
 ```
 
 Then re-run the affected tests.
+
+If model-routing golden tests fail after an intentional audit-output change:
+
+```bash
+make verify-model-routing-golden
+make update-model-routing-golden
+```
+
+Review the fixture and every regenerated `expected*.json` diff before accepting
+the change. For a new run, follow `.github/skills/model-routing-golden/SKILL.md`
+and require the capture tool's full-download versus minimized-fixture comparison
+to pass.
 
 **Prior CI failures** — for each failure captured during triage, pull logs and fix the root cause:
 
@@ -155,17 +206,20 @@ Status vocabulary:
 
 ## Stopping conditions
 
+- **Ignored bot-authored PR** — platform-managed dependency bot or another unrecognized bot, without an explicit user request to handle it. Report no action and stop.
 - **Ready for merge (pending human CI re-trigger)** — local validation green, Reviews resolved, Mergeable clean. Summarize and stop.
 - **Nothing actionable remains** — non-actionable blocker (human approval, external service). Summarize and stop.
 - **Truly stuck** — unresolvable conflicts, ambiguous feedback, irreproducible failures. `ask_user` with context.
 
 ## Completion standard
 
-The task is complete only when all are true:
+For eligible PRs, the task is complete only when all are true:
 
 - `make fmt`, `make lint`, `make test-unit` all pass (or unrelated pre-existing failures explicitly identified).
+- The PR author passed the bot eligibility check, or the user explicitly requested handling that bot-authored PR.
 - `make test` was run and fixed when it was part of the failing state; wasm goldens regenerated when required.
 - The `copilot-review` skill addressed all in-scope review threads, including GitHub Actions bot review comments/threads (`github-actions[bot]`) (reply + resolve succeeded for each).
+- Review threads where Copilot had already replied with a substantive answer were resolved (step 2a) before delegating unresolved threads to `copilot-review` (step 2b).
 - Mergeable condition was checked; conflicts resolved and `BEHIND` updated when present.
 - Prior CI failures were inspected at the log level and either fixed at the root cause (with a local reproduction where possible) or explicitly flagged as not locally reproducible / escalated.
 - Every iteration that changed files was committed and pushed, and no local changes were left unpushed at stop. No post-push re-check loop.

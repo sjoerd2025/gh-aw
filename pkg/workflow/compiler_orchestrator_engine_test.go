@@ -5,6 +5,7 @@ package workflow
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/parser"
@@ -14,6 +15,145 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSetupEngineAndImports_GeminiDeprecation(t *testing.T) {
+	tests := []struct {
+		name         string
+		engine       string
+		imported     bool
+		override     string
+		batchMode    bool
+		quiet        bool
+		wantEngine   string
+		wantNotices  int
+		wantBatchUse int
+		wantWarnings int
+	}{
+		{name: "string form", engine: "engine: gemini\n", wantEngine: "gemini", wantNotices: 1},
+		{name: "object form with pin", engine: "engine:\n  id: gemini\n  version: \"0.39.1\"\n", wantEngine: "gemini", wantNotices: 1},
+		{name: "imported engine", imported: true, wantEngine: "gemini", wantNotices: 1},
+		{name: "override to Gemini", engine: "engine: copilot\n", override: "gemini", wantEngine: "gemini", wantNotices: 1, wantWarnings: 1},
+		{name: "override away from Gemini", engine: "engine: gemini\n", override: "copilot", wantEngine: "copilot", wantWarnings: 1},
+		{name: "batch mode aggregates notice", engine: "engine: gemini\n", batchMode: true, wantEngine: "gemini", wantBatchUse: 1},
+		{name: "quiet mode suppresses notice", engine: "engine: gemini\n", quiet: true, wantEngine: "gemini"},
+		{name: "default engine", wantEngine: "copilot"},
+		{name: "experimental replacement", engine: "engine: agy\n", wantEngine: "agy"},
+		{
+			name: "Google WIF",
+			engine: `engine:
+  id: gemini
+  auth:
+    type: github-oidc
+    provider: gcp
+    workload-identity-provider: projects/123/locations/global/workloadIdentityPools/test/providers/test
+    service-account: test@example.iam.gserviceaccount.com
+    project: test-project
+`,
+			wantEngine: "gemini", wantNotices: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := testutil.TempDir(t, "gemini-deprecation")
+			engine := tt.engine
+			if tt.imported {
+				require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "shared.md"), []byte("---\nengine: gemini\n---\n"), 0644))
+				engine = "imports:\n  - shared.md\n"
+			}
+			content := "---\non: push\n" + engine + "---\n\n# Test Workflow\n"
+			frontmatter, err := parser.ExtractFrontmatterFromContent(content)
+			require.NoError(t, err)
+			compiler := NewCompiler(WithEngineOverride(tt.override))
+			compiler.SetStrictMode(true)
+			compiler.SetBatchMode(tt.batchMode)
+			compiler.SetQuiet(tt.quiet)
+			output := testutil.CaptureStderr(t, func() {
+				result, err := compiler.setupEngineAndImports(frontmatter, filepath.Join(tmpDir, "test.md"), []byte(content), tmpDir)
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.Equal(t, tt.wantEngine, result.agenticEngine.GetID())
+				assert.Equal(t, tt.wantEngine, result.engineConfig.ID)
+				if tt.name == "object form with pin" {
+					assert.Equal(t, "0.39.1", result.engineConfig.Version)
+				}
+				if tt.name == "Google WIF" {
+					require.NotNil(t, result.engineConfig.Auth)
+					assert.Equal(t, "github-oidc", result.engineConfig.Auth.Type)
+					assert.Equal(t, "gcp", result.engineConfig.Auth.Provider)
+				}
+			})
+			assert.Equal(t, tt.wantNotices, strings.Count(output, "The gemini engine is deprecated"))
+			assert.Equal(t, tt.wantBatchUse, compiler.GetExperimentalFeatureUsage()["gemini deprecation"])
+			assert.Equal(t, tt.wantWarnings, compiler.GetWarningCount())
+			if tt.wantNotices > 0 {
+				assert.Contains(t, output, "Use engine: agy where supported")
+				assert.Contains(t, output, "retain engine: gemini for Google WIF")
+			}
+		})
+	}
+}
+
+func TestFrontmatterDeclaresImports(t *testing.T) {
+	tests := []struct {
+		name        string
+		frontmatter map[string]any
+		want        bool
+	}{
+		{name: "array", frontmatter: map[string]any{"imports": []any{"shared/engine.md"}}, want: true},
+		{name: "string array", frontmatter: map[string]any{"imports": []string{"shared/engine.md"}}, want: true},
+		{name: "object array", frontmatter: map[string]any{"imports": map[string]any{"aw": []any{"shared/engine.md"}}}, want: true},
+		{name: "object string array", frontmatter: map[string]any{"imports": map[string]any{"aw": []string{"shared/engine.md"}}}, want: true},
+		{name: "empty object array", frontmatter: map[string]any{"imports": map[string]any{"aw": []any{}}}, want: false},
+		{name: "missing imports", frontmatter: map[string]any{}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, frontmatterDeclaresImports(tt.frontmatter))
+		})
+	}
+}
+
+func TestSetupEngineAndImports_UnknownEngineObjectHasSourceLocation(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "unknown-imported-engine")
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755))
+	sharedContent := `---
+engine:
+  id: harness-engine
+  display-name: Harness Engine
+  behaviors:
+    secret-strategy: universal-llm-consumer
+    execution:
+      command-name: harness-engine
+      step-name: Execute Harness Engine
+---
+
+# Shared Engine Definition
+`
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "engine.md"), []byte(sharedContent), 0644))
+
+	content := `---
+on: push
+engine: # select the runtime
+  id: codexx
+strict: false
+imports:
+  - shared/engine.md
+---
+
+# Test Workflow
+`
+	frontmatter, err := parser.ExtractFrontmatterFromContent(content)
+	require.NoError(t, err)
+
+	compiler := NewCompiler()
+	_, err = compiler.setupEngineAndImports(frontmatter, filepath.Join(tmpDir, "test.md"), []byte(content), tmpDir)
+	require.Error(t, err)
+	require.ErrorContains(t, err, filepath.Join(tmpDir, "test.md")+":4:3: error:")
+	require.ErrorContains(t, err, `unknown engine "codexx"; did you mean "codex"?`)
+}
+
 // TestSetupEngineAndImports_ValidSetup tests successful engine setup with imports
 func TestSetupEngineAndImports_ValidSetup(t *testing.T) {
 	tmpDir := testutil.TempDir(t, "engine-setup-valid")
@@ -21,6 +161,7 @@ func TestSetupEngineAndImports_ValidSetup(t *testing.T) {
 	testContent := `---
 on: push
 engine: copilot
+strict: false
 network:
   allowed:
     - python
@@ -278,6 +419,171 @@ imports:
 	assert.Equal(t, 7, result.engineConfig.MaxTurnCacheMisses)
 }
 
+// TestSetupEngineAndImports_ImportedEngineVersionDefault verifies that a shared/imported
+// engine definition's top-level `version` field is applied as the default
+// EngineConfig.Version when the workflow's own `engine:` frontmatter selects the same
+// engine ID but omits `version`. This mirrors how shared/goose.md pins a default
+// version for the Goose engine, so workflows that only set `engine: { id: goose }`
+// still get a non-empty GH_AW_ENGINE_VERSION rather than crashing at runtime.
+func TestSetupEngineAndImports_ImportedEngineVersionDefault(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-imported-version-default")
+
+	sharedContent := `---
+engine:
+  id: harness-engine
+  version: "1.45.0"
+  display-name: Harness Engine
+  behaviors:
+    secret-strategy: universal-llm-consumer
+    execution:
+      command-name: harness-engine
+      step-name: Execute Harness Engine
+---
+
+# Shared Engine Definition
+`
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "engine.md"), []byte(sharedContent), 0644))
+
+	testContent := `---
+on: push
+engine:
+  id: harness-engine
+imports:
+  - shared/engine.md
+---
+
+# Test Workflow
+`
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, "harness-engine", result.engineSetting)
+	assert.Equal(t, "1.45.0", result.engineConfig.Version)
+}
+
+func TestSetupEngineAndImports_ExplicitVersionNotOverriddenByDefault(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-explicit-version-wins")
+
+	sharedContent := `---
+engine:
+  id: harness-engine
+  version: "1.45.0"
+  display-name: Harness Engine
+  behaviors:
+    secret-strategy: universal-llm-consumer
+    execution:
+      command-name: harness-engine
+      step-name: Execute Harness Engine
+---
+
+# Shared Engine Definition
+`
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "engine.md"), []byte(sharedContent), 0644))
+
+	testContent := `---
+on: push
+engine:
+  id: harness-engine
+  version: "2.0.0"
+imports:
+  - shared/engine.md
+---
+
+# Test Workflow
+`
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+	compiler := NewCompiler()
+	content := []byte(testContent)
+	frontmatterResult, err := parser.ExtractFrontmatterFromContent(string(content))
+	require.NoError(t, err)
+
+	result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, content, tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.engineConfig)
+	assert.Equal(t, "harness-engine", result.engineSetting)
+	assert.Equal(t, "2.0.0", result.engineConfig.Version)
+}
+
+func TestSetupEngineAndImports_ImportedEngineVersionDefaultDoesNotLeakAcrossWorkflows(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "engine-imported-version-no-leak")
+
+	sharedContent := `---
+engine:
+  id: harness-engine
+  version: "1.45.0"
+  display-name: Harness Engine
+  behaviors:
+    secret-strategy: universal-llm-consumer
+    execution:
+      command-name: harness-engine
+      step-name: Execute Harness Engine
+---
+
+# Shared Engine Definition
+`
+	sharedDir := filepath.Join(tmpDir, "shared")
+	require.NoError(t, os.MkdirAll(sharedDir, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "engine.md"), []byte(sharedContent), 0644))
+
+	importingContent := `---
+on: push
+engine:
+  id: harness-engine
+imports:
+  - shared/engine.md
+---
+
+# Importing Workflow
+`
+	importingFile := filepath.Join(tmpDir, "importing.md")
+	require.NoError(t, os.WriteFile(importingFile, []byte(importingContent), 0644))
+
+	compiler := NewCompiler()
+	importingFrontmatter, err := parser.ExtractFrontmatterFromContent(importingContent)
+	require.NoError(t, err)
+	importingResult, err := compiler.setupEngineAndImports(importingFrontmatter, importingFile, []byte(importingContent), tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, importingResult)
+	require.NotNil(t, importingResult.engineConfig)
+	require.Equal(t, "1.45.0", importingResult.engineConfig.Version)
+
+	plainContent := `---
+on: push
+engine:
+  id: harness-engine
+---
+
+# Plain Workflow
+`
+	plainFile := filepath.Join(tmpDir, "plain.md")
+	require.NoError(t, os.WriteFile(plainFile, []byte(plainContent), 0644))
+	plainFrontmatter, err := parser.ExtractFrontmatterFromContent(plainContent)
+	require.NoError(t, err)
+
+	plainResult, err := compiler.setupEngineAndImports(plainFrontmatter, plainFile, []byte(plainContent), tmpDir)
+	require.NoError(t, err)
+	require.NotNil(t, plainResult)
+	require.NotNil(t, plainResult.engineConfig)
+	assert.Equal(t, "harness-engine", plainResult.engineSetting)
+	assert.Empty(t, plainResult.engineConfig.Version)
+}
+
 // TestSetupEngineAndImports_MainMaxTurnCacheMissesTakesPrecedenceOverImport verifies that
 // a main workflow's max-turn-cache-misses frontmatter wins over the same field in an import.
 func TestSetupEngineAndImports_MainMaxTurnCacheMissesTakesPrecedenceOverImport(t *testing.T) {
@@ -364,6 +670,87 @@ imports:
 	assert.Equal(t, "copilot", result.engineSetting)
 	assert.Equal(t, "gpt-5.6-sol", result.model, "imported engine.model must not be dropped when main workflow sets max-ai-credits")
 	assert.Equal(t, int64(1500), result.engineConfig.MaxAICredits, "max-ai-credits from main workflow must be preserved")
+}
+
+func TestSetupEngineAndImports_ImportedAuthPreservedWithTopLevelEnginePreferences(t *testing.T) {
+	tests := []struct {
+		name        string
+		rootSetting string
+		verify      func(t *testing.T, result *engineSetupResult)
+	}{
+		{
+			name:        "model",
+			rootSetting: "model: claude-sonnet-4-5",
+			verify: func(t *testing.T, result *engineSetupResult) {
+				assert.Equal(t, "claude-sonnet-4-5", result.model)
+			},
+		},
+		{
+			name:        "max turns",
+			rootSetting: "max-turns: 40",
+			verify: func(t *testing.T, result *engineSetupResult) {
+				assert.Equal(t, "40", result.engineConfig.MaxTurns)
+			},
+		},
+		{
+			name:        "max AI credits",
+			rootSetting: "max-ai-credits: 500",
+			verify: func(t *testing.T, result *engineSetupResult) {
+				assert.Equal(t, int64(500), result.engineConfig.MaxAICredits)
+			},
+		},
+	}
+
+	sharedContent := `---
+engine:
+  id: claude
+  auth:
+    type: github-oidc
+    provider: anthropic
+    federation-rule-id: fr_01ABC
+    organization-id: org_01XYZ
+    service-account-id: sa_01DEF
+    workspace-id: ws_01GHI
+---
+
+# Shared Workflow
+`
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := testutil.TempDir(t, "engine-imported-auth-preferences")
+			sharedDir := filepath.Join(tmpDir, "shared")
+			require.NoError(t, os.MkdirAll(sharedDir, 0755))
+			require.NoError(t, os.WriteFile(filepath.Join(sharedDir, "engine.md"), []byte(sharedContent), 0644))
+
+			testContent := `---
+on: push
+` + tt.rootSetting + `
+imports:
+  - shared/engine.md
+---
+
+# Test Workflow
+`
+			testFile := filepath.Join(tmpDir, "test.md")
+			require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0644))
+
+			compiler := NewCompiler()
+			frontmatterResult, err := parser.ExtractFrontmatterFromContent(testContent)
+			require.NoError(t, err)
+
+			result, err := compiler.setupEngineAndImports(frontmatterResult, testFile, []byte(testContent), tmpDir)
+			require.NoError(t, err)
+			require.NotNil(t, result.engineConfig.Auth)
+			assert.Equal(t, "github-oidc", result.engineConfig.Auth.Type)
+			assert.Equal(t, "anthropic", result.engineConfig.Auth.Provider)
+			assert.Equal(t, "fr_01ABC", result.engineConfig.Auth.AnthropicFederationRuleID)
+			assert.Equal(t, "org_01XYZ", result.engineConfig.Auth.AnthropicOrganizationID)
+			assert.Equal(t, "sa_01DEF", result.engineConfig.Auth.ServiceAccountID)
+			assert.Equal(t, "ws_01GHI", result.engineConfig.Auth.AnthropicWorkspaceID)
+			tt.verify(t, result)
+		})
+	}
 }
 
 // TestSetupEngineAndImports_EngineOverride tests command-line engine override
@@ -515,6 +902,21 @@ func TestShouldScanImportedMarkdown(t *testing.T) {
 			want:           true,
 		},
 		{
+			name:           "scans pinned remote markdown imports",
+			importFilePath: "owner/repo/.github/workflows/connectors/tracker.md@1111111111111111111111111111111111111111",
+			want:           true,
+		},
+		{
+			name:           "does not infer markdown from the remote ref",
+			importFilePath: "owner/repo/workflow.yml@release.md",
+			want:           false,
+		},
+		{
+			name:           "preserves local at signs",
+			importFilePath: "shared/workflow@release.md",
+			want:           true,
+		},
+		{
 			name:           "skips builtin markdown imports",
 			importFilePath: parser.BuiltinPathPrefix + "engines/claude.md",
 			want:           false,
@@ -564,6 +966,7 @@ network:
 	testContent := `---
 on: push
 engine: copilot
+strict: false
 imports:
   - imported.md
 network:
@@ -704,6 +1107,7 @@ func TestSetupEngineAndImports_FirewallEnablement(t *testing.T) {
 	testContent := `---
 on: push
 engine: copilot
+strict: false
 network:
   allowed:
     - python

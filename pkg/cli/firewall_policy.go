@@ -213,6 +213,7 @@ func containsRegexMeta(s string) bool {
 // domainMatchesRegex checks if a domain matches any regex pattern in the list.
 func domainMatchesRegex(domain string, patterns []string) bool {
 	for _, pattern := range patterns {
+		//nolint:regexpdynamicpattern // Invalid user-provided patterns are logged and skipped.
 		re, err := regexp.Compile(pattern)
 		if err != nil {
 			firewallPolicyLog.Printf("Invalid regex pattern %q: %v", pattern, err)
@@ -466,7 +467,7 @@ func detectFirewallAuditArtifacts(runDir string) (manifestPath, auditJSONLPath s
 			if !checkDir(filepath.Join(agentDir, "sandbox", "firewall", "audit"), agentBase+"/sandbox/firewall/audit") {
 				// Old artifact structure (/tmp/gh-aw/ prefix preserved inside the artifact):
 				//   <agentDir>/tmp/gh-aw/sandbox/firewall/audit/
-				checkDir(filepath.Join(agentDir, "tmp", "gh-aw", "sandbox", "firewall", "audit"), agentBase+constants.AWFAuditDir)
+				checkDir(filepath.Join(agentDir, "tmp", "gh-aw", "sandbox", "firewall", "audit"), agentBase+constants.AWFAuditDir.String())
 			}
 			if manifestPath != "" && auditJSONLPath != "" {
 				return manifestPath, auditJSONLPath, nil

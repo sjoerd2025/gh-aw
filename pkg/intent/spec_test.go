@@ -13,6 +13,30 @@ import (
 // TestSpec tests derive from pkg/intent/README.md. They enforce the documented
 // public surface of the intent package without coupling to implementation internals.
 
+// TestSpec_PublicAPI_ResolveRisk validates explicit and derived risk classification.
+func TestSpec_PublicAPI_ResolveRisk(t *testing.T) {
+	tests := []struct {
+		name string
+		rec  intent.IntentRecord
+		want string
+	}{
+		{name: "explicit risk takes precedence", rec: intent.IntentRecord{Risk: "urgent", Domains: []string{"production"}}, want: "urgent"},
+		{name: "critical security is high", rec: intent.IntentRecord{Domains: []string{"security"}, Priority: "critical"}, want: "high"},
+		{name: "production is high", rec: intent.IntentRecord{Domains: []string{"production"}}, want: "high"},
+		{name: "infrastructure is medium", rec: intent.IntentRecord{Domains: []string{"infrastructure"}}, want: "medium"},
+		{name: "documentation is low", rec: intent.IntentRecord{Domains: []string{"documentation"}}, want: "low"},
+		{name: "other domains are unknown", rec: intent.IntentRecord{Domains: []string{"security"}, Priority: "high"}, want: "unknown"},
+		{name: "empty input is unknown", rec: intent.IntentRecord{}, want: "unknown"},
+		{name: "non-security critical priority keeps domain risk", rec: intent.IntentRecord{Domains: []string{"infrastructure"}, Priority: "critical"}, want: "medium"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, intent.ResolveRisk(tt.rec))
+		})
+	}
+}
+
 // TestSpec_PublicAPI_AttributionStatusConstants validates the documented
 // AttributionStatus constant values.
 // Spec (README "AttributionStatus constants"):
@@ -20,6 +44,7 @@ import (
 //	AttributionMapped="mapped", AttributionUnmapped="unmapped", AttributionUnlinked="unlinked",
 //	AttributionAmbiguous="ambiguous", AttributionSuggested="suggested"
 func TestSpec_PublicAPI_AttributionStatusConstants(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, intent.AttributionMapped, intent.AttributionStatus("mapped"),
 		"AttributionMapped should equal \"mapped\" per the spec")
 	assert.Equal(t, intent.AttributionUnmapped, intent.AttributionStatus("unmapped"),
@@ -38,6 +63,7 @@ func TestSpec_PublicAPI_AttributionStatusConstants(t *testing.T) {
 //
 //	SourceExplicitMetadata="explicit_metadata", SourceClosingIssue="closing_issue", etc.
 func TestSpec_PublicAPI_AttributionSourceConstants(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		got      intent.AttributionSource
@@ -65,6 +91,7 @@ func TestSpec_PublicAPI_AttributionSourceConstants(t *testing.T) {
 // intent record is returned as-is, with ResolverVersion stamped when absent.
 // Spec: "Explicit intent metadata (PullRequestData.ExplicitIntent) — used as-is."
 func TestSpec_PublicAPI_ResolvePullRequest_ExplicitIntent(t *testing.T) {
+	t.Parallel()
 	resolver := intent.Resolver{ResolverVersion: "v1"}
 
 	explicit := &intent.IntentRecord{
@@ -86,6 +113,7 @@ func TestSpec_PublicAPI_ResolvePullRequest_ExplicitIntent(t *testing.T) {
 // closing issue produces a closing-issue attribution.
 // Spec: "A single closing issue — resolved from the issue's labels."
 func TestSpec_PublicAPI_ResolvePullRequest_SingleClosingIssue(t *testing.T) {
+	t.Parallel()
 	resolver := intent.Resolver{
 		MatchLabels: func(labels []string) []string { return labels },
 	}
@@ -111,6 +139,7 @@ func TestSpec_PublicAPI_ResolvePullRequest_SingleClosingIssue(t *testing.T) {
 // multiple closing issues produce an ambiguous attribution.
 // Spec: "Multiple competing sources were found → ambiguous."
 func TestSpec_PublicAPI_ResolvePullRequest_MultipleClosingIssues(t *testing.T) {
+	t.Parallel()
 	resolver := intent.Resolver{}
 
 	record := resolver.ResolvePullRequest(intent.PullRequestData{
@@ -132,6 +161,7 @@ func TestSpec_PublicAPI_ResolvePullRequest_MultipleClosingIssues(t *testing.T) {
 // are used when no closing issues are present.
 // Spec: "PR labels — used as an artifact fallback when no closing issues are present."
 func TestSpec_PublicAPI_ResolvePullRequest_ArtifactFallback(t *testing.T) {
+	t.Parallel()
 	resolver := intent.Resolver{
 		MatchLabels: func(labels []string) []string { return labels },
 	}
@@ -154,6 +184,7 @@ func TestSpec_PublicAPI_ResolvePullRequest_ArtifactFallback(t *testing.T) {
 // sources produces an unlinked attribution.
 // Spec: "No supported sources — returns an AttributionUnlinked record."
 func TestSpec_PublicAPI_ResolvePullRequest_NoSources(t *testing.T) {
+	t.Parallel()
 	resolver := intent.Resolver{}
 
 	record := resolver.ResolvePullRequest(intent.PullRequestData{})
@@ -170,6 +201,7 @@ func TestSpec_PublicAPI_ResolvePullRequest_NoSources(t *testing.T) {
 // labels produces a mapped intent record.
 // Spec: "Resolver.ResolveIssue — resolves intent for an issue using its labels."
 func TestSpec_PublicAPI_ResolveIssue_Mapped(t *testing.T) {
+	t.Parallel()
 	resolver := intent.Resolver{
 		MatchLabels: func(labels []string) []string { return labels },
 	}
@@ -194,6 +226,7 @@ func TestSpec_PublicAPI_ResolveIssue_Mapped(t *testing.T) {
 // no labels produces an unlinked record.
 // Spec: "No supported sources — returns an AttributionUnlinked record."
 func TestSpec_PublicAPI_ResolveIssue_NoLabelsUnlinked(t *testing.T) {
+	t.Parallel()
 	resolver := intent.Resolver{}
 
 	record := resolver.ResolveIssue("I_kwDOAAABCQ4", "https://github.com/owner/repo/issues/1", nil)
@@ -202,4 +235,71 @@ func TestSpec_PublicAPI_ResolveIssue_NoLabelsUnlinked(t *testing.T) {
 		"issue with no labels should produce unlinked status")
 	assert.Equal(t, "no_supported_intent_source", record.Rule,
 		"issue with no labels should produce no_supported_intent_source rule")
+}
+
+// TestSpec_PublicAPI_AuthorizeTool validates deny precedence and the documented
+// nil-versus-empty allowlist contract.
+func TestSpec_PublicAPI_AuthorizeTool(t *testing.T) {
+	t.Parallel()
+	authorizer := intent.Authorizer{}
+	tests := []struct {
+		name   string
+		policy intent.ExecutionPolicy
+		tool   string
+		want   error
+	}{
+		{name: "nil allowlist is unrestricted", policy: intent.ExecutionPolicy{}, tool: "read"},
+		{name: "listed tool is allowed", policy: intent.ExecutionPolicy{AllowedTools: []string{"read"}}, tool: "read"},
+		{name: "unlisted tool is not allowed", policy: intent.ExecutionPolicy{AllowedTools: []string{"read"}}, tool: "write", want: intent.ErrToolNotAllowed},
+		{name: "non-nil empty allowlist denies all", policy: intent.ExecutionPolicy{AllowedTools: []string{}}, tool: "read", want: intent.ErrToolNotAllowed},
+		{name: "explicit denial wins over allowlist", policy: intent.ExecutionPolicy{AllowedTools: []string{"write"}, DeniedTools: []string{"write"}}, tool: "write", want: intent.ErrToolDenied},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := authorizer.AuthorizeTool(tt.policy, tt.tool)
+			if tt.want == nil {
+				assert.NoError(t, err, "AuthorizeTool should allow the tool for %s", tt.name)
+				return
+			}
+			assert.ErrorIs(t, err, tt.want, "AuthorizeTool should return the documented sentinel for %s", tt.name)
+		})
+	}
+}
+
+// TestSpec_PublicAPI_PolicyCompilerConditions validates the documented matching
+// rules: empty fields are wildcards, label conditions use Labels, and Org may
+// match either the repository organization or owner.
+func TestSpec_PublicAPI_PolicyCompilerConditions(t *testing.T) {
+	t.Parallel()
+	compiler := intent.PolicyCompiler{Rules: []intent.PolicyRule{
+		{
+			ID:    "label-and-org",
+			Scope: "repository",
+			When:  intent.PolicyCondition{Domain: "security", Org: "octo-org"},
+			Set:   intent.ExecutionPolicy{Autonomy: "supervised", WriteScope: "feature_branch"},
+		},
+	}}
+
+	tests := []struct {
+		name string
+		repo intent.RepositoryContext
+	}{
+		{name: "organization matches", repo: intent.RepositoryContext{Org: "octo-org"}},
+		{name: "owner matches", repo: intent.RepositoryContext{Owner: "octo-org"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := compiler.Compile(intent.IntentRecord{Status: intent.AttributionMapped, Labels: []string{"security"}}, tt.repo)
+			assert.Contains(t, policy.RuleIDs, "label-and-org", "Compile should record the ID of a matching rule")
+			assert.Equal(t, "supervised", policy.Autonomy, "Compile should apply the matching policy fragment")
+		})
+	}
+
+	policy := compiler.Compile(intent.IntentRecord{
+		Status:  intent.AttributionMapped,
+		Domains: []string{"security"},
+	}, intent.RepositoryContext{Org: "octo-org"})
+	assert.NotContains(t, policy.RuleIDs, "label-and-org", "Domain conditions must match Labels, not IntentRecord.Domains")
 }

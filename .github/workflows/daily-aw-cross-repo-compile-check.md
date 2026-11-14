@@ -12,17 +12,22 @@ permissions:
   issues: read
   pull-requests: read
   actions: read
+  copilot-requests: write
 tracker-id: daily-aw-cross-repo-compile-check
 max-turns: 140
 engine:
   id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default, repos]
   cache-memory: true
   bash:
@@ -80,7 +85,7 @@ Every run must:
 ## Run Context
 
 - Cache root: `/tmp/gh-aw/cache-memory/aw-compat`
-- Work root: `/tmp/gh-aw/agent/aw-compat-work`
+- Work root: `/tmp/gh-aw/aw-compat-work`
 - Use filesystem-safe timestamps only: `YYYY-MM-DD-HH-MM-SS-sss` (no colons).
 
 ## Phase 0: Prepare Workspace and Build Latest gh-aw
@@ -91,7 +96,7 @@ set -euo pipefail
 RUN_TS="$(date -u +%Y-%m-%d-%H-%M-%S)-$(date -u +%3N)"
 CACHE_ROOT="/tmp/gh-aw/cache-memory/aw-compat"
 RUN_DIR="$CACHE_ROOT/runs/$RUN_TS"
-WORK_ROOT="/tmp/gh-aw/agent/aw-compat-work/$RUN_TS"
+WORK_ROOT="/tmp/gh-aw/aw-compat-work/$RUN_TS"
 
 mkdir -p "$RUN_DIR" "$WORK_ROOT" "$CACHE_ROOT/index"
 
@@ -126,6 +131,8 @@ Use **`gh` CLI search** (not manual scraping):
 4. For each unique repository, fetch star information using `gh repo view <owner/repo> --json stargazerCount,isPrivate,isArchived`.
 5. Sort by stars descending.
 6. Select the top 20 repositories.
+
+Do not search or list existing issues to deduplicate reports; the configured `create_issue` safe output closes older issues. If GitHub search is rate-limited or unavailable, do not sleep or repeatedly retry. Make at most one materially different retry, then stop and report the blocked run using the terminal safe-output fallback below. Never describe a partial audit as a clean result.
 
 Save selection artifacts:
 
@@ -248,16 +255,18 @@ Formatting rules:
 
 ## Output Requirements
 
-At the end, do one of the following:
+At the end, choose exactly one terminal outcome:
 
 - If any issue category above is non-empty, call `create_issue` safe-output(s).
-- If no action is needed, call:
+- If the full 20-repository audit completed and no action is needed, call:
 
 ```json
 {"noop":{"message":"No compatibility issues detected; validated 20 repositories and found no actionable cross-repository failures."}}
 ```
 
-Never finish without a safe-output call.
+- If an infrastructure or tooling failure prevents completing the audit, call `create_issue` once with a title explaining that the cross-repo audit was blocked. Include the phase reached, the specific blocker, verified partial progress, and what remains unverified; do not claim compatibility findings or a clean result without completing the audit. If this terminal issue cannot be created, emit `report_incomplete` with the blocker instead.
+
+Never wait on a long rate-limit delay or finish without a safe-output call. `noop` is only valid after the full audit completes successfully with no actionable findings.
 
 ## Quality Bar
 

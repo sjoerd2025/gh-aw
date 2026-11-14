@@ -62,8 +62,7 @@ All diagnostic output MUST go to `stderr` using `console` formatting helpers. St
 | `gh aw forecast` | `NewForecastCommand` | Forecast token usage and costs for agentic workflows |
 | `gh aw trial` | `NewTrialCommand` | Run trial workflow executions |
 | `gh aw deploy` | `NewDeployCommand` | Deploy agentic workflows to a target repository using a pull request |
-| `gh aw outcomes` | `NewOutcomesCommand` | Check what happened to a workflow run's safe outputs |
-| `gh aw outcomes history` | `NewOutcomesHistorySubcommand` | Score recent closed issues and merged PRs against the objective mapping |
+| `gh aw logs --outcomes` | `NewLogsCommand` | Check what happened to selected runs' safe outputs |
 | _No `gh aw deps` command_ | `deps_*.go` (internal utilities) | Dependency reporting/advisory helpers used by other commands |
 | `gh aw doctor` | `NewDoctorCommand` | Run diagnostics to verify CLI authentication and repository setup |
 | `gh aw version` | `versionCmd` (main.go) | Show version information |
@@ -71,159 +70,141 @@ All diagnostic output MUST go to `stderr` using `console` formatting helpers. St
 
 ## Public API
 
-### Key Types
+The `cli` package is intentionally large and command-oriented. The tables below document the most important exported, source-verified entry points and data types rather than every helper. Callers SHOULD treat `New*Command()` constructors as the stable integration surface for Cobra wiring, and SHOULD use the corresponding `Run*` or library helpers for programmatic use.
 
-| Type | File | Description |
+### Types
+
+| Type | Kind | Description |
 |------|------|-------------|
-| `CompileConfig` | `compile_config.go` | Configuration for `CompileWorkflows` — file list, flags, validation options |
-| `ValidationResult` | `compile_config.go` | Result of a compilation validation pass |
-| `AddOptions` | `add_command.go` | Options controlling workflow addition behavior |
-| `AddWorkflowsResult` | `add_command.go` | Result of `AddWorkflows` / `AddResolvedWorkflows` |
-| `ResolvedWorkflow` | `add_workflow_resolution.go` | A single resolved workflow with source metadata |
-| `ResolvedWorkflows` | `add_workflow_resolution.go` | Collection of resolved workflows |
-| `RunOptions` | `run_workflow_execution.go` | Options for `RunWorkflowOnGitHub` |
-| `WorkflowRunResult` | `run_workflow_execution.go` | Result of a triggered workflow run |
-| `AuditData` | `audit_report.go` | Full audit data structure for a workflow run |
-| `AuditDiff` | `audit_diff.go` | Diff between two audit runs |
-| `CrossRunAuditReport` | `audit_cross_run.go` | Cross-run trend analysis |
-| `HealthConfig` | `health_command.go` | Configuration for health computation |
-| `WorkflowHealth` | `health_metrics.go` | Per-workflow health metrics |
-| `HealthSummary` | `health_metrics.go` | Aggregate health across all workflows |
-| `DependencyReport` | `deps_report.go` | Full dependency report |
-| `OutdatedDependency` | `deps_outdated.go` | An outdated dependency entry |
-| `SecurityAdvisory` | `deps_security.go` | A security advisory entry |
-| `WorkflowStatus` | `status_command.go` | Run status for a single workflow; embeds `WorkflowListItem` |
-| `MCPRegistryClient` | `mcp_registry.go` | Client for the MCP registry API |
-| `ToolGraph` | `tool_graph.go` | Dependency graph of MCP tools |
-| `DependencyGraph` | `dependency_graph.go` | Dependency graph across workflows |
-| `FileTracker` | `file_tracker.go` | Tracks files modified during an operation |
-| `RepeatOptions` | `retry.go` | Options for `ExecuteWithRepeat` polling loop |
-| `PollOptions` | `signal_aware_poll.go` | Options for `PollWithSignalHandling` |
-| `FixConfig` | `fix_command.go` | Configuration for `RunFix` codemods |
-| `ForecastConfig` | `forecast_command.go` | Configuration for `NewForecastCommand` (token usage forecasting) |
-| `ExperimentsListConfig` | `experiments_command.go` | Configuration for `RunExperimentsList` |
-| `ExperimentsAnalyzeConfig` | `experiments_command.go` | Configuration for `RunExperimentsAnalyze` |
-| `TrialOptions` | `trial_types.go` | Options for `RunWorkflowTrials` |
-| `WorkflowTrialResult` | `trial_types.go` | Result of a trial run |
-| `UpgradeConfig` | `upgrade_command.go` | Configuration for `NewUpgradeCommand` |
-| `ChecksConfig` | `checks_command.go` | Configuration for `RunChecks` |
-| `ChecksResult` | `checks_command.go` | Result of `FetchChecksResult` |
-| `OutcomesConfig` | `outcomes_command.go` | Configuration for `RunOutcomes` safe-output outcome evaluation |
-| `OutcomesData` | `outcomes_command.go` | Evaluated outcome data returned by `RunOutcomes` |
+| `AddOptions` | struct | Options for installing workflows from local paths, URLs, or source repositories. |
+| `AddWorkflowsResult` | struct | Result of `AddWorkflows` and `AddResolvedWorkflows`, including PR metadata and dispatch detection. |
+| `CompileConfig` | struct | Compilation and validation settings for `CompileWorkflows`, including scanner and output controls. |
+| `ValidationResult` | struct | Per-workflow validation result used by compile and validate flows. |
+| `ResolvedWorkflow` | struct | Metadata and fetched content for a single resolved workflow source. |
+| `ResolvedWorkflows` | struct | Batch resolution result for `gh aw add`, including warnings and bootstrap profile metadata. |
+| `RunOptions` | struct | Options for triggering workflows on GitHub, including enable/push/wait/dry-run behavior. |
+| `WorkflowRunFlags` | struct | Shared run flags embedded in `RunOptions` and `RunWorkflowOptions`. |
+| `WorkflowRunResult` | struct | JSON-friendly result for a triggered or simulated workflow run. |
+| `HealthConfig` | struct | Configuration for workflow health analysis. |
+| `WorkflowHealth` | struct | Per-workflow health metrics computed from historical runs. |
+| `HealthSummary` | struct | Aggregate health summary across workflows. |
+| `ChecksConfig` | struct | Inputs for normalizing CI check state for a pull request. |
+| `ChecksResult` | struct | Normalized check-rollup result returned by `FetchChecksResult`. |
+| `OutcomesData` | struct | Structured outcomes report for JSON output. |
+| `UpdateWorkflowsOptions` | struct | Options controlling `gh aw update` behavior for sourced workflows. |
+| `WorkflowStatus` | struct | Status view for a workflow, combining list metadata with latest run state. |
+| `MCPRegistryClient` | struct | Client for the MCP registry used by MCP subcommands. |
+| `ToolGraph` | struct | Directed graph of MCP tool transitions used in log analysis. |
+| `FileTracker` | struct | Tracks modified files during multi-step CLI operations. |
+| `RepeatOptions` | struct | Retry-loop configuration for `ExecuteWithRepeat`. |
+| `PollOptions` | struct | Signal-aware polling configuration for `PollWithSignalHandling`. |
+| `FixConfig` | struct | Configuration for codemod-based fixes. |
+| `ForecastConfig` | struct | Configuration for Monte Carlo AIC forecasting. |
+| `ExperimentsListConfig` | struct | Configuration for listing workflow experiments. |
+| `ExperimentsAnalyzeConfig` | struct | Configuration for detailed experiment analysis. |
+| `AuditOptions` | struct | Shared options for audit and audit-diff execution, including artifact sets and filters. |
+| `Codemod` | struct | A single code transformation applied to workflow files by `gh aw fix`, with optional file-path-aware `ApplyWithContext`. |
+| `DependencyGraph` | struct | Tracks workflow file dependencies (imports) for efficient recompilation. |
+| `DependencyReport` | struct | Aggregated dependency health report including outdated modules and security advisories. |
+| `DockerImagesOptions` | struct | Selects which Docker-based static analysis tools (`Zizmor`, `Poutine`, `Actionlint`, etc.) are requested. |
+| `LogAnalysis` | interface | Read-only interface for accessing domain analysis results; implemented by `DomainAnalysis` and `FirewallAnalysis`. |
+| `MutableLogAnalysis` | interface | Extends `LogAnalysis` with mutation methods (`SetAllowedDomains`, `SetBlockedDomains`, `AddMetrics`) used during log aggregation. |
+| `Metadata` | struct | Pagination metadata for MCP registry list responses. |
+| `OutdatedDependency` | struct | A Go module dependency with a newer version available, including current/latest versions and age. |
+| `SecurityAdvisory` | struct | A security vulnerability (GHSA/CVE) affecting a dependency, with severity and patched versions. |
+| `SetupAuthOptions` | struct | Options for checking `gh` authentication status during repository setup. |
+| `SetupRepositoryCheckOptions` | struct | Options for validating repository access and ownership during setup. |
+| `TrialOptions` | struct | Configuration for running workflow trials, including repo context, timeout, and repeat count. |
 
-### Key Functions
+### Functions
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `CompileWorkflows` | `func(ctx, CompileConfig) ([]*workflow.WorkflowData, error)` | Orchestrates compilation of one or more workflow files |
-| `CompileWorkflowWithValidation` | `func(*workflow.Compiler, filePath string, ...) error` | Compiles and validates a single workflow file |
-| `AddWorkflows` | `func([]string, AddOptions) (*AddWorkflowsResult, error)` | Adds workflows from string specs |
-| `ResolveWorkflows` | `func([]string, bool) (*ResolvedWorkflows, error)` | Resolves workflow specs to local paths and metadata |
-| `RunWorkflowOnGitHub` | `func(ctx, string, RunOptions) error` | Dispatches a single workflow run on GitHub |
-| `RunWorkflowsOnGitHub` | `func(ctx, []string, RunOptions) error` | Dispatches multiple workflows |
-| `AuditWorkflowRun` | `func(ctx, runID int64, ...) error` | Downloads and renders an audit report for a run |
-| `RunAuditDiff` | `func(ctx, baseRunID, compareRunIDs, ...) error` | Renders a diff between audit runs |
-| `DownloadWorkflowLogs` | `func(ctx, workflowName string, ...) error` | Downloads and analyzes workflow logs |
-| `RunListWorkflows` | `func(repo, path, pattern string, ...) error` | Lists installed workflows |
-| `StatusWorkflows` | `func(pattern string, ...) error` | Prints workflow run status |
-| `GetWorkflowStatuses` | `func(pattern, ref, ...) ([]WorkflowStatus, error)` | Fetches workflow statuses |
-| `RunHealth` | `func(HealthConfig) error` | Computes and renders workflow health metrics |
-| `CalculateWorkflowHealth` | `func(string, []WorkflowRun, float64) WorkflowHealth` | Pure health computation for a single workflow |
-| `CalculateHealthSummary` | `func([]WorkflowHealth, string, float64) HealthSummary` | Aggregate health computation |
-| `RunFix` | `func(FixConfig) error` | Applies automatic codemods |
-| `GetAllCodemods` | `func() []Codemod` | Returns all available codemods |
-| `InitRepository` | `func(InitOptions) error` | Initializes a repo with the `gh-aw` setup |
-| `CreateWorkflowMarkdownFile` | `func(string, bool, bool, string) error` | Creates a new workflow markdown file |
-| `IsRunnable` | `func(string) (bool, error)` | Checks whether a workflow file is runnable |
-| `RunWorkflowInteractively` | `func(ctx, ...) error` | Interactive workflow selection and dispatch |
-| `RunSpecificWorkflowInteractively` | `func(ctx, string, ...) error` | Interactive dispatch for a named workflow |
-| `RunAddInteractive` | `func(ctx, []string, ...) error` | Interactive wizard for adding workflows |
-| `RunSetupAuth` | `func(SetupAuthOptions) error` | Checks GitHub CLI authentication as part of `gh aw doctor` |
-| `RunSetupRepositoryCheck` | `func(SetupRepositoryCheckOptions) error` | Verifies repository existence, owner type, and checkout state for `gh aw doctor` |
-| `RunWorkflowTrials` | `func(ctx, []string, TrialOptions) error` | Runs trial workflow executions |
-| `RunUpdateWorkflows` | `func(ctx, []string, ...) error` | Updates workflows from upstream sources |
-| `RunChecks` | `func(ChecksConfig) error` | Fetches and renders CI check results for a PR |
-| `RunProjectNew` | `func(ctx, ProjectConfig) error` | Creates a new GitHub Project V2 board |
-| `RunListDomains` | `func(bool) error` | Lists all domains used across workflows |
-| `RunWorkflowDomains` | `func(string, bool) error` | Lists domains for a specific workflow |
-| `RunHashFrontmatter` | `func(string) error` | Prints the frontmatter hash for a workflow file |
-| `RunActionlintOnFiles` | `func([]string, bool, bool) error` | Runs actionlint linter on compiled lock files |
-| `RunZizmorOnFiles` | `func([]string, bool, bool) error` | Runs zizmor linter on compiled lock files |
-| `RunPoutineOnDirectory` | `func(string, bool, bool) error` | Runs poutine supply-chain scanner on workflow directory |
-| `RunRunnerGuardOnDirectory` | `func(string, bool, bool) error` | Runs runner-guard scanner on workflow directory |
-| `AddMCPTool` | `func(string, string, ...) error` | Adds an MCP server to a workflow file |
-| `InspectWorkflowMCP` | `func(string, ...) error` | Inspects MCP server configurations |
-| `ListWorkflowMCP` | `func(string, bool) error` | Lists MCP server info for a workflow |
-| `UpdateActions` | `func(bool, bool, bool, time.Duration) error` | Bulk-updates GitHub Action versions in workflows |
-| `ActionsBuildCommand` | `func() error` | Builds all custom actions in `actions/` |
-| `ActionsValidateCommand` | `func() error` | Validates all `action.yml` files under `actions/` |
-| `ActionsCleanCommand` | `func() error` | Removes generated action build artifacts |
-| `GenerateActionMetadataCommand` | `func() error` | Generates `action.yml` and README metadata for selected action modules |
-| `UpdateWorkflows` | `func([]string, ...) error` | Updates workflows from upstream sources |
-| `RemoveWorkflows` | `func(string, bool, string) error` | Removes workflow files |
-| `ValidateWorkflowName` | `func(string) error` | Validates a workflow name identifier |
-| `GetBinaryPath` | `func() (string, error)` | Returns the path to the `gh-aw` binary |
-| `GetCurrentRepoSlug` | `func() (string, error)` | Returns `owner/repo` for the current directory |
-| `GetVersion` | `func() string` | Returns the current CLI version |
-| `SetVersionInfo` | `func(string)` | Sets the version at startup |
-| `EnableWorkflowsByNames` | `func([]string, string) error` | Enables GitHub Actions workflows |
-| `DisableWorkflowsByNames` | `func([]string, string) error` | Disables GitHub Actions workflows |
-| `CheckOutdatedDependencies` | `func(bool) ([]OutdatedDependency, error)` | Checks for outdated dependencies |
-| `CheckSecurityAdvisories` | `func(bool) ([]SecurityAdvisory, error)` | Checks for known CVEs |
-| `GenerateDependencyReport` | `func(bool) (*DependencyReport, error)` | Full dependency analysis report |
-| `InstallShellCompletion` | `func(bool, CommandProvider) error` | Installs shell completions |
-| `PollWithSignalHandling` | `func(PollOptions) error` | Polls a predicate with SIGINT handling |
-| `ExecuteWithRepeat` | `func(RepeatOptions) error` | Repeats an operation with delay |
-| `IsRunningInCI` | `func() bool` | Detects CI environment |
-| `DetectShell` | `func() ShellType` | Detects the user's current shell |
-| `AddResolvedWorkflows` | `func([]string, *ResolvedWorkflows, AddOptions) (*AddWorkflowsResult, error)` | Adds pre-resolved workflows |
-| `FetchWorkflowFromSource` | `func(*WorkflowSpec, bool) (*FetchedWorkflow, error)` | Fetches a workflow from a remote or local source |
-| `FetchIncludeFromSource` | `func(string, *WorkflowSpec, bool) ([]byte, string, error)` | Fetches an `@include` target from source |
-| `MergeWorkflowContent` | `func(base, current, new, oldSpec, newSpec, localPath string, bool) (string, bool, error)` | Three-way merge of workflow content |
-| `CompileWorkflowDataWithValidation` | `func(*workflow.Compiler, *workflow.WorkflowData, string, ...) error` | Compiles a pre-loaded WorkflowData and runs security validators |
-| `ResolveWorkflowPath` | `func(string) (string, error)` | Resolves a workflow name to its absolute file path |
-| `ExtractWorkflowDescription` | `func(string) string` | Extracts the `description` field from workflow markdown content |
-| `ExtractWorkflowDescriptionFromFile` | `func(string) string` | Extracts the `description` field from a workflow file |
-| `ExtractWorkflowEngine` | `func(string) string` | Extracts the `engine` field from workflow markdown content |
-| `ExtractWorkflowPrivate` | `func(string) bool` | Returns true if the workflow is marked private |
-| `UpdateFieldInFrontmatter` | `func(content, fieldName, fieldValue string) (string, error)` | Sets a field in frontmatter YAML |
-| `SetFieldInOnTrigger` | `func(content, fieldName, fieldValue string) (string, error)` | Sets a field inside the `on:` trigger block |
-| `RemoveFieldFromOnTrigger` | `func(content, fieldName string) (string, error)` | Removes a field from the `on:` trigger block |
-| `UpdateScheduleInOnBlock` | `func(content, scheduleExpr string) (string, error)` | Updates the cron schedule in the `on:` block |
-| `ScanWorkflowsForMCP` | `func(workflowsDir, serverFilter string, verbose bool) ([]WorkflowMCPMetadata, error)` | Scans all workflows for MCP server configurations |
-| `ListToolsForMCP` | `func(workflowFile, mcpServerName string, verbose bool) error` | Lists tools for a specific MCP server in a workflow |
-| `CollectLockFileManifests` | `func(workflowsDir string) map[string]*workflow.GHAWManifest` | Reads all `*.lock.yml` manifests from a directory |
-| `WritePriorManifestFile` | `func(map[string]*workflow.GHAWManifest) (string, error)` | Writes manifest cache to a temporary file |
-| `GroupRunsByWorkflow` | `func([]WorkflowRun) map[string][]WorkflowRun` | Groups a flat slice of runs by workflow name |
-| `WaitForWorkflowCompletion` | `func(ctx, repoSlug, runID string, timeoutMinutes int, verbose bool) error` | Polls until a workflow run finishes or times out |
-| `ValidArtifactSetNames` | `func() []string` | Returns the valid artifact set name strings |
-| `ResolveArtifactFilter` | `func([]string) []string` | Expands artifact set aliases to concrete artifact names |
-| `ValidateArtifactSets` | `func([]string) error` | Validates that all provided artifact set names are known |
-| `ParseCopilotCodingAgentLogMetrics` | `func(logContent string, verbose bool) workflow.LogMetrics` | Parses Copilot coding-agent logs into metrics |
-| `ExtractLogMetricsFromRun` | `func(ProcessedRun) workflow.LogMetrics` | Extracts log metrics from a processed run |
-| `TrainDrain3Weights` | `func([]ProcessedRun, outputDir string, verbose bool) error` | Trains Drain3 anomaly-detection weights from run history |
-| `EvaluateOutcomes` | `func(items []CreatedItemReport, repoOverride string, mapping *github.ObjectiveMapping) []OutcomeReport` | Checks the current state of all safe output items from a run |
-| `ComputeOutcomeSummary` | `func(reports []OutcomeReport, mapping *github.ObjectiveMapping) OutcomeSummary` | Aggregates outcome reports into a summary with acceptance and zero-touch rates |
-| `RunOutcomes` | `func(OutcomesConfig) error` | Evaluates safe-output outcomes for a completed workflow run |
-| `RunOutcomesHistory` | `func(OutcomesHistoryConfig) error` | Scores recent closed issues and merged PRs against the objective mapping |
-| `RunForecast` | `func(ForecastConfig) error` | Forecasts AIC usage for agentic workflows via Monte Carlo simulation |
-| `RunExperimentsList` | `func(ExperimentsListConfig) error` | Lists all A/B experiment workflow branches |
-| `RunExperimentsAnalyze` | `func(ExperimentsAnalyzeConfig) error` | Analyzes variant distribution for a specific experiment workflow |
-| `DisplayOutdatedDependencies` | `func([]OutdatedDependency, int)` | Renders an outdated-dependencies table to stdout |
-| `DisplayDependencyReport` | `func(*DependencyReport)` | Renders a full dependency report to stdout |
-| `DisplayDependencyReportJSON` | `func(*DependencyReport) error` | Renders a dependency report as JSON to stdout |
-| `DisplaySecurityAdvisories` | `func([]SecurityAdvisory)` | Renders a security-advisory table to stdout |
-| `IsDockerAvailable` | `func(ctx context.Context) bool` | Returns true if the Docker daemon is reachable |
-| `IsDockerImageAvailable` | `func(ctx context.Context, image string) bool` | Returns true if a Docker image is present locally |
-| `IsDockerImageDownloading` | `func(string) bool` | Returns true if an image pull is in progress |
-| `StartDockerImageDownload` | `func(ctx context.Context, image string) (bool, func() error)` | Begins a background image pull; returns false if already pulling. The join function blocks until the goroutine exits and returns any download error. |
+| `NewAddCommand` | `func NewAddCommand(validateEngine func(string) error) *cobra.Command` | Constructs the `gh aw add` command. |
+| `AddWorkflows` | `func AddWorkflows(ctx context.Context, workflows []string, opts AddOptions) (*AddWorkflowsResult, error)` | Resolves and installs one or more workflows. |
+| `AddResolvedWorkflows` | `func AddResolvedWorkflows(ctx context.Context, workflowStrings []string, resolved *ResolvedWorkflows, opts AddOptions) (*AddWorkflowsResult, error)` | Installs workflows from a pre-resolved batch. |
+| `ResolveWorkflows` | `func ResolveWorkflows(ctx context.Context, workflows []string, verbose bool) (*ResolvedWorkflows, error)` | Parses workflow specs and fetches their source content. |
+| `CompileWorkflows` | `func CompileWorkflows(ctx context.Context, config CompileConfig) ([]*workflow.WorkflowData, error)` | Compiles workflow markdown into GitHub Actions lock files. |
+| `CompileWorkflowWithValidation` | `func CompileWorkflowWithValidation(ctx context.Context, compiler *workflow.Compiler, filePath string, opts CompileValidationOptions) error` | Compiles and validates a single workflow file. |
+| `CompileWorkflowDataWithValidation` | `func CompileWorkflowDataWithValidation(ctx context.Context, compiler *workflow.Compiler, workflowData *workflow.WorkflowData, filePath string, opts CompileValidationOptions) error` | Validates a pre-loaded workflow object. |
+| `RunWorkflowOnGitHub` | `func RunWorkflowOnGitHub(ctx context.Context, workflowIdOrName string, opts RunOptions) error` | Validates, optionally compiles and pushes, and dispatches one workflow run. |
+| `RunWorkflowsOnGitHub` | `func RunWorkflowsOnGitHub(ctx context.Context, workflowNames []string, opts RunOptions) error` | Dispatches multiple workflows sequentially. |
+| `WaitForWorkflowCompletion` | `func WaitForWorkflowCompletion(ctx context.Context, repoSlug, runID string, timeoutMinutes int, verbose bool) error` | Polls GitHub until a workflow run completes or times out. |
+| `AuditWorkflowRun` | `func AuditWorkflowRun(ctx context.Context, runID int64, opts AuditOptions) error` | Downloads artifacts and renders an audit report for a run. |
+| `RunAuditDiff` | `func RunAuditDiff(ctx context.Context, baseRunID int64, compareRunIDs []int64, opts AuditOptions) error` | Diffs multiple audit reports. |
+| `DownloadWorkflowLogs` | `func DownloadWorkflowLogs(ctx context.Context, opts LogsDownloadOptions) error` | Downloads and parses workflow logs and artifacts. |
+| `NewHealthCommand` | `func NewHealthCommand() *cobra.Command` | Constructs the `gh aw health` command. |
+| `CalculateWorkflowHealth` | `func CalculateWorkflowHealth(workflowName string, runs []WorkflowRun, threshold float64) WorkflowHealth` | Calculates success-rate and trend metrics for one workflow. |
+| `CalculateHealthSummary` | `func CalculateHealthSummary(workflowHealths []WorkflowHealth, period string, threshold float64) HealthSummary` | Aggregates workflow health results. |
+| `NewChecksCommand` | `func NewChecksCommand() *cobra.Command` | Constructs the `gh aw checks` command. |
+| `RunChecks` | `func RunChecks(config ChecksConfig) error` | Emits normalized PR check state. |
+| `FetchChecksResult` | `func FetchChecksResult(repoOverride string, prNumber string) (*ChecksResult, error)` | Returns normalized CI state for a pull request. |
+| `EvaluateOutcomes` | `func EvaluateOutcomes(ctx context.Context, items []CreatedItemReport, repoOverride string, mapping *github.ObjectiveMapping) []OutcomeReport` | Evaluates current state for created GitHub objects. |
+| `ComputeOutcomeSummary` | `func ComputeOutcomeSummary(reports []OutcomeReport, mapping *github.ObjectiveMapping) OutcomeSummary` | Summarizes outcome reports. |
+| `NewUpdateCommand` | `func NewUpdateCommand(validateEngine func(string) error) *cobra.Command` | Constructs the `gh aw update` command. |
+| `RunUpdateWorkflows` | `func RunUpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error` | CLI wrapper for updating sourced workflows. |
+| `UpdateWorkflows` | `func UpdateWorkflows(ctx context.Context, opts UpdateWorkflowsOptions) error` | Updates workflows with `source:` frontmatter from upstream definitions. |
+| `NewStatusCommand` | `func NewStatusCommand() *cobra.Command` | Constructs the `gh aw status` command. |
+| `GetWorkflowStatuses` | `func GetWorkflowStatuses(ctx context.Context, pattern string, ref string, labelFilter string, repoOverride string) ([]WorkflowStatus, error)` | Returns workflow status data for programmatic callers. |
+| `StatusWorkflows` | `func StatusWorkflows(ctx context.Context, pattern string, verbose bool, jsonOutput bool, ref string, labelFilter string, repoOverride string) error` | Renders workflow status to terminal or JSON. |
+| `InitRepository` | `func InitRepository(opts InitOptions) error` | Initializes repository-local gh-aw support files. |
+| `CreateWorkflowMarkdownFile` | `func CreateWorkflowMarkdownFile(workflowName string, verbose bool, force bool, engine string) error` | Creates a new workflow markdown file. |
+| `ResolveWorkflowPath` | `func ResolveWorkflowPath(workflowFile string) (string, error)` | Resolves a workflow identifier to a local file path. |
+| `ExtractWorkflowDescription` | `func ExtractWorkflowDescription(content string) string` | Reads the frontmatter description from workflow content. |
+| `ExtractWorkflowDescriptionFromFile` | `func ExtractWorkflowDescriptionFromFile(filePath string) string` | Reads the description from a workflow file. |
+| `ExtractWorkflowEngine` | `func ExtractWorkflowEngine(content string) string` | Reads the preferred engine from workflow frontmatter. |
+| `ExtractWorkflowPrivate` | `func ExtractWorkflowPrivate(content string) bool` | Reports whether workflow frontmatter marks the workflow private. |
+| `UpdateFieldInFrontmatter` | `func UpdateFieldInFrontmatter(content, fieldName, fieldValue string) (string, error)` | Updates a top-level YAML frontmatter field. |
+| `SetFieldInOnTrigger` | `func SetFieldInOnTrigger(content, fieldName, fieldValue string) (string, error)` | Sets a field inside the `on:` block. |
+| `RemoveFieldFromOnTrigger` | `func RemoveFieldFromOnTrigger(content, fieldName string) (string, error)` | Removes a field from the `on:` block. |
+| `UpdateScheduleInOnBlock` | `func UpdateScheduleInOnBlock(content, scheduleExpr string) (string, error)` | Rewrites the workflow schedule expression inside `on:`. |
+| `ScanWorkflowsForMCP` | `func ScanWorkflowsForMCP(workflowsDir string, serverFilter string, verbose bool) ([]WorkflowMCPMetadata, error)` | Scans workflow markdown for MCP usage. |
+| `ListToolsForMCP` | `func ListToolsForMCP(workflowFile string, mcpServerName string, verbose bool) error` | Lists tools exposed by one MCP server reference. |
+| `ListWorkflowMCP` | `func ListWorkflowMCP(workflowFile string, verbose bool) error` | Lists MCP server configuration for a workflow. |
+| `InspectWorkflowMCP` | `func InspectWorkflowMCP(ctx context.Context, workflowFile string, serverFilter string, toolFilter string, verbose bool, useActionsSecrets bool) error` | Inspects MCP server definitions and resolved secrets. |
+| `AddMCPTool` | `func AddMCPTool(ctx context.Context, workflowFile string, mcpServerID string, registryURL string, transportType string, customToolID string, verbose bool) error` | Adds an MCP tool or server reference to workflow frontmatter. |
+| `GenerateDependencyReport` | `func GenerateDependencyReport(ctx context.Context, verbose bool) (*DependencyReport, error)` | Generates a dependency report for the current repo. |
+| `CheckOutdatedDependencies` | `func CheckOutdatedDependencies(ctx context.Context, verbose bool) ([]OutdatedDependency, error)` | Detects outdated dependencies. |
+| `CheckSecurityAdvisories` | `func CheckSecurityAdvisories(ctx context.Context, verbose bool) ([]SecurityAdvisory, error)` | Detects known GitHub advisories affecting dependencies. |
+| `DisplayDependencyReport` | `func DisplayDependencyReport(report *DependencyReport)` | Renders a dependency report. |
+| `DisplayDependencyReportJSON` | `func DisplayDependencyReportJSON(report *DependencyReport) error` | Writes a dependency report as JSON. |
+| `DisplayOutdatedDependencies` | `func DisplayOutdatedDependencies(outdated []OutdatedDependency, totalDeps int)` | Renders outdated dependencies. |
+| `DisplaySecurityAdvisories` | `func DisplaySecurityAdvisories(advisories []SecurityAdvisory)` | Renders advisory results. |
+| `RunForecast` | `func RunForecast(config ForecastConfig) error` | Runs token and AIC forecast analysis. |
+| `RunExperimentsList` | `func RunExperimentsList(config ExperimentsListConfig) error` | Lists experiment branches and summary statistics. |
+| `RunExperimentsAnalyze` | `func RunExperimentsAnalyze(config ExperimentsAnalyzeConfig) error` | Produces detailed statistical analysis for one experiment workflow. |
+| `ExecuteWithRepeat` | `func ExecuteWithRepeat(options RepeatOptions) error` | Repeats an operation with delay and retry controls. |
+| `PollWithSignalHandling` | `func PollWithSignalHandling(options PollOptions) error` | Polls while honoring interruption signals. |
+| `InstallShellCompletion` | `func InstallShellCompletion(verbose bool, rootCmd CommandProvider) error` | Installs shell completion scripts for the CLI. |
+| `DetectShell` | `func DetectShell() ShellType` | Detects the current interactive shell. |
+| `GetBinaryPath` | `func GetBinaryPath() (string, error)` | Returns the current gh-aw binary path. |
+| `GetCurrentRepoSlug` | `func GetCurrentRepoSlug() (string, error)` | Returns the current repository slug. |
+| `GetVersion` | `func GetVersion() string` | Returns the CLI version string. |
+| `SetVersionInfo` | `func SetVersionInfo(v string)` | Sets the CLI version string at startup. |
+| `CheckAndPrepareDockerImagesWithDetachedDownloads` | `func(ctx context.Context, opts DockerImagesOptions) error` | Checks requested scanner images and starts bounded downloads where needed. |
+| `DryRunRequiredBoolFlags` | `func() []string` | Lists development-compile checks that cannot be disabled. |
+| `NewSkillCommand` | `func() *cobra.Command` | Constructs the skill command. |
+| `NewWorkCommandWithNativeDeliveryHost` | `func(host *workqueue.NativeDeliveryHost) *cobra.Command` | Constructs the protected native work command using a host-supplied delivery boundary. |
+| `NewConnectorsCommand` | `func() *cobra.Command` | Constructs commands for validating and inspecting connector definitions and hosting frozen plans. |
+| `NewConnectorCommand` | `func() *cobra.Command` | Constructs the id-first setup and local-test interface for AW Markdown connectors. |
+| `RetrieveEpisodeLogs` | `func(ctx context.Context, opts EpisodeRetrievalOptions) (LogsData, error)` | Collects canonical workflow-run members using compact artifacts and the standard log report builder. |
+| `ValidateDevelopmentCompileFlags` | `func(dev bool, flags map[string]bool) error` | Rejects explicit development-compile opt-outs while allowing omitted defaults. |
+
+### Constants
+
+| Constant | Type | Value | Description |
+|----------|------|-------|-------------|
+| `CheckStateFailed` | `CheckState` | `"failed"` | Normalized CI state indicating one or more checks failed. |
+| `CheckStatePending` | `CheckState` | `"pending"` | Normalized CI state indicating checks are still running or queued. |
+| `CheckStateNoChecks` | `CheckState` | `"no_checks"` | Normalized CI state indicating no checks were configured or triggered. |
+| `CheckStatePolicyBlocked` | `CheckState` | `"policy_blocked"` | Normalized CI state indicating policy or account gates blocked the PR. |
+| `CheckStateSuccess` | `CheckState` | `"success"` | Normalized CI state indicating all required checks passed. |
 | `CheckAndPrepareDockerImages` | `func(ctx context.Context, opts DockerImagesOptions) error` | Pre-pulls security-scanner Docker images |
-| `UpdateContainerPins` | `func(ctx, workflowDir string, verbose bool) error` | Updates container image SHA pins in workflow files |
-| `CreatePRWithChanges` | `func(branchPrefix, commitMessage, prTitle, prBody string, verbose bool) (string, error)` | Creates a GitHub PR from uncommitted changes |
+| `UpdateContainerPins` | `func(ctx context.Context, workflowDir string, verbose bool) (bool, error)` | Updates container image SHA pins in workflow files |
 | `AutoMergePullRequestsCreatedAfter` | `func(repoSlug string, createdAfter time.Time, verbose bool) error` | Auto-merges eligible PRs created after a given time |
 | `PreflightCheckForCreatePR` | `func(bool) error` | Validates prerequisites before creating a PR |
 | `DisableAllWorkflowsExcept` | `func(repoSlug string, exceptWorkflows []string, verbose bool) error` | Disables all workflows in a repo except the named ones |
-| `GetEngineSecretNameAndValue` | `func(engine string, existingSecrets map[string]bool) (string, string, bool, error)` | Prompts for and validates an engine API secret |
+| `GetEngineSecretNameAndValue` | `func(engine string, existingSecrets map[string]struct{}) (string, string, bool, error)` | Prompts for and validates an engine API secret |
 | `CheckForUpdatesAsync` | `func(ctx, noCheckUpdate, verbose bool) func()` | Checks for a newer `gh-aw` version in the background; returns a join function the caller must invoke before exit |
 | `FetchChecksResult` | `func(repoOverride, prNumber string) (*ChecksResult, error)` | Fetches CI check results for a pull request |
 | `ValidEngineNames` | `func() []string` | Returns the supported engine names for shell completion |
@@ -272,11 +253,9 @@ The `cli` package exports many types used across its command implementations. Th
 | `CodemodResult` | struct | Result of a single codemod transformation |
 | `CommandProvider` | interface | Interface implemented by Cobra root commands for shell-completion helpers |
 | `CompilationStats` | struct | Statistics from a compilation run (files, errors, warnings) |
-| `CompileValidationError` | struct | A validation error emitted during compilation |
 | `CombinedTrialResult` | struct | Combined results from multiple trial runs |
 | `ContinuationData` | struct | State for multi-turn agent continuations |
 | `CopilotCodingAgentDetector` | struct | Detector for Copilot coding-agent log patterns |
-| `CopilotWorkflowStep` | struct | A single step from a Copilot setup-steps YAML file |
 | `CreatedItemReport` | struct | Report of an item created by a safe-output action (type, URL, number, repo) |
 | `CrossRunSummary` | struct | Summary of cross-run metrics across multiple workflow runs |
 | `DependencyInfo` | struct | Metadata for a single dependency in `go.mod` or `package.json` |
@@ -295,11 +274,9 @@ The `cli` package exports many types used across its command implementations. Th
 | `DomainDiffEntry` | struct | Per-domain diff between two runs |
 | `DownloadResult` | struct | Result of a log artifact download |
 | `EpisodeData` | struct | A single agent episode (one tool-call turn) |
-| `ErrorInfo` | struct | Structured error captured from an agent run |
 | `ErrorSummary` | struct | Aggregated error summary for a workflow run |
 | `FetchedWorkflow` | struct | A workflow fetched from a remote or local source with metadata |
 | `FileInfo` | struct | File metadata captured during a workflow run |
-| `Finding` | struct | A finding from a security scanner (Zizmor/Poutine/Actionlint) |
 | `FirewallAnalysis` | struct | Analysis of AWF network firewall logs |
 | `FirewallDiff` | struct | Diff of firewall domain access between two audit runs |
 | `FirewallDiffSummary` | struct | Summary statistics for a firewall diff |
@@ -349,12 +326,11 @@ The `cli` package exports many types used across its command implementations. Th
 | `OverviewData` | struct | High-level overview data for a workflow run |
 | `OutcomeEvaluation` | struct | Evaluation state embedded in `OutcomeReport` (status, merge/close metadata) |
 | `OutcomeReport` | struct | Result of evaluating one safe output item — outcome, timing, human engagement, and objective value |
-| `OutcomeResult` | string alias | Outcome classification: `accepted`, `rejected`, `ignored`, `pending`, `unknown`, `lifecycle`, `error` |
+| `OutcomeStatus` | string alias | Outcome classification: `accepted`, `rejected`, `ignored`, `pending`, `skipped`, `unknown`, `lifecycle`, `lifecycle_close`, `error` |
 | `OutcomeSummary` | struct | Aggregated outcome statistics across multiple safe output items |
-| `OutcomesHistoryConfig` | struct | Configuration for `RunOutcomesHistory` |
 | `PRCheckRun` | struct | A single CI check run attached to a pull request |
 | `PRCommitStatus` | struct | A commit status context for a pull request |
-| `PRInfo` | struct | Pull-request metadata used by `gh aw pr` commands |
+| `PRInfo` | type alias | Backward-compatible alias for `PullRequest` |
 | `PerRunFirewallBreakdown` | struct | Per-run firewall domain breakdown in a cross-run report |
 | `PerformanceMetrics` | struct | Performance counters for a workflow run |
 | `PolicyAnalysis` | struct | Analysis of guard-policy evaluation results |
@@ -400,20 +376,20 @@ The `cli` package exports many types used across its command implementations. Th
 | `ToolCallsDiffSummary` | struct | Summary statistics for a tool calls diff |
 | `ToolTransition` | struct | A transition between tool calls in an agent episode |
 | `ToolUsageInfo` | struct | Usage information for a single tool |
+| `ToolUsageStatsBase` | struct | Identity and metrics shared by tool usage summaries |
 | `ToolUsageSummary` | struct | Aggregated tool usage statistics |
 | `Transport` | struct | MCP server transport configuration |
-| `TrendDirection` | int alias | Direction of a metric trend (`Up`, `Down`, `Stable`) |
+| `TrendDirection` | int alias | Direction of a metric trend (`TrendImproving`, `TrendStable`, `TrendDegrading`) |
 | `TrialArtifacts` | struct | Artifacts generated during a trial run |
 | `TrialRepoContext` | struct | Repository context used during a trial run |
 | `VSCodeMCPServer` | struct | An MCP server entry in `.vscode/mcp.json` |
 | `VSCodeSettings` | struct | Parsed `.vscode/settings.json` |
+| `ValidationIssue` | struct | A validation error, warning, or audit issue entry |
 | `ValidationResult` | struct | Result of a workflow compilation validation pass |
-| `Workflow` | struct | Minimal workflow metadata used in list operations |
 | `WorkflowDomainsDetail` | struct | Detailed per-workflow domain information |
 | `WorkflowDomainsSummary` | struct | Summary of domains used across workflows |
 | `WorkflowFailure` | struct | A workflow failure record |
 | `WorkflowFileStatus` | struct | Status of a workflow file (exists, outdated, etc.) |
-| `WorkflowJob` | struct | A GitHub Actions job within a workflow run |
 | `WorkflowListItem` | struct | A single item in `gh aw list`; shared workflow metadata fields (name, engine, compiled status, labels, triggers) also embedded in `WorkflowStatus` |
 | `WorkflowMCPMetadata` | struct | MCP server metadata scanned from a workflow file |
 | `WorkflowNode` | struct | A node in the workflow dependency graph |
@@ -423,7 +399,6 @@ The `cli` package exports many types used across its command implementations. Th
 | `WorkflowSpec` | struct | A fully resolved workflow specification with source metadata |
 | `WorkflowStats` | struct | Aggregate statistics for a workflow |
 | `LogMetrics` | type alias | Alias for `workflow.LogMetrics` — log parsing metrics |
-| `PostTransformFunc` | func type | A post-compilation transformation function |
 | `LogParser[T]` | generic func type | Generic log-parser function type parameterized on analysis result |
 | `ExperimentState` | struct | State stored in `experiments/*` git branches (counts and run history) |
 | `ExperimentRunRecord` | struct | A single workflow run record in experiment state history |
@@ -457,10 +432,10 @@ The `cli` package exports many types used across its command implementations. Th
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `ZizmorImage` | `"ghcr.io/zizmorcore/zizmor:latest"` | Default image for Zizmor security scanner. |
-| `PoutineImage` | `"ghcr.io/boostsecurityio/poutine:latest"` | Default image for Poutine supply-chain scanner. |
-| `ActionlintImage` | `"rhysd/actionlint:1.7.12"` | Default image for Actionlint workflow linter. |
-| `RunnerGuardImage` | `"ghcr.io/vigilant-llc/runner-guard:latest"` | Default image for Runner Guard sandbox. |
+| `ZizmorImage` | `"ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d"` | Default image for Zizmor security scanner. |
+| `PoutineImage` | `"ghcr.io/boostsecurityio/poutine:1.1.6@sha256:722a8e0999b583c1540fe2974e691032b2d9d21b9256a17965132b6bfd0081b0"` | Default image for Poutine supply-chain scanner. |
+| `ActionlintImage` | `"rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667"` | Default image for Actionlint workflow linter. |
+| `RunnerGuardImage` | `"ghcr.io/vigilant-llc/runner-guard:3.1.5@sha256:2df426ef96d21f1622e05b21329f26bd263fc46110609cefb6afe43457613ac0"` | Default image for Runner Guard sandbox. |
 
 #### Timeline Event Constants
 
@@ -499,10 +474,60 @@ data, err := cli.CompileWorkflows(ctx, cli.CompileConfig{
 
 ```go
 err := cli.RunWorkflowOnGitHub(ctx, "my-workflow", cli.RunOptions{
-    Repo:    "owner/repo",
-    Verbose: true,
+    WorkflowRunFlags: cli.WorkflowRunFlags{
+        RepoOverride: "owner/repo",
+        Verbose:      true,
+    },
 })
 ```
+
+#### Migrating workflow run option literals
+
+`RunOptions` and `RunWorkflowOptions` now embed `WorkflowRunFlags`, as requested
+by issue [#67198](https://github.com/github/gh-aw/issues/67198). This is a breaking
+Go source API change: promoted fields cannot be keys in an outer struct's
+composite literal.
+
+Before (no longer compiles):
+
+```go
+runOpts := cli.RunOptions{
+    RepoOverride: "owner/repo",
+    Verbose:      true,
+    Enable:       true,
+}
+interactiveOpts := cli.RunWorkflowOptions{
+    WorkflowName: "my-workflow",
+    RepoOverride: "owner/repo",
+    Verbose:      true,
+}
+```
+
+After:
+
+```go
+runOpts := cli.RunOptions{
+    WorkflowRunFlags: cli.WorkflowRunFlags{
+        RepoOverride: "owner/repo",
+        Verbose:      true,
+    },
+    Enable: true,
+}
+interactiveOpts := cli.RunWorkflowOptions{
+    WorkflowRunFlags: cli.WorkflowRunFlags{
+        RepoOverride: "owner/repo",
+        Verbose:      true,
+    },
+    WorkflowName: "my-workflow",
+}
+```
+
+Move `Verbose`, `EngineOverride`, `RepoOverride`, `RefOverride`, `AutoMergePRs`,
+`Push`, `DryRun`, and `Approve` into the nested `WorkflowRunFlags` literal.
+Keep mode-specific fields on the outer struct. Field selectors and assignments
+(for example, `runOpts.RepoOverride` and `interactiveOpts.Verbose = true`),
+zero-value defaults, and flat JSON serialization remain unchanged. CLI flags
+and runtime behavior are unchanged; CLI users do not need to migrate.
 
 ### Auditing a run
 
@@ -514,16 +539,6 @@ err := cli.AuditWorkflowRun(ctx, runID, cli.AuditOptions{
     OutputDir: "/tmp/output",
     Verbose:   true,
     Parse:     true,
-})
-```
-
-### Checking workflow health
-
-```go
-err := cli.RunHealth(cli.HealthConfig{
-    Pattern:   "*.md",
-    Threshold: 0.8,
-    Period:    "30d",
 })
 ```
 
@@ -564,6 +579,9 @@ err := cli.RunHealth(cli.HealthConfig{
 - `github.com/github/gh-aw/pkg/intent` — intent attribution and resolution for mapping PRs and issues to labelled intent records
 - `github.com/github/gh-aw/pkg/modelsdev` — model pricing lookup backed by the public `models.dev` catalog
 - `github.com/github/gh-aw/pkg/setutil` — set operations backed by `map[K]struct{}`
+- `github.com/github/gh-aw/pkg/colorwriter` — color-profile-aware writers and ANSI degradation for terminal output
+- `github.com/github/gh-aw/pkg/ctxutil` — non-nil `context.Context` fallback for optional context options
+- `github.com/github/gh-aw/pkg/githubapi` — go-gh REST client options with repository-standard defaults
 
 **Test-only**:
 - `github.com/github/gh-aw/pkg/testutil` — shared test fixtures and assertion helpers used by CLI package tests
@@ -576,6 +594,12 @@ err := cli.RunHealth(cli.HealthConfig{
 
 Individual command `Run*` functions are not concurrently safe unless explicitly documented. The `CompileWorkflows` orchestrator serializes compilation by default; parallel compilation is gated by `CompileConfig` flags.
 
+### Additional exported helpers
+
+- MCP cache helpers: `GetPermission`, `SetPermission`, `GetRepo`, `SetRepo`
+- HTTP wiring helpers: `RoundTrip`, `WriteHeader`
+- External scanner helpers: `RunGrantOnLockFiles`, `RunGrypeOnLockFiles`, `RunSyftOnLockFiles`, `RunYamllintOnFiles`
+
 <!-- BEGIN SOURCE-VERIFIED EXPORT COVERAGE -->
 ## Source-verified export coverage
 
@@ -587,7 +611,7 @@ This appendix is generated from the current non-test Go source files in this pac
 | Constants | 77 |
 | Variables | 2 |
 | Functions and methods | 214 |
-| Additional symbols documented in this appendix | 168 |
+| Additional symbols documented in this appendix | 195 |
 
 ### Additional types
 
@@ -596,9 +620,9 @@ This appendix is generated from the current non-test Go source files in this pac
 | `audit_cross_run.go` | `DomainInventoryEntry` | `type DomainInventoryEntry struct { Domain string `json:"domain"` SeenInRuns int `json:"seen_in_runs"` TotalAllowed int `json:"total_allowed"` TotalBlocked int `json:"total_blocked"` OverallStatus string `json:"overall_status"` // "allowed", "denied", "mixed" PerRunStatus []DomainRunStatus `json:"per_run_status"` }` | DomainInventoryEntry describes a single domain seen across multiple runs. |
 | `audit_cross_run.go` | `DomainRunStatus` | `type DomainRunStatus struct { RunID int64 `json:"run_id"` Status string `json:"status"` // "allowed", "denied", "mixed", "absent" Allowed int `json:"allowed"` Blocked int `json:"blocked"` }` | DomainRunStatus records the status of a domain in a single run. |
 | `audit_cross_run.go` | `ErrorTrendData` | `type ErrorTrendData struct { RunsWithErrors int `json:"runs_with_errors"` TotalErrors int `json:"total_errors"` AvgErrorsPerRun float64 `json:"avg_errors_per_run"` RunsWithWarnings int `json:"runs_with_warnings"` TotalWarnings int `json:"total_warnings"` }` | ErrorTrendData summarizes error and warning patterns across runs. |
-| `audit_cross_run.go` | `MCPServerCrossRunHealth` | `type MCPServerCrossRunHealth struct { ServerName string `json:"server_name"` RunsConnected int `json:"runs_connected"` // Runs where server was used (appeared in tool usage) TotalRuns int `json:"total_runs"` TotalCalls int `json:"total_calls"` TotalErrors int `json:"total_errors"` ErrorRate float64 `json:"error_rate"` // 0.0–1.0 Unreliable bool `json:"unreliable"` // True if error_rate > 0.10 or connected < 75% of runs }` | MCPServerCrossRunHealth describes the health of a single MCP server across runs. |
-| `audit_report.go` | `JobStepData` | `type JobStepData struct { Name string `json:"name"` Status string `json:"status,omitempty"` Conclusion string `json:"conclusion,omitempty"` }` | JobStepData contains information about an individual workflow job step. |
-| `audit_report.go` | `MCPServerStats` | `type MCPServerStats struct { ServerName string `json:"server_name" console:"header:Server"` // RequestCount is kept for backward-compatible report schemas that label per-server // request volume; in MCP usage summaries this currently mirrors ToolCallCount. RequestCount int `json:"request_count" console:"header:Requests"` ToolCallCount int `json:"tool_call_count" console:"header:Tool Calls"` TotalInputSize int `json:"total_input_size" console:"header:Total Input,format:number"` TotalOutputSize int `json:"total_output_size" console:"header:Total Output,format:number"` AvgDuration string `json:"avg_duration,omitempty" console:"header:Avg Duration,omitempty"` ErrorCount int `json:"error_count,omitempty" console:"header:Errors,omitempty"` }` | MCPServerStats contains server-level statistics |
+| `audit_cross_run.go` | `MCPServerCrossRunHealth` | `type MCPServerCrossRunHealth struct { MCPServerStatsBase RunsConnected int `json:"runs_connected"` // Runs where server was used (appeared in tool usage) TotalRuns int `json:"total_runs"` ErrorRate float64 `json:"error_rate"` // 0.0–1.0 Unreliable bool `json:"unreliable"` // True if error_rate > 0.10 or connected < 75% of runs }` | MCPServerCrossRunHealth describes the health of a single MCP server across runs. |
+| `audit_report.go` | `JobStepData` | `type JobStepData = JobStep` | JobStepData is an alias for JobStep (see logs_models.go). |
+| `audit_report.go` | `MCPServerStats` | `type MCPServerStats struct { MCPServerStatsBase // RequestCount is kept for backward-compatible report schemas that label per-server // request volume; in MCP usage summaries this currently mirrors ToolCallCount. RequestCount int `json:"request_count" console:"header:Requests"` TotalInputSize int `json:"total_input_size" console:"header:Total Input,format:number"` TotalOutputSize int `json:"total_output_size" console:"header:Total Output,format:number"` AvgDuration string `json:"avg_duration,omitempty" console:"header:Avg Duration,omitempty"` }` | MCPServerStats contains server-level statistics |
 | `audit_report.go` | `OverviewDisplay` | `type OverviewDisplay struct { RunID int64 `console:"header:Run ID"` Workflow string `console:"header:Workflow"` Status string `console:"header:Status"` Duration string `console:"header:Duration,omitempty"` Event string `console:"header:Event"` Branch string `console:"header:Branch"` URL string `console:"header:URL"` Files string `console:"header:Files,omitempty"` Experiment string `console:"header:Experiment,omitempty"` }` | OverviewDisplay is a display-optimized version of OverviewData for console rendering |
 | `audit_report_experiments.go` | `ExperimentData` | `type ExperimentData struct { // Assignments maps each experiment name to the variant selected for this run. // e.g. {"caveman": "yes", "style": "concise"} Assignments map[string]string `json:"assignments"` // CumulativeCounts maps each experiment name to a per-variant invocation counter. // e.g. {"caveman": {"yes": 3, "no": 2}} CumulativeCounts map[string]map[string]int `json:"cumulative_counts,omitempty"` }` | ExperimentData represents the A/B experiment assignments for a single workflow run. |
 | `compile_validation.go` | `CompileValidationOptions` | `type CompileValidationOptions struct { Verbose bool RunZizmorPerFile bool RunPoutinePerFile bool RunActionlintPerFile bool Strict bool ValidateActionSHAs bool }` | CompileValidationOptions holds optional validation flags for workflow compilation. |
@@ -637,7 +661,8 @@ This appendix is generated from the current non-test Go source files in this pac
 | `logs_github_rate_limit_usage.go` | `GitHubRateLimitUsage` | `type GitHubRateLimitUsage struct { TotalRequestsMade int `json:"total_requests_made" console:"header:Total GitHub API Calls,format:number"` CoreConsumed int `json:"core_consumed" console:"header:Core Quota Consumed,format:number"` CoreConsumedSource string `json:"core_consumed_source,omitempty" console:"-"` CoreRemaining int `json:"core_remaining" console:"header:Core Remaining,format:number"` CoreLimit int `json:"core_limit" console:"header:Core Limit,format:number"` Resources []*GitHubRateLimitResourceUsage `json:"resources,omitempty"` }` | GitHubRateLimitUsage provides an aggregated view of GitHub API quota consumed by a single workflow run. |
 | `logs_models.go` | `AggregatedSummaryBase` | `type AggregatedSummaryBase struct { Count int `json:"count" console:"header:Occurrences"` Workflows []string `json:"workflows" console:"-"` // List of workflow names WorkflowsDisplay string `json:"-" console:"header:Workflows,maxlen:40"` // Formatted display of workflows FirstReason string `json:"first_reason" console:"-"` // Reason from the first occurrence FirstReasonDisplay string `json:"-" console:"header:First Reason,maxlen:50"` // Formatted display of first reason RunIDs []int64 `json:"run_ids" console:"-"` // List of run IDs }` | AggregatedSummaryBase holds the shared tail fields that appear byte-for-byte identically in MissingToolSummary and MissingDataSummary (and as a subset in MCPFailureSummary). |
 | `logs_models.go` | `JobStep` | `type JobStep struct { Name string `json:"name"` Status string `json:"status,omitempty"` Conclusion string `json:"conclusion,omitempty"` }` | JobStep represents basic information about an individual workflow job step. |
-| `logs_models.go` | `MCPFailureSummary` | `type MCPFailureSummary struct { ServerName string `json:"server_name" console:"header:Server"` Count int `json:"count" console:"header:Failures"` Workflows []string `json:"workflows" console:"-"` // List of workflow names that had this server fail WorkflowsDisplay string `json:"-" console:"header:Workflows,maxlen:60"` // Formatted display of workflows RunIDs []int64 `json:"run_ids" console:"-"` // List of run IDs where this server failed }` | MCPFailureSummary aggregates MCP server failure reports across runs |
+| `logs_models.go` | `MCPFailureSummary` | `type MCPFailureSummary struct { ServerName string `json:"server_name" console:"header:Server"` AggregatedSummaryBase `console:"-"` }` | MCPFailureSummary aggregates MCP server failure reports across runs |
+| `logs_models.go` | `MCPServerStatsBase` | `type MCPServerStatsBase struct { ServerName string `json:"server_name" console:"header:Server"` ToolCallCount int `json:"tool_call_count" console:"header:Tool Calls"` // ErrorCount keeps the omitempty tags of MCPServerStats, the only embedder that // serializes/renders these tags directly; the other embedders override MarshalJSON. ErrorCount int `json:"error_count,omitempty" console:"header:Errors,omitempty"` }` | MCPServerStatsBase holds the per-server identity and volume fields shared by the MCP server health/stats report types. |
 | `logs_models.go` | `ReportProvenance` | `type ReportProvenance struct { Timestamp string `json:"timestamp"` WorkflowName string `json:"workflow_name,omitempty"` // Tracks which workflow reported this RunID int64 `json:"run_id,omitempty"` // Tracks which run reported this ExperimentName string `json:"experiment_name,omitempty"` // Assigned experiment name for this run (if present) Variant string `json:"variant,omitempty"` // Assigned variant value for ExperimentName (if present) }` | ReportProvenance holds the shared provenance fields common to all report record types. |
 | `logs_orchestrator_types.go` | `LogsDownloadOptions` | `type LogsDownloadOptions struct { WorkflowName string Count int StartDate string EndDate string OutputDir string Engine string Ref string BeforeRunID int64 AfterRunID int64 RepoOverride string Verbose bool ToolGraph bool NoStaged bool FirewallOnly bool NoFirewall bool Parse bool JSONOutput bool TimeoutMinutes int SummaryFile string SafeOutputType string FilteredIntegrity bool EvalsOnly bool Train bool Format string ArtifactSets []string After string ReportFile string }` | LogsDownloadOptions holds parameters for DownloadWorkflowLogs. |
 | `logs_orchestrator_types.go` | `StdinLogsOptions` | `type StdinLogsOptions struct { RunURLs []string OutputDir string Engine string RepoOverride string Verbose bool ToolGraph bool NoStaged bool FirewallOnly bool NoFirewall bool Parse bool JSONOutput bool Timeout int SummaryFile string SafeOutputType string FilteredIntegrity bool EvalsOnly bool Train bool Format string ReportFile string // ArtifactSets defaults to nil (download all artifacts) when this API is used // programmatically. The CLI passes ["usage"] to match the logs command default. ArtifactSets []string }` | StdinLogsOptions holds parameters for DownloadWorkflowLogsFromStdin. |
@@ -647,11 +672,56 @@ This appendix is generated from the current non-test Go source files in this pac
 | `outcome_evaluation.go` | `EvidenceStrength` | `type EvidenceStrength string` | EvidenceStrength describes how confidently the outcome can be inferred. |
 | `outcome_evaluation.go` | `OutcomeStatus` | `type OutcomeStatus string` | OutcomeStatus is the normalized classification for a safe output outcome. |
 | `packages.go` | `IncludeDependency` | `type IncludeDependency struct { SourcePath string // Path in the source (local) TargetPath string // Relative path where it should be copied in .github/workflows IsOptional bool // Whether this is an optional include (@include?) }` | IncludeDependency represents a file dependency from @include directives |
-| `run_interactive.go` | `RunWorkflowOptions` | `type RunWorkflowOptions struct { WorkflowName string Verbose bool EngineOverride string RepoOverride string RefOverride string AutoMergePRs bool Push bool DryRun bool }` | RunWorkflowOptions holds parameters for RunSpecificWorkflowInteractively. |
+| `run_interactive.go` | `RunWorkflowOptions` | `type RunWorkflowOptions struct { WorkflowRunFlags WorkflowName string requiredInputsOnly bool }` | RunWorkflowOptions holds parameters for interactive workflow runs. |
 | `token_usage_types.go` | `SubagentModelActual` | `type SubagentModelActual struct { Model string `json:"model"` Provider string `json:"provider,omitempty"` Requests int `json:"requests"` }` | SubagentModelActual captures model usage observed in token-usage logs. |
 | `token_usage_types.go` | `SubagentModelRequest` | `type SubagentModelRequest struct { AgentName string `json:"agent_name"` RequestedModel string `json:"requested_model"` InvocationCount int `json:"invocation_count"` EffectiveModel string `json:"effective_model,omitempty"` ReasonCode string `json:"reason_code,omitempty"` }` | SubagentModelRequest captures requested/effective model attribution for a sub-agent. |
+| `audit_report.go` | `AuditData` | `type AuditData struct { ... }` | AuditData is the top-level audit report payload assembled from all extracted artifacts and analyses. |
+| `audit_diff.go` | `AuditDiff` | `type AuditDiff struct { ... }` | AuditDiff captures between-run differences for firewall, MCP, and run-level metrics. |
+| `audit_cross_run.go` | `CrossRunAuditReport` | `type CrossRunAuditReport struct { ... }` | CrossRunAuditReport summarizes trends and comparisons across multiple workflow runs. |
+| `audit_diff.go` | `DiffEntryBase` | `type DiffEntryBase struct { ... }` | DiffEntryBase contains shared status/anomaly fields used by diff entries. |
+| `domain_buckets.go` | `AnalysisBase` | `type AnalysisBase struct { ... }` | AnalysisBase provides shared domain/request counters for firewall and domain analyses. |
+| `logs_report_firewall.go` | `FirewallSummaryBase` | `type FirewallSummaryBase struct { ... }` | FirewallSummaryBase is the shared summary schema for firewall report rendering. |
+| `experiments_analyze_statistics.go` | `MetricEvalResults` | `type MetricEvalResults struct { ... }` | MetricEvalResults tracks yes/no/unknown evaluation outcomes for one metric. |
+| `logs_models.go` | `SkillActivation` | `type SkillActivation struct { ... }` | SkillActivation captures skill invocation telemetry extracted from logs. |
+| `setup_repository.go` | `SetupAuthResult` | `type SetupAuthResult struct { ... }` | SetupAuthResult reports whether repository authentication checks succeeded. |
+| `setup_repository.go` | `SetupRepositoryCheckResult` | `type SetupRepositoryCheckResult struct { ... }` | SetupRepositoryCheckResult captures setup preflight checks for repository/checkout state. |
+| `syft.go` | `SyftScanResult` | `type SyftScanResult struct { ... }` | SyftScanResult contains summarized SBOM scan output metadata. |
+| `token_usage_types.go` | `TokenCoreMetrics` | `type TokenCoreMetrics struct { ... }` | TokenCoreMetrics stores normalized token counts used in usage reporting. |
+| `upgrade_command.go` | `UpgradeConfig` | `type UpgradeConfig struct { ... }` | UpgradeConfig controls upgrade command behavior and optional automation. |
+| `trial_types.go` | `WorkflowTrialResult` | `type WorkflowTrialResult struct { ... }` | WorkflowTrialResult stores the outcome and extracted artifacts for a workflow trial run. |
 | `update_workflows.go` | `UpdateWorkflowsOptions` | `type UpdateWorkflowsOptions struct { WorkflowNames []string AllowMajor bool Force bool Yes bool Verbose bool EngineOverride string WorkflowsDir string NoStopAfter bool StopAfter string NoMerge bool DisableReleaseBump bool DisableSecurityScanner bool NoCompile bool NoRedirect bool CoolDown time.Duration }` | UpdateWorkflowsOptions configures workflow update behavior. |
 | `view_command.go` | `ViewOptions` | `type ViewOptions struct { Owner string Repo string Hostname string OutputDir string Verbose bool }` | ViewOptions holds configuration for the view command. |
+
+### Additional types (verified 2026-09-26)
+
+| File | Symbol | Declaration | Description |
+|------|--------|-------------|-------------|
+| `audit_report.go` | `AuditFinding` | `type AuditFinding struct { Code AuditFindingCode; Category string; Severity scanfindings.SeverityLevel; Title string; Description string; Impact string }` | AuditFinding represents a key insight discovered during audit. |
+| `audit_report.go` | `LabelReport` | `type LabelReport struct { Name string; DatabaseID int64; NodeID string }` | LabelReport describes a GitHub label referenced by an audit report. |
+| `audit_report.go` | `IntegrityFilterSummary` | `type IntegrityFilterSummary struct { TotalFiltered int; RunsWithFilteredEvents int; FilteredServerCounts map[string]int; FilteredToolCounts map[string]int; FilteredReasonCounts map[string]int }` | IntegrityFilterSummary contains aggregate DIFC integrity-filter activity. |
+| `audit_cross_run_clusters.go` | `RunCluster` | `type RunCluster struct { Dimension string; Value string; RunIDs []int64; Count int; Metrics ClusterMetrics }` | RunCluster groups runs that share a common behavioral dimension (e.g., same conclusion, task domain, or execution style). |
+| `audit_cross_run_clusters.go` | `ClusterMetrics` | `type ClusterMetrics struct { AvgTokens int; MedianTokens float64; StdDevTokens float64; AvgTurns float64; AvgDurationNs int64; AvgErrorsPerRun float64; SuccessRate float64 }` | ClusterMetrics holds aggregate metrics for a cluster of runs. |
+| `audit_cross_run_clusters.go` | `ClusterPattern` | `type ClusterPattern struct { Kind string; Severity string; Title string; Description string; Evidence string }` | ClusterPattern describes a detected pattern across clusters (e.g., "failed runs use 2.5x more tokens than successful runs"). |
+| `audit_cross_run_clusters.go` | `ClusterAnalysis` | `type ClusterAnalysis struct { Clusters []RunCluster; Patterns []ClusterPattern }` | ClusterAnalysis is the top-level cluster/pattern output added to CrossRunAuditReport. |
+| `audit_group.go` | `GroupedAuditReport` | `type GroupedAuditReport struct { RunsAnalyzed int; SkippedRuns []int64; Entries []GroupedAuditEntry }` | GroupedAuditReport represents audit findings grouped by run and stable finding code. |
+| `audit_group.go` | `GroupedAuditEntry` | `type GroupedAuditEntry struct { RunID int64; Code AuditFindingCode; Occurrences int; RepresentativeEntry AuditFinding }` | GroupedAuditEntry summarizes all findings for one [run, audit code] pair. |
+| `audit_report_graders.go` | `GraderResult` | `type GraderResult struct { ID string; Name string; Status string; Value *float64; Unit string; Passed *bool; Direction string; Threshold *float64; Message string; Error string }` | GraderResult is a single grader outcome surfaced in the audit report. |
+| `audit_report_graders.go` | `GradersData` | `type GradersData struct { Version int; Results []GraderResult; Total int; Passed int; Failed int; ErrorCount int; UnavailableCount int }` | GradersData aggregates the grader results recorded for a single workflow run. |
+| `experiments_analyze_statistics.go` | `GuardrailVariantStatus` | `type GuardrailVariantStatus struct { Variant string; ObservationCount int; Mean *float64; Passed *bool }` | GuardrailVariantStatus reports one variant's aggregate guardrail outcome. |
+| `experiments_decision.go` | `ExperimentDecisionPolicy` | `type ExperimentDecisionPolicy struct { MinimumEffect float64; RegressionTolerance float64; Confidence float64 }` | ExperimentDecisionPolicy is the normalized deterministic policy used to interpret analysis. |
+| `experiments_decision.go` | `ExperimentDecisionEffect` | `type ExperimentDecisionEffect struct { Absolute float64; Relative *float64; NormalizedAbsolute float64 }` | ExperimentDecisionEffect reports the candidate effect in primary-metric units. |
+| `experiments_decision.go` | `ExperimentDecisionEvidence` | `type ExperimentDecisionEvidence struct { AnalysisType string; Significant bool; PValue *float64; ProbabilitySuperiority *float64 }` | ExperimentDecisionEvidence reports the analyzer evidence consumed by the decision layer. |
+| `experiments_decision.go` | `ExperimentDecisionGuardrails` | `type ExperimentDecisionGuardrails struct { Configured bool; Passed *bool }` | ExperimentDecisionGuardrails summarizes mandatory guardrail outcomes. |
+| `experiments_decision.go` | `ExperimentDecisionResult` | `type ExperimentDecisionResult struct { Decision ExperimentDecision; ReasonCode ExperimentDecisionReasonCode; DecisionReason string; Control string; Candidate string; Direction string; Samples map[string]int; Effect *ExperimentDecisionEffect; Evidence *ExperimentDecisionEvidence; Guardrails ExperimentDecisionGuardrails; Policy ExperimentDecisionPolicy }` | ExperimentDecisionResult is the stable, machine-readable deterministic recommendation returned by `DecideExperiment`. |
+| `experiments_grader_observations.go` | `GraderMetricObservation` | `type GraderMetricObservation struct { RunID string; Variant string; GraderID string; GraderStatus string; Value float64; Binary bool }` | GraderMetricObservation records one grader-derived experiment outcome. |
+| `experiments_grader_observations.go` | `ExcludedObservationSummary` | `type ExcludedObservationSummary struct { Reason string; Count int; RunIDs []string }` | ExcludedObservationSummary groups assigned runs that could not produce a usable observation. |
+| `experiments_grader_statistics.go` | `MetricComparison` | `type MetricComparison struct { ControlVariant string; Variant string; AnalysisType string; Delta float64; PValue *float64; ProbabilitySuperiority *float64; Error string }` | MetricComparison is one control-versus-variant comparison of grader observations. |
+| `logs_models.go` | `GatewaySteeringEvent` | `type GatewaySteeringEvent struct { Type string; Message string; Timestamp string }` | GatewaySteeringEvent records an AI-credit or timeout warning injected by the gateway. |
+| `logs_models.go` | `RunAnalysis` | `type RunAnalysis struct { Run WorkflowRun; Metrics LogMetrics; ... }` | RunAnalysis holds the run metadata, metrics, and analysis reports extracted from a workflow run's logs and artifacts; embedded by both `RunSummary` and `DownloadResult`. |
+| `logs_rate_limit.go` | `GitHubAPIRateLimitState` | `type GitHubAPIRateLimitState struct { Limit int; Remaining int; Reset int64; Used int }` | GitHubAPIRateLimitState holds the core API quota at one point in time. |
+| `logs_rate_limit.go` | `GitHubAPIRateLimitReport` | `type GitHubAPIRateLimitReport struct { Host string; Start *GitHubAPIRateLimitState; End *GitHubAPIRateLimitState }` | GitHubAPIRateLimitReport records the core API quota around a logs command. |
+| `logs_report.go` | `WorkflowContinuation` | `type WorkflowContinuation struct { Repository string; ContinuationData }` | WorkflowContinuation identifies a per-target cursor in a combined multi-workflow report. |
+| `logs_usage_activity.go` | `WorkingSetMetrics` | `type WorkingSetMetrics struct { MeasurementState string; RebuildFactor *float64; CumulativeInputTokens int64; PeakInputTokens int64; RebuildExcessTokens int64; Invocations int }` | WorkingSetMetrics describes cumulative model-input traffic relative to the largest invocation context observed during the agent phase. |
 
 ### Additional constants and variables
 
@@ -675,7 +745,7 @@ This appendix is generated from the current non-test Go source files in this pac
 | `logs_artifact_set.go` | `const` | `ArtifactSetUsage` | `const ArtifactSetUsage ArtifactSet = "usage"` | ArtifactSetUsage downloads the compact usage artifact produced by the conclusion job (aw-info. |
 | `logs_models.go` | `const` | `APICallCooldown` | `const APICallCooldown = 500 * time.Millisecond` | APICallCooldown is the minimum pause between successive batch-fetch iterations to avoid hitting the GitHub API rate limit when processing many runs in a single invocation. |
 | `logs_models.go` | `const` | `BatchSize` | `const BatchSize = 100` | BatchSize is the number of runs to fetch in each iteration |
-| `logs_models.go` | `const` | `BatchSizeForAllWorkflows` | `const BatchSizeForAllWorkflows = 250` | BatchSizeForAllWorkflows is the larger batch size when searching for agentic workflows There can be a really large number of workflow runs in a repository, so we are generous in the batch size when used without qualific… |
+| `logs_models.go` | `const` | `BatchSizeForAllWorkflows` | `const BatchSizeForAllWorkflows = 100` | Batch size when searching across all agentic workflows, capped at the GitHub API page size to avoid extra round-trips. |
 | `logs_models.go` | `const` | `GitHubActionsRetentionDays` | `const GitHubActionsRetentionDays = 90` | GitHubActionsRetentionDays is GitHub's default log-retention window for GitHub Actions workflow runs. |
 | `logs_models.go` | `const` | `MaxConcurrentDownloads` | `const MaxConcurrentDownloads = 10` | MaxConcurrentDownloads limits the number of parallel artifact downloads |
 | `logs_models.go` | `const` | `MaxIterations` | `const MaxIterations = 20` | MaxIterations limits how many batches we fetch to prevent infinite loops |
@@ -688,23 +758,26 @@ This appendix is generated from the current non-test Go source files in this pac
 | `mcp_registry_types.go` | `const` | `ArgumentTypePositional` | `const ArgumentTypePositional = "positional"` | Argument type constants |
 | `mcp_registry_types.go` | `const` | `StatusActive` | `const StatusActive = "active"` | Status constants for server status |
 | `mcp_registry_types.go` | `const` | `StatusInactive` | `const StatusInactive = "inactive"` | Status constants for server status |
-| `outcome_eval.go` | `const` | `OutcomeAccepted` | `const OutcomeAccepted OutcomeResult = "accepted"` | Exported constant declared in `outcome_eval.go`. |
-| `outcome_eval.go` | `const` | `OutcomeError` | `const OutcomeError OutcomeResult = "error"` | Exported constant declared in `outcome_eval.go`. |
-| `outcome_eval.go` | `const` | `OutcomeIgnored` | `const OutcomeIgnored OutcomeResult = "ignored"` | Exported constant declared in `outcome_eval.go`. |
-| `outcome_eval.go` | `const` | `OutcomeLifecycle` | `const OutcomeLifecycle OutcomeResult = "lifecycle"` | Exported constant declared in `outcome_eval.go`. |
-| `outcome_eval.go` | `const` | `OutcomePending` | `const OutcomePending OutcomeResult = "pending"` | Exported constant declared in `outcome_eval.go`. |
-| `outcome_eval.go` | `const` | `OutcomeRejected` | `const OutcomeRejected OutcomeResult = "rejected"` | Exported constant declared in `outcome_eval.go`. |
-| `outcome_eval.go` | `const` | `OutcomeUnknown` | `const OutcomeUnknown OutcomeResult = "unknown"` | Exported constant declared in `outcome_eval.go`. |
-| `outcome_evaluation.go` | `const` | `EvidenceMedium` | `const EvidenceMedium EvidenceStrength = "medium"` | Exported constant declared in `outcome_evaluation.go`. |
-| `outcome_evaluation.go` | `const` | `EvidenceNone` | `const EvidenceNone EvidenceStrength = "none"` | Exported constant declared in `outcome_evaluation.go`. |
-| `outcome_evaluation.go` | `const` | `EvidenceStrong` | `const EvidenceStrong EvidenceStrength = "strong"` | Exported constant declared in `outcome_evaluation.go`. |
-| `outcome_evaluation.go` | `const` | `EvidenceWeak` | `const EvidenceWeak EvidenceStrength = "weak"` | Exported constant declared in `outcome_evaluation.go`. |
+| `docker_images.go` | `const` | `GrantImage` | `const GrantImage = "anchore/grant:v0.7.1@sha256:..."` | GrantImage is the pinned image used to run Grant license scanning. |
+| `docker_images.go` | `const` | `GrypeImage` | `const GrypeImage = "anchore/grype:v0.121.3@sha256:..."` | GrypeImage is the pinned image used to run Grype vulnerability scanning. |
+| `docker_images.go` | `const` | `ShellcheckImage` | `const ShellcheckImage = "koalaman/shellcheck:v0.11.0@sha256:..."` | ShellcheckImage is the pinned image used for shellcheck validation. |
+| `docker_images.go` | `const` | `SyftImage` | `const SyftImage = "anchore/syft:v1.57.1@sha256:..."` | SyftImage is the pinned image used for Syft SBOM generation. |
+| `docker_images.go` | `const` | `YamllintImage` | `const YamllintImage = "pipelinecomponents/yamllint:latest@sha256:..."` | YamllintImage is the pinned image used for yamllint checks. |
+| `flags.go` | `const` | `EngineFlagFilterUsage` | `const EngineFlagFilterUsage = "Filter logs by AI engine (...)"` | EngineFlagFilterUsage is the CLI help text for `--engine` log filtering. |
+| `flags.go` | `const` | `EngineFlagOverrideUsage` | `const EngineFlagOverrideUsage = "Override AI engine (...)"` | EngineFlagOverrideUsage is the CLI help text for `--engine-override`. |
+| `outcome_evaluation.go` | `const` | `OutcomeStatusLifecycleClose` | `const OutcomeStatusLifecycleClose OutcomeStatus = "lifecycle_close"` | OutcomeStatusLifecycleClose represents lifecycle close events in normalized outcome reporting. |
 | `outcome_evaluation.go` | `const` | `OutcomeStatusAccepted` | `const OutcomeStatusAccepted OutcomeStatus = "accepted"` | Exported constant declared in `outcome_evaluation.go`. |
+| `outcome_evaluation.go` | `const` | `OutcomeStatusError` | `const OutcomeStatusError OutcomeStatus = "error"` | Exported constant declared in `outcome_evaluation.go`. |
 | `outcome_evaluation.go` | `const` | `OutcomeStatusIgnored` | `const OutcomeStatusIgnored OutcomeStatus = "ignored"` | Exported constant declared in `outcome_evaluation.go`. |
+| `outcome_evaluation.go` | `const` | `OutcomeStatusLifecycle` | `const OutcomeStatusLifecycle OutcomeStatus = "lifecycle"` | Exported constant declared in `outcome_evaluation.go`. |
 | `outcome_evaluation.go` | `const` | `OutcomeStatusPending` | `const OutcomeStatusPending OutcomeStatus = "pending"` | Exported constant declared in `outcome_evaluation.go`. |
 | `outcome_evaluation.go` | `const` | `OutcomeStatusRejected` | `const OutcomeStatusRejected OutcomeStatus = "rejected"` | Exported constant declared in `outcome_evaluation.go`. |
 | `outcome_evaluation.go` | `const` | `OutcomeStatusSkipped` | `const OutcomeStatusSkipped OutcomeStatus = "skipped"` | Exported constant declared in `outcome_evaluation.go`. |
 | `outcome_evaluation.go` | `const` | `OutcomeStatusUnknown` | `const OutcomeStatusUnknown OutcomeStatus = "unknown"` | Exported constant declared in `outcome_evaluation.go`. |
+| `outcome_evaluation.go` | `const` | `EvidenceMedium` | `const EvidenceMedium EvidenceStrength = "medium"` | Exported constant declared in `outcome_evaluation.go`. |
+| `outcome_evaluation.go` | `const` | `EvidenceNone` | `const EvidenceNone EvidenceStrength = "none"` | Exported constant declared in `outcome_evaluation.go`. |
+| `outcome_evaluation.go` | `const` | `EvidenceStrong` | `const EvidenceStrong EvidenceStrength = "strong"` | Exported constant declared in `outcome_evaluation.go`. |
+| `outcome_evaluation.go` | `const` | `EvidenceWeak` | `const EvidenceWeak EvidenceStrength = "weak"` | Exported constant declared in `outcome_evaluation.go`. |
 | `shell_completion.go` | `const` | `ShellBash` | `const ShellBash ShellType = "bash"` | Exported constant declared in `shell_completion.go`. |
 | `shell_completion.go` | `const` | `ShellFish` | `const ShellFish ShellType = "fish"` | Exported constant declared in `shell_completion.go`. |
 | `shell_completion.go` | `const` | `ShellPowerShell` | `const ShellPowerShell ShellType = "powershell"` | Exported constant declared in `shell_completion.go`. |
@@ -744,6 +817,7 @@ This appendix is generated from the current non-test Go source files in this pac
 | `firewall_log.go` | `(*FirewallAnalysis).AddMetrics` | `func (*FirewallAnalysis).AddMetrics(other LogAnalysis)` | AddMetrics adds metrics from another analysis |
 | `fix_codemods.go` | `(*GuidedError).Unwrap` | `func (*GuidedError).Unwrap() error` | Exported function or method declared in `fix_codemods.go`. |
 | `fix_codemods.go` | `GetCodemods` | `func GetCodemods(disabledIDs []string) ([]Codemod, error)` | GetCodemods returns all codemods except any explicitly disabled by ID. |
+| `frontmatter_editor.go` | `RemoveTopLevelFieldFromFrontmatter` | `func RemoveTopLevelFieldFromFrontmatter(content, fieldName string) (string, error)` | RemoveTopLevelFieldFromFrontmatter removes a root-level frontmatter key while preserving YAML structure. |
 | `gateway_logs_timeline.go` | `BuildUnifiedTimeline` | `func BuildUnifiedTimeline(logDir string, verbose bool) ([]UnifiedTimelineEvent, error)` | BuildUnifiedTimeline collects all JSONL events from the MCP Gateway, the AWF firewall, the agent session, and the AWF API proxy in logDir, merges them into a single slice, and sorts the slice in ascending wall-clock ord… |
 | `import_url_fetcher.go` | `FetchImportURL` | `func FetchImportURL(ctx context.Context, rawURL string, opts FetchOptions) (*FetchedResource, error)` | FetchImportURL fetches rawURL and returns its content and canonicalized Content-Type. |
 | `interactive.go` | `CreateWorkflowInteractively` | `func CreateWorkflowInteractively(ctx context.Context, workflowName string, verbose bool, force bool) error` | CreateWorkflowInteractively prompts the user to build a workflow interactively |
@@ -756,7 +830,9 @@ This appendix is generated from the current non-test Go source files in this pac
 | `mcp_registry.go` | `NewMCPRegistryClient` | `func NewMCPRegistryClient(registryURL string) *MCPRegistryClient` | NewMCPRegistryClient creates a new MCP registry client |
 | `mcp_schema.go` | `AddSchemaDefault` | `func AddSchemaDefault(schema *jsonschema.Schema, propertyName string, value any) error` | AddSchemaDefault adds a default value to a property in a JSON schema. |
 | `mcp_schema.go` | `GenerateSchema` | `func GenerateSchema[T any]() (*jsonschema.Schema, error)` | GenerateSchema generates a JSON schema from a Go struct type. |
-| `model_costs.go` | `FindOrFetchModelPricing` | `func FindOrFetchModelPricing(ctx context.Context, provider, model string) (map[string]float64, bool)` | FindOrFetchModelPricing resolves per-token pricing for the given provider/model. |
+| `update_merge.go` | `MergeWorkflowContent` | `func MergeWorkflowContent(base, current, new, oldSourceSpec, newRefOrSourceSpec, localWorkflowPath string, verbose bool) (string, bool, error)` | MergeWorkflowContent performs marker-aware merging for source-managed workflow updates. |
+| `compile_external_tools.go` | `RunActionlintOnFiles` | `func RunActionlintOnFiles(ctx context.Context, lockFiles []string, verbose bool, strict bool) error` | RunActionlintOnFiles runs actionlint over generated lock files. |
+| `add_interactive_orchestrator.go` | `RunAddInteractive` | `func RunAddInteractive(ctx context.Context, config *AddInteractiveConfig) error` | RunAddInteractive drives the interactive `gh aw add` installation flow. |
 | `outcome_domain_breakdown.go` | `ComputeDomainBreakdowns` | `func ComputeDomainBreakdowns(reports []OutcomeReport) []DomainBreakdown` | ComputeDomainBreakdowns aggregates outcome metrics by label/domain. |
 | `packages.go` | `ExtractWorkflowPrivateSetting` | `func ExtractWorkflowPrivateSetting(content string) (bool, bool)` | ExtractWorkflowPrivateSetting extracts the private field from workflow content string. |
 | `pr_automerge.go` | `AutoMergePullRequestsLegacy` | `func AutoMergePullRequestsLegacy(repoSlug string, verbose bool) error` | AutoMergePullRequestsLegacy is the legacy function that auto-merges all open PRs (used by trial command for backward compatibility) |
@@ -767,16 +843,114 @@ This appendix is generated from the current non-test Go source files in this pac
 | `tool_graph.go` | `(*ToolGraph).AddSequence` | `func (*ToolGraph).AddSequence(tools []string)` | AddSequence adds a tool call sequence to the graph |
 | `tool_graph.go` | `(*ToolGraph).GenerateMermaidGraph` | `func (*ToolGraph).GenerateMermaidGraph() string` | GenerateMermaidGraph generates a Mermaid state diagram from the tool graph |
 | `tool_graph.go` | `NewToolGraph` | `func NewToolGraph() *ToolGraph` | NewToolGraph creates a new empty tool graph |
-| `update_actions.go` | `UpdateActionsInWorkflowFiles` | `func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverride string, verbose, disableReleaseBump bool, noCompile bool, coolDown time.Duration) error` | UpdateActionsInWorkflowFiles scans all workflow . |
 | `view_command.go` | `ViewWorkflowRun` | `func ViewWorkflowRun(ctx context.Context, runID int64, opts ViewOptions) error` | ViewWorkflowRun downloads artifacts for the given run (if not already cached) and renders the unified event timeline, safe outputs, and a link to the run page. |
 | `vscode_config.go` | `(*VSCodeSettings).UnmarshalJSON` | `func (*VSCodeSettings).UnmarshalJSON(data []byte) error` | UnmarshalJSON custom unmarshaler for VSCodeSettings to preserve unknown fields |
 | `vscode_config.go` | `(VSCodeSettings).MarshalJSON` | `func (VSCodeSettings).MarshalJSON() ([]byte, error)` | MarshalJSON custom marshaler for VSCodeSettings to include all fields |
 
 <!-- END SOURCE-VERIFIED EXPORT COVERAGE -->
 
+### Additional exported top-level functions (verified 2026-08-08)
+
+| File | Function | Signature | Description |
+|------|----------|-----------|-------------|
+| `actions_build_command.go` | `ActionsBuildCommand` | `func ActionsBuildCommand() error` | Builds all custom GitHub Actions by bundling JavaScript dependencies. |
+| `actions_build_command.go` | `ActionsCleanCommand` | `func ActionsCleanCommand() error` | Removes generated `index.js` files from all actions. |
+| `actions_build_command.go` | `ActionsValidateCommand` | `func ActionsValidateCommand() error` | Validates all `action.yml` files. |
+| `ci.go` | `IsRunningInCI` | `func IsRunningInCI() bool` | Checks if the process is running in a CI environment. |
+| `compile_external_tools.go` | `RunGrantOnLockFiles` | `func RunGrantOnLockFiles(lockFiles []string, verbose bool, strict bool) error` | Runs the `grant` tool against lock files derived from `gh-aw-manifest` headers. |
+| `compile_external_tools.go` | `RunGrypeOnLockFiles` | `func RunGrypeOnLockFiles(lockFiles []string, verbose bool, strict bool) error` | Runs Grype against pinned images referenced by lock files, deduplicated and cached per image. |
+| `compile_external_tools.go` | `RunPoutineOnDirectory` | `func RunPoutineOnDirectory(workflowDir string, verbose bool, strict bool) error` | Scans all workflows in a directory once with Poutine. |
+| `compile_external_tools.go` | `RunRunnerGuardOnDirectory` | `func RunRunnerGuardOnDirectory(workflowDir string, verbose bool, strict bool) error` | Scans all workflows in a directory once with runner-guard. |
+| `compile_external_tools.go` | `RunShellcheckOnLockFilesAndResources` | `func RunShellcheckOnLockFilesAndResources(ctx context.Context, lockFiles []string, resources []workflow.ShellScriptResource, verbose bool, strict bool) error` | Runs shellcheck across lock files and shell script resources; returns nil when shellcheck is unavailable. |
+| `compile_external_tools.go` | `RunSyftOnLockFiles` | `func RunSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error` | Generates SBOMs with Syft from images referenced by lock file manifests. |
+| `compile_external_tools.go` | `RunYamllintOnFiles` | `func RunYamllintOnFiles(lockFiles []string, verbose bool, strict bool) error` | Runs yamllint once across all provided lock files. |
+| `compile_external_tools.go` | `RunZizmorOnFiles` | `func RunZizmorOnFiles(lockFiles []string, verbose bool, strict bool) error` | Runs zizmor once across all provided lock files. |
+| `copilot_agent_logs.go` | `ParseCopilotCodingAgentLogMetrics` | `func ParseCopilotCodingAgentLogMetrics(logContent string, verbose bool) workflow.LogMetrics` | Parses GitHub Copilot coding agent logs, which use a different format than Copilot CLI logs. |
+| `docker_images.go` | `IsDockerAvailable` | `func IsDockerAvailable(ctx context.Context) bool` | Checks if the Docker daemon is running and accessible. |
+| `docker_images.go` | `IsDockerImageAvailable` | `func IsDockerImageAvailable(ctx context.Context, image string) bool` | Checks if a Docker image is available locally. |
+| `docker_images.go` | `IsDockerImageDownloading` | `func IsDockerImageDownloading(image string) bool` | Checks if a Docker image is currently being downloaded. |
+| `docker_images.go` | `StartDockerImageDownload` | `func StartDockerImageDownload(ctx context.Context, image string) (bool, func() error)` | Starts a background Docker image pull and returns a wait function for its result. |
+| `domains_command.go` | `RunListDomains` | `func RunListDomains(jsonOutput bool) error` | Lists all workflows with their domain configuration summary. |
+| `domains_command.go` | `RunWorkflowDomains` | `func RunWorkflowDomains(workflowArg string, jsonOutput bool) error` | Lists all effective domains for a specific workflow. |
+| `enable.go` | `DisableWorkflowsByNames` | `func DisableWorkflowsByNames(ctx context.Context, workflowNames []string, repoOverride string) error` | Disables workflows by specific names, or all workflows if none are provided. |
+| `enable.go` | `EnableWorkflowsByNames` | `func EnableWorkflowsByNames(ctx context.Context, workflowNames []string, repoOverride string) error` | Enables workflows by specific names, or all workflows if none are provided. |
+| `fix_codemods.go` | `GetAllCodemods` | `func GetAllCodemods() []Codemod` | Returns all available codemods in the registry. |
+| `fix_command.go` | `RunFix` | `func RunFix(config FixConfig) error` | Runs the `fix` command with the given configuration. |
+| `generate_action_metadata_command.go` | `GenerateActionMetadataCommand` | `func GenerateActionMetadataCommand() error` | Generates `action.yml` and README.md files for JavaScript modules. |
+| `hash_command.go` | `RunHashFrontmatter` | `func RunHashFrontmatter(workflowPath string) error` | Computes and prints the frontmatter hash for a workflow. |
+| `includes.go` | `FetchIncludeFromSource` | `func FetchIncludeFromSource(ctx context.Context, includePath string, baseSpec *WorkflowSpec, verbose bool) ([]byte, string, error)` | Fetches include content and its `#fragment` section from a local or remote source. |
+| `list_workflows_command.go` | `RunListWorkflows` | `func RunListWorkflows(ctx context.Context, repo, path, pattern string, verbose bool, jsonOutput bool, labelFilter string, staleOnly bool) error` | Lists workflows without checking their GitHub Actions status. |
+| `logs_artifact_set.go` | `ResolveArtifactFilter` | `func ResolveArtifactFilter(sets []string) []string` | Resolves named artifact sets to a filter list; returns nil for `ArtifactSetAll`. |
+| `logs_artifact_set.go` | `ValidArtifactSetNames` | `func ValidArtifactSetNames() []string` | Returns the valid artifact set names, derived dynamically from the artifact-set map. |
+| `logs_artifact_set.go` | `ValidateArtifactSets` | `func ValidateArtifactSets(sets []string) error` | Validates artifact set names, returning an error listing any unrecognized names. |
+| `logs_metrics.go` | `ExtractLogMetricsFromRun` | `func ExtractLogMetricsFromRun(processedRun ProcessedRun) workflow.LogMetrics` | Extracts log metrics from a processed run's log directory. |
+| `mcp_safe_update_cache.go` | `CollectLockFileManifests` | `func CollectLockFileManifests(workflowsDir string) map[string]*workflow.GHAWManifest` | Collects manifests from lock files so they cannot be tampered with by the agent. |
+| `mcp_safe_update_cache.go` | `WritePriorManifestFile` | `func WritePriorManifestFile(cache map[string]*workflow.GHAWManifest) (string, error)` | Writes a prior-manifest cache file and returns its path; caller must remove it when done. |
+| `project_command.go` | `RunProjectNew` | `func RunProjectNew(ctx context.Context, config ProjectConfig) error` | Executes the project creation logic. |
+| `remove_command.go` | `RemoveWorkflows` | `func RemoveWorkflows(pattern string, keepOrphans bool, workflowDir string) error` | Removes workflows matching a pattern. |
+| `run_interactive.go` | `RunSpecificWorkflowInteractively` | `func RunSpecificWorkflowInteractively(ctx context.Context, opts RunWorkflowOptions) error` | Runs a known workflow interactively, collecting inputs if the workflow defines any. |
+| `run_interactive.go` | `RunWorkflowInteractively` | `func RunWorkflowInteractively(ctx context.Context, opts RunWorkflowOptions) error` | Runs a workflow in interactive mode. |
+| `run_workflow_validation.go` | `IsRunnable` | `func IsRunnable(markdownPath string) (bool, error)` | Checks whether the compiled `.lock.yml` for a workflow is runnable. |
+| `setup_repository.go` | `RunSetupAuth` | `func RunSetupAuth(opts SetupAuthOptions) error` | Runs the repository authentication setup flow. |
+| `setup_repository.go` | `RunSetupRepositoryCheck` | `func RunSetupRepositoryCheck(opts SetupRepositoryCheckOptions) error` | Runs the repository setup readiness check. |
+| `trial_runner.go` | `RunWorkflowTrials` | `func RunWorkflowTrials(ctx context.Context, workflowSpecs []string, opts TrialOptions) error` | Executes trial runs for one or more workflows. |
+| `update_actions_lockfile.go` | `UpdateActions` | `func UpdateActions(ctx context.Context, allowMajor, verbose, disableReleaseBump bool, coolDown time.Duration) error` | Updates pinned GitHub Actions references, bumping SHAs and cooldown state. |
+| `update_actions_workflow_files.go` | `UpdateActionsInWorkflowFiles` | `func UpdateActionsInWorkflowFiles(ctx context.Context, workflowsDir, engineOverride string, verbose, disableReleaseBump bool, noCompile bool, coolDown time.Duration, approve bool) error` | Scans workflow files and updates `actions/*` references. |
+| `validators.go` | `ValidateWorkflowName` | `func ValidateWorkflowName(s string) error` | Ensures a workflow name is non-empty and contains only alphanumeric characters, hyphens, and underscores. |
+
+Method-form symbols on exported types (e.g. `(*FileTracker).TrackCreated`, `(*DomainBuckets).SetAllowedDomains`, `(*ToolGraph).AddSequence`) are already documented in the "Additional functions and methods" table above; the entries here cover only package-level functions that were not yet listed.
+
+### Additional exported top-level functions (verified 2026-09-26)
+
+| File | Function | Signature | Description |
+|------|----------|-----------|-------------|
+| `compile_model_validation.go` | `PrepareCompileModelValidation` | `func PrepareCompileModelValidation(ctx context.Context, config *CompileConfig)` | Builds the active model inventory used by `compile --models`. |
+| `edit_command.go` | `NewEditCommand` | `func NewEditCommand() *cobra.Command` | Creates the experimental command for changing workflow frontmatter. |
+| `experiments_decision.go` | `DecideExperiment` | `func DecideExperiment(analysis ExperimentAnalysis) ExperimentDecisionResult` | Deterministically transforms an existing experiment analysis result into a decision; performs no I/O, statistical tests, artifact loading, or experiment mutation. |
+| `format_command.go` | `NewFormatCommand` | `func NewFormatCommand() *cobra.Command` | Creates the `format` command that applies codemods and normalizes agentic workflow frontmatter. |
+| `graders_command.go` | `NewGradersCommand` | `func NewGradersCommand() *cobra.Command` | Creates the `graders` command group for running workflow graders. |
+| `json_schema_command.go` | `NewJSONSchemaCommand` | `func NewJSONSchemaCommand() *cobra.Command` | Creates the `json-schema` command. |
+| `logs_multi.go` | `DownloadWorkflowLogsForTargets` | `func DownloadWorkflowLogsForTargets(ctx context.Context, opts LogsDownloadOptions, targets []logsWorkflowTarget, initialErrors []error) (err error)` | Downloads several workflow reports concurrently and renders one combined report, using an isolated output directory per target so run IDs from different repositories cannot collide in the local cache. |
+| `mcp_schema.go` | `GenerateNamedOutputSchema` | `func GenerateNamedOutputSchema(name string) ([]byte, error)` | Generates and serializes a known CLI output schema by name (e.g. `audit`). |
+| `mcp_schema.go` | `MarshalOutputSchema` | `func MarshalOutputSchema(schema *jsonschema.Schema) ([]byte, error)` | Serializes a generated output schema using the CLI's standard indented JSON format. |
+| `models_command.go` | `NewModelsCommand` | `func NewModelsCommand() *cobra.Command` | Creates the `models` command that lists model catalog pricing, aliases, and observed automation models. |
+
+### Additional exported symbols (verified 2026-10-06)
+
+| File | Symbol | Kind | Description |
+|------|--------|------|-------------|
+| `sessions_command.go` | `NewSessionsCommand` | `func NewSessionsCommand() *cobra.Command` | Creates the `sessions` command. |
+| `work_command.go` | `NewWorkCommand` | `func NewWorkCommand() *cobra.Command` | Creates the `work` command. |
+| `mcp_schema.go` | `GenerateOutputSchema` | `func GenerateOutputSchema[T any]() (*jsonschema.Schema, error)` | Generates a JSON schema for the CLI output type `T`. |
+| `validation_issue.go` | `(ValidationIssue).ToFinding` | `func (v ValidationIssue) ToFinding(severity scanfindings.SeverityLevel) scanfindings.Finding` | Converts a validation issue into a scan finding of the given severity. |
+| `gateway_logs_types.go` | `(RPCMessageEntry).EffectiveType` | `func (e RPCMessageEntry) EffectiveType() string` | Returns the message type; the legacy `type` field takes precedence over `event` (schema `rpc-message/v2`). |
+| `logs_models.go` | `NumericID` | `type NumericID int64` | Integer identifier accepting either a JSON number or its string form. |
+| `experiments_analyze_statistics.go` | `ExperimentReadiness` | `type ExperimentReadiness string` | Whether normal analysis requirements have enough usable data. |
+| `experiments_analyze_statistics.go` | `GuardrailStatusCode` | `type GuardrailStatusCode string` | Stable machine-readable outcome of a guardrail evaluation. |
+| `friction_cost.go` | `FrictionCostSummary`, `FrictionCost`, `FrictionTokens`, `FrictionUncertain`, `FrictionDriverSummary`, `FrictionGroup`, `FrictionEvent`, `FrictionUnmeasuredDriver` | structs | Precomputed estimated avoidable marginal cost of execution-friction events in a run (AIC is the canonical unit). |
+| `logs_work_queue.go` | `WorkQueueReport`, `WorkQueueSnapshot`, `WorkQueueWorker`, `WorkQueueTransaction`, `WorkQueueOperation` | structs | Activation-time queue facts, agent intent, and operations observed in a run's job logs (runtime queue protocol). |
+| `logs_usage_activity.go` | `LedgerActivity`, `LedgerCompactionActivity` | structs | Ledger mutations and repo-memory compaction statistics. |
+
+Methods on unexported types (e.g. `cachedLogsJSONLWriter.Append*`, `githubGraderRunArtifactSource.Load`) are not part of the public API.
+
+### Additional exported report and analysis symbols
+
+| Area | Exported symbols | Description |
+|------|------------------|-------------|
+| Audit and detection | `AuditComparisonRoute`, `AuditComparisonRouteDelta`, `AuditDecision`, `AuditDecisionQuestion`, `AuditHarnessRoutingOutcome`, `AuditModelCatalog`, `AuditModelCatalogEndpoint`, `AuditCatalogModel`, `AuditRetrySummary`, `AuditEngineRetry`, `AuditRetryAttempt`, `AuditEvidenceSearch`, `AuditEvidenceMatch`, `AuditEvidenceExcerpt`, `AuditEvidenceRef`, `AuditEvidenceNativeRef`, `DetectionModelUsage`, `EvalsSummary`, `ObsoletePREvidence` | Structured audit comparisons, advisory decisions, model and retry observations, query-specific evidence, detection traffic, and PR lifecycle evidence. These records do not establish completeness, authorization, or root cause. |
+| Doctor and health | `DoctorAgentAssignmentCheck`, `DoctorAssignmentRunHistory`, `DoctorAssignmentRunEvidence`, `DoctorTokenValidation`, `DoctorReleaseCheck`, `DoctorCompiledWorkflowCheck`, `HealthApprovalEvidence`, `HealthCacheEvidence`, `HealthCollection`, `HealthDetectionFailure`, `HealthDurableRun`, `HealthDurableSessions`, `HealthPotentialIssue`, `HealthJobEvidence`, `HealthPRLifecycleEvidence`, `HealthRevisionCohort`, `HealthRevisionStatus`, `HealthSubagentFailure`, `HealthWorkQueue` | Bounded repository, run, cache, revision, durable-session, and work-queue observations used by doctor and health reports. |
+| Dry-run, durable sessions, and graders | `DryRunCompileReport`, `DryRunScannerCheck`, `DryRunScannerDifferential`, `DurableSessionReport`, `ValidationScriptLocation`, `RegradedRun`, `RegradeDefinition`, `RegradeOriginalEvidence`, `SecondaryMetricAnalysis`, `SecondaryMetricVariantAnalysis`, `OutcomeMetricCoverage`, `OutcomeWindowInfo` | Compilation and scanner-gate results, validated session restoration, grader evidence, secondary metrics, and outcome maturity coverage. |
+| Episodes and failures | `EpisodeRoot`, `EpisodeCoverage`, `EpisodeHop`, `EpisodeHopEdge`, `EpisodeRunCost`, `EpisodeExplanation`, `EpisodeRetrievalIssue`, `EpisodeOutcomeObservation`, `EpisodeOutcomesData`, `EpisodeOutcomeMembershipCoverage`, `EpisodeOutcomeData`, `FailureSignal`, `FailureCluster`, `FailureRunIdentity`, `FailureClusterTarget`, `FailureInvestigation`, `FailureInvestigationTarget`, `FailureClusterStatistics` | Bounded workflow-invocation and failure-sample evidence; shared symptoms are not diagnoses, and selected runs are not presumed to exhaust an episode. |
+| Model routing and usage | `AwInfoModelConfig`, `AwInfoModelConfigRouting`, `AwInfoModelSelection`, `AwInfoModelRouting`, `ModelEndpointMismatch`, `ModelRoutingLogsSummary`, `ModelRoutingRouteSummary`, `ModelRoutingLabels`, `ModelRoutingChoice`, `ModelRoutingFailure`, `ModelRoutingCost`, `ModelRoutingDeviation`, `ModelRoutingAgentCost`, `ModelRoutingSummary`, `AgentUsageBreakdown`, `AgentModelUsage`, `TokenUsageSteering`, `SteeringNotice` | Configured and observed model routes, endpoint compatibility, costs, failures, agent attribution, and steering notices. Detection traffic remains separate from agent usage. |
+| Work-queue and cached-log reports | `WorkQueueCurrentSnapshot`, `WorkQueueAssignmentReceipt`, `WorkQueueClaimReceipt`, `WorkQueueFinishReceipt`, `WorkQueueDiagnostics`, `WorkQueueAssignedClaimDiagnostics` | Snapshot-based queue diagnostics; receipts describe validated facts. |
+
 ## Source Synchronization
 
-Reviewed against recent source updates on 2026-07-17; no additional public-contract deltas were identified beyond the sections above.
+Re-verified on 2026-10-06: the exported symbols listed above were previously undocumented and are now covered.
+
+Verified against source on 2026-11-13: added grouped coverage for the audit, doctor, health, episode, failure, model-routing, grader, and work-queue report types above.
+
+Reviewed against recent source updates on 2026-08-08; the "Additional exported top-level functions" table above was added after diffing the full exported-symbol list against this README. Re-verified on 2026-09-26: diffed the full exported top-level function list against all documented tables and added the "Additional exported top-level functions (verified 2026-09-26)" table above for 10 previously undocumented functions. No other public-contract deltas were identified beyond the sections above.
 
 ---
 

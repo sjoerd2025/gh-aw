@@ -10,6 +10,7 @@ import (
 )
 
 func TestCodemodTypes(t *testing.T) {
+	t.Parallel()
 	// Test that the Codemod type has all required fields
 	codemod := Codemod{
 		ID:           "test-id",
@@ -29,6 +30,7 @@ func TestCodemodTypes(t *testing.T) {
 }
 
 func TestCodemodResultType(t *testing.T) {
+	t.Parallel()
 	// Test that the CodemodResult type has all required fields
 	result := CodemodResult{
 		Applied: true,
@@ -40,6 +42,7 @@ func TestCodemodResultType(t *testing.T) {
 }
 
 func TestGetAllCodemods_ReturnsAllCodemods(t *testing.T) {
+	t.Parallel()
 	codemods := GetAllCodemods()
 
 	// Verify we have the expected number of codemods
@@ -57,6 +60,7 @@ func TestGetAllCodemods_ReturnsAllCodemods(t *testing.T) {
 }
 
 func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
+	t.Parallel()
 	codemods := GetAllCodemods()
 
 	// Build a map of codemod IDs
@@ -71,6 +75,7 @@ func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
 		"network-firewall-migration",
 		"command-to-slash-command-migration",
 		"workflow-dispatch-required-false-with-slash-command",
+		"workflow-dispatch-aw-context-removal",
 		"mcp-scripts-mode-removal",
 		"upload-assets-to-upload-asset-migration",
 		"write-permissions-to-read-migration",
@@ -88,10 +93,12 @@ func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
 		"bash-anonymous-removal",
 		"activation-outputs-to-sanitized-step",
 		"roles-to-on-roles",
+		"pull-request-target-restrict-roles",
 		"bots-to-on-bots",
 		"engine-steps-to-top-level",
 		"assign-to-agent-default-agent-to-name",
 		"playwright-allowed-domains-migration",
+		"playwright-cli-mode-removal",
 		"expires-integer-to-string",
 		"app-to-github-app",
 		"github-app-app-id-to-client-id",
@@ -99,10 +106,11 @@ func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
 		"safe-output-merge-pr-constraints",
 		"safe-output-add-reviewer-allowlists",
 		"safe-output-dispatch-repository-key",
+		"safe-output-report-missing-tool",
+		"safe-output-report-missing-data",
+		"safe-job-runner-to-runs-on",
 		"safe-inputs-to-mcp-scripts",
 		"rate-limit-to-user-rate-limit",
-		"effective-tokens-to-ai-credits",
-		"messages-effective-tokens-suffix-to-ai-credits-suffix",
 		"engine-max-runs-to-top-level",
 		"max-runs-to-max-turns",
 		"engine-max-turns-to-top-level",
@@ -114,22 +122,30 @@ func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
 		"checkout-persist-credentials-false",
 		"pull-request-target-checkout-false",
 		"dependabot-toolset-permissions",
+		"github-app-token-permissions",
 		"github-repos-to-allowed-repos",
+		"toolset-singular-to-toolsets",
+		"allowed-repos-current-to-github-repository",
 		"features-copilot-requests-to-permissions",
 		"features-byok-copilot-removal",
 		"features-inline-agents-removal",
-		"features-cli-proxy-to-tools-github-mode",
 		"features-difc-proxy-to-tools-github",
 		"mount-as-clis-to-cli-proxy",
+		"cli-proxy-false-when-bash-disabled",
 		"sandbox-mcp-container-removal",
 		"sandbox-mcp-version-removal",
-		"sandbox-agent-false-removal",
+		"sandbox-fields-kebab-case",
 		"bash-single-quoted-args-rewrite",
+		"bash-allowlist-unsupported-engine-guided-error",
+		"copilot-web-fetch-removal",
+		"copilot-web-search-removal",
 		"infer-to-disable-model-invocation",
 		"run-install-scripts-to-runtimes-node",
 		"mentions-allow-team-members-to-allowed-collaborators",
 		"engine-copilot-sdk-driver-to-driver",
-		"engine-model-to-top-level",
+		"request-review-policy-normalization",
+		"post-steps-safe-outputs-guided-error",
+		"pull-request-target-guided-error",
 	}
 
 	for _, expectedID := range expectedIDs {
@@ -138,6 +154,7 @@ func TestGetAllCodemods_ContainsExpectedCodemods(t *testing.T) {
 }
 
 func TestGetAllCodemods_NoduplicateIDs(t *testing.T) {
+	t.Parallel()
 	codemods := GetAllCodemods()
 
 	// Check for duplicate IDs
@@ -149,6 +166,7 @@ func TestGetAllCodemods_NoduplicateIDs(t *testing.T) {
 }
 
 func TestGetCodemods_DisablesRequestedCodemods(t *testing.T) {
+	t.Parallel()
 	codemods, err := GetCodemods([]string{"timeout-minutes-migration", "network-firewall-migration"})
 	require.NoError(t, err)
 
@@ -163,6 +181,7 @@ func TestGetCodemods_DisablesRequestedCodemods(t *testing.T) {
 }
 
 func TestGetCodemods_UnknownDisabledCodemodReturnsError(t *testing.T) {
+	t.Parallel()
 	codemods, err := GetCodemods([]string{"not-a-real-codemod"})
 	require.Error(t, err)
 	assert.Nil(t, codemods)
@@ -170,6 +189,7 @@ func TestGetCodemods_UnknownDisabledCodemodReturnsError(t *testing.T) {
 }
 
 func TestGetAllCodemods_InExpectedOrder(t *testing.T) {
+	t.Parallel()
 	codemods := GetAllCodemods()
 
 	// Verify codemods are returned in the expected order
@@ -188,6 +208,7 @@ func expectedCodemodOrder() []string {
 		"network-firewall-migration",
 		"command-to-slash-command-migration",
 		"workflow-dispatch-required-false-with-slash-command",
+		"workflow-dispatch-aw-context-removal",
 		"mcp-scripts-mode-removal",
 		"upload-assets-to-upload-asset-migration",
 		"write-permissions-to-read-migration",
@@ -204,8 +225,12 @@ func expectedCodemodOrder() []string {
 		"install-script-url-migration",
 		"bash-anonymous-removal",
 		"bash-single-quoted-args-rewrite",
+		"copilot-web-fetch-removal",
+		"copilot-web-search-removal",
+		"bash-allowlist-unsupported-engine-guided-error",
 		"activation-outputs-to-sanitized-step",
 		"roles-to-on-roles",
+		"pull-request-target-restrict-roles",
 		"bots-to-on-bots",
 		"engine-steps-to-top-level",
 		"engine-max-runs-to-top-level",
@@ -216,6 +241,7 @@ func expectedCodemodOrder() []string {
 		"top-level-env-secrets-guided-error",
 		"assign-to-agent-default-agent-to-name",
 		"playwright-allowed-domains-migration",
+		"playwright-cli-mode-removal",
 		"expires-integer-to-string",
 		"app-to-github-app",
 		"github-app-app-id-to-client-id",
@@ -223,29 +249,38 @@ func expectedCodemodOrder() []string {
 		"safe-output-merge-pr-constraints",
 		"safe-output-add-reviewer-allowlists",
 		"safe-output-dispatch-repository-key",
+		"safe-output-report-missing-tool",
+		"safe-output-report-missing-data",
+		"safe-job-runner-to-runs-on",
 		"safe-inputs-to-mcp-scripts",
 		"rate-limit-to-user-rate-limit",
-		"effective-tokens-to-ai-credits",
-		"messages-effective-tokens-suffix-to-ai-credits-suffix",
+		"serena-mcp-location-migration",
 		"serena-tools-to-shared-import",
 		"workflow-run-branches-default",
 		"checkout-persist-credentials-false",
 		"pull-request-target-checkout-false",
 		"dependabot-toolset-permissions",
+		"github-app-token-permissions",
 		"github-repos-to-allowed-repos",
+		"toolset-singular-to-toolsets",
+		"allowed-repos-current-to-github-repository",
 		"features-copilot-requests-to-permissions",
 		"features-byok-copilot-removal",
 		"features-inline-agents-removal",
-		"features-cli-proxy-to-tools-github-mode",
 		"features-difc-proxy-to-tools-github",
 		"mount-as-clis-to-cli-proxy",
+		"min-integrity-none-requires-bash",
+		"cli-proxy-false-when-bash-disabled",
 		"sandbox-mcp-container-removal",
 		"sandbox-mcp-version-removal",
-		"sandbox-agent-false-removal",
+		"sandbox-runtime-profiles",
+		"sandbox-fields-kebab-case",
 		"infer-to-disable-model-invocation",
 		"run-install-scripts-to-runtimes-node",
 		"mentions-allow-team-members-to-allowed-collaborators",
 		"engine-copilot-sdk-driver-to-driver",
-		"engine-model-to-top-level",
+		"request-review-policy-normalization",
+		"post-steps-safe-outputs-guided-error",
+		"pull-request-target-guided-error",
 	}
 }

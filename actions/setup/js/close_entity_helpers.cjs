@@ -2,7 +2,10 @@
 /// <reference types="@actions/github-script" />
 
 const { loadAgentOutput } = require("./load_agent_output.cjs");
-const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
+const { assembleReportBodyParts } = require("./markdown_body_helpers.cjs");
+const { appendConfiguredReportFooter } = require("./body_footer.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
 const { getTrackerID } = require("./get_tracker_id.cjs");
 const { getRepositoryUrl } = require("./get_repository_url.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
@@ -45,9 +48,10 @@ const { ERR_API } = require("./error_codes.cjs");
  * @param {string} body - The original comment body
  * @param {number|undefined} triggeringIssueNumber - Issue number that triggered this workflow
  * @param {number|undefined} triggeringPRNumber - PR number that triggered this workflow
+ * @param {string} [bodyFooterTemplate] - Deterministic body footer template
  * @returns {string} The complete comment body with tracker ID and footer
  */
-function buildCommentBody(body, triggeringIssueNumber, triggeringPRNumber) {
+function buildCommentBody(body, triggeringIssueNumber, triggeringPRNumber, bodyFooterTemplate) {
   const workflowName = process.env.GH_AW_WORKFLOW_NAME || "Workflow";
   const workflowSource = process.env.GH_AW_WORKFLOW_SOURCE || "";
   const workflowSourceURL = process.env.GH_AW_WORKFLOW_SOURCE_URL || "";
@@ -55,9 +59,12 @@ function buildCommentBody(body, triggeringIssueNumber, triggeringPRNumber) {
 
   // Inject CAUTION at top of body if threat detection warning was raised.
   // Caller is responsible for sanitizing body before passing it here.
-  const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
-  const bodyWithCaution = detectionCaution ? detectionCaution + "\n\n" + body.trim() : body.trim();
-  return bodyWithCaution + getTrackerID("markdown") + generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber, undefined, undefined, { skipDetectionCaution: true });
+  const { detectionCaution, footer } = assembleReportBodyParts({ includeFooter: true, workflowName, runUrl, workflowSource, workflowSourceURL, triggeringIssueNumber, triggeringPRNumber });
+  const children = [...detectionCaution, ...parseReportMarkdown(body, { minimumHeadingLevel: 2, agentTainted: true })];
+  const trackerID = getTrackerID();
+  if (trackerID) children.push({ type: "xml_marker", name: "gh-aw-tracker-id", value: trackerID, agentTainted: false });
+  children.push(...footer);
+  return renderSizedReport(appendConfiguredReportFooter({ type: "report", title: "Entity closed", children }, bodyFooterTemplate)).body;
 }
 
 /**

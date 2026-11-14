@@ -10,6 +10,18 @@ func BadStringOfBytesCall() string {
 	return string(buf.Bytes()) // want `string\(buf\.Bytes\(\)\) can be simplified to buf\.String\(\)`
 }
 
+func BadParenStringOfBytesCall() string {
+	var buf bytes.Buffer
+	buf.WriteString("hello")
+	return string((buf.Bytes())) // want `string\(buf\.Bytes\(\)\) can be simplified to buf\.String\(\)`
+}
+
+func BadParenBytesCallee() string {
+	var buf bytes.Buffer
+	buf.WriteString("hello")
+	return string((buf.Bytes)()) // want `string\(buf\.Bytes\(\)\) can be simplified to buf\.String\(\)`
+}
+
 func BadStringOfBytesCallPtr() string {
 	buf := &bytes.Buffer{}
 	buf.WriteString("world")

@@ -3,7 +3,6 @@ private: true
 emoji: "⚖️"
 description: Daily regulatory workflow that monitors and cross-checks other daily report agents' outputs for data consistency and anomalies
 on:
-  schedule: daily
   workflow_dispatch:
 permissions:
   contents: read
@@ -12,14 +11,18 @@ permissions:
   pull-requests: read
   discussions: read
 
-sandbox:
-  agent:
-    sudo: false
 
+engine:
+  id: codex
+  model-provider: github
+model: copilot/gpt-5.6-luna
 strict: true
 tracker-id: daily-regulatory
 max-ai-credits: 1000
 tools:
+  work-queue:
+    worker: true
+    require-assignment: true
   cli-proxy: true
   github:
     toolsets: [default, discussions]
@@ -31,19 +34,24 @@ safe-outputs:
     required-title-prefix: "[daily regulatory] "
 timeout-minutes: 30
 imports:
+  - shared/daily-report-worker.md
   - uses: shared/daily-audit-base.md
     with:
       title-prefix: "[daily regulatory] "
   - shared/github-queries-mcp-script.md
+  - shared/reporting.md
 
 
   - shared/otlp.md
+features:
+  gh-aw-detection: true
 evals:
   - id: report_outputs_cross_checked
     question: Did the agent cross-check other daily report agents' outputs for consistency and anomalies?
   - id: regulatory_report_created_or_noop
     question: Was a regulatory report created with findings, or was noop used when all outputs were consistent?
 ---
+
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Regulatory Report Generator
@@ -273,8 +281,6 @@ fi
 Create a comprehensive discussion report with findings.
 
 ### Discussion Format
-
-- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 
 **Title**: `[daily regulatory] Regulatory Report - YYYY-MM-DD`
 

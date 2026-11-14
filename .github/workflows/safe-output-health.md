@@ -10,16 +10,19 @@ permissions:
    issues: read
    pull-requests: read
    actions: read
+   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 engine:
   id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
   mcp:
     tool-timeout: 10m
 max-ai-credits: 1500
+max-turns: 200
 tools:
   cli-proxy: true
 timeout-minutes: 30
@@ -33,7 +36,16 @@ imports:
   - ../skills/jqschema/SKILL.md
 
   - shared/otlp.md
+steps:
+  - name: Check successful audit cadence
+    uses: actions/github-script@v9.0.0
+    with:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+      script: |
+        const { checkCadence } = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/safe_output_health_cadence.cjs`);
+        await checkCadence({ github, context, core });
 ---
+
 # Safe Output Health Monitor
 
 You are the Safe Output Health Monitor - an expert system that monitors and analyzes the health of safe output jobs in agentic workflows.
@@ -53,6 +65,16 @@ Daily audit all agentic workflow runs from the last 24 hours to identify issues,
 - DO NOT ATTEMPT TO USE GH AW DIRECTLY, it is not authenticated. Use the MCP server instead.
 - Do not attempt to download the `gh aw` extension or build it. If the MCP fails, give up.
 - Run the `status` tool of `gh-aw` MCP server to verify configuration.
+
+### Phase 0.1: Check Monitoring Cadence
+
+Read `/tmp/gh-aw/agent/safe-output-health-cadence.json`, produced by the read-only setup check against this workflow's default-branch run history.
+
+- The expected interval is **24 hours**; a gap **greater than 48 hours** since the previous successful run is a **high-priority monitoring-staleness finding**, even when no safe output errors are found.
+- Include the cadence status, elapsed hours, previous successful run timestamp and link in the Executive Summary. For a stale result, also add a Process Improvements recommendation to investigate the intervening runs and restore successful daily publication.
+- Failed, cancelled, or skipped attempts do not reset the successful-audit baseline. Distinguish missed schedule triggers from scheduled runs that failed before publishing; do not claim the workflow was disabled without evidence.
+- If the check is unavailable, has no successful history, or its file is missing, report cadence as **unknown**, not healthy. Continue the audit and publish the report.
+- Treat this monitor's cadence as an explicit exception to the safe-output-only scope below. Keep the normal log analysis window at 24 hours, and mark historical comparisons across a stale gap as discontinuous.
 
 ### Phase 1: Collect Workflow Logs
 
@@ -90,7 +112,7 @@ Safe output jobs are the separate jobs created to handle output from agentic wor
 - `update_issue` - Job that updates issue properties
 - `add_labels` - Job that adds labels to issues/PRs
 - `push_to_pull_request_branch` - Job that pushes changes to PR branches
-- `missing_tool` - Job that reports missing tools
+- `report_missing_tool` - Diagnostic tool that records missing functionality during safe output processing
 
 #### 2.2 Error Detection Strategy
 
@@ -167,10 +189,18 @@ Based on error clustering and root cause analysis, provide:
 
 Create a discussion with the following structure:
 
-```markdown
-# 🏥 Safe Output Health Report - [DATE]
+Use `###` or lower for every report heading; reserve h1/h2 for the
+platform-rendered title. Follow this order: overview → key metrics/issues →
+collapsible detailed findings → next actions or limitations. Keep the executive
+summary and decision-relevant metrics visible. Put long tables, lists, and
+evidence in `<details><summary><b>...</b></summary>...</details>` blocks. Use
+`- [ ]` for follow-up actions and format applicable workflow runs as
+`[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)`.
 
-## Executive Summary
+```markdown
+### 🏥 Safe Output Health Report - [DATE]
+
+### Summary
 
 - **Period**: Last 24 hours
 - **Runs Analyzed**: [NUMBER]
@@ -178,8 +208,17 @@ Create a discussion with the following structure:
 - **Safe Output Jobs Executed**: [NUMBER]
 - **Safe Output Jobs Failed**: [NUMBER]
 - **Error Clusters Identified**: [NUMBER]
+- **Cadence**: [healthy/stale/unknown, elapsed hours, and previous successful run]
 
-## Safe Output Job Statistics
+### Key Metrics and Issues
+
+- **Overall success rate**: [PERCENTAGE]%
+- **Most important finding**: [brief issue or state that no errors were found]
+
+<details>
+<summary><b>Detailed findings, statistics, and evidence</b></summary>
+
+### Safe Output Job Statistics
 
 | Job Type | Total Executions | Failures | Success Rate |
 |----------|------------------|----------|--------------|
@@ -189,125 +228,110 @@ Create a discussion with the following structure:
 | create_pull_request | [NUM] | [NUM] | [PCT]% |
 | other... | [NUM] | [NUM] | [PCT]% |
 
-## Error Clusters
+### Error Clusters
 
-### Cluster 1: [Error Type/Pattern]
+#### Cluster 1: [Error Type/Pattern]
 
 - **Count**: [NUMBER] occurrences
 - **Affected Jobs**: [Job types]
 - **Affected Workflows**: [Workflow names]
-- **Sample Error**:
-  ```
-  [Error message excerpt]
-  ```
+- **Sample Error**: [brief excerpt]
 - **Root Cause**: [Analysis of underlying cause]
 - **Impact**: [Severity and impact description]
 
-### Cluster 2: [Error Type/Pattern]
+#### Cluster 2: [Error Type/Pattern]
 
 [Same structure as above]
 
-## Root Cause Analysis
+### Root Cause Analysis
 
-### API-Related Issues
+#### API-Related Issues
 
 [Details of API errors, rate limits, authentication problems]
 
-### Data Validation Issues
+#### Data Validation Issues
 
 [Details of parsing and validation errors]
 
-### Permission Issues
+#### Permission and Other Issues
 
-[Details of permission-related failures]
+[Details of permission-related failures and any other categories]
 
-### Other Issues
+### Recommendations
 
-[Any other categories of errors found]
+#### Critical Issues (Immediate Action Required)
 
-## Recommendations
+- **[Issue Title]** — **Priority**: [Critical/High/Medium/Low]
+- **Root Cause**: [Brief explanation]
+- **Recommended Action**: [Specific steps to fix]
+- **Affected**: [Workflows/job types affected]
 
-### Critical Issues (Immediate Action Required)
+#### Bug Fixes Required
 
-1. **[Issue Title]**
-   - **Priority**: Critical/High/Medium/Low
-   - **Root Cause**: [Brief explanation]
-   - **Recommended Action**: [Specific steps to fix]
-   - **Affected**: [Workflows/job types affected]
+- **[Bug Title]**
+  - **File/Location**: [Specific file and function]
+  - **Problem**: [What's wrong]
+  - **Fix**: [What needs to change]
+  - **Affected Jobs**: [Job types]
 
-2. [Additional critical issues]
+#### Configuration Changes
 
-### Bug Fixes Required
+- **[Configuration Item]**
+  - **Current**: [Current setting]
+  - **Recommended**: [Recommended change]
+  - **Reason**: [Why this change helps]
 
-1. **[Bug Title]**
-   - **File/Location**: [Specific file and function]
-   - **Problem**: [What's wrong]
-   - **Fix**: [What needs to change]
-   - **Affected Jobs**: [Job types]
+#### Process Improvements
 
-2. [Additional bug fixes]
+- **[Improvement Area]**
+  - **Current State**: [How it works now]
+  - **Proposed**: [How it should work]
+  - **Benefits**: [Expected improvements]
 
-### Configuration Changes
+### Work Item Plans
 
-1. **[Configuration Item]**
-   - **Current**: [Current setting]
-   - **Recommended**: [Recommended change]
-   - **Reason**: [Why this change helps]
+For each significant issue cluster, provide a structured plan:
 
-2. [Additional configuration changes]
-
-### Process Improvements
-
-1. **[Improvement Area]**
-   - **Current State**: [How it works now]
-   - **Proposed**: [How it should work]
-   - **Benefits**: [Expected improvements]
-
-2. [Additional improvements]
-
-## Work Item Plans
-
-For each significant issue cluster, provide a structured work item plan:
-
-### Work Item 1: [Title]
+#### Work Item 1: [Title]
 
 - **Type**: Bug Fix / Enhancement / Investigation
 - **Priority**: Critical / High / Medium / Low
-- **Description**: [Detailed description of the issue]
+- **Description**: [Detailed description]
 - **Acceptance Criteria**:
-  - [ ] [Specific measurable outcome 1]
-  - [ ] [Specific measurable outcome 2]
+  - [ ] [Specific measurable outcome]
 - **Technical Approach**: [How to implement the fix]
 - **Estimated Effort**: [Small / Medium / Large]
-- **Dependencies**: [Any dependencies or prerequisites]
+- **Dependencies**: [Prerequisites]
 
-### Work Item 2: [Title]
+#### Work Item 2: [Title]
 
 [Same structure as above]
 
-## Historical Context
+### Historical Context
 
-[Compare with previous safe output health audits if available from cache memory]
+Compare with previous safe output health audits when available.
 
-### Trends
+#### Trends
 
-- Error rate trend: [Increasing/Decreasing/Stable]
-- Most common recurring issue: [Description]
-- Improvement since last audit: [Metrics]
+- **Error rate trend**: [Increasing/Decreasing/Stable]
+- **Most common recurring issue**: [Description]
+- **Improvement since last audit**: [Metrics]
 
-## Metrics and KPIs
+### Metrics and KPIs
 
 - **Overall Safe Output Success Rate**: [PERCENTAGE]%
 - **Most Reliable Job Type**: [Job type with highest success rate]
 - **Most Problematic Job Type**: [Job type with lowest success rate]
 - **Average Time to Failure**: [If applicable]
 
-## Next Steps
+</details>
 
-- [ ] [Immediate action item 1]
-- [ ] [Immediate action item 2]
-- [ ] [Follow-up investigation]
-- [ ] [Process improvement task]
+### Next Steps or Limitations
+
+- [ ] [Highest-priority follow-up action]
+- [ ] [Follow-up investigation or process improvement]
+- [ ] State any missing logs, incomplete coverage, or unavailable historical evidence.
+
 ```
 
 ## Important Guidelines

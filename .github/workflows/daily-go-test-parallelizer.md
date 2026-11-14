@@ -1,25 +1,44 @@
 ---
 private: true
 name: Daily Go Test Parallelizer
-description: Adds t.Parallel to safe Go tests using daily round-robin analysis
+description: Adds t.Parallel to safe Go tests using bounded batch analysis
 on:
-  schedule: daily
+  schedule: every 2h
   workflow_dispatch:
   skip-if-match: 'is:pr is:open in:title "[test-parallel]"'
 permissions:
+  copilot-requests: write
   contents: read
+  issues: read
   pull-requests: read
+engine:
+  id: codex
+  env:
+    GOCACHE: /tmp/gh-aw/agent/go-build-cache
+    GOMODCACHE: /tmp/gh-aw/agent/go-mod-cache
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
+steps:
+  - name: Provision disposable Go validation caches
+    run: mkdir -p /tmp/gh-aw/agent/go-build-cache /tmp/gh-aw/agent/go-mod-cache
 strict: true
 timeout-minutes: 30
+max-ai-credits: 15
+max-turns: 40
 network:
   allowed:
     - defaults
+    - github
     - go
-sandbox:
-  agent:
-    sudo: false
+    - node
 tools:
+  cli-proxy: true
+  github:
+    mode: gh-proxy
   cache-memory:
+    restore-only: true
     retention-days: 30
     allowed-extensions: [".json"]
   edit:
@@ -35,26 +54,117 @@ safe-outputs:
     protected-files: blocked
     allowed-files:
       - "**/*_test.go"
-    max-patch-files: 1
+    max-patch-files: 25
     max-patch-size: 2048
   noop:
+evals:
+  - id: tests_analyzed
+    question: Did the agent analyze Go tests to identify a safe candidate for t.Parallel?
+  - id: pr_created_or_noop
+    question: Did the agent create a pull request for a safe test change, or use noop when no safe change was available?
+imports:
+  - shared/pr-safe-output-defaults.md
+  - shared/reporting.md
+features:
+  gh-aw-detection: true
 ---
 
 # Daily Go Test Parallelizer
 
-Analyze one Go test file per run and add `t.Parallel()` only where parallel execution is demonstrably safe.
+Analyze up to twenty-five Go test files per run and add `t.Parallel()` only where parallel execution is demonstrably safe.
 
 ## Select a file
 
 1. Use `grep` to list tracked `*_test.go` files containing top-level `Test` functions. Exclude `vendor/` and generated files, then sort paths lexicographically.
 2. Read `/tmp/gh-aw/cache-memory/go-test-parallelizer/state.json` when it exists. It has this shape:
    `{"last_file":"path/to/file_test.go"}`.
-3. Select the path after `last_file`, wrapping to the first path. If the cache is absent, malformed, or names a removed file, select the first path.
-4. Analyze and modify at most that one file.
+3. Rotate the sorted list to start after `last_file`, wrapping to the first path. If the cache is absent, malformed, or names a removed file, start from the first path. Partition the rotated list into non-overlapping batches of at most 25 files; do not wrap within a batch.
+4. Select batch `(github.run_number - 1) % number_of_batches`, using run number `${{ github.run_number }}`. This attempted-batch rotation permits zero consecutive retries after a block: the next run selects the next batch regardless of outcome, without changing the completed-analysis cursor. If there are no files, report a completed no-candidate analysis; if there is only one batch, report that rotation cannot select a different batch.
+5. Analyze and modify only this selected batch (maximum 25 files). Keep the previous cursor unchanged; selection alone is not completed analysis.
+6. Minimize token usage: avoid re-reading files you already analyzed, and do not paste full file contents into notes or outputs.
 
 ## Analyze safety
 
-Add `t.Parallel()` at the start of eligible top-level tests. Also add it to eligible table-driven subtests when loop variables are safely captured.
+Add `t.Parallel()` at the start of eligible top-level tests. Also add it to eligible table-driven subtests.
+For Go 1.22+ semantics, do not add redundant loop-variable rebinding (`tt := tt`, `cmd := cmd`) unless a case truly needs an additional local copy for correctness.
+Apply the safety exclusions below before assessing eligibility.
+
+## Batched analysis agent (small context)
+
+1. Analyze the selected path list as one batch.
+2. Do not create one sub-agent per file; keep the repeated static rules in this single batch call.
+3. Require compact JSON output:
+   `{"files":[{"file":"...","safe":true|false,"reasons":["..."],"candidate_tests":["TestName"]}]}`.
+4. Use the JSON results to decide which files to edit. Keep aggregation notes short and avoid repeating unchanged rule text.
+
+Do not change assertions, test behavior, production code, dependencies, generated files, or vendored files. When safety is uncertain, make no change.
+
+## Validate
+
+Use the disposable Go build and module caches provisioned by this workflow through `GOCACHE` and `GOMODCACHE`; do not read pre-existing caches or inspect the process environment.
+
+After editing the selected batch:
+
+1. Run `go test -race` once per unique modified package (deduplicate package paths across edited files).
+2. Run `go test ./...` once after all candidate edits.
+3. Inspect the diff and confirm it contains only safe `t.Parallel()` additions in selected files.
+4. If any test command fails, restore only your candidate edits and call `report_incomplete`. If the diff contains any other change, remove your out-of-scope edits and call `report_incomplete`; never revert pre-existing work.
+
+Security-policy limitations are not test failures or evidence that no safe
+candidate exists. The full suite includes environment-enumeration and
+credential-fixture tests that may be incompatible with the run's immutable
+policy. Do not execute prohibited operations, grant fixture exceptions, omit
+tests, or replace the required full-suite/race evidence with static analysis.
+If required validation is blocked, leave test files unchanged, preserve the
+previous cursor, and call `report_incomplete`.
+Do not create a pull request or use `noop` to imply validation succeeded.
+
+Before `report_incomplete`, self-check and report:
+
+- The blocked batch, the exact required command and its concrete error. If a
+  command was prohibited before execution, say it was not run and name the
+  policy limitation instead of inventing an error. Classify the outcome as
+  environment/policy blocked, test failure, or agent failure; state uncertainty.
+- Confirm candidate edits were restored by inspecting the diff without reverting
+  pre-existing work; if restoration cannot be confirmed, say so.
+- Confirm the completed-analysis cursor remains unchanged and identify the next
+  attempted batch using the rotation above, or state why it cannot be determined.
+
+## Persist and report
+
+Treat `state.json` as a completed-analysis cursor, not an attempted-batch cursor.
+A completed analysis requires all selected files to have a completed safety
+assessment and either:
+
+- No safe edit is available, so the completed analysis ends with `noop`; no test execution is claimed.
+- Candidate edits pass every required validation command and the diff check.
+
+Cursor persistence is temporarily disabled: the compiler-enforced
+`restore-only: true` cache configuration restores existing state but never
+uploads or saves cache-memory changes. Do not write `state.json` or create its
+directory. Preserve the previous cursor byte-for-byte (or leave it absent) on
+every outcome, including successful validation and completed no-candidate
+analysis. Never advance the cursor immediately after selection.
+
+The run-number rotation advances attempted batches independently of completion;
+it does not persist progress or prove analysis succeeded. A retry of the same
+workflow run keeps the same run number, and changes to the file list can alter
+batch boundaries. A trusted persistence gate is still required to advance the
+completed-analysis cursor; an agent-written success flag is not validation evidence.
+
+Use `###` or lower headings in any PR description or final report. Present a
+concise overview, selected files and results, collapsible detailed test evidence,
+then next actions or limitations. Keep the outcome visible and put long logs or
+per-file breakdowns in
+`<details><summary><b>...</b></summary>...</details>`. Format applicable run
+references as `[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)`.
+
+Before stopping, call exactly one terminal safe-output tool: create one draft
+pull request when validation succeeds with a change; use `noop` only for a
+completed analysis with no safe edit; use `report_incomplete` when analysis or
+required validation is blocked or fails. Include the selected batch and a short
+reason, and state that the completed-analysis cursor did not advance
+(restore-only mode). For incomplete outcomes include the self-check above.
 
 Do not parallelize tests that use or may conflict through:
 
@@ -62,20 +172,3 @@ Do not parallelize tests that use or may conflict through:
 - shared mutable globals, singleton state, ordering assumptions, or package-level mocks
 - fixed ports, fixed filesystem paths, shared databases, or shared external services
 - unsafe loop-variable capture, timing dependencies, or explicit synchronization between tests
-
-Do not change assertions, test behavior, production code, dependencies, generated files, or vendored files. When safety is uncertain, make no change.
-
-## Validate
-
-After editing:
-
-1. Run the selected package with the race detector.
-2. Run `go test ./...`.
-3. Inspect the diff and confirm it contains only safe `t.Parallel()` additions in the selected file.
-4. Revert the edit and use `noop` if either test command fails or the diff contains any other change.
-
-## Persist and report
-
-Always create `/tmp/gh-aw/cache-memory/go-test-parallelizer/` and write the selected path to `state.json`, even when no edit is safe, so the next daily run advances round-robin.
-
-If validation succeeds with a change, create one draft pull request describing the safety analysis and test results. Otherwise use `noop` with the selected path and a short reason.

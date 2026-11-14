@@ -10,15 +10,14 @@ on:
     strategy: decentralized
   status-comment: true
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
 
-sandbox:
-  agent:
-    sudo: false
 
-engine: codex
+engine: pi
+model: copilot/gpt-6.1-sol
 strict: true
 timeout-minutes: 25
 network:
@@ -29,25 +28,7 @@ tools:
     mode: gh-proxy
     toolsets: [default, pull_requests]
   bash:
-    - "git diff:*"
-    - "git grep:*"
-    - "git log:*"
-    - "git show:*"
-    - "go test:*"
-    - "npm test:*"
-    - "npm run:*"
-    - "node:*"
-    - "find:*"
-    - "grep:*"
-    - "sed:*"
-    - "awk:*"
-    - "cat:*"
-    - "head:*"
-    - "tail:*"
-    - "ls:*"
-    - "mkdir:*"
-    - "echo:*"
-    - "xargs:*"
+    - "*"
   edit:
 safe-outputs:
   push-to-pull-request-branch:
@@ -62,7 +43,7 @@ safe-outputs:
     commit-title-suffix: " [necromancer]"
   add-comment:
     max: 1
-    hide-older-comments: true
+    replace-older-comments: true
   noop:
   messages:
     footer: "> 🧟 *Regression revived by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
@@ -71,6 +52,7 @@ safe-outputs:
     run-failure: "⚠️ [{workflow_name}]({run_url}) {status} while raising regression tests."
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 evals:
   - id: investigation-completed
     question: Did the agent investigate the pull request and identify any root-cause issues or missing test coverage?

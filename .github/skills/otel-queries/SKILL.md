@@ -36,9 +36,8 @@ Prefer sources in this order unless the user says otherwise:
 
 1. Local artifacts or mirrors already in the workspace.
 2. `/tmp/gh-aw/otel.jsonl` for gh-aw spans.
-3. `/tmp/gh-aw/copilot-otel.jsonl` for Copilot CLI spans.
-4. Live OTLP backend data through an MCP server or supported tool.
-5. Static code inspection only, when no telemetry is available.
+3. Live OTLP backend data through an MCP server or supported tool — Copilot CLI spans are exported directly to the configured OTLP backend (no local file mirror) and must be queried there, filtered by the `github.run_id` resource attribute.
+4. Static code inspection only, when no telemetry is available.
 
 Use the cheapest source that can disconfirm the current hypothesis.
 
@@ -272,7 +271,7 @@ Start with these files when telemetry indicates an instrumentation or correlatio
 - `actions/setup/js/generate_observability_summary.cjs`
 - `actions/setup/js/aw_context.cjs`
 - `pkg/workflow/observability_otlp.go`
-- `docs/src/content/docs/guides/custom-otlp-attributes.md`
+- `docs/src/content/docs/reference/open-telemetry-attributes.mdx`
 
 ## Anti-Patterns
 

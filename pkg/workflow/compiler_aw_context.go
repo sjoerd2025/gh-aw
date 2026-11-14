@@ -1,10 +1,12 @@
 package workflow
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var awContextLog = logger.New("workflow:compiler_aw_context")
@@ -13,13 +15,18 @@ var awContextLog = logger.New("workflow:compiler_aw_context")
 // It is managed internally by the agentic workflow system and should not be surfaced to users.
 const AwContextInputName = "aw_context"
 
+// WorkQueueAssignmentInputName carries the immutable version-3 Claim array.
+const WorkQueueAssignmentInputName = "work_queue_assignment"
+
+const WorkQueueClaimInputName = WorkQueueAssignmentInputName
+
 // NetworkAllowedInputName is the optional workflow_call input that extends the compiled
 // network allowlist at runtime for reusable workflows.
 const NetworkAllowedInputName = "network_allowed"
 
 // awContextInputDescription is the description for the aw_context workflow_dispatch input.
 // It signals to users that this input is managed internally by the agentic workflow system.
-const awContextInputDescription = "Agent caller context (used internally by Agentic Workflows)."
+const awContextInputDescription = "Agent caller context (Reserved for Agentic Workflows)."
 
 const networkAllowedInputDescription = "Additional allowed network domains or ecosystem identifiers to union with network.allowed (comma-separated, for example: \"rust\" or \"python,github.com\")."
 
@@ -42,6 +49,37 @@ func injectAwContextIntoOnYAML(onSection string) string {
 	return updated
 }
 
+func injectWorkQueueClaimIntoOnYAML(onSection string) string {
+	return injectInputIntoTrigger(onSection, "workflow_dispatch", WorkQueueClaimInputName, buildWorkQueueClaimInputLines)
+}
+
+func validateReservedWorkflowInputs(data *WorkflowData) error {
+	if data == nil || data.RawFrontmatter == nil {
+		return nil
+	}
+	on, ok := data.RawFrontmatter["on"].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	for _, trigger := range []string{"workflow_dispatch", "workflow_call"} {
+		triggerConfig, ok := on[trigger].(map[string]any)
+		if !ok {
+			continue
+		}
+		inputs, ok := triggerConfig["inputs"].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, inputName := range []string{AwContextInputName, WorkQueueAssignmentInputName, "work_queue_claim"} {
+			if _, exists := inputs[inputName]; exists {
+				return fmt.Errorf("on.%s.inputs.%s is reserved and managed by the compiler; remove it from workflow inputs", trigger, inputName)
+			}
+		}
+	}
+	return nil
+}
+
 func injectNetworkAllowedIntoOnYAML(onSection string, network *NetworkPermissions) string {
 	if network == nil || !network.AllowedInput {
 		return onSection
@@ -56,23 +94,9 @@ func injectInputIntoTrigger(onSection string, triggerName string, inputName stri
 	}
 	awContextLog.Printf("Injecting %s input into %s trigger", inputName, triggerName)
 
+	onSection = expandInlineOnTriggers(onSection)
 	lines := strings.Split(onSection, "\n")
-
-	// Find the trigger line (bare — no sub-value on same line)
-	triggerLineIdx := -1
-	triggerIndent := 0
-	for i, line := range lines {
-		stripped := strings.TrimLeft(line, " \t")
-		rest, found := strings.CutPrefix(stripped, triggerName+":")
-		if found {
-			rest = strings.TrimSpace(rest)
-			if rest == "" || rest == "null" || rest == "~" {
-				triggerLineIdx = i
-				triggerIndent = len(line) - len(stripped)
-				break
-			}
-		}
-	}
+	triggerLineIdx, triggerIndent := findBareTriggerLine(lines, triggerName)
 
 	if triggerLineIdx == -1 {
 		awContextLog.Printf("No bare %s: line found, skipping %s injection", triggerName, inputName)
@@ -80,52 +104,138 @@ func injectInputIntoTrigger(onSection string, triggerName string, inputName stri
 	}
 	awContextLog.Printf("Found %s at line %d (indent=%d), injecting %s", triggerName, triggerLineIdx, triggerIndent, inputName)
 
-	// Look for an "inputs:" key directly inside the trigger block.
-	// Only the first non-empty, non-comment line after the trigger matters.
-	inputsLineIdx := -1
-	for i := triggerLineIdx + 1; i < len(lines); i++ {
-		stripped := strings.TrimLeft(lines[i], " \t")
+	inputsLineIdx := findTriggerInputsLine(lines, triggerLineIdx, triggerIndent)
+	if triggerAlreadyHasInput(lines, inputsLineIdx, inputName) {
+		awContextLog.Printf("%s already injected into %s, skipping", inputName, triggerName)
+		return onSection
+	}
+
+	return insertTriggerInputLines(lines, triggerLineIdx, triggerIndent, inputsLineIdx, buildInputLines(triggerIndent))
+}
+
+func expandInlineOnTriggers(onSection string) string {
+	lines := strings.Split(onSection, "\n")
+	for i, line := range lines {
+		if strings.TrimLeft(line, " \t") != line {
+			continue
+		}
+		onKey := ""
+		for _, candidate := range []string{"on:", `"on":`, "'on':"} {
+			if strings.HasPrefix(line, candidate) {
+				onKey = candidate
+				break
+			}
+		}
+		if onKey == "" {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(line, onKey))
+		if value == "" || value == "null" || value == "~" || strings.HasPrefix(value, "#") {
+			continue
+		}
+
+		var events []string
+		if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+			for event := range strings.SplitSeq(strings.TrimSpace(value[1:len(value)-1]), ",") {
+				events = append(events, strings.Trim(strings.TrimSpace(event), "'\""))
+			}
+		} else {
+			events = []string{strings.Trim(value, "'\"")}
+		}
+		if len(events) == 0 {
+			continue
+		}
+
+		expanded := []string{onKey}
+		for _, event := range events {
+			if event == "" || strings.ContainsAny(event, " \t{}[]:#") {
+				expanded = nil
+				break
+			}
+			expanded = append(expanded, "  "+event+":")
+		}
+		if expanded != nil {
+			lines = append(lines[:i], append(expanded, lines[i+1:]...)...)
+			return strings.Join(lines, "\n")
+		}
+	}
+	return onSection
+}
+
+func findBareTriggerLine(lines []string, triggerName string) (int, int) {
+	for i, line := range lines {
+		stripped := strings.TrimLeft(line, " \t")
+		rest, found := strings.CutPrefix(stripped, triggerName+":")
+		if !found {
+			continue
+		}
+		rest = strings.TrimSpace(rest)
+		if rest == "" || rest == "null" || rest == "~" {
+			return i, len(line) - len(stripped)
+		}
+	}
+	return -1, 0
+}
+
+func findTriggerInputsLine(lines []string, triggerLineIdx, triggerIndent int) int {
+	for i, line := range lines {
+		if i <= triggerLineIdx {
+			continue
+		}
+		stripped := strings.TrimLeft(line, " \t")
 		if stripped == "" || strings.HasPrefix(stripped, "#") {
 			continue
 		}
-		lineIndent := len(lines[i]) - len(stripped)
-		if lineIndent <= triggerIndent {
-			break // left workflow_dispatch block entirely
+		if len(line)-len(stripped) <= triggerIndent {
+			break
 		}
 		if strings.HasPrefix(stripped, "inputs:") {
-			inputsLineIdx = i
+			return i
 		}
-		break // only inspect the first substantive child key
+		break
+	}
+	return -1
+}
+
+func triggerAlreadyHasInput(lines []string, inputsLineIdx int, inputName string) bool {
+	if inputsLineIdx < 0 || inputsLineIdx >= len(lines) {
+		return false
 	}
 
-	if inputsLineIdx != -1 {
-		inputsIndent := len(lines[inputsLineIdx]) - len(strings.TrimLeft(lines[inputsLineIdx], " \t"))
-		for i := inputsLineIdx + 1; i < len(lines); i++ {
-			stripped := strings.TrimLeft(lines[i], " \t")
-			if stripped == "" || strings.HasPrefix(stripped, "#") {
-				continue
-			}
-			lineIndent := len(lines[i]) - len(stripped)
-			if lineIndent <= inputsIndent {
-				break
-			}
-			if strings.HasPrefix(stripped, inputName+":") {
-				awContextLog.Printf("%s already injected into %s, skipping", inputName, triggerName)
-				return onSection
-			}
+	inputsIndent := -1
+	for i, line := range lines {
+		if i == inputsLineIdx {
+			stripped := strings.TrimLeft(line, " \t")
+			inputsIndent = len(line) - len(stripped)
+			continue
+		}
+		if i <= inputsLineIdx || inputsIndent < 0 {
+			continue
+		}
+		stripped := strings.TrimLeft(line, " \t")
+		if stripped == "" || strings.HasPrefix(stripped, "#") {
+			continue
+		}
+		if len(line)-len(stripped) <= inputsIndent {
+			break
+		}
+		if strings.HasPrefix(stripped, inputName+":") {
+			return true
 		}
 	}
+	return false
+}
 
-	inputLines := buildInputLines(triggerIndent)
-
-	result := make([]string, 0, safeAllocationCapacity(len(lines), len(inputLines), 1))
+func insertTriggerInputLines(lines []string, triggerLineIdx, triggerIndent, inputsLineIdx int, inputLines []string) string {
+	result := make([]string, 0, typeutil.SafeAllocationCapacity(len(lines), len(inputLines), 1))
 	for i, line := range lines {
 		// When the trigger line contains an explicit null/~ value,
 		// replace it with a bare trigger so sub-keys can follow.
 		if i == triggerLineIdx && (strings.HasSuffix(strings.TrimSpace(line), " null") ||
 			strings.HasSuffix(strings.TrimSpace(line), " ~")) {
 			stripped := strings.TrimLeft(line, " \t")
-			line = strings.Repeat(" ", triggerIndent) + strings.SplitN(stripped, ":", 2)[0] + ":"
+			triggerKey, _, _ := strings.Cut(stripped, ":")
+			line = strings.Repeat(" ", triggerIndent) + triggerKey + ":"
 		}
 		result = append(result, line)
 
@@ -150,6 +260,18 @@ func buildAwContextInputLines(wdIndent int) []string {
 		awIndent + AwContextInputName + ":",
 		propIndent + "default: \"\"",
 		propIndent + "description: " + strconv.Quote(awContextInputDescription),
+		propIndent + "required: false",
+		propIndent + "type: string",
+	}
+}
+
+func buildWorkQueueClaimInputLines(wdIndent int) []string {
+	inputIndent := strings.Repeat(" ", wdIndent+4)
+	propIndent := strings.Repeat(" ", wdIndent+6)
+	return []string{
+		inputIndent + WorkQueueClaimInputName + ":",
+		propIndent + `default: ""`,
+		propIndent + `description: "Trusted work queue assignment (Reserved for Agentic Workflows)."`,
 		propIndent + "required: false",
 		propIndent + "type: string",
 	}

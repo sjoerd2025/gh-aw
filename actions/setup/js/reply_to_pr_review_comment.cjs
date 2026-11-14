@@ -7,15 +7,18 @@
 
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
-const { generateFooterWithMessages, getDetectionCautionAlert } = require("./messages_footer.cjs");
+const { getBodyFooterBlocks, getDetectionCautionBlocks } = require("./messages_footer.cjs");
+const { buildGeneratedFooterBlocks } = require("./markdown_body_helpers.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
 const { getPRNumber } = require("./update_context_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
-const { parseBoolTemplatable } = require("./templatable.cjs");
+const { parseBoolTemplatable, parseIntTemplatable } = require("./templatable.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
-const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { resolveDefaultMentions, resolveMentionsForItem } = require("./resolve_mentions_from_payload.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
 
 /**
  * Type constant for handler identification
@@ -44,11 +47,12 @@ async function main(config = {}) {
   const requiredTitlePrefix = config.required_title_prefix || "";
   if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
   if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
-  let allowedMentionAliases = [];
+  const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
+  let defaultMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
-    allowedMentionAliases = config.allowedMentionAliases;
+    defaultMentionAliases = config.allowedMentionAliases;
   } else if (config.mentions != null) {
-    allowedMentionAliases = await resolveAllowedMentionsFromPayload(context, githubClient, core, config.mentions);
+    defaultMentionAliases = await resolveDefaultMentions(context, githubClient, core, config.mentions, defaultTargetRepo);
   }
 
   // Determine the triggering PR number from context
@@ -124,6 +128,7 @@ async function main(config = {}) {
       }
 
       const { owner, repo } = repoResult.repoParts;
+      const allowedMentionAliases = await resolveMentionsForItem(context, githubClient, core, config.mentions, defaultMentionAliases, defaultTargetRepo, repoResult);
 
       // Determine the target PR number
       let targetPRNumber;
@@ -174,17 +179,15 @@ async function main(config = {}) {
       }
 
       // Inject CAUTION at top of body unconditionally if threat detection warning was raised
-      let finalBody = sanitizeContent(body, { allowedAliases: allowedMentionAliases });
-      const detectionCaution = getDetectionCautionAlert(workflowName, runUrl);
-      if (detectionCaution) {
-        finalBody = detectionCaution + "\n\n" + finalBody;
-      }
+      const sanitizedBody = sanitizeContent(body, { allowedAliases: allowedMentionAliases, maxMentions });
+      const children = [...getDetectionCautionBlocks(workflowName, runUrl), ...parseReportMarkdown(sanitizedBody, { minimumHeadingLevel: 2, allowMetadata: true, agentTainted: true, allowedMentions: allowedMentionAliases })];
 
       // Append footer with workflow information when enabled
       if (includeFooter) {
-        const footer = generateFooterWithMessages(workflowName, runUrl, workflowSource, workflowSourceURL, undefined, triggeringPRNumber, undefined, undefined, { skipDetectionCaution: true });
-        finalBody = finalBody.trimEnd() + footer;
+        children.push(...buildGeneratedFooterBlocks({ workflowName, runUrl, workflowSource, workflowSourceURL, triggeringPRNumber }));
       }
+      children.push(...getBodyFooterBlocks(config.body_footer, { workflowName, runUrl }));
+      const finalBody = renderSizedReport({ type: "report", title: "Review reply", children }).body;
 
       core.info(`Replying to review comment ${numericCommentId} on PR #${targetPRNumber} (${owner}/${repo})`);
 

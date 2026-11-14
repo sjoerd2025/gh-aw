@@ -16,7 +16,7 @@ permissions:
   issues: read
   pull-requests: read
 tracker-id: daily-model-resolution
-model: gpt-5.4-mini
+model: gpt-5
 engine:
   id: copilot
   copilot-sdk: true
@@ -37,11 +37,12 @@ imports:
     with:
       toolsets: [default, actions]
   - shared/otlp.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    id: awf
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -166,6 +167,13 @@ confirm whether the mismatch is a misconfiguration or a resolution bug.
 
 After all `run-analyzer` calls complete, build the report:
 
+Use `###` or lower for every report heading. Begin with a concise overview of
+the run and mismatch counts, then summarize key metrics and findings, keep
+decision-relevant conclusions visible, collapse per-run evidence in
+`<details><summary><b>...</b></summary>...</details>`, and end with next actions
+or coverage limitations. Format applicable run references as
+`[§12345](https://github.com/${{ github.repository }}/actions/runs/12345)`.
+
 1. **Runs analyzed**: total downloaded, total with sub-agents, mismatches found.
 2. **Per-workflow table**: workflow name, sub-agent name, declared model alias,
    observed model, classification (✅ correct / ⚠️ mismatch / ❓ unknown).
@@ -174,15 +182,14 @@ After all `run-analyzer` calls complete, build the report:
 4. **Correct resolutions**: brief confirmation that all other sub-agents used the
    right model size.
 
-### Report Formatting
-
-Use `###` or lower for all headings inside the issue body.
-Wrap verbose tables in `<details><summary>…</summary>` blocks.
-
 ### Report Template
 
 ```markdown
 ### 🔬 Sub-Agent Model Resolution Audit — {DATE}
+
+### Summary
+
+{N} runs analyzed; {K} mismatches found. State the key conclusion and any next action or coverage limitation.
 
 **Period**: last 2 days · **Runs analyzed**: {N} · **With sub-agents**: {M}
 
@@ -195,7 +202,7 @@ Wrap verbose tables in `<details><summary>…</summary>` blocks.
 | … | … | `small` | `claude-sonnet-4-5` | ⚠️ size mismatch |
 
 <details>
-<summary>Mismatch details</summary>
+<summary><b>Mismatch details</b></summary>
 
 For each mismatch: run link, agent-stdio.log snippet showing the dispatch,
 token-usage.jsonl model observed, and note on whether the workflow source
@@ -231,7 +238,7 @@ You **MUST** call one safe-output tool before finishing:
 ## agent: `run-analyzer`
 ---
 description: Parses a single run directory to extract sub-agent dispatch requests and actual models from api-proxy logs, then classifies model size correctness.
-model: gpt-5.4-mini
+model: mini
 ---
 You are a model-resolution analysis sub-agent.
 

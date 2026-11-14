@@ -10,9 +10,11 @@ import (
 )
 
 func TestSafeOutputMergePRConstraintsCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getSafeOutputMergePRConstraintsCodemod()
 
 	t.Run("renames allowed-labels to required-labels, leaves allowed-branches unchanged", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 safe-outputs:
   merge-pull-request:
@@ -39,6 +41,7 @@ safe-outputs:
 	})
 
 	t.Run("no-op when only allowed-branches present (no allowed-labels to migrate)", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 safe-outputs:
   merge-pull-request:
@@ -60,6 +63,7 @@ safe-outputs:
 	})
 
 	t.Run("does not modify when new fields already present", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 safe-outputs:
   merge-pull-request:
@@ -83,6 +87,7 @@ safe-outputs:
 	})
 
 	t.Run("does not affect other safe-outputs handlers", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 safe-outputs:
   close-issue:
@@ -112,6 +117,7 @@ safe-outputs:
 	})
 
 	t.Run("no-op when safe-outputs missing", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 engine: copilot
 ---

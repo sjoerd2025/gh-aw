@@ -39,6 +39,8 @@ type WorkflowSpec struct {
 	// FromRepositoryManifest is true when this workflow was selected from an aw.yml
 	// repository package manifest (root or nested package path).
 	FromRepositoryManifest bool
+	// VersionInferred distinguishes package defaults from explicitly requested refs.
+	VersionInferred bool
 	// RawURL is set only for generic HTTP(S) URL specs whose host is not a recognized
 	// GitHub host.  When non-empty, WorkflowPath, RepoSlug, Version, and Host are all
 	// empty; the spec is resolved by fetching the URL and dispatching on Content-Type.
@@ -50,6 +52,14 @@ type WorkflowSpec struct {
 	// IsPackageAgentFile is true when this spec refers to an agent .md file from an aw.yml
 	// package manifest. The file is installed as-is to the agentic engine agents folder.
 	IsPackageAgentFile bool
+	// IsPackageResourceFile is true when this spec refers to a declarative repository
+	// resource from an aw.yml package manifest. The file is installed as-is to DestinationPath.
+	IsPackageResourceFile bool
+	// DestinationPath is the repository-root-relative install path resolved from a package
+	// manifest entry (e.g. ".github/workflows/reviewer.md"). WorkflowName is derived from
+	// it, so installation writes the file under the declared destination name.
+	// Empty for specs that do not originate from a package manifest entry.
+	DestinationPath string
 	// SkillName is the name of the skill directory for package skill files.
 	// Only meaningful when IsPackageSkillFile is true.
 	SkillName string
@@ -127,7 +137,7 @@ func parseRepoSpec(repoSpec string) (*RepoSpec, error) {
 		repoURL, err := url.Parse(repo)
 		if err != nil {
 			specLog.Printf("Failed to parse GitHub URL: %v", err)
-			return nil, fmt.Errorf("invalid GitHub URL: %w", err)
+			return nil, fmt.Errorf("could not parse GitHub URL %q (use a URL like https://github.com/owner/repo): %w", repo, err)
 		}
 
 		// Extract owner/repo from path
@@ -145,7 +155,7 @@ func parseRepoSpec(repoSpec string) (*RepoSpec, error) {
 		currentRepo, err := GetCurrentRepoSlug()
 		if err != nil {
 			specLog.Printf("Failed to get current repo: %v", err)
-			return nil, fmt.Errorf("failed to get current repository info: %w", err)
+			return nil, fmt.Errorf("failed to get current repository info (run this command from inside a git repository with a GitHub remote, or specify 'owner/repo' explicitly): %w", err)
 		}
 		repo = currentRepo
 		specLog.Printf("Resolved current repo: %s", repo)
@@ -181,15 +191,15 @@ func parseGitHubURL(spec string) (*WorkflowSpec, error) {
 	parsedURL, err := url.Parse(spec)
 	if err != nil {
 		specLog.Printf("Failed to parse URL: %v", err)
-		return nil, fmt.Errorf("invalid URL: %w", err)
+		return nil, fmt.Errorf("could not parse URL %q (use a URL like https://github.com/owner/repo/blob/main/workflows/workflow.md): %w", spec, err)
 	}
 
 	if parsedURL.Host == "" {
-		return nil, fmt.Errorf("URL must include a host: %s", spec)
+		return nil, fmt.Errorf("URL %q is missing a host. Use a full URL. Example: https://github.com/owner/repo/blob/main/workflows/workflow.md", spec)
 	}
 
 	if !isGitHubHost(parsedURL.Host) {
-		return nil, fmt.Errorf("URL must be from github.com or a GitHub Enterprise host (*.ghe.com), got %q", parsedURL.Host)
+		return nil, fmt.Errorf("URL host %q is not supported. Expected github.com or a GitHub Enterprise host (*.ghe.com). Example: https://github.com/owner/repo/blob/main/workflows/workflow.md", parsedURL.Host)
 	}
 
 	owner, repo, ref, filePath, err := parser.ParseRepoFileURL(spec)
@@ -202,12 +212,12 @@ func parseGitHubURL(spec string) (*WorkflowSpec, error) {
 
 	// Ensure the file path ends with .md
 	if !strings.HasSuffix(filePath, ".md") {
-		return nil, errors.New("GitHub URL must point to a .md file")
+		return nil, errors.New("GitHub URL must point to a .md file. Example: https://github.com/owner/repo/blob/main/workflows/workflow.md")
 	}
 
 	// Validate owner and repo
 	if !parser.IsValidGitHubIdentifier(owner) || !parser.IsValidGitHubRepositoryName(repo) {
-		return nil, fmt.Errorf("invalid GitHub URL: '%s/%s' does not look like a valid GitHub repository", owner, repo)
+		return nil, fmt.Errorf("GitHub URL contains '%s/%s', which does not look like a valid GitHub repository. Expected owner and repository names with only letters, numbers, hyphens, and underscores", owner, repo)
 	}
 
 	// For raw.githubusercontent.com content, the API host is github.com.
@@ -294,10 +304,10 @@ func parseWorkflowSpec(spec string) (*WorkflowSpec, error) {
 		// Non-GitHub HTTP(S) URL: return a generic URL spec whose content will be
 		// fetched at resolution time and dispatched on Content-Type.
 		if urlErr != nil {
-			return nil, fmt.Errorf("invalid URL %q: %w", spec, urlErr)
+			return nil, fmt.Errorf("could not parse URL %q (use a fully qualified http(s) URL): %w", spec, urlErr)
 		}
 		if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-			return nil, fmt.Errorf("unsupported URL scheme %q: only http and https are supported", parsedURL.Scheme)
+			return nil, fmt.Errorf("URL scheme %q is not supported. Only http and https are supported. Example: https://example.com/workflow.md", parsedURL.Scheme)
 		}
 		specLog.Printf("Detected generic import URL: %s", spec)
 		return &WorkflowSpec{
@@ -341,7 +351,7 @@ func parseWorkflowSpec(spec string) (*WorkflowSpec, error) {
 
 	// Must have at least 3 parts: owner/repo/workflow-path
 	if len(slashParts) < 3 {
-		return nil, errors.New("workflow specification must be in format 'owner/repo/workflow-name[@version]'")
+		return nil, errors.New("workflow specification format is not recognized. Expected 'owner/repo/workflow-name[@version]'. Example: github/gh-aw/ci-doctor")
 	}
 
 	owner := slashParts[0]
@@ -367,12 +377,12 @@ func parseWorkflowSpec(spec string) (*WorkflowSpec, error) {
 
 	// Validate owner and repo parts are not empty
 	if owner == "" || repo == "" {
-		return nil, errors.New("invalid workflow specification: owner and repo cannot be empty")
+		return nil, errors.New("workflow specification is missing owner or repo. Expected 'owner/repo/workflow-name[@version]'. Example: github/gh-aw/ci-doctor")
 	}
 
 	// Basic validation that owner and repo look like GitHub identifiers
 	if !parser.IsValidGitHubIdentifier(owner) || !parser.IsValidGitHubRepositoryName(repo) {
-		return nil, fmt.Errorf("invalid workflow specification: '%s/%s' does not look like a valid GitHub repository", owner, repo)
+		return nil, fmt.Errorf("workflow specification contains '%s/%s', which does not look like a valid GitHub repository. Expected owner and repository names with only letters, numbers, hyphens, and underscores", owner, repo)
 	}
 
 	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
@@ -407,7 +417,7 @@ func parseWorkflowSpec(spec string) (*WorkflowSpec, error) {
 		// Four or more parts: owner/repo/workflows/workflow-name or owner/repo/path/to/workflow-name
 		// Require .md extension to be explicit
 		if !strings.HasSuffix(workflowPath, ".md") {
-			return nil, fmt.Errorf("workflow specification with path must end with '.md' extension: %s", workflowPath)
+			return nil, fmt.Errorf("workflow specification path %q must end with '.md' extension. Example: owner/repo/workflows/ci-doctor.md", workflowPath)
 		}
 	}
 
@@ -428,7 +438,7 @@ func parseLocalWorkflowSpec(spec string) (*WorkflowSpec, error) {
 	// Validate that it's a .md file
 	if !strings.HasSuffix(spec, ".md") {
 		specLog.Printf("Invalid extension for local workflow: %s", spec)
-		return nil, fmt.Errorf("local workflow specification must end with '.md' extension: %s", spec)
+		return nil, fmt.Errorf("local workflow specification %q must end with '.md' extension. Example: ./workflows/ci-doctor.md", spec)
 	}
 
 	specLog.Printf("Parsed local workflow: path=%s", spec)
@@ -470,18 +480,19 @@ func parseSourceSpec(source string) (*SourceSpec, error) {
 	return spec, nil
 }
 
-// buildSourceStringWithCommitSHA builds the source string with the actual commit SHA
-// This is used when adding workflows to include the precise commit that was installed
+// buildSourceStringWithCommitSHA preserves the requested ref for future updates,
+// falling back to the resolved commit SHA when no ref was specified.
 func buildSourceStringWithCommitSHA(workflow *WorkflowSpec, commitSHA string) string {
 	if workflow.RepoSlug == "" || workflow.WorkflowPath == "" {
 		return ""
 	}
 
+	ref := workflow.Version
+	if ref == "" || workflow.VersionInferred {
+		ref = commitSHA
+	}
+
 	if workflow.FromRepositoryManifest {
-		ref := workflow.Version
-		if commitSHA != "" {
-			ref = commitSHA
-		}
 		if ref == "" {
 			return repositoryPackageIdentifier(workflow.RepoSlug, workflow.PackagePath)
 		}
@@ -491,13 +502,10 @@ func buildSourceStringWithCommitSHA(workflow *WorkflowSpec, commitSHA string) st
 	// For local workflows, remove the "./" prefix from the WorkflowPath
 	workflowPath := strings.TrimPrefix(workflow.WorkflowPath, "./")
 
-	// Format: owner/repo/path@commitSHA
+	// Format: owner/repo/path@ref
 	source := workflow.RepoSlug + "/" + workflowPath
-	if commitSHA != "" {
-		source += "@" + commitSHA
-	} else if workflow.Version != "" {
-		// Fallback to the version if no commit SHA is available
-		source += "@" + workflow.Version
+	if ref != "" {
+		source += "@" + ref
 	}
 
 	return source

@@ -20,10 +20,13 @@ For workflows that **persist state across runs** — deduplication, incremental 
 | Track a numeric metric and compare current vs. baseline (runs at least every 7 days) | `cache-memory` ✅ first choice |
 | Long-lived knowledge base visible in PRs and code reviews | `repo-memory` |
 | Baselines that must survive cache expiry (e.g. security findings, dedup lists) | `repo-memory` |
+| Bounded append-only structured event history and built-in current-state projections | `tools.ledger` — see [ledger.md](ledger.md) |
+| Reusable lessons need semantic consolidation beyond deterministic cleanup | [Scheduled dreaming](#scheduled-dreaming) only when cheaper options cannot meet the need |
 | Human-readable wiki pages for knowledge accumulation | `repo-memory` with `wiki: true` |
 | Persist notes/state inline on the triggering issue or PR | `comment-memory` |
+| Private-preview GitHub Drives backend (enrolled repos only) | `drive-memory` — see [drive-memory.md](drive-memory.md) |
 
-**Default to `cache-memory` unless you have a specific reason to use `repo-memory`.**
+**Default to `cache-memory` unless you have a specific reason to use `repo-memory`.** Do not suggest `drive-memory` unless the repository is confirmed enrolled in the GitHub Drives private preview.
 
 ---
 
@@ -92,6 +95,33 @@ tools:
       retention-days: 14
 ```
 
+### Custom validation
+
+Declare required per-file JSON and JSONL schemas with `validation.json-schemas`; this runs without a custom script for cache-memory, repo-memory, and drive-memory:
+
+```yaml
+tools:
+  cache-memory:
+    validation:
+      json-schemas:
+        - file: state.json
+          schema:
+            type: object
+            required: [version, items]
+            additionalProperties: false
+            properties:
+              version: { enum: [1] }
+              items:
+                type: array
+                items: { type: string }
+      timeout-minutes: 1
+      script: |
+        if (memoryKind !== "cache") throw new Error("unexpected memory kind");
+```
+
+Each declaration has an inline schema object and may have a relative `file` path or glob (using `*` within a path segment and `**` across segments). When `file` is omitted, the schema applies to every eligible `.json` and `.jsonl` file in the memory directory, excluding `.git`; the format is inferred for each file and `format` must also be omitted. Otherwise, the format is inferred from each matched file's `.json` or `.jsonl` extension (case-insensitive); optional `format: json` or `format: jsonl` overrides inference and is required for other extensions. A path must match configured file filters and exist; a glob must match at least one file, and every match is validated. JSON is one non-empty document; JSONL validates records individually, accepts LF/CRLF and an optional final newline, allows an existing empty file, and rejects blank lines or malformed records with physical line numbers. Schemas validate without coercion or rewriting and run after filtering/normalization, before an optional `validation.script`; schema and script failures both reject persistence.
+
+Supported schema keywords are `type` (including arrays of types and `null`), primitive `enum`, `required`, nested `properties`, `additionalProperties: false`, object-schema `items`, and standalone `oneOf`/`anyOf`, up to 32 levels. Numeric enum integers must be exactly representable by JavaScript, and values checked against numeric enums must not lose precision during JSON parsing. This is not full JSON Schema: `$ref`, `const`, `format`, patterns, bounds, `uniqueItems`, and other unsupported keywords are rejected. Use the optional Node.js script (globals: `fs`, `path`, `memoryRoot`, `memoryId`, `memoryKind`) for cross-file uniqueness, timestamps, positive-ID checks, and other domain rules. Its timeout defaults to 1 minute (`validation.timeout-minutes`, max 5). See [cache-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/cache-memory.md#custom-validation), [repo-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/reference/repo-memory.md#custom-validation), and [drive-memory reference](https://github.com/github/gh-aw/blob/main/docs/src/content/docs/experimental/drive-memory.md#validation).
 ### Storage path
 
 - Single cache: `/tmp/gh-aw/cache-memory/`
@@ -99,7 +129,7 @@ tools:
 
 ### Branch scoping
 
-Caches are **branch-scoped** with default-branch fallback restore. A feature branch's first restore comes from `main`; subsequent saves fork a branch-local lineage. For warmed-state workflows, schedule on the default branch to reuse one lineage instead of fragmenting state.
+Caches are **branch-scoped** with default-branch fallback restore. A feature branch's first restore can come from the default branch; subsequent saves fork a branch-local lineage. Caches saved on a PR merge ref cannot be restored by a default-branch scheduled workflow. Default-branch fallback does not publish PR-local updates back to that branch. For warmed-state workflows, schedule on the default branch to reuse one lineage instead of fragmenting state.
 
 ### Deduplication example (scheduled workflow)
 
@@ -166,7 +196,7 @@ When instructing the agent for timestamped files, say: "Use `YYYY-MM-DD-HH-MM-SS
 
 ## `repo-memory` — Long-lived Repository Knowledge
 
-Uses a dedicated Git branch (default: `memory/agent-notes`) to store files that persist indefinitely until explicitly deleted. The directory lives at `/tmp/gh-aw/repo-memory/`.
+Uses a dedicated Git branch (default: `memory/agent-notes`) to store long-lived files. Omission or local deletion during a workflow does not delete backing-branch files. The directory lives at `/tmp/gh-aw/repo-memory/`.
 
 ### When to use
 
@@ -190,15 +220,88 @@ tools:
 
 Compiler creates a separate `push_repo_memory` job with `contents: write`; main agent job stays read-only.
 
+To push to ruleset-protected memory branches, add `github-app: {client-id, private-key}` (app needs **Contents: read and write**). Use `github-app-read` / `github-app-write` to split read and write apps; only the write app needs the ruleset bypass. Without an app, `github.token` is used.
+
+### Structured event history: standalone ledger
+
+For immutable, structured events where each run appends records and later runs
+query them by a stable key, use `tools.ledger` instead — configured
+independently of repo-memory. See [ledger.md](ledger.md) for configuration,
+state-model types, limits, and compaction.
+
 ### Tradeoffs
 
 | ✅ Pros | ❌ Cons |
 |---|---|
 | Persists indefinitely (no expiry) | Produces Git commits — repository noise |
 | Auditable: Git history shows every change | Slower: requires Git clone + push |
-| Survives cache invalidation | Not available for Copilot engine (requires GitHub tools) |
+| Survives cache invalidation | Shared-file writers need explicit ownership |
 | Human-readable via GitHub branch UI | More complex setup |
 | Can target a different repository | |
+
+---
+
+## Scheduled dreaming
+
+Dreaming is a separate, scheduled workflow that turns accumulated observations
+into a small, evidence-backed knowledge view for later runs. It is not a new
+frontmatter field, ledger compaction, or permission to rewrite task state.
+Use existing `tools.repo-memory` and, when immutable lessons and corrections
+are useful, `tools.ledger` with `type: notes`.
+
+Use the cheapest sufficient option, in this order:
+
+| Need | First choice |
+|---|---|
+| Exact-key deduplication, sorting, hash-based invalidation, retention of disposable state, rebuilding an index | Deterministic cleanup in the existing workflow; no model invocation |
+| Meaning-based reconciliation or synthesis that fits an existing run's budget | Bounded review by the already-running agent; no additional workflow |
+| Recurring semantic consolidation that the cheaper options cannot cover economically | A separate dreamer, only with primary evidence, a consumer, and a credible benefit |
+
+Deterministic cleanup is preferable whenever the rules reliably express the
+operation. Invalidating a changed citation by hash does not verify the new
+assertion's meaning. Never prune canonical ledger evidence or producer task
+state under the guise of retention; clean disposable state and derived views.
+Keep semantic review by the already-running producer within its budget and
+ownership; do not use it to rewrite another workflow's files.
+
+Inspect the producer workflow and its actual memory format first. Repeated
+investigations, tested strategies, environment gotchas, and recurring explicit
+corrections are good inputs. A deduplication list, backlog cursor, numeric
+baseline, one-off task, or raw transcript alone does not justify dreaming.
+Preserve successful techniques as well as failures; distinguish observed
+outcomes from hypotheses.
+
+Recommend dreaming only when a later consumer will reuse the knowledge and
+the expected reduction in repeated reasoning or stale advice justifies the
+extra workflow, model invocation, and maintenance after cheaper options are
+ruled out. Compare total cost, not just reduced online tokens; do not invent
+savings. If the benefit is uncertain, do not add the dreamer.
+Identify the observed problem, primary evidence source, later consumer, and
+why an additional workflow is worth its total cost. Keep this a quick design
+decision, not a separate investigation; defer the dreamer when these are unknown.
+A recurring schedule or a growing note count
+alone is not enough. Prefer direct recall and producer-owned corrections when
+the existing view is already small, current, and cheap to use.
+
+For `cache-memory`, scheduled and manual dreamer runs must use the repository's
+actual default branch, not a hard-coded `main`. Scheduled dreaming is eligible
+for default-branch history only, not PR-local caches. A PR merge-ref run may
+restore an eligible default-branch cache, but its updates do not flow back to the
+default branch. Keep PR-local cleanup inside the PR workflow.
+
+Separate workflows do not automatically share cache-memory: default keys are
+workflow-scoped. Verify compatible restore/save key prefixes, cache versions and
+paths, schema, and integrity/access policy. `scope: repo` broadens eligible
+restore keys, not GitHub's branch visibility; a shared key does not remove PR
+isolation. Cache eviction remains possible, so define a rebuildable cold start.
+If knowledge must outlive or cross PR boundaries, require explicitly authorized,
+evidence-validated publication to durable repo-memory or a ledger. Do not silently
+export PR content into shared memory to bypass cache isolation.
+
+Once the need, cost, and input scope justify a separate dreamer, load
+[dreaming.md](dreaming.md) for configuration, ownership, bounded consolidation,
+publication, consumer recall, and examples. Do not load implementation details
+merely because a workflow uses memory.
 
 ---
 
@@ -288,7 +391,12 @@ Multiple memory IDs in one comment are supported; each maps to a separate `*.md`
 
 ## Stateful Scanning Pattern (repo-memory)
 
-Persist a baseline JSON file between runs to alert only on *new* findings — vulnerability scans, dependency audits, licence checks. Unlike `cache-memory`, the baseline survives cache expiry, so a missed cycle won't flood the repo with duplicate issues. Store only stable identifiers (advisory IDs), cap output with `max:`, treat missing baseline as `[]`. Requires Claude or custom engine — not Copilot.
+Persist a baseline JSON file between runs to alert only on *new* findings — vulnerability scans, dependency audits, licence checks. Unlike `cache-memory`, the baseline survives cache expiry, so a missed cycle won't flood the repo with duplicate issues. Store only stable identifiers (advisory IDs), cap output with `max:`, treat missing baseline as `[]`.
+
+Keep this as a replaceable repo-memory snapshot by default. Use the
+ledger only when the audit needs an append-only record of each scan or finding
+and its expected writer count fits the default 1024-shard limit; it does not replace,
+prune, or compact an existing baseline.
 
 > **Worked example** (nightly npm vulnerability scan, with key design decisions): [memory-stateful-patterns.md](memory-stateful-patterns.md#stateful-scanning-repo-memory).
 

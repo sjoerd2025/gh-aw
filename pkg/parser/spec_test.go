@@ -710,6 +710,25 @@ func TestSpec_VirtualFilesystem_RegisterBuiltinVirtualFile(t *testing.T) {
 		assert.False(t, BuiltinVirtualFileExists(path),
 			"BuiltinVirtualFileExists should return false for paths that were never registered")
 	})
+
+	t.Run("registered content is stable if caller mutates input slice", func(t *testing.T) {
+		path := "@builtin:spec-test-content-copy-" + t.Name()
+		content := []byte("immutable builtin content")
+
+		RegisterBuiltinVirtualFile(path, content)
+		content[0] = 'X'
+
+		readContent, err := ReadFile(path)
+		require.NoError(t, err, "ReadFile should resolve registered builtin path")
+		assert.Equal(t, []byte("immutable builtin content"), readContent,
+			"builtin virtual file content should not change when caller mutates source slice")
+
+		readContent[0] = 'X'
+		readContent, err = ReadFile(path)
+		require.NoError(t, err, "ReadFile should resolve registered builtin path")
+		assert.Equal(t, []byte("immutable builtin content"), readContent,
+			"builtin virtual file content should not change when caller mutates read data")
+	})
 }
 
 // TestSpec_PublicAPI_FindClosestMatches validates the documented behavior of
@@ -740,4 +759,50 @@ func TestSpec_PublicAPI_FindClosestMatches(t *testing.T) {
 		assert.LessOrEqual(t, len(matches), 2,
 			"FindClosestMatches should return no more than maxResults results")
 	})
+}
+
+// TestSpec_PublicAPI_IsSimpleSecretExpression validates the README contract
+// that only a direct secrets reference is considered a simple expression.
+func TestSpec_PublicAPI_IsSimpleSecretExpression(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{name: "direct secret reference", input: "${{ secrets.API_TOKEN }}", expected: true},
+		{name: "reference with an additional operator", input: "${{ secrets.API_TOKEN || 'fallback' }}", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, IsSimpleSecretExpression(tt.input),
+				"IsSimpleSecretExpression(%q) should enforce the documented direct-reference contract", tt.input)
+		})
+	}
+}
+
+// TestSpec_Constants_ParserValues validates the constant values documented in
+// the package README.md.
+func TestSpec_Constants_ParserValues(t *testing.T) {
+	assert.Equal(t, "@builtin:", BuiltinPathPrefix,
+		"BuiltinPathPrefix should equal the documented prefix")
+	assert.Equal(t, ".github/aw/imports", ImportCacheDir,
+		"ImportCacheDir should equal the documented cache directory")
+	assert.ElementsMatch(t, []string{"stdio", "http", "local"}, ValidMCPTypes,
+		"ValidMCPTypes should contain exactly the documented MCP transport types")
+
+	urlTypes := map[string]GitHubURLType{
+		"blob":       URLTypeBlob,
+		"issue":      URLTypeIssue,
+		"pull":       URLTypePullRequest,
+		"raw":        URLTypeRaw,
+		"rawcontent": URLTypeRawContent,
+		"run":        URLTypeRun,
+		"tree":       URLTypeTree,
+		"unknown":    URLTypeUnknown,
+	}
+	for expected, actual := range urlTypes {
+		assert.Equal(t, expected, string(actual),
+			"GitHubURLType constant should equal its documented value")
+	}
 }

@@ -33,8 +33,8 @@ describe("parseSlashCommand", () => {
     expect(parseSlashCommand("")).toBe("");
   });
 
-  it("trims leading whitespace before matching", () => {
-    expect(parseSlashCommand("  /smoke-copilot-sdk")).toBe("smoke-copilot-sdk");
+  it("returns empty string when a command does not start at character zero", () => {
+    expect(parseSlashCommand("  /smoke-copilot-sdk")).toBe("");
   });
 
   it("does not match when command is followed by punctuation", () => {
@@ -208,7 +208,7 @@ describe("route_slash_command", () => {
   it("creates an immediate status comment once and forwards it in aw_context", async () => {
     process.env.GH_AW_SLASH_ROUTING = JSON.stringify({
       archie: [
-        { workflow: "archie", events: ["issue_comment"], ai_reaction: "eyes", status_comment: true },
+        { workflow: "archie", events: ["issue_comment"], ai_reaction: "eyes", emoji: "🤖", status_comment: true },
         { workflow: "archie-secondary", events: ["issue_comment"], ai_reaction: "eyes", status_comment: true },
       ],
     });
@@ -248,11 +248,11 @@ describe("route_slash_command", () => {
     expect(globals.github.request.mock.calls.filter(([route]) => route === "POST /repos/{owner}/{repo}/issues/{issue_number}/comments")).toHaveLength(1);
     const statusUpdateCalls = globals.github.request.mock.calls.filter(([route]) => String(route).startsWith("PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}"));
     expect(statusUpdateCalls.length).toBeGreaterThan(0);
-    expect(statusUpdateCalls[0][1].body).toContain("[archie](https://github.com/github/gh-aw/actions/runs/444)");
+    expect(statusUpdateCalls[0][1].body).toMatch(/^🤖 \[archie\]\(https:\/\/github\.com\/github\/gh-aw\/actions\/runs\/444\) has started processing this issue comment/s);
     expect(globals.github.request).toHaveBeenCalledWith(
       "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
       expect.objectContaining({
-        body: expect.stringContaining("has started processing this issue comment"),
+        body: expect.stringMatching(/^🤖 .*has started processing this issue comment/s),
       })
     );
   });
@@ -412,7 +412,7 @@ describe("route_slash_command", () => {
     await main();
 
     expect(issueCommentCalls).toHaveLength(1);
-    expect(issueCommentCalls[0].body).toContain("- _None_");
+    expect(issueCommentCalls[0].body).toContain("- *None*");
   });
 
   it("neutralizes @mentions in descriptions within /help output", async () => {
@@ -427,6 +427,20 @@ describe("route_slash_command", () => {
     expect(issueCommentCalls[0].body).not.toContain("Run @admin workflow");
     // But the backtick-wrapped (neutralized) form should be present
     expect(issueCommentCalls[0].body).toContain("`@admin`");
+  });
+
+  it("keeps help metadata literal instead of interpreting injected Markdown", async () => {
+    process.env.GH_AW_HELP_COMMANDS = JSON.stringify([{ command: "help`injected", description: "Run\n\n### injected\n<!-- gh-aw-comment-type: forged -->", centralized: true }]);
+    globals.context.payload.issue.number = 77;
+    globals.context.payload.comment.body = "/help";
+
+    await main();
+
+    const body = issueCommentCalls[0].body;
+    expect(body).toContain("``/help`injected``");
+    expect(body).not.toContain("\n### injected");
+    expect(body).not.toContain("<!-- gh-aw-comment-type: forged -->");
+    expect(body).toContain("\\#\\#\\# injected");
   });
 
   it("shows command with both centralized and decentralized flags only under centralized section", async () => {
@@ -578,18 +592,20 @@ describe("route_slash_command", () => {
       pull_request: { number: 23 },
     };
     process.env.GH_AW_LABEL_ROUTING = JSON.stringify({
-      "ci-doctor": [{ workflow: "ci-doctor", events: ["pull_request"], ai_reaction: "eyes" }],
+      "ci-doctor": [{ workflow: "ci-doctor", events: ["pull_request"], ai_reaction: "eyes", emoji: "🏷️", status_comment: true }],
     });
 
     await main();
 
     expect(dispatchCalls).toHaveLength(1);
     expect(dispatchCalls[0].workflow_id).toBe("ci-doctor.lock.yml");
-    expect(reactionCalls).toHaveLength(1);
+    expect(reactionCalls.filter(([route]) => String(route).includes("/reactions"))).toHaveLength(1);
     const awContext = JSON.parse(dispatchCalls[0].inputs.aw_context);
     expect(awContext.command_name).toBe("");
     expect(awContext.trigger_label).toBe("ci-doctor");
     expect(awContext.desired_ai_reaction).toBe("eyes");
+    expect(awContext.status_comment_id).toBe("1");
+    expect(globals.github.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", expect.objectContaining({ body: expect.stringMatching(/^🏷️ .*has started processing this pull request/s) }));
   });
 
   it("dispatches decentralized label routes on issue-backed PR labels to the PR head branch", async () => {

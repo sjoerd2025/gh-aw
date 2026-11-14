@@ -2,8 +2,10 @@
 /// <reference types="@actions/github-script" />
 
 const { sanitizeContent } = require("./sanitize_content.cjs");
-const { closeOlderEntities, MAX_CLOSE_COUNT: SHARED_MAX_CLOSE_COUNT } = require("./close_older_entities.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
+const { MAX_CLOSE_COUNT: SHARED_MAX_CLOSE_COUNT } = require("./close_older_entities.cjs");
 const { searchOlderEntitiesByMarker } = require("./close_older_search_helpers.cjs");
+const { createCloseOlderSearchAdapter, closeOlderWithDescriptor } = require("./close_older_handler_factory.cjs");
 
 /**
  * Maximum number of older issues to close
@@ -135,13 +137,34 @@ async function closeIssueAsNotPlanned(github, owner, repo, issueNumber) {
  * @returns {string} Closing message
  */
 function getCloseOlderIssueMessage({ newIssueUrl, newIssueNumber, workflowName, runUrl }) {
-  return `This issue is being closed as outdated. A newer issue has been created: #${newIssueNumber}
-
-[View newer issue](${newIssueUrl})
-
----
-
-*This action was performed automatically by the [\`${workflowName}\`](${runUrl}) workflow.*`;
+  return renderSizedReport({
+    type: "report",
+    title: "Outdated issue",
+    children: [
+      {
+        type: "paragraph",
+        children: [
+          { type: "text", value: "This issue is being closed as outdated. A newer issue has been created: ", agentTainted: false },
+          { type: "issue_reference", number: String(newIssueNumber), agentTainted: false },
+        ],
+      },
+      { type: "paragraph", children: [{ type: "link", url: newIssueUrl, children: [{ type: "text", value: "View newer issue", agentTainted: false }] }] },
+      { type: "separator" },
+      {
+        type: "paragraph",
+        children: [
+          {
+            type: "emphasis",
+            children: [
+              { type: "text", value: "This action was performed automatically by the ", agentTainted: false },
+              { type: "link", url: runUrl, children: [{ type: "code", value: workflowName, agentTainted: false }] },
+              { type: "text", value: " workflow.", agentTainted: false },
+            ],
+          },
+        ],
+      },
+    ],
+  }).body;
 }
 
 /**
@@ -161,13 +184,17 @@ function getCloseOlderIssueMessage({ newIssueUrl, newIssueNumber, workflowName, 
  * @returns {Promise<Array<{number: number, html_url: string}>>} List of closed issues
  */
 async function closeOlderIssues(github, owner, repo, workflowId, newIssue, workflowName, runUrl, callerWorkflowId, closeOlderKey, currentRunIssueNumbers) {
-  const result = await closeOlderEntities(github, owner, repo, workflowId, newIssue, workflowName, runUrl, {
+  return closeOlderWithDescriptor({
+    github,
+    owner,
+    repo,
+    workflowId,
+    newEntity: newIssue,
+    workflowName,
+    runUrl,
     entityType: "issue",
     entityTypePlural: "issues",
-    // Use a closure so callerWorkflowId, closeOlderKey, and currentRunIssueNumbers are
-    // forwarded to searchOlderIssues without going through the closeOlderEntities
-    // extraArgs mechanism (which appends excludeNumber last)
-    searchOlderEntities: (gh, o, r, wid, excludeNumber) => searchOlderIssues(gh, o, r, wid, excludeNumber, callerWorkflowId, closeOlderKey, currentRunIssueNumbers),
+    searchOlderEntities: createCloseOlderSearchAdapter(searchOlderIssues, [], [callerWorkflowId, closeOlderKey, currentRunIssueNumbers]),
     getCloseMessage: params =>
       getCloseOlderIssueMessage({
         newIssueUrl: params.newEntityUrl,
@@ -180,13 +207,11 @@ async function closeOlderIssues(github, owner, repo, workflowId, newIssue, workf
     delayMs: API_DELAY_MS,
     getEntityId: entity => entity.number,
     getEntityUrl: entity => entity.html_url,
+    mapClosedEntity: item => ({
+      number: item.number,
+      html_url: item.html_url || "",
+    }),
   });
-
-  // Map to issue-specific return type
-  return result.map(item => ({
-    number: item.number,
-    html_url: item.html_url || "",
-  }));
 }
 
 module.exports = {

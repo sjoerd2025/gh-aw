@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/ctxutil"
+	"github.com/github/gh-aw/pkg/errorutil"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
@@ -28,14 +31,25 @@ func downloadWorkflowContentViaGit(ctx context.Context, repo, path, ref string, 
 
 	downloadLog.Printf("Attempting git fallback for downloading workflow content: %s/%s@%s", repo, path, ref)
 
+	if err := gitutil.ValidateGitRef(ref); err != nil {
+		return nil, fmt.Errorf("refusing git fallback: %w", err)
+	}
+	if err := gitutil.ValidateGitPath(path); err != nil {
+		return nil, fmt.Errorf("refusing git fallback: %w", err)
+	}
+
 	// Use git archive to get the file content without cloning
 	githubHost := getGitHubHostForRepo(repo)
 	repoURL := fmt.Sprintf("%s/%s.git", githubHost, repo)
 
-	// git archive command: git archive --remote=<repo> <ref> <path>
+	// git archive command: git archive --remote=<repo> <ref> -- <path>
+	// The '--' end-of-options separator ensures path is never parsed as a git flag
+	// even if it begins with '-' (argument injection, CWE-88).
+	// ValidateGitRef/ValidateGitPath above guard against leading '-' and '..' at
+	// this layer; '--' is kept as defence-in-depth per the git(1) specification.
 	// #nosec G204 -- repoURL, ref, and path are from workflow import configuration authored by the
 	// developer; exec.CommandContext with separate args (not shell execution) prevents shell injection.
-	cmd := exec.CommandContext(ctx, "git", "archive", "--remote="+repoURL, ref, path)
+	cmd := exec.CommandContext(ctx, "git", "archive", "--remote="+repoURL, ref, "--", path)
 	archiveOutput, err := cmd.Output()
 	if err != nil {
 		downloadLog.Printf("git archive failed, falling back to git clone: repo=%s, ref=%s, err=%v", repo, ref, err)
@@ -118,7 +132,7 @@ func downloadWorkflowContentViaGitClone(ctx context.Context, repo, path, ref str
 	}
 
 	// Check if ref is a SHA (40 hex characters)
-	isSHA := len(ref) == 40 && gitutil.IsHexString(ref)
+	isSHA := gitutil.IsValidFullSHACaseInsensitive(ref)
 	downloadLog.Printf("Fetching ref via sparse checkout: is_sha=%t", isSHA)
 
 	if isSHA {
@@ -181,15 +195,36 @@ func downloadWorkflowContent(ctx context.Context, repo, path, ref string, verbos
 		fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("Fetching %s/%s@%s", repo, path, ref)))
 	}
 
-	// Use gh CLI to download the file
-	output, err := workflow.RunGHCombinedContext(ctx, "Downloading workflow...", "api", fmt.Sprintf("/repos/%s/contents/%s?ref=%s", repo, path, ref), "--jq", ".content")
+	var output []byte
+	var err error
+	if client := updateGitHubClientFromContext(ctx); client != nil {
+		segments := strings.Split(path, "/")
+		for i, segment := range segments {
+			segments[i] = url.PathEscape(segment)
+		}
+		endpoint := fmt.Sprintf("/repos/%s/contents/%s?ref=%s", repo, strings.Join(segments, "/"), url.QueryEscape(ref))
+		var result struct {
+			Content *string `json:"content"`
+		}
+		_, err = client.get(ctx, endpoint, &result)
+		if err == nil {
+			if result.Content == nil {
+				return nil, fmt.Errorf("missing file content in GitHub response for %s/%s@%s", repo, path, ref)
+			}
+			output = []byte(*result.Content)
+		}
+	} else {
+		output, err = workflow.RunGHCombinedContext(ctx, "Downloading workflow...", "api", fmt.Sprintf("/repos/%s/contents/%s?ref=%s", repo, path, ref), "--jq", ".content")
+	}
 	if err != nil {
 		// Check if this is an authentication error
 		outputStr := string(output)
-		if gitutil.IsAuthError(outputStr) || gitutil.IsAuthError(err.Error()) {
+		if errorutil.IsAuthError(outputStr) || errorutil.IsAuthError(err.Error()) {
 			downloadLog.Printf("GitHub API authentication failed, attempting git fallback for %s/%s@%s", repo, path, ref)
 			// Try fallback using git commands
+			finish := ctxutil.StartOperation(ctx, fmt.Sprintf("git download %s/%s@%s", repo, path, ref))
 			content, gitErr := downloadWorkflowContentViaGit(ctx, repo, path, ref, verbose)
+			finish(gitErr)
 			if gitErr != nil {
 				return nil, fmt.Errorf("failed to fetch file content via GitHub API and git: API error: %w, Git error: %w", err, gitErr)
 			}
@@ -203,15 +238,12 @@ func downloadWorkflowContent(ctx context.Context, repo, path, ref string, verbos
 }
 
 // decodeBase64FileContent decodes base64-encoded file content returned by the GitHub API.
-// The GitHub API wraps lines at 60 characters and may include surrounding whitespace,
-// so both are stripped before decoding.
+// All Unicode whitespace is ignored, including wrapped LF/CRLF lines and surrounding space.
 func decodeBase64FileContent(raw string) ([]byte, error) {
-	cleaned := strings.ReplaceAll(strings.TrimSpace(raw), "\n", "")
+	cleaned := strings.Join(strings.Fields(raw), "")
 	content, err := base64.StdEncoding.DecodeString(cleaned)
 	if err != nil {
-		downloadLog.Printf("Base64 decode failed: cleaned_len=%d, err=%v", len(cleaned), err)
 		return nil, fmt.Errorf("failed to decode file content: %w", err)
 	}
-	downloadLog.Printf("Decoded base64 file content: bytes=%d", len(content))
 	return content, nil
 }

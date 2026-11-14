@@ -28,12 +28,13 @@ fi
 REQUIRED_DEPS=(
   "mcp_scripts_mcp_server_http.cjs"
   "mcp_http_transport.cjs"
-  "mcp_scripts_validation.cjs"
+  "schema-validation.cjs"
   "mcp_enhanced_errors.cjs"
   "mcp_logger.cjs"
   "mcp_scripts_bootstrap.cjs"
   "error_helpers.cjs"
   "mcp_server_core.cjs"
+  "safe_output_names.cjs"
   "mcp_scripts_config_loader.cjs"
   "read_buffer.cjs"
   "mcp_handler_shell.cjs"
@@ -83,9 +84,9 @@ mkdir -p /tmp/gh-aw/mcp-scripts/logs
   echo ""
 } > /tmp/gh-aw/mcp-scripts/logs/server.log
 
-# Start the HTTP server in the background with DEBUG enabled
+# Start the HTTP server in the background
 echo "Starting mcp-scripts MCP HTTP server..."
-DEBUG="*" node mcp-server.cjs >> /tmp/gh-aw/mcp-scripts/logs/server.log 2>&1 &
+node mcp-server.cjs >> /tmp/gh-aw/mcp-scripts/logs/server.log 2>&1 &
 SERVER_PID=$!
 echo "Started mcp-scripts MCP server with PID $SERVER_PID"
 
@@ -129,5 +130,5 @@ done
 # Output the configuration for the MCP client
 {
   echo "port=$GH_AW_MCP_SCRIPTS_PORT"
-  echo "api_key=${GH_AW_MCP_SCRIPTS_API_KEY@Q}"
+  echo "api_key=$GH_AW_MCP_SCRIPTS_API_KEY"
 } >> "$GITHUB_OUTPUT"

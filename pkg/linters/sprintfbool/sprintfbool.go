@@ -9,9 +9,9 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
@@ -29,30 +29,21 @@ type replacement struct {
 }
 
 type candidate struct {
-	call *ast.CallExpr
-	arg  ast.Expr
-	file *ast.File
+	call        *ast.CallExpr
+	arg         ast.Expr
+	file        *ast.File
+	replacement replacement
 }
 
 // Analyzer is the sprintfbool analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "sprintfbool",
-	Doc:      `reports fmt.Sprintf("%t", b) calls where b is a single bool value; use strconv.FormatBool(b) instead`,
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/sprintfbool",
-	Requires: []*analysis.Analyzer{inspect.Analyzer, nolint.Analyzer, filecheck.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("sprintfbool", `reports fmt.Sprintf("%t", b) calls where b is a single bool value; use strconv.FormatBool(b) instead`, analyzeSprintfBool)
 
-func run(pass *analysis.Pass) (any, error) {
+func analyzeSprintfBool(pass *analysis.Pass) (any, error) {
 	insp, err := astutil.Inspector(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintIndex, err := nolint.Index(pass)
-	if err != nil {
-		return nil, err
-	}
-	generatedFiles, err := filecheck.Index(pass)
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -60,18 +51,19 @@ func run(pass *analysis.Pass) (any, error) {
 	seenImportFiles := make(map[token.Pos]bool)
 	candidates, targetCallsByFile, filesByPos := collectSprintfBoolCandidates(pass, insp, generatedFiles, noLintIndex)
 
-	replacements := make([]replacement, len(candidates))
+	resolvedCandidates := make([]candidate, 0, len(candidates))
 	fixableCallsByFile := make(map[token.Pos]int)
-	for i, c := range candidates {
+	for _, c := range candidates {
 		repl := replacementForCall(pass, c.call, c.arg, c.file)
-		replacements[i] = repl
+		c.replacement = repl
 		if repl.canFix && c.file != nil {
 			fixableCallsByFile[c.file.Pos()]++
 		}
+		resolvedCandidates = append(resolvedCandidates, c)
 	}
 
-	orphanFmtByFile := computeOrphanFmtStatus(pass, filesByPos, targetCallsByFile, fixableCallsByFile)
-	reportSprintfBoolDiagnostics(pass, candidates, replacements, seenImportFiles, orphanFmtByFile)
+	orphanFmtByFile := computeOrphanedFmtImportStatus(pass, filesByPos, targetCallsByFile, fixableCallsByFile)
+	reportSprintfBoolDiagnostics(pass, resolvedCandidates, seenImportFiles, orphanFmtByFile)
 
 	return nil, nil
 }
@@ -92,7 +84,7 @@ func collectSprintfBoolCandidates(pass *analysis.Pass, insp *inspector.Inspector
 		if nolint.HasDirectiveForLinter(pos, noLintIndex, "sprintfbool") {
 			return
 		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
+		sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 		if !ok || sel.Sel.Name != "Sprintf" {
 			return
 		}
@@ -102,13 +94,25 @@ func collectSprintfBoolCandidates(pass *analysis.Pass, insp *inspector.Inspector
 		if len(call.Args) != 2 {
 			return
 		}
-		formatLit, ok := call.Args[0].(*ast.BasicLit)
+		var formatArg ast.Expr
+		var arg ast.Expr
+		for i, callArg := range call.Args {
+			switch i {
+			case 0:
+				formatArg = callArg
+			case 1:
+				arg = callArg
+			}
+		}
+		if formatArg == nil || arg == nil {
+			return
+		}
+		formatLit, ok := astutil.UnwrapParenExpr(formatArg).(*ast.BasicLit)
 		if !ok || formatLit.Kind != token.STRING || formatLit.Value != `"%t"` {
 			return
 		}
-		arg := call.Args[1]
 		argType := pass.TypesInfo.TypeOf(arg)
-		if argType == nil || argType != types.Typ[types.Bool] {
+		if argType == nil || argType != types.Universe.Lookup("bool").Type() {
 			return
 		}
 		file := astutil.FileForPos(pass.Files, call.Pos())
@@ -121,9 +125,9 @@ func collectSprintfBoolCandidates(pass *analysis.Pass, insp *inspector.Inspector
 	return candidates, targetCallsByFile, filesByPos
 }
 
-// computeOrphanFmtStatus returns a map of file positions where fmt is imported
+// computeOrphanedFmtImportStatus returns a map of file positions where fmt is imported
 // solely for the flagged Sprintf calls (and thus can be removed after the fix).
-func computeOrphanFmtStatus(pass *analysis.Pass, filesByPos map[token.Pos]*ast.File, targetCallsByFile, fixableCallsByFile map[token.Pos]int) map[token.Pos]bool {
+func computeOrphanedFmtImportStatus(pass *analysis.Pass, filesByPos map[token.Pos]*ast.File, targetCallsByFile, fixableCallsByFile map[token.Pos]int) map[token.Pos]bool {
 	orphanFmtByFile := make(map[token.Pos]bool)
 	for filePos, targetCalls := range targetCallsByFile {
 		file := filesByPos[filePos]
@@ -139,9 +143,9 @@ func computeOrphanFmtStatus(pass *analysis.Pass, filesByPos map[token.Pos]*ast.F
 }
 
 // reportSprintfBoolDiagnostics emits one diagnostic per candidate.
-func reportSprintfBoolDiagnostics(pass *analysis.Pass, candidates []candidate, replacements []replacement, seenImportFiles map[token.Pos]bool, orphanFmtByFile map[token.Pos]bool) {
-	for i, c := range candidates {
-		repl := replacements[i]
+func reportSprintfBoolDiagnostics(pass *analysis.Pass, candidates []candidate, seenImportFiles map[token.Pos]bool, orphanFmtByFile map[token.Pos]bool) {
+	for _, c := range candidates {
+		repl := c.replacement
 		argText := repl.argText
 		if argText == "" {
 			argText = astutil.NodeText(pass.Fset, c.arg)
@@ -178,7 +182,7 @@ func buildFormatBoolFix(
 	}}
 
 	if file != nil {
-		edits = append(edits, buildImportEdits(pass, file, seenImportFiles, orphanFmtByFile)...)
+		edits = append(edits, buildStrconvFmtImportEdits(pass, file, seenImportFiles, orphanFmtByFile)...)
 	}
 
 	return []analysis.SuggestedFix{{
@@ -187,7 +191,11 @@ func buildFormatBoolFix(
 	}}
 }
 
-func buildImportEdits(
+// buildStrconvFmtImportEdits returns TextEdits that add "strconv" to file and,
+// when the file's "fmt" import becomes unused after the fix, also remove it.
+// seenImportFiles prevents duplicate overlapping edits in files with multiple
+// violations.
+func buildStrconvFmtImportEdits(
 	pass *analysis.Pass,
 	file *ast.File,
 	seenImportFiles map[token.Pos]bool,
@@ -197,31 +205,15 @@ func buildImportEdits(
 		return nil
 	}
 
-	_, strconvImported := astutil.ImportedAs(file, pass.TypesInfo, strconvPkg)
 	_, fmtImported := astutil.ImportedAs(file, pass.TypesInfo, fmtPkg)
-
 	orphanFmt := fmtImported && orphanFmtByFile[file.Pos()]
-	needStrconv := !strconvImported
-	needRemoveFmt := orphanFmt
 
-	if !needStrconv && !needRemoveFmt {
+	edits, needed := astutil.SwapPkgImportEdits(pass, file, strconvPkg, fmtPkg, orphanFmt)
+	if !needed {
 		return nil
 	}
 	seenImportFiles[file.Pos()] = true
-
-	switch {
-	case needStrconv && needRemoveFmt:
-		return astutil.SwapImportEdits(pass.Fset, file, strconvPkg, fmtPkg)
-	case needStrconv:
-		if edit, ok := astutil.AddImportEdit(pass, file, strconvPkg); ok {
-			return []analysis.TextEdit{edit}
-		}
-	case needRemoveFmt:
-		if edit, ok := astutil.RemoveImportEdit(pass.Fset, file, fmtPkg); ok {
-			return []analysis.TextEdit{edit}
-		}
-	}
-	return nil
+	return edits
 }
 
 func replacementForCall(pass *analysis.Pass, call *ast.CallExpr, arg ast.Expr, file *ast.File) replacement {

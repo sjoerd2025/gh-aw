@@ -15,27 +15,32 @@ type AddCommentConfig = AddCommentsConfig
 type AddCommentsConfig struct {
 	BaseSafeOutputConfig   `yaml:",inline"`
 	SafeOutputFilterConfig `yaml:",inline"`
+	MaxLinks               int      `yaml:"max-links,omitempty"`                 // Maximum URLs in agent content (default: 50); generated metadata is excluded
+	CollapseData           *bool    `yaml:"collapse-data,omitempty"`             // Render structured data in a collapsed details block instead of visible JSON
 	Target                 string   `yaml:"target,omitempty"`                    // Target for comments: "triggering" (default), "*" (any issue), or explicit issue number
 	TargetRepoSlug         string   `yaml:"target-repo,omitempty"`               // Target repository in format "owner/repo" for cross-repository comments
 	AllowedRepos           []string `yaml:"allowed-repos,omitempty"`             // List of additional repositories that comments can be added to (additionally to the target-repo)
+	AllowedCommentIDs      []string `yaml:"allows-comment-ids,omitempty"`        // Trusted allowlist of issue/PR comment IDs the agent may update when target is "*"
 	HideOlderComments      *string  `yaml:"hide-older-comments,omitempty"`       // When true, minimizes/hides all previous comments from the same workflow before creating the new comment
+	ReplaceOlderComments   *string  `yaml:"replace-older-comments,omitempty"`    // When true, updates the newest matching issue or PR comment instead of creating one
 	HideOlderCommentsMatch []string `yaml:"hide-older-comments-match,omitempty"` // Internal list populated from hide-older-comments.match and passed to the JS handler as exact workflow ID matches
 	AllowedReasons         []string `yaml:"allowed-reasons,omitempty"`           // List of allowed reasons for hiding older comments (default: all reasons allowed)
 	Issues                 *bool    `yaml:"issues,omitempty"`                    // When false, excludes issues:write permission and issues from event condition. Default (nil or true) includes issues:write.
 	PullRequests           *bool    `yaml:"pull-requests,omitempty"`             // When false, excludes pull-requests:write permission and PRs from event condition. Default (nil or true) includes pull-requests:write.
 	Discussions            *bool    `yaml:"discussions,omitempty"`               // When true, includes discussions:write permission. Default (nil or false) excludes discussions:write.
-	Footer                 *string  `yaml:"footer,omitempty"`                    // Controls whether AI-generated footer is added. When false, visible footer is omitted but XML markers are kept.
 }
 
 // parseCommentsConfig handles add-comment configuration
 func (c *Compiler) parseCommentsConfig(outputMap map[string]any) *AddCommentsConfig {
-	// Check if the key exists
 	if _, exists := outputMap["add-comment"]; !exists {
 		return nil
 	}
 
 	// Get config data for pre-processing before YAML unmarshaling
-	configData, _ := outputMap["add-comment"].(map[string]any)
+	configData, ok := outputMap["add-comment"].(map[string]any)
+	if !ok {
+		configData = nil
+	}
 
 	if err := preprocessHideOlderCommentsConfig(configData, addCommentLog); err != nil {
 		addCommentLog.Printf("Invalid hide-older-comments configuration: %v", err)
@@ -45,6 +50,10 @@ func (c *Compiler) parseCommentsConfig(outputMap map[string]any) *AddCommentsCon
 	// Pre-process templatable bool fields
 	if err := preprocessBoolFieldAsString(configData, "hide-older-comments", addCommentLog); err != nil {
 		addCommentLog.Printf("Invalid hide-older-comments value: %v", err)
+		return nil
+	}
+	if err := preprocessBoolFieldAsString(configData, "replace-older-comments", addCommentLog); err != nil {
+		addCommentLog.Printf("Invalid replace-older-comments value: %v", err)
 		return nil
 	}
 	if err := preprocessBoolFieldAsString(configData, "footer", addCommentLog); err != nil {
@@ -63,22 +72,26 @@ func (c *Compiler) parseCommentsConfig(outputMap map[string]any) *AddCommentsCon
 		addCommentLog.Printf("Invalid allowed-repos value: %v", err)
 		return nil
 	}
-
-	config := parseConfigScaffold(outputMap, "add-comment", addCommentLog, func(err error) *AddCommentsConfig {
-		addCommentLog.Printf("Failed to unmarshal config: %v", err)
-		// For backward compatibility, handle nil/empty config
-		return &AddCommentsConfig{}
-	})
-	if config == nil {
+	if err := preprocessStringArrayFieldAsTemplatable(configData, "allows-comment-ids", addCommentLog); err != nil {
+		addCommentLog.Printf("Invalid allows-comment-ids value: %v", err)
 		return nil
 	}
 
-	// Set default max if not specified
-	if config.Max == nil {
-		config.Max = defaultIntStr(1)
-	}
+	// Pre-process target field if numeric
+	preprocessTargetFieldAsString(configData, addCommentLog)
 
-	return config
+	return parseConfigScaffoldWithPostProcess(outputMap, "add-comment", addCommentLog,
+		func(err error) *AddCommentsConfig {
+			addCommentLog.Printf("Failed to unmarshal config: %v", err)
+			// For backward compatibility, handle nil/empty config
+			return &AddCommentsConfig{}
+		},
+		func(config *AddCommentsConfig) {
+			// Set default max if not specified
+			if config.Max == nil {
+				config.Max = defaultIntStr(1)
+			}
+		})
 }
 
 func preprocessHideOlderCommentsConfig(configData map[string]any, debugLog *logger.Logger) error {

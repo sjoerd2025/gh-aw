@@ -7,7 +7,7 @@ sidebar:
 
 # MCP Gateway Specification
 
-**Version**: 1.15.0  
+**Version**: 1.18.0
 **Status**: Draft Specification  
 **Latest Version**: [mcp-gateway](/gh-aw/reference/mcp-gateway/)  
 **JSON Schema**: [mcp-gateway-config.schema.json](/gh-aw/schemas/mcp-gateway-config.schema.json)  
@@ -159,6 +159,10 @@ Stdio-based MCP servers MUST be containerized. The gateway SHALL NOT support dir
 
 Direct command execution of stdio servers (e.g., `command: "node server.js"` without a container) is explicitly NOT SUPPORTED by this specification.
 
+The gh-aw launcher defaults the built-in `agenticworkflows` and `safeoutputs` backend containers to the runner's effective numeric UID and primary GID, including nonzero GIDs below 1000, with a container-local writable `HOME` at `/tmp`. Identity is applied to the backend arguments sent to mcpg, independently of the parent gateway container, across engine configuration formats. This keeps owner-only (`0600`) config files readable and outputs runner-owned without relaxing file permissions. Generated safeoutputs config, tools, tools metadata, validation, and output files use `0600`, including when replacing existing files. Explicit container-user settings, configured `HOME` values, and `--group-add` arguments are preserved; supplementary runner groups are not automatically granted to backends. The gateway separately receives the Docker socket group needed to launch child containers; other MCP servers are unchanged.
+
+The v1.0.1 compiler emitted `--user ${MCP_GATEWAY_UID}:${MCP_GATEWAY_GID}` for the parent gateway, but did not apply that identity to the safeoutputs backend.
+
 ### 3.3 Operational Model
 
 The gateway operates in a headless mode:
@@ -202,7 +206,7 @@ The gateway MUST accept configuration via stdin in JSON format conforming to the
   },
   "gateway": {
     "port": 8080,
-    "apiKey": "string",
+    "agentId": "string",
     "domain": "string",
     "startupTimeout": 30,
     "toolTimeout": 60
@@ -229,10 +233,16 @@ Each server configuration MUST support:
 | `registry` | string | No | URI to the installation location when MCP is installed from a registry. This is an informational field used for documentation and tooling discovery. Applies to both stdio and HTTP servers. Example: `"https://api.mcp.github.com/v0/servers/microsoft/markitdown"` |
 | `tools` | array[string] | No | Tool filter for the MCP server. Use `["*"]` to allow all tools (default), or specify a list of tool names to allow. This field is passed through to agent configurations and applies to both stdio and http servers. |
 | `headers` | object | No | HTTP headers to include in requests (HTTP servers only). Commonly used for authentication to external HTTP servers. Values may contain variable expressions. |
+| `caCertFile` | string | No | PEM CA file trusted only for this HTTP server, in addition to system roots. gh-aw's author-facing [`ca-cert-file`](/gh-aw/reference/tools/#custom-ca-certificates) is resolved and mounted read-only by the launcher. Requires gateway v0.4.35 or later. |
 | `auth` | object | No | Upstream authentication configuration for HTTP servers. See [Section 7.6](#76-upstream-authentication-oidc). |
 
 *Required for stdio servers (containerized execution)  
 **Required for HTTP servers
+
+The `stdioServerConfig.container` schema field accepts an image reference with an optional tag and an optional digest: `image[:tag][@sha256:<64 hex>]`. The `@sha256:<64 hex>` suffix is valid with or without a tag and MUST contain exactly 64 hexadecimal characters (`0-9`, `a-f`, or `A-F`) after `sha256:`. References without a digest remain valid.
+
+> [!NOTE]
+> Digest-pinned server images require MCP Gateway v0.4.36 or later, which includes the [upstream schema validation fix](https://github.com/github/gh-aw-mcpg/pull/15212). The default gateway version includes this fix. Container digests are preserved in generated server configurations, including replacements configured through `container_pins`.
 
 **Note**: The `command` field is NOT supported. Stdio servers MUST use the `container` field to specify a containerized MCP server. Direct command execution is not supported by this specification.
 
@@ -244,7 +254,8 @@ The `gateway` section is required and configures gateway-specific behavior:
 |-------|------|----------|-------------|
 | `port` | integer | Yes | HTTP server port |
 | `domain` | string | Yes | Gateway domain (localhost or host.docker.internal) |
-| `apiKey` | string | Yes | API key for authentication |
+| `agentId` | string | Conditional* | Single agent/session identifier used for authentication. Mutually exclusive with `agentIds`. See Section 4.1.3.9. |
+| `agentIds` | array[string] | Conditional* | List of agent/session identifiers (at least one, each non-empty), used for authentication. Mutually exclusive with `agentId`. See Section 4.1.3.9. |
 | `startupTimeout` | integer | No | Server startup timeout in seconds (default: 30) |
 | `toolTimeout` | integer | No | Tool invocation timeout in seconds (default: 60) |
 | `payloadDir` | string | No | Directory path for storing large payload JSON files for authenticated clients |
@@ -254,8 +265,10 @@ The `gateway` section is required and configures gateway-specific behavior:
 | `keepaliveInterval` | integer | No | Keepalive ping interval in seconds for HTTP MCP backends. Prevents session expiry during long-running tasks. Use `-1` to disable, `0` or unset for gateway default (1500s = 25 min), or a positive integer for a custom interval. |
 | `sessionTimeout` | string | No | Session timeout for MCP gateway sessions as a Go duration string (e.g. `"30m"`, `"4h"`, `"24h"`). Empty or omitted uses the gateway default (6h). Must be at least 5m when set by the workflow compiler (no upper bound; infrastructure operators may override via `MCP_GATEWAY_SESSION_TIMEOUT` env var). |
 | `opentelemetry` | object | No | OpenTelemetry configuration for emitting distributed tracing events for MCP calls. See Section 4.1.3.7 for details. |
-| `forcePublicRepos` | boolean | No | When `true` (default), forces the allow-only policy to `repos="public"` at runtime if the gateway detects it is running in a public repository. When `false`, disables this override — set by the compiler when `private-to-public-flows: allow` is declared in workflow frontmatter. See Section 4.1.3.8 for details. |
+| `forcePublicRepos` | boolean | No | When `true` (default), forces the allow-only policy to `repos="public"` at runtime if the gateway detects it is running in a public repository. When `false`, disables this override — set by the compiler for `private-to-public-flows: allow` or an enclave-only static GitHub agent backend. See Section 4.1.3.8 for details. |
 | `sinkVisibilityExemptServers` | array[string] | No | List of server IDs exempt from the default `sink-visibility="public"` enforcement. Use `["*"]` to exempt all servers. Set by the compiler when `private-to-public-flows` lists specific server IDs in workflow frontmatter. See Section 10.9 for details. |
+
+*Exactly one of `agentId` or `agentIds` MUST be specified; the two fields are mutually exclusive. See Section 4.1.3.9.
 
 #### 4.1.3.1 Payload Directory Path Validation
 
@@ -330,7 +343,7 @@ payload_dir = "/tmp/jq-payloads"
 payload_path_prefix = "/workspace/payloads"
 port = 8080
 domain = "localhost"
-apiKey = "secret"
+agent_id = "secret"
 ```
 
 **Use Cases**:
@@ -379,6 +392,8 @@ payload_size_threshold = 262144   # 256KB - more aggressive disk storage
 
 The optional `trustedBots` field in the gateway configuration passes an additional list of GitHub bot identity strings to the gateway. The gateway merges this list with its own built-in trusted identity list to form the effective set of identities it recognizes.
 
+Workflow frontmatter accepts only the kebab-case `sandbox.mcp.trusted-bots` key. The compiler translates it into camelCase `gateway.trustedBots` in the generated gateway JSON; `trustedBots` is not a frontmatter alias.
+
 > **Important**: `trustedBots` is **additive**. The gateway maintains its own internal list of trusted bot identities. The `trustedBots` field extends that internal list with additional identities; it cannot remove or override the gateway's built-in trusted identities.
 
 **Configuration Example**:
@@ -388,7 +403,7 @@ The optional `trustedBots` field in the gateway configuration passes an addition
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "agentId": "${MCP_GATEWAY_AGENT_ID}",
     "trustedBots": [
       "github-actions[bot]",
       "copilot-swe-agent[bot]"
@@ -399,17 +414,30 @@ The optional `trustedBots` field in the gateway configuration passes an addition
 
 **Frontmatter Example** (workflow author):
 
-```yaml
+```aw wrap title=".github/workflows/trusted-bots.md"
+---
+on: workflow_dispatch
+permissions:
+  contents: read
+  issues: read
+engine: copilot
+tools:
+  github:
+    toolsets: [issues]
 sandbox:
   mcp:
     trusted-bots:
       - github-actions[bot]
       - copilot-swe-agent[bot]
+---
+
+Summarize the open issues in this repository.
 ```
 
 **Requirements**:
 - `trustedBots` MUST be a non-empty array of strings when present
 - Each entry MUST be a non-empty string (typically a GitHub username such as `github-actions[bot]`)
+- When configured through workflow frontmatter, entries MUST contain only ASCII letters, digits, hyphens, or underscores, optionally followed by `[bot]`. The compiler also validates these characters before rendering the gateway configuration to prevent shell expansion.
 - `trustedBots` entries are **merged** with the gateway's internal built-in trusted identities to form the effective list passed to the gateway
 - `trustedBots` MUST NOT be used to remove or override entries in the gateway's internal built-in trusted identity list
 
@@ -432,7 +460,7 @@ The optional `keepaliveInterval` field in the gateway configuration controls how
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "agentId": "${MCP_GATEWAY_AGENT_ID}",
     "keepaliveInterval": 300
   }
 }
@@ -471,7 +499,7 @@ The optional `sessionTimeout` field in the gateway configuration controls how lo
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "agentId": "${MCP_GATEWAY_AGENT_ID}",
     "sessionTimeout": "4h"
   }
 }
@@ -501,7 +529,7 @@ The optional `opentelemetry` object in the gateway configuration enables the gat
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `endpoint` | string | Yes (when `opentelemetry` is present) | OTLP/HTTP endpoint URL for the OpenTelemetry collector (e.g., `https://collector.example.com:4318/v1/traces`). MUST use HTTPS. Supports variable expressions. |
+| `endpoint` | string | Yes (when `opentelemetry` is present) | OTLP/HTTP endpoint URL for the OpenTelemetry collector (e.g., `https://collector.example.com:4318/v1/traces` or `http://127.0.0.1:4318/v1/traces`). MUST use HTTP or HTTPS. Supports variable expressions. |
 | `traceId` | string | No | Parent trace ID for context propagation. When set, the gateway attaches all emitted spans as children of this trace, enabling correlation with an existing distributed trace. MUST be a 32-character lowercase hex string (128-bit W3C trace ID format). Supports variable expressions. |
 | `spanId` | string | No | Parent span ID for context propagation. When set together with `traceId`, the gateway sets this span as the direct parent of its root span. MUST be a 16-character lowercase hex string (64-bit W3C span ID format). Ignored when `traceId` is not set. Supports variable expressions. |
 | `serviceName` | string | No | Logical service name reported in the `service.name` resource attribute of all emitted spans. Identifies the gateway in the tracing backend. Defaults to `"mcp-gateway"` when not specified. |
@@ -516,7 +544,7 @@ The optional `opentelemetry` object in the gateway configuration enables the gat
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "agentId": "${MCP_GATEWAY_AGENT_ID}",
     "opentelemetry": {
       "endpoint": "https://collector.example.com:4318/v1/traces",
       "serviceName": "my-mcp-gateway"
@@ -549,7 +577,7 @@ The gateway MUST NOT fail to start if the OpenTelemetry collector endpoint is un
 **Requirements**:
 
 - `endpoint` MUST be present when the `opentelemetry` object is configured
-- `endpoint` MUST be an HTTPS URL
+- `endpoint` MUST be an HTTP or HTTPS URL
 - `traceId`, when provided, MUST be a 32-character lowercase hex string
 - `spanId`, when provided, MUST be a 16-character lowercase hex string
 - `spanId` SHOULD only be set when `traceId` is also set; if `spanId` is provided without `traceId` the gateway SHOULD log a warning and ignore `spanId`
@@ -575,7 +603,7 @@ When `forcePublicRepos` is `true` (the default), the gateway overrides the compi
 - This override is **skipped** when `GITHUB_REPOSITORY` or the GitHub token is unavailable.
 - API errors during visibility detection result in a non-fatal warning; the gateway/proxy falls back to the compiled policy.
 
-**Opt-out**: Workflow authors who intentionally allow private→public data flows set `private-to-public-flows: allow` in frontmatter (Section 10.9). The compiler translates this to `gateway.forcePublicRepos: false` in the generated gateway JSON stdin config. For proxy mode, launchers should pass `--force-public-repos=false` when they need equivalent opt-out behavior.
+**Opt-out**: Workflow authors who intentionally allow private→public data flows set `private-to-public-flows: allow` in frontmatter (Section 10.9). The compiler translates this to `gateway.forcePublicRepos: false` in the generated gateway JSON stdin config. The compiler also emits `gateway.forcePublicRepos: false` when the GitHub MCP server is rendered solely to serve a static agent enclave identity (`tools.github: false` plus `enclaves[].agent.tools.github`), because the override would otherwise discard the enclave's configured `allowed-repos`. For proxy mode, launchers should pass `--force-public-repos=false` when they need equivalent opt-out behavior.
 
 **Environment variable override**: `MCP_GATEWAY_FORCE_PUBLIC_REPOS=false` disables the override without requiring a config change. The `--force-public-repos` flag defaults to the value of this environment variable (defaulting to `true` when unset).
 
@@ -586,13 +614,64 @@ When `forcePublicRepos` is `true` (the default), the gateway overrides the compi
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "agentId": "${MCP_GATEWAY_AGENT_ID}",
     "forcePublicRepos": false
   }
 }
 ```
 
 **Compliance Test**: T-WS-004 (Section 11.1.12)
+
+#### 4.1.3.9 Agent Identifier Configuration (`agentId` / `agentIds`)
+
+The gateway configuration MUST select exactly one of the following mutually exclusive forms to configure the agent/session identifier(s) used for authentication and DIFC session-state keying:
+
+- `agentId` (string): a single agent/session identifier.
+- `agentIds` (array of strings): one or more agent/session identifiers, enabling a primary agent and enclave sessions to share one gateway instance while retaining independent DIFC state and policies.
+
+**Requirements**:
+
+- A gateway configuration MUST specify exactly one of `agentId` or `agentIds`. Specifying both, or neither, MUST be rejected as invalid configuration.
+- `agentId`, when present, MUST be a non-empty string.
+- `agentIds`, when present, MUST be an array containing at least one item, and every item MUST be a non-empty string.
+- `agentIds` enables associating multiple agent/session identifiers with one gateway instance in configuration. Runtime authentication and per-identifier DIFC session-state keying are out of scope for this section and are tracked as follow-up work (see Section 7.2).
+
+**Configuration Example (singular)**:
+
+```json
+{
+  "gateway": {
+    "port": 8080,
+    "domain": "localhost",
+    "agentId": "primary-agent"
+  }
+}
+```
+
+**Configuration Example (plural)**:
+
+```json
+{
+  "gateway": {
+    "port": 8080,
+    "domain": "localhost",
+    "agentIds": ["primary-agent", "enclave-agent"]
+  }
+}
+```
+
+**mcpg TOML spelling**:
+
+```toml
+[gateway]
+port = 8080
+domain = "localhost"
+agent_id = "primary-agent"
+# OR
+agent_ids = ["primary-agent", "enclave-agent"]
+```
+
+**Compatibility**: Implementations MAY continue to accept the legacy `api_key`/`apiKey` spelling internally for backward compatibility with existing deployments, but `apiKey` MUST NOT appear in generated or published configuration; `agentId` or `agentIds` MUST be used instead. Runtime mapping from individual identifiers to allow-only policies is out of scope for this section and is tracked as follow-up work.
 
 #### 4.1.3a Top-Level Configuration Fields
 
@@ -620,7 +699,7 @@ Custom server types MUST be registered in the `customSchemas` field at the top l
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "secret"
+    "agentId": "secret"
   },
   "customSchemas": {
     "safeinputs": "https://docs.github.com/gh-aw/schemas/mcp-scripts-config.schema.json"
@@ -657,7 +736,7 @@ When a server configuration includes a `type` field with a value not in `["stdio
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "secret"
+    "agentId": "secret"
   },
   "customSchemas": {
     "safeinputs": "https://docs.github.com/gh-aw/schemas/mcp-scripts-config.schema.json"
@@ -848,7 +927,7 @@ POST /close
 ```http
 POST /mcp/{server-name} HTTP/1.1
 Content-Type: application/json
-Authorization: <apiKey>
+Authorization: <agentId>
 
 {
   "jsonrpc": "2.0",
@@ -898,7 +977,7 @@ The gateway MUST provide a `/close` endpoint for graceful shutdown and resource 
 
 ```http
 POST /close HTTP/1.1
-Authorization: <apiKey>
+Authorization: <agentId>
 ```
 
 **Note**: The format of the `Authorization` header is implementation-dependent. Consult your gateway implementation's documentation for the expected format.
@@ -954,7 +1033,7 @@ The `/close` endpoint MUST be idempotent:
 
 **Authentication**:
 
-The `/close` endpoint MUST require authentication when `gateway.apiKey` is configured. Requests without valid authentication MUST be rejected with HTTP 401 Unauthorized.
+The `/close` endpoint MUST require authentication when `gateway.agentId` or `gateway.agentIds` is configured. Requests without valid authentication MUST be rejected with HTTP 401 Unauthorized.
 
 #### 5.1.4 Request Routing
 
@@ -1050,7 +1129,7 @@ After successful initialization, the gateway MUST:
          "type": "http",
          "url": "http://{domain}:{port}/mcp/server-name",
          "headers": {
-           "Authorization": "{apiKey}"
+           "Authorization": "{agentId}"
          },
          "tools": ["*"]
        }
@@ -1126,46 +1205,46 @@ The gateway MUST NOT:
 
 ### 7.1 Authorization Header Format
 
-The MCP Gateway uses a simple API key authentication scheme. When `gateway.apiKey` is configured:
+The MCP Gateway uses a simple agent identifier authentication scheme. When `gateway.agentId` or `gateway.agentIds` is configured:
 
-- The `Authorization` header contains the API key value
-- Implementations MAY use different formats (e.g., direct value or Bearer scheme)
+- The `Authorization` header contains an agent/session identifier value (the configured `agentId`, or one of the configured `agentIds` entries)
+- Implementations MAY use different formats (e.g., direct value or a scheme-prefixed value)
 - The specific format is implementation-dependent
 
 > [!WARNING]
-> The gateway API key should not be treated as a secure lock against code already running inside the agent container. A sufficiently capable agent may extract it from in-memory process state or other runtime channels. Treat this key as leaked by design and rely on container isolation, network controls, and staged permission boundaries for defense in depth.
+> The gateway agent identifier should not be treated as a secure lock against code already running inside the agent container. A sufficiently capable agent may extract it from in-memory process state or other runtime channels. Treat this identifier as leaked by design and rely on container isolation, network controls, and staged permission boundaries for defense in depth.
 
 **Example formats**:
 
 ```http
-Authorization: my-secret-api-key-12345
+Authorization: my-secret-agent-id-12345
 ```
 
 or
 
 ```http
-Authorization: Bearer my-secret-api-key-12345
+Authorization: Token my-other-agent-id-67890
 ```
 
 This authentication scheme provides flexibility for different implementation requirements.
 
-### 7.2 API Key Authentication
+### 7.2 Agent Identifier Authentication
 
-When `gateway.apiKey` is configured, the gateway MUST:
+When `gateway.agentId` or `gateway.agentIds` is configured, the gateway MUST:
 
 1. Require `Authorization` header on all RPC requests to `/mcp/{server-name}` and `/close` endpoints
    - The specific format of the Authorization header is implementation-dependent
    - Implementations SHOULD document their expected format
 2. Reject requests with missing or invalid tokens (HTTP 401)
 3. Reject requests with malformed Authorization headers (HTTP 400)
-4. NOT log API keys in plaintext
+4. NOT log agent identifiers in plaintext
 
-### 7.3 Optimal Temporary API Key
+> [!NOTE]
+> This section covers configuration parsing only. Runtime authentication and routing of individual `agentIds` entries to independent DIFC session state is out of scope for this specification and is tracked as follow-up implementation work.
 
-The gateway SHOULD support temporary API keys:
+### 7.3 Temporary Agent Identifiers
 
-1. Generate a random API key on startup if not provided
-2. Include key in stdout configuration output
+A gateway configuration MUST always specify exactly one of `agentId` or `agentIds` (see Section 4.1.3.9); the gateway MUST NOT silently generate an identifier when neither is provided. Callers that need a short-lived identity (for example, an ephemeral session) SHOULD generate their own temporary identifier and supply it as `agentId` before starting the gateway.
 
 ### 7.4 Authentication Exemptions
 
@@ -1250,15 +1329,27 @@ In this case, the audience defaults to `"https://my-server.example.com/mcp"`.
 
 **Frontmatter Example** (workflow author):
 
-```yaml
-tools:
-  mcp-servers:
-    my-mcp-server:
-      type: http
-      url: "https://my-server.example.com/mcp"
-      auth:
-        type: github-oidc
-        audience: "https://my-server.example.com"
+```aw wrap title=".github/workflows/oidc-mcp.md"
+---
+on: workflow_dispatch
+permissions:
+  contents: read
+  id-token: write
+engine: copilot
+network:
+  allowed:
+    - defaults
+    - my-server.example.com
+mcp-servers:
+  my-mcp-server:
+    type: http
+    url: "https://my-server.example.com/mcp"
+    auth:
+      type: github-oidc
+      audience: "https://my-server.example.com"
+---
+
+Use my-mcp-server to summarize the available project information.
 ```
 
 #### 7.6.2 Interaction with Static Headers
@@ -1354,6 +1445,8 @@ The gateway SHOULD:
 
 > [!TIP]
 > To inspect MCP server health for a specific workflow run at runtime, use `gh aw audit <run-id>`. The **MCP Server Health** section of the audit report shows connection failures, timeout errors, tool call counts, and error rates per server — providing a post-run view of gateway behavior. For recurring MCP failures, pass two run IDs to `gh aw audit` (e.g. `gh aw audit <base-id> <compare-id>`) to compare MCP tool usage between runs and identify regressions. See [Audit Commands](/gh-aw/reference/audit/).
+
+When safe outputs are configured, gh-aw setup also waits for the `safeoutputs` or `safe-outputs` backend to return a non-empty `tools/list` response. It retries successful empty responses and transient transport or server failures within the configured gateway health retry limits and the remaining startup timeout plus registration margin; the health and tool-registration checks share the original startup deadline. Probes stop when less than 750ms remains, reserving at least 250ms per handshake request. Authentication failures and permanent protocol errors fail immediately. If tools never register, setup fails with an explicit gateway readiness error before the agent starts, including the last failing handshake phase and HTTP status or safe transport code. Health and safe-output readiness timings are logged separately. Workflows without either safe-output server name skip this check.
 
 ---
 
@@ -1701,22 +1794,22 @@ mcp-servers:
 
 #### 10.9.2 Constraints
 
-Blanket `allow` is incompatible with `guards_mode: strict`, so the compiler MUST reject that combination at compile time. The list form remains compatible with `strict` because it relaxes only the default sink-visibility for named servers while leaving other protections in place. In list form, every server ID MUST map to an actual MCP server declared in the workflow's `tools` or `mcp-servers` list; unknown IDs MUST be rejected at compile time. With non-strict mode (`filter` or `propagate`), the blanket form disables both the forced `repos="public"` override (Section 4.1.3.8) and the `sink-visibility` runtime-verification override (Section 10.8.4).
+Both forms are incompatible with `guards_mode: strict`, so the compiler MUST reject either form at compile time. In list form, every server ID MUST map to an actual MCP server declared in the workflow's `tools` or `mcp-servers` list; unknown IDs MUST be rejected at compile time. With non-strict mode (`filter` or `propagate`), the compiler MUST warn because action logs are public and agents may expose private data. The blanket form disables both the forced `repos="public"` override (Section 4.1.3.8) and the `sink-visibility` runtime-verification override (Section 10.8.4).
 
 #### 10.9.3 Compiler Responsibilities
 
 When the compiler encounters `private-to-public-flows`, it MUST validate the chosen form, emit the matching gateway configuration, and record the opt-out in the audit trail.
 
-For blanket `allow`, the compiler MUST reject `guards_mode: strict`, set `gateway.forcePublicRepos: false` in the generated JSON stdin config, and skip setting `sink-visibility` in write-sink guard policies even if the target repo is public at compile time.
+For blanket `allow`, the compiler MUST reject `guards_mode: strict`, warn in non-strict mode, set `gateway.forcePublicRepos: false` in the generated JSON stdin config, and skip setting `sink-visibility` in write-sink guard policies even if the target repo is public at compile time.
 
-For list form, the compiler MUST verify that every listed server ID exists in the workflow's declared `tools` or `mcp-servers` list, set `gateway.sinkVisibilityExemptServers` to that list in the generated JSON stdin config, and leave `forcePublicRepos` unchanged.
+For list form, the compiler MUST reject `guards_mode: strict`, warn in non-strict mode, verify that every listed server ID exists in the workflow's declared `tools` or `mcp-servers` list, set `gateway.sinkVisibilityExemptServers` to that list in the generated JSON stdin config, and leave `forcePublicRepos` unchanged.
 
 #### 10.9.4 Interaction Matrix
 
 | `guards_mode` | `private-to-public-flows` | Forced `repos="public"` | Default `sink-visibility` enforced | Strict-mode compatible |
 |---|---|---|---|---|
 | `strict` | `allow` | ❌ **Rejected** (compile error) | — | ❌ |
-| `strict` | `[servers...]` | ✅ Yes | ✅ Yes (except listed servers) | ✅ |
+| `strict` | `[servers...]` | ❌ **Rejected** (compile error) | — | ❌ |
 | `strict` | *(omitted)* | ✅ Yes | ✅ Yes | ✅ |
 | `filter` / `propagate` | `allow` | ❌ Disabled | ❌ Disabled | N/A |
 | `filter` / `propagate` | `[servers...]` | ✅ Yes | ✅ Yes (except listed servers) | N/A |
@@ -1726,7 +1819,7 @@ For list form, the compiler MUST verify that every listed server ID exists in th
 
 This opt-out exists for workflows that legitimately need to read from private repos and post summaries to public issue trackers, aggregate private data into public dashboards, or cross-post between private and public repos.
 
-The strict-mode incompatibility ensures organizations requiring maximum security cannot accidentally enable this escape hatch.
+The strict-mode incompatibility ensures organizations requiring maximum security cannot accidentally enable this escape hatch. Non-strict warnings make the risk explicit because workflow logs are public and agents may expose private data through public destinations.
 
 **Compliance Test**: T-WS-005 (Section 11.1.12)
 
@@ -1844,7 +1937,7 @@ A conforming implementation MUST pass the following test categories:
 - **T-OTEL-001**: Gateway starts successfully when `opentelemetry` is omitted
 - **T-OTEL-002**: Gateway starts successfully when `opentelemetry` is configured with a valid endpoint
 - **T-OTEL-003**: Reject `opentelemetry` configuration with missing `endpoint` field
-- **T-OTEL-004**: Reject `opentelemetry` configuration with a non-HTTPS endpoint
+- **T-OTEL-004**: Reject `opentelemetry` configuration with a non-HTTP(S) endpoint
 - **T-OTEL-005**: Span emitted for each MCP tool invocation with required attributes (`mcp.server`, `mcp.method`, `mcp.tool`, `http.status_code`)
 - **T-OTEL-006**: When `OTEL_EXPORTER_OTLP_HEADERS` env var is set, headers are sent with every OTLP export request
 - **T-OTEL-007**: W3C `traceparent` context propagated when both `traceId` and `spanId` are configured
@@ -1927,7 +2020,7 @@ Implementations SHOULD provide:
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "gateway-secret-token"
+    "agentId": "gateway-secret-token"
   }
 }
 ```
@@ -1951,7 +2044,7 @@ Implementations SHOULD provide:
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "gateway-secret-token"
+    "agentId": "gateway-secret-token"
   }
 }
 ```
@@ -2035,7 +2128,7 @@ The `registry` field documents the MCP server's installation location in an MCP 
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "gateway-secret-token"
+    "agentId": "gateway-secret-token"
   }
 }
 ```
@@ -2063,7 +2156,7 @@ The following example configures the gateway to export traces to an OTLP collect
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "agentId": "${MCP_GATEWAY_AGENT_ID}",
     "opentelemetry": {
       "endpoint": "https://collector.example.com:4318/v1/traces",
       "serviceName": "my-workflow-gateway"
@@ -2091,7 +2184,7 @@ The following example propagates an existing distributed trace into the gateway,
   "gateway": {
     "port": 8080,
     "domain": "localhost",
-    "apiKey": "${MCP_GATEWAY_API_KEY}",
+    "agentId": "${MCP_GATEWAY_AGENT_ID}",
     "opentelemetry": {
       "endpoint": "https://collector.example.com:4318/v1/traces",
       "traceId": "${PARENT_TRACE_ID}",
@@ -2103,6 +2196,28 @@ The following example propagates an existing distributed trace into the gateway,
 ```
 
 `PARENT_TRACE_ID` and `PARENT_SPAN_ID` are 32-character and 16-character lowercase hex strings respectively, typically injected as environment variables by the orchestrating system.
+
+#### A.8 Gateway with Multiple Agent Identifiers (`agentIds`)
+
+The following example configures a gateway shared by a primary agent and an enclave agent, each with its own identifier and independently keyed DIFC session state:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "container": "ghcr.io/github/github-mcp-server:latest",
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  },
+  "gateway": {
+    "port": 8080,
+    "domain": "localhost",
+    "agentIds": ["primary-agent", "enclave-agent"]
+  }
+}
+```
 
 ### Appendix B: Gateway Lifecycle Examples
 
@@ -2181,7 +2296,7 @@ Content-Type: application/json
 
 #### D.1 Credential Handling
 
-- API keys MUST NOT be logged
+- Agent identifiers (`agentId`/`agentIds`) MUST NOT be logged
 - Environment variables MUST be isolated per server
 - Secrets SHOULD be cleared from memory after use
 
@@ -2231,12 +2346,38 @@ Content-Type: application/json
 
 ## Change Log
 
+### Version 1.18.0 (Draft)
+
+- **Changed**: `stdioServerConfig.container` accepts an optional `@sha256:<64 hex>` suffix, with or without a tag (Section 4.1.2)
+- **Updated**: JSON Schema — container image patterns in both canonical schema copies accept digest-pinned references
+- **Changed**: Generated MCP server configurations preserve explicit, resolved, and mapped container digests instead of stripping them for older gateways
+- **Requires**: MCP Gateway v0.4.36 or later for digest-pinned server images; the default gateway version includes the upstream fix
+
+### Version 1.17.0 (Draft)
+
+- **BREAKING**: Removed `gateway.apiKey` from the specification and published schemas (Sections 4.1.1, 4.1.3, 7.1, 7.2)
+  - The field's terminology was misleading: it represented agent/session identity, not a separately modeled API credential
+  - Replaced by `gateway.agentId` (singular) and `gateway.agentIds` (plural), which are mutually exclusive
+- **Added**: `gateway.agentId` — a single agent/session identifier, equivalent in behavior to the former `apiKey` field (Section 4.1.3.9)
+- **Added**: `gateway.agentIds` — an array of agent/session identifiers (at least one, each a non-empty string), enabling a primary agent and enclave sessions to share one gateway instance while retaining independent DIFC state and policies (Section 4.1.3.9)
+- **Added**: Section 4.1.3.9 — Agent Identifier Configuration (`agentId` / `agentIds`), documenting the mutually exclusive singular/plural forms and the corresponding mcpg TOML spelling `agent_id` / `agent_ids`
+- **Changed**: A gateway configuration MUST select exactly one of `agentId` or `agentIds` (Sections 4.1.3, 4.1.3.9)
+- **Updated**: JSON Schema — `gatewayConfig` definition now requires `port`, `domain`, and exactly one of `agentId`/`agentIds`; `apiKey` removed from both canonical schema copies
+- **Note**: Implementations MAY continue to accept the legacy `api_key`/`apiKey` spelling internally for backward compatibility, but it is no longer part of the normative or published configuration contract
+
+### Version 1.16.0 (Draft)
+
+- **Changed**: `opentelemetry.endpoint` now accepts HTTP or HTTPS OTLP/HTTP collector URLs (Section 4.1.3.7)
+  - Enables runner-local OTLP collectors such as `http://127.0.0.1:4318` for gateway self-telemetry
+  - **Updated**: T-OTEL-004 — now rejects non-HTTP(S) endpoints instead of all non-HTTPS endpoints
+  - **Updated**: JSON Schema — `opentelemetryConfig.endpoint` pattern now accepts `http://` and `https://` URLs in both canonical schema copies
+
 ### Version 1.15.0 (Draft)
 
 - **Added**: Section 4.1.3.8 — `forcePublicRepos` Configuration
   - New optional boolean gateway config field (default: `true`) that forces the allow-only policy to `repos="public"` at runtime when the gateway detects it is running in a public repository
   - Prevents agents from accumulating private-data secrecy tags by restricting repository access at the input side
-  - Set to `false` by the compiler when `private-to-public-flows: allow` is declared in workflow frontmatter
+  - Set to `false` by the compiler when `private-to-public-flows: allow` is declared in workflow frontmatter or when the GitHub MCP backend serves only a static agent enclave
   - Can also be overridden via `MCP_GATEWAY_FORCE_PUBLIC_REPOS=false` environment variable
 - **Added**: `forcePublicRepos` field to the gateway configuration fields table (Section 4.1.3)
 - **Added**: Section 10.8 — Write-Sink Guard Policy (`sink-visibility`)
@@ -2256,37 +2397,29 @@ Content-Type: application/json
 - **Updated**: Compliance Checklist (Section 11.2) — added Write-Sink Guard Policy row (T-WS-*, Level 2, Standard)
 - **Updated**: JSON Schema — added typed `write-sink` property to `guard-policies` in both `stdioServerConfig` and `httpServerConfig`; added `forcePublicRepos` property to `gatewayConfig`
 
-### Version 1.14.0 (Draft)
-
-- **Added**: Section 10 — Guard Policy
-  - Formal specification of the guard policy mechanism for integrity-based content filtering on the GitHub MCP server
-  - Section 10.1 — Overview: describes the purpose and relationship to the integrity filtering reference
-  - Section 10.2 — Integrity Levels: defines `merged`, `approved`, `unapproved`, `none`, and `blocked` levels
-  - Section 10.3 — Guard Policy Fields: field reference table covering `min-integrity`, `allowed-repos`, `blocked-users`, `trusted-users`, `approval-labels`, and `refusal-labels`
-  - Section 10.4 — Effective Integrity Computation: normative 6-step algorithm with precedence rules
-  - Section 10.5 — `approval-labels` Field: semantics, constraints, and configuration example
-  - Section 10.6 — `refusal-labels` Field: new field; semantics, constraints, combined example, and requirements
-  - Section 10.7 — Centralized Management via GitHub Variables: `GH_AW_GITHUB_REFUSAL_LABELS` variable added
-- **Added**: `refusal-labels` guard policy field (Section 10.6)
-  - The inverse of `approval-labels`: items bearing any listed label have effective integrity downgraded to `none`
-  - Overrides `trusted-users` and `approval-labels` promotion; `blocked-users` still takes precedence
-  - Accepts a literal array or a GitHub Actions expression (comma- or newline-separated list)
-  - Empty list is a no-op
-- **Added**: Compliance test category 11.1.11 — Guard Policy Tests (T-GP-001 through T-GP-010)
-  - T-GP-004 through T-GP-008 specifically cover `refusal-labels` behavior
-- **Updated**: Compliance Checklist (Section 11.2) — added Guard Policy row (T-GP-*, Level 2, Standard)
-- **Renumbered**: Former Section 10 (Compliance Testing) is now Section 11; all subsection references updated accordingly
-- **Added**: `GH_AW_GITHUB_REFUSAL_LABELS` to the centralized management variables table (Section 10.7)
-
-### Version 1.14.0 (Draft)
+### Version 1.14.1 (Draft)
 
 - **Breaking**: `headers` field removed from `opentelemetry` configuration in JSON schema and gateway config spec (Section 4.1.3.7)
   - Authentication headers MUST now be provided via the `OTEL_EXPORTER_OTLP_HEADERS` environment variable (standard OTel convention)
   - gh-aw automatically forwards `OTEL_EXPORTER_OTLP_HEADERS` to the mcpg container when `observability.otlp` is configured
   - This keeps credentials out of the stdin JSON config pipe and follows the [OTel SDK environment variable spec](https://opentelemetry.io/docs/specs/otel/protocol/exporter/#configuration-options)
-- **Updated**: T-OTEL-006 — now verifies `OTEL_EXPORTER_OTLP_HEADERS` env var is read and applied (instead of `headers` JSON field)
-- **Updated**: JSON Schema — removed `headers` property from `opentelemetryConfig` definition
+- **Updated**: T-OTEL-006 — now verifies `OTEL_EXPORTER_OTLP_HEADERS` env var is read and applied instead of a `headers` JSON field
+- **Updated**: JSON Schema — removed `headers` property from `opentelemetryConfig`
 - **Updated**: Appendix A.6 and A.7 examples to remove `headers` from JSON config and document env var usage
+
+### Version 1.14.0 (Draft)
+
+- **Added**: Section 10 — Guard Policy, covering the mechanism for integrity-based content filtering on the GitHub MCP server.
+  - Includes the overview, integrity levels, guard policy fields, effective integrity computation algorithm, `approval-labels`, `refusal-labels`, and centralized GitHub variable management.
+- **Added**: `refusal-labels` guard policy field (Section 10.6)
+  - The inverse of `approval-labels`: items bearing any listed label have effective integrity downgraded to `none`
+  - Overrides `trusted-users` and `approval-labels` promotion; `blocked-users` still takes precedence
+  - Accepts a literal array or a GitHub Actions expression (comma- or newline-separated list)
+  - Empty list is a no-op
+- **Added**: Compliance test category 11.1.11 — Guard Policy Tests (T-GP-001 through T-GP-010), including `refusal-labels` coverage in T-GP-004 through T-GP-008
+- **Updated**: Compliance Checklist (Section 11.2) — added Guard Policy row (T-GP-*, Level 2, Standard)
+- **Renumbered**: Former Section 10 (Compliance Testing) is now Section 11; all subsection references updated accordingly
+- **Added**: `GH_AW_GITHUB_REFUSAL_LABELS` to the centralized management variables table (Section 10.7)
 
 ### Version 1.13.0 (Draft)
 
@@ -2309,7 +2442,7 @@ Content-Type: application/json
 - **Added**: Compliance tests T-OTEL-011 and T-OTEL-012 for string-form header parsing
 - **Updated**: JSON Schema `opentelemetryConfig.headers` changed from a plain `object` type to `oneOf [object, string]`
 
-### Version 1.11.0 (Draft)
+### Version 1.11.1 (Draft)
 
 - **Added**: `opentelemetry` field to gateway configuration (Section 4.1.3, 4.1.3.6)
   - Optional object for configuring OpenTelemetry distributed tracing of MCP calls
@@ -2318,10 +2451,7 @@ Content-Type: application/json
   - `traceId`: Parent trace ID (32-char lowercase hex) for W3C trace context propagation
   - `spanId`: Parent span ID (16-char lowercase hex) for W3C trace context propagation
   - `serviceName`: Logical service name in the `service.name` resource attribute (default: `"mcp-gateway"`)
-- **Added**: Section 4.1.3.6 — OpenTelemetry Configuration
-  - Full field reference table with types, requirements, and descriptions
-  - Tracing behavior requirements (span attributes, W3C `traceparent` construction, export protocol)
-  - Failure handling requirements (export failures MUST NOT affect MCP processing)
+- **Added**: Section 4.1.3.6 — OpenTelemetry Configuration, including field requirements, tracing behavior, and failure handling
 - **Added**: Compliance test category 10.1.10 — OpenTelemetry Tests (T-OTEL-001 through T-OTEL-010)
 - **Added**: OpenTelemetry example configurations (Appendix A.6, A.7)
 - **Added**: Normative references for W3C Trace Context and OTLP

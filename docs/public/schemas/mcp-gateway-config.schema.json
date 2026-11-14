@@ -69,7 +69,7 @@
           "type": "string",
           "description": "Container image for the MCP server (e.g., 'ghcr.io/example/mcp-server:latest'). This field is required for stdio servers per MCP Gateway Specification section 4.1.2.",
           "minLength": 1,
-          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9./_-]*(:([a-zA-Z0-9._-]+|latest))?$"
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9./_-]*(:([a-zA-Z0-9._-]+|latest))?(@sha256:[a-fA-F0-9]{64})?$"
         },
         "entrypoint": {
           "type": "string",
@@ -147,6 +147,11 @@
           "pattern": "^https?://.+",
           "minLength": 1
         },
+        "caCertFile": {
+          "type": "string",
+          "minLength": 1,
+          "description": "PEM CA file trusted only for this HTTP server, in addition to system trust. The launcher resolves the host file and mounts it read-only at a gateway-private path."
+        },
         "headers": {
           "type": "object",
           "description": "HTTP headers to include in requests to the external HTTP MCP server. Commonly used for authentication to the external server (e.g., Authorization: 'Bearer ${API_TOKEN}' for servers that require Bearer tokens). Note: This is for authenticating to external HTTP servers, not for gateway client authentication. Values may contain variable expressions using '${VARIABLE_NAME}' syntax.",
@@ -162,6 +167,18 @@
             "type": "string"
           },
           "default": ["*"]
+        },
+        "connectTimeout": {
+          "type": "integer",
+          "description": "Per-transport timeout in seconds while connecting to an HTTP MCP upstream.",
+          "minimum": 1,
+          "default": 30
+        },
+        "toolTimeout": {
+          "type": "integer",
+          "description": "Per-server timeout in seconds for a tool invocation.",
+          "minimum": 1,
+          "default": 60
         },
         "env": {
           "type": "object",
@@ -234,10 +251,31 @@
           ],
           "description": "HTTP server port for the gateway. The gateway exposes endpoints at http://{domain}:{port}/. Can be an integer (1-65535) or a variable expression like '${MCP_GATEWAY_PORT}'."
         },
-        "apiKey": {
+        "agentId": {
           "type": "string",
-          "description": "API key for authentication. When configured, clients must include 'Authorization: <apiKey>' header in all RPC requests (the API key is used directly without Bearer or other scheme prefix). Per MCP Gateway Specification section 7.1, the authorization header format is 'Authorization: <apiKey>' where the API key is the complete header value. API keys must not be logged in plaintext per section 7.2.",
+          "description": "Single agent/session identifier used for authentication and DIFC session-state keying. When configured, clients must include an 'Authorization' header conveying this identifier in all RPC requests; the exact header format (e.g. a bare value or a scheme-prefixed value) is implementation-dependent per MCP Gateway Specification section 7.1. Mutually exclusive with agentIds. Agent identifiers must not be logged in plaintext per section 7.2.",
           "minLength": 1
+        },
+        "agentIds": {
+          "type": "array",
+          "description": "List of agent/session identifiers, enabling a primary agent and enclave sessions to share one gateway instance while retaining independent DIFC state and policies. Each entry may be used as an 'Authorization' header value. Mutually exclusive with agentId. Per MCP Gateway Specification section 4.1.3.9.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "agentPolicies": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "servers": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "tools": { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string", "minLength": 1 } } },
+              "allow-only": { "type": "object" }
+            },
+            "additionalProperties": false
+          }
         },
         "domain": {
           "oneOf": [
@@ -300,7 +338,7 @@
         },
         "forcePublicRepos": {
           "type": "boolean",
-          "description": "When true (default), forces the allow-only policy to repos=\"public\" at runtime if the gateway detects it is running in a public repository. Set to false by the compiler when private-to-public-flows: allow is declared in workflow frontmatter, or via MCP_GATEWAY_FORCE_PUBLIC_REPOS=false environment variable. See MCP Gateway Specification section 4.1.3.8.",
+          "description": "When true (default), forces the allow-only policy to repos=\"public\" at runtime if the gateway detects it is running in a public repository. Set to false by the compiler when private-to-public-flows: allow is declared in workflow frontmatter or when the GitHub MCP backend serves only a static agent enclave, or via MCP_GATEWAY_FORCE_PUBLIC_REPOS=false environment variable. See MCP Gateway Specification section 4.1.3.8.",
           "default": true
         },
         "sinkVisibilityExemptServers": {
@@ -311,7 +349,17 @@
           }
         }
       },
-      "required": ["port", "domain", "apiKey"],
+      "required": ["port", "domain"],
+      "oneOf": [
+        {
+          "required": ["agentId"],
+          "not": { "required": ["agentIds"] }
+        },
+        {
+          "required": ["agentIds"],
+          "not": { "required": ["agentId"] }
+        }
+      ],
       "additionalProperties": false
     },
     "writeSinkGuardPolicyConfig": {
@@ -340,8 +388,8 @@
       "properties": {
         "endpoint": {
           "type": "string",
-          "description": "OTLP/HTTP endpoint URL for the OpenTelemetry collector (e.g., 'https://collector.example.com:4318/v1/traces'). MUST be an HTTPS URL. Supports variable expressions using '${VARIABLE_NAME}' syntax.",
-          "pattern": "^(https://.+|\\$\\{[A-Z_][A-Z0-9_]*\\})$",
+          "description": "OTLP/HTTP endpoint URL for the OpenTelemetry collector (e.g., 'https://collector.example.com:4318/v1/traces' or 'http://127.0.0.1:4318/v1/traces'). MUST be an HTTP or HTTPS URL. Supports variable expressions using '${VARIABLE_NAME}' syntax.",
+          "pattern": "^(https?://.+|\\$\\{[A-Z_][A-Z0-9_]*\\})$",
           "minLength": 1
         },
         "traceId": {
@@ -392,7 +440,7 @@
       "gateway": {
         "port": 8080,
         "domain": "localhost",
-        "apiKey": "gateway-secret-token"
+        "agentId": "gateway-secret-token"
       }
     },
     {
@@ -430,7 +478,7 @@
       "gateway": {
         "port": 8080,
         "domain": "localhost",
-        "apiKey": "gateway-secret-token"
+        "agentId": "gateway-secret-token"
       }
     },
     {
@@ -454,10 +502,25 @@
       "gateway": {
         "port": 8080,
         "domain": "localhost",
-        "apiKey": "gateway-secret-token"
+        "agentId": "gateway-secret-token"
       },
       "customSchemas": {
         "safeinputs": "https://docs.github.com/gh-aw/schemas/mcp-scripts-config.schema.json"
+      }
+    },
+    {
+      "mcpServers": {
+        "github": {
+          "container": "ghcr.io/github/github-mcp-server:latest",
+          "env": {
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+          }
+        }
+      },
+      "gateway": {
+        "port": 8080,
+        "domain": "localhost",
+        "agentIds": ["primary-agent", "enclave-agent"]
       }
     }
   ]

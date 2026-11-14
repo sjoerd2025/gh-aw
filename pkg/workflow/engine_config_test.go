@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -77,6 +78,22 @@ func TestExtractEngineConfig(t *testing.T) {
 			},
 			expectedEngineSetting: "",
 			expectedConfig:        &EngineConfig{MaxToolDenials: "${{ inputs.max-tool-denials }}"},
+		},
+		{
+			name: "top-level max-tool-calls without engine",
+			frontmatter: map[string]any{
+				"max-tool-calls": 24,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxToolCalls: "24"},
+		},
+		{
+			name: "top-level max-tool-calls expression",
+			frontmatter: map[string]any{
+				"max-tool-calls": "${{ inputs.max-tool-calls }}",
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxToolCalls: "${{ inputs.max-tool-calls }}"},
 		},
 		{
 			name: "top-level max-turn-cache-misses without engine",
@@ -204,7 +221,7 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedModel:         "gpt-4o",
 		},
 		{
-			name: "object format - top-level model overrides engine.model",
+			name: "object format - engine.model overrides top-level model",
 			frontmatter: map[string]any{
 				"engine": map[string]any{
 					"id":    "codex",
@@ -214,7 +231,7 @@ func TestExtractEngineConfig(t *testing.T) {
 			},
 			expectedEngineSetting: "codex",
 			expectedConfig:        &EngineConfig{ID: "codex"},
-			expectedModel:         "gpt-5",
+			expectedModel:         "gpt-4o",
 		},
 		{
 			// Empty top-level model: "" must NOT override engine.model.
@@ -345,6 +362,17 @@ func TestExtractEngineConfig(t *testing.T) {
 			},
 			expectedEngineSetting: "copilot",
 			expectedConfig:        &EngineConfig{ID: "copilot", MaxToolDenials: "8"},
+		},
+		{
+			name: "object format - with top-level max-tool-calls",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+				},
+				"max-tool-calls": 24,
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot", MaxToolCalls: "24"},
 		},
 		{
 			name: "object format - top-level max-turns overrides engine max-turns",
@@ -542,6 +570,7 @@ func TestExtractEngineConfig(t *testing.T) {
 						"initial-delay-ms":   10000,
 						"backoff-multiplier": 2,
 						"max-delay-ms":       180000,
+						"watchdog-timeout":   120,
 					},
 				},
 			},
@@ -552,6 +581,7 @@ func TestExtractEngineConfig(t *testing.T) {
 				HarnessInitialDelayMs:    "10000",
 				HarnessBackoffMultiplier: "2",
 				HarnessMaxDelayMs:        "180000",
+				HarnessWatchdogTimeoutMs: "120000",
 			},
 		},
 		{
@@ -564,6 +594,7 @@ func TestExtractEngineConfig(t *testing.T) {
 						"initial-delay-ms":   "${{ vars.RETRY_DELAY }}",
 						"backoff-multiplier": "${{ vars.BACKOFF }}",
 						"max-delay-ms":       "${{ vars.MAX_DELAY }}",
+						"watchdog-timeout":   "${{ vars.WATCHDOG_TIMEOUT_SEC }}",
 					},
 				},
 			},
@@ -574,6 +605,7 @@ func TestExtractEngineConfig(t *testing.T) {
 				HarnessInitialDelayMs:    "${{ vars.RETRY_DELAY }}",
 				HarnessBackoffMultiplier: "${{ vars.BACKOFF }}",
 				HarnessMaxDelayMs:        "${{ vars.MAX_DELAY }}",
+				HarnessWatchdogTimeoutMs: "${{ vars.WATCHDOG_TIMEOUT_SEC }}",
 			},
 		},
 		{
@@ -628,6 +660,9 @@ func TestExtractEngineConfig(t *testing.T) {
 				if config.MaxToolDenials != test.expectedConfig.MaxToolDenials {
 					t.Errorf("Expected config.MaxToolDenials '%s', got '%s'", test.expectedConfig.MaxToolDenials, config.MaxToolDenials)
 				}
+				if config.MaxToolCalls != test.expectedConfig.MaxToolCalls {
+					t.Errorf("Expected config.MaxToolCalls '%s', got '%s'", test.expectedConfig.MaxToolCalls, config.MaxToolCalls)
+				}
 
 				if config.MaxRuns != test.expectedConfig.MaxRuns {
 					t.Errorf("Expected config.MaxRuns '%d', got '%d'", test.expectedConfig.MaxRuns, config.MaxRuns)
@@ -664,6 +699,9 @@ func TestExtractEngineConfig(t *testing.T) {
 				}
 				if config.HarnessMaxDelayMs != test.expectedConfig.HarnessMaxDelayMs {
 					t.Errorf("Expected config.HarnessMaxDelayMs '%s', got '%s'", test.expectedConfig.HarnessMaxDelayMs, config.HarnessMaxDelayMs)
+				}
+				if config.HarnessWatchdogTimeoutMs != test.expectedConfig.HarnessWatchdogTimeoutMs {
+					t.Errorf("Expected config.HarnessWatchdogTimeoutMs '%s', got '%s'", test.expectedConfig.HarnessWatchdogTimeoutMs, config.HarnessWatchdogTimeoutMs)
 				}
 
 				if len(config.Env) != len(test.expectedConfig.Env) {
@@ -760,7 +798,7 @@ func TestExtractEngineConfig_AnthropicWIFMapsToAWFEnv(t *testing.T) {
 		assert.Equal(t, "anthropic", config.Auth.Provider)
 		assert.Equal(t, "fr_01ABC", config.Auth.AnthropicFederationRuleID)
 		assert.Equal(t, "org_01XYZ", config.Auth.AnthropicOrganizationID)
-		assert.Equal(t, "sa_01DEF", config.Auth.AnthropicServiceAccountID)
+		assert.Equal(t, "sa_01DEF", config.Auth.ServiceAccountID)
 		assert.Equal(t, "ws_01GHI", config.Auth.AnthropicWorkspaceID)
 	}
 
@@ -770,6 +808,34 @@ func TestExtractEngineConfig_AnthropicWIFMapsToAWFEnv(t *testing.T) {
 	assert.Equal(t, "org_01XYZ", config.Env["AWF_AUTH_ANTHROPIC_ORGANIZATION_ID"])
 	assert.Equal(t, "sa_01DEF", config.Env["AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID"])
 	assert.Equal(t, "ws_01GHI", config.Env["AWF_AUTH_ANTHROPIC_WORKSPACE_ID"])
+}
+
+func TestExtractEngineConfig_OpenAIWIFMapsToAWFEnv(t *testing.T) {
+	_, config, _ := NewCompiler().ExtractEngineConfig(map[string]any{
+		"engine": map[string]any{
+			"id": "codex",
+			"auth": map[string]any{
+				"type":                 "github-oidc",
+				"provider":             "openai",
+				"identity-provider-id": "idp_01ABC",
+				"service-account-id":   "svc_01DEF",
+				"audience":             "https://api.openai.com/v1",
+			},
+		},
+	})
+
+	assert.NotNil(t, config)
+	if assert.NotNil(t, config.Auth) {
+		assert.Equal(t, "openai", config.Auth.Provider)
+		assert.Equal(t, "idp_01ABC", config.Auth.OpenAIIdentityProviderID)
+		assert.Equal(t, "svc_01DEF", config.Auth.ServiceAccountID)
+	}
+	assert.Equal(t, "github-oidc", config.Env["AWF_AUTH_TYPE"])
+	assert.Equal(t, "openai", config.Env["AWF_AUTH_PROVIDER"])
+	assert.Equal(t, "https://api.openai.com/v1", config.Env["AWF_AUTH_OIDC_AUDIENCE"])
+	assert.Equal(t, "idp_01ABC", config.Env["AWF_AUTH_OPENAI_IDENTITY_PROVIDER_ID"])
+	assert.Equal(t, "svc_01DEF", config.Env["AWF_AUTH_OPENAI_SERVICE_ACCOUNT_ID"])
+	assert.NotContains(t, config.Env, "AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID")
 }
 
 func TestCompileWorkflowWithExtendedEngine(t *testing.T) {
@@ -889,6 +955,191 @@ This is a test workflow.`,
 			}
 		})
 	}
+}
+
+func TestParseWorkflowWithSplitEngineModels(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "split-engine-model-test"), "workflow.md")
+	workflowContent := `---
+on: push
+permissions:
+  contents: read
+strict: false
+engine:
+  id: codex
+model: openai/gpt-4o-mini
+safe-outputs:
+  threat-detection:
+    engine:
+      id: copilot
+      model: gpt-5-mini
+---
+
+# Test Workflow
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	workflowData, err := NewCompiler().ParseWorkflowFile(workflowPath)
+	if err != nil {
+		t.Fatalf("ParseWorkflowFile failed: %v", err)
+	}
+
+	assert.Equal(t, "openai/gpt-4o-mini", workflowData.Model)
+	if assert.NotNil(t, workflowData.SafeOutputs) && assert.NotNil(t, workflowData.SafeOutputs.ThreatDetection) {
+		assert.Equal(t, "gpt-5-mini", workflowData.SafeOutputs.ThreatDetection.Model)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	metadata, legacy, err := ExtractMetadataFromLockFile(string(lockFile))
+	if err != nil {
+		t.Fatalf("ExtractMetadataFromLockFile failed: %v", err)
+	}
+	if metadata == nil {
+		t.Fatal("Expected compiled lock file to contain metadata")
+	}
+	if legacy {
+		t.Fatal("Expected compiled lock file to contain structured metadata")
+	}
+	assert.Equal(t, "openai/gpt-4o-mini", metadata.AgentModel)
+	assert.Equal(t, "gpt-5-mini", metadata.DetectionAgentModel)
+}
+
+// TestCompileClaudeWithExperimentsModel ensures that ${{ experiments.<name> }} used as
+// engine.model is rewritten to a valid GitHub Actions expression everywhere it lands in the
+// compiled lock file, instead of the literal (invalid) `experiments` context reference.
+// Regression test for https://github.com/github/gh-aw/issues/61584.
+func TestCompileClaudeWithExperimentsModel(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "claude-experiments-model-test"), "workflow.md")
+	workflowContent := `---
+on:
+  workflow_dispatch:
+engine:
+  id: claude
+  model: ${{ experiments.model }}
+experiments:
+  model: [sonnet, opus]
+safe-outputs:
+  noop:
+---
+
+# Test Workflow
+
+Write a haiku and say Done.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	lock := string(lockFile)
+
+	// The literal (invalid) "experiments" context must never appear in the compiled workflow.
+	assert.False(t, containsInNonCommentLines(lock, "experiments.model }}"), "the raw experiments.model expression must be rewritten")
+
+	// Within the activation job (same job as the pick-experiment step), the info step must
+	// read the step output directly since a job cannot reference its own outputs via needs.
+	assert.Contains(t, lock, `GH_AW_INFO_MODEL: "${{ steps.pick-experiment.outputs.model }}"`)
+
+	// The pick-experiment step must run before the info step, otherwise its output is not
+	// yet available and the resolved model would be empty at run time.
+	pickIdx := strings.Index(lock, "id: pick-experiment")
+	infoIdx := strings.Index(lock, "id: generate_aw_info")
+	assert.NotEqual(t, -1, pickIdx, "pick-experiment step should be present")
+	assert.NotEqual(t, -1, infoIdx, "generate_aw_info step should be present")
+	assert.Less(t, pickIdx, infoIdx, "experiment selection must precede the agentic run info step")
+	// Everywhere else (agent job env, safe-outputs job env), the activation job's output
+	// must be referenced via the needs context.
+	assert.Contains(t, lock, "ANTHROPIC_MODEL: ${{ needs.activation.outputs.model }}")
+	assert.Contains(t, lock, `GH_AW_ENGINE_MODEL: "${{ needs.activation.outputs.model }}"`)
+}
+
+// TestCompileClaudeWithExperimentsModelSplitField is like TestCompileClaudeWithExperimentsModel
+// but uses the split top-level `model:` field (rather than `engine.model`) to confirm both
+// paths funnel through the same rewrite before the compiled workflow is emitted.
+func TestCompileClaudeWithExperimentsModelSplitField(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "claude-experiments-model-split-test"), "workflow.md")
+	workflowContent := `---
+on:
+  workflow_dispatch:
+engine:
+  id: claude
+model: ${{ experiments.model }}
+experiments:
+  model: [sonnet, opus]
+safe-outputs:
+  noop:
+---
+
+# Test Workflow
+
+Write a haiku and say Done.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	lock := string(lockFile)
+
+	assert.False(t, containsInNonCommentLines(lock, "experiments.model }}"), "the raw experiments.model expression must be rewritten")
+	assert.Contains(t, lock, `GH_AW_INFO_MODEL: "${{ steps.pick-experiment.outputs.model }}"`)
+	assert.Contains(t, lock, "ANTHROPIC_MODEL: ${{ needs.activation.outputs.model }}")
+	assert.Contains(t, lock, `GH_AW_ENGINE_MODEL: "${{ needs.activation.outputs.model }}"`)
+}
+
+func TestCompileCodexWithCopilotModel(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "codex-copilot-model-test"), "workflow.md")
+	workflowContent := `---
+on: push
+permissions:
+  contents: read
+  copilot-requests: write
+strict: false
+engine: codex
+model: copilot/auto
+---
+
+# Test Workflow
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	lock := string(lockFile)
+	assert.Contains(t, lock, "GH_AW_LLM_PROVIDER: github")
+	assert.Contains(t, lock, "COPILOT_GITHUB_TOKEN: ${{ github.token }}")
+	assert.Contains(t, lock, constants.CopilotBYOKDummyAPIKeyEnvVar+": "+constants.CopilotBYOKDummyAPIKey)
+	assert.Contains(t, lock, `export CODEX_API_KEY="$`+constants.CopilotBYOKDummyAPIKeyEnvVar+`"`)
+	assert.Contains(t, lock, "GH_AW_MODEL_AGENT_CODEX: auto")
+	assert.NotContains(t, lock, "secrets.CODEX_API_KEY")
+	assert.NotContains(t, lock, "secrets.OPENAI_API_KEY")
 }
 
 func TestEngineConfigurationWithModel(t *testing.T) {
@@ -1089,6 +1340,92 @@ func TestNilEngineConfig(t *testing.T) {
 	}
 }
 
+func TestEngineDynamicWorkflowsFieldExtraction(t *testing.T) {
+	compiler := NewCompiler()
+	tests := []struct {
+		name    string
+		engine  any
+		enabled bool
+	}{
+		{
+			name:    "engine string uses engine default",
+			engine:  "claude",
+			enabled: false,
+		},
+		{
+			name: "engine object uses engine default",
+			engine: map[string]any{
+				"id": "claude",
+			},
+			enabled: false,
+		},
+		{
+			name: "explicitly enabled",
+			engine: map[string]any{
+				"id":                "claude",
+				"dynamic-workflows": true,
+			},
+			enabled: true,
+		},
+		{
+			name: "explicitly disabled",
+			engine: map[string]any{
+				"id":                "claude",
+				"dynamic-workflows": false,
+			},
+			enabled: false,
+		},
+	}
+
+	for _, engineID := range []string{"claude", "copilot"} {
+		for _, tt := range tests {
+			t.Run(engineID+"/"+tt.name, func(t *testing.T) {
+				engine := tt.engine
+				if object, ok := engine.(map[string]any); ok {
+					engineObject := map[string]any{"id": engineID}
+					if value, exists := object["dynamic-workflows"]; exists {
+						engineObject["dynamic-workflows"] = value
+					}
+					engine = engineObject
+				} else {
+					engine = engineID
+				}
+				_, config, _ := compiler.ExtractEngineConfig(map[string]any{"engine": engine})
+				if !assert.NotNil(t, config) {
+					return
+				}
+				assert.Equal(t, tt.enabled, config.DynamicWorkflowsEnabled())
+			})
+		}
+	}
+}
+
+func TestDynamicWorkflowsEnabledUsesEngineCapability(t *testing.T) {
+	engine := NewClaudeEngine()
+	engine.id = "not-claude"
+	assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+	enabled := true
+	assert.True(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &enabled}))
+
+	disabled := false
+	assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &disabled}))
+
+	engine.capabilities.DynamicWorkflows = false
+	assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+}
+
+func TestDynamicWorkflowsEnabledRequiresOptIn(t *testing.T) {
+	enabled, disabled := true, false
+	for _, engine := range []CodingAgentEngine{NewCopilotEngine(), NewClaudeEngine(), NewCodexEngine()} {
+		t.Run(engine.GetID(), func(t *testing.T) {
+			assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+			assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{}))
+			assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &disabled}))
+			assert.Equal(t, engine.GetCapabilities().DynamicWorkflows, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &enabled}))
+		})
+	}
+}
+
 func TestEngineBareFieldExtraction(t *testing.T) {
 	compiler := NewCompiler()
 
@@ -1284,6 +1621,11 @@ func TestSupportsBareMode(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "pi supports bare mode",
+			engine:   NewPiEngine(),
+			expected: true,
+		},
+		{
 			name:     "codex does not support bare mode",
 			engine:   NewCodexEngine(),
 			expected: false,
@@ -1299,6 +1641,26 @@ func TestSupportsBareMode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, tt.engine.GetCapabilities().BareMode,
 				"BareMode capability should be %v for %s", tt.expected, tt.engine.GetID())
+		})
+	}
+}
+
+func TestSupportsContextWindow(t *testing.T) {
+	tests := []struct {
+		name     string
+		engine   CodingAgentEngine
+		expected bool
+	}{
+		{name: "Claude does not support context-window", engine: NewClaudeEngine()},
+		{name: "Codex does not support context-window", engine: NewCodexEngine()},
+		{name: "Copilot does not support context-window", engine: NewCopilotEngine()},
+		{name: "Gemini does not support context-window", engine: NewGeminiEngine()},
+		{name: "Pi supports context-window", engine: NewPiEngine(), expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.engine.GetCapabilities().ContextWindow)
 		})
 	}
 }

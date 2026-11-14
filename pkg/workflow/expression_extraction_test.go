@@ -111,7 +111,7 @@ func TestExpressionExtractor_ExtractExpressions(t *testing.T) {
 			name:            "experiments.name === value strict-equality form gets transformed to step output",
 			markdown:        `{{#if ${{ experiments.prompt_style === "concise" }} }}foo{{/if}}`,
 			wantCount:       1,
-			wantExpressions: []string{`steps.pick-experiment.outputs.prompt_style === 'concise'`},
+			wantExpressions: []string{`steps.pick-experiment.outputs.prompt_style == 'concise'`},
 		},
 		{
 			name:            "experiments.name != value inequality form gets transformed to step output",
@@ -123,7 +123,7 @@ func TestExpressionExtractor_ExtractExpressions(t *testing.T) {
 			name:            "experiments.name !== value strict-inequality form gets transformed to step output",
 			markdown:        `{{#if ${{ experiments.reasoning_depth !== "multi_candidate" }} }}foo{{/if}}`,
 			wantCount:       1,
-			wantExpressions: []string{`steps.pick-experiment.outputs.reasoning_depth !== 'multi_candidate'`},
+			wantExpressions: []string{`steps.pick-experiment.outputs.reasoning_depth != 'multi_candidate'`},
 		},
 		{
 			name:            "experiments.name == value with single quotes gets transformed to step output",
@@ -141,13 +141,37 @@ func TestExpressionExtractor_ExtractExpressions(t *testing.T) {
 			name:            "aw context syntax sugar gets transformed",
 			markdown:        "Issue: ${{ github.event.issue.number || (github.aw.context.item_type == 'issue' && github.aw.context.item_number) }}",
 			wantCount:       1,
-			wantExpressions: []string{"github.event.issue.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'issue' && fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number)"},
+			wantExpressions: []string{"github.event.issue.number || (fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').item_type == 'issue' && fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').item_number)"},
 		},
 		{
-			name:            "aw context syntax sugar with hyphenated field does not transform",
+			name:            "webhook batch items serialize from normalized context",
+			markdown:        "Items: ${{ toJSON(github.aw.context.items) }}",
+			wantCount:       1,
+			wantExpressions: []string{"toJSON(fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').items)"},
+		},
+		{
+			name:            "nested webhook batch event uses normalized context",
+			markdown:        "Event: ${{ github.aw.context.webhook.event }}",
+			wantCount:       1,
+			wantExpressions: []string{"fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').webhook.event"},
+		},
+		{
+			name:            "aw context syntax sugar supports official hyphenated properties",
 			markdown:        "Issue: ${{ github.aw.context.item-number }}",
 			wantCount:       1,
-			wantExpressions: []string{"github.aw.context.item-number"},
+			wantExpressions: []string{"fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').item-number"},
+		},
+		{
+			name:            "gateway events indexed matching literal",
+			markdown:        "${{ gateway.events[0].payload.filters['closed-states'][0] }}",
+			wantCount:       1,
+			wantExpressions: []string{"fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').webhook.deliveries[0].payload.filters['closed-states'][0]"},
+		},
+		{
+			name:            "gateway events transform leaves string literals alone",
+			markdown:        "${{ gateway.events[0].payload.url == 'gateway.events' }}",
+			wantCount:       1,
+			wantExpressions: []string{"fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').webhook.deliveries[0].payload.url == 'gateway.events'"},
 		},
 		// Parenthesised compound expressions
 		{
@@ -423,8 +447,8 @@ func TestTransformActivationOutputs(t *testing.T) {
 		},
 		{
 			name:     "transform with trailing parenthesis",
-			input:    "func(needs.activation.outputs.text)",
-			expected: "func(steps.sanitized.outputs.text)",
+			input:    "toJSON(needs.activation.outputs.text)",
+			expected: "toJSON(steps.sanitized.outputs.text)",
 		},
 		{
 			name:     "partial match followed by valid match",

@@ -1,5 +1,6 @@
 // @ts-check
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 
 /**
  * mcp_cli_bridge.cjs
@@ -12,9 +13,9 @@ const { getErrorMessage } = require("./error_helpers.cjs");
  *
  * Protocol flow: initialize → notifications/initialized → (periodic ping) → tools/call
  *
- * All interactions are logged via core.* (shim.cjs) to console and
- * appended as JSONL entries to /tmp/gh-aw/mcp-cli-audit/<server>.jsonl
- * for auditing.
+ * Operation metadata is logged via core.* (shim.cjs) and appended as JSONL
+ * entries to /tmp/gh-aw/mcp-cli-audit/<server>.audit.jsonl for auditing. Audit logs
+ * omit payloads and are removed after 24 hours.
  *
  * Usage (called by generated CLI wrappers):
  *   node mcp_cli_bridge.cjs \
@@ -37,15 +38,19 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const { renderToolRecommendedExample, renderToolSignature, summarizeHelpText } = require("./mcp_cli_schema_docs.cjs");
+const { isBlankOptionalField, normalizeBlankOptionalFields } = require("./optional_field_normalizer.cjs");
 
 /** Directory for JSONL audit logs (writable inside AWF sandbox via /tmp mount) */
 const AUDIT_LOG_DIR = "/tmp/gh-aw/mcp-cli-audit";
+const AUDIT_LOG_RETENTION_MS = 24 * 60 * 60 * 1000;
+const SAFE_AUDIT_FIELDS = new Set(["event", "tool", "statusCode", "hasSession", "elapsedMs", "totalElapsedMs", "pingId", "intervalMs", "pid", "toolCount", "argumentBytes", "responseBytes"]);
 
 /** Default timeout (ms) for HTTP calls to the local MCP gateway */
 const DEFAULT_HTTP_TIMEOUT_MS = 15000;
 
 /** Timeout (ms) for tool invocation calls (may be long-running) */
 const TOOL_CALL_TIMEOUT_MS = 120000;
+const TOOLS_LIST_REQUEST_ID = 3;
 /** Default run count for logs MCP calls when count is not provided (mirrors server default) */
 const LOGS_TOOL_DEFAULT_COUNT = 100;
 /** Number of runs per timeout minute for logs auto-scaling (mirrors server: ceil(count/40)) */
@@ -56,6 +61,7 @@ const LOGS_TOOL_MIN_TIMEOUT_MINUTES_NO_FILTER = 5;
 const LOGS_TOOL_MAX_EXPLICIT_TIMEOUT_MINUTES = 60;
 /** Extra time (ms) to allow response marshalling/transport after tool execution */
 const TOOL_CALL_TIMEOUT_BUFFER_MS = 15000;
+const ENCLAVE_BIT_BUDGET_HINT = "Hint: the enclave response schema exceeded the finite-disclosure bit budget. Retry only with a lower-cardinality response schema.";
 
 /** Timeout (ms) for the notifications/initialized handshake step */
 const NOTIFY_TIMEOUT_MS = 10000;
@@ -72,20 +78,65 @@ const TOOL_HELP_MAX_LINES = 30;
 const TOOL_DESC_MAX_LEN = 90;
 const COMPACT_NAME_LINE_TARGET_WIDTH = 110;
 const SAFEOUTPUTS_SERVER_NAME = "safeoutputs";
+const AWF_ENCLAVE_SERVER_NAME = "awf-enclave";
+const DEFERRED_SERVERS_ENV = "GH_AW_MCP_DEFERRED_SERVERS";
+const DEFERRED_TOOLS_LIST_MAX_ATTEMPTS = 5;
+const DEFERRED_TOOLS_LIST_RETRY_DELAY_MS = 1000;
+/** @type {Set<string>} */
+const deferredToolsRefreshExhaustedServers = new Set();
 
 // ---------------------------------------------------------------------------
 // Audit logging
 // ---------------------------------------------------------------------------
 
 /**
- * Ensure the JSONL audit log directory exists.
+ * Ensure the JSONL audit log directory exists and remove expired records.
+ * @param {string} [auditDir]
  */
-function ensureAuditDir() {
+function ensureAuditDir(auditDir = AUDIT_LOG_DIR) {
   try {
-    fs.mkdirSync(AUDIT_LOG_DIR, { recursive: true });
+    fs.mkdirSync(auditDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(auditDir, 0o700);
+    const cutoff = Date.now() - AUDIT_LOG_RETENTION_MS;
+    for (const filename of fs.readdirSync(auditDir)) {
+      const logPath = path.join(auditDir, filename);
+      const stat = fs.lstatSync(logPath);
+      if (stat.isFile() && filename.endsWith(".jsonl") && stat.mtimeMs < cutoff) {
+        fs.rmSync(logPath);
+      }
+    }
   } catch (err) {
     const core = global.core;
-    core.warning(`Failed to create audit log directory ${AUDIT_LOG_DIR}: ${getErrorMessage(err)}`);
+    core.warning(`Failed to prepare audit log directory ${auditDir}: ${getErrorMessage(err)}`);
+  }
+}
+
+/**
+ * Retain only non-payload fields that are safe and useful for diagnostics.
+ * @param {Record<string, unknown>} entry
+ * @returns {Record<string, string | number | boolean>}
+ */
+function sanitizeAuditEntry(entry) {
+  /** @type {Record<string, string | number | boolean>} */
+  const safeEntry = {};
+  for (const [key, value] of Object.entries(entry)) {
+    if (SAFE_AUDIT_FIELDS.has(key) && (typeof value === "string" || typeof value === "number" || typeof value === "boolean")) {
+      safeEntry[key] = value;
+    }
+  }
+  return safeEntry;
+}
+
+/**
+ * Return the serialized UTF-8 size of a value without exposing its content.
+ * @param {unknown} value
+ * @returns {number}
+ */
+function serializedSize(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value) ?? "");
+  } catch {
+    return 0;
   }
 }
 
@@ -94,19 +145,26 @@ function ensureAuditDir() {
  *
  * @param {string} serverName - Server name (used as filename prefix)
  * @param {Record<string, unknown>} entry - Log entry object
+ * @param {string} [auditDir]
  */
-function auditLog(serverName, entry) {
+function auditLog(serverName, entry, auditDir = AUDIT_LOG_DIR) {
+  let fd;
   try {
-    const logPath = path.join(AUDIT_LOG_DIR, `${serverName}.jsonl`);
+    const safeServerName = serverName.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const logPath = path.join(auditDir, `${safeServerName}.audit.jsonl`);
     const record = {
       timestamp: new Date().toISOString(),
       server: serverName,
-      ...entry,
+      ...sanitizeAuditEntry(entry),
     };
-    fs.appendFileSync(logPath, JSON.stringify(record) + "\n", { mode: 0o644 });
+    fd = fs.openSync(logPath, fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600);
+    fs.fchmodSync(fd, 0o600);
+    fs.writeSync(fd, JSON.stringify(record) + "\n");
   } catch (err) {
     const core = global.core;
     core.warning(`Failed to write audit log for ${serverName}: ${getErrorMessage(err)}`);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
 }
 
@@ -191,6 +249,7 @@ function httpPostJSON(urlStr, headers, body, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS
 
     const req = http.request(options, res => {
       let data = "";
+      res.on("error", reject);
       res.on("data", chunk => {
         data += chunk;
       });
@@ -328,12 +387,13 @@ async function mcpNotifyInitialized(serverUrl, apiKey, sessionId, serverName) {
 async function mcpToolsCall(serverUrl, apiKey, sessionId, toolName, toolArgs, serverName) {
   const core = global.core;
   const startMs = Date.now();
-  core.info(`[${serverName}] MCP tools/call: tool=${toolName}, args=${JSON.stringify(toolArgs)}`);
+  const argumentBytes = serializedSize(toolArgs);
+  core.info(`[${serverName}] MCP tools/call: tool=${toolName}, argumentBytes=${argumentBytes}`);
 
   auditLog(serverName, {
     event: "tools_call_start",
     tool: toolName,
-    arguments: toolArgs,
+    argumentBytes,
   });
 
   /** @type {Record<string, string>} */
@@ -363,7 +423,7 @@ async function mcpToolsCall(serverUrl, apiKey, sessionId, toolName, toolArgs, se
     tool: toolName,
     statusCode: resp.statusCode,
     elapsedMs,
-    response: resp.body,
+    responseBytes: serializedSize(resp.body),
   });
 
   return resp;
@@ -375,7 +435,8 @@ async function mcpToolsCall(serverUrl, apiKey, sessionId, toolName, toolArgs, se
  * The logs tool may legitimately run for multiple minutes. The bridge always
  * computes a count-derived floor that mirrors the server's own auto-scaling
  * (`ceil(count / 40)` minutes, with a 5-minute minimum when no `workflow_name`
- * filter is provided — matching `effectiveMCPLogsToolTimeoutMinutes` in
+ * filter is provided, or when an `engine` filter is provided — matching
+ * `effectiveMCPLogsToolTimeoutMinutes` in
  * `mcp_tools_privileged.go`). This floor applies to both the implicit path and
  * any explicit `timeout` argument, so callers that pass a small positive value
  * still receive a bridge deadline that is at least as long as the server's own
@@ -398,9 +459,10 @@ function getToolCallTimeoutMs(toolName, toolArgs) {
   const countCandidate = typeof toolArgs?.count === "number" ? toolArgs.count : NaN;
   const effectiveCount = Number.isFinite(countCandidate) && countCandidate > 0 ? countCandidate : LOGS_TOOL_DEFAULT_COUNT;
   const baseMinutes = Math.ceil(effectiveCount / LOGS_TOOL_RUNS_PER_TIMEOUT_MINUTE);
-  // Without a workflow filter the GitHub API scans all runs and is substantially
-  // slower for large repositories — apply the same 5-minute floor as the server.
-  const floorMinutes = toolArgs?.workflow_name ? baseMinutes : Math.max(LOGS_TOOL_MIN_TIMEOUT_MINUTES_NO_FILTER, baseMinutes);
+  // Without a workflow filter, or when filtering by engine, the GitHub API scans
+  // all runs and is substantially slower for large repositories — apply the same
+  // 5-minute floor as the server.
+  const floorMinutes = toolArgs?.workflow_name && !toolArgs?.engine ? baseMinutes : Math.max(LOGS_TOOL_MIN_TIMEOUT_MINUTES_NO_FILTER, baseMinutes);
   const floorMs = Math.ceil(floorMinutes * 60 * 1000) + TOOL_CALL_TIMEOUT_BUFFER_MS;
 
   // Honor an explicit timeout when present. Reject non-numeric types (e.g.
@@ -557,10 +619,8 @@ function parseBridgeArgs(argv) {
  * - No arguments are provided and stdin is not connected to a terminal (piped JSON payload), or
  * - Any '--key .' or '--key=.' pair is present (per-field stdin mode — raw text for that field).
  *
- * This enables agents to pipe content in multiple ways:
- *   printf '{"issue_number":42,"body":"hello"}' | safeoutputs add_comment .
- *   printf '{"issue_number":42,"body":"hello"}' | safeoutputs add_comment
- *   printf 'Long issue body...' | safeoutputs create_issue --title "Bug" --body .
+ * Full-object stdin uses `safeoutputs <tool> .`; per-field stdin uses
+ * `safeoutputs <tool> --body .`. Stdin support grants no helper-command permissions.
  *
  * @param {string[]} args - User arguments after the tool name
  * @returns {boolean}
@@ -590,20 +650,35 @@ const STDIN_MAX_BYTES = 10 * 1024 * 1024;
  * after bytes have already been collected (to prevent silently returning partial content).
  * Returns an empty string if stdin is empty or if an error occurs before any bytes are read.
  *
+ * @param {boolean} [waitForData] - Whether stdin was explicitly requested
  * @returns {string}
  */
-function readStdinSync() {
+function readStdinSync(waitForData = false) {
   const STDIN_FD = 0;
   /** @type {Buffer[]} */
   const chunks = [];
   const bufSize = 65536;
   let totalBytes = 0;
+  let firstRead = true;
+  let idleSince = Date.now();
+  const retryWait = new Int32Array(new SharedArrayBuffer(4));
   while (true) {
     const buf = Buffer.alloc(bufSize);
     let bytesRead;
+    const isFirstRead = firstRead;
+    firstRead = false;
     try {
       bytesRead = fs.readSync(STDIN_FD, buf, 0, bufSize, null);
     } catch (err) {
+      if (err && typeof err === "object" && (err.code === "EAGAIN" || err.code === "EINTR")) {
+        if (err.code === "EAGAIN" && isFirstRead && !waitForData) return "";
+        if (Date.now() - idleSince >= 30000) {
+          throw new Error("timed out waiting for stdin input", { cause: err });
+        }
+        // Pipes may be nonblocking; a temporary lack of data is not EOF.
+        Atomics.wait(retryWait, 0, 0, 10);
+        continue;
+      }
       // If we have already read some bytes, rethrow so the caller doesn't
       // unknowingly use partial content. An error before any data is read
       // (e.g. stdin is not connected) is treated as empty input.
@@ -613,6 +688,7 @@ function readStdinSync() {
       return "";
     }
     if (bytesRead === 0) break;
+    idleSince = Date.now();
     totalBytes += bytesRead;
     if (totalBytes > STDIN_MAX_BYTES) {
       throw new Error(`stdin input exceeds maximum allowed size of ${STDIN_MAX_BYTES} bytes`);
@@ -631,10 +707,8 @@ function readStdinSync() {
  * extract individual fields without the entire JSON string ending up as the
  * field value.
  *
- * Example: an agent may construct a full payload JSON and still pass individual
- * fields via `--key .`:
- *   printf '{"title":"Fix bug","body":"Details here"}' \
- *     | safeoutputs create_pull_request --title "Fix bug" --body .
+ * A caller may provide a full JSON object on stdin while using
+ * `safeoutputs create_pull_request --title "Fix bug" --body .`.
  * Without this helper the body would be the raw JSON string.  With it, the
  * body is correctly extracted as "Details here".
  *
@@ -680,23 +754,48 @@ function tryExtractJsonFieldFromStdin(trimmedStdin, canonicalKey, schemaProperti
 }
 
 /**
+ * Detect an inline JSON payload candidate: a single positional argument that
+ * is JSON, e.g. `safeoutputs noop '{"message":"done"}'`.
+ *
+ * Returns the trimmed JSON string when the sole positional argument looks like
+ * JSON, otherwise null. The `--json` output flag is ignored regardless of
+ * position when finding the positional argument. Detection is intentionally permissive about
+ * invalid objects and arrays so they produce a loud parse error instead of
+ * being silently skipped as non-flag arguments.
+ *
+ * @param {string[]} args - User arguments after the tool name
+ * @returns {string | null}
+ */
+function findInlineJsonPayloadArg(args) {
+  if (args.some(arg => arg.startsWith("--") && !isJsonFlagToken(arg))) return null;
+  const positionalArgs = args.filter(arg => !isJsonFlagToken(arg));
+  if (positionalArgs.length !== 1) return null;
+  const trimmed = positionalArgs[0].trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return trimmed;
+  try {
+    JSON.parse(trimmed);
+    return trimmed;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Parse user-provided --key value pairs into a tool arguments object.
  * Supports both --key value and --key=value styles.
  * Boolean flags (--key without a value) are set to true.
  *
  * When `stdinContent` is provided and args is empty or `['.']`, the stdin
  * content is parsed as a JSON object and its properties are used as tool
- * arguments directly (JSON payload mode). This enables agents to pipe
- * complex multi-argument payloads without shell quoting issues:
- *   printf '{"issue_number":42,"body":"hello"}' | safeoutputs add_comment .
+ * arguments directly (JSON payload mode). Full-object stdin uses
+ * `safeoutputs <tool> .`.
  *
  * When `stdinContent` is provided and non-empty, any '--key .' or '--key=.'
  * pair substitutes that field's value with stdin.  If stdin is a JSON object
  * that contains the target key, the matching field value is extracted from the
  * JSON instead of using the entire stdin string.  This prevents a common agent
- * mistake where the whole JSON payload ends up as a string field value:
- *   printf '{"title":"Fix bug","body":"Details"}' \
- *     | safeoutputs create_pull_request --title "Fix bug" --body .
+ * mistake where the whole JSON payload ends up as a string field value when
+ * JSON stdin is supplied alongside `safeoutputs <tool> --body .`.
  * When stdin is empty, the '.' is passed through as a literal value.  When
  * stdin is non-empty but the key is absent from the JSON (or stdin is not a
  * JSON object), the entire trimmed stdin string is used as the field value.
@@ -705,33 +804,77 @@ function tryExtractJsonFieldFromStdin(trimmedStdin, canonicalKey, schemaProperti
  * @param {Record<string, {type?: string|string[]}>} [schemaProperties] - Tool input schema properties
  * @param {string | null} [stdinContent] - Pre-read stdin content; used in JSON payload mode
  *   (args empty or `['.']`) and per-field stdin mode (`--key .`).
+ * @param {{rejectPositionalArguments?: boolean, omitBlankOptionalFields?: boolean, requiredFields?: string[]}} [options]
  * @returns {{args: Record<string, unknown>, json: boolean}}
  */
-function parseToolArgs(args, schemaProperties = {}, stdinContent = null) {
+function parseToolArgs(args, schemaProperties = {}, stdinContent = null, options = {}) {
   /** @type {Record<string, unknown>} */
   const result = {};
   let jsonOutput = false;
   const hasSchemaProperties = Object.keys(schemaProperties).length > 0;
   const { normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys } = buildNormalizedSchemaKeyMap(schemaProperties);
+  const normalizeArgs = values => (options.omitBlankOptionalFields ? normalizeBlankOptionalFields(values, schemaProperties, options.requiredFields) : values);
+  const assignFlagValue = (key, rawValue) => {
+    if (options.omitBlankOptionalFields && rawValue.trim() === "") {
+      if (!isBlankOptionalField(rawValue, schemaProperties[key], options.requiredFields?.includes(key), key)) {
+        result[key] = rawValue;
+      }
+      return;
+    }
+    result[key] = coerceToolArgValue(key, rawValue, schemaProperties[key], result[key], !hasSchemaProperties);
+  };
+
+  // Inline JSON payload mode: the whole payload is passed as a single quoted
+  // argument, e.g. `safeoutputs noop '{"message":"done"}'`.  This keeps the
+  // binary first on the command line so a malformed invocation still runs the
+  // CLI and reports an error, unlike the piped `.` sentinel form where a
+  // dropped pipe silently skips the binary entirely.
+  const inlineJsonPayload = findInlineJsonPayloadArg(args);
+  if (inlineJsonPayload !== null) {
+    let parsed;
+    try {
+      parsed = JSON.parse(inlineJsonPayload);
+    } catch (err) {
+      throw new Error(`inline JSON argument is not valid JSON: ${getErrorMessage(err)}. Pass one single-quoted JSON object with newlines encoded as \\n. JSON stdin is also supported with '.'.`, { cause: err });
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("inline JSON argument must be a JSON object. Pass one single-quoted JSON object with newlines encoded as \\n. JSON stdin is also supported with '.'.");
+    }
+    for (const [key, value] of Object.entries(parsed)) {
+      const canonicalKey = resolveSchemaPropertyKey(key, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
+      result[canonicalKey] = value;
+    }
+    return { args: normalizeArgs(result), json: resolveJsonFlag(args) };
+  }
   // Trimmed stdin content used in both JSON payload mode and per-field stdin mode.
   const trimmedStdin = stdinContent !== null ? stdinContent.trim() : null;
+  const isJsonPayloadMode = trimmedStdin !== null && (args.length === 0 || (args.length === 1 && args[0] === "."));
+  const isExplicitJsonSentinel = args.length === 1 && args[0] === ".";
 
   // JSON payload mode: when args is empty or ['.'] and stdinContent is available,
   // parse stdin as a JSON object and use its properties directly as tool arguments.
-  if (trimmedStdin !== null && (args.length === 0 || (args.length === 1 && args[0] === "."))) {
-    if (trimmedStdin) {
+  if (isJsonPayloadMode) {
+    const hasRawStdinBytes = typeof stdinContent === "string" && stdinContent.length > 0;
+    if (isExplicitJsonSentinel || hasRawStdinBytes) {
+      let parsed;
       try {
-        const parsed = JSON.parse(trimmedStdin);
-        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-          for (const [key, value] of Object.entries(parsed)) {
-            const canonicalKey = resolveSchemaPropertyKey(key, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
-            result[canonicalKey] = value;
-          }
-          return { args: result, json: false };
-        }
-      } catch {
-        // Not valid JSON; fall through to normal flag-based argument parsing.
+        parsed = JSON.parse(trimmedStdin ?? "");
+      } catch (err) {
+        const parseError = getErrorMessage(err);
+        throw new Error(
+          `stdin is not valid JSON: ${parseError}. JSON payload mode was requested ${isExplicitJsonSentinel ? "with '.'" : "from piped stdin with no flags"}. Prefer one single-quoted JSON object argument, or correct the stdin JSON. For raw text in one field, use per-field stdin notation such as '--body .' (replace 'body' with the field name).`
+        );
       }
+      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [key, value] of Object.entries(parsed)) {
+          const canonicalKey = resolveSchemaPropertyKey(key, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
+          result[canonicalKey] = value;
+        }
+        return { args: normalizeArgs(result), json: false };
+      }
+      throw new Error(
+        `stdin JSON payload must be an object. JSON payload mode was requested ${isExplicitJsonSentinel ? "with '.'" : "from piped stdin with no flags"}. Prefer one single-quoted JSON object argument, or provide a JSON object on stdin. For raw text in one field, use per-field stdin notation such as '--body .' (replace 'body' with the field name).`
+      );
     }
   }
 
@@ -743,7 +886,7 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null) {
         // --key=value style
         const key = raw.slice(0, eqIdx);
         if (key === "json") {
-          jsonOutput = true;
+          jsonOutput = parseJsonFlagValue(raw.slice(eqIdx + 1));
         } else {
           const canonicalKey = resolveSchemaPropertyKey(key, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
           const rawValue = raw.slice(eqIdx + 1);
@@ -751,7 +894,7 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null) {
             const extracted = tryExtractJsonFieldFromStdin(trimmedStdin, canonicalKey, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
             result[canonicalKey] = extracted !== undefined ? extracted : trimmedStdin;
           } else {
-            result[canonicalKey] = coerceToolArgValue(canonicalKey, rawValue, schemaProperties[canonicalKey], result[canonicalKey], !hasSchemaProperties);
+            assignFlagValue(canonicalKey, rawValue);
           }
         }
       } else if (raw === "json") {
@@ -763,18 +906,59 @@ function parseToolArgs(args, schemaProperties = {}, stdinContent = null) {
           const extracted = tryExtractJsonFieldFromStdin(trimmedStdin, canonicalKey, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
           result[canonicalKey] = extracted !== undefined ? extracted : trimmedStdin;
         } else {
-          result[canonicalKey] = coerceToolArgValue(canonicalKey, rawValue, schemaProperties[canonicalKey], result[canonicalKey], !hasSchemaProperties);
+          assignFlagValue(canonicalKey, rawValue);
         }
         i++;
       } else {
         const canonicalKey = resolveSchemaPropertyKey(raw, schemaProperties, normalizedSchemaKeyMap, ambiguousNormalizedSchemaKeys);
         result[canonicalKey] = true;
       }
+    } else if (options.rejectPositionalArguments) {
+      throw new Error("Unexpected positional argument. Pass a single quoted JSON object or use --key value flags.");
     }
     // Skip non-flag arguments
   }
 
-  return { args: result, json: jsonOutput };
+  return { args: normalizeArgs(result), json: jsonOutput };
+}
+
+/**
+ * @param {string} arg - CLI argument
+ * @returns {boolean}
+ */
+function isJsonFlagToken(arg) {
+  return arg === "--json" || arg.startsWith("--json=");
+}
+
+/**
+ * @param {string} value - Value supplied with --json=
+ * @returns {boolean}
+ */
+function parseJsonFlagValue(value) {
+  const normalizedValue = value.toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalizedValue)) return true;
+  if (["false", "0", "no", "off"].includes(normalizedValue)) return false;
+  throw new Error(`invalid value for --json: '${value}'. Use --json, --json=true, or --json=false.`);
+}
+
+/**
+ * @param {string} arg - CLI argument
+ * @returns {boolean}
+ */
+function jsonFlagIsEnabled(arg) {
+  return arg === "--json" || (arg.startsWith("--json=") && parseJsonFlagValue(arg.slice("--json=".length)));
+}
+
+/**
+ * @param {string[]} args - CLI arguments
+ * @returns {boolean}
+ */
+function resolveJsonFlag(args) {
+  let enabled = false;
+  for (const arg of args) {
+    if (isJsonFlagToken(arg)) enabled = jsonFlagIsEnabled(arg);
+  }
+  return enabled;
 }
 
 /**
@@ -1053,6 +1237,89 @@ function ensureSafeOutputsTools(tools, serverName, toolsFile) {
 }
 
 /**
+ * @param {string} name
+ * @param {string} list
+ * @returns {boolean}
+ */
+function serverInCommaList(name, list) {
+  return list
+    .split(",")
+    .map(item => item.trim())
+    .filter(Boolean)
+    .includes(name);
+}
+
+function isEnclaveBitBudgetExhausted(serverName, message) {
+  return serverName === AWF_ENCLAVE_SERVER_NAME && /bit-budget-exhausted/i.test(message);
+}
+
+/**
+ * Fetch the live tools/list result for a server and persist it over an empty
+ * cache. The awf-enclave server is always treated as deferred, and any server in
+ * GH_AW_MCP_DEFERRED_SERVERS is also treated as deferred. These servers may
+ * register after the wrapper is mounted, so their startup-time cache can
+ * legitimately be empty. The refresh retries bounded attempts before falling
+ * back to the cached tools. If retries are exhausted, a process-local marker
+ * avoids repeating the same bounded retry loop again in this invocation.
+ *
+ * @param {Array<{name: string, description?: string, inputSchema?: {properties?: Record<string, {description?: string, type?: string}>, required?: string[]}}>} tools
+ * @param {string} serverName
+ * @param {string} serverUrl
+ * @param {string} apiKey
+ * @param {string} toolsFile
+ * @param {number} [maxAttempts]
+ * @param {number} [retryDelayMs]
+ * @returns {Promise<Array<{name: string, description?: string, inputSchema?: {properties?: Record<string, {description?: string, type?: string}>, required?: string[]}}>>}
+ */
+async function refreshDeferredToolsIfNeeded(tools, serverName, serverUrl, apiKey, toolsFile, maxAttempts = DEFERRED_TOOLS_LIST_MAX_ATTEMPTS, retryDelayMs = DEFERRED_TOOLS_LIST_RETRY_DELAY_MS) {
+  const isDeferredServer = serverName === AWF_ENCLAVE_SERVER_NAME || serverInCommaList(serverName, process.env[DEFERRED_SERVERS_ENV] || "");
+  if (tools.length > 0 || !isDeferredServer) {
+    return tools;
+  }
+  if (deferredToolsRefreshExhaustedServers.has(serverName)) {
+    global.core.warning(`[${serverName}] deferred tools/list refresh already exhausted in this process; using cached schema`);
+    return tools;
+  }
+  const core = global.core;
+  core.warning(`[${serverName}] cached tool schema is empty for deferred server; refreshing from live gateway`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const sessionId = await mcpInitialize(serverUrl, apiKey, serverName);
+      await mcpNotifyInitialized(serverUrl, apiKey, sessionId, serverName);
+      /** @type {Record<string, string>} */
+      const headers = { Authorization: apiKey };
+      if (sessionId) {
+        headers["Mcp-Session-Id"] = sessionId;
+      }
+      const resp = await httpPostJSON(serverUrl, headers, { jsonrpc: "2.0", id: TOOLS_LIST_REQUEST_ID, method: "tools/list" }, DEFAULT_HTTP_TIMEOUT_MS);
+      const messages = extractJSONRPCMessages(resp.body);
+      const resultMessage = messages.find(isResultMessage);
+      const result = resultMessage && typeof resultMessage === "object" && "result" in resultMessage && resultMessage.result && typeof resultMessage.result === "object" ? resultMessage.result : null;
+      const refreshed = result && "tools" in result && Array.isArray(result.tools) ? result.tools : [];
+      if (refreshed.length > 0) {
+        try {
+          fs.writeFileSync(toolsFile, JSON.stringify(refreshed, null, 2), { mode: 0o644 });
+        } catch (err) {
+          core.warning(`[${serverName}] failed to update refreshed tools cache ${toolsFile}: ${getErrorMessage(err)}`);
+        }
+        deferredToolsRefreshExhaustedServers.delete(serverName);
+        core.info(`[${serverName}] refreshed deferred tools cache with ${refreshed.length} tool(s)`);
+        return refreshed;
+      }
+      core.warning(`[${serverName}] live tools/list attempt ${attempt}/${maxAttempts} returned 0 tools for deferred server`);
+    } catch (err) {
+      core.warning(`[${serverName}] deferred tools/list attempt ${attempt}/${maxAttempts} failed: ${getErrorMessage(err)}`);
+    }
+    if (attempt < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+    }
+  }
+  deferredToolsRefreshExhaustedServers.add(serverName);
+  core.warning(`[${serverName}] deferred tools/list refresh exhausted retries; using cached empty schema`);
+  return tools;
+}
+
+/**
  * Show top-level help: list all available commands for a server.
  *
  * @param {string} serverName - Server name
@@ -1097,7 +1364,9 @@ function showToolHelp(serverName, toolName, tools) {
     ...renderToolSignature(serverName, tool).split("\n"),
     "Recommended:",
     ...renderToolRecommendedExample(serverName, tool).split("\n"),
-    `JSON mode: printf '{"param":"value",...}' | ${serverName} ${toolName} .`,
+    `JSON mode: ${serverName} ${toolName} '{"param":"value",...}' (preferred; encode newlines as \\n, double quotes as \\", backslashes as \\\\, apostrophes as \\u0027)`,
+    `Stdin is also supported: ${serverName} ${toolName} . reads a JSON object; no extra shell permissions are granted.`,
+    `Per-field stdin: cat file | ${serverName} ${toolName} --<field> . substitutes that one field with the raw stdin text verbatim (no JSON escaping needed). Only use the bare '.' form above when the whole stdin is itself a JSON object; never write '.' as a value inside a quoted JSON literal.`,
   ];
 
   const props = tool.inputSchema?.properties;
@@ -1126,16 +1395,26 @@ function showToolHelp(serverName, toolName, tools) {
  * Determine whether the bridge should show tool help instead of invoking the tool
  * with an empty arguments object.
  *
- * safeoutputs tools always require arguments, so any call with an empty argument
- * object is a schema-discovery probe that would otherwise trigger a -32602
- * validation error and encourage wasteful retries.
+ * For safeoutputs tools, help is shown only when the tool schema declares at least
+ * one required field.  Zero-argument tools (empty properties, no required array) and
+ * optional-only tools are valid and should proceed to MCP tools/call.  A missing or
+ * malformed cached schema is treated conservatively as no-required so the MCP server
+ * remains authoritative; it can return the appropriate protocol error if needed.
  *
  * @param {string} serverName
  * @param {Record<string, unknown>} toolArgs
+ * @param {{inputSchema?: {required?: string[]}} | null | undefined} matchedTool - resolved tool definition from the cached tool schema
  * @returns {boolean}
  */
-function shouldShowToolHelpForEmptyArgs(serverName, toolArgs) {
-  return serverName === SAFEOUTPUTS_SERVER_NAME && Object.keys(toolArgs).length === 0;
+function shouldShowToolHelpForEmptyArgs(serverName, toolArgs, matchedTool) {
+  if (serverName !== SAFEOUTPUTS_SERVER_NAME || Object.keys(toolArgs).length !== 0) {
+    return false;
+  }
+  // Show help only when the schema explicitly declares required fields.
+  // Zero-argument and optional-only tools have no required array (or an empty one)
+  // and must be allowed to call through to MCP so their output item is recorded.
+  const required = matchedTool && matchedTool.inputSchema && Array.isArray(matchedTool.inputSchema.required) ? matchedTool.inputSchema.required : [];
+  return required.length > 0;
 }
 
 /**
@@ -1225,19 +1504,11 @@ function extractJSONRPCMessages(responseBody) {
 
   /** @type {unknown[]} */
   const messages = [];
-  for (const line of trimmed.split(/\r?\n/)) {
-    if (!line.startsWith("data:")) {
-      continue;
-    }
-    const payload = line.slice(5).trim();
-    if (!payload || payload === "[DONE]") {
-      continue;
-    }
-    try {
-      messages.push(JSON.parse(payload));
-    } catch {
-      // Ignore non-JSON SSE data lines.
-    }
+  for (const event of iterateJsonlEvents(trimmed, {
+    lineFilter: line => line.startsWith("data:"),
+    lineTransform: line => line.slice(5),
+  })) {
+    if (event.type === "json" && event.rawLine.startsWith("data:")) messages.push(event.value);
   }
 
   return messages;
@@ -1319,10 +1590,13 @@ async function formatResponse(responseBody, serverName, toolName = "") {
     const message = "message" in errRecord ? String(errRecord.message || "Unknown error") : "Unknown error";
     const code = "code" in errRecord && errRecord.code != null ? String(errRecord.code) : "";
     const isSafeOutputsEmptyArgs = serverName === SAFEOUTPUTS_SERVER_NAME && code === "-32602" && /Empty arguments are not allowed/i.test(message);
+    const isEnclaveBitBudget = isEnclaveBitBudgetExhausted(serverName, message);
     const hint =
       isSafeOutputsEmptyArgs && toolName
         ? `Hint: do not retry '${serverName} ${toolName}' with empty arguments. Run '${serverName} ${toolName} --help' to inspect the required options, or call 'noop' with a message if no action is needed.`
-        : "";
+        : isEnclaveBitBudget
+          ? ENCLAVE_BIT_BUDGET_HINT
+          : "";
     const errText = code ? `Error [${code}]: ${message}` : `Error: ${message}`;
     process.stderr.write(errText + "\n");
     auditLog(serverName, { event: "tool_error", error: errText });
@@ -1350,6 +1624,9 @@ async function formatResponse(responseBody, serverName, toolName = "") {
       const output = outputParts.join("\n");
       if (isErrorResult) {
         process.stderr.write(output + "\n");
+        if (isEnclaveBitBudgetExhausted(serverName, output)) {
+          process.stderr.write(ENCLAVE_BIT_BUDGET_HINT + "\n");
+        }
         auditLog(serverName, { event: "tool_error", error: output });
         core.setFailed(`[${serverName}] Tool returned isError=true: ${output.length} chars`);
         return;
@@ -1363,6 +1640,9 @@ async function formatResponse(responseBody, serverName, toolName = "") {
     const resultStr = typeof result === "string" ? result : JSON.stringify(result);
     if (isErrorResult) {
       process.stderr.write(resultStr + "\n");
+      if (isEnclaveBitBudgetExhausted(serverName, resultStr)) {
+        process.stderr.write(ENCLAVE_BIT_BUDGET_HINT + "\n");
+      }
       auditLog(serverName, { event: "tool_error", error: resultStr });
       core.setFailed(`[${serverName}] Tool returned isError=true`);
       return;
@@ -1392,17 +1672,15 @@ async function main() {
 
   ensureAuditDir();
 
-  core.info(`[${serverName}] Bridge invoked: url=${serverUrl}, toolsFile=${toolsFile}, userArgs=${JSON.stringify(userArgs)}`);
+  core.info(`[${serverName}] Bridge invoked: argumentCount=${Math.max(0, userArgs.length - 1)}`);
   auditLog(serverName, {
     event: "bridge_invoked",
-    url: serverUrl,
-    toolsFile,
-    userArgs,
     pid: process.pid,
   });
 
   // Load cached tools for help display
-  const tools = ensureSafeOutputsTools(loadTools(toolsFile), serverName, toolsFile);
+  let tools = await refreshDeferredToolsIfNeeded(loadTools(toolsFile), serverName, serverUrl, apiKey, toolsFile);
+  tools = ensureSafeOutputsTools(tools, serverName, toolsFile);
 
   // Route: --help or no args → show top-level help
   if (userArgs.length === 0 || userArgs[0] === "--help" || userArgs[0] === "-h") {
@@ -1414,6 +1692,7 @@ async function main() {
 
   const toolName = userArgs[0];
   const toolUserArgs = userArgs.slice(1);
+  const shouldReadStdin = hasStdinJsonPayload(toolUserArgs);
 
   // Route: <command> --help → show command-specific help
   if (toolUserArgs.length > 0 && (toolUserArgs[0] === "--help" || toolUserArgs[0] === "-h")) {
@@ -1428,18 +1707,39 @@ async function main() {
   const schemaProperties = matchedTool && matchedTool.inputSchema && matchedTool.inputSchema.properties ? matchedTool.inputSchema.properties : {};
 
   // Pre-read stdin when JSON payload mode is triggered ('.' sentinel or no args with piped stdin).
-  const stdinContent = hasStdinJsonPayload(toolUserArgs) ? readStdinSync() : null;
-  const { args: toolArgs, json: jsonOutput } = parseToolArgs(toolUserArgs, schemaProperties, stdinContent);
+  const stdinContent = shouldReadStdin ? readStdinSync(toolUserArgs.length > 0) : null;
+  if (shouldReadStdin) {
+    const stdinBytes = stdinContent !== null ? Buffer.byteLength(stdinContent, "utf8") : 0;
+    core.info(`[${serverName}] Stdin captured: ${stdinBytes} bytes`);
+  }
+  /** @type {{args: Record<string, unknown>, json: boolean}} */
+  let parsedArgs;
+  try {
+    // Other MCP bridges retain positional syntax; safeoutputs maps CLI arguments to a strict tool schema.
+    parsedArgs = parseToolArgs(toolUserArgs, schemaProperties, stdinContent, {
+      rejectPositionalArguments: serverName === SAFEOUTPUTS_SERVER_NAME,
+      omitBlankOptionalFields: serverName === SAFEOUTPUTS_SERVER_NAME,
+      requiredFields: matchedTool?.inputSchema?.required || [],
+    });
+  } catch (err) {
+    const message = getErrorMessage(err);
+    auditLog(serverName, { event: "parse_args_error", tool: toolName, error: message });
+    process.stderr.write(`Error: ${message}\n`);
+    core.setFailed(`[${serverName}] Argument parsing failed: ${message}`);
+    return;
+  }
+  const { args: toolArgs, json: jsonOutput } = parsedArgs;
 
-  if (shouldShowToolHelpForEmptyArgs(serverName, toolArgs)) {
+  if (shouldShowToolHelpForEmptyArgs(serverName, toolArgs, matchedTool)) {
     core.warning(`[${serverName}] No arguments provided for '${toolName}'; showing command help instead of calling the tool`);
     auditLog(serverName, { event: "show_tool_help_empty_args", tool: toolName });
     showToolHelp(serverName, toolName, tools);
     return;
   }
 
-  core.info(`[${serverName}] Calling tool '${toolName}' with args: ${JSON.stringify(toolArgs)}${jsonOutput ? " (--json)" : ""}`);
-  auditLog(serverName, { event: "call_start", tool: toolName, arguments: toolArgs });
+  const argumentBytes = serializedSize(toolArgs);
+  core.info(`[${serverName}] Calling tool '${toolName}' (${argumentBytes} argument bytes${jsonOutput ? ", JSON output" : ""})`);
+  auditLog(serverName, { event: "call_start", tool: toolName, argumentBytes });
 
   const callStartMs = Date.now();
   /** @type {(() => void) | null} */
@@ -1514,8 +1814,15 @@ module.exports = {
   showToolHelp,
   shouldShowToolHelpForEmptyArgs,
   hasStdinJsonPayload,
+  findInlineJsonPayloadArg,
   readStdinSync,
   ensureSafeOutputsTools,
+  refreshDeferredToolsIfNeeded,
+  serverInCommaList,
   getToolCallTimeoutMs,
+  auditLog,
+  ensureAuditDir,
+  sanitizeAuditEntry,
+  serializedSize,
   main,
 };

@@ -14,9 +14,20 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	if err != nil {
 		return err
 	}
+	if err := c.generateLedgerProjectionStep(yaml, data); err != nil {
+		return err
+	}
+	compilerYamlLog.Printf("Initial and checkout steps generated (needsCheckout=%v)", needsCheckout)
+
+	for _, line := range generateComponentExecutionEvidenceStep("agent", "not_started", agentExecutionEvidencePath, "") {
+		yaml.WriteString(line)
+	}
 
 	// Phase 2: Runtime detection, custom steps, and workspace setup
-	customStepsContainCheckout := c.generateRuntimeAndWorkspaceSetupSteps(yaml, data, needsCheckout)
+	customStepsContainCheckout, err := c.generateRuntimeAndWorkspaceSetupSteps(yaml, data, needsCheckout)
+	if err != nil {
+		return err
+	}
 	needsGitConfig := needsCheckout || customStepsContainCheckout
 
 	// Phase 3: Engine installation, MCP setup, and pre-agent preparation
@@ -29,7 +40,9 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	// can reuse the pre-computed value instead of re-running the expensive map+sort
 	// operation inside each engine's domain helper.  The result is stored on WorkflowData
 	// and is also used later by generateOutputCollectionStep.
-	_, _ = c.computeAllowedDomainsForSanitization(data)
+	if _, err := c.computeAllowedDomainsForFirewall(data); err != nil {
+		return err
+	}
 
 	// Phase 4: Agent execution and immediate post-agent steps
 	artifactPaths, logFileFull, err := c.generateAgentRunSteps(yaml, data, engine, needsGitConfig)
@@ -38,5 +51,6 @@ func (c *Compiler) generateMainJobSteps(yaml *strings.Builder, data *WorkflowDat
 	}
 
 	// Phase 5: Artifact collection, log parsing, upload, and cleanup
+	compilerYamlLog.Printf("Main job steps generation complete for workflow: %s", data.Name)
 	return c.generatePostAgentCollectionAndUpload(yaml, data, engine, artifactPaths, logFileFull, checkoutMgr)
 }

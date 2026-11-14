@@ -60,7 +60,7 @@ func ExtractMapField(frontmatter map[string]any, key string) map[string]any {
 
 // ToMap converts FrontmatterConfig back to map[string]any for backward compatibility
 // This allows gradual migration from map[string]any to strongly-typed config
-func (fc *FrontmatterConfig) ToMap() map[string]any {
+func (fc *FrontmatterConfig) ToMap() map[string]any { //nolint:largefunc // Serialization preserves backwards-compatible field ordering.
 	frontmatterTypesLog.Printf("Converting FrontmatterConfig to map: name=%s", fc.Name)
 	result := make(map[string]any)
 
@@ -70,6 +70,9 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	}
 	if fc.Description != "" {
 		result["description"] = fc.Description
+	}
+	if fc.Intent != "" {
+		result["intent"] = fc.Intent
 	}
 	if fc.Engine != nil {
 		result["engine"] = fc.Engine
@@ -83,8 +86,8 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.TrackerID != "" {
 		result["tracker-id"] = fc.TrackerID
 	}
-	if fc.Version != "" {
-		result["version"] = fc.Version
+	if fc.TokenBroker != nil {
+		result["token-broker"] = fc.TokenBroker
 	}
 	if fc.TimeoutMinutes != nil {
 		result["timeout-minutes"] = fc.TimeoutMinutes.ToValue()
@@ -94,6 +97,12 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	}
 	if len(fc.Labels) > 0 {
 		result["labels"] = fc.Labels
+	}
+	if len(fc.AmbientFolders) > 0 {
+		result["ambient-folders"] = fc.AmbientFolders
+	}
+	if fc.GitHubApp != nil {
+		result["github-app"] = githubAppConfigToMap(fc.GitHubApp)
 	}
 
 	// Configuration sections
@@ -120,6 +129,9 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 		// Convert MCPScriptsConfig to map - would need a ToMap method
 		result["mcp-scripts"] = fc.MCPScripts
 	}
+	if len(fc.Enclaves) > 0 {
+		result["enclaves"] = fc.Enclaves
+	}
 
 	// Event and trigger configuration
 	if fc.On != nil {
@@ -142,7 +154,7 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Network != nil {
 		// Convert NetworkPermissions to map format
 		// If allowed list is just ["defaults"], convert to string format "defaults"
-		if len(fc.Network.Allowed) == 1 && fc.Network.Allowed[0] == "defaults" && !fc.Network.AllowedInput && fc.Network.Firewall == nil && len(fc.Network.Blocked) == 0 {
+		if len(fc.Network.Allowed) == 1 && fc.Network.Allowed[0] == "defaults" && !fc.Network.AllowedInput && fc.Network.Firewall == nil && fc.Network.HostedWeb == nil && len(fc.Network.Blocked) == 0 { //nolint:uncheckedsliceindex // The length check ensures index zero exists.
 			result["network"] = "defaults"
 		} else {
 			networkMap := make(map[string]any)
@@ -154,6 +166,13 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 			}
 			if len(fc.Network.Blocked) > 0 {
 				networkMap["blocked"] = fc.Network.Blocked
+			}
+			if fc.Network.HostedWeb != nil {
+				if fc.Network.HostedWeb.Enabled {
+					networkMap["hosted-web"] = fc.Network.HostedWeb
+				} else {
+					networkMap["hosted-web"] = false
+				}
 			}
 			if fc.Network.Firewall != nil {
 				networkMap["firewall"] = fc.Network.Firewall
@@ -217,9 +236,6 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 	if fc.Imports != nil {
 		result["imports"] = fc.Imports
 	}
-	if fc.Include != nil {
-		result["include"] = fc.Include
-	}
 
 	// Metadata
 	if fc.Metadata != nil {
@@ -229,6 +245,37 @@ func (fc *FrontmatterConfig) ToMap() map[string]any {
 		result["secret-masking"] = fc.SecretMasking
 	}
 
+	return result
+}
+
+func githubAppConfigToMap(app *GitHubAppConfig) map[string]any {
+	result := make(map[string]any)
+	if app.AppID != "" {
+		result["client-id"] = app.AppID
+	}
+	if app.PrivateKey != "" {
+		result["private-key"] = app.PrivateKey
+	}
+	if app.IgnoreIfMissing {
+		result["ignore-if-missing"] = true
+	}
+	if app.Owner != "" {
+		result["owner"] = app.Owner
+	}
+	if len(app.Repositories) > 0 {
+		repositories := make([]any, 0, len(app.Repositories))
+		for _, repository := range app.Repositories {
+			repositories = append(repositories, repository)
+		}
+		result["repositories"] = repositories
+	}
+	if len(app.Permissions) > 0 {
+		permissions := make(map[string]any, len(app.Permissions))
+		for permission, level := range app.Permissions {
+			permissions[permission] = level
+		}
+		result["permissions"] = permissions
+	}
 	return result
 }
 
@@ -312,7 +359,7 @@ func runtimesConfigToMap(config *RuntimesConfig) map[string]any {
 }
 
 // permissionsConfigToMap converts PermissionsConfig back to map[string]any
-func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
+func permissionsConfigToMap(config *PermissionsConfig) map[string]any { //nolint:largefunc // Permission scopes remain an explicit mapping.
 	if config == nil {
 		return nil
 	}
@@ -333,6 +380,9 @@ func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
 	if config.Checks != "" {
 		result["checks"] = config.Checks
 	}
+	if config.CodeQuality != "" {
+		result["code-quality"] = config.CodeQuality
+	}
 	if config.Contents != "" {
 		result["contents"] = config.Contents
 	}
@@ -347,6 +397,9 @@ func permissionsConfigToMap(config *PermissionsConfig) map[string]any {
 	}
 	if config.Discussions != "" {
 		result["discussions"] = config.Discussions
+	}
+	if config.Drives != "" {
+		result["drives"] = config.Drives
 	}
 	if config.Packages != "" {
 		result["packages"] = config.Packages

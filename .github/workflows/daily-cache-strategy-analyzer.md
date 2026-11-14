@@ -14,15 +14,16 @@ permissions:
   pull-requests: read
   discussions: read
 tracker-id: daily-cache-strategy-analyzer
-model: "${{ needs.activation.outputs.model_size }}"
+model: openai/gpt-6-luna
 engine:
   id: codex
+  model-provider: openai
 strict: true
 experiments:
   model_size:
-    variants: [gpt-5.4, gpt-5.4-mini]
+    variants: [gpt-5.3-codex, gpt-5.3-codex-spark]
     description: "Compares codex-compatible models for cache issue detection quality and efficiency."
-    hypothesis: "H0: no change in issue creation rate or run success rate. H1: gpt-5.4-mini reduces AI Credits while keeping run success rate >=0.90."
+    hypothesis: "H0: no change in issue creation rate or run success rate. H1: gpt-5.3-codex-spark reduces AI Credits while keeping run success rate >=0.90."
     metric: ai_credits_total
     secondary_metrics: [run_success_rate, run_duration_ms]
     guardrail_metrics:
@@ -39,12 +40,12 @@ network:
     - "api.github.com"
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cache-memory: true
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
 safe-outputs:
   create-issue:
     expires: 7d
@@ -60,6 +61,7 @@ safe-outputs:
     close-older-discussions: true
 timeout-minutes: 60
 imports:
+  - uses: shared/aw-logs-24h-fetch-setup.md
   - uses: shared/meta-analysis-base.md
     with:
       toolsets: [default, actions]
@@ -102,7 +104,7 @@ Review the last 24 hours of agentic workflow logs, **focusing exclusively on wor
 └── cache-strategy/
     ├── index.json              # Master list: workflow → last-seen findings
     ├── runs.json               # Per-run cache hit/miss records (rolling 30 days)
-    └── known-issues.json       # Issues already created (title → issue_number)
+    └── known-issues.json       # Issues already created (workflow_id → issue_number)
 ```
 
 ### Initialize or Load
@@ -110,41 +112,56 @@ Review the last 24 hours of agentic workflow logs, **focusing exclusively on wor
 1. Check whether the cache directory exists:
 
 ```bash
-if [ -d /tmp/gh-aw/cache-memory/cache-strategy ]; then
-  echo "Cache exists"
-else
-  mkdir -p /tmp/gh-aw/cache-memory/cache-strategy
-  echo '{}' > /tmp/gh-aw/cache-memory/cache-strategy/index.json
+mkdir -p /tmp/gh-aw/cache-memory/cache-strategy
+for file in index known-issues; do
+  if [ ! -f "/tmp/gh-aw/cache-memory/cache-strategy/$file.json" ]; then
+    echo '{}' > "/tmp/gh-aw/cache-memory/cache-strategy/$file.json"
+  fi
+done
+if [ ! -f /tmp/gh-aw/cache-memory/cache-strategy/runs.json ]; then
   echo '[]' > /tmp/gh-aw/cache-memory/cache-strategy/runs.json
-  echo '{}' > /tmp/gh-aw/cache-memory/cache-strategy/known-issues.json
-  echo "Initialized new cache"
 fi
 ```
 
-> **Important**: An absent or empty `cache-strategy/` directory at startup is **expected and normal** for the first few runs of this workflow or after a cache reset. See the [**When to Call `missing_data`**](#when-to-call-missing_data) section for guidance.
+> **Important**: An absent or empty `cache-strategy/` directory at startup is **expected and normal** for the first few runs of this workflow or after a cache reset. See the [**When to Call `report_missing_data`**](#when-to-call-report_missing_data) section for guidance.
 
 2. Load:
-   - `index.json` — map of `workflow_name → { last_analyzed, miss_streak, miss_rate, last_cache_hit_run_id }`
-   - `runs.json` — array of run records appended each day (prune entries older than 30 days)
-   - `known-issues.json` — map of `issue_title → issue_number` to avoid duplicate issues
+   - `index.json` — map of `workflow_id → { last_analyzed, miss_streak, miss_rate, last_cache_hit_run_id }`
+   - `runs.json` — per-run evidence records (prune entries older than 30 days)
+   - `known-issues.json` — map of `workflow_id → issue_number` to avoid duplicate issues
+   - Use the repository-relative workflow source path as `workflow_id`, not the
+     display name or issue title. Resolve it from run metadata and normalize
+     `.lock.yml` to `.md`. Migrate legacy display-name/title keys only when their
+     mapping to a source path is unambiguous; otherwise leave them unresolved.
+
+3. Before aggregation, migrate legacy `runs.json` records whose identity is in
+   `workflow` rather than `workflow_id`. Keep an existing canonical
+   `workflow_id`; otherwise resolve `workflow` only when it is an exact
+   repository-relative workflow source path (normalize `.lock.yml` to `.md` if
+   that source exists), or an exact display name mapped to one source path by
+   that run's metadata. Do not infer identity from similar titles. Replace a
+   uniquely resolved legacy `workflow` with `workflow_id`, preserve its run
+   fields, then upsert by `(workflow_id, run_id, run_attempt)`. Repeating this
+   migration must not change an already canonical record or create a duplicate.
+
+   Apply the same exact, one-to-one mapping to legacy `index.json` keys. Move
+   resolved entries to the canonical source-path key and retain their existing
+   dates and metrics; recompute derived streaks and rates only from deduplicated
+   observed run records. If both legacy and canonical entries map to one key,
+   keep the newest `last_analyzed` and prefer metrics derived from observed
+   records; do not add legacy streaks together. Preserve unresolved records and
+   keys verbatim under their legacy identities, exclude them from canonical
+   statistics, and report history as incomplete rather than treating missing
+   mappings as a reset or a healthy cache. Persist the migration so subsequent
+   runs are idempotent.
 
 ---
 
 ## Phase 1: Download Recent Workflow Logs
 
-Use the `agentic-workflows` MCP `logs` tool to fetch logs from the last 24 hours.
+{{#runtime-import? shared/aw-logs-24h-fetch-prompt.md}}
 
-**Tool**: `logs`
-**Parameters**:
-```json
-{
-  "count": 200,
-  "start_date": "-1d",
-  "parse": true
-}
-```
-
-Logs are saved to `/tmp/gh-aw/aw-mcp/logs/`. Each run directory contains:
+Logs are available in `/tmp/gh-aw/aw-mcp/logs/`. Each run directory contains:
 
 ```
 /tmp/gh-aw/aw-mcp/logs/run-<id>/
@@ -159,28 +176,26 @@ Logs are saved to `/tmp/gh-aw/aw-mcp/logs/`. Each run directory contains:
 
 **Only process runs where `uses_cache_memory` is `true`.** Skip any run whose `aw_info.json` does not declare `cache-memory`.
 
-For each run directory, read `aw_info.json` to filter to cache-memory workflows, then scan agent logs for issues:
+The pre-fetch contains **metadata and usage only**, not necessarily transcripts.
+Group runs by `workflow_id` and prioritize workflows by total agent input tokens
+from usage metadata. For likely offenders, retrieve existing agent/session
+evidence with `audit` and the `agent`/`usage` artifact sets; reuse downloaded
+`usage/aw_session.jsonl`, `agent-session.jsonl`, or `agent-stdio.log`.
+Do not download the entire fleet's transcripts. If collection is unavailable or
+partial, report evidence as **unknown**, not a cache miss or healthy cache.
 
-```bash
-for run_dir in /tmp/gh-aw/aw-mcp/logs/run-*/; do
-  info="$run_dir/aw_info.json"
-  [ -f "$info" ] || continue
-  workflow=$(jq -r '.workflow_name // .workflow // "unknown"' "$info")
-  uses_cache=$(jq -r 'if .tools.cache_memory or (.tools | to_entries[] | select(.key | test("cache.memory"; "i"))) then "yes" else "no" end' "$info" 2>/dev/null || echo "no")
-  [ "$uses_cache" = "yes" ] || continue
-  # Scan for cache miss signals
-  grep -ri --include="*.log" --include="*.txt" \
-    -e "cache miss" -e "cache not found" -e "Initializing new cache" \
-    -e "no cache found" -e "mkdir -p.*cache-memory" \
-    "$run_dir/agent/" 2>/dev/null | head -20
-done
-```
+Inspect actual tool results and successful file reads/writes, not echoed prompts,
+command arguments, or source snippets. Include named cache roots such as
+`/tmp/gh-aw/cache-memory-focus-areas/`, as declared by the workflow's cache IDs.
+Check current source and imports: exclude workflows that have since disabled
+cache-memory. Keep evidence from older source revisions separate from runs of
+the fixed revision; do not let pre-fix misses form a post-fix streak.
 
-**Cache miss signals** (any of these in agent logs):
+**Cache miss signals** (confirmed by executed operations or their results):
 
 | Signal | Log Pattern |
 |--------|-------------|
-| Cache directory created fresh | `mkdir -p.*cache-memory` followed by no `ls` showing existing files |
+| Missing state file | Failed read or existence check showing the workflow's reusable state file is absent |
 | Explicit miss log | `Cache miss`, `cache not found`, `Initializing new cache`, `no cache found` |
 | Full re-computation | Workflow re-runs identical expensive operations without referencing cached results |
 | Cache key mismatch | Log lines mentioning stale or incompatible cache keys |
@@ -195,6 +210,11 @@ done
 - Overwrites history on every run (full replace instead of incremental append)
 
 Check `aw_info.json` cache-memory configuration and agent output logs for these patterns.
+`mkdir -p` alone is idempotent setup, not evidence of a miss. A cache hit requires
+a successful read of reusable state, not just an existing directory or a write.
+Only claim unused caching after inspecting a complete successful agent session
+and its pre/post-agent cache operations. Failed, skipped, or incomplete runs
+cannot establish that a workflow never reads or writes its cache.
 
 ---
 
@@ -202,20 +222,29 @@ Check `aw_info.json` cache-memory configuration and agent output logs for these 
 
 Load `runs.json` and `index.json` from cache-memory to identify **patterns across days**:
 
-1. **Miss streak**: How many consecutive days did a workflow experience a cache miss?
+1. **Miss streak**: How many consecutive observed days did a workflow experience a cache miss?
    - Threshold for issue creation: ≥ 3 consecutive misses
 2. **Miss rate**: What percentage of runs in the last 14 days had a cache miss?
    - Threshold for issue creation: ≥ 50% miss rate over 14 days
 3. **Last cache hit**: When did this workflow last successfully read from cache?
-   - Threshold for issue creation: No cache hit in the last 7 days despite `cache-memory: true`
+   - Context only, not an independent issue threshold. An old or absent hit date
+     with zero observed misses or unavailable transcripts is not a finding.
 
-Update `runs.json` by appending today's run records:
+Upsert `runs.json` by `(workflow_id, run_id, run_attempt)` so overlapping downloads
+and repeated audits never count a run twice. Store `evidence_status` as
+`observed` or `unknown`; calculate rates only from observed hit/miss records.
+Unknown evidence and days with no run do not advance a streak. A successful
+reusable-state read resets it; unknown evidence breaks confirmation of a
+consecutive miss streak. Aggregate multiple runs on a day once; any hit prevents
+that day from counting as an all-miss day.
 
 ```json
 {
   "date": "YYYY-MM-DD",
   "run_id": "12345678",
-  "workflow": "my-workflow",
+  "workflow_id": ".github/workflows/my-workflow.md",
+  "run_attempt": 1,
+  "evidence_status": "observed",
   "had_cache_hit": false,
   "had_cache_miss": true,
   "miss_signals": ["Initializing new cache"]
@@ -228,7 +257,7 @@ Update `index.json` for each workflow analyzed:
 
 ```json
 {
-  "my-workflow": {
+  ".github/workflows/my-workflow.md": {
     "last_analyzed": "YYYY-MM-DD",
     "miss_streak": 4,
     "miss_rate_14d": 0.71,
@@ -242,7 +271,10 @@ Update `index.json` for each workflow analyzed:
 
 ## Phase 4: Prioritize Findings
 
-Rank all findings by severity. **Only workflows that use `cache-memory` are evaluated.**
+Aggregate all findings by `workflow_id` before ranking: keep the highest
+severity and combine evidence and recommendations into **one finding per
+workflow**, even when it has multiple runs, cache IDs, or problem types.
+**Only workflows currently using `cache-memory` are evaluated.**
 
 | Severity | Criteria |
 |----------|----------|
@@ -251,14 +283,96 @@ Rank all findings by severity. **Only workflows that use `cache-memory` are eval
 | 🟡 **Medium** | Miss streak 3–4 days, OR miss rate 50–69% over 14 days |
 
 Create at most **5 GitHub issues** total. Prioritize Critical and High findings first.
+Within a severity level, prioritize the workflows consuming the most input tokens.
+Evidence-backed unused caching is actionable; missing evidence is not.
 
 ---
 
 ## Phase 5: Create GitHub Issues for Problems Found
 
-For each finding that meets the threshold AND for which no open issue already exists (check `known-issues.json`):
+For each workflow finding that meets the threshold AND has no open issue:
+check `known-issues.json` and query GitHub for open `[cache-strategy]` issues
+from this analyzer, including grouped child issues. Match the canonical workflow
+path marker, or the exact workflow field/name for legacy reports; do not match
+only the title. Paginate the results. If that query fails, skip new issue creation
+and report deduplication as unavailable rather than risk duplicates.
 
 ### Issue Template
+
+Use the `cache-strategy-issue-template` skill for the title and body. Reserve each
+`workflow_id` in memory before queuing an issue so it is submitted at most once
+in this run. Record a returned issue number only when known; queued output is
+not proof of publication. On the next run reconcile reservations with GitHub.
+
+---
+
+## Phase 6: Generate Discussion Report
+
+Create a discussion summarizing today's analysis. Use the `create-discussion` safe-output tool.
+
+Use the `cache-strategy-discussion-template` skill for the discussion title and body format when generating the report.
+
+---
+
+## Important Guidelines
+
+### Cache Memory Best Practices to Look For
+
+When evaluating workflows, check for these common mistakes:
+
+1. **Volatile keys without restore-keys**: Cache key contains `run_id`, `run_number`, or current timestamp **and** no restore-keys are configured → guaranteed cold start every run. (A `run_id` key paired with a restore-key is the valid "last one wins" pattern and should not be flagged.)
+2. **No writes**: `cache-memory: true` declared but the agent never writes to `/tmp/gh-aw/cache-memory/` → tool does nothing useful
+3. **No reads**: Cache is written but the agent never reads previous data → cache is write-only, no benefit
+4. **Full overwrites**: Agent always writes a complete fresh file instead of merging with existing data → loses history
+5. **Too broad scope**: One giant JSON blob cached that is invalidated by any single change → low hit rate
+6. **No expiry awareness**: Stale data read without checking age → incorrect behavior silently
+
+### Report Formatting
+
+- Use h3 (###) or lower for all headers
+- Wrap long sections in `<details><summary>...</summary>` tags
+- Be specific: include workflow names, run IDs, and log excerpts as evidence
+- Be actionable: every finding must have a concrete recommended fix
+
+### Time Management
+
+- Spend no more than 5 minutes on each run's log analysis
+- If approaching the 60-minute timeout, save partial results to cache-memory and finish the report with what is available
+- Prioritize workflows that already have entries in `index.json` (continuing historical analysis) over brand-new workflows
+
+### Avoiding Duplicate Issues
+
+Always reconcile cached issue numbers with live GitHub state, including after
+a cache reset. If an open issue already tracks that `workflow_id`, skip creation
+and link it in the report. Consolidate repeated runs and problem types into one
+row per workflow across all severity groups; never repeat a workflow in both
+findings and healthy/unknown sections.
+
+### When to Call `report_missing_data`
+
+Only call the `report_missing_data` tool when an **external** dependency is truly unavailable and prevents analysis from completing — for example, the `agentic-workflows` MCP server is unreachable and no workflow logs can be downloaded.
+
+**Do NOT call `report_missing_data` for**:
+- An absent or empty `cache-strategy/` directory at startup (this is normal for first runs or after cache resets — just initialize and proceed)
+- Having few or no historical runs to compare against yet
+
+---
+
+## Success Criteria
+
+A successful run:
+- ✅ Downloads and analyzes logs from the last 24 hours
+- ✅ Filters to workflows that use `cache-memory` only
+- ✅ Identifies cache misses and misconfigured caches using log pattern analysis
+- ✅ Updates `cache-memory` with today's run records
+- ✅ Creates up to 5 GitHub issues for Critical/High findings not already tracked
+- ✅ Creates a discussion summarizing all findings
+- ✅ Reports each workflow once and avoids duplicate issues using workflow IDs and live GitHub reconciliation
+
+## skill: `cache-strategy-issue-template`
+---
+description: Issue title, body structure, and known-issues recording format for cache-strategy findings.
+---
 
 **Title**: `[cache-strategy] Fix cache miss in <workflow-name>`
 
@@ -270,6 +384,7 @@ For each finding that meets the threshold AND for which no open issue already ex
 **Severity**: 🔴 Critical / 🟠 High / 🟡 Medium
 
 **Workflow**: `<workflow-name>`  
+**Workflow Source**: `<workflow_id>`
 **Analysis Date**: YYYY-MM-DD  
 **Issue Type**: Cache miss / Misconfigured cache
 
@@ -302,19 +417,19 @@ If fixed, this workflow should avoid re-running expensive operations on N% of fu
 *Detected by the [Daily Cache Strategy Analyzer](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})*
 ```
 
-After creating each issue, record it in `known-issues.json`:
+Include `<!-- cache-strategy-workflow: <workflow_id> -->` in the issue body.
+After confirming publication, record it in `known-issues.json`:
 
 ```json
 {
-  "[cache-strategy] Fix cache miss in my-workflow": 1234
+  ".github/workflows/my-workflow.md": 1234
 }
 ```
 
+## skill: `cache-strategy-discussion-template`
 ---
-
-## Phase 6: Generate Discussion Report
-
-Create a discussion summarizing today's analysis. Use the `create-discussion` safe-output tool.
+description: Discussion title and body structure for the daily cache strategy analysis report.
+---
 
 **Title**: `[cache-strategy] Cache Strategy Analysis - YYYY-MM-DD`
 
@@ -395,58 +510,3 @@ These workflows use cache-memory correctly and had consistent cache hits:
 ---
 *Report generated by the [Daily Cache Strategy Analyzer](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
 ```
-
----
-
-## Important Guidelines
-
-### Cache Memory Best Practices to Look For
-
-When evaluating workflows, check for these common mistakes:
-
-1. **Volatile keys without restore-keys**: Cache key contains `run_id`, `run_number`, or current timestamp **and** no restore-keys are configured → guaranteed cold start every run. (A `run_id` key paired with a restore-key is the valid "last one wins" pattern and should not be flagged.)
-2. **No writes**: `cache-memory: true` declared but the agent never writes to `/tmp/gh-aw/cache-memory/` → tool does nothing useful
-3. **No reads**: Cache is written but the agent never reads previous data → cache is write-only, no benefit
-4. **Full overwrites**: Agent always writes a complete fresh file instead of merging with existing data → loses history
-5. **Too broad scope**: One giant JSON blob cached that is invalidated by any single change → low hit rate
-6. **No expiry awareness**: Stale data read without checking age → incorrect behavior silently
-
-### Report Formatting
-
-- Use h3 (###) or lower for all headers
-- Wrap long sections in `<details><summary>...</summary>` tags
-- Be specific: include workflow names, run IDs, and log excerpts as evidence
-- Be actionable: every finding must have a concrete recommended fix
-
-### Time Management
-
-- Spend no more than 5 minutes on each run's log analysis
-- If approaching the 60-minute timeout, save partial results to cache-memory and finish the report with what is available
-- Prioritize workflows that already have entries in `index.json` (continuing historical analysis) over brand-new workflows
-
-### Avoiding Duplicate Issues
-
-Always check `known-issues.json` before creating a new issue. If an issue title already exists in the map:
-- Skip issue creation for that workflow
-- Mention the existing issue number in the discussion report
-
-### When to Call `missing_data`
-
-Only call the `missing_data` tool when an **external** dependency is truly unavailable and prevents analysis from completing — for example, the `agentic-workflows` MCP server is unreachable and no workflow logs can be downloaded.
-
-**Do NOT call `missing_data` for**:
-- An absent or empty `cache-strategy/` directory at startup (this is normal for first runs or after cache resets — just initialize and proceed)
-- Having few or no historical runs to compare against yet
-
----
-
-## Success Criteria
-
-A successful run:
-- ✅ Downloads and analyzes logs from the last 24 hours
-- ✅ Filters to workflows that use `cache-memory` only
-- ✅ Identifies cache misses and misconfigured caches using log pattern analysis
-- ✅ Updates `cache-memory` with today's run records
-- ✅ Creates up to 5 GitHub issues for Critical/High findings not already tracked
-- ✅ Creates a discussion summarizing all findings
-- ✅ Avoids duplicate issues by checking `known-issues.json`

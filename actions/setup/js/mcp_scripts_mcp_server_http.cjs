@@ -11,6 +11,8 @@
  *
  * Usage:
  *   node mcp_scripts_mcp_server_http.cjs /path/to/tools.json [--port 3000] [--stateless]
+ *   Requires GH_AW_MCP_SCRIPTS_API_KEY; POST requests send it in Authorization.
+ *   Uploads are limited to 1 MiB and 30 seconds; GET /health is unauthenticated.
  *
  * Options:
  *   --port <number>    Port to listen on (default: 3000)
@@ -24,13 +26,14 @@ require("./shim.cjs");
 
 const { randomUUID } = require("crypto");
 const { MCPServer, MCPHTTPTransport } = require("./mcp_http_transport.cjs");
-const { validateRequiredFields, validateStringInputLengths, buildStringLengthValidationError } = require("./mcp_scripts_validation.cjs");
+const { validateRequiredFields, validateStringInputLengths, buildStringLengthValidationError } = require("./schema-validation.cjs");
 const { generateEnhancedErrorMessage } = require("./mcp_enhanced_errors.cjs");
 const { createLogger } = require("./mcp_logger.cjs");
 const { bootstrapMCPScriptsServer, cleanupConfigFile } = require("./mcp_scripts_bootstrap.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { redactMCPScriptLogMessage } = require("./diagnostic_sanitization.cjs");
 const { ERR_VALIDATION } = require("./error_codes.cjs");
-const { runHttpServer, logStartupError } = require("./mcp_http_server_runner.cjs");
+const { runHttpServer, logStartupError, requireHttpApiKey } = require("./mcp_http_server_runner.cjs");
 
 /**
  * Create and configure the MCP server with tools
@@ -41,7 +44,7 @@ const { runHttpServer, logStartupError } = require("./mcp_http_server_runner.cjs
  */
 function createMCPServer(configPath, options = {}) {
   // Create logger early
-  const logger = createLogger("mcpscripts");
+  const logger = createLogger("mcpscripts", redactMCPScriptLogMessage);
 
   logger.debug(`=== Creating MCP Server ===`);
   logger.debug(`Configuration file: ${configPath}`);
@@ -66,6 +69,7 @@ function createMCPServer(configPath, options = {}) {
       capabilities: {
         tools: {},
       },
+      redactLogMessage: redactMCPScriptLogMessage,
     }
   );
 
@@ -91,13 +95,13 @@ function createMCPServer(configPath, options = {}) {
       // Validate required fields using helper
       const missing = validateRequiredFields(args, tool.inputSchema);
       if (missing.length) {
-        throw new Error(generateEnhancedErrorMessage(missing, tool.name, tool.inputSchema));
+        throw new Error(`${ERR_VALIDATION}: ${generateEnhancedErrorMessage(missing, tool.name, tool.inputSchema)}`);
       }
 
       // SM-IS-01: Validate per-string input length limits (default 10 KB, or explicit schema maxLength when set).
       const oversized = validateStringInputLengths(args, tool.inputSchema);
       if (oversized.length) {
-        throw new Error(buildStringLengthValidationError(tool.name, oversized));
+        throw new Error(`${ERR_VALIDATION}: ${buildStringLengthValidationError(tool.name, oversized)}`);
       }
 
       // Call the handler
@@ -127,10 +131,12 @@ function createMCPServer(configPath, options = {}) {
  * @param {Object} options - Server options
  * @param {number} [options.port] - Port to listen on (default: 3000)
  * @param {boolean} [options.stateless] - Run in stateless mode (default: false)
+ * @param {string} [options.apiKey] - API key (defaults to GH_AW_MCP_SCRIPTS_API_KEY)
  * @param {string} [options.logDir] - Override log directory from config
  */
 async function startHttpServer(configPath, options = {}) {
-  const port = options.port || 3000;
+  const apiKey = requireHttpApiKey(options.apiKey ?? process.env.GH_AW_MCP_SCRIPTS_API_KEY, "GH_AW_MCP_SCRIPTS_API_KEY");
+  const port = options.port ?? 3000;
   const stateless = options.stateless || false;
 
   const logger = createLogger("mcp-scripts-startup");
@@ -157,6 +163,7 @@ async function startHttpServer(configPath, options = {}) {
       sessionIdGenerator: stateless ? undefined : () => randomUUID(),
       enableJsonResponse: true,
       enableDnsRebindingProtection: false, // Disable for local development
+      redactLogMessage: redactMCPScriptLogMessage,
     });
     logger.debug(`HTTP transport created`);
 
@@ -168,6 +175,7 @@ async function startHttpServer(configPath, options = {}) {
     return await runHttpServer({
       transport,
       port,
+      apiKey,
       getHealthPayload: () => ({
         status: "ok",
         server: config.serverName || "mcpscripts",

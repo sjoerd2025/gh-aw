@@ -4,9 +4,13 @@
 *.dll
 *.so
 *.dylib
+*.tgz
 
 # Test binary, built with `go test -c`
 *.test
+/test_dup_import
+/tmp/smoke_test_*.go
+/{outname}.f
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
@@ -66,6 +70,10 @@ docs/public/wasm/wasm_exec.js
 # credentials
 .credentials/
 
+# Claude Code's persisted command approvals can contain plaintext credentials.
+# Keep local settings private at every project depth; shared settings and skills stay tracked.
+**/.claude/settings.local.json
+
 # Environment variable files - may contain sensitive API keys, tokens, and passwords
 .env
 .env.*
@@ -74,8 +82,15 @@ docs/public/wasm/wasm_exec.js
 .env.*.backup
 
 coverage.html
-coverage/
+/coverage/
 logs/
+!pkg/cli/testdata/model_routing_golden/**/sandbox/firewall/logs/
+!pkg/cli/testdata/model_routing_golden/**/sandbox/firewall/logs/**
+!pkg/cli/testdata/model_routing_golden_capture/**/sandbox/firewall/logs/
+!pkg/cli/testdata/model_routing_golden_capture/**/sandbox/firewall/logs/**
+!actions/setup/js/fixtures/routing-analytics/run-*/
+!actions/setup/js/fixtures/routing-analytics/run-*/**/sandbox/firewall/logs/
+!actions/setup/js/fixtures/routing-analytics/run-*/**/sandbox/firewall/logs/**
 
 # Benchmark results
 bench_results.txt
@@ -149,7 +164,14 @@ pkg/cli/.github/aw/actions-lock.json
 # Test run artifacts (legacy - now uses system temp)
 test-runs/
 
+# Local queue validation tooling and caches
+/.queue-validation-cache/
+
 # Security scan reports
+# Local tool binaries are installed via `go install` (see Makefile `tools` target)
+# and must never be committed as opaque build artifacts.
+/actionlint
+/gosec
 gosec-report.json
 gosec-results.sarif
 govulncheck-results.sarif
@@ -174,6 +196,7 @@ test-inline-*.lock.yml
 *.txt
 !docs/public/robots.txt
 !docs/public/.well-known/ai.txt
+!.github/workflows/requirements-agentrx.txt
 conclusion/
 detection/
 

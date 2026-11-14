@@ -13,58 +13,46 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 network:
   allowed:
   - defaults
   - github
   - go
+  - node
 imports:
+- shared/pr-safe-output-defaults.md
 - shared/reporting.md
 - shared/otlp.md
 safe-outputs:
   create-pull-request:
-    draft: false
     expires: 3d
     labels:
     - pkg-specifications
     - testing
     - automation
     title-prefix: "[spec-enforcer] "
+  upload-code-coverage:
 description: Generates and maintains specification-driven test suites for each Go package, relying on README.md specifications rather than source code
 emoji: 📋
 max-turns: 100
-model: copilot/gpt-5.4
 engine:
-  id: pi
+  id: codex
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: balanced
 name: Package Specification Enforcer
 strict: true
 timeout-minutes: 30
 tools:
   bash:
-  - cat pkg/*/README.md
-  - find pkg -maxdepth 1 -type d
-  - find pkg/* -maxdepth 0 -type d
-  - find pkg -name "*_test.go" -type f
-  - find pkg -name "README.md" -type f
-  - ls pkg/*/
-  - head -n * pkg/*/*.go
-  - cat pkg/*/*.go
-  - wc -l pkg/*/*.go
-  - grep -rn "func Test" pkg --include="*_test.go"
-  - grep -rn "func [A-Z]" pkg --include="*.go"
-  - grep -rn "type [A-Z]" pkg --include="*.go"
-  - grep -rn "package " pkg --include="*.go"
-  - "git log --oneline --since=\"7 days ago\" -- pkg/*/README.md"
-  - "git diff HEAD -- pkg/*"
-  - git status
-  - go test -v -run "TestSpec" ./pkg/...
-  - go test -v -list "TestSpec" ./pkg/...
-  - go build ./pkg/...
+  - "*"
   cache-memory: true
   cli-proxy: true
   edit: null
   github:
-    mode: gh-proxy
+    mode: local
     toolsets:
     - default
 tracker-id: spec-enforcer
@@ -136,6 +124,9 @@ You MUST NOT:
      "total_eligible": 0
    }
    ```
+
+   Report `Cache hit` only after successfully reading reusable rotation state,
+   or `Cache miss` if the file is missing. Directory creation is not a miss.
 
 3. If `rotation.json` is missing or empty, fetch the most recently merged PR with:
    - `gh pr list --repo ${{ github.repository }} --state merged --label pkg-specifications --limit 1 --json number,body,mergedAt`
@@ -316,7 +307,26 @@ Then pass both outputs to the `test-output-classifier` agent. Use the returned J
 3. `flag_spec_mismatch` → add `// SPEC_MISMATCH: <description>` and document it in the PR body
 4. `investigate` → re-read the spec section before deciding
 
+When one or more generated or updated spec tests pass validation, publish one experimental coverage report for the processed package set:
+
+```bash
+mkdir -p /tmp/gh-aw/spec-enforcer "$GITHUB_WORKSPACE/coverage"
+go install github.com/boumenot/gocover-cobertura@4afa1205ab3b54ae098dd4724c1657aad10f7484
+go test ./pkg/<package>/... -run "TestSpec" -covermode=atomic -coverprofile=/tmp/gh-aw/spec-enforcer/coverage.out
+"$(go env GOPATH)/bin/gocover-cobertura" < /tmp/gh-aw/spec-enforcer/coverage.out > "$GITHUB_WORKSPACE/coverage/spec-enforcer-cobertura.xml"
+```
+
+Only after verifying `coverage/spec-enforcer-cobertura.xml` exists and is non-empty, call `upload_code_coverage` with
+`file: "coverage/spec-enforcer-cobertura.xml"`, `language: "Go"`, and `label: "spec-enforcer/generated-tests"`.
+
 ## Phase 5: Save Cache and Create PR
+
+Before either a PR or `noop`, update
+`/tmp/gh-aw/cache-memory/spec-enforcer/rotation.json` with `last_index`,
+`last_packages`, `last_run`, and `total_eligible` from this run. In full-sweep
+mode preserve the round-robin cursor. Merge updated README hashes into
+`/tmp/gh-aw/cache-memory/spec-enforcer/spec-hashes.json`, preserving unprocessed
+packages, and read both files back to verify persistence.
 
 ### Save Enforcement Data
 
@@ -404,7 +414,6 @@ All tests are derived from README.md specifications, not from implementation sou
 ## agent: `rotation-state-recoverer`
 ---
 description: Parse merged PR body text to recover package rotation state.
-model: small
 ---
 You receive:
 - `pr_body`: the merged PR body text
@@ -428,7 +437,6 @@ Output JSON only:
 ## agent: `readme-spec-extractor`
 ---
 description: Extract structured API contract from a Go package README.md.
-model: small
 ---
 You are given the full contents of a single Go package README.md.
 
@@ -445,7 +453,6 @@ Do not invent details that the README does not state. Output JSON only.
 ## agent: `test-output-classifier`
 ---
 description: Classify go test/go build failures into a fixed taxonomy.
-model: small
 ---
 You receive raw `go build` and `go test` output for a single package.
 

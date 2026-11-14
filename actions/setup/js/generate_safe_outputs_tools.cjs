@@ -30,8 +30,13 @@ require("./shim.cjs");
 
 const fs = require("fs");
 const path = require("path");
-const { ERR_CONFIG } = require("./error_codes.cjs");
+const { ERR_CONFIG, ERR_PARSE, ERR_SAFE_OUTPUT_TOOL_COPY_FAILED, ERR_SYSTEM } = require("./error_codes.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { normalizeSafeOutputName } = require("./safe_output_names.cjs");
+const { buildAddLabelsObjectOnlyFieldDesc } = require("./add_labels_schema.cjs");
+const { addDependencySchema } = require("./safe_output_submission.cjs");
+const { writeFile } = require("./create_files.cjs");
+const normalizeToolName = name => normalizeSafeOutputName(String(name).replace(/-/g, "_").toLowerCase());
 const ADD_COMMENT_DEFAULT_DISCUSSIONS_NOTE =
   "NOTE: By default, this tool does not require discussions:write permission. Set 'discussions: true' in the workflow's safe-outputs.add-comment configuration to enable discussion comments and request this permission.";
 const ADD_COMMENT_DISCUSSIONS_ENABLED_NOTE = "NOTE: Discussion comments are enabled for this workflow because discussions:write permission is available.";
@@ -46,6 +51,8 @@ const ADD_LABELS_STRICT_FIELD_DESC =
   'Labels to add. Each label must be an object with required fields: name (string), rationale (string, max 280 chars), and confidence (exactly one of: LOW, MEDIUM, HIGH). Plain string label names are not permitted. Example: [{"name": "bug", "rationale": "The report describes reproducible incorrect behavior.", "confidence": "HIGH"}]. Labels must exist in the repository.';
 const ADD_LABELS_OPTIONAL_FIELD_DESC =
   'Labels to add. Prefer structured label objects: {"name": "bug", "rationale": "The report describes reproducible incorrect behavior.", "confidence": "HIGH", "suggest": true}. Plain strings are also accepted for compatibility. Include rationale (string, max 280 chars) and confidence (LOW, MEDIUM, or HIGH) to improve transparency; use suggest: true to route for human review. Labels must exist in the repository.';
+const ADD_LABELS_STRING_ONLY_FIELD_DESC = "Labels to add. Each label must be a plain string matching the configured item schema. Labels must exist in the repository.";
+
 const ASSIGN_TO_AGENT_EXAMPLE_USAGE_REGEX = /Example usage: assign_to_agent\([^)]+\)(?: or assign_to_agent\([^)]+\))?/g;
 const ASSIGN_TO_AGENT_STRICT_EXAMPLE_USAGE =
   'Example usage: assign_to_agent(issue_number=123, agent="copilot", rationale="Delegate this coding task to the agent.", confidence="HIGH") or assign_to_agent(pull_number=456, agent="copilot", pull_request_repo="owner/repo", rationale="The agent should implement this PR fix.", confidence="HIGH")';
@@ -201,6 +208,37 @@ function applyAssignMilestoneAlternativeRequirements(tool) {
   schema.anyOf = [{ required: ["milestone_number"] }, { required: ["milestone_title"] }];
 }
 
+/**
+ * Resolve ${ENV_VAR} placeholders inside a JSON string from process.env.
+ * Replacement values are escaped as JSON string content so quotes, backslashes, and
+ * newlines in the resolved value do not corrupt the surrounding JSON document.
+ * Unresolved placeholders are left unchanged.
+ * @param {string} value
+ * @returns {string}
+ */
+function resolveEnvStringPlaceholders(value) {
+  return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (match, envName) => {
+    const envValue = process.env[envName];
+    if (envValue === undefined) {
+      return match;
+    }
+    // JSON.stringify wraps the value in quotes; strip them to get escaped string content.
+    return JSON.stringify(envValue).slice(1, -1);
+  });
+}
+
+/**
+ * Detect references whose scope could change when a schema is embedded under record.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function containsSchemaRef(value) {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  return Object.hasOwn(value, "$ref") || Object.values(value).some(containsSchemaRef);
+}
+
 async function main() {
   const toolsSourcePath = process.env.GH_AW_SAFE_OUTPUTS_TOOLS_SOURCE_PATH || `${process.env.RUNNER_TEMP}/gh-aw/actions/safe_outputs_tools.json`;
   const configPath = process.env.GH_AW_SAFE_OUTPUTS_CONFIG_PATH || `${process.env.RUNNER_TEMP}/gh-aw/safeoutputs/config.json`;
@@ -210,17 +248,17 @@ async function main() {
   // Write JSON payloads from env vars if provided (replaces heredoc-based file writing)
   if (process.env.GH_AW_TOOLS_META_JSON) {
     try {
-      fs.writeFileSync(toolsMetaPath, process.env.GH_AW_TOOLS_META_JSON);
+      writeFile(toolsMetaPath, resolveEnvStringPlaceholders(process.env.GH_AW_TOOLS_META_JSON));
     } catch (err) {
-      throw new Error(`Failed to write file ${toolsMetaPath}: ${String(err)}`, { cause: err });
+      throw new Error(`${ERR_SYSTEM}: Failed to write file ${toolsMetaPath}: ${getErrorMessage(err)}`, { cause: err });
     }
   }
   if (process.env.GH_AW_VALIDATION_JSON) {
     const validationPath = path.join(path.dirname(configPath), "validation.json");
     try {
-      fs.writeFileSync(validationPath, process.env.GH_AW_VALIDATION_JSON);
+      writeFile(validationPath, process.env.GH_AW_VALIDATION_JSON);
     } catch (err) {
-      throw new Error(`Failed to write file ${validationPath}: ${String(err)}`, { cause: err });
+      throw new Error(`${ERR_SYSTEM}: Failed to write file ${validationPath}: ${getErrorMessage(err)}`, { cause: err });
     }
   }
 
@@ -232,10 +270,17 @@ async function main() {
   }
   /** @type {Array<{name: string, description: string, inputSchema?: {properties?: Record<string, unknown>}}>} */
   let allTools;
+  /** @type {string} */
+  let allToolsRaw;
   try {
-    allTools = JSON.parse(fs.readFileSync(toolsSourcePath, "utf8"));
+    allToolsRaw = fs.readFileSync(toolsSourcePath, "utf8");
   } catch (err) {
-    throw new Error("Failed to parse tools source file " + toolsSourcePath + ": " + getErrorMessage(err), { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to read tools source file ${toolsSourcePath}: ${getErrorMessage(err)}`, { cause: err });
+  }
+  try {
+    allTools = JSON.parse(allToolsRaw);
+  } catch (err) {
+    throw new Error(`${ERR_PARSE}: ` + "Failed to parse tools source file " + toolsSourcePath + ": " + getErrorMessage(err), { cause: err });
   }
 
   // Load config to determine which tools are enabled
@@ -246,40 +291,85 @@ async function main() {
   }
   /** @type {Record<string, unknown>} */
   let config;
+  /** @type {string} */
+  let configRaw;
   try {
-    config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    configRaw = fs.readFileSync(configPath, "utf8");
   } catch (err) {
-    throw new Error("Failed to parse config file " + configPath + ": " + getErrorMessage(err), { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to read config file ${configPath}: ${getErrorMessage(err)}`, { cause: err });
+  }
+  try {
+    config = Object.fromEntries(Object.entries(JSON.parse(configRaw)).map(([key, value]) => [normalizeToolName(key), value]));
+  } catch (err) {
+    throw new Error(`${ERR_PARSE}: ` + "Failed to parse config file " + configPath + ": " + getErrorMessage(err), { cause: err });
   }
 
   // Load tools meta (description suffixes, repo params, dynamic tools)
-  /** @type {{description_suffixes?: Record<string, string>, repo_params?: Record<string, {type: string, description: string}>, dynamic_tools?: Array<unknown>, required_field_removals?: Record<string, string[]>, required_field_additions?: Record<string, string[]>, property_injections?: Record<string, Record<string, unknown>>}} */
+  /** @type {{work_queue_scoped?: boolean, description_suffixes?: Record<string, string>, repo_params?: Record<string, {type: string, description: string}>, dynamic_tools?: Array<any>, required_field_removals?: Record<string, string[]>, required_field_additions?: Record<string, string[]>, property_injections?: Record<string, Record<string, unknown>>, item_schemas?: Record<string, Record<string, unknown>>}} */
   let toolsMeta = { description_suffixes: {}, repo_params: {}, dynamic_tools: [] };
   if (fs.existsSync(toolsMetaPath)) {
+    /** @type {string} */
+    let toolsMetaRaw;
     try {
-      toolsMeta = JSON.parse(fs.readFileSync(toolsMetaPath, "utf8"));
+      toolsMetaRaw = fs.readFileSync(toolsMetaPath, "utf8");
     } catch (err) {
-      throw new Error("Failed to parse tools meta file " + toolsMetaPath + ": " + getErrorMessage(err), { cause: err });
+      throw new Error(`${ERR_SYSTEM}: Failed to read tools meta file ${toolsMetaPath}: ${getErrorMessage(err)}`, { cause: err });
+    }
+    try {
+      toolsMeta = JSON.parse(toolsMetaRaw);
+    } catch (err) {
+      throw new Error(`${ERR_PARSE}: ` + "Failed to parse tools meta file " + toolsMetaPath + ": " + getErrorMessage(err), { cause: err });
     }
   }
 
   // Build set of source tool names (predefined/static tools only)
-  const sourceToolNames = new Set(allTools.map(t => t.name));
+  const sourceToolNames = new Set(allTools.map(t => normalizeToolName(t.name)));
 
   // Determine enabled tools: config keys that match source tool names
   // This filters out non-tool config entries like dispatch_workflow, call_workflow,
   // mentions, max_bot_mentions, etc.
-  const enabledToolNames = new Set(Object.keys(config).filter(k => sourceToolNames.has(k)));
+  const enabledToolNames = new Set(
+    Object.keys(config)
+      .map(normalizeToolName)
+      .filter(name => sourceToolNames.has(name))
+  );
+  /** @type {{ledger_append?: {ledgers?: Array<{name: string, type?: string, schema?: Record<string, unknown>}>}}} */
+  const ledgerConfig = config;
+  const configuredLedgers = ledgerConfig.ledger_append?.ledgers;
+  const generalLedgers = Array.isArray(configuredLedgers) ? configuredLedgers.filter(ledger => ledger.type !== "map" && ledger.type !== "notes") : [];
+  if (Array.isArray(configuredLedgers) && configuredLedgers.length > 0 && generalLedgers.length === 0) {
+    enabledToolNames.delete("ledger_append");
+  }
   // Filter predefined tools to those enabled in config and apply enhancements
   const filteredTools = allTools
-    .filter(tool => enabledToolNames.has(tool.name))
+    .filter(tool => enabledToolNames.has(normalizeToolName(tool.name)))
     .map(tool => {
-      // Deep copy to avoid modifying the original
+      // Deep copy to avoid modifying the original. `tool` here is parsed straight from the
+      // JSON tools-source file (see toolsSourcePath above), so it can never carry a function-valued
+      // `handler` field — unlike safe_outputs_tools_loader.cjs, which clones live tool objects that
+      // do carry handlers and must strip them before cloning.
       let enhancedTool;
       try {
-        enhancedTool = JSON.parse(JSON.stringify(tool));
+        enhancedTool = structuredClone(tool);
       } catch (err) {
-        throw new Error("Failed to deep-copy tool " + tool.name + ": " + getErrorMessage(err), { cause: err });
+        throw new Error(`${ERR_SAFE_OUTPUT_TOOL_COPY_FAILED}: Failed to deep-copy tool ${tool.name}: ${getErrorMessage(err)}`, { cause: err });
+      }
+      if (tool.name === "ledger_append" && Array.isArray(configuredLedgers)) {
+        const generalNames = generalLedgers.map(ledger => ledger.name);
+        if (generalNames.length > 0) {
+          enhancedTool.inputSchema.properties.ledger.enum = generalNames;
+          if (configuredLedgers.length > 1) {
+            enhancedTool.inputSchema.required = [...new Set([...(enhancedTool.inputSchema.required || []), "ledger"])];
+          }
+          if (generalLedgers.every(ledger => !ledger.type)) {
+            enhancedTool.description = "Submit a custom record to a configured Git-backed ledger using record, not operation or value. Persistence follows trusted validation.";
+            enhancedTool.inputSchema.properties = Object.fromEntries(Object.entries(enhancedTool.inputSchema.properties).filter(([name]) => ["ledger", "temp_id", "record"].includes(name)));
+            enhancedTool.inputSchema.required = [...new Set([...(enhancedTool.inputSchema.required || []), "record"])];
+            if (generalLedgers.length === 1 && generalLedgers[0].schema && !containsSchemaRef(generalLedgers[0].schema)) {
+              enhancedTool.inputSchema.properties.record = { ...enhancedTool.inputSchema.properties.record, ...generalLedgers[0].schema };
+            }
+          }
+        }
       }
 
       // Apply description suffix if available (e.g., " CONSTRAINTS: Maximum 5 issues.")
@@ -383,6 +473,31 @@ async function main() {
         }
       }
 
+      const itemSchemas = toolsMeta.item_schemas?.[tool.name];
+      if (itemSchemas && typeof itemSchemas === "object") {
+        for (const [propertyName, itemSchema] of Object.entries(itemSchemas)) {
+          const propertySchema = enhancedTool.inputSchema?.properties?.[propertyName];
+          if (propertySchema?.type === "array") {
+            propertySchema.items = itemSchema;
+            if (tool.name === "add_labels" && propertyName === "labels") {
+              /** @type {{type?: unknown, properties?: Record<string, unknown>, required?: unknown}} */
+              const configuredItemSchema = itemSchema && typeof itemSchema === "object" ? itemSchema : {};
+              if (configuredItemSchema.type === "object") {
+                propertySchema.description = isIssueIntentEnabledForTool(tool.name, config[tool.name]) ? ADD_LABELS_STRICT_FIELD_DESC : buildAddLabelsObjectOnlyFieldDesc(configuredItemSchema);
+                const itemProperties = configuredItemSchema.properties && typeof configuredItemSchema.properties === "object" ? configuredItemSchema.properties : {};
+                const required = Array.isArray(configuredItemSchema.required) ? configuredItemSchema.required : [];
+                if (!isIssueIntentEnabledForTool(tool.name, config[tool.name]) && (!("rationale" in itemProperties) || !("confidence" in itemProperties) || required.includes("rationale") || required.includes("confidence"))) {
+                  enhancedTool.description = (enhancedTool.description || "").replace(ISSUE_INTENT_OPTIONAL_SUFFIX, "").trim();
+                }
+              } else if (configuredItemSchema.type === "string") {
+                propertySchema.description = ADD_LABELS_STRING_ONLY_FIELD_DESC;
+                enhancedTool.description = (enhancedTool.description || "").replace(ISSUE_INTENT_OPTIONAL_SUFFIX, "").trim();
+              }
+            }
+          }
+        }
+      }
+
       applyAssignMilestoneAlternativeRequirements(enhancedTool);
 
       return enhancedTool;
@@ -391,12 +506,26 @@ async function main() {
   // Append dynamic tools (custom jobs, dispatch_workflow, call_workflow)
   const dynamicTools = Array.isArray(toolsMeta.dynamic_tools) ? toolsMeta.dynamic_tools : [];
   const allFilteredTools = [...filteredTools, ...dynamicTools];
+  for (const tool of allFilteredTools) addDependencySchema(tool);
+  if (toolsMeta.work_queue_scoped === true) {
+    for (const tool of allFilteredTools) {
+      tool.inputSchema.properties ||= {};
+      if (Object.prototype.hasOwnProperty.call(tool.inputSchema.properties, "claim_handle")) throw new Error(`${ERR_CONFIG}: claim_handle is reserved for trusted queue scope`);
+      tool.inputSchema.properties.claim_handle = {
+        type: "string",
+        minLength: 1,
+        maxLength: 256,
+        "x-preserve-blank": true,
+        description: "Immutable assignment Claim handle. May be omitted only for an originally single-Claim assignment. Explicit blank or foreign handles are rejected.",
+      };
+    }
+  }
 
   // Write the result to the output path
   try {
-    fs.writeFileSync(outputPath, JSON.stringify(allFilteredTools, null, 2));
+    writeFile(outputPath, JSON.stringify(allFilteredTools, null, 2));
   } catch (err) {
-    throw new Error(`Failed to write file ${outputPath}: ${String(err)}`, { cause: err });
+    throw new Error(`${ERR_SYSTEM}: Failed to write file ${outputPath}: ${getErrorMessage(err)}`, { cause: err });
   }
 
   const debugEnabled = process.env.DEBUG === "*" || (process.env.DEBUG || "").includes("safe_outputs");

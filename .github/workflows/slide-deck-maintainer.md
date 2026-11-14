@@ -3,8 +3,6 @@ emoji: "📊"
 name: Slide Deck Maintainer
 description: Maintains the gh-aw slide deck by scanning repository content and detecting layout issues using Playwright
 on:
-  schedule:
-    - cron: "daily around 16:00 on weekdays"  # ~4 PM UTC on weekdays
   workflow_dispatch:
     inputs:
       focus:
@@ -16,14 +14,13 @@ permissions:
   pull-requests: read
   issues: read
 
-sandbox:
-  agent:
-    sudo: false
 
 concurrency:
   job-discriminator: ${{ inputs.focus || github.run_id }}
 tracker-id: slide-deck-maintainer
-engine: copilot
+engine:
+  id: copilot
+  copilot-sdk: true
 imports:
   - uses: shared/skip-if-issue-open.md
     with:
@@ -35,18 +32,25 @@ imports:
       expires: "1d"
   - shared/otlp.md
 timeout-minutes: 45
+checkout:
+  lfs: false
+runtimes:
+  node:
+    version: "24"
 tools:
   cli-proxy: true
   cache-memory: true
   playwright:
-    mode: cli
   edit:
   bash:
+    - "npm *"
     - "npm install*"
     - "npm run*"
     - "npm ci*"
+    - "npx *"
     - "npx @marp-team/marp-cli*"
     - "npx http-server*"
+    - "node *"
     - "curl*"
     - "kill*"
     - "lsof*"
@@ -63,8 +67,24 @@ network:
   allowed:
     - node
 steps:
+  - name: Fetch Git LFS files
+    run: |
+      attempt=1
+      max_attempts=5
+      wait_time=5
+      until git lfs pull; do
+        if [ "${attempt}" -ge "${max_attempts}" ]; then
+          echo "::error::git lfs pull failed after ${max_attempts} attempts"
+          exit 1
+        fi
+        echo "git lfs pull failed (attempt ${attempt}/${max_attempts}). Retrying in ${wait_time}s..."
+        sleep "${wait_time}"
+        attempt=$((attempt + 1))
+        wait_time=$((wait_time * 2))
+      done
+
   - name: Setup Node.js
-    uses: actions/setup-node@v7.0.0
+    uses: actions/setup-node@v7.1.0
     with:
       node-version: "24"
       cache: npm
@@ -72,7 +92,7 @@ steps:
   
   - name: Install Marp dependencies
     run: |
-      cd docs
+      cd docs || exit 1
       npm ci
 
 ---
@@ -183,7 +203,7 @@ fi
 - `documentation` → next is `source-code`
 - Any other/missing value → use `documentation`
 
-If the file exists but is malformed or unreadable, call `missing_data` with `data_type: "cache_memory"` and `reason: "cache_memory_miss"`, then default to `documentation`.
+If the file exists but is malformed or unreadable, call `report_missing_data` with `data_type: "cache_memory"` and `reason: "cache_memory_miss"`, then default to `documentation`.
 
 The schema is:
 ```json

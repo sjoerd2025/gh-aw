@@ -10,11 +10,16 @@ on:
 max-daily-ai-credits: 10000
 permissions:
   contents: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 tracker-id: daily-elixir-credo-snippet-audit
 engine:
   id: claude
+  model-provider: github
+  model-routing:
+    goal: cost
+    mode: economy
 timeout-minutes: 45
 strict: true
 runtimes:
@@ -29,7 +34,7 @@ network:
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   bash:
     - "*"
@@ -43,7 +48,7 @@ imports:
       reviewers: [copilot]
 sandbox:
   agent:
-    sudo: false
+    id: awf
 steps:
   - name: Install Credo tooling project
     run: |
